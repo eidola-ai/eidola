@@ -60,12 +60,46 @@ use crate::changes::{Change, ChangeOrigin, with_origin};
 use crate::error::AppError;
 use crate::{
     AttachedReference, ChatStreamEvent, Inner, NotificationPlan, PlannedTurn, Planner,
-    ReferenceSpec, ResponseMode, TurnSelector, db,
+    ReferenceSpec, ResponseMode, TurnDirective, TurnSelector, db,
 };
 
 /// The per-room driver registry: room id → whether an arm arrived while its
 /// task was running (see [`Inner::arm_subspace_driver`]).
 pub(crate) type DriverRegistry = HashMap<String, bool>;
+
+/// Why a room is being armed, which decides one thing: whether it may wait for
+/// its anchor to be answered (see [`Inner::report_delegation`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Arm {
+    /// Something was written into the room and the bus said so.
+    Signal,
+    /// The startup sweep. A process that has just started cannot be waiting on
+    /// a turn of its own, so nothing it finds is still in flight.
+    Sweep,
+}
+
+/// What one process has done about one room's last word — the meter that stops
+/// a failing delegation being retried forever. See [`Inner::claim_walk`].
+#[derive(Clone, Debug)]
+pub(crate) struct Walk {
+    tail: String,
+    attempts: u32,
+}
+
+/// The per-room walk ledger: room id → what has been tried against its current
+/// last word.
+pub(crate) type WalkLedger = HashMap<String, Walk>;
+
+/// How many times one process may walk a delegated room from the same last
+/// word.
+///
+/// It is a *retry* bound, not a work bound — the turn budget is that. What it
+/// bounds is the arm-fail-arm circuit: a failure writes no post, so nothing
+/// about the room changes and the failure's own change event arms it again. A
+/// handful of attempts rides out a blip; anything past that is an outage, and
+/// an outage is waited out rather than billed against. A restart, or any post
+/// from outside, starts the count over.
+pub const MAX_ATTEMPTS_PER_TAIL: u32 = 3;
 
 /// How many turns one delegation may take, across its whole life.
 ///
@@ -87,15 +121,115 @@ pub(crate) type DriverRegistry = HashMap<String, bool>;
 /// the cascade guard never fires.
 pub const MAX_DELEGATION_TURNS: i64 = 32;
 
+/// Why a delegated room's turn could not run — a **bounded category**, never
+/// the error's own words.
+///
+/// A failure message can carry an upstream response body, and an upstream is on
+/// the other side of a trust boundary: splicing one into the owning agent's
+/// prompt would let whatever answered the room write into another model's
+/// context, at whatever length it liked. It can equally carry a local path or a
+/// database detail, which is nobody's business one conversation over. So the
+/// report says which *kind* of thing went wrong and the detail stays where it
+/// is useful and contained — the local warning log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelegationFailure {
+    /// The model's endpoint could not be reached, or refused the request.
+    Upstream,
+    /// The turn could not be paid for.
+    Funding,
+    /// The room's own configuration stopped it — a model that no longer
+    /// resolves, a participant that is gone.
+    Configuration,
+    /// The turn ran and could not be finished. Everything that is neither of
+    /// the above, including a local failure with no bearing on the room.
+    Unfinished,
+}
+
+impl DelegationFailure {
+    /// The category an error falls into. Exhaustive over [`AppError`] on
+    /// purpose: a new variant is a compile error here rather than a silent
+    /// slide into the catch-all.
+    fn of(error: &AppError) -> Self {
+        match error {
+            AppError::Network { .. }
+            | AppError::Attestation { .. }
+            | AppError::Server { .. }
+            | AppError::Credential { .. } => Self::Upstream,
+            AppError::NoAccount
+            | AppError::InsufficientBalance { .. }
+            | AppError::ProvisioningTimeout { .. }
+            | AppError::TermsAcceptanceRequired { .. } => Self::Funding,
+            AppError::NotConfigured { .. }
+            | AppError::Config { .. }
+            | AppError::NotAParticipant { .. }
+            | AppError::WrongPostKind { .. }
+            | AppError::SpawnRefused { .. }
+            | AppError::NotJoined { .. }
+            | AppError::SpaceArchived { .. } => Self::Configuration,
+            AppError::ToolLoop { .. }
+            | AppError::Internal { .. }
+            | AppError::Database { .. }
+            | AppError::DatabaseInUse { .. }
+            | AppError::LocalModel { .. }
+            | AppError::Update { .. } => Self::Unfinished,
+        }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::Upstream => "upstream",
+            Self::Funding => "funding",
+            Self::Configuration => "configuration",
+            Self::Unfinished => "unfinished",
+        }
+    }
+
+    fn parse(token: &str) -> Option<Self> {
+        Some(match token {
+            "upstream" => Self::Upstream,
+            "funding" => Self::Funding,
+            "configuration" => Self::Configuration,
+            "unfinished" => Self::Unfinished,
+            _ => return None,
+        })
+    }
+
+    /// What a model reads. English, like every other model-facing string this
+    /// crate builds, and built at render time rather than persisted.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Upstream => "the model it was talking to could not be reached",
+            Self::Funding => "the turn could not be paid for",
+            Self::Configuration => "something about that conversation's setup stopped it",
+            Self::Unfinished => "the turn could not be finished",
+        }
+    }
+}
+
+/// The reserved prefix of a delegation ending written into a reference edge's
+/// `annotation`.
+///
+/// The column holds either a person's note about the passage they quoted or one
+/// of these, and nothing else — which is why the prefix has to be something
+/// nobody types. [`crate::PostReference`] splits the two apart so no reader can
+/// print one where the other belongs.
+const DELEGATION_END_PREFIX: &str = "eidola:delegation/";
+
 /// How a delegated room stopped.
 ///
 /// Every variant is reported, on the same channel, in the same shape — the
-/// failure arm is not a quieter version of the success one. What differs is one
-/// sentence, which becomes the annotation on the reference edge the report
-/// carries, so the reason is durable and reaches the human's footnote rail as
-/// well as the next model to read the post.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DelegationEnd {
+/// failure arm is not a quieter version of the success one.
+///
+/// **It is persisted as a token, never as a sentence.** The ending rides the
+/// report's reference edge, and `annotation` is a column a person's own note
+/// lives in, so whatever this crate writes there is read as-is in every
+/// language — the same rule that keeps a spawned room's *title* a bare name.
+/// So the durable form is [`Self::token`] and the prose is built at read time:
+/// English for models (which is what every model-facing string here is), and
+/// the presentation layer's own words for people, from
+/// [`crate::PostReference::delegation_end`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelegationEnd {
     /// Planning returned no turns: nobody's notify policy fired on the room's
     /// last post, which is what a conversation running out of things to say
     /// looks like from here.
@@ -104,17 +238,62 @@ pub(crate) enum DelegationEnd {
     Paused { depth: i64, limit: i64 },
     /// The per-delegation turn budget is spent.
     BudgetSpent { limit: i64 },
-    /// A turn failed. The message is the typed error's own words.
-    TurnFailed { message: String },
+    /// A turn failed, in the bounded sense of [`DelegationFailure`].
+    TurnFailed { reason: DelegationFailure },
 }
 
 impl DelegationEnd {
-    /// The sentence that rides the report's reference edge as its annotation.
-    ///
-    /// Written for whoever reads the report next — the participants of the
-    /// parent conversation, model and human alike — so it says what happened to
-    /// the room rather than naming an internal state.
-    pub(crate) fn annotation(&self) -> String {
+    /// The failure arm for an error, categorized. The error itself never
+    /// travels — see [`DelegationFailure`].
+    fn failed(error: &AppError) -> Self {
+        Self::TurnFailed {
+            reason: DelegationFailure::of(error),
+        }
+    }
+
+    /// The durable form: locale-neutral, stable, and unmistakable for a
+    /// person's note.
+    pub fn token(&self) -> String {
+        match self {
+            Self::Concluded => format!("{DELEGATION_END_PREFIX}concluded"),
+            Self::Paused { depth, limit } => {
+                format!("{DELEGATION_END_PREFIX}paused/{depth}/{limit}")
+            }
+            Self::BudgetSpent { limit } => format!("{DELEGATION_END_PREFIX}budget/{limit}"),
+            Self::TurnFailed { reason } => {
+                format!("{DELEGATION_END_PREFIX}failed/{}", reason.token())
+            }
+        }
+    }
+
+    /// Read an annotation back as an ending, or `None` when it is not one —
+    /// which is every annotation a person wrote, and also any token a future
+    /// version writes that this one does not understand. Both degrade to "a
+    /// note", which is the safe direction: a reader shows prose it cannot
+    /// interpret rather than claiming an ending it guessed at.
+    pub fn parse(annotation: &str) -> Option<Self> {
+        let rest = annotation.strip_prefix(DELEGATION_END_PREFIX)?;
+        let mut parts = rest.split('/');
+        let out = match parts.next()? {
+            "concluded" => Self::Concluded,
+            "paused" => Self::Paused {
+                depth: parts.next()?.parse().ok()?,
+                limit: parts.next()?.parse().ok()?,
+            },
+            "budget" => Self::BudgetSpent {
+                limit: parts.next()?.parse().ok()?,
+            },
+            "failed" => Self::TurnFailed {
+                reason: DelegationFailure::parse(parts.next()?)?,
+            },
+            _ => return None,
+        };
+        parts.next().is_none().then_some(out)
+    }
+
+    /// What a model reads where a person's annotation would go — built here,
+    /// never stored.
+    pub(crate) fn describe(&self) -> String {
         match self {
             Self::Concluded => "the delegated conversation ran to a stop".to_string(),
             Self::Paused { depth, limit } => format!(
@@ -125,11 +304,25 @@ impl DelegationEnd {
                 "the delegated conversation used all {limit} of the turns it is allowed and was \
                  stopped there"
             ),
-            Self::TurnFailed { message } => {
-                format!("a turn in the delegated conversation failed: {message}")
-            }
+            Self::TurnFailed { reason } => format!(
+                "the delegated conversation stopped because {}",
+                reason.describe()
+            ),
         }
     }
+}
+
+/// What a reference edge's `annotation` says to a **model**: a delegation
+/// ending in this crate's own English, or the person's note as they wrote it.
+///
+/// One function, called wherever a [`crate::ReferenceEntry`] is built, so the
+/// two cannot drift into showing a reader a raw token.
+pub(crate) fn annotation_for_model(annotation: Option<&str>) -> Option<String> {
+    let annotation = annotation?;
+    Some(match DelegationEnd::parse(annotation) {
+        Some(end) => end.describe(),
+        None => annotation.to_string(),
+    })
 }
 
 impl Inner {
@@ -154,7 +347,7 @@ impl Inner {
     /// the answer unanswered until something else woke the room. So the second
     /// arm sets a flag the running task checks before it retires, and the walk
     /// simply starts again from the room's new tail.
-    pub(crate) fn arm_subspace_driver(self: &Arc<Self>, space_id: &str) {
+    pub(crate) fn arm_subspace_driver(self: &Arc<Self>, space_id: &str, arm: Arm) {
         if !self.subspace_driver_running() {
             return;
         }
@@ -179,7 +372,7 @@ impl Inner {
                 // invalidation while it is busy loses it for good.
                 let result = with_origin(
                     ChangeOrigin::Unattended,
-                    inner.drive_subspace(space_id.clone()),
+                    inner.drive_subspace(space_id.clone(), arm),
                 )
                 .await;
                 if let Err(e) = result {
@@ -221,11 +414,50 @@ impl Inner {
         match rooms {
             Ok(rooms) => {
                 for room in rooms {
-                    self.arm_subspace_driver(&room.id);
+                    self.arm_subspace_driver(&room.id, Arm::Sweep);
                 }
             }
             Err(e) => eprintln!("warning: delegated conversations could not be enumerated: {e}"),
         }
+    }
+
+    /// Claim the right to walk `space_id` from `tail`, or refuse.
+    ///
+    /// **This is what stops a driver paying for the same failure forever.** A
+    /// driven turn that fails writes no post, so the room's last word is
+    /// unchanged and its delegation is still outstanding — and the failure's own
+    /// `Change::Space` arms the room again. With a dead upstream both the turn
+    /// and the report fail, nothing is ever marked, and the arm-fail-arm circuit
+    /// bills a request every time round. Neither the turn budget nor the cascade
+    /// guard closes it: both count *posts*, and a failure produces none.
+    ///
+    /// So the meter here is attempts, keyed on the room's last word: a walk from
+    /// a tail this process has already walked [`MAX_ATTEMPTS_PER_TAIL`] times is
+    /// refused. An **external** post is a different tail and starts fresh, which
+    /// is the whole discrimination the loop needed — a failure changes nothing
+    /// and a stranger's post changes exactly this. In-memory rather than durable
+    /// on purpose: a new process is a new chance, and the state it is protecting
+    /// against is a running one's.
+    fn claim_walk(&self, space_id: &str, tail: &str) -> bool {
+        let mut walks = self.subspace_walks.lock().expect("walk map poisoned");
+        match walks.get_mut(space_id) {
+            Some(walk) if walk.tail == tail => {
+                if walk.attempts >= MAX_ATTEMPTS_PER_TAIL {
+                    return false;
+                }
+                walk.attempts += 1;
+            }
+            _ => {
+                walks.insert(
+                    space_id.to_string(),
+                    Walk {
+                        tail: tail.to_string(),
+                        attempts: 1,
+                    },
+                );
+            }
+        }
+        true
     }
 
     /// Drive one delegated room to a stop, then report it to its parent.
@@ -234,7 +466,7 @@ impl Inner {
     /// driver owns, is archived, or has already had its last word reported —
     /// which is what makes arming cheap enough to do from a signal every post
     /// raises.
-    pub(crate) async fn drive_subspace(&self, space_id: String) -> Result<(), AppError> {
+    pub(crate) async fn drive_subspace(&self, space_id: String, arm: Arm) -> Result<(), AppError> {
         let conn = self.db_conn().await?;
         let Some(sub) = db::subspace(&conn, &space_id).await? else {
             return Ok(()); // not a delegated room
@@ -259,18 +491,31 @@ impl Inner {
             return Ok(());
         }
         drop(conn);
+        // Asked *after* the outstanding check, so a settled room costs no
+        // attempt and a room that is genuinely stuck cannot spend forever.
+        if !self.claim_walk(&space_id, &tail) {
+            return Ok(());
+        }
 
         // Boxed, like every other await on the turn path: `run_turn_stream`'s
         // state machine is the largest in the crate, and stacking this walk's
         // frame on top of it overflows a worker stack.
-        let end = Box::pin(self.cascade_subspace(&space_id, tail)).await?;
-        let Some(end) = end else {
+        let Some((end, witness)) = Box::pin(self.cascade_subspace(&space_id, tail)).await? else {
             return Ok(()); // the room closed under us; nothing to report
         };
-        Box::pin(self.report_delegation(&sub, end)).await
+        Box::pin(self.report_delegation(&sub, end, witness, arm)).await
     }
 
     /// The plan → drive → re-plan walk, ending at the first terminal outcome.
+    ///
+    /// Returns the outcome **and the post the walk ended on** — its witness.
+    /// That post, not whatever the room's tail happens to be by the time the
+    /// report is written, is what the report quotes: a post landing in between
+    /// would otherwise be reported as if the walk had considered it, and would
+    /// then read as already-reported when its own walk came round, so the room
+    /// would go quiet holding an unanswered post. Reporting the witness leaves
+    /// that post unreported, which is exactly what makes its own arrival arm the
+    /// room again and get it the walk it is owed.
     ///
     /// `Ok(None)` means the room stopped being drivable while we were in it (an
     /// archival landed), which is deliberately **not** an outcome to report: the
@@ -280,7 +525,10 @@ impl Inner {
         &self,
         space_id: &str,
         tail: String,
-    ) -> Result<Option<DelegationEnd>, AppError> {
+    ) -> Result<Option<(DelegationEnd, String)>, AppError> {
+        // The room's last word *as this walk saw it* — the entry tail until a
+        // driven turn produces something newer.
+        let mut witness = tail.clone();
         // Posts whose replies have not been planned yet. A fan-out puts several
         // answers on it at once; taking the newest first walks each thread of
         // the room down before starting the next, which is the order a reader
@@ -288,7 +536,7 @@ impl Inner {
         let mut frontier: Vec<String> = vec![tail];
         loop {
             let Some(post) = frontier.pop() else {
-                return Ok(Some(DelegationEnd::Concluded));
+                return Ok(Some((DelegationEnd::Concluded, witness)));
             };
             let conn = self.db_conn().await?;
             let live = db::is_live_subspace(&conn, space_id).await?;
@@ -301,16 +549,19 @@ impl Inner {
             // room whose budget is spent may cost a router inference, and the
             // turns it returned could not be driven anyway.
             if taken >= MAX_DELEGATION_TURNS {
-                return Ok(Some(DelegationEnd::BudgetSpent {
-                    limit: MAX_DELEGATION_TURNS,
-                }));
+                return Ok(Some((
+                    DelegationEnd::BudgetSpent {
+                        limit: MAX_DELEGATION_TURNS,
+                    },
+                    witness,
+                )));
             }
             let turns = match self
                 .plan_and_refine(space_id, &post, Planner::Driver)
                 .await?
             {
                 NotificationPlan::Paused { depth, limit } => {
-                    return Ok(Some(DelegationEnd::Paused { depth, limit }));
+                    return Ok(Some((DelegationEnd::Paused { depth, limit }, witness)));
                 }
                 NotificationPlan::Turns(turns) => turns,
             };
@@ -319,21 +570,30 @@ impl Inner {
                 let taken = db::turns_taken_in_space(&conn, space_id).await?;
                 drop(conn);
                 if taken >= MAX_DELEGATION_TURNS {
-                    return Ok(Some(DelegationEnd::BudgetSpent {
-                        limit: MAX_DELEGATION_TURNS,
-                    }));
+                    return Ok(Some((
+                        DelegationEnd::BudgetSpent {
+                            limit: MAX_DELEGATION_TURNS,
+                        },
+                        witness,
+                    )));
                 }
                 match Box::pin(self.drive_planned_turn(space_id, &turn)).await {
-                    // A turn that wrote a post is a post to re-plan from; a
-                    // turn that declined wrote a decision, which is not
-                    // something anyone replies to.
-                    Ok(Some(post_action_id)) => frontier.push(post_action_id),
+                    // A turn that wrote a post is a post to re-plan from, and
+                    // the room's newest word; a turn that declined wrote a
+                    // decision, which is not something anyone replies to.
+                    Ok(Some(post_action_id)) => {
+                        witness = post_action_id.clone();
+                        frontier.push(post_action_id);
+                    }
                     Ok(None) => {}
                     Err(AppError::SpaceArchived { .. }) => return Ok(None),
                     Err(e) => {
-                        return Ok(Some(DelegationEnd::TurnFailed {
-                            message: e.to_string(),
-                        }));
+                        // The error's own words stop here — the report carries a
+                        // category, never a message (see [`DelegationFailure`]).
+                        eprintln!(
+                            "warning: a turn in the delegated conversation {space_id} failed: {e}"
+                        );
+                        return Ok(Some((DelegationEnd::failed(&e), witness)));
                     }
                 }
             }
@@ -361,7 +621,7 @@ impl Inner {
             &turn.target_action_id,
             ResponseMode::Reply,
             None,
-            &[],
+            &TurnDirective::default(),
             tx,
         ))
         .await?;
@@ -370,31 +630,37 @@ impl Inner {
 
     /// Deliver the owner's report into the parent conversation.
     ///
-    /// A turn for the owning agent, replying to **its own last post there** —
-    /// the one-reply spine the rest of the thread model depends on, and the
-    /// branch the delegation was opened from — carrying the delegated room's
-    /// last word as a quoted reference the driver attaches itself.
+    /// A turn for the owning agent, replying **on the branch the delegation was
+    /// opened from**, carrying `witness` — the room's last word as the walk saw
+    /// it — as a quoted reference the driver attaches itself.
     ///
     /// Every refusal the parent can raise is the parent's to raise: an archived
     /// parent refuses the turn at the same gate every other turn meets, an
     /// owner who has left the parent is refused by participant resolution, and
     /// a funding failure fails like any other turn. None of them is special-
-    /// cased here, and the room's tail stays unreported, so a later run tries
-    /// again.
+    /// cased here, and the room's last word stays unreported, so a later run
+    /// tries again.
     async fn report_delegation(
         &self,
         sub: &db::SubspaceRow,
         end: DelegationEnd,
+        witness: String,
+        arm: Arm,
     ) -> Result<(), AppError> {
         let conn = self.db_conn().await?;
-        let Some(tail) = db::last_action_in_space(&conn, &sub.id).await? else {
+        // **The room is re-read one last time before anything acts.** An
+        // archival can land during the walk — a retirement archives every room
+        // its agent owned — and a report about a conversation somebody closed
+        // is a message nobody asked for about work nobody wants continued. One
+        // read, the same shape as every other liveness gate here.
+        if !db::is_live_subspace(&conn, &sub.id).await? {
             return Ok(());
-        };
-        // The passage: the room's last post, whole. A delegation's last word is
-        // its finding, and clipping it here would report a fragment while the
-        // edge claimed the post.
+        }
+        // The passage: the post the walk ended on, whole. A delegation's last
+        // word is its finding, and clipping it here would report a fragment
+        // while the edge claimed the post.
         let (content_block_id, range_start, range_end) =
-            match db::first_quotable_block(&conn, &tail).await? {
+            match db::first_quotable_block(&conn, &witness).await? {
                 Some((block_id, text)) if !text.is_empty() => {
                     (Some(block_id), Some(0), Some(text.len() as i64))
                 }
@@ -403,58 +669,144 @@ impl Inner {
                 // it, which is what a range-less reference means everywhere.
                 _ => (None, None, None),
             };
-        // Named as the *source* space names them: the parent may never have met
-        // this participant, and its own override would be the wrong name.
-        let author_label = match db::action_author(&conn, &tail).await? {
-            Some((author_id, _, _)) => db::space_participants(&conn, &sub.id)
+        // Named the way every other reference read names an author: the label
+        // that post's **own space** gives them, with no liveness filter — so an
+        // agent retired between writing the finding and its being reported is
+        // still named, rather than degrading to an anonymous post from
+        // somewhere else.
+        let author_label = db::post_author_label(&conn, &witness).await?;
+
+        // Where it attaches. The anchor is the post in the parent this
+        // delegation was opened from, captured at the spawn because only the
+        // caller knew it; the report belongs on *that* branch, beneath the
+        // owner's own answer there.
+        let target = match sub.parent_action_id.as_deref() {
+            Some(anchor) => {
+                match db::last_reply_by_participant(
+                    &conn,
+                    &sub.parent_space_id,
+                    &sub.owner_participant_id,
+                    anchor,
+                )
                 .await?
-                .into_iter()
-                .find(|m| m.participant_id == author_id)
-                .map(|m| m.label),
-            None => None,
-        };
-        // Where it attaches: the owner's own last word in the parent, which is
-        // the turn that opened this delegation. A parent whose owner has posted
-        // nothing at all falls back to the conversation's tail rather than
-        // refusing — the report is the point, and an unattached one would be a
-        // second thread root.
-        let target = match db::last_post_by_participant(
-            &conn,
-            &sub.parent_space_id,
-            &sub.owner_participant_id,
-        )
-        .await?
-        {
-            Some(id) => Some(id),
-            None => db::last_action_in_space(&conn, &sub.parent_space_id).await?,
+                {
+                    Some(answer) => Some(answer),
+                    // **The owner has not answered the anchor yet**, which is
+                    // not an ordinary absence: a spawn happens inside the
+                    // owner's turn, so this state means that turn is still in
+                    // flight (or failed). Reporting now would make the report
+                    // the first reply to the anchor and the owner's own answer
+                    // an indented branch off it — durably the wrong way round.
+                    // So the delegation stays outstanding and the room waits for
+                    // its parent to change, which the answer (or the failure)
+                    // will do.
+                    //
+                    // It waits **once**, and never when the sweep armed it: a
+                    // process that has just started cannot be waiting on a turn
+                    // of its own, so at that point the answer either exists or
+                    // never will, and the anchor is then the right attachment
+                    // because there is no answer for it to sit beneath.
+                    None if arm == Arm::Signal && self.defer_for_anchor(sub) => return Ok(()),
+                    None => Some(anchor.to_string()),
+                }
+            }
+            // A spawn that named no anchor — a direct API caller with no turn
+            // behind it. The owner's own last word is the best available guess
+            // and the conversation's tail is the fallback behind that; both are
+            // honest, and neither is as good as an anchor.
+            None => match db::last_post_by_participant(
+                &conn,
+                &sub.parent_space_id,
+                &sub.owner_participant_id,
+            )
+            .await?
+            {
+                Some(id) => Some(id),
+                None => db::last_action_in_space(&conn, &sub.parent_space_id).await?,
+            },
         };
         let Some(target) = target else {
             return Ok(()); // an empty parent has nothing to reply to
         };
         drop(conn);
 
-        let attached = [AttachedReference {
-            spec: ReferenceSpec {
-                antecedent_action_id: tail,
-                content_block_id,
-                range_start,
-                range_end,
-                annotation: Some(end.annotation()),
-            },
-            author_label,
-        }];
+        let directive = TurnDirective {
+            attached: vec![AttachedReference {
+                spec: ReferenceSpec {
+                    antecedent_action_id: witness,
+                    content_block_id,
+                    range_start,
+                    range_end,
+                    // Typed, not a sentence: this is persisted, and a persisted
+                    // sentence is read as-is in every language.
+                    annotation: Some(end.token()),
+                },
+                author_label,
+            }],
+            mechanical: true,
+        };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
-        Box::pin(self.run_turn_stream(
+        let result = Box::pin(self.run_turn_stream(
             &sub.parent_space_id,
             TurnSelector::Participant(sub.owner_participant_id.clone()),
             &target,
             ResponseMode::Reply,
             None,
-            &attached,
+            &directive,
             tx,
         ))
         .await?;
+        // **A report that wrote no post is not a report.** The reference edge
+        // rides the answer, so without one the delegation has said nothing and
+        // is still outstanding — which is the truth, and saying so loudly is
+        // what keeps it from being mistaken for a delivery. Unreachable while
+        // the directive withdraws the decline checkpoint (the only way a turn
+        // ends postless), and kept as the thing that would notice if it stopped
+        // being.
+        if result.response_action_id.is_none() {
+            return Err(AppError::Internal {
+                message: format!(
+                    "the report for delegated conversation {} produced no post",
+                    sub.id
+                ),
+            });
+        }
+        self.awaiting_anchor
+            .lock()
+            .expect("anchor wait map poisoned")
+            .remove(&sub.id);
         Ok(())
+    }
+
+    /// Record that `sub` is waiting for its anchor to be answered, and answer
+    /// whether it may wait. A room waits at most once per process — the second
+    /// time round it attaches to the anchor instead, so a spawning turn that
+    /// died can never leave a delegation waiting on an answer that is not
+    /// coming.
+    fn defer_for_anchor(&self, sub: &db::SubspaceRow) -> bool {
+        let mut waiting = self
+            .awaiting_anchor
+            .lock()
+            .expect("anchor wait map poisoned");
+        if waiting.contains_key(&sub.id) {
+            waiting.remove(&sub.id);
+            return false;
+        }
+        waiting.insert(sub.id.clone(), sub.parent_space_id.clone());
+        true
+    }
+
+    /// The rooms waiting on a change in `space_id` — see
+    /// [`Inner::defer_for_anchor`]. A pure in-memory lookup, because it is
+    /// asked of every `Change::Space` in the process.
+    fn rooms_awaiting(&self, space_id: &str) -> Vec<String> {
+        self.awaiting_anchor
+            .lock()
+            .expect("anchor wait map poisoned")
+            .iter()
+            .filter(|(_, parent)| parent.as_str() == space_id)
+            .map(|(room, _)| room.clone())
+            .collect()
     }
 }
 
@@ -477,10 +829,18 @@ pub(crate) async fn supervise(
     loop {
         match bus.recv().await {
             Ok(event) => {
-                if let Change::Space(space_id) = event.change
-                    && !inner.is_ordinary_space(&space_id).await
-                {
-                    inner.arm_subspace_driver(&space_id);
+                if let Change::Space(space_id) = event.change {
+                    // Rooms waiting on this space as their **parent** — the
+                    // anchor's answer landing there is what they are for. Asked
+                    // first and from memory alone, because the parent of a
+                    // delegation is an ordinary conversation and the check
+                    // below would have cached it as one and skipped it.
+                    for room in inner.rooms_awaiting(&space_id) {
+                        inner.arm_subspace_driver(&room, Arm::Signal);
+                    }
+                    if !inner.is_ordinary_space(&space_id).await {
+                        inner.arm_subspace_driver(&space_id, Arm::Signal);
+                    }
                 }
             }
             // A lagged supervisor missed writes it cannot name, so it re-asks
@@ -529,5 +889,88 @@ impl Inner {
                 .insert(space_id.to_string());
         }
         !live
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The durable form round-trips, which is the whole of what makes it safe
+    /// to store instead of a sentence.
+    #[test]
+    fn every_ending_survives_being_written_down_and_read_back() {
+        for end in [
+            DelegationEnd::Concluded,
+            DelegationEnd::Paused { depth: 4, limit: 4 },
+            DelegationEnd::BudgetSpent { limit: 32 },
+            DelegationEnd::TurnFailed {
+                reason: DelegationFailure::Upstream,
+            },
+            DelegationEnd::TurnFailed {
+                reason: DelegationFailure::Funding,
+            },
+            DelegationEnd::TurnFailed {
+                reason: DelegationFailure::Configuration,
+            },
+            DelegationEnd::TurnFailed {
+                reason: DelegationFailure::Unfinished,
+            },
+        ] {
+            let token = end.token();
+            assert_eq!(DelegationEnd::parse(&token), Some(end), "{token}");
+            assert!(!end.describe().is_empty());
+        }
+    }
+
+    /// **A person's note is never mistaken for one** — which is what lets the
+    /// two share a column. Neither is anything a future version writes that
+    /// this one does not understand: both read back as a note, which shows the
+    /// reader prose rather than an ending somebody guessed at.
+    #[test]
+    fn a_note_is_not_an_ending() {
+        for note in [
+            "the delegated conversation ran to a stop",
+            "eidola:delegation",
+            "eidola:delegation/",
+            "eidola:delegation/concluded/extra",
+            "eidola:delegation/paused/4",
+            "eidola:delegation/budget/lots",
+            "eidola:delegation/failed/moonshot",
+            "eidola:delegation/adjourned",
+            "",
+        ] {
+            assert_eq!(DelegationEnd::parse(note), None, "{note:?}");
+            assert_eq!(annotation_for_model(Some(note)), Some(note.to_string()));
+        }
+        assert_eq!(annotation_for_model(None), None);
+    }
+
+    /// The failure a report carries is a category, and the category is decided
+    /// from the error's *variant* — never from its words.
+    #[test]
+    fn a_failure_reports_its_kind_and_not_its_message() {
+        let secret = "https://internal.example/v1 — token abc123";
+        let described = DelegationEnd::failed(&AppError::Server {
+            status: 500,
+            message: secret.to_string(),
+        })
+        .describe();
+        assert!(!described.contains(secret), "{described}");
+        assert_eq!(
+            DelegationEnd::failed(&AppError::Server {
+                status: 500,
+                message: secret.to_string(),
+            }),
+            DelegationEnd::TurnFailed {
+                reason: DelegationFailure::Upstream
+            }
+        );
+        assert_eq!(
+            DelegationEnd::failed(&AppError::NoAccount),
+            DelegationEnd::TurnFailed {
+                reason: DelegationFailure::Funding
+            }
+        );
     }
 }

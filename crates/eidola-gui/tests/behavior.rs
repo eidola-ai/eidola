@@ -10086,6 +10086,7 @@ fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
             range_start: Some(0),
             range_end: Some(4),
             annotation: None,
+            delegation_end: None,
             snippet: Some("some passage".into()),
             antecedent_author_label: "Ada".into(),
             antecedent_author_kind: "agent".into(),
@@ -10097,6 +10098,7 @@ fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
             range_start: Some(0),
             range_end: Some(4),
             annotation: None,
+            delegation_end: None,
             // The stored range no longer maps — the rail says so rather than
             // guessing at a remap.
             snippet: None,

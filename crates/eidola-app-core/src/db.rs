@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 7;
+const LATEST_VERSION: i64 = 8;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -1618,6 +1618,10 @@ pub struct SubspaceRow {
     pub parent_space_id: String,
     /// The `role = 'owner'` member — the agent that spawned it.
     pub owner_participant_id: String,
+    /// The post in the parent the delegation was opened from, when the spawn
+    /// named one. It is where the report attaches, so the answer lands on the
+    /// branch the work was asked for on. `None` for a spawn that named none.
+    pub parent_action_id: Option<String>,
     pub title: Option<String>,
     pub created_at: i64,
     pub archived_at: Option<i64>,
@@ -1712,9 +1716,10 @@ fn subspace_row(row: &turso::Row) -> Result<SubspaceRow, AppError> {
         id: row.get::<String>(0).map_err(AppError::db)?,
         parent_space_id: row.get::<String>(1).map_err(AppError::db)?,
         owner_participant_id: row.get::<String>(2).map_err(AppError::db)?,
-        title: row.get::<Option<String>>(3).map_err(AppError::db)?,
-        created_at: row.get::<i64>(4).map_err(AppError::db)?,
-        archived_at: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+        parent_action_id: row.get::<Option<String>>(3).map_err(AppError::db)?,
+        title: row.get::<Option<String>>(4).map_err(AppError::db)?,
+        created_at: row.get::<i64>(5).map_err(AppError::db)?,
+        archived_at: row.get::<Option<i64>>(6).map_err(AppError::db)?,
     })
 }
 
@@ -1724,8 +1729,8 @@ async fn subspace_rows(
     param: Option<&str>,
 ) -> Result<Vec<SubspaceRow>, AppError> {
     let sql = format!(
-        "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.title, s.created_at, \
-                s.archived_at \
+        "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.parent_action_id, s.title, \
+                s.created_at, s.archived_at \
          FROM space s \
          WHERE s.parent_space_id IS NOT NULL AND {SUBSPACE_OWNER_SQL} IS NOT NULL \
            AND {where_clause} \
@@ -1890,10 +1895,50 @@ pub async fn has_reference_from(
     Ok(rows.next().await.map_err(AppError::db)?.is_some())
 }
 
+/// The most recent **post** `participant_id` wrote in `space_id` **replying
+/// directly to `antecedent_action_id`** — the owner's own answer to the post a
+/// delegation was opened from, which is where that delegation's report belongs.
+///
+/// A direct reply rather than any descendant, because the relationship is
+/// exact: a spawn happens inside a turn, and that turn persists its answer as a
+/// reply to the very post it was answering. Newest first, so a regenerated
+/// answer resolves to its latest generation — and a reply edge threads under
+/// its antecedent's *item tip* anyway, so even picking a superseded generation
+/// renders in the right place.
+pub async fn last_reply_by_participant(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    antecedent_action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = format!(
+        "SELECT a.id FROM action a \
+         JOIN action_antecedent aa \
+           ON aa.action_id = a.id AND aa.relation = 'reply' \
+         WHERE a.space_id = ?1 AND a.participant_id = ?2 \
+           AND aa.antecedent_action_id = ?3 \
+           AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY a.created_at DESC LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Text(antecedent_action_id.to_string()),
+        ])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
 /// The most recent **post** `participant_id` wrote in `space_id`, or `None`
-/// when they have written none. Where a report attaches: replying to the
-/// owner's own last word keeps the one-reply spine the rest of the thread
-/// model depends on.
+/// when they have written none. The fallback a report takes when its spawn
+/// named no anchor — see [`last_reply_by_participant`] for the anchored path.
 pub async fn last_post_by_participant(
     conn: &Connection,
     space_id: &str,
@@ -2029,6 +2074,10 @@ pub(crate) struct SubspacePlan<'a> {
     pub brief: &'a str,
     pub brief_action_id: &'a str,
     pub brief_item_id: &'a str,
+    /// The post in the parent this delegation is being opened from — the turn's
+    /// own target, which the caller knows and this door cannot derive. Written
+    /// to `space.parent_action_id` and validated to be a post of the parent.
+    pub parent_action_id: Option<&'a str>,
     /// Global agents to seat beside the owner, deduped and in requested order.
     pub participant_ids: &'a [String],
     /// Capability names requested; each must already be held by the parent,
@@ -2170,6 +2219,21 @@ async fn spawn_subspace_tx_body(
         });
     }
 
+    // (2b) the anchor, when one was named: the post in the parent this
+    // delegation is being opened from. Decided at the write like every other
+    // guard — a post cannot stop being a post, but the space it belongs to is
+    // exactly the thing a caller could get wrong, and an anchor pointing
+    // somewhere else would attach the eventual report to another conversation.
+    if let Some(anchor) = plan.parent_action_id {
+        match action_space_and_type(conn, anchor).await? {
+            Some((space_id, action_type))
+                if space_id == plan.parent_space_id && is_post_action_type(&action_type) => {}
+            _ => refuse!(SpawnRefusal::AnchorNotInParent {
+                action_id: anchor.to_string(),
+            }),
+        }
+    }
+
     // (3) depth.
     let depth = space_depth(conn, plan.parent_space_id).await? + 1;
     if depth > MAX_SPAWN_DEPTH {
@@ -2263,9 +2327,9 @@ async fn spawn_subspace_tx_body(
     // the brief below means it could never have been reaped anyway.
     conn.execute(
         "INSERT INTO space \
-         (id, parent_space_id, title, linkability, cascade_limit, router_model, \
-          created_at, touched_at) \
-         VALUES (?1, ?2, ?3, 'unlinked', ?4, ?5, ?6, ?6)",
+         (id, parent_space_id, parent_action_id, title, linkability, cascade_limit, \
+          router_model, created_at, touched_at) \
+         VALUES (?1, ?2, ?7, ?3, 'unlinked', ?4, ?5, ?6, ?6)",
         (
             Value::Text(plan.space_id.to_string()),
             Value::Text(plan.parent_space_id.to_string()),
@@ -2273,6 +2337,7 @@ async fn spawn_subspace_tx_body(
             Value::Integer(parent_cascade_limit),
             opt_str(parent_router_model.as_deref()),
             Value::Integer(plan.now),
+            opt_str(plan.parent_action_id),
         ),
     )
     .await
@@ -5135,25 +5200,64 @@ impl ReferenceEdgeRow {
 /// `edit_post` to replicate references onto a new generation and by the
 /// upstream-context embed expansion — which also renders each passage's
 /// byline, hence the author join (on the **antecedent's** space).
+/// How a post's author is **named**, as one SQL fragment every reader shares.
+///
+/// Two things about it are load-bearing and both are easy to get wrong
+/// separately: the label is the one that post's **own space** gives the author
+/// (a reading space's override is that space's name for somebody, and using it
+/// on a cross-space passage misattributes it), and there is **no liveness
+/// filter** — who wrote a post goes on being named after they retire, which is
+/// exactly the record retirement promises to leave alone. Expects the author's
+/// action to be in scope as `ant`, and binds `p` / `sp`.
+const POST_AUTHOR_LABEL_SQL: &str = "COALESCE(sp.override_label, p.label)";
+
+/// The joins [`POST_AUTHOR_LABEL_SQL`] reads from.
+const POST_AUTHOR_JOIN_SQL: &str = "JOIN participant p ON p.id = ant.participant_id \
+     LEFT JOIN space_participant sp \
+       ON sp.space_id = ant.space_id AND sp.participant_id = ant.participant_id";
+
+/// How a post's author is named, for a reader holding the post rather than an
+/// edge to it — the same fragment [`reference_antecedents`] joins, asked
+/// directly, so a passage cannot be attributed one way in a prompt and another
+/// way in the record. `None` for an action that does not exist.
+pub async fn post_author_label(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {POST_AUTHOR_LABEL_SQL} FROM action ant {POST_AUTHOR_JOIN_SQL} \
+             WHERE ant.id = ?1"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
 pub async fn reference_antecedents(
     conn: &Connection,
     action_id: &str,
 ) -> Result<Vec<ReferenceEdgeRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT aa.ordinal, aa.antecedent_action_id, aa.content_block_id, \
                     aa.range_start, aa.range_end, aa.annotation, cb.text_content, \
                     ant.action_type, cb.block_type, \
-                    COALESCE(sp.override_label, p.label) \
+                    {POST_AUTHOR_LABEL_SQL} \
              FROM action_antecedent aa \
              JOIN action ant ON ant.id = aa.antecedent_action_id \
-             JOIN participant p ON p.id = ant.participant_id \
-             LEFT JOIN space_participant sp \
-               ON sp.space_id = ant.space_id AND sp.participant_id = ant.participant_id \
+             {POST_AUTHOR_JOIN_SQL} \
              LEFT JOIN content_block cb ON cb.id = aa.content_block_id \
              WHERE aa.action_id = ?1 AND aa.relation = 'reference' \
              ORDER BY aa.ordinal ASC",
-        )
+        ))
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt

@@ -125,6 +125,17 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
 
+    /// Remove a tool from this registry, if it holds one by that name.
+    ///
+    /// The counterpart to [`Self::register`], and used for the same reason a
+    /// turn layers tools on: a turn's snapshot is *this turn's* tool set. A
+    /// turn nobody invited — the driver's own mechanical notification — takes
+    /// the decline checkpoint back out, because declining one would be a turn
+    /// bowing out of a message it was not asked to have an opinion about.
+    pub fn withdraw(&mut self, name: &str) {
+        self.tools.retain(|t| t.name() != name);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }

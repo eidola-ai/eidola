@@ -197,6 +197,15 @@ CREATE INDEX idx_connection_attestation
 CREATE TABLE space (
     id                TEXT PRIMARY KEY,        -- UUIDv7
     parent_space_id   TEXT REFERENCES space(id),
+    -- Navigational in exactly the sense parent_space_id is, one level
+    -- finer: "this space was derived from that *post*". Written only by
+    -- the sub-space spawn door, which is reached from inside a turn and
+    -- so knows the post being answered when the delegation was opened.
+    -- It is what a delegation's report attaches to, so the answer stays
+    -- on the branch the work was asked for on rather than wherever the
+    -- owning agent happened to speak last. Fixed at birth and never
+    -- updated: it records a fact about the space's origin, not its state.
+    parent_action_id  TEXT REFERENCES action(id),
     title             TEXT,
     linkability       TEXT NOT NULL CHECK (linkability IN (
                           'linked', 'unlinked', 'public'

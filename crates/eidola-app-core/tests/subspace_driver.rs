@@ -25,8 +25,9 @@ mod chat_harness;
 use chat_harness::{ChatBehavior, MockConfig, MockServer, flat_messages};
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AppCore, ExpectedScope, MAX_DELEGATION_TURNS, NewParticipant, NotificationPlan,
-    ParticipantUpdate, PostNode, SpawnedSubspace,
+    AppCore, DelegationEnd, DelegationFailure, ExpectedScope, MAX_ATTEMPTS_PER_TAIL,
+    MAX_DELEGATION_TURNS, NewParticipant, NotificationPlan, ParticipantUpdate, PostNode,
+    SpawnedSubspace,
 };
 
 /// These turns run over an `openai` backend, so none of them needs a
@@ -106,7 +107,21 @@ fn parent_with_a_post(core: &AppCore) -> String {
     parent
 }
 
+/// A spawn with no anchor — a caller with no turn behind it, which is every
+/// direct use of the API today.
 fn spawn(core: &AppCore, parent: &str, owner: &str, participants: Vec<String>) -> SpawnedSubspace {
+    spawn_from(core, parent, owner, participants, None)
+}
+
+/// A spawn that names the post in the parent it is being opened from — what a
+/// turn-scoped caller supplies, and what the report attaches beneath.
+fn spawn_from(
+    core: &AppCore,
+    parent: &str,
+    owner: &str,
+    participants: Vec<String>,
+    anchor: Option<&str>,
+) -> SpawnedSubspace {
     core.runtime()
         .block_on(core.spawn_subspace(
             parent.to_string(),
@@ -115,6 +130,7 @@ fn spawn(core: &AppCore, parent: &str, owner: &str, participants: Vec<String>) -
             participants,
             vec![],
             None,
+            anchor.map(str::to_string),
         ))
         .expect("spawn")
 }
@@ -122,6 +138,13 @@ fn spawn(core: &AppCore, parent: &str, owner: &str, participants: Vec<String>) -
 fn drive(core: &AppCore, space_id: &str) -> Result<(), AppError> {
     core.runtime()
         .block_on(core.test_drive_subspace(space_id.to_string()))
+}
+
+/// A walk of the kind the startup sweep arms — which never waits for an
+/// anchor's answer.
+fn drive_as_sweep(core: &AppCore, space_id: &str) -> Result<(), AppError> {
+    core.runtime()
+        .block_on(core.test_drive_subspace_armed(space_id.to_string(), false))
 }
 
 fn tree(core: &AppCore, space_id: &str) -> Vec<PostNode> {
@@ -250,13 +273,17 @@ fn a_room_that_pauses_at_its_cascade_guard_says_so() {
             "the guard pauses before any turn runs"
         );
         let report = report(&core, &parent).expect("a paused room still reports");
-        let annotation = report.references[0]
-            .annotation
-            .clone()
-            .expect("the edge says how the room ended");
         assert!(
-            annotation.contains("reply limit"),
-            "the pause is named honestly: {annotation}"
+            matches!(
+                report.references[0].delegation_end,
+                Some(DelegationEnd::Paused { depth: 1, limit: 1 })
+            ),
+            "the pause is carried as a value, not a sentence: {:?}",
+            report.references[0].delegation_end
+        );
+        assert_eq!(
+            report.references[0].annotation, None,
+            "and it is not left standing where a person's own note is rendered"
         );
     });
 }
@@ -311,10 +338,11 @@ fn a_finished_delegation_reports_back_with_the_rooms_last_word_attached() {
             .expect("the passage resolves through the one rendering");
         assert!(!snippet.is_empty());
         assert_eq!(
-            reference.annotation.as_deref(),
-            Some("the delegated conversation ran to a stop"),
-            "the edge carries what ended the room"
+            reference.delegation_end,
+            Some(DelegationEnd::Concluded),
+            "the edge carries what ended the room, typed"
         );
+        assert_eq!(reference.annotation, None, "and says nothing as a person");
 
         // And the model wrote with the passage in front of it: the report
         // request carries the attached block, attributed and quoted.
@@ -349,7 +377,7 @@ fn a_finished_delegation_reports_back_with_the_rooms_last_word_attached() {
 #[test]
 fn a_failed_turn_is_reported_rather_than_swallowed() {
     run(|| {
-        let (_mock, core, _dir) = setup();
+        let (mock, core, _dir) = setup();
         let parent = parent_with_a_post(&core);
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
@@ -376,14 +404,24 @@ fn a_failed_turn_is_reported_rather_than_swallowed() {
             "the failing turn wrote no post"
         );
         let report = report(&core, &parent).expect("failure is information, not silence");
-        let annotation = report.references[0].annotation.clone().unwrap_or_default();
-        assert!(
-            annotation.starts_with("a turn in the delegated conversation failed:"),
-            "the failure is named: {annotation}"
+        assert_eq!(
+            report.references[0].delegation_end,
+            Some(DelegationEnd::TurnFailed {
+                reason: DelegationFailure::Configuration
+            }),
+            "the failure is reported as a bounded category"
         );
+        // And the error's own words never leave this process: nothing in the
+        // owner's prompt names the backend, the URL or the message.
+        let body = mock
+            .chat_bodies()
+            .last()
+            .cloned()
+            .expect("a report request");
+        let sent = serde_json::to_string(&body).expect("body");
         assert!(
-            annotation.contains("missing"),
-            "and says what went wrong in the error's own words: {annotation}"
+            !sent.contains("nowhere") && !sent.contains("missing"),
+            "the raw failure text must not reach another model's context: {sent}"
         );
     });
 }
@@ -420,6 +458,149 @@ fn a_report_into_an_archived_parent_is_refused_and_stays_outstanding() {
 }
 
 // ===========================================================================
+// Where the report attaches
+// ===========================================================================
+
+/// **The report lands on the branch the work was asked for on**, beneath the
+/// owning agent's own answer there — not wherever that agent happened to speak
+/// last. The two are the same thing only when nothing else is going on in the
+/// parent, which is exactly the assumption a delegation cannot make.
+#[test]
+fn a_report_attaches_beneath_the_owners_answer_to_the_post_it_was_asked_on() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+
+        // The post the work is asked for on, and the owner's answer to it.
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let answer = ask(&core, &parent, &owner, &asked);
+        // …and then the owner says something else, elsewhere in the parent,
+        // *after* that answer. This is the post the old rule would have picked.
+        let aside = core
+            .runtime()
+            .block_on(core.post("Meanwhile:".into(), Some(parent.clone())))
+            .expect("post");
+        let later = ask(&core, &parent, &owner, &aside.action_id);
+
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(answer.as_str()),
+            "beneath the owner's answer to the post it was asked on"
+        );
+        assert_ne!(
+            report.parent_action_id.as_deref(),
+            Some(later.as_str()),
+            "and not beneath whatever it said most recently"
+        );
+    });
+}
+
+/// **A delegation whose spawning turn has not answered yet waits**, rather than
+/// planting its report as the first reply and leaving the agent's own answer
+/// indented beneath it. It waits once, and a walk armed by the startup sweep
+/// never waits at all — a process that has just started cannot be waiting on a
+/// turn of its own.
+#[test]
+fn a_report_waits_for_the_answer_it_belongs_under_and_never_waits_twice() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        // Spawned from a post the owner has not answered — the state a spawn
+        // made mid-turn is in until that turn persists its answer.
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        drive(&core, &out.space.id).expect("the room is driven");
+        assert!(
+            report(&core, &parent).is_none(),
+            "it waits rather than reporting into the wrong place"
+        );
+        assert_eq!(
+            inference_count(&tree(&core, &out.space.id)),
+            1,
+            "the room's own work still happened"
+        );
+
+        // The answer lands, and the next arm delivers.
+        let answer = ask(&core, &parent, &owner, &asked);
+        drive(&core, &out.space.id).expect("the room is driven again");
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(report.parent_action_id.as_deref(), Some(answer.as_str()));
+    });
+}
+
+/// The other half of the wait: an answer that is never coming. A walk armed by
+/// the startup sweep reports against the post the work was asked on, because at
+/// that moment nothing can still be in flight.
+#[test]
+fn a_sweep_never_waits_for_an_answer_that_is_not_coming() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        drive_as_sweep(&core, &out.space.id).expect("the room is driven");
+
+        let report = report(&core, &parent).expect("the delegation is reported anyway");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(asked.as_str()),
+            "attached to the post it was asked on, there being no answer to sit beneath"
+        );
+    });
+}
+
+/// A quoted passage is attributed by the space it was written in, and that has
+/// to survive the author being retired between saying it and its being
+/// reported — the record retirement promises to leave alone.
+#[test]
+fn a_retired_author_is_still_named_in_the_report() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], None);
+
+        // The helper answers, and is then retired before the report goes out.
+        let brief = out.brief_action_id.clone();
+        ask(&core, &out.space.id, &helper, &brief);
+        core.runtime()
+            .block_on(core.retire_participant(helper))
+            .expect("retire the helper");
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let body = mock
+            .chat_bodies()
+            .last()
+            .cloned()
+            .expect("a report request");
+        let messages = flat_messages(&body);
+        let attached = messages
+            .iter()
+            .find(|(_, content)| content.contains("Attached to your reply"))
+            .map(|(_, content)| content.clone())
+            .expect("the attached block reaches the model");
+        assert!(
+            attached.contains("[1] Surveyor"),
+            "a retired author keeps the name they wrote under: {attached}"
+        );
+    });
+}
+
+// ===========================================================================
 // Guards
 // ===========================================================================
 
@@ -449,10 +630,12 @@ fn a_delegation_stops_at_its_turn_budget_and_says_so() {
             "the budget is the ceiling, exactly"
         );
         let report = report(&core, &parent).expect("a spent budget is reported");
-        let annotation = report.references[0].annotation.clone().unwrap_or_default();
-        assert!(
-            annotation.contains(&format!("all {MAX_DELEGATION_TURNS} of the turns")),
-            "budget exhaustion is information, not silence: {annotation}"
+        assert_eq!(
+            report.references[0].delegation_end,
+            Some(DelegationEnd::BudgetSpent {
+                limit: MAX_DELEGATION_TURNS
+            }),
+            "budget exhaustion is information, not silence"
         );
     });
 }
@@ -525,10 +708,12 @@ fn a_spent_budget_survives_a_restart() {
             "the report, and not one driven turn more"
         );
         let report = report(&core, &parent).expect("the room reports again");
-        let annotation = report.references[0].annotation.clone().unwrap_or_default();
         assert!(
-            annotation.contains("of the turns"),
-            "still over budget after the restart: {annotation}"
+            matches!(
+                report.references[0].delegation_end,
+                Some(DelegationEnd::BudgetSpent { .. })
+            ),
+            "still over budget after the restart"
         );
         drop(mock_rt);
     });
@@ -563,6 +748,144 @@ fn the_driver_never_drives_an_archived_room() {
             "the brief, and nothing after it"
         );
         assert!(report(&core, &parent).is_none());
+    });
+}
+
+/// **A report is a notification, not an invitation.** The decline checkpoint is
+/// withdrawn from its registry snapshot: declining one would write a decision
+/// instead of the post the reference edge rides, and the delegation would
+/// vanish without a word.
+#[test]
+fn a_report_turn_is_not_offered_the_decline_checkpoint() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        core.register_tool(eidola_app_core::decline::decline_tool())
+            .expect("register decline");
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let bodies = mock.chat_bodies();
+        let driven = &bodies[bodies.len() - 2];
+        let report = bodies.last().expect("a report request");
+        assert!(
+            tool_names(driven).contains(&"decline".to_string()),
+            "an ordinary driven turn still carries it: {:?}",
+            tool_names(driven)
+        );
+        assert!(
+            !tool_names(report).contains(&"decline".to_string()),
+            "the report does not: {:?}",
+            tool_names(report)
+        );
+    });
+}
+
+/// And the withdrawal reaches the **fallback** registry, not just the turn's
+/// own snapshot. A backend that rejects a `tools` field degrades a turn back to
+/// exactly what the consumer registered, so a withdrawal applied only to the
+/// snapshot would hand the checkpoint back on the retry — and here that is
+/// observable end to end: with `decline` the sole registration, a report whose
+/// fallback is properly empty sends no `tools` field and lands, while one that
+/// still carried the checkpoint would be rejected a second time and deliver
+/// nothing at all.
+#[test]
+fn the_withdrawal_reaches_the_registry_a_degrade_falls_back_to() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        core.register_tool(eidola_app_core::decline::decline_tool())
+            .expect("register decline");
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        assert!(
+            report(&core, &parent).is_some(),
+            "the report gets through the degrade"
+        );
+        assert!(
+            mock.chat_bodies()
+                .iter()
+                .all(|b| !tool_names(b).contains(&"decline".to_string())
+                    || !flat_messages(b)
+                        .iter()
+                        .any(|(_, c)| c.contains("Attached to your reply"))),
+            "and never advertises the checkpoint on the way"
+        );
+    });
+}
+
+/// The tool names a request advertises.
+fn tool_names(body: &serde_json::Value) -> Vec<String> {
+    body.get("tools")
+        .and_then(|t| t.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// **A room that cannot be worked on is not billed for forever.** A failing
+/// turn writes no post, so nothing about the room changes and its own failure
+/// arms it again; with the upstream down the report fails too, so nothing is
+/// ever marked. The retry meter is what closes that circuit — a handful of
+/// attempts against one unchanged last word, then silence until something
+/// external happens.
+#[test]
+fn a_room_that_keeps_failing_is_not_retried_forever() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::Non2xx(500),
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        // Arm it far more often than the meter allows, recording what each
+        // arm cost.
+        let mut sent = Vec::new();
+        for _ in 0..8 {
+            let _ = drive(&core, &out.space.id);
+            sent.push(mock.chat_bodies().len());
+        }
+
+        assert!(sent[0] > 0, "it does try — a blip has to be able to heal");
+        let spent = sent[MAX_ATTEMPTS_PER_TAIL as usize - 1];
+        assert_eq!(
+            *sent.last().expect("eight arms"),
+            spent,
+            "and it stops once the meter is spent: {sent:?}"
+        );
+        assert!(
+            report(&core, &parent).is_none(),
+            "nothing was delivered, which is the truth"
+        );
+        // The other half of the discrimination — a post from outside is a
+        // different last word and starts the count over — cannot be staged
+        // here, because a post into the room needs a turn and the upstream is
+        // what is down. `a_spent_budget_survives_a_restart` walks that arm on a
+        // healthy upstream.
     });
 }
 
