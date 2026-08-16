@@ -5226,6 +5226,113 @@ pub struct ActionEntry {
 ///
 /// `participant_scope` is `NOT NULL`, so an unknown participant fails loudly
 /// here instead of inserting a NULL echo (which MATCH SIMPLE would then skip).
+/// Everything one saved post is made of — see [`post_tx`].
+pub(crate) struct PostPlan<'a> {
+    pub space_id: &'a str,
+    pub participant_id: &'a str,
+    pub action_id: &'a str,
+    pub item_id: &'a str,
+    pub text: &'a str,
+    /// The title to derive onto the space, when this post is the one that earns
+    /// the space a name. `None` leaves the title alone.
+    pub auto_title: Option<&'a str>,
+    /// The structural `reply` antecedent at ordinal 0: the explicit branch
+    /// target, or the space's tail, or nothing for a space's first post.
+    pub reply_to: Option<&'a str>,
+    /// Quoted references at ordinals `1..=N` in supplied order — already
+    /// validated by the caller, which is where a refusal belongs.
+    pub references: &'a [crate::ReferenceSpec],
+    pub created_at: i64,
+}
+
+/// Write one post — **the action, its text, its reply edge, its quoted
+/// references and any title it earns, in one `BEGIN IMMEDIATE` transaction.**
+/// Answers whether the space took a derived title.
+///
+/// **A post is not its action row.** Written as separate autocommitted
+/// statements, the row lands first and its text, its place in the thread and
+/// its quotations follow — so for as long as those take, the post exists and
+/// says nothing. Every reader keyed on the action is entitled to it in that
+/// window, and one of them acts: the sub-space driver's refill takes posts by
+/// commit order, so it can plan and *bill* a turn against a post with no words
+/// in it, and by the time the writer's own change event arms the room again the
+/// driven reply may already have settled it. Rendering has the same exposure
+/// with a gentler ending (a blank row in an open window).
+///
+/// The transaction is what makes "a post" a single event, and it is the same
+/// cure `instantiate_template` took for the same class of defect: a space
+/// without its participants is not a space, and a post without its words is not
+/// a post. Nothing here spends or calls out — the writes are local and
+/// adjacent, which is what makes them transaction-able at all — and the caller
+/// validates before it opens this, so a refusal still writes nothing and now
+/// cannot half-write either.
+pub(crate) async fn post_tx(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, AppError> {
+    begin_write(conn).await?;
+    match post_tx_body(conn, plan).await {
+        Ok(auto_titled) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(auto_titled)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, AppError> {
+    insert_action(
+        conn,
+        &ActionEntry {
+            id: plan.action_id.to_string(),
+            space_id: plan.space_id.to_string(),
+            participant_id: plan.participant_id.to_string(),
+            item_id: plan.item_id.to_string(),
+            supersedes_action_id: None,
+            action_type: "user_input".to_string(),
+            status: "complete".to_string(),
+            intent: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            credits_consumed: None,
+            created_at: plan.created_at,
+        },
+    )
+    .await?;
+    insert_text_content_block(
+        conn,
+        &uuid::Uuid::now_v7().to_string(),
+        plan.action_id,
+        0,
+        "text",
+        plan.text,
+    )
+    .await?;
+    let auto_titled = match plan.auto_title {
+        Some(title) => update_space_title(conn, plan.space_id, title, plan.created_at).await?,
+        None => false,
+    };
+    if let Some(ante) = plan.reply_to {
+        insert_action_antecedent(conn, plan.action_id, ante, 0, "reply").await?;
+    }
+    for (i, spec) in plan.references.iter().enumerate() {
+        insert_reference_antecedent(
+            conn,
+            plan.action_id,
+            &spec.antecedent_action_id,
+            (i + 1) as i64,
+            spec.content_block_id.as_deref(),
+            spec.range_start,
+            spec.range_end,
+            spec.annotation.as_deref(),
+        )
+        .await?;
+    }
+    Ok(auto_titled)
+}
+
 pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
@@ -8431,6 +8538,109 @@ mod tests {
         .await
         .unwrap();
         action_id
+    }
+
+    /// **A post is written whole or not at all.** Its action row, its words,
+    /// its place in the thread and its quotations were separate autocommitted
+    /// statements, so for as long as the tail of them took, the post existed
+    /// and said nothing — a state every reader keyed on the action could see
+    /// and the sub-space driver's refill would *act* on, planning and billing a
+    /// turn against an empty post. One transaction is what makes the post one
+    /// event; the fragment is then not a state anything can observe, which is
+    /// the only way to hold a reader to it.
+    #[tokio::test]
+    async fn a_post_is_written_whole_or_not_at_all() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let first = add_user_action(&conn, "room", &user, "the ask", 2_000).await;
+
+        // A post whose *last* write cannot land: the reference edge names an
+        // action that does not exist, which the foreign key refuses. Everything
+        // before it — the action, its text, the title, the reply edge — is
+        // already written when that happens.
+        let doomed = uuid::Uuid::now_v7().to_string();
+        let err = post_tx(
+            &conn,
+            &PostPlan {
+                space_id: "room",
+                participant_id: &user,
+                action_id: &doomed,
+                item_id: &uuid::Uuid::now_v7().to_string(),
+                text: "about that",
+                auto_title: Some("A title it must not keep"),
+                reply_to: Some(&first),
+                references: &[crate::ReferenceSpec {
+                    antecedent_action_id: "no-such-action".into(),
+                    content_block_id: None,
+                    range_start: None,
+                    range_end: None,
+                    annotation: None,
+                }],
+                created_at: 3_000,
+            },
+        )
+        .await
+        .expect_err("a reference to an action that does not exist cannot be written");
+        assert!(matches!(err, AppError::Database { .. }), "{err:?}");
+
+        assert_eq!(
+            space_action_ids(&conn, "room").await.unwrap(),
+            vec![first.clone()],
+            "the half-written post is gone entirely — no action for a reader to find"
+        );
+        assert!(
+            first_content_block(&conn, &doomed).await.unwrap().is_none(),
+            "and no orphaned text block"
+        );
+        assert!(
+            get_space(&conn, "room")
+                .await
+                .unwrap()
+                .unwrap()
+                .title
+                .is_none(),
+            "and no title from a post that was never written"
+        );
+
+        // The same post, written whole: everything arrives together.
+        let good = uuid::Uuid::now_v7().to_string();
+        assert!(
+            post_tx(
+                &conn,
+                &PostPlan {
+                    space_id: "room",
+                    participant_id: &user,
+                    action_id: &good,
+                    item_id: &uuid::Uuid::now_v7().to_string(),
+                    text: "about that",
+                    auto_title: Some("Named by its first post"),
+                    reply_to: Some(&first),
+                    references: &[],
+                    created_at: 4_000,
+                },
+            )
+            .await
+            .unwrap(),
+            "the space took the title"
+        );
+        assert!(
+            first_content_block(&conn, &good)
+                .await
+                .unwrap()
+                .is_some_and(|(_, text)| text.as_deref() == Some("about that")),
+            "the words are there the moment the action is"
+        );
+        assert_eq!(
+            reply_antecedent(&conn, &good).await.unwrap().as_deref(),
+            Some(first.as_str()),
+            "and so is its place in the thread"
+        );
     }
 
     /// **The walk boundary is commit order, and a clock cannot stand in for
