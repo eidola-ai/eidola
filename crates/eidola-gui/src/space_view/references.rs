@@ -41,8 +41,10 @@ use gpui::{
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use eidola_app_core::error::AppError;
+use eidola_app_core::{DelegationEnd, DelegationFailure};
 
 use crate::actions::{Quote, QuoteInReply};
+use crate::i18n::msg;
 use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
 
@@ -203,6 +205,33 @@ pub(crate) struct FootnoteRow {
     pub(crate) body: FootnoteBody,
     /// The quoted post — the click target.
     pub(crate) antecedent_action_id: String,
+    /// How the delegated conversation this passage came from stopped, when the
+    /// reference is a delegation's report. **A value, not a sentence**: what
+    /// app-core persists on the edge is a token, because a persisted sentence
+    /// is read as-is in every language, so the words belong here.
+    pub(crate) delegation: Option<DelegationEnd>,
+}
+
+/// What a footnote row says about a delegated conversation's ending, in the
+/// reader's language. Sits in the rail's quiet register — the rail is a
+/// footnote, not a banner — and finishes the clause "this conversation …".
+fn delegation_note(end: DelegationEnd, cx: &gpui::App) -> SharedString {
+    match end {
+        DelegationEnd::Concluded => msg::space_footnote_delegation_concluded(cx),
+        DelegationEnd::Paused { depth, limit } => {
+            msg::space_footnote_delegation_paused(cx, depth, limit)
+        }
+        DelegationEnd::BudgetSpent { limit } => msg::space_footnote_delegation_budget(cx, limit),
+        DelegationEnd::TurnFailed { reason } => msg::space_footnote_delegation_failed(
+            cx,
+            match reason {
+                DelegationFailure::Upstream => "upstream",
+                DelegationFailure::Funding => "funding",
+                DelegationFailure::Configuration => "configuration",
+                DelegationFailure::Unfinished => "unfinished",
+            },
+        ),
+    }
 }
 
 /// What a footnote row can honestly say. The three cases are genuinely
@@ -1525,6 +1554,7 @@ impl SpaceView {
                     (None, None) => FootnoteBody::Backlink,
                 },
                 antecedent_action_id: r.antecedent_action_id.clone(),
+                delegation: r.delegation_end,
             })
             .collect();
         if rows.is_empty() {
@@ -1643,6 +1673,10 @@ impl SpaceView {
                 byline: r.byline.clone(),
                 body: FootnoteBody::Quote(footnote_snippet(&r.snippet).into()),
                 antecedent_action_id: r.spec.antecedent_action_id.clone(),
+                // A draft quotes what a reader chose; a delegation's ending is
+                // written by the machinery onto a post that already exists, so
+                // an unposted draft never carries one.
+                delegation: None,
             };
             let ordinal = r.ordinal;
             let mut el = self.footnote_row(
@@ -1798,7 +1832,13 @@ impl SpaceView {
         // is laid out: both are visually bounded below (`BYLINE_MAX_W`, the
         // passage's `truncate`), and an ellipsis is a fact about this row's
         // width, never about who wrote the passage.
-        let aria = format!("Reference {}: {} — {}", row.index, row.byline, text);
+        let note = row.delegation.map(|end| delegation_note(end, cx));
+        // The ending joins the accessible name where it joins the line: a
+        // reader who cannot see the row is owed the same clause.
+        let aria = match &note {
+            Some(note) => format!("Reference {}: {} — {note} — {text}", row.index, row.byline),
+            None => format!("Reference {}: {} — {}", row.index, row.byline, text),
+        };
         h_flex()
             .id(SharedString::from(element_id))
             .probe(
@@ -1831,6 +1871,17 @@ impl SpaceView {
                     .text_color(theme.muted_foreground)
                     .child(row.byline.clone()),
             )
+            // **Between the byline and the passage, and `flex_none`.** It is a
+            // fact about the conversation the passage came out of, so it reads
+            // with the attribution rather than with the words; and it is short
+            // and always true, so the passage — which is neither — is the cell
+            // that gives up room first.
+            .children(note.map(|note| {
+                div()
+                    .flex_none()
+                    .text_color(theme.muted_foreground.opacity(0.75))
+                    .child(note)
+            }))
             .child(
                 div()
                     .flex_1()

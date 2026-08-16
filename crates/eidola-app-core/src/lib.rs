@@ -46,7 +46,8 @@ pub use local_models::{
     LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
 };
 pub use subspace_driver::{
-    DelegationEnd, DelegationFailure, MAX_ATTEMPTS_PER_TAIL, MAX_DELEGATION_TURNS,
+    ANCHOR_WAIT_GRACE, DelegationEnd, DelegationFailure, MAX_ATTEMPTS_PER_TAIL,
+    MAX_DELEGATION_TURNS,
 };
 pub use subspaces::{
     MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, MAX_SUBAGENTS_PER_SPAWN, SpaceCapability,
@@ -1560,6 +1561,10 @@ struct Inner {
     /// answered, mapped to the parent whose next change wakes them (see
     /// `Inner::report_delegation`).
     awaiting_anchor: Mutex<std::collections::HashMap<String, String>>,
+    /// How long an anchor wait holds out, in milliseconds; `0` means
+    /// `subspace_driver::ANCHOR_WAIT_GRACE`. Only a test moves it — waiting ten
+    /// real minutes is not the behaviour worth exercising.
+    anchor_wait_grace_ms: std::sync::atomic::AtomicU64,
     /// Test-only rendezvous inside the anchor window — the few instructions
     /// between a room registering itself against its parent and asking whether
     /// that parent has answered. A lost wake-up lives or dies on the *order* of
@@ -1578,6 +1583,14 @@ struct Inner {
     /// [`Inner::anchor_window`].
     #[cfg(feature = "test-support")]
     cascade_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **between a walk's reads**, after it has read the
+    /// room's last post and before it has decided anything from it. That is
+    /// where a post used to fall between two stools — too late for the tail,
+    /// too early for the refill's window — so it is where a test has to be able
+    /// to put one. Same shape and same reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    entry_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
@@ -7948,10 +7961,13 @@ impl AppCore {
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
                 subspace_walks: Mutex::new(std::collections::HashMap::new()),
                 awaiting_anchor: Mutex::new(std::collections::HashMap::new()),
+                anchor_wait_grace_ms: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "test-support")]
                 anchor_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 cascade_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                entry_window: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 summary_gate: tokio::sync::Mutex::new(()),
                 summary_triggers: Mutex::new(std::collections::HashMap::new()),
@@ -9144,6 +9160,18 @@ impl AppCore {
         rx
     }
 
+    /// Test-only seam: shorten how long an anchor wait holds out before its own
+    /// alarm comes due (see `subspace_driver::ANCHOR_WAIT_GRACE`). What is
+    /// worth exercising is what happens when it does, not the waiting.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_set_anchor_wait_grace(&self, grace: std::time::Duration) {
+        self.inner.anchor_wait_grace_ms.store(
+            grace.as_millis().max(1) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Test-only seam: the delegated rooms currently waiting on `space_id` as
     /// their parent — the registration that makes a change there wake them.
     #[doc(hidden)]
@@ -9166,6 +9194,22 @@ impl AppCore {
                     .await;
             })
             .await;
+    }
+
+    /// Test-only seam: stop the next walk between reading the room's last post
+    /// and deciding anything from it (see `Inner::entry_window`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_entry_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .entry_window
+            .lock()
+            .expect("entry window lock poisoned") = Some(tx);
+        rx
     }
 
     /// Test-only seam: stop the next walk once inside its cascade, after its

@@ -87,6 +87,10 @@ pub(crate) enum Arm {
     /// flight — which is what makes it safe, and the only thing that makes it
     /// safe, to stop waiting for an answer here.
     Sweep,
+    /// A wait's own alarm, come due (see [`ANCHOR_WAIT_GRACE`]). The answer has
+    /// had longer than any turn takes and has not come; the room stops holding
+    /// out for it.
+    Grace,
 }
 
 /// What a report attempt did.
@@ -130,6 +134,32 @@ pub const MAX_ATTEMPTS_PER_TAIL: u32 = 3;
 /// [`MAX_ATTEMPTS_PER_TAIL`] deep, so this is the difference between riding out
 /// a blip and hammering an upstream that is away, not a backoff schedule.
 const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long a delegation holds out for the post it was opened from to be
+/// answered before reporting against that post instead.
+///
+/// **This is a clock because there is nothing else to read**, and that was
+/// established rather than assumed. What the wait is holding out for is the end
+/// of a *turn*, and a turn that fails leaves the database exactly as it found
+/// it: the only durable trace is an unattached `request` row, which carries no
+/// space, no action and no participant, so nothing can be joined back to the
+/// post being waited on; and the tool rounds a spawning turn wrote chain off
+/// that post whether it later answers or dies, so they say "a turn started" and
+/// never "a turn ended". In-process bookkeeping would be precise, but its
+/// release cannot be ordered in front of the terminal emissions without
+/// threading a guard through every error arm — and a release that lands after
+/// the emission recreates the lost wake-up this wait exists to be ordered
+/// against.
+///
+/// So the honest end is time: the thing being waited on is bounded work with a
+/// duration, and a wait for something with a duration ends by outliving it. Ten
+/// minutes is far past any turn — one is at most [`crate::MAX_TURN_ROUNDS`]
+/// model round trips — so a wait that reaches it is waiting on nothing.
+///
+/// **The alarm is the wait's own**, scheduled when it begins, so termination
+/// depends on no other event: an unrelated post in the parent still never
+/// spends the wait, and a parent that goes quiet forever still ends it.
+pub const ANCHOR_WAIT_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How many turns one delegation may take, across its whole life.
 ///
@@ -536,6 +566,15 @@ impl Inner {
     /// which is what makes arming cheap enough to do from a signal every post
     /// raises.
     pub(crate) async fn drive_subspace(&self, space_id: String, arm: Arm) -> Result<(), AppError> {
+        // **Taken before the first read, not after it.** This is the line that
+        // divides "already in front of me" from "arrived while I was working",
+        // and the reads below are several `await`s wide — a post committing
+        // inside them would otherwise fall between the two: too late for the
+        // tail this walk starts from, too early for the refill's window, and
+        // its own change event spent on a walk already in progress. Ordering
+        // closes it, the same way it closes the anchor wait: every arrival is
+        // either in the reads that follow or in the refill.
+        let began = now_ms();
         let conn = self.db_conn().await?;
         // **A room that is done stops being waited on.** An anchor wait is a
         // standing registration against the parent, and every post there wakes
@@ -554,6 +593,8 @@ impl Inner {
             self.end_anchor_wait(&space_id);
             return Ok(()); // a room with no posts — unreachable, a brief opens every one
         };
+        #[cfg(feature = "test-support")]
+        self.pause_in_entry_window().await;
         // The whole of "is there anything to do here", asked of the rows. A
         // reported tail is a delegation whose last word the parent already has;
         // anything posted since makes a new tail, and the answer flips back.
@@ -578,12 +619,13 @@ impl Inner {
         // Boxed, like every other await on the turn path: `run_turn_stream`'s
         // state machine is the largest in the crate, and stacking this walk's
         // frame on top of it overflows a worker stack.
-        let Some((end, witness)) = Box::pin(self.cascade_subspace(&space_id, tail.clone())).await?
+        let Some((end, leaves)) =
+            Box::pin(self.cascade_subspace(&space_id, tail.clone(), began)).await?
         else {
             self.end_anchor_wait(&space_id);
             return Ok(()); // the room closed under us; nothing to report
         };
-        let outcome = Box::pin(self.report_delegation(&sub, end, witness, arm)).await;
+        let outcome = Box::pin(self.report_delegation(&sub, end, leaves, arm)).await;
         // **Waiting is not an attempt.** The meter bounds retries of work that
         // failed; a walk that ended by waiting for the post it was delegated
         // from tried nothing and failed at nothing, and the room's last word is
@@ -598,14 +640,20 @@ impl Inner {
 
     /// The plan → drive → re-plan walk, ending at the first terminal outcome.
     ///
-    /// Returns the outcome **and the post the walk ended on** — its witness.
-    /// That post, not whatever the room's tail happens to be by the time the
-    /// report is written, is what the report quotes: a post landing in between
-    /// would otherwise be reported as if the walk had considered it, and would
-    /// then read as already-reported when its own walk came round, so the room
-    /// would go quiet holding an unanswered post. Reporting the witness leaves
-    /// that post unreported, which is exactly what makes its own arrival arm the
-    /// room again and get it the walk it is owed.
+    /// Returns the outcome **and every branch tip the walk followed** — see
+    /// [`finish`]. Those posts, not whatever the room's tail happens to be by
+    /// the time the report is written, are what the report quotes: a post
+    /// landing in between would otherwise be reported as if the walk had
+    /// considered it, and would then read as already-reported when its own walk
+    /// came round, so the room would go quiet holding an unanswered post.
+    /// Quoting what the walk actually reached leaves such a post unreported,
+    /// which is exactly what makes its arrival arm the room again and get it the
+    /// walk it is owed.
+    ///
+    /// **`began` is the caller's**, taken before its first read: the boundary
+    /// between what was already there and what arrived mid-walk has to sit in
+    /// front of every read, or a post committing inside them belongs to
+    /// neither.
     ///
     /// `Ok(None)` means the room stopped being drivable while we were in it (an
     /// archival landed), which is deliberately **not** an outcome to report: the
@@ -615,14 +663,21 @@ impl Inner {
         &self,
         space_id: &str,
         tail: String,
-    ) -> Result<Option<(DelegationEnd, String)>, AppError> {
-        // When this walk began. Anything posted from here on that the walk did
-        // not write itself came from somewhere else and is owed a hearing —
-        // see the refill below.
-        let began = now_ms();
-        // The room's last word *as this walk saw it* — the entry tail until a
-        // driven turn produces something newer.
-        let mut witness = tail.clone();
+        began: i64,
+    ) -> Result<Option<(DelegationEnd, Vec<String>)>, AppError> {
+        // **The tips of everything this walk followed, not one of them.** A
+        // delegated room fans out: several helpers answer the brief, each
+        // branch runs down to a post nothing follows, and every one of those is
+        // a finding. Quoting whichever happened to be written last would report
+        // one helper and silently drop the rest — and the room would then read
+        // as reported, so nothing would ever go back for them.
+        let mut leaves: Vec<String> = Vec::new();
+        // The first branch to reach the room's reply limit. **A pause is a
+        // branch's, not the walk's**: the guard is derived per post, so one
+        // thread of the room running out of replies says nothing about its
+        // siblings — abandoning them there would drop their findings exactly
+        // the way a single witness did.
+        let mut paused: Option<(i64, i64)> = None;
         // Every post this walk has planned off. It is what tells the walk's own
         // work apart from a stranger's, and there is nothing durable that could:
         // a post the driver planned and a post nobody has looked at are the same
@@ -633,7 +688,7 @@ impl Inner {
         // answers on it at once; taking the newest first walks each thread of
         // the room down before starting the next, which is the order a reader
         // watching the transcript would expect.
-        let mut frontier: Vec<String> = vec![tail];
+        let mut frontier: Vec<String> = vec![tail.clone()];
         #[cfg(feature = "test-support")]
         let mut paused_once = false;
         loop {
@@ -652,7 +707,11 @@ impl Inner {
                 drop(conn);
                 frontier.extend(arrived.into_iter().filter(|id| !served.contains(id)));
                 if frontier.is_empty() {
-                    return Ok(Some((DelegationEnd::Concluded, witness)));
+                    let end = match paused {
+                        Some((depth, limit)) => DelegationEnd::Paused { depth, limit },
+                        None => DelegationEnd::Concluded,
+                    };
+                    return Ok(Some((end, finish(leaves, &frontier, &tail))));
                 }
                 continue;
             };
@@ -672,7 +731,7 @@ impl Inner {
                     DelegationEnd::BudgetSpent {
                         limit: MAX_DELEGATION_TURNS,
                     },
-                    witness,
+                    finish(with(leaves, post), &frontier, &tail),
                 )));
             }
             let turns = match self
@@ -680,10 +739,19 @@ impl Inner {
                 .await?
             {
                 NotificationPlan::Paused { depth, limit } => {
-                    return Ok(Some((DelegationEnd::Paused { depth, limit }, witness)));
+                    paused.get_or_insert((depth, limit));
+                    leaves.push(post.clone());
+                    continue;
                 }
                 NotificationPlan::Turns(turns) => turns,
             };
+            // **Nothing follows this one, so it is a finding.** A post whose
+            // plan comes back empty is where a branch of the room stopped
+            // having anything to add — which is exactly what the parent is owed
+            // a look at.
+            if turns.is_empty() {
+                leaves.push(post.clone());
+            }
             for turn in turns {
                 let conn = self.db_conn().await?;
                 let taken = db::turns_taken_in_space(&conn, space_id).await?;
@@ -693,7 +761,7 @@ impl Inner {
                         DelegationEnd::BudgetSpent {
                             limit: MAX_DELEGATION_TURNS,
                         },
-                        witness,
+                        finish(with(leaves, post), &frontier, &tail),
                     )));
                 }
                 match Box::pin(self.drive_planned_turn(space_id, &turn)).await {
@@ -701,7 +769,6 @@ impl Inner {
                     // the room's newest word; a turn that declined wrote a
                     // decision, which is not something anyone replies to.
                     Ok(Some(post_action_id)) => {
-                        witness = post_action_id.clone();
                         frontier.push(post_action_id);
                         #[cfg(feature = "test-support")]
                         if !std::mem::replace(&mut paused_once, true) {
@@ -716,7 +783,10 @@ impl Inner {
                         eprintln!(
                             "warning: a turn in the delegated conversation {space_id} failed: {e}"
                         );
-                        return Ok(Some((DelegationEnd::failed(&e), witness)));
+                        return Ok(Some((
+                            DelegationEnd::failed(&e),
+                            finish(with(leaves, post), &frontier, &tail),
+                        )));
                     }
                 }
             }
@@ -761,8 +831,8 @@ impl Inner {
     /// Deliver the owner's report into the parent conversation.
     ///
     /// A turn for the owning agent, replying **on the branch the delegation was
-    /// opened from**, carrying `witness` — the room's last word as the walk saw
-    /// it — as a quoted reference the driver attaches itself.
+    /// opened from**, carrying every finding the walk reached as a quoted
+    /// reference the driver attaches itself, at ordinals `1..=N`.
     ///
     /// Every refusal the parent can raise is the parent's to raise: an archived
     /// parent refuses the turn at the same gate every other turn meets, an
@@ -774,7 +844,7 @@ impl Inner {
         &self,
         sub: &db::SubspaceRow,
         end: DelegationEnd,
-        witness: String,
+        leaves: Vec<String>,
         arm: Arm,
     ) -> Result<Report, AppError> {
         let conn = self.db_conn().await?;
@@ -787,25 +857,43 @@ impl Inner {
             self.end_anchor_wait(&sub.id);
             return Ok(Report::Settled);
         }
-        // The passage: the post the walk ended on, whole. A delegation's last
-        // word is its finding, and clipping it here would report a fragment
-        // while the edge claimed the post.
-        let (content_block_id, range_start, range_end) =
-            match db::first_quotable_block(&conn, &witness).await? {
-                Some((block_id, text)) if !text.is_empty() => {
-                    (Some(block_id), Some(0), Some(text.len() as i64))
-                }
-                // No text to quote (a room whose last post carries none) still
-                // gets an edge — a pointer to the post rather than a quote of
-                // it, which is what a range-less reference means everywhere.
-                _ => (None, None, None),
-            };
-        // Named the way every other reference read names an author: the label
-        // that post's **own space** gives them, with no liveness filter — so an
-        // agent retired between writing the finding and its being reported is
-        // still named, rather than degrading to an anonymous post from
-        // somewhere else.
-        let author_label = db::post_author_label(&conn, &witness).await?;
+        // One attachment per finding, at ordinals `1..=N` in the order the walk
+        // found them. The passages travel whole: a quote's range is recorded on
+        // its edge, so shortening what the reader is shown would make the edge
+        // describe something the report does not contain.
+        let mut attached: Vec<AttachedReference> = Vec::with_capacity(leaves.len());
+        for (i, leaf) in leaves.iter().enumerate() {
+            let (content_block_id, range_start, range_end) =
+                match db::first_quotable_block(&conn, leaf).await? {
+                    Some((block_id, text)) if !text.is_empty() => {
+                        (Some(block_id), Some(0), Some(text.len() as i64))
+                    }
+                    // No text to quote still gets an edge — a pointer to the
+                    // post rather than a quote of it, which is what a
+                    // range-less reference means everywhere.
+                    _ => (None, None, None),
+                };
+            // Named the way every other reference read names an author: the
+            // label that post's **own space** gives them, with no liveness
+            // filter — so an agent retired between writing the finding and its
+            // being reported is still named, rather than degrading to an
+            // anonymous post from somewhere else.
+            let author_label = db::post_author_label(&conn, leaf).await?;
+            attached.push(AttachedReference {
+                ordinal: (i + 1) as i64,
+                origin: AttachmentOrigin::Authored,
+                spec: ReferenceSpec {
+                    antecedent_action_id: leaf.clone(),
+                    content_block_id,
+                    range_start,
+                    range_end,
+                    // Typed, not a sentence: this is persisted, and a persisted
+                    // sentence is read as-is in every language.
+                    annotation: Some(end.token()),
+                },
+                author_label,
+            });
+        }
 
         // Where it attaches. The anchor is the post in the parent this
         // delegation was opened from, captured at the spawn because only the
@@ -898,22 +986,7 @@ impl Inner {
         drop(conn);
 
         let directive = TurnDirective {
-            attached: vec![AttachedReference {
-                // Ordinal 0 is the reply edge's; a report quotes exactly one
-                // thing, so the finding is 1.
-                ordinal: 1,
-                origin: AttachmentOrigin::Authored,
-                spec: ReferenceSpec {
-                    antecedent_action_id: witness,
-                    content_block_id,
-                    range_start,
-                    range_end,
-                    // Typed, not a sentence: this is persisted, and a persisted
-                    // sentence is read as-is in every language.
-                    annotation: Some(end.token()),
-                },
-                author_label,
-            }],
+            attached,
             mechanical: true,
         };
         // Dropped before the turn runs, for the reason the driven turns' is.
@@ -956,10 +1029,50 @@ impl Inner {
     /// map. Idempotent — a room that is already waiting stays waiting, because
     /// a wake-up that found no answer has established nothing.
     fn begin_anchor_wait(&self, sub: &db::SubspaceRow) {
-        self.awaiting_anchor
+        let fresh = self
+            .awaiting_anchor
             .lock()
             .expect("anchor wait map poisoned")
-            .insert(sub.id.clone(), sub.parent_space_id.clone());
+            .insert(sub.id.clone(), sub.parent_space_id.clone())
+            .is_none();
+        // One alarm per wait, set when the wait begins. A room woken by
+        // unrelated traffic re-registers into the same entry and does not stack
+        // a second one; a room that stopped waiting and later starts again gets
+        // a new one, which is right — the clock is per wait, not per room.
+        if fresh {
+            self.schedule_anchor_grace(&sub.id);
+        }
+    }
+
+    /// Wake this room once the wait has outlived any turn that could still
+    /// answer it (see [`ANCHOR_WAIT_GRACE`]).
+    fn schedule_anchor_grace(&self, space_id: &str) {
+        // No runtime (a synchronous unit test) ⇒ nothing to spawn onto.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let Some(inner) = self.self_ref.upgrade() else {
+            return;
+        };
+        let space_id = space_id.to_string();
+        let grace = self.anchor_wait_grace();
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            inner.arm_subspace_driver(&space_id, Arm::Grace);
+        });
+    }
+
+    /// How long a wait holds out. [`ANCHOR_WAIT_GRACE`] unless a test has
+    /// shortened it — the behaviour under test is what happens when the alarm
+    /// comes due, not how long it takes to.
+    fn anchor_wait_grace(&self) -> std::time::Duration {
+        match self
+            .anchor_wait_grace_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => ANCHOR_WAIT_GRACE,
+            ms => std::time::Duration::from_millis(ms),
+        }
     }
 
     /// Hold the walk inside the anchor window while a test commits the write
@@ -974,6 +1087,13 @@ impl Inner {
     #[cfg(feature = "test-support")]
     async fn pause_in_cascade_window(&self) {
         pause_in_window(&self.cascade_window).await;
+    }
+
+    /// The same, for the window between a walk's reads (see
+    /// `Inner::entry_window`).
+    #[cfg(feature = "test-support")]
+    async fn pause_in_entry_window(&self) {
+        pause_in_window(&self.entry_window).await;
     }
 
     /// Stop waiting: the answer arrived, or there is no longer one to wait for.
@@ -998,6 +1118,40 @@ impl Inner {
             .map(|(room, _)| room.clone())
             .collect()
     }
+}
+
+/// The posts a report will quote: every branch tip the walk followed, plus —
+/// where the walk stopped short — the post it stopped at and anything still
+/// waiting on its frontier, which nothing followed either. Deduped, oldest first, and never empty: a walk that got no
+/// further than the room's first post still has that post to show.
+///
+/// **Bounded by the roster, not by clipping.** A room seats at most
+/// [`crate::MAX_SUBAGENTS_PER_SPAWN`] agents, so that is the natural ceiling on
+/// distinct voices with something to report; a deeper tree keeps its most
+/// recent tips. The bound is on *how many* passages travel and never on how
+/// much of one: a quote's range is recorded on its edge, so shortening the text
+/// a reader is shown would make the edge describe something the report does not
+/// contain.
+fn finish(mut leaves: Vec<String>, unwalked: &[String], entry_tail: &str) -> Vec<String> {
+    // Anything still on the frontier when the walk stopped is a tip nothing
+    // followed either — it just never got its turn.
+    leaves.extend(unwalked.iter().cloned());
+    let mut seen = std::collections::HashSet::new();
+    leaves.retain(|id| seen.insert(id.clone()));
+    if leaves.is_empty() {
+        leaves.push(entry_tail.to_string());
+    }
+    let limit = crate::MAX_SUBAGENTS_PER_SPAWN as usize;
+    if leaves.len() > limit {
+        leaves.drain(..leaves.len() - limit);
+    }
+    leaves
+}
+
+/// `leaves` with `post` appended — the post a walk stopped at is a tip too.
+fn with(mut leaves: Vec<String>, post: String) -> Vec<String> {
+    leaves.push(post);
+    leaves
 }
 
 /// Hold here until whoever opened this window lets go. A no-op — one lock and a
