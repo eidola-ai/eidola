@@ -139,7 +139,14 @@
 //! chat path. Per-space participant CRUD emits `Change::Participants`
 //! (`add_space_participant` / `update_space_participant` /
 //! `remove_space_participant`, each after its durable write; a rejected update
-//! emits nothing). The space-template registry emits `Change::Templates`
+//! emits nothing). **A departure that closes delegations says so too**:
+//! `remove_space_participant` archives the rooms the departing agent was
+//! running for the conversation it left, and emits `Change::Space` per closed
+//! room plus one `SpaceIndex` beside its `Participants` — the same
+//! announcement-per-closed-room `archive_space` makes, and for the same reason
+//! (it is what releases a delegation registered against one of them as its
+//! parent). Covered by `an_owner_leaving_a_conversation_closes_the_delegations_it_ran_for_it`
+//! (`subspaces.rs`). The space-template registry emits `Change::Templates`
 //! (`create_template` / `update_template` / `remove_template` /
 //! `template_from_space`), and `set_default_template` emits **both**
 //! `Change::Config` (the config key) and `Change::Templates` (the default

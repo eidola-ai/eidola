@@ -4327,46 +4327,57 @@ impl Inner {
         // be overtaken by another window's promotion, and a soft-remove aimed at
         // a row that has since become global retires a shared agent outright.
         // See `db::remove_space_participant_tx`.
-        let removed =
-            match db::remove_space_participant_tx(&conn, space_id, participant_id, now_ms()).await?
-            {
-                // Structural, and unrecoverable if obeyed: the notebook exists only
-                // for this agent, is where its `core` memory lives, and nothing can
-                // grant a notebook membership back. Refused by the write itself, so
-                // a promotion landing mid-flight cannot slip one past.
-                db::SpaceRemoval::RefusedNotebookOwner => {
-                    let who = db::get_participant(&conn, participant_id)
-                        .await?
-                        .map(|p| p.label)
-                        .unwrap_or_else(|| "that agent".to_string());
-                    return Err(AppError::Config {
-                        message: format!(
-                            "this space is {who}'s notebook — it is where its memory lives, so it \
+        let departure =
+            db::remove_space_participant_tx(&conn, space_id, participant_id, now_ms()).await?;
+        let removed = match departure.outcome {
+            // Structural, and unrecoverable if obeyed: the notebook exists only
+            // for this agent, is where its `core` memory lives, and nothing can
+            // grant a notebook membership back. Refused by the write itself, so
+            // a promotion landing mid-flight cannot slip one past.
+            db::SpaceRemoval::RefusedNotebookOwner => {
+                let who = db::get_participant(&conn, participant_id)
+                    .await?
+                    .map(|p| p.label)
+                    .unwrap_or_else(|| "that agent".to_string());
+                return Err(AppError::Config {
+                    message: format!(
+                        "this space is {who}'s notebook — it is where its memory lives, so it \
                          cannot leave it"
-                        ),
-                    });
-                }
-                // The other structural membership, refused in the same
-                // statement and for the same shape of reason: the owner row is
-                // the whole of what records who is answerable for a delegation,
-                // whose live-room quota it counts against, and who its report
-                // goes to, and nothing can grant a sub-space ownership back.
-                db::SpaceRemoval::RefusedSubspaceOwner => {
-                    let who = db::get_participant(&conn, participant_id)
-                        .await?
-                        .map(|p| p.label)
-                        .unwrap_or_else(|| "that agent".to_string());
-                    return Err(AppError::Config {
-                        message: format!(
-                            "{who} opened this conversation and is answerable for it, so it \
+                    ),
+                });
+            }
+            // The other structural membership, refused in the same
+            // statement and for the same shape of reason: the owner row is
+            // the whole of what records who is answerable for a delegation,
+            // whose live-room quota it counts against, and who its report
+            // goes to, and nothing can grant a sub-space ownership back.
+            db::SpaceRemoval::RefusedSubspaceOwner => {
+                let who = db::get_participant(&conn, participant_id)
+                    .await?
+                    .map(|p| p.label)
+                    .unwrap_or_else(|| "that agent".to_string());
+                return Err(AppError::Config {
+                    message: format!(
+                        "{who} opened this conversation and is answerable for it, so it \
                              cannot leave it — archive the conversation instead"
-                        ),
-                    });
-                }
-                outcome => outcome != db::SpaceRemoval::NothingToDo,
-            };
+                    ),
+                });
+            }
+            outcome => outcome != db::SpaceRemoval::NothingToDo,
+        };
+        // **A departure closes the delegations it was running for this
+        // conversation** (`db::close_delegations_run_for`), so each closed room
+        // announces itself for the reason `Inner::archive_space`'s do: that is
+        // what releases a delegation registered against one of them as its
+        // parent, and what tells a window open on one that it has stopped.
+        for id in &departure.archived_spaces {
+            self.bus.emit(Change::Space(id.clone()));
+        }
         if removed {
             self.bus.emit(Change::Participants);
+        }
+        if !departure.archived_spaces.is_empty() {
+            self.bus.emit(Change::SpaceIndex);
         }
         Ok(removed)
     }

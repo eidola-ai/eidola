@@ -1914,6 +1914,27 @@ pub async fn has_reference_from(
 /// answer resolves to its latest generation — and a reply edge threads under
 /// its antecedent's *item tip* anyway, so even picking a superseded generation
 /// renders in the right place.
+///
+/// **This resolves an answer, not *the* answer, and the gap is recorded rather
+/// than closed.** If the same owner answers the same post twice without one
+/// superseding the other — two concurrent explicit asks on one target, which is
+/// the only way to get there — the report attaches beneath the newer of the
+/// two, which may not be the turn the spawn happened inside. Nothing durable
+/// distinguishes them: a turn's rounds chain off *the post it answers*,
+/// deliberately never off its own inference (which a capped or budget-stopped
+/// turn never writes), so there is no edge from a spawning round to that turn's
+/// own answer. The one durable trace that relates them at all is
+/// `context_assembly`, and it is not one-to-one — a later turn replaying a
+/// trace records the same round in its own assembly, so the join answers a set.
+/// Recording the spawning round on the room would need a caller that could
+/// supply it, and there is none: nothing exposes the spawn door as a tool, and
+/// `tools::Tool::call` receives parsed arguments and no turn identity at all.
+/// So the residual is exactly this: **same owner, same anchor, two live answers
+/// — the report lands under the newer.** No report is lost, and the inversion
+/// the wait exists to prevent cannot happen either way, because both candidates
+/// are answers *of that owner to that anchor*: the report still sits beneath
+/// one of them rather than above it. Building for it before a caller exists
+/// would be machinery for a shape that has not been designed yet.
 pub async fn last_reply_by_participant(
     conn: &Connection,
     space_id: &str,
@@ -4202,12 +4223,28 @@ pub enum SpaceRemoval {
 /// (`promote_participant_tx` requires `scope = 'space' AND removed_at IS NULL`),
 /// so whichever transaction commits first, the loser refuses cleanly rather than
 /// writing through a premise that has expired.
+/// What a departure did: which of the two ways it ended, and **every
+/// delegation it closed on the way out**.
+///
+/// The second half is the same rule archival and retirement already apply, said
+/// of the third door that can end an agent's part in a conversation: a room an
+/// agent opened *for* this conversation exists to serve it, and an agent that
+/// is no longer in the conversation can no longer report to it — every report
+/// it tried would act as a participant that has left and be refused, forever,
+/// against a meter nobody reads and a live-room slot nobody gets back.
+pub struct SpaceDeparture {
+    pub outcome: SpaceRemoval,
+    /// The rooms closed with the departure, so the caller can announce each one
+    /// (which is what releases a delegation waiting on it as its parent).
+    pub archived_spaces: Vec<String>,
+}
+
 pub async fn remove_space_participant_tx(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
     now: i64,
-) -> Result<SpaceRemoval, AppError> {
+) -> Result<SpaceDeparture, AppError> {
     begin_write(conn).await?;
     match remove_space_participant_tx_body(conn, space_id, participant_id, now).await {
         Ok(outcome) => {
@@ -4226,7 +4263,7 @@ async fn remove_space_participant_tx_body(
     space_id: &str,
     participant_id: &str,
     now: i64,
-) -> Result<SpaceRemoval, AppError> {
+) -> Result<SpaceDeparture, AppError> {
     // Either branch changes the space's roster, and the transaction makes the
     // stamp atomic with whichever one lands; a `NothingToDo` over-marks, which
     // keeps a space rather than losing one.
@@ -4245,7 +4282,10 @@ async fn remove_space_participant_tx_body(
         .await
         .map_err(AppError::db)?;
     if struck > 0 {
-        return Ok(SpaceRemoval::SoftRemoved);
+        return Ok(SpaceDeparture {
+            outcome: SpaceRemoval::SoftRemoved,
+            archived_spaces: close_delegations_run_for(conn, space_id, participant_id, now).await?,
+        });
     }
     // The two **structural** memberships are guarded **in the leave's own
     // `WHERE`**, for the reason the soft-remove is guarded above: a promotion
@@ -4276,15 +4316,88 @@ async fn remove_space_participant_tx_body(
         .await
         .map_err(AppError::db)?;
     if left > 0 {
-        return Ok(SpaceRemoval::Left);
+        return Ok(SpaceDeparture {
+            outcome: SpaceRemoval::Left,
+            archived_spaces: close_delegations_run_for(conn, space_id, participant_id, now).await?,
+        });
     }
+    let refused = |outcome| SpaceDeparture {
+        outcome,
+        archived_spaces: Vec::new(),
+    };
     if notebook_participant_of(conn, space_id).await?.as_deref() == Some(participant_id) {
-        return Ok(SpaceRemoval::RefusedNotebookOwner);
+        return Ok(refused(SpaceRemoval::RefusedNotebookOwner));
     }
     if subspace_owner_of(conn, space_id).await?.as_deref() == Some(participant_id) {
-        return Ok(SpaceRemoval::RefusedSubspaceOwner);
+        return Ok(refused(SpaceRemoval::RefusedSubspaceOwner));
     }
-    Ok(SpaceRemoval::NothingToDo)
+    Ok(refused(SpaceRemoval::NothingToDo))
+}
+
+/// Archive every live delegation `participant_id` was running **for
+/// `space_id`** — the rooms it owns whose parent is the conversation it has
+/// just left — and everything beneath them.
+///
+/// **Two rules about one membership, and they are not in tension.** An owner
+/// cannot leave the *room* it owns (`SpaceRemoval::RefusedSubspaceOwner`,
+/// guarded in the leave's own `WHERE`): that membership is the whole record of
+/// who is answerable for the delegation, and nothing can grant it back. An
+/// owner leaving the *parent* is an ordinary departure and is allowed — and it
+/// takes the delegations it opened there with it, because their purpose was to
+/// serve that conversation and their reports are turns it can no longer take:
+/// every one would act as a participant that has left and be refused. The first
+/// rule protects a room from losing its owner; the second stops a room outliving
+/// the reason it existed. Together they say one thing — a delegation and the
+/// conversation it was opened from stand or fall together.
+///
+/// Scoped by `parent_space_id`, so an agent's rooms under *other* conversations
+/// are untouched: leaving one conversation says nothing about another.
+async fn close_delegations_run_for(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    now: i64,
+) -> Result<Vec<String>, AppError> {
+    const OWNED_UNDER_THIS_PARENT: &str = "archived_at IS NULL AND parent_space_id = ?1          AND EXISTS (              SELECT 1 FROM space_participant r              WHERE r.space_id = space.id AND r.participant_id = ?2                AND r.role = 'owner' AND r.left_at IS NULL          )";
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT id FROM space WHERE {OWNED_UNDER_THIS_PARENT}"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut archived = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        archived.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    if archived.is_empty() {
+        return Ok(archived);
+    }
+    conn.execute(
+        &format!(
+            "UPDATE space SET archived_at = ?3, touched_at = COALESCE(touched_at, ?3) \
+             WHERE {OWNED_UNDER_THIS_PARENT}"
+        ),
+        (
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to close the delegations of a departing owner: {e}"),
+    })?;
+    // And whatever those rooms had delegated onward, at any depth and whoever
+    // owns it — the invariant every archival restores.
+    archived.extend(archive_rooms_under_a_closed_one(conn, now).await?);
+    Ok(archived)
 }
 
 /// The participant a space is the **notebook** of, if it is one — the reverse of
@@ -7034,28 +7147,58 @@ pub async fn get_space_tree_data(
     })
 }
 
-/// Returns the ID of the last terminal action in a space (for antecedent linking).
-/// Every **post** in `space_id` written at or after `since`, oldest first.
+/// The high-water mark of the `action` table: **no row above this existed when
+/// this was read.**
+///
+/// The boundary a walk divides "already in front of me" from "arrived while I
+/// was working" with, and it is `rowid` rather than a clock because a clock
+/// cannot answer the question. Every writer here samples `now_ms()` *before*
+/// its transaction — `Inner::post` takes it above several awaited validations —
+/// so a row's `created_at` can predate a reader that its commit postdates.
+/// Anything deciding "did this arrive after me" from that timestamp therefore
+/// misses exactly the writes that raced it. `rowid` is assigned by the store at
+/// insert, and writers here are serialized (`BEGIN IMMEDIATE`, one writer at a
+/// time), so it *is* commit order: a row inserted after this read is above this
+/// number, and a row at or below it was already visible.
+///
+/// Table-wide rather than per space, which is both cheaper (`MAX(rowid)` is a
+/// seek to the last row, not a scan of a space's actions) and a stronger claim
+/// — a later insert anywhere is above it.
+pub async fn action_watermark(conn: &Connection) -> Result<i64, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT COALESCE(MAX(rowid), 0) FROM action")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(0),
+        Some(row) => row.get::<i64>(0).map_err(AppError::db),
+    }
+}
+
+/// Every **post** in `space_id` written after `since_row` (see
+/// [`action_watermark`]), oldest first.
 ///
 /// What a turn driver asks at the end of a walk to find the posts that arrived
 /// while it was walking: subtract the ones it served itself and what is left is
-/// somebody else's, still unanswered. Ordered oldest first so they are taken up
-/// in the order they were written.
+/// somebody else's, still unanswered. Ordered by `rowid`, which is the order
+/// they were *committed* — the order a reader watching the room saw them
+/// appear, and the only order that agrees with the boundary.
 pub async fn posts_in_space_since(
     conn: &Connection,
     space_id: &str,
-    since: i64,
+    since_row: i64,
 ) -> Result<Vec<String>, AppError> {
     let sql = format!(
         "SELECT id FROM action \
-         WHERE space_id = ?1 AND created_at >= ?2 \
+         WHERE space_id = ?1 AND rowid > ?2 \
            AND status IN ('complete', 'cancelled') \
            AND action_type IN ({POST_ACTION_TYPES_SQL}) \
-         ORDER BY created_at ASC, id ASC"
+         ORDER BY rowid ASC"
     );
     let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt
-        .query([Value::Text(space_id.to_string()), Value::Integer(since)])
+        .query([Value::Text(space_id.to_string()), Value::Integer(since_row)])
         .await
         .map_err(AppError::db)?;
     let mut out = Vec::new();
@@ -8205,7 +8348,7 @@ mod tests {
         participant_id: &str,
         text: &str,
         created_at: i64,
-    ) {
+    ) -> String {
         let action_id = uuid::Uuid::now_v7().to_string();
         insert_action(
             conn,
@@ -8237,6 +8380,63 @@ mod tests {
         )
         .await
         .unwrap();
+        action_id
+    }
+
+    /// **The walk boundary is commit order, and a clock cannot stand in for
+    /// it.** Every writer in this crate samples `now_ms()` above its own
+    /// transaction — `Inner::post` takes it before several awaited validations
+    /// — so a post's `created_at` can predate a reader that its commit
+    /// postdates. A refill that asked "written at or after my start time" then
+    /// missed exactly the posts that raced it, and missing one is a loss: the
+    /// walk drives on, its own newer answer becomes the room's last word, the
+    /// report settles the room on that word, and the unserved post sits in a
+    /// room that reads as reported.
+    #[tokio::test]
+    async fn the_refill_boundary_is_commit_order_not_the_writers_clock() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let early = add_user_action(&conn, "room", &user, "before the walk", 5_000).await;
+
+        // The walk opens here.
+        let since = action_watermark(&conn).await.unwrap();
+        assert!(since > 0, "the mark names a row that exists");
+
+        // A post whose author stamped it *before* the walk opened and whose
+        // insert lands after — the interleaving `Inner::post` makes reachable
+        // by sampling its clock above its awaits.
+        let raced =
+            add_user_action(&conn, "room", &user, "stamped early, landed late", 4_000).await;
+        // And an ordinary one after it.
+        let later = add_user_action(&conn, "room", &user, "plainly later", 9_000).await;
+
+        let arrived = posts_in_space_since(&conn, "room", since).await.unwrap();
+        assert_eq!(
+            arrived,
+            vec![raced.clone(), later.clone()],
+            "both arrivals are served, in the order they were committed"
+        );
+        assert!(
+            !arrived.contains(&early),
+            "and what was already in front of the walk is not served twice"
+        );
+
+        // The mark moves with the writes, so a second walk opening now sees
+        // nothing outstanding.
+        let next = action_watermark(&conn).await.unwrap();
+        assert!(next > since);
+        assert!(
+            posts_in_space_since(&conn, "room", next)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -9754,7 +9954,8 @@ mod tests {
         assert_eq!(
             remove_space_participant_tx(&conn, "s-new", "p-new", 3)
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome,
             SpaceRemoval::Left,
             "the premise expired, so the removal ends the membership instead"
         );
@@ -9778,7 +9979,8 @@ mod tests {
         assert_eq!(
             remove_space_participant_tx(&conn, "s-owned", "p-owned", 3)
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome,
             SpaceRemoval::SoftRemoved
         );
         assert!(
@@ -9793,7 +9995,8 @@ mod tests {
         assert_eq!(
             remove_space_participant_tx(&conn, "s-owned", "p-owned", 4)
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome,
             SpaceRemoval::NothingToDo
         );
     }

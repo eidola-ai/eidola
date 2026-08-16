@@ -606,6 +606,11 @@ const STAMP_LEDGER: &[(&str, &str)] = &[
         "archives the delegations beneath a closed conversation; stamps in the \
          same statement",
     ),
+    (
+        "close_delegations_run_for",
+        "archives the delegations a departing owner was running for the space \
+         it left; stamps in the same statement",
+    ),
     ("update_space_title", "stamps in the same statement"),
     (
         "retire_participant_tx_body",
