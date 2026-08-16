@@ -271,7 +271,16 @@ impl Inner {
                 }
                 triggers.remove(&space_id);
             }
-            if let Err(e) = inner.refresh_branch_summaries(&space_id).await {
+            // Nobody is waiting on this pass — the post or turn that triggered
+            // it returned long before the debounce elapsed — so its `Change`
+            // has to say so, or a busy window drops the invalidation and shows
+            // a stale branch until something unrelated re-reads.
+            let result = crate::changes::with_origin(
+                crate::changes::ChangeOrigin::Unattended,
+                inner.refresh_branch_summaries(&space_id),
+            )
+            .await;
+            if let Err(e) = result {
                 eprintln!(
                     "warning: branch summaries for space {space_id} could not be refreshed: {e}"
                 );

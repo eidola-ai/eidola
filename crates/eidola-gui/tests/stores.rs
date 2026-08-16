@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use eidola_app_core::AppCore;
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeOrigin};
 use gpui::{AppContext, TestAppContext};
 
 use eidola_gui::stores::{self, SpacesStore, Stores};
@@ -1953,6 +1953,106 @@ fn a_participants_change_arriving_mid_operation_is_replayed(cx: &mut TestAppCont
     wait_until(cx, "the deferred invalidation is replayed", |cx| {
         byline(cx).as_deref() == Some("Skipper")
     });
+}
+
+/// **A write nobody is waiting on is deferred while the space is busy, and
+/// replayed** — the `Change::Space` half of the same rule the participants
+/// change above obeys.
+///
+/// The exit reload an in-flight operation performs is several reads, so a post
+/// committing while they run is caught by none of them; dropping its signal
+/// loses it until something unrelated re-reads. The one that reaches a busy
+/// window in practice is app-core's own sub-space driver posting a delegation's
+/// report into the conversation the reader is mid-turn in.
+#[gpui::test]
+fn an_unattended_space_change_arriving_mid_operation_is_replayed(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let count = |cx: &mut TestAppContext| space.read_with(cx, |s, _| s.messages().len());
+    wait_until(cx, "the transcript loads", |cx| count(cx) == 1);
+
+    // A turn owns the transcript's truth.
+    space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+
+    // Something else writes into this very space while that runs.
+    core.runtime()
+        .block_on(core.post(
+            "And the moon is nobody's.".into(),
+            Some(posted.space_id.clone()),
+        ))
+        .expect("a second post");
+    cx.update(|cx| {
+        stores::dispatch_change_event_for_test(
+            &stores,
+            Some(Change::Space(posted.space_id.clone())),
+            ChangeOrigin::Unattended,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        count(cx),
+        1,
+        "the busy gate still holds the reload off while the operation runs"
+    );
+
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    wait_until(cx, "the deferred invalidation is replayed", |cx| {
+        count(cx) == 2
+    });
+}
+
+/// **And an own write buys no redundant re-read.** Every post raises
+/// `Change::Space`, and almost all of them are the busy operation's own — its
+/// exit reload already covers those, so recording them would cost a whole-tree
+/// re-read at the end of every turn to close a window only a write from
+/// somewhere else can open.
+#[gpui::test]
+fn a_caller_space_change_arriving_mid_operation_is_dropped(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let count = |cx: &mut TestAppContext| space.read_with(cx, |s, _| s.messages().len());
+    wait_until(cx, "the transcript loads", |cx| count(cx) == 1);
+
+    space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+    core.runtime()
+        .block_on(core.post(
+            "And the moon is nobody's.".into(),
+            Some(posted.space_id.clone()),
+        ))
+        .expect("a second post");
+    cx.update(|cx| {
+        stores::dispatch_change_for_test(&stores, Some(Change::Space(posted.space_id.clone())), cx)
+    });
+    cx.run_until_parked();
+
+    // The operation settles with no debt outstanding: the reload that lands is
+    // the operation's own, not one this signal bought.
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        count(cx),
+        1,
+        "a caller-origin change is contained by the operation's own exit reload"
+    );
 }
 
 /// A ⌘N space's row commits behind its window, and the very first Send must

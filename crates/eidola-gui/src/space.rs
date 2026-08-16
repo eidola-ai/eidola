@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use eidola_app_core::changes::ChangeOrigin;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AppCore, ChatResult, ChatStreamEvent, IncomingReference, NotificationPlan, PostNode,
@@ -1281,20 +1282,34 @@ impl Space {
     /// own completion. Routed through the bus-bridge dispatch in
     /// `stores::dispatch_change`.
     ///
-    /// **Residual, deliberately not deferred** like
-    /// [`Self::invalidate_transcript`]: that exit reload is several reads, so a
-    /// *foreign* write committing while they run is caught by none of them and
-    /// its signal was dropped here. Deferring it too is one line — but this
-    /// signal fires on every post, and almost every one of them is this space's
-    /// own write, already in the exit reload; recording every one would buy a
-    /// redundant whole-tree re-read at the end of every turn to close a window
-    /// only another window's or the CLI's concurrent post can open. Worth its
-    /// own task, with a way to tell our own writes from a stranger's.
-    pub fn on_space_changed(&mut self, changed_id: &str, cx: &mut Context<Self>) {
+    /// **A write nobody is waiting on is deferred, not dropped.** The busy gate
+    /// used to discard every signal, and for most of them that is right: this
+    /// fires on every post, and almost every one is this space's own write,
+    /// already contained in the operation's exit reload — recording those would
+    /// buy a redundant whole-tree re-read at the end of every turn. But the exit
+    /// reload is several reads, so a write committing *while they run* is caught
+    /// by none of them, and dropping its signal loses it until something
+    /// unrelated re-reads. Which of the two a signal is, is not something this
+    /// entity can work out; app-core says so ([`ChangeOrigin`]), and
+    /// [`ChangeOrigin::Unattended`] is exactly the case with no operation
+    /// behind it to cover the write — a background chore, or the driver giving
+    /// a windowless conversation its turns and then posting its report here.
+    /// Those take the same defer-and-replay path
+    /// [`Self::invalidate_transcript`] takes, discharged by
+    /// [`Self::settle_transcript_debt`] when the last runner settles.
+    pub fn on_space_changed(
+        &mut self,
+        changed_id: &str,
+        origin: ChangeOrigin,
+        cx: &mut Context<Self>,
+    ) {
         if self.id != changed_id {
             return;
         }
         if self.is_busy() {
+            if origin == ChangeOrigin::Unattended {
+                self.pending_transcript_refresh = true;
+            }
             return;
         }
         self.load_transcript(cx);

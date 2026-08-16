@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eidola_app_core::AppCore;
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeOrigin};
 use gpui::{App, AppContext, AsyncApp, Entity};
 
 pub use account::AccountStore;
@@ -329,8 +329,11 @@ pub fn install_bus_bridge(stores: &Stores, cx: &mut App) -> BusBridge {
     app_core.runtime().handle().clone().spawn(async move {
         loop {
             match bus.recv().await {
-                Ok(change) => {
-                    if tx.send(BridgeEvent::Change(change)).is_err() {
+                Ok(event) => {
+                    if tx
+                        .send(BridgeEvent::Change(event.change, event.origin))
+                        .is_err()
+                    {
                         break; // gpui loop gone — app shutting down
                     }
                 }
@@ -364,7 +367,7 @@ pub fn install_bus_bridge(stores: &Stores, cx: &mut App) -> BusBridge {
             // `AsyncApp::update` here yields `()` (the dispatch returns unit);
             // ignore via a statement-position call so the loop keeps draining.
             cx.update(|cx| match event {
-                BridgeEvent::Change(change) => dispatch_change(&stores, change, cx),
+                BridgeEvent::Change(change, origin) => dispatch_change(&stores, change, origin, cx),
                 BridgeEvent::Lagged => refresh_everything(&stores, cx),
             });
         }
@@ -411,7 +414,7 @@ impl BusBridge {
 }
 
 enum BridgeEvent {
-    Change(Change),
+    Change(Change, ChangeOrigin),
     Lagged,
 }
 
@@ -419,16 +422,33 @@ enum BridgeEvent {
 /// tokio→gpui plumbing. Lets tests assert "a `Change::X` refreshes store X"
 /// deterministically (the live plumbing's timing is exercised by the app at
 /// runtime, not by a test). `Lagged` is modelled by passing `None`.
+///
+/// The origin defaults to [`ChangeOrigin::Caller`] — what every write made on
+/// a consumer's own call path carries; [`dispatch_change_event_for_test`] is
+/// the seam for the unattended half.
 #[doc(hidden)]
 pub fn dispatch_change_for_test(stores: &Stores, change: Option<Change>, cx: &mut App) {
+    dispatch_change_event_for_test(stores, change, ChangeOrigin::Caller, cx)
+}
+
+/// [`dispatch_change_for_test`] naming the origin the change was emitted
+/// under — the seam for asserting what a busy surface does with a write
+/// nobody is waiting on.
+#[doc(hidden)]
+pub fn dispatch_change_event_for_test(
+    stores: &Stores,
+    change: Option<Change>,
+    origin: ChangeOrigin,
+    cx: &mut App,
+) {
     match change {
-        Some(change) => dispatch_change(stores, change, cx),
+        Some(change) => dispatch_change(stores, change, origin, cx),
         None => refresh_everything(stores, cx),
     }
 }
 
 /// Route one [`Change`] to the store(s) that own the affected domain.
-fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
+fn dispatch_change(stores: &Stores, change: Change, origin: ChangeOrigin, cx: &mut App) {
     match change {
         Change::Config => {
             stores.config.update(cx, |s, cx| s.refresh(cx));
@@ -457,7 +477,7 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         Change::Space(id) => {
             stores
                 .spaces
-                .update(cx, |s, cx| s.notify_space_changed(&id, cx));
+                .update(cx, |s, cx| s.notify_space_changed(&id, origin, cx));
             stores
                 .space_settings
                 .update(cx, |s, cx| s.refresh_if_cached(&id, cx));

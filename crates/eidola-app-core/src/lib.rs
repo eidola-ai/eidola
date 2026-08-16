@@ -7586,9 +7586,12 @@ impl AppCore {
     /// Subscribe to the invalidation bus.
     ///
     /// Returns a [`tokio::sync::broadcast::Receiver`] that receives a
-    /// [`changes::Change`] after every successful durable write in this
-    /// `AppCore` instance.  The receiver is independent — dropping it does
-    /// not affect the bus or other subscribers.
+    /// [`changes::ChangeEvent`] after every successful durable write in this
+    /// `AppCore` instance — the change itself, plus a [`changes::ChangeOrigin`]
+    /// saying whether a caller is waiting on that write (see the module docs;
+    /// a consumer that drops invalidations while it is busy must not drop the
+    /// unattended ones).  The receiver is independent — dropping it does not
+    /// affect the bus or other subscribers.
     ///
     /// ## Lagged receivers
     ///
@@ -7596,7 +7599,7 @@ impl AppCore {
     /// it will receive [`tokio::sync::broadcast::error::RecvError::Lagged`].
     /// Treat that as "refresh everything you care about" — at least that many
     /// changes were missed.
-    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<changes::Change> {
+    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<changes::ChangeEvent> {
         self.bus.subscribe()
     }
 

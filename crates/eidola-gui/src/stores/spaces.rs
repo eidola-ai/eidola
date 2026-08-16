@@ -43,6 +43,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use eidola_app_core::changes::ChangeOrigin;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{AppCore, SpaceInfo};
 use gpui::{AppContext, Context, Entity, Task, WeakEntity};
@@ -576,7 +577,12 @@ impl SpacesStore {
     /// A's posts should highlight, and the bus event carries only the written
     /// space's id. The indexes are re-fetched lazily per rendered post, so
     /// this costs a query per *visible* post at most.
-    pub fn notify_space_changed(&mut self, id: &str, cx: &mut Context<Self>) {
+    ///
+    /// `origin` says whether a caller is waiting on the write, and it reaches
+    /// the entity untouched: the entity is the only thing that knows whether it
+    /// is busy, and therefore the only thing that can decide what to do about
+    /// a write that arrived while it was.
+    pub fn notify_space_changed(&mut self, id: &str, origin: ChangeOrigin, cx: &mut Context<Self>) {
         for entity in self.live_spaces() {
             entity.update(cx, |space, cx| space.invalidate_incoming_references(cx));
         }
@@ -588,7 +594,7 @@ impl SpacesStore {
                 // written in the space that ran them), so only the changed
                 // space drops its index.
                 space.invalidate_traces(cx);
-                space.on_space_changed(id, cx);
+                space.on_space_changed(id, origin, cx);
             });
         }
     }

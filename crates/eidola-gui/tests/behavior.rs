@@ -11,7 +11,7 @@
 //! 4. Assert against the view/core's public state with `read_with`.
 
 use eidola_app_core::AppCore;
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeOrigin};
 use eidola_app_core::error::AppError;
 use eidola_app_core::updates::{
     Claim, ClaimDelta, ClaimsComparison, UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease,
@@ -11645,9 +11645,9 @@ fn space_change_invalidates_the_trace_index(cx: &mut TestAppContext) {
     space.read_with(cx, |s, _| assert_eq!(s.traces_for("a1").len(), 1));
 
     cx.update(|cx| {
-        stores
-            .spaces
-            .update(cx, |st, cx| st.notify_space_changed("s", cx));
+        stores.spaces.update(cx, |st, cx| {
+            st.notify_space_changed("s", ChangeOrigin::Caller, cx)
+        });
     });
     space.read_with(cx, |s, _| {
         assert!(

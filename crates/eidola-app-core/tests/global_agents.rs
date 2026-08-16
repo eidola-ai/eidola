@@ -30,7 +30,7 @@ use chat_harness::{
     memory_section, system_message_with, tool_script,
 };
 use eidola_app_core::AppCore;
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::discovery::{GLOBAL_AGENT_NOTE, LIST_MY_SPACES_TOOL_NAME};
 use eidola_app_core::memory::MEMORY_NOTE;
 
@@ -124,10 +124,10 @@ fn script_remember(script: &ToolScript, arguments: serde_json::Value) {
     *script.lock().unwrap() = vec![("remember".into(), arguments.to_string())];
 }
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     while let Ok(c) = rx.try_recv() {
-        out.push(c);
+        out.push(c.change);
     }
     out
 }
