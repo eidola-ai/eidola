@@ -1697,3 +1697,269 @@ fn two_declines_by_one_agent_on_one_post_stay_separate_disclosures() {
         assert_ne!(traces[0].id, traces[1].id, "and each turn has its own id");
     });
 }
+
+// ===========================================================================
+// Archival stops new work
+// ===========================================================================
+
+/// **An archived conversation takes no new turns**, and the rule lives on the
+/// turn path rather than in any caller.
+///
+/// Archival is what closes a conversation — the Library stops offering it, and
+/// retiring a shared agent archives every room it owned — but nothing in
+/// planning or in turn preparation used to read it, so a cascade planned a
+/// moment before an archival went on driving and re-planning and spending
+/// inside a room somebody had closed. Two gates, each at a read that was
+/// already being taken: planning yields no turns, and preparation refuses one
+/// that was planned before the archival landed.
+///
+/// The boundary is deliberate and is asserted below: a turn that got past the
+/// second gate finishes and persists (the request was made and the tokens were
+/// spent; dropping the answer would bill for nothing), and it is that answer's
+/// *re-plan* that stops the cascade.
+#[test]
+fn an_archived_space_plans_no_turns_and_starts_none() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let space = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+        // Two auto-responders, so an agent's answer plans the *other* one's
+        // turn — a cascade with a next hop to stop.
+        add_agent(&core, &space, "Chatter", MODEL, "all", None);
+        add_agent(&core, &space, "Answerer", MODEL, "all", None);
+        let chatter = agent_id(&core, &space, "Chatter");
+
+        // A turn that completes *before* the archival persists its answer, and
+        // that answer is what the cascade would have continued from.
+        let u1 = core
+            .runtime()
+            .block_on(core.post("start".into(), Some(space.clone())))
+            .expect("post");
+        let i1 = drive_as(&core, &space, &chatter, &u1.action_id)
+            .expect("i1")
+            .response_action_id
+            .expect("i1 id");
+        assert!(
+            matches!(
+                core.runtime()
+                    .block_on(core.plan_notifications(space.clone(), i1.clone()))
+                    .expect("plan"),
+                NotificationPlan::Turns(t) if !t.is_empty()
+            ),
+            "while the space is open, the cascade would continue"
+        );
+
+        // A second turn is planned — and then the space is archived before it
+        // is driven. This is the race the driving gate exists for.
+        let pending = match core
+            .runtime()
+            .block_on(core.plan_notifications(space.clone(), i1.clone()))
+            .expect("plan")
+        {
+            NotificationPlan::Turns(t) => t.into_iter().next().expect("a planned turn"),
+            other => panic!("expected turns, got {other:?}"),
+        };
+        assert!(
+            core.runtime()
+                .block_on(core.archive_space(space.clone()))
+                .expect("archive")
+        );
+
+        // The **earliest** observable effects of a turn, not just the last one.
+        // The refusal is the first read after the database handle, ahead of
+        // resolving the participant and the backend — so nothing below it runs:
+        // no provider row is persisted, no engine is started, no attested
+        // client is built and no catalogue is fetched. `models_hits` is the one
+        // that catches a gate placed too late: a refusal after backend setup
+        // still leaves `chat_bodies` untouched, because the turn never reaches
+        // a completion — but the catalogue fetch has already happened.
+        let models_before = mock.models_hits();
+        let requests_before = mock.chat_bodies().len();
+        let records_before = core
+            .runtime()
+            .block_on(core.list_requests(100, 0))
+            .expect("requests")
+            .len();
+        let actions_before = core
+            .runtime()
+            .block_on(core.test_space_actions(space.clone()))
+            .expect("actions")
+            .len();
+
+        // The planned turn refuses rather than starting.
+        let err = core
+            .runtime()
+            .block_on(async {
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                core.respond_stream_as(
+                    space.clone(),
+                    pending.participant_id.clone(),
+                    i1.clone(),
+                    tx,
+                )
+                .await
+            })
+            .expect_err("a turn planned before the archival must not start after it");
+        match &err {
+            AppError::SpaceArchived { space_id } => assert_eq!(space_id, &space),
+            other => panic!("expected SpaceArchived, got {other:?}"),
+        }
+
+        // Nothing else on the turn path starts one either — the gate is in the
+        // shared preparation, so every entry point inherits it.
+        for (what, result) in [
+            (
+                "an explicit retry",
+                core.runtime().block_on(async {
+                    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                    core.respond_stream(space.clone(), MODEL.into(), i1.clone(), tx)
+                        .await
+                }),
+            ),
+            (
+                "a regeneration",
+                core.runtime()
+                    .block_on(core.regenerate(i1.clone(), MODEL.into())),
+            ),
+        ] {
+            assert!(
+                matches!(result, Err(AppError::SpaceArchived { .. })),
+                "{what} must be refused too, got {result:?}"
+            );
+        }
+
+        // And the persisted answer does not resurrect the room: re-planning
+        // from it yields nothing at all.
+        assert!(
+            matches!(
+                core.runtime()
+                    .block_on(core.plan_notifications(space.clone(), i1.clone()))
+                    .expect("plan"),
+                NotificationPlan::Turns(t) if t.is_empty()
+            ),
+            "an archived space plans no turns"
+        );
+
+        // Nothing was spent past the archival: no request left the process and
+        // no action was written after it.
+        assert_eq!(
+            mock.models_hits(),
+            models_before,
+            "a refused turn never got as far as building a client and fetching \
+             the catalogue — this is what pins the gate ahead of backend setup"
+        );
+        assert_eq!(
+            mock.chat_bodies().len(),
+            requests_before,
+            "a refused turn makes no upstream request"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.list_requests(100, 0))
+                .expect("requests")
+                .len(),
+            records_before,
+            "and records none"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.test_space_actions(space.clone()))
+                .expect("actions")
+                .len(),
+            actions_before,
+            "and writes nothing"
+        );
+
+        // Reading is untouched — archival closes a conversation, it does not
+        // hide or delete one.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.get_space_tree(space))
+                .expect("tree")
+                .len(),
+            2,
+            "the transcript is whole"
+        );
+    });
+}
+
+/// **A closed room is not worth asking the router about.**
+///
+/// Planning and refinement are two calls, and an archival can land between
+/// them — a retirement closing the rooms an agent owned is the case that made
+/// this reachable. Refinement would then hold a live plan for a conversation
+/// that has since closed, and a *remote* router model bills a real inference
+/// per triggering post: money spent choosing among turns `prepare_turn` will
+/// refuse the moment anyone tries to drive them.
+///
+/// The fix is the same one-read shape the turn path uses: refinement reads the
+/// space's own row once and takes both facts off it — still open, and does it
+/// route — rather than reading the router setting alone.
+#[test]
+fn refinement_asks_no_router_about_a_room_that_closed_under_it() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            router: chat_harness::RouterBehavior::Reply(r#"{"notify": [1]}"#.into()),
+            ..MockConfig::default()
+        });
+        let (space, post) = space_with_two_candidates(&core);
+        enable_router(&core, &mock, &space);
+
+        // The plan is computed while the conversation is open…
+        let plan = core
+            .runtime()
+            .block_on(core.mechanical_notification_plan(space.clone(), post.clone()))
+            .expect("plan");
+        assert!(
+            matches!(&plan, NotificationPlan::Turns(t) if t.len() == 2),
+            "precondition: a real plan to refine, {plan:?}"
+        );
+
+        // …and the room closes before refinement runs.
+        assert!(
+            core.runtime()
+                .block_on(core.archive_space(space.clone()))
+                .expect("archive")
+        );
+
+        let before = router_calls(&mock).len();
+        let refined = core
+            .runtime()
+            .block_on(core.test_refine_notifications(space.clone(), post.clone(), plan.clone()))
+            .expect("refine");
+
+        assert_eq!(
+            router_calls(&mock).len(),
+            before,
+            "no router request for a conversation that has closed"
+        );
+        assert_eq!(
+            refined, plan,
+            "and the plan comes back untouched — refinement degrades, it never invents"
+        );
+
+        // The control: the same call on an open conversation does ask.
+        let (open_space, open_post) = space_with_two_candidates(&core);
+        enable_router(&core, &mock, &open_space);
+        let open_plan = core
+            .runtime()
+            .block_on(core.mechanical_notification_plan(open_space.clone(), open_post.clone()))
+            .expect("plan");
+        let before = router_calls(&mock).len();
+        core.runtime()
+            .block_on(core.test_refine_notifications(open_space, open_post, open_plan))
+            .expect("refine");
+        assert_eq!(
+            router_calls(&mock).len(),
+            before + 1,
+            "an open conversation is still routed"
+        );
+    });
+}

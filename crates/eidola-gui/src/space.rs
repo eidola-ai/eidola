@@ -79,9 +79,38 @@ pub struct StreamingTurn {
     pub response: StreamingResponse,
 }
 
+/// Whether a failure is worth offering **Retry** for — i.e. whether re-asking
+/// could plausibly succeed *given the affordances this app has*.
+///
+/// That last clause is why the question is answered here and not in app-core:
+/// the core ships typed variants and no opinion about what a reader can do
+/// next, and retryability is exactly such an opinion. It is also why the
+/// default is `true` — a network blip recovers, credits get topped up, a
+/// missing model gets configured, so almost every refusal is worth another
+/// press, and a new variant should keep that behaviour until somebody decides
+/// otherwise rather than silently losing its recovery path.
+///
+/// The exception is a refusal nothing in the app can lift.
+/// [`AppError::SpaceArchived`] is the first: archival is what closes a
+/// conversation, and there is **no unarchive door anywhere in this
+/// application** — the Library lists only live spaces and offers Archive, and
+/// nothing offers the reverse. So a Retry there could only ever re-hit the
+/// same guard, and an affordance that cannot succeed is worse than none: it
+/// invites the reader to keep pressing while the explanation stays put.
+///
+/// The explanation itself is not affected — see
+/// `SpaceView::render_error_band`. What goes is the button, not the sentence.
+pub(crate) fn is_retryable(e: &AppError) -> bool {
+    !matches!(e, AppError::SpaceArchived { .. })
+}
+
 /// The turn a failed ask leaves behind — who was asked, about what — so the
 /// recovery notice's Retry can re-ask the *same* participant without
 /// disturbing any sibling turns still streaming.
+///
+/// **Only a retryable failure leaves one** ([`is_retryable`]): the record *is*
+/// what arms Retry ([`Space::can_retry`]), so a permanent refusal recording one
+/// would offer a button whose only possible outcome is the same refusal again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedTurn {
     pub participant_id: String,
@@ -160,6 +189,18 @@ pub struct ChatMessageView {
     pub blocks: Vec<PostBlockSpan>,
     pub reasoning: Option<String>,
     pub reasoning_expanded: bool,
+    /// Whether **Regenerate** applies to this post — true only for an agent's
+    /// *inferred* answer.
+    ///
+    /// Carried rather than derived from [`Self::message`]'s role, because the
+    /// role cannot answer it: an agent-authored `brief` renders in the same
+    /// `assistant` slot (it is that agent's own words, so the byline and the
+    /// column are right) and regenerating one is refused by the core —
+    /// `AppError::WrongPostKind`, since a brief was never inferred and there is
+    /// no attempt to repeat. Offering a verb whose only outcome is that refusal
+    /// is the affordance lying about what it does, so the fact travels from
+    /// where the action type is known and the gutter reads it.
+    pub regenerable: bool,
 }
 
 impl ChatMessageView {
@@ -183,6 +224,8 @@ impl ChatMessageView {
             blocks: Vec::new(),
             reasoning: None,
             reasoning_expanded: false,
+            // A synthetic row has no persisted action to regenerate.
+            regenerable: false,
         }
     }
 
@@ -198,9 +241,16 @@ impl ChatMessageView {
             "user_input" => "user",
             "inference" => "assistant",
             "error" => "error",
+            // An agent-authored post that was not inferred — today the `brief`
+            // that opens a delegated conversation. Its author is an agent, so
+            // it belongs in the same column under the same byline; what it is
+            // not is a *response*, which `regenerable` below is what records.
             _ => "assistant",
         }
         .to_string();
+        // Mirrors the core's own rule for `regenerate` (an `inference` tip), so
+        // the affordance and the refusal cannot disagree.
+        let regenerable = node.action_type == "inference";
         // Concatenate the text blocks, recording each block's span within the
         // joined content (the selection→quote mapping); collect the thinking
         // blocks separately as the disclosure.
@@ -243,6 +293,7 @@ impl ChatMessageView {
             blocks,
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
             reasoning_expanded: false,
+            regenerable,
         }
     }
 }
@@ -1565,7 +1616,18 @@ impl Space {
     ) {
         self.streams.retain(|s| s.seq != seq);
         self.turn_runners.remove(&seq);
-        if let (Some(p), Some(t)) = (participant_id, target_action_id) {
+        // A permanent refusal records nothing **and ends whatever recovery was
+        // already standing**: the record is what arms Retry, and Retry on a
+        // closed conversation can only re-hit the guard that closed it (see
+        // [`is_retryable`]). Not clearing is the subtler half — an earlier
+        // retryable failure leaves a record behind, and the band would then
+        // explain the refusal while Retry re-asked on the *old* record's
+        // behalf, into a room that cannot reopen. One refusal that stands
+        // supersedes any recovery it stands in front of. The notice still
+        // explains itself either way — `SpaceEvent::Failed` carries the error.
+        if !is_retryable(&e) {
+            self.failed_turn = None;
+        } else if let (Some(p), Some(t)) = (participant_id, target_action_id) {
             self.failed_turn = Some(FailedTurn {
                 participant_id: p,
                 target_action_id: t,

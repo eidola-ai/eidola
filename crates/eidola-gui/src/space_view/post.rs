@@ -458,7 +458,13 @@ impl SpaceView {
                     })),
                 )
             }
-            "assistant" => {
+            // **Only an agent's inferred answer**, which is not the same set
+            // as "everything in the assistant column": an agent-authored brief
+            // renders there too, and regenerating one is refused by the core
+            // (it was never inferred, so there is no attempt to repeat). The
+            // verb reads `post.regenerable` rather than the role so it offers
+            // exactly what would work.
+            "assistant" if post.regenerable && self.viewer_may_act(cx) => {
                 let id = action_id.clone();
                 col.child(
                     verb(
@@ -497,6 +503,121 @@ impl SpaceView {
             self.hovered_post = None;
             cx.notify();
         }
+    }
+
+    /// Whether the reader may *act* in this conversation, or is only watching
+    /// it — the view's half of app-core's `require_human_joined`.
+    ///
+    /// A human can open any conversation their agents opened between
+    /// themselves, and the window that opens is an ordinary one: a composer, a
+    /// per-post gutter, an Ask menu. The core refuses every one of those verbs
+    /// there ([`AppError::NotJoined`]) — except **Ask**, which cannot be
+    /// refused there and must not be: it drives `respond_stream_as`, which
+    /// names the agent it acts as and is the door a turn driver uses. So for
+    /// Ask this *is* the gate, and for the rest it keeps the window from
+    /// offering what it knows would be refused.
+    ///
+    /// **A pure read, asked at render.** The two cells it reads land
+    /// asynchronously and their store observers repaint, so a verdict cached
+    /// into the render snapshot would go on offering verbs after the roster had
+    /// answered. Loading is [`Self::ensure_viewer_gate`]'s job; deciding is
+    /// this one's, every frame.
+    ///
+    /// **Known means `Loadable::value()`, the same read the rendering uses.**
+    /// A refresh that fails over a good snapshot resolves to `Failed { prior }`
+    /// and every consumer goes on showing the prior — `ParticipantsStore::list`,
+    /// which is what `space_agents` and so the Ask chips read, resolves through
+    /// `value()` for exactly that reason. A gate that instead asked for
+    /// `Loaded` called that state unknown, and its unknowns are not neutral: the
+    /// roster's answered "may act", so a failed refresh handed the verbs back
+    /// *over the very roster that proves the reader is not a member*, with the
+    /// chips rendering from that same retained list. Asking the one question
+    /// both sides ask is what makes them unable to disagree. It cuts the other
+    /// way on the second cell too, where the mismatch was merely wrong rather
+    /// than dangerous: a notebook whose settings refresh failed kept a prior
+    /// that says "notebook" and would have stayed suppressed on it.
+    ///
+    /// **An unknown answers whichever way costs least, and that is not the same
+    /// answer twice:**
+    ///
+    /// * **The roster unanswered ⇒ may act.** It is the cell every window
+    ///   loads, it arrives with the conversation, and until it does there is no
+    ///   reason to suspect anything — an ordinary room, where the human is
+    ///   always a member, must never flicker its verbs on the way in.
+    /// * **The roster answered *without* the reader, the notebook cell
+    ///   unanswered ⇒ may not act.** This is the suspicious window and the only
+    ///   one, so it is the only place the doubt is worth paying for: the reader
+    ///   is provably not a member, and the sole thing that could still make
+    ///   acting legitimate is this being a notebook. Guessing "may act" here
+    ///   exposes an Ask that no one downstream will refuse, which is a billed
+    ///   inference; guessing "may not" costs a notebook's verbs for as long as
+    ///   one cell takes to answer, after which they come back. That trade is
+    ///   the whole reason the two unknowns answer differently.
+    pub(crate) fn viewer_may_act(&self, cx: &gpui::App) -> bool {
+        let id = self.space.read(cx).id();
+        let Some(roster) = self.stores.participants.read(cx).participants(id).value() else {
+            return true;
+        };
+        if roster
+            .iter()
+            .any(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+        {
+            return true;
+        }
+        match self.stores.space_settings.read(cx).settings(id).value() {
+            Some(settings) => settings.notebook_participant_id.is_some(),
+            None => false,
+        }
+    }
+
+    /// Load what [`Self::viewer_may_act`] needs to answer with.
+    ///
+    /// The notebook cell is asked for **only** once the roster has answered
+    /// without the reader in it, so an ordinary conversation — where the human
+    /// is always a member — never loads it at all.
+    pub(crate) fn ensure_viewer_gate(&mut self, cx: &mut Context<Self>) {
+        let id = self.space.read(cx).id().to_string();
+        // The same read the verdict takes: a roster retained through a failed
+        // refresh is an answered roster, and if it lacks the reader the second
+        // cell is still the thing that would settle the question.
+        let Some(roster) = self.stores.participants.read(cx).participants(&id).value() else {
+            return;
+        };
+        if roster
+            .iter()
+            .any(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+        {
+            return;
+        }
+        self.stores
+            .space_settings
+            .update(cx, |s, cx| s.ensure(id, cx));
+    }
+
+    /// The agents this reader may **ask** to respond — [`Self::space_agents`]
+    /// for a participant, nobody for someone who is only watching.
+    ///
+    /// Every Ask surface reads this rather than `space_agents`, which is what
+    /// keeps the sweep closed: Ask is the one acting verb app-core cannot
+    /// refuse on the reader's behalf, so an Ask chip that renders is a billed
+    /// inference that will run. `space_agents` itself stays unfiltered — it
+    /// also names streaming bylines, and who is speaking is not a permission.
+    pub(crate) fn askable_agents(&self, cx: &gpui::App) -> Vec<(String, String)> {
+        if self.viewer_may_act(cx) {
+            self.space_agents(cx)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Test-only: reveal one post's action gutter, as hovering it would.
+    ///
+    /// Exists because an *absent* verb is only meaningful against a revealed
+    /// gutter — otherwise a test asserting "no Regenerate here" would pass on a
+    /// gutter that was simply not showing.
+    #[doc(hidden)]
+    pub fn reveal_post_affordances_for_test(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.set_post_hover(&SharedString::from(id.to_string()), true, cx);
     }
 
     /// Begin editing a persisted user post in place: retire any active draft,
@@ -960,12 +1081,15 @@ impl SpaceView {
             .children
             .iter()
             .any(|c| matches!(c.src, NodeSrc::Msg(_)));
+        // One gate for the whole band — the Ask chips *and* the Reply that
+        // opens a draft — so a reader who is only watching is not handed a
+        // composer whose Send is refused, nor an Ask that would spend.
         let agents = if is_persisted {
-            self.space_agents(cx)
+            self.askable_agents(cx)
         } else {
             Vec::new()
         };
-        let offer_reply = is_persisted && has_committed_reply;
+        let offer_reply = is_persisted && has_committed_reply && self.viewer_may_act(cx);
         let offer_ask = !agents.is_empty();
         let menu_open = self.band_menu.as_ref() == Some(&parent_id);
 

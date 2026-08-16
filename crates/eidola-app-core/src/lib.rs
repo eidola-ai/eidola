@@ -8,6 +8,7 @@ pub mod error;
 pub mod local_models;
 pub mod memory;
 pub mod router;
+pub mod subspaces;
 pub mod summaries;
 pub mod tools;
 pub mod trust_root;
@@ -42,6 +43,10 @@ use error::AppError;
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
     LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
+};
+pub use subspaces::{
+    MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, MAX_SUBAGENTS_PER_SPAWN, SpaceCapability,
+    SpawnRefusal, SpawnedSubspace, SubspaceInfo,
 };
 
 // ============================================================================
@@ -365,6 +370,13 @@ pub struct SpaceSettings {
     /// membership is structural, so no Remove may be offered beside it — an
     /// affordance that could only ever be refused.
     pub notebook_participant_id: Option<String>,
+    /// The agent that **owns this sub-space**, if it is one — the other
+    /// structural membership, carried for the same reason and read the same
+    /// way. It records who is answerable for the delegation, whose live-room
+    /// quota it counts against, and who its report goes to, so nothing can end
+    /// it and nothing can grant it back; a roster offering Remove beside that
+    /// row offers a press that can only bounce.
+    pub subspace_owner_participant_id: Option<String>,
 }
 
 impl Default for SpaceSettings {
@@ -373,6 +385,7 @@ impl Default for SpaceSettings {
             cascade_limit: DEFAULT_CASCADE_LIMIT,
             router_model: None,
             notebook_participant_id: None,
+            subspace_owner_participant_id: None,
         }
     }
 }
@@ -2766,7 +2779,7 @@ impl Inner {
                 Some(v) => *v,
                 None => {
                     let v =
-                        db::is_space_member(&db_conn, &r.space_id, viewer_participant_id).await?;
+                        db::may_read_space(&db_conn, &r.space_id, viewer_participant_id).await?;
                     seen.insert(r.space_id.clone(), v);
                     v
                 }
@@ -3019,11 +3032,33 @@ impl Inner {
                 ),
             });
         }
-        // Rule 1: only a participant of the referenced space may create a
-        // reference to it. Membership is the ACL (task 36), so the fix is an
-        // ordinary grant and a retry — no special machinery, no new concept.
-        // The refusal names nothing about that space (see `NotAParticipant`).
-        if !db::is_space_member(conn, &source_space_id, author_participant_id).await? {
+        // Rule 1, in the words it has always had: **you may quote what you can
+        // read.** So the question asked here is the read one
+        // (`db::may_read_space`), not bare membership — which is what it had
+        // drifted into, and what made the human read bypass incoherent: a
+        // reader can open the rooms their agents opened between themselves,
+        // and quoting a finding out of one into their own conversation is
+        // precisely the oversight the bypass exists for. Asking membership
+        // refused exactly that, deterministically, after the draft was already
+        // composed.
+        //
+        // **Widening it grants nothing new.** Quoting *copies* the excerpt to
+        // the new audience, and the premise is that this author can already
+        // read the passage — they could retype it. The link itself is not a
+        // capability; that is the doctrine's own sentence.
+        //
+        // **And it is author-kind-aware by construction**, so it cannot leak
+        // sideways: `may_read_space` widens for a *human* viewer and for
+        // nobody else, so an agent that is not a member still fails it. Today
+        // that is theoretical — the one caller is `post`, which hard-codes the
+        // shared human as author — but it means a future non-human caller
+        // inherits the membership rule rather than the bypass.
+        //
+        // **A notebook stays refused** by that function's own carve-out: an
+        // agent's private residence is the one space the human may not read,
+        // and so the one they may not quote. The refusal names nothing about
+        // the space either way (see `NotAParticipant`).
+        if !db::may_read_space(conn, &source_space_id, author_participant_id).await? {
             return Err(AppError::NotAParticipant {
                 participant_id: author_participant_id.to_string(),
                 action_id: spec.antecedent_action_id.clone(),
@@ -3229,6 +3264,62 @@ impl Inner {
                 message: "that participant is no longer part of this space, so this change \
                           was not saved"
                     .to_string(),
+            });
+        }
+        // Still a live member, so the write was refused rather than orphaned:
+        // the only clause left is the sub-space owner's notify policy, which
+        // the statement keeps non-inherited and never `all` (see
+        // `db::update_space_participant_override`). Read afterwards to *name*
+        // the refusal — never to decide it.
+        if ov.notify_policy.is_some()
+            && db::subspace_owner_of(&conn, space_id).await?.as_deref() == Some(participant_id)
+        {
+            return Err(AppError::Config {
+                message: "this agent opened this conversation and answers for it, so it stays \
+                          quiet while its helpers work — it can be set to reply to people or \
+                          to nobody, but not to every post, and not left to inherit"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// **Reading a sub-space is oversight; acting in one is membership.**
+    ///
+    /// A human can open any of the rooms their agents opened
+    /// (`db::may_read_space`), and the Library offers every listed row a window
+    /// with a composer and a full set of per-post verbs. What none of that may
+    /// do is *act*: a post written by a participant the roster does not carry
+    /// makes that roster a lie to every model in the room and fires the `human`
+    /// notify policy in a space whose whole premise is that it has none, and a
+    /// regeneration or a retry spends the reader's credits driving a
+    /// conversation they never joined. Oversight is looking; this is the line
+    /// it stops at.
+    ///
+    /// **Every door that acts *as the human* asks this**, and that is exactly
+    /// the set: `post` (and `chat`/`chat_stream`/`submit` through it), which
+    /// hard-codes the human as author, and `edit_post`, `regenerate` and
+    /// `respond_stream`, which the human's own picker and per-post verbs drive.
+    /// `respond_stream_as` deliberately does **not** — it names the participant
+    /// it acts as, is already gated on *that* participant's membership
+    /// (`resolve_explicit_participant`), and is the door a turn driver uses, so
+    /// a human-membership test there would refuse the sub-space's own agents
+    /// working in their own room.
+    ///
+    /// Asked before any write and before any spend, so a refusal is zero-trace.
+    /// A **notebook** is deliberately untouched — the human has always been
+    /// able to write in their own agent's notebook from Settings, and
+    /// narrowing that is not this rule's business.
+    async fn require_human_joined(
+        &self,
+        conn: &turso::Connection,
+        space_id: &str,
+    ) -> Result<(), AppError> {
+        if db::subspace(conn, space_id).await?.is_some()
+            && !db::is_space_member(conn, space_id, db::HUMAN_PARTICIPANT_ID).await?
+        {
+            return Err(AppError::NotJoined {
+                space_id: space_id.to_string(),
             });
         }
         Ok(())
@@ -3811,7 +3902,8 @@ impl Inner {
             });
         }
 
-        if !db::retire_participant_tx(&conn, participant_id, now_ms()).await? {
+        let retirement = db::retire_participant_tx(&conn, participant_id, now_ms()).await?;
+        if !retirement.retired {
             // The pre-check read a live row, so a `false` here means another
             // writer retired it in between. Same fact, same message.
             return Err(AppError::NotConfigured {
@@ -3819,15 +3911,27 @@ impl Inner {
             });
         }
 
-        // `Change::Participants` and nothing else — the same reasoning
-        // `promote_participant` states: the space this archived is a notebook,
-        // which `list_spaces` excludes unconditionally (in **both** its
-        // `include_archived` branches), so the Library listing provably did not
-        // change and a `SpaceIndex` here would invalidate a store that reads
-        // nothing new. `archive_space` emits `SpaceIndex` because the space it
-        // archives is one the Library lists; the rule is the same, the answer
-        // differs because the space does.
+        // **`Change::Participants` always, and `SpaceIndex` exactly when the
+        // Library's listing actually moved.** The rule has never been about
+        // what was archived but about whether the listing shows it: a notebook
+        // is excluded from `list_spaces` in **both** its `include_archived`
+        // branches, so archiving one provably changes nothing a store would
+        // re-read, while a sub-space is an ordinary Library row and archiving
+        // one takes it out of the default view. The transaction counts the
+        // listed rows it archived so this can announce the one it changed and
+        // stay silent about the one it did not — which is why the count comes
+        // back from inside the write rather than from a read after it.
+        //
+        // Nothing else is emitted, and that is checked rather than assumed: no
+        // store reads a *single* space's archival (`SpaceSettings` carries the
+        // cascade limit, the router and the notebook owner, not `archived_at`),
+        // so a `Space(id)` here would announce a change no subscriber can
+        // observe. `archive_space` emits `SpaceIndex` alone for the same
+        // reason.
         self.bus.emit(Change::Participants);
+        if retirement.listed_spaces_archived > 0 {
+            self.bus.emit(Change::SpaceIndex);
+        }
         Ok(())
     }
 
@@ -3865,6 +3969,23 @@ impl Inner {
                         message: format!(
                             "this space is {who}'s notebook — it is where its memory lives, so it \
                          cannot leave it"
+                        ),
+                    });
+                }
+                // The other structural membership, refused in the same
+                // statement and for the same shape of reason: the owner row is
+                // the whole of what records who is answerable for a delegation,
+                // whose live-room quota it counts against, and who its report
+                // goes to, and nothing can grant a sub-space ownership back.
+                db::SpaceRemoval::RefusedSubspaceOwner => {
+                    let who = db::get_participant(&conn, participant_id)
+                        .await?
+                        .map(|p| p.label)
+                        .unwrap_or_else(|| "that agent".to_string());
+                    return Err(AppError::Config {
+                        message: format!(
+                            "{who} opened this conversation and is answerable for it, so it \
+                             cannot leave it — archive the conversation instead"
                         ),
                     });
                 }
@@ -4156,6 +4277,7 @@ impl Inner {
             cascade_limit,
             router_model: db::space_router_model(&conn, space_id).await?,
             notebook_participant_id: db::notebook_participant_of(&conn, space_id).await?,
+            subspace_owner_participant_id: db::subspace_owner_of(&conn, space_id).await?,
         })
     }
 
@@ -4369,6 +4491,7 @@ impl Inner {
                     .ok_or_else(|| AppError::NotConfigured {
                         message: format!("space not found: {sid}"),
                     })?;
+            self.require_human_joined(&db_conn, sid).await?;
             (sid.to_string(), row.title, false)
         } else {
             // A new space is instantiated from the default template, so it has
@@ -4507,6 +4630,26 @@ impl Inner {
             .ok_or_else(|| AppError::Internal {
                 message: format!("item has no current generation: {item_id}"),
             })?;
+        // Acting as the human in a room they have not joined — same gate as
+        // `post`, asked here because an edit is the same act on an older post.
+        self.require_human_joined(&db_conn, &space_id).await?;
+
+        // **An edit appends a `user_input` generation authored by the human**,
+        // so aimed at anything else it does not amend a post — it replaces
+        // another participant's words with the human's, under that
+        // participant's byline for every prior generation, in an item whose
+        // whole trail then says two different things about who was writing.
+        // The kind it may claim is the kind it writes. (An agent-authored
+        // brief is the case that made this reachable: it renders in the
+        // assistant slot, and it is a contract the room's participants are
+        // working from.)
+        require_post_kind(
+            &db_conn,
+            &tip,
+            "user_input",
+            "only your own posts can be edited",
+        )
+        .await?;
         let reply_parent = db::reply_antecedent(&db_conn, &tip).await?;
         let tip_references = db::reference_antecedents(&db_conn, &tip).await?;
 
@@ -4759,6 +4902,43 @@ impl Inner {
 
         let db_conn = self.db_conn().await?;
 
+        // **The space must exist and must still be open, and that is asked
+        // before anything else is done — first read, first refusal.**
+        //
+        // One statement answers both, so no interleaving can put "it is there"
+        // in front of an archival that has already landed. It sits here, ahead
+        // of the participant and the backend, because everything below it
+        // *acts*: resolving a backend persists a provider row, an engine-backed
+        // model may start a llama.cpp subprocess, and the eidola path builds an
+        // attested client and fetches the model catalogue over the network. A
+        // refusal that came after those would be a turn that never ran leaving
+        // a spawned sidecar, a durable row and a handshake behind it — work
+        // done on behalf of a conversation somebody had closed. Refusing on the
+        // first read costs one query and leaves nothing.
+        //
+        // This is the gate every entry point passes through (`chat` /
+        // `chat_stream`, `regenerate`, `respond_stream`, and the
+        // participant-aware `respond_stream_as` a cascade is driven through),
+        // which is what makes "an archived conversation takes no new turns" a
+        // property of the turn path rather than a rule each caller has to
+        // remember. It is the *second* of two gates and the one that closes the
+        // race the first cannot: a plan is computed, the space is archived, and
+        // only then is the planned turn driven — planning refuses afterwards
+        // (`mechanical_plan`), this refuses in between. A turn already past
+        // this point runs to completion and persists; see
+        // [`AppError::SpaceArchived`] for why the boundary is drawn there.
+        let space_row =
+            db::get_space(&db_conn, space_id)
+                .await?
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("space not found: {space_id}"),
+                })?;
+        if space_row.archived_at.is_some() {
+            return Err(AppError::SpaceArchived {
+                space_id: space_id.to_string(),
+            });
+        }
+
         let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
             Arc::new(Mutex::new(Vec::new()));
 
@@ -4982,12 +5162,6 @@ impl Inner {
             context_length.min(4096) as u32
         };
 
-        // The space already exists (post created it). Validate it first.
-        db::get_space(&db_conn, space_id)
-            .await?
-            .ok_or_else(|| AppError::NotConfigured {
-                message: format!("space not found: {space_id}"),
-            })?;
         // The target (the post being replied to / the generation being revised)
         // must belong to this space — otherwise a caller could splice another
         // space's thread into this turn (cross-space context + reply edge). This
@@ -6240,6 +6414,29 @@ impl Inner {
             .ok_or_else(|| AppError::Internal {
                 message: format!("item has no current generation: {item_id}"),
             })?;
+        // A regeneration is the human's verb — their picker chooses the model —
+        // and it *spends*, so it takes the same gate as `post`, before any of
+        // that. Reading a delegated conversation must not come with a button
+        // that drives one.
+        self.require_human_joined(&db_conn, &space_id).await?;
+
+        // **Regeneration is "that agent, again", and it is destructive**: it
+        // supersedes the tip with a fresh `inference`, and `Revise` withholds
+        // the generation being replaced from the context, so what comes back
+        // is written without having seen what it replaces. Aimed at anything
+        // that was not inferred, that is not a second attempt at the same
+        // thing — it is a billed turn that overwrites authored text with a
+        // model's guess at it. The sub-space brief is the sharp case (it
+        // renders in the assistant slot, so a surface offering Regenerate by
+        // role would offer it): the brief is the contract the room is working
+        // from, and there is no attempt to repeat.
+        require_post_kind(
+            &db_conn,
+            &tip,
+            "inference",
+            "only an agent's answer can be regenerated",
+        )
+        .await?;
         drop(db_conn);
         self.run_turn(
             &space_id,
@@ -6730,13 +6927,25 @@ impl Inner {
         // depth behind `ChatResult::response_action_id` being `None` on a
         // declined turn (see [`decline`]); the guard is cheap and the failure
         // it prevents is silent.
-        match db::action_type(&conn, post_action_id).await?.as_deref() {
-            Some("user_input") | Some("inference") => {}
+        match db::action_type(&conn, post_action_id).await? {
+            Some(t) if db::is_post_action_type(&t) => {}
             _ => return Ok(NotificationPlan::Turns(Vec::new())),
         }
 
-        let limit = db::space_cascade_limit(&conn, space_id)
-            .await?
+        // **An archived conversation plans no turns**, and the same read that
+        // answers that carries the cascade budget — one statement for the
+        // whole verdict, so an archival cannot land between the two halves of
+        // it. This is the gate that stops a *cascade*: every hop re-plans, so
+        // an archival stops the next hop even when it lands mid-flight, and a
+        // turn that was already streaming persists its answer into a room that
+        // then goes quiet. Archival is not a soft delete — nothing here is
+        // hidden or refused a reader — it is the end of new work.
+        let space = db::get_space(&conn, space_id).await?;
+        if space.as_ref().is_some_and(|s| s.archived_at.is_some()) {
+            return Ok(NotificationPlan::Turns(Vec::new()));
+        }
+        let limit = space
+            .map(|s| s.cascade_limit)
             .unwrap_or(DEFAULT_CASCADE_LIMIT);
         let depth = db::agent_cascade_depth(&conn, post_action_id).await?;
         if depth >= limit {
@@ -7014,6 +7223,14 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move {
+                // Retry is the human's verb — their picker chose the model —
+                // and it spends, so it takes the same gate `post` does before
+                // anything else happens. `respond_stream_as` below deliberately
+                // does not: it names the participant it acts as, and that is a
+                // door a turn driver uses.
+                let conn = inner.db_conn().await?;
+                inner.require_human_joined(&conn, &space_id).await?;
+                drop(conn);
                 inner
                     .run_turn_stream(
                         &space_id,
@@ -7114,15 +7331,23 @@ impl AppCore {
     ///
     /// **This is the human click path of task 37's rule 4, so it is gated like
     /// the agent one.** Following a reference is following it whoever does it:
-    /// the read answers only for a `viewer_participant_id` that is a live
-    /// member of the action's space, and otherwise refuses with
-    /// [`AppError::NotAParticipant`] — which names no title, no participant and
-    /// no content (rule 3 already made *existence* public inside the
-    /// referencing space; nothing else is). The viewer is a required argument
-    /// rather than a second entry point so no caller can navigate without
-    /// asking: the ungated read would have opened an agent's private notebook
-    /// to a reader who is not in it, which is the one space the human is
-    /// genuinely not a member of.
+    /// the read answers only for a `viewer_participant_id` that may read the
+    /// action's space (`db::may_read_space` — a live member, or any human),
+    /// and otherwise refuses with [`AppError::NotAParticipant`] — which names
+    /// no title, no participant and no content (rule 3 already made
+    /// *existence* public inside the referencing space; nothing else is). The
+    /// viewer is a required argument rather than a second entry point so no
+    /// caller can navigate without asking.
+    ///
+    /// **The human arm is the one that is wider than membership**, and this is
+    /// one of the two surfaces it is wider on (see `db::may_read_space` for
+    /// the whole rule). An agent-spawned sub-space has no human member by
+    /// construction, so a membership-only read would make the rooms an agent
+    /// opened on the human's behalf the one thing the human could not oversee.
+    /// A **notebook** is still refused — an agent's own residence is the
+    /// privacy this gate was built for, and refusing it is what keeps the
+    /// bypass about oversight rather than about access. Models' gates are
+    /// untouched.
     ///
     /// `Ok(None)` stays "no such action" — an unknown id is not a refusal, and
     /// conflating the two would make this read a membership oracle.
@@ -7140,7 +7365,7 @@ impl AppCore {
                 else {
                     return Ok(None);
                 };
-                if !db::is_space_member(&conn, &space_id, &viewer_participant_id).await? {
+                if !db::may_read_space(&conn, &space_id, &viewer_participant_id).await? {
                     return Err(AppError::NotAParticipant {
                         participant_id: viewer_participant_id,
                         action_id,
@@ -7198,6 +7423,35 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.mechanical_plan(&space_id, &post_action_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Test-only seam: refine a plan the caller already holds.
+    ///
+    /// Production always plans and refines in one call
+    /// ([`Self::plan_notifications`]), which is exactly why the interleaving
+    /// worth testing cannot be reached from outside: an archival that lands
+    /// *between* the two — the one a retirement performs, say — leaves
+    /// refinement holding a plan for a room that has since closed, and a remote
+    /// router would bill an inference to choose among turns that can no longer
+    /// run. Handing refinement a plan directly is the only way to stage that
+    /// moment.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_refine_notifications(
+        &self,
+        space_id: String,
+        post_action_id: String,
+        plan: NotificationPlan,
+    ) -> Result<NotificationPlan, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                Ok(inner
+                    .refine_notifications(&space_id, &post_action_id, plan)
+                    .await)
+            })
             .await
             .map_err(join_err)?
     }
@@ -8239,6 +8493,33 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Test-only seam: grant a space a capability outright.
+    ///
+    /// It exists because the capability model is deliberately closed: the only
+    /// writer is a spawn, and a spawn may only carry down what the parent
+    /// already holds — so with no capability in the world there is nothing for
+    /// the attenuation gate to *pass*, and only its refusals could be tested.
+    /// This seeds the root of a chain so the gate can be held to both answers.
+    /// Nothing in production grants a capability yet, which is the whole point
+    /// of the shape (see [`subspaces`]).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_grant_space_capability(
+        &self,
+        space_id: String,
+        name: String,
+        config: String,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                db::test_insert_space_capability(&conn, &space_id, &name, &config).await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Test-only seam: a space's whole footprint as raw row counts —
     /// `(space rows, space_participant rows, owned participant rows)`.
     ///
@@ -8468,6 +8749,102 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// **Spawn a sub-space**: a new space under `parent_space_id` with **no
+    /// human member**, owned by `owner_participant_id` and opened by the
+    /// `brief` that agent writes into it. See [`subspaces`] for the shape and
+    /// the attenuation rule; `db::spawn_subspace_tx` for the guards, every one
+    /// of which is decided inside the writing transaction.
+    ///
+    /// `participants` are global agents seated beside the owner (empty = the
+    /// owner alone, the scratch-space mode). `capabilities` are names the
+    /// parent space must already hold, carried down with their configuration
+    /// copied verbatim — a request can narrow the set and can never widen one.
+    /// `title` is optional; the brief's opening line names the room when none
+    /// is given.
+    ///
+    /// Refusals arrive as [`AppError::SpawnRefused`] carrying a
+    /// [`SpawnRefusal`], and leave nothing behind. On success:
+    /// [`Change::SpaceIndex`] (the Library lists sub-spaces like any other
+    /// conversation), [`Change::Space`] for the new id, and
+    /// [`Change::Participants`].
+    pub async fn spawn_subspace(
+        &self,
+        parent_space_id: String,
+        owner_participant_id: String,
+        brief: String,
+        participants: Vec<String>,
+        capabilities: Vec<String>,
+        title: Option<String>,
+    ) -> Result<SpawnedSubspace, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .spawn_subspace(
+                        &parent_space_id,
+                        &owner_participant_id,
+                        &brief,
+                        &participants,
+                        &capabilities,
+                        title.as_deref(),
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Every sub-space spawned from `parent_space_id`, oldest first, archived
+    /// ones included. Pure read.
+    pub async fn subspaces_of(
+        &self,
+        parent_space_id: String,
+    ) -> Result<Vec<SubspaceInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.subspaces_of(&parent_space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Every live sub-space `owner_participant_id` owns — the rooms an agent
+    /// is answerable for, and the set the per-owner spawn guard counts. Pure
+    /// read.
+    pub async fn live_subspaces_owned_by(
+        &self,
+        owner_participant_id: String,
+    ) -> Result<Vec<SubspaceInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.live_subspaces_owned_by(&owner_participant_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Read a space **as a sub-space** — its parent and its owner — or `None`
+    /// when it is an ordinary space. This is the read behind "where does this
+    /// report go, and who writes it". Pure read.
+    pub async fn subspace(&self, space_id: String) -> Result<Option<SubspaceInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.subspace(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The capabilities a space holds — its spawn-time snapshot, immutable
+    /// afterwards. Empty for every space today. Pure read.
+    pub async fn space_capabilities(
+        &self,
+        space_id: String,
+    ) -> Result<Vec<SpaceCapability>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.space_capabilities(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Delete a space **if nothing has ever been done with it**, answering
     /// whether it did.
     ///
@@ -8647,11 +9024,13 @@ impl AppCore {
     }
 
     /// [`Self::references_to`] filtered per viewer: only the referring posts
-    /// `viewer_participant_id` takes part in — the referrers it could actually
-    /// follow (task 37's inbound-exposure rule). A cross-space-aware surface
-    /// wants this one; a same-space highlight sees the same rows either way,
-    /// since a viewer is a member of the space it is reading. Pure read; emits
-    /// nothing.
+    /// `viewer_participant_id` could actually follow (the permission model's
+    /// inbound-exposure rule) — the read-side rule of `db::may_read_space`, so
+    /// a human sees the backlinks from the sub-spaces their agents opened and
+    /// an agent sees only the spaces it takes part in. A cross-space-aware
+    /// surface wants this one; a same-space highlight sees the same rows
+    /// either way, since a viewer is a member of the space it is reading. Pure
+    /// read; emits nothing.
     ///
     /// For the human surfaces the viewer is `db::HUMAN_PARTICIPANT_ID` — the
     /// shared "User" the default template references into every space.
@@ -11340,8 +11719,9 @@ fn header_prefix_viable(line: &str) -> bool {
 
 /// Convert space action rows into a sequence of role/content messages for UI
 /// display and for external callers. Groups content blocks by action and
-/// concatenates text; roles are the legacy shape (`user_input` → `user`,
-/// `inference` → `assistant`) with no headers. The upstream wire rendering is
+/// concatenates text; roles are the legacy shape (an agent's post →
+/// `assistant`, anyone else's → `user`) with no headers. The upstream wire
+/// rendering is
 /// [`actions_to_upstream_messages`].
 fn actions_to_messages(action_rows: &[db::SpaceActionRow]) -> Vec<SpaceMessage> {
     render_messages(action_rows, None)
@@ -11388,7 +11768,7 @@ fn render_messages(
     let mut current_action_id: Option<&str> = None;
 
     for row in action_rows {
-        if !matches!(row.action_type.as_str(), "user_input" | "inference") {
+        if !db::is_post_action_type(&row.action_type) {
             continue; // skip tool_call, tool_result, etc. for now
         }
         let role = match responder_participant_id {
@@ -11400,9 +11780,11 @@ fn render_messages(
                     "user"
                 }
             }
-            // Display/legacy: by action type.
+            // Display/legacy: by action type. An agent's post is its own
+            // words whether it inferred them or authored them directly (a
+            // sub-space brief), and there is no responder here to ask.
             None => {
-                if row.action_type == "inference" {
+                if db::is_agent_post_action_type(&row.action_type) {
                     "assistant"
                 } else {
                     "user"
@@ -12447,6 +12829,28 @@ const SNIPPET_MAX_CHARS: usize = 120;
 /// bullets, blockquotes, numbered lists) and surrounding emphasis
 /// characters, then truncate to ~64 chars on a word boundary (appending an
 /// ellipsis when truncated). Returns `None` if nothing presentable is left.
+/// Refuse a post-level write aimed at a generation of the wrong kind.
+///
+/// Both writers that claim an item's identity — `edit_post` (appends a
+/// `user_input` generation) and `regenerate` (appends an `inference` one) —
+/// ask this of the tip they are about to supersede, before anything is
+/// written. The kind a write may claim is the kind it produces; anything else
+/// is a replacement wearing an amendment's clothes. `reason` is the sentence
+/// the caller wants read; the kinds themselves are never surfaced.
+async fn require_post_kind(
+    conn: &turso::Connection,
+    action_id: &str,
+    expected: &str,
+    reason: &str,
+) -> Result<(), AppError> {
+    match db::action_type(conn, action_id).await?.as_deref() {
+        Some(t) if t == expected => Ok(()),
+        _ => Err(AppError::WrongPostKind {
+            message: reason.to_string(),
+        }),
+    }
+}
+
 pub(crate) fn derive_space_title(prompt: &str) -> Option<String> {
     let line = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
 

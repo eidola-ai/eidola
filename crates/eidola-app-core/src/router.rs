@@ -274,14 +274,32 @@ impl Inner {
         let Ok(conn) = self.db_conn().await else {
             return plan;
         };
+        // **Is this room still open, and does it route — one statement.**
+        //
         // Unset (the default) = the feature is off: no router call is made.
-        let router_model = match db::space_router_model(&conn, space_id).await {
-            Ok(Some(m)) => m,
+        // Archived means the same thing here for a different reason: the turns
+        // this call exists to filter would be refused by `prepare_turn`
+        // anyway, so a remote router model would bill a real inference to pick
+        // among turns that can never run. Planning already refuses an archived
+        // space, but planning and refinement are two calls and an archival —
+        // including the one a retirement performs — can land between them, so
+        // the fact is re-read here rather than inherited. Both halves come off
+        // the same row for the reason `prepare_turn` reads it that way: nothing
+        // can interleave between two answers that arrive together.
+        let space = match db::get_space(&conn, space_id).await {
+            Ok(Some(s)) => s,
+            // A space that has gone routes nothing; so does a read that failed.
             Ok(None) => return plan,
             Err(e) => {
-                eprintln!("warning: could not read the space's router model: {e}");
+                eprintln!("warning: could not read the space's router settings: {e}");
                 return plan;
             }
+        };
+        if space.archived_at.is_some() {
+            return plan;
+        }
+        let Some(router_model) = space.router_model else {
+            return plan;
         };
 
         let (thread, candidates) = match self

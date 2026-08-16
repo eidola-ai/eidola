@@ -206,6 +206,28 @@ impl SpaceView {
         self.space.read(cx).id().to_string()
     }
 
+    /// Whether `participant_id` **owns this sub-space** — the other membership
+    /// no roster may offer to end.
+    ///
+    /// Read exactly like the notebook's, and unknown the same way: until the
+    /// settings have landed the space cannot be known to be a sub-space, and
+    /// Remove is offered as it is anywhere else. That is the honest
+    /// degradation — pressing it is refused rather than obeyed.
+    fn inspector_participant_owns_this_subspace(
+        &self,
+        participant_id: &str,
+        cx: &gpui::App,
+    ) -> bool {
+        let space_id = self.space_id(cx);
+        self.stores
+            .space_settings
+            .read(cx)
+            .settings(&space_id)
+            .value()
+            .and_then(|s| s.subspace_owner_participant_id.as_deref())
+            == Some(participant_id)
+    }
+
     /// Whether this space is `participant_id`'s own notebook — the one
     /// membership no roster may offer to end.
     fn inspector_participant_owns_this_notebook(
@@ -1515,17 +1537,21 @@ impl SpaceView {
             return div().into_any_element();
         };
         let is_agent = edit.kind == "agent";
-        // Two members are never removable: the shared "You", and — when this
-        // space is an agent's **notebook** — that agent. The notebook exists
-        // only for it and is where its `core` memory lives, so the membership is
-        // structural and app-core refuses to end it. Withholding the affordance
-        // is the courtesy; the refusal is the guarantee (task 36; Codex review,
-        // PR #279). Until the space's settings have landed the space cannot be
-        // known to be a notebook, and Remove is offered as it is anywhere else —
-        // the honest degradation, since pressing it is refused rather than
-        // obeyed.
+        // Three members are never removable: the shared "You"; when this space
+        // is an agent's **notebook**, that agent; and when it is an
+        // agent-spawned **sub-space**, its owner. The notebook exists only for
+        // its agent and is where its `core` memory lives; a sub-space's owner
+        // row records who is answerable for the delegation, whose live-room
+        // quota it counts against and who its report goes to. Both memberships
+        // are structural — nothing can end them and nothing can grant either
+        // back — so app-core refuses, and withholding the affordance is the
+        // courtesy while the refusal is the guarantee. Until the space's
+        // settings have landed neither fact is
+        // known and Remove is offered as it is anywhere else — the honest
+        // degradation, since pressing it is refused rather than obeyed.
         let can_remove = p.id != eidola_app_core::HUMAN_PARTICIPANT_ID
-            && !self.inspector_participant_owns_this_notebook(&p.id, cx);
+            && !self.inspector_participant_owns_this_notebook(&p.id, cx)
+            && !self.inspector_participant_owns_this_subspace(&p.id, cx);
         let remove_id = p.id.clone();
         let subject = display_name_for_participant(&p.kind, &p.label);
         // Only a **space-owned** agent can be shared: a referenced global

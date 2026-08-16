@@ -58,7 +58,7 @@ use crate::actions::CloseWindow;
 use crate::focus::TabRegion as _;
 use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
-use crate::space::{ChatMessageView, Space, SpaceEvent};
+use crate::space::{ChatMessageView, Space, SpaceEvent, is_retryable};
 use crate::stores::Stores;
 use crate::theme;
 use crate::window_input::WindowInput;
@@ -752,7 +752,15 @@ pub struct SpaceView {
 
     /// A minimal honest error band (e.g. a submit failing before onboarding
     /// exists). Full onboarding is a later, separate window.
-    pub(crate) error: Option<String>,
+    ///
+    /// **The typed error, not its text.** `error_copy` reads the reader's
+    /// locale, so a formatted string held here is a cached render decision:
+    /// changing language refreshes every window, the band re-renders, and it
+    /// would paint the same sentence in the old language until some *other*
+    /// failure happened to replace it. Views render from state; the words are
+    /// chosen at render. (`stores::account`'s `account_op_error` already holds
+    /// its `AppError` for the same reason.)
+    pub(crate) error: Option<AppError>,
 
     /// A quiet notice about a **reference** that could not be followed (task
     /// 37): the reader clicked a quote from a conversation they take no part
@@ -900,15 +908,28 @@ impl SpaceView {
                 cx.notify();
             }),
             // The space's participants feed the separator Ask menus, the
-            // streaming bylines, and the cascade notice's ask affordances.
-            cx.observe(&stores.participants, |_, _, cx| cx.notify()),
+            // streaming bylines, and the cascade notice's ask affordances —
+            // and the roster is the first half of the acting gate, so its
+            // arrival is what asks for the second (see `ensure_viewer_gate`).
+            // Repainting alone would leave that request unmade: nothing else
+            // here rebuilds, so the gate could sit on "unknown" for the life of
+            // the window.
+            cx.observe(&stores.participants, |this: &mut Self, _, cx| {
+                this.ensure_viewer_gate(cx);
+                cx.notify();
+            }),
             // This space's own settings are the inspector's rows. Every one of
             // this store's announcements is asynchronous — the panel's opening
             // `ensure` load completing or failing, each write's re-read, a bus
             // `Change::Space` refresh — and none of them is accompanied by
             // anything else that would repaint this window, so without this the
             // panel could sit on "Loading…" until an unrelated event redrew it.
-            cx.observe(&stores.space_settings, |_, _, cx| cx.notify()),
+            cx.observe(&stores.space_settings, |this: &mut Self, _, cx| {
+                // Also the acting gate's second cell: a failed load leaves it
+                // unanswered, and only another attempt can end that.
+                this.ensure_viewer_gate(cx);
+                cx.notify();
+            }),
             // Local models feed the request panel (a load/unload while it's
             // open must re-render — offline, the models store is quiet, so
             // this is the *only* signal that would refresh it) *and* the
@@ -1458,10 +1479,12 @@ impl SpaceView {
         self.hovered_post.as_ref().map(|s| s.to_string())
     }
 
-    /// The recovery-notice error text, if the notice is showing.
+    /// The recovery-notice error text, if the notice is showing — formatted
+    /// exactly as the band formats it, `cx` and all, so a test reads what a
+    /// reader reads *in the active locale* rather than a cached string.
     #[doc(hidden)]
-    pub fn error_for_test(&self) -> Option<String> {
-        self.error.clone()
+    pub fn error_for_test(&self, cx: &gpui::App) -> Option<String> {
+        self.error.as_ref().map(|e| error_copy(e, cx))
     }
 
     /// The node id whose separator band menu is open, if any.
@@ -1683,7 +1706,18 @@ impl SpaceView {
                 // participant label; split it into the human display pair
                 // (model name over backend name) for the gutter. Everything
                 // else ("You", "Error") passes through with no sub-line.
-                let (byline, byline_backend) = if m.message.role == "assistant" {
+                //
+                // **A recorded model is what earns that chrome**, not the
+                // column. An agent-authored `brief` renders as an assistant
+                // because its author is an agent, but nothing was requested for
+                // it — no model, no backend, no spend — so reading its byline
+                // as a model reference would name a serving backend that never
+                // served it (and `parse_model_ref` would happily take the
+                // author's own label for one). It keeps the column and its
+                // author's plain byline. The accessible label and the backend
+                // chip both derive from `byline_backend`, so both follow.
+                let (byline, byline_backend) = if m.message.role == "assistant" && m.model.is_some()
+                {
                     let (name, backend) = self.model_display(&m.byline, cx);
                     (name, Some(backend))
                 } else {
@@ -1692,6 +1726,7 @@ impl SpaceView {
                 post_data_from(m, byline, byline_backend)
             })
             .collect();
+        self.ensure_viewer_gate(cx);
         self.rethread_drafts(&posts);
         self.retarget_tree_focus(&posts);
         self.posts = posts;
@@ -1925,7 +1960,14 @@ impl SpaceView {
                 // silently removing the user's only recovery path (the Retry
                 // renders inside the notice). It persists until that turn is
                 // retried or explicitly dismissed.
-                if self.space.read(cx).failed_turn().is_none() {
+                // A **permanent** refusal records no `failed_turn` at all
+                // (see `space::is_retryable`), so keying the notice's lifetime
+                // on that record alone would let a sibling turn — one that was
+                // already streaming when the conversation was archived — blank
+                // the explanation on its way out. What has nothing to retry
+                // still has something to say.
+                let unretryable = self.error.as_ref().is_some_and(|e| !is_retryable(e));
+                if self.space.read(cx).failed_turn().is_none() && !unretryable {
                     self.error = None;
                 }
                 self.rebuild(cx);
@@ -1941,7 +1983,7 @@ impl SpaceView {
                 self.follow_completed_turn(*seq, response_action_id.as_deref());
             }
             SpaceEvent::Failed(e) => {
-                self.error = Some(error_copy(e));
+                self.error = Some(e.clone());
                 self.rebuild(cx);
             }
             SpaceEvent::CascadePaused {
@@ -2156,6 +2198,7 @@ fn post_data_from(
         reasoning_expanded: m.reasoning_expanded,
         references: m.references.clone(),
         blocks: m.blocks.clone(),
+        regenerable: m.regenerable,
     }
 }
 
@@ -2177,12 +2220,27 @@ fn collect_scrollers(
 
 /// Window-facing copy for a typed submit failure (Phase 1 minimal surface;
 /// onboarding is a later, separate window).
-fn error_copy(e: &AppError) -> String {
+///
+/// **`SpaceArchived` is the first arm read from the localization resources**,
+/// and it is the pattern the rest of this function is waiting for: match the
+/// typed variant, and answer with a message the reader's locale defines. It
+/// takes `cx` for no other reason.
+///
+/// The two arms above it are English literals and the fallback prints
+/// `AppError`'s own `Display`, which is written for a log rather than for a
+/// reader and is English in every locale. That is a **known, accepted
+/// residual** owned by the localization extraction sweep, not something this
+/// arm is exempt from — app-core ships no user-facing strings by doctrine, so
+/// every one of these belongs here eventually. See the localization section of
+/// this crate's AGENTS.md.
+fn error_copy(e: &AppError, cx: &gpui::App) -> String {
     match e {
         AppError::NoAccount => "No account yet — create one to start a conversation.".to_string(),
         AppError::InsufficientBalance { .. } => {
             "Not enough credits to send. Add credits to continue.".to_string()
         }
+        AppError::SpaceArchived { .. } => crate::i18n::msg::space_error_archived(cx).to_string(),
+        AppError::NotJoined { .. } => crate::i18n::msg::space_error_not_joined(cx).to_string(),
         other => other.to_string(),
     }
 }
@@ -2572,11 +2630,21 @@ impl Render for SpaceView {
             // registration-is-enablement mechanism as CloseWindow, with the
             // extra selection condition. `note_body_selection` re-renders on
             // exactly the transitions that flip this.
+            // Quoting *elsewhere* lands its draft in whichever conversation
+            // the reader picks, so a selection is the whole of its condition.
             .when(self.post_selection.is_some(), |d| {
-                d.on_action(cx.listener(Self::quote))
-                    .on_action(cx.listener(Self::quote_in_reply))
-                    .on_action(cx.listener(Self::quote_elsewhere))
+                d.on_action(cx.listener(Self::quote_elsewhere))
             })
+            // These two land a draft **here**, so they also need the reader to
+            // be able to act here — registration-is-enablement, so macOS greys
+            // them for a reader who is only watching.
+            .when(
+                self.post_selection.is_some() && self.viewer_may_act(cx),
+                |d| {
+                    d.on_action(cx.listener(Self::quote))
+                        .on_action(cx.listener(Self::quote_in_reply))
+                },
+            )
             // **The sole owner of "Escape closes the context menu."** Key
             // dispatch bubbles inner→outer, so the root runs *last* — after
             // every inner Escape handler (the composer's, an edit session's)
@@ -3211,9 +3279,13 @@ impl SpaceView {
     /// itself is already recovered (the composer and per-post Edit remain live),
     /// so the user can also just keep typing a follow-up or edit their message.
     fn render_error_band(&self, cx: &Context<Self>) -> AnyElement {
-        let Some(msg) = self.error.clone() else {
+        let Some(err) = self.error.as_ref() else {
             return div().into_any_element();
         };
+        // Formatted here, every frame, from the typed value — so a locale
+        // change repaints this band in the new language without anything
+        // having to invalidate a cache.
+        let msg = error_copy(err, cx);
         let theme = cx.theme();
         let can_retry = self.space.read(cx).can_retry();
         let to_copy = msg.clone();
@@ -3568,7 +3640,7 @@ impl SpaceView {
             return div().into_any_element();
         }
         let theme = cx.theme();
-        let agents = self.space_agents(cx);
+        let agents = self.askable_agents(cx);
         let notice_text = SharedString::from(format!(
             "Replies paused — the conversation reached its cascade limit ({}). \
              Ask to continue.",

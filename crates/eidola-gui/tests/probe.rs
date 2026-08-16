@@ -3281,6 +3281,76 @@ fn space_inspector_a_notebooks_owner_is_not_removable(cx: &mut TestAppContext) {
     );
 }
 
+/// **A sub-space's owner carries no Remove either** — the other structural
+/// membership, suppressed the same way and for the same shape of reason.
+///
+/// The owner row records who is answerable for the delegation, whose live-room
+/// quota it counts against and who its report goes to; nothing can end it and
+/// nothing can grant it back, so app-core refuses. An affordance that could
+/// only be refused has no business on the row — and the space's own settings
+/// are what say which participant that is, exactly as they do for a notebook.
+///
+/// Both arms, so this proves suppression rather than an empty roster: the
+/// owner has no Remove, and an ordinary member of the same room keeps one.
+#[gpui::test]
+fn space_inspector_a_sub_spaces_owner_is_not_removable(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some(probe_participants());
+        s.space_settings = Some((
+            "demo".into(),
+            eidola_app_core::SpaceSettings {
+                subspace_owner_participant_id: Some("agent-1".into()),
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/inspector/participants/editor/save".to_string()),
+        "the row is still an editor: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/inspector/participants/agent-1/remove".to_string()),
+        "a sub-space's owner must not be offered removal from the room it opened: {names:?}"
+    );
+
+    // The same roster, with the ownership pointing elsewhere: this agent is an
+    // ordinary member of a delegated room, and keeps its Remove.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some(probe_participants());
+        s.space_settings = Some((
+            "demo".into(),
+            eidola_app_core::SpaceSettings {
+                subspace_owner_participant_id: Some("some-other-agent".into()),
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/inspector/participants/agent-1/remove".to_string()),
+        "an ordinary member of a sub-space is removable like anyone else: {names:?}"
+    );
+}
+
 fn participants_inspector_stores(cx: &mut TestAppContext) -> Stores {
     stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
@@ -6651,6 +6721,616 @@ fn space_inspector_invite_probes_its_door_and_its_form(cx: &mut TestAppContext) 
     assert!(
         !names.contains(&"space/inspector/participants/invite".to_string()),
         "the door is replaced by the form it opened: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **An affordance may not offer what the core refuses.**
+///
+/// A `brief` — the post an agent writes to open a delegated conversation —
+/// renders in the assistant column, because its author *is* an agent and the
+/// byline and the column are right. What it is not is a *response*: nothing was
+/// inferred, so there is no attempt to repeat, and `regenerate` refuses it
+/// (`AppError::WrongPostKind`). The role alone cannot tell the two apart, so
+/// the row carries the fact and the gutter reads it.
+///
+/// Edit is checked from the other side: it is offered on `role == "user"`,
+/// which is exactly the `user_input` the core allows, so a brief never had that
+/// ghost — asserted here so it stays that way.
+#[gpui::test]
+fn a_brief_offers_no_regenerate_and_an_answer_still_does(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut brief = probe_post("a1", "Check the tide tables for Friday.");
+    brief.action_type = "brief".into();
+    brief.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Navigator".into(),
+    };
+    let mut answer = probe_post("a2", "Low water at 06:12 and 18:41.");
+    answer.action_type = "inference".into();
+    answer.parent_action_id = Some("a1".into());
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![brief, answer], cx)
+        });
+    });
+    draw(cx, window);
+
+    // One gutter at a time (hover is a single row), so an absent verb is absent
+    // rather than merely unrevealed.
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a1", cx));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"space/post/0/regenerate".to_string()),
+        "a brief was never inferred, so there is nothing to regenerate: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/post/0/edit".to_string()),
+        "and it is not the reader's post to edit either: {names:?}"
+    );
+
+    // The agent's actual answer keeps the verb — this is the half that fails if
+    // the rule were "no assistant post may be regenerated".
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a2", cx));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/1/regenerate".to_string()),
+        "an inferred answer is still regenerable: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **A window onto a room you only watch offers no verb that would be
+/// refused.**
+///
+/// The human can open any conversation their agents opened between themselves,
+/// and what opens is an ordinary window. App-core refuses every acting verb
+/// there (`AppError::NotJoined`) and that refusal is the guarantee; this is the
+/// window declining to offer what it knows would be refused. Both facts have
+/// to be known before it does: the roster has answered and does not carry the
+/// human, and the settings have answered that this is not an agent's
+/// **notebook** — which the human is also not a member of, and may nonetheless
+/// write in.
+#[gpui::test]
+fn a_room_the_reader_only_watches_offers_no_regenerate(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let agent_only = vec![eidola_app_core::ParticipantInfo {
+        id: "agent-a".into(),
+        scope: "global".into(),
+        source: "referenced".into(),
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+        model_ref: Some("gemma4-31b".into()),
+        system_prompt: None,
+        notify_policy: "all".into(),
+        role: "member".into(),
+        reference: None,
+    }];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        // The roster has answered, and the reader is not in it.
+        s.participants = Some(("s".to_string(), agent_only));
+        // …and this is not a notebook, so the refusal really applies.
+        s.space_settings = Some((
+            "s".to_string(),
+            eidola_app_core::SpaceSettings {
+                notebook_participant_id: None,
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12.");
+    answer.action_type = "inference".into();
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a1", cx));
+    });
+
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"space/post/0/regenerate".to_string()),
+        "an inferred answer is regenerable in general — but not by someone who has not joined \
+         the conversation, because the core refuses it: {names:?}"
+    );
+
+    // **No door into acting, anywhere on the surface.** The band's `+` opens
+    // Reply and Ask together, so it is gone; Ask is the sharp one, because it
+    // is the single acting verb app-core cannot refuse on the reader's behalf
+    // (it drives `respond_stream_as`, which names the agent it acts as and is
+    // the door a turn driver uses) — an Ask chip that renders is a billed
+    // inference that will run.
+    for probe_name in ["space/band/add", "space/band/menu"] {
+        assert!(
+            !names.contains(&probe_name.to_string()),
+            "{probe_name} opens Reply and Ask, which a watching reader may not do: {names:?}"
+        );
+    }
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.starts_with("space/band/menu/ask/") || n.starts_with("space/cascade/ask/")),
+        "and no Ask reaches the surface by any route: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The same conversation, read by a **member** — every affordance the test
+/// above finds absent is present here, so that one is proving suppression
+/// rather than an empty fixture.
+#[gpui::test]
+fn a_room_the_reader_belongs_to_keeps_its_verbs(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let roster = vec![
+        eidola_app_core::ParticipantInfo {
+            id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+            scope: "global".into(),
+            source: "referenced".into(),
+            kind: "human".into(),
+            label: "User".into(),
+            model_ref: None,
+            system_prompt: None,
+            notify_policy: "explicit".into(),
+            role: "owner".into(),
+            reference: None,
+        },
+        eidola_app_core::ParticipantInfo {
+            id: "agent-a".into(),
+            scope: "global".into(),
+            source: "referenced".into(),
+            kind: "agent".into(),
+            label: "Surveyor".into(),
+            model_ref: Some("gemma4-31b".into()),
+            system_prompt: None,
+            notify_policy: "all".into(),
+            role: "member".into(),
+            reference: None,
+        },
+    ];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.participants = Some(("s".to_string(), roster));
+        s.space_settings = Some((
+            "s".to_string(),
+            eidola_app_core::SpaceSettings {
+                notebook_participant_id: None,
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12.");
+    answer.action_type = "inference".into();
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a1", cx));
+    });
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/0/regenerate".to_string()),
+        "a member may regenerate an inferred answer: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/band/add".to_string()),
+        "and reach Reply and Ask: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **The gate has to converge, and its interim must not be the open one.**
+///
+/// The verdict reads two cells that land asynchronously, and the roster's
+/// arrival is what asks for the second. Two failures live there, and this
+/// walks the ordering that finds both: the observers must *re-drive* the
+/// request rather than merely repaint (otherwise the notebook cell is never
+/// asked for, and the gate sits on "unknown" for the life of the window), and
+/// "unknown" must not mean "may act" once the roster has answered without the
+/// reader in it — that window is exactly where an Ask nobody downstream will
+/// refuse would be a billed inference.
+///
+/// The cost is a notebook's verbs for as long as one cell takes to answer.
+/// That they come back is asserted here rather than assumed.
+#[gpui::test]
+fn the_acting_gate_converges_and_its_interim_withholds(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    // Nothing seeded: neither cell has answered.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+    });
+    let participants = stores.participants.clone();
+    let settings = stores.space_settings.clone();
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12.");
+    answer.action_type = "inference".into();
+    answer.model = Some("gemma4-31b".into());
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a1", cx));
+    });
+
+    // **Roster unanswered: the verbs are there.** An ordinary conversation —
+    // where the reader is always a member — must not flicker on the way in,
+    // and until the roster speaks there is nothing to suspect.
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/0/regenerate".to_string()),
+        "an unanswered roster must not cost an ordinary room its verbs: {names:?}"
+    );
+
+    // **The roster answers without the reader.** This is the whole window the
+    // second cell exists to close, and until it answers the verbs go.
+    cx.update(|cx| {
+        participants.update(cx, |p, cx| {
+            p.seed_for_test(
+                "s",
+                vec![eidola_app_core::ParticipantInfo {
+                    id: "agent-a".into(),
+                    scope: "global".into(),
+                    source: "referenced".into(),
+                    kind: "agent".into(),
+                    label: "Surveyor".into(),
+                    model_ref: Some("gemma4-31b".into()),
+                    system_prompt: None,
+                    notify_policy: "all".into(),
+                    role: "member".into(),
+                    reference: None,
+                }],
+            );
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"space/post/0/regenerate".to_string()),
+        "provably not a member, and nothing yet says this is a notebook: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/band/add".to_string()),
+        "and no door into Reply or the billed Ask: {names:?}"
+    );
+
+    // **The notebook cell answers, and the verbs come back.** A notebook
+    // legitimately lacks the human and legitimately allows writing, so the
+    // suppression above has to be an interim rather than a verdict.
+    cx.update(|cx| {
+        settings.update(cx, |s, cx| {
+            s.seed_for_test(
+                "s",
+                eidola_app_core::SpaceSettings {
+                    notebook_participant_id: Some("agent-a".into()),
+                    ..Default::default()
+                },
+            );
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/0/regenerate".to_string()),
+        "a notebook's reader gets its verbs back once the cell answers: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/band/add".to_string()),
+        "including the door into Reply and Ask: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **Chrome belongs to a post that made a request.**
+///
+/// A `brief` renders in the assistant column because its author is an agent,
+/// but nothing was requested for it: no model, no backend, no spend. Reading
+/// its byline as a model reference named a serving backend that never served
+/// it — and `parse_model_ref` takes any label, so the author's own name became
+/// one. The accessible label folds the same pair, so both follow one fix.
+#[gpui::test]
+fn a_brief_wears_no_backend_and_an_answer_still_does(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut brief = probe_post("a1", "Check the tide tables for Friday.");
+    brief.action_type = "brief".into();
+    brief.model = None;
+    brief.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Navigator".into(),
+    };
+    let mut answer = probe_post("a2", "Low water at 06:12.");
+    answer.action_type = "inference".into();
+    answer.parent_action_id = Some("a1".into());
+    answer.model = Some("gemma4-31b".into());
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![brief, answer], cx)
+        });
+    });
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+    assert!(
+        !names.contains(&"space/post/a1/metadata/backend".to_string()),
+        "a brief made no request, so it wears no serving backend: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/post/a2/metadata/backend".to_string()),
+        "an inference keeps its chrome: {names:?}"
+    );
+
+    // The accessible label folds the same byline pair, so it is where the
+    // claim was actually spoken: "Navigator · Eidola" for a post that reached
+    // no backend. It now names the author and stops.
+    let label_of = |name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name} is probed: {entries:?}"))
+            .1
+            .label
+            .clone()
+    };
+    assert_eq!(
+        label_of("space/post/0"),
+        "Navigator",
+        "the brief's spoken label is its author, not a model name parsed out of it"
+    );
+    assert!(
+        label_of("space/post/1").contains("Eidola"),
+        "an inference still says where it was served: {:?}",
+        label_of("space/post/1")
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **The gate's loading is re-driven by the cells it waits on.**
+///
+/// `viewer_may_act` reads two cells; `ensure_viewer_gate` asks for the second
+/// only once the first has answered without the reader in it. Nothing else in
+/// this window rebuilds on either store, so if their observers merely repaint,
+/// that request is never made and the gate waits forever — which, before the
+/// interim was made to fail closed, meant the billed Ask stayed exposed for the
+/// life of the window.
+///
+/// Asserted lexically because it cannot be asserted otherwise here: a stubbed
+/// store has no `AppCore`, so its `refresh` completes nothing and the request
+/// leaves no trace to observe. What is checkable is that the trigger is wired,
+/// and that is the half that was missing.
+#[test]
+fn the_acting_gates_cells_re_drive_its_loading() {
+    let source = include_str!("../src/space_view/mod.rs");
+    for store in ["stores.participants", "stores.space_settings"] {
+        let at = source
+            .find(&format!("cx.observe(&{store},"))
+            .unwrap_or_else(|| panic!("{store} is observed by SpaceView"));
+        // The observer's own body — up to the next observer registration.
+        let body_end = source[at..]
+            .find("cx.observe")
+            .map(|i| at + i)
+            .and_then(|start| {
+                source[start + 10..]
+                    .find("cx.observe")
+                    .map(|i| start + 10 + i)
+            })
+            .unwrap_or(source.len());
+        assert!(
+            source[at..body_end].contains("ensure_viewer_gate"),
+            "{store}'s observer must re-drive ensure_viewer_gate, not merely repaint: its \
+             arrival is what asks for the acting gate's other cell, and nothing else here \
+             rebuilds"
+        );
+    }
+}
+
+/// **A cell that is answered and failing is still answered.**
+///
+/// A refresh that fails over a good snapshot resolves to `Failed { prior }`,
+/// and every consumer goes on showing the prior — `ParticipantsStore::list`,
+/// which is what the Ask chips render from, reads through `Loadable::value()`
+/// for exactly that reason. A gate that asked instead for `Loaded` called that
+/// state unknown, and the roster's unknown means "may act": so a failed
+/// refresh handed the verbs back *over the very roster that proves the reader
+/// is not a member*, with the chips drawn from that same retained list.
+///
+/// The cure is that both sides ask `value()`, so they cannot disagree about
+/// whether the roster is known. This walks it on both cells, in both
+/// directions.
+#[gpui::test]
+fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+    });
+    let participants = stores.participants.clone();
+    let settings = stores.space_settings.clone();
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12.");
+    answer.action_type = "inference".into();
+    answer.model = Some("gemma4-31b".into());
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a1", cx));
+    });
+
+    let agent_roster = vec![eidola_app_core::ParticipantInfo {
+        id: "agent-a".into(),
+        scope: "global".into(),
+        source: "referenced".into(),
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+        model_ref: Some("gemma4-31b".into()),
+        system_prompt: None,
+        notify_policy: "all".into(),
+        role: "member".into(),
+        reference: None,
+    }];
+
+    // A roster without the reader, and an answered second cell: suppressed.
+    cx.update(|cx| {
+        participants.update(cx, |p, cx| {
+            p.seed_for_test("s", agent_roster.clone());
+            cx.notify();
+        });
+        settings.update(cx, |s, cx| {
+            s.seed_for_test("s", eidola_app_core::SpaceSettings::default());
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"space/band/add".to_string()),
+        "precondition: a watching reader has no door into Reply or Ask: {names:?}"
+    );
+
+    // **The roster's refresh now fails over that snapshot.** The chips would
+    // render from the retained list, so the gate has to keep reading it too.
+    cx.update(|cx| {
+        participants.update(cx, |p, cx| {
+            p.fail_refresh_for_test("s", "network");
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"space/band/add".to_string()),
+        "a roster kept through a failed refresh still proves the reader is not a member: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/post/0/regenerate".to_string()),
+        "and the per-post verbs stay with it: {names:?}"
+    );
+
+    // **The same rule on the other cell, in the other direction.** A notebook
+    // whose settings refresh fails keeps a prior that says "notebook" — and
+    // reading only `Loaded` there would suppress on it, which is wrong in the
+    // safe direction rather than the dangerous one, but wrong all the same.
+    cx.update(|cx| {
+        settings.update(cx, |s, cx| {
+            s.seed_for_test(
+                "s",
+                eidola_app_core::SpaceSettings {
+                    notebook_participant_id: Some("agent-a".into()),
+                    ..Default::default()
+                },
+            );
+            s.fail_refresh_for_test("s", "network");
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/band/add".to_string()),
+        "a notebook's retained settings still say notebook: {names:?}"
+    );
+
+    // And an ordinary room with a retained roster keeps everything.
+    cx.update(|cx| {
+        participants.update(cx, |p, cx| {
+            let mut with_human = agent_roster.clone();
+            with_human.push(eidola_app_core::ParticipantInfo {
+                id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                scope: "global".into(),
+                source: "referenced".into(),
+                kind: "human".into(),
+                label: "User".into(),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: "explicit".into(),
+                role: "owner".into(),
+                reference: None,
+            });
+            p.seed_for_test("s", with_human);
+            p.fail_refresh_for_test("s", "network");
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/0/regenerate".to_string())
+            && names.contains(&"space/band/add".to_string()),
+        "a member's verbs survive a failed refresh of the roster that names them: {names:?}"
     );
 
     probe::set_probes_enabled(false);
