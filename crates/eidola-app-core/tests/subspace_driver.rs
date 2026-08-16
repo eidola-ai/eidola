@@ -1635,6 +1635,46 @@ fn regenerating_a_report_keeps_its_finding_and_its_ending() {
     });
 }
 
+/// The failing sibling of [`MODEL`]: a second upstream that answers every
+/// chat with a 500, registered as backend `ext2`. The caller points a
+/// participant at `FAILING_MODEL` to make its next turn persist a current
+/// `status = 'error'` generation, and points it back afterwards.
+const FAILING_MODEL: &str = "qwen3-8b@ext2";
+
+fn failing_backend(core: &AppCore) -> MockServer {
+    let broken = core.runtime().block_on(chat_harness::start(MockConfig {
+        chat: ChatBehavior::Non2xx(500),
+        ..MockConfig::default()
+    }));
+    core.runtime()
+        .block_on(core.add_backend(eidola_app_core::NewBackend {
+            id: "ext2".into(),
+            kind: eidola_app_core::BackendKind::OpenAi,
+            display_name: String::new(),
+            base_url: Some(broken.base_url.clone()),
+            api_key: None,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+        }))
+        .expect("add the failing backend");
+    broken
+}
+
+fn set_model(core: &AppCore, participant: &str, model_ref: &str) {
+    core.runtime()
+        .block_on(core.update_space_participant(
+            participant.to_string(),
+            ParticipantUpdate {
+                model_ref: Some(Some(model_ref.into())),
+                ..ParticipantUpdate::default()
+            },
+            ExpectedScope::Global,
+        ))
+        .expect("point the participant");
+}
+
 /// **A failed regeneration must not settle the room.** Regenerating a report
 /// against a failing upstream persists a **current `status = 'error'`**
 /// generation carrying the report's replicated edges, and the transcript hides
@@ -1654,36 +1694,10 @@ fn a_failed_regeneration_does_not_settle_the_room() {
         drive(&core, &out.space.id).expect("the room is driven");
         let delivered = report(&core, &parent).expect("the delegation is reported");
 
-        // A second upstream that only fails, and the owner pointed at it.
-        let broken = core.runtime().block_on(chat_harness::start(MockConfig {
-            chat: ChatBehavior::Non2xx(500),
-            ..MockConfig::default()
-        }));
+        let _broken = failing_backend(&core);
+        set_model(&core, &owner, FAILING_MODEL);
         core.runtime()
-            .block_on(core.add_backend(eidola_app_core::NewBackend {
-                id: "ext2".into(),
-                kind: eidola_app_core::BackendKind::OpenAi,
-                display_name: String::new(),
-                base_url: Some(broken.base_url.clone()),
-                api_key: None,
-                models_dir: None,
-                model_overrides: None,
-                engine_path: None,
-                auto_start: true,
-            }))
-            .expect("add the failing backend");
-        core.runtime()
-            .block_on(core.update_space_participant(
-                owner.clone(),
-                ParticipantUpdate {
-                    model_ref: Some(Some("qwen3-8b@ext2".into())),
-                    ..ParticipantUpdate::default()
-                },
-                ExpectedScope::Global,
-            ))
-            .expect("point the owner at it");
-        core.runtime()
-            .block_on(core.regenerate(delivered.action_id.clone(), "qwen3-8b@ext2".into()))
+            .block_on(core.regenerate(delivered.action_id.clone(), FAILING_MODEL.into()))
             .expect_err("the regeneration fails upstream");
         assert!(
             reports(&core, &parent).is_empty(),
@@ -1693,21 +1707,95 @@ fn a_failed_regeneration_does_not_settle_the_room() {
         // Pointed back at a working upstream, the next walk re-reports: the
         // room's last word is quoted by nothing the parent shows, so the
         // delegation is outstanding again.
-        core.runtime()
-            .block_on(core.update_space_participant(
-                owner,
-                ParticipantUpdate {
-                    model_ref: Some(Some(MODEL.to_string())),
-                    ..ParticipantUpdate::default()
-                },
-                ExpectedScope::Global,
-            ))
-            .expect("point the owner back");
+        set_model(&core, &owner, MODEL);
         drive(&core, &out.space.id).expect("the room is re-walked");
         assert_eq!(
             reports(&core, &parent).len(),
             1,
             "the paid result is recreated rather than lost behind a hidden error"
+        );
+    });
+}
+
+/// **A failed regeneration announces the rooms it hid.** The settlement read
+/// makes the room outstanding again the moment the error generation stands in
+/// front of its report — but outstanding is not armed: the parent's own
+/// emission maps back to no settled room (its wait ended at delivery, and the
+/// supervisor's cache knows the parent as ordinary), so without an
+/// announcement the paid result stays hidden until a restart's sweep. The
+/// failing turn therefore announces every room its replicated edges quoted,
+/// and the running driver takes it from there — no manual drive in this test.
+#[test]
+fn a_failed_regeneration_arms_the_room_it_unsettled() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        core.start_subspace_driver();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let _out = spawn(&core, &parent, &owner, vec![helper]);
+        wait_until(&core, || report(&core, &parent).is_some());
+
+        let delivered = report(&core, &parent).expect("the delegation is reported");
+        let _broken = failing_backend(&core);
+        set_model(&core, &owner, FAILING_MODEL);
+        core.runtime()
+            .block_on(core.regenerate(delivered.action_id.clone(), FAILING_MODEL.into()))
+            .expect_err("the regeneration fails upstream");
+        set_model(&core, &owner, MODEL);
+
+        // The announcement arms the room; the driver re-walks and re-reports
+        // on its own. (The driver may catch the owner still pointed at the
+        // failing upstream for its first attempt — the retry meter absorbs
+        // that, which is what it is for.)
+        wait_until(&core, || reports(&core, &parent).len() == 1);
+    });
+}
+
+/// **A hidden answer is not an answer.** The report waits for the owner's
+/// reply to the anchor, and a reply whose regeneration failed leaves a
+/// current `status = 'error'` tip the transcript hides — beneath which a
+/// report would render at the conversation root, attached to a word nobody
+/// can see. The anchor lookup reads by the transcript's predicate, so the
+/// wait holds until a visible answer exists.
+#[test]
+fn a_report_does_not_attach_beneath_a_hidden_answer() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        drive(&core, &out.space.id).expect("the walk runs");
+        assert!(report(&core, &parent).is_none(), "it waits for the answer");
+
+        // The answer lands — and then a failed regeneration hides it.
+        let answer = ask(&core, &parent, &owner, &asked);
+        let _broken = failing_backend(&core);
+        set_model(&core, &owner, FAILING_MODEL);
+        core.runtime()
+            .block_on(core.regenerate(answer, FAILING_MODEL.into()))
+            .expect_err("the regeneration fails upstream");
+        set_model(&core, &owner, MODEL);
+
+        drive(&core, &out.space.id).expect("the room is woken");
+        assert!(
+            report(&core, &parent).is_none(),
+            "a superseded answer is not attached beneath — the wait holds"
+        );
+
+        // A fresh, visible answer ends the wait the ordinary way.
+        let answer2 = ask(&core, &parent, &owner, &asked);
+        drive(&core, &out.space.id).expect("the room reports");
+        assert_eq!(
+            report(&core, &parent)
+                .expect("the delegation is reported")
+                .parent_action_id
+                .as_deref(),
+            Some(answer2.as_str()),
+            "beneath the visible answer"
         );
     });
 }

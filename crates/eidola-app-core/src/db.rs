@@ -1922,10 +1922,16 @@ pub async fn has_reference_from(
 /// A direct reply rather than any descendant, because the relationship is
 /// exact: a spawn happens inside a turn, and that turn persists its answer as a
 /// reply to the very post it was answering. Newest — by **commit order**, the
-/// one ordering a writer's clock cannot contradict (see [`action_watermark`]) —
-/// so a regenerated answer resolves to its latest generation — and a reply edge threads under
-/// its antecedent's *item tip* anyway, so even picking a superseded generation
-/// renders in the right place.
+/// one ordering a writer's clock cannot contradict (see [`action_watermark`])
+/// — and **a generation the parent shows** (current, terminal status, post
+/// type — the transcript's predicate, as settlement reads it): an answer
+/// whose regeneration failed leaves a current `status = 'error'` tip, and a
+/// superseded generation that matched here would end the wait and put the
+/// report beneath an answer rendering resolves to nothing — at the
+/// conversation root, not under the owner's visible word. With the item's tip
+/// hidden nothing of that item matches, so the wait goes on waiting, which is
+/// the honest reading: the visible answer is gone until a regeneration lands
+/// or the grace alarm ends the wait against the anchor.
 ///
 /// **This resolves an answer, not *the* answer, and the gap is recorded rather
 /// than closed.** If the same owner answers the same post twice without one
@@ -1957,6 +1963,7 @@ pub async fn last_reply_by_participant(
         "SELECT a.id FROM action a \
          JOIN action_antecedent aa \
            ON aa.action_id = a.id AND aa.relation = 'reply' \
+         JOIN item_current ic ON ic.current_action_id = a.id \
          WHERE a.space_id = ?1 AND a.participant_id = ?2 \
            AND aa.antecedent_action_id = ?3 \
            AND a.status IN ('complete', 'cancelled') \
@@ -1980,18 +1987,21 @@ pub async fn last_reply_by_participant(
 
 /// The most recent — by **commit order** — **post** `participant_id` wrote in
 /// `space_id`, or `None` when they have written none. The fallback a report
-/// takes when its spawn named no anchor — see [`last_reply_by_participant`] for the anchored path.
+/// takes when its spawn named no anchor — see [`last_reply_by_participant`]
+/// for the anchored path, including why only a generation the parent shows
+/// may answer (the same `item_current` + visibility predicate).
 pub async fn last_post_by_participant(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
 ) -> Result<Option<String>, AppError> {
     let sql = format!(
-        "SELECT id FROM action \
-         WHERE space_id = ?1 AND participant_id = ?2 \
-           AND status IN ('complete', 'cancelled') \
-           AND action_type IN ({POST_ACTION_TYPES_SQL}) \
-         ORDER BY rowid DESC LIMIT 1"
+        "SELECT a.id FROM action a \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         WHERE a.space_id = ?1 AND a.participant_id = ?2 \
+           AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY a.rowid DESC LIMIT 1"
     );
     let mut rows = conn
         .query(
@@ -7450,17 +7460,26 @@ pub async fn action_watermark(conn: &Connection) -> Result<i64, AppError> {
 /// somebody else's, still unanswered. Ordered by `rowid`, which is the order
 /// they were *committed* — the order a reader watching the room saw them
 /// appear, and the only order that agrees with the boundary.
+///
+/// **Current generations only.** An arrival that is edited before this read
+/// runs is one post, not two: without the join both generations land on the
+/// walk's frontier, and the walk plans and bills a turn against wording its
+/// author already replaced — then quotes the retraction into the report
+/// beside the edit. The superseding row's own `rowid` is inside any boundary
+/// its predecessor's is, so restricting to the tip drops nothing that is
+/// still anyone's word.
 pub async fn posts_in_space_since(
     conn: &Connection,
     space_id: &str,
     since_row: i64,
 ) -> Result<Vec<String>, AppError> {
     let sql = format!(
-        "SELECT id FROM action \
-         WHERE space_id = ?1 AND rowid > ?2 \
-           AND status IN ('complete', 'cancelled') \
-           AND action_type IN ({POST_ACTION_TYPES_SQL}) \
-         ORDER BY rowid ASC"
+        "SELECT a.id FROM action a \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         WHERE a.space_id = ?1 AND a.rowid > ?2 \
+           AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY a.rowid ASC"
     );
     let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt
@@ -8908,6 +8927,51 @@ mod tests {
             current_tip_of_item(&conn, "room", &item_id).await.unwrap(),
             Some(good),
             "the edit is the current generation, words and all"
+        );
+    }
+
+    /// **The refill serves an arrival's current words, once.** An arrival
+    /// edited before the refill runs is one post, not two: returning both
+    /// generations puts both on the walk's frontier, and the walk plans and
+    /// bills a turn against wording its author already replaced — then quotes
+    /// the retraction into the report beside the edit.
+    #[tokio::test]
+    async fn the_refill_serves_only_current_generations() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let boundary = action_watermark(&conn).await.unwrap();
+
+        // A post arrives after the boundary and is edited before the refill.
+        let orig = add_user_action(&conn, "room", &user, "first wording", 2_000).await;
+        let (item_id, _) = action_item_and_space(&conn, &orig).await.unwrap().unwrap();
+        let edit = uuid::Uuid::now_v7().to_string();
+        edit_post_tx(
+            &conn,
+            &EditPostPlan {
+                space_id: "room",
+                participant_id: &user,
+                action_id: &edit,
+                item_id: &item_id,
+                supersedes_action_id: &orig,
+                text: "second wording",
+                reply_to: None,
+                references: &[],
+                created_at: 3_000,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            posts_in_space_since(&conn, "room", boundary).await.unwrap(),
+            vec![edit],
+            "one arrival, its current words — not the retraction beside them"
         );
     }
 
