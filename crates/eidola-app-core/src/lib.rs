@@ -4291,18 +4291,18 @@ impl Inner {
         // stay silent about the one it did not — which is why the count comes
         // back from inside the write rather than from a read after it.
         //
-        // Nothing else is emitted, and that is checked rather than assumed: no
-        // store reads a *single* space's archival (`SpaceSettings` carries the
-        // cascade limit, the router and the notebook owner, not `archived_at`),
-        // so a `Space(id)` here would announce a change no subscriber can
-        // observe. `Inner::archive_space` does announce each room it closed,
-        // and for a reason that is not about stores: it is what releases a
-        // delegation registered against one of them as its parent. A retirement
-        // needs no such release — a room waiting on its anchor is waiting for
-        // *this* agent's answer in the parent, and the next post there arms it
-        // and finds it archived — and the transaction answers with a count
-        // rather than a list, which is all the listing question needs.
+        // And **every room this closed is closed properly** — announced, and
+        // released from any wait it was holding (`Inner::close_rooms`, the one
+        // thing all three archival doors owe a room). Retirement is the door
+        // that reaches a room without touching its parent, so nothing about the
+        // parent can announce it and the room's own standing registration would
+        // otherwise be left for the grace alarm to clear ten minutes later,
+        // making every post in that parent pay for a no-op walk until then.
+        // Which is why the transaction answers with the ids and not only the
+        // count: the count decides the *listing* announcement, and only a list
+        // can say which rooms to close out.
         self.bus.emit(Change::Participants);
+        self.close_rooms(&retirement.archived_spaces);
         if retirement.listed_spaces_archived > 0 {
             self.bus.emit(Change::SpaceIndex);
         }
@@ -4366,13 +4366,9 @@ impl Inner {
             outcome => outcome != db::SpaceRemoval::NothingToDo,
         };
         // **A departure closes the delegations it was running for this
-        // conversation** (`db::close_delegations_run_for`), so each closed room
-        // announces itself for the reason `Inner::archive_space`'s do: that is
-        // what releases a delegation registered against one of them as its
-        // parent, and what tells a window open on one that it has stopped.
-        for id in &departure.archived_spaces {
-            self.bus.emit(Change::Space(id.clone()));
-        }
+        // conversation** (`db::close_delegations_run_for`), and closes them the
+        // way every archival door does — see [`Inner::close_rooms`].
+        self.close_rooms(&departure.archived_spaces);
         if removed {
             self.bus.emit(Change::Participants);
         }
@@ -4767,19 +4763,17 @@ impl Inner {
     /// `db::archive_space_tx` for why closing a room closes what hangs beneath
     /// it.
     ///
-    /// **Every closed room announces itself** (`Change::Space`), the Library
-    /// once (`Change::SpaceIndex`). The per-room announcement is what carries
-    /// the closure to the sub-space driver without a second wiring: a delegated
-    /// room registers itself against its parent while it waits for an answer,
-    /// and `Change::Space` on that parent is what wakes it — where it reads its
-    /// own archival, stops, and lets the registration go. A window open on one
-    /// of these rooms learns the same way it learns about a post.
+    /// **Every closed room is closed properly** — announced, and released from
+    /// any wait it was holding ([`Inner::close_rooms`]) — and the Library hears
+    /// once (`Change::SpaceIndex`). The announcement is what carries the
+    /// closure to a window open on one of these rooms, and to any *other*
+    /// delegation registered against one of them as its parent; the release is
+    /// the closed room's own registration, which nothing on the bus can deliver
+    /// because an archived room is never armed.
     async fn archive_space(&self, space_id: &str) -> Result<bool, AppError> {
         let db_conn = self.db_conn().await?;
         let archived = db::archive_space_tx(&db_conn, space_id, now_ms()).await?;
-        for id in &archived {
-            self.bus.emit(Change::Space(id.clone()));
-        }
+        self.close_rooms(&archived);
         if !archived.is_empty() {
             self.bus.emit(Change::SpaceIndex);
         }

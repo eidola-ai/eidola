@@ -1031,6 +1031,57 @@ fn no_more_than_the_bound_of_rooms_is_walked_at_once() {
     });
 }
 
+/// **A room that is closed lets go of its parent, whichever door closed it.**
+/// A waiting room holds a standing registration against its parent, and every
+/// post there wakes every room registered under it — so a room archived out
+/// from under its own wait makes that parent's every post pay for a walk that
+/// can only no-op. Retirement is the door that reaches a room this way without
+/// touching its parent, so nothing about the parent can announce it: the door
+/// has to end the wait where it ends the room.
+#[test]
+fn retiring_an_owner_releases_the_wait_its_room_was_holding() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        // Long enough that the alarm cannot be what releases this.
+        core.test_set_anchor_wait_grace(std::time::Duration::from_secs(300));
+        core.start_subspace_driver();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        // Opened from a post the owner has not answered, so the room waits.
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        wait_until(&core, || {
+            core.test_rooms_awaiting(parent.clone()) == vec![out.space.id.clone()]
+        });
+
+        let requests = mock.chat_bodies().len();
+        core.runtime()
+            .block_on(core.retire_participant(owner.clone()))
+            .expect("retire the owner");
+        settle(&core);
+
+        assert!(
+            core.runtime()
+                .block_on(core.test_space_archived(out.space.id.clone()))
+                .expect("archived?"),
+            "the room is closed with its owner"
+        );
+        assert!(
+            core.test_rooms_awaiting(parent.clone()).is_empty(),
+            "and it stops waiting on a parent it can never report to — without \
+             the grace, which is what the room would otherwise hold out for"
+        );
+        assert_eq!(
+            mock.chat_bodies().len(),
+            requests,
+            "nothing was driven on the way"
+        );
+        assert!(report(&core, &parent).is_none(), "and nothing was reported");
+    });
+}
+
 /// **A delegation beneath a closed conversation stops, and lets go.** Archiving
 /// a room archives what it delegated (`subspaces.rs`), and each closed room
 /// announces itself — so a nested delegation waiting on its now-archived parent

@@ -3490,10 +3490,17 @@ pub async fn list_grantable_agents(
 /// **Library lists** it archived on the way (the notebook is never one — the
 /// listing excludes notebooks in both its branches — so this counts sub-spaces
 /// and is what decides whether the caller announces a listing change).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retirement {
     pub retired: bool,
+    /// How many spaces the Library lists were archived — what the `SpaceIndex`
+    /// emission is decided from. Never counts the notebook.
     pub listed_spaces_archived: i64,
+    /// **Every space this retirement closed**, notebook included, so the
+    /// caller can do what every archival door does: announce each one and end
+    /// any wait it was holding. A count cannot say *which*, and the rooms are
+    /// exactly the things a delegation can be registered against.
+    pub archived_spaces: Vec<String>,
 }
 
 /// Retire a global agent: the soft-remove **and** the archival of every space
@@ -3567,31 +3574,46 @@ async fn retire_participant_tx_body(
         return Ok(Retirement {
             retired: false,
             listed_spaces_archived: 0,
+            archived_spaces: Vec::new(),
         });
     }
+    // **Read before written, on both arms**, because the caller needs the ids
+    // and not only the count: every door that closes a room announces it and
+    // ends any wait it was holding (see [`Retirement::archived_spaces`]), and a
+    // rows-affected figure cannot say *which*. The predicate is the same in the
+    // select and the update, so the two describe one set — nothing can land in
+    // between, the whole body being one `BEGIN IMMEDIATE` transaction.
+    const LIVE_NOTEBOOK_OF: &str = "notebook_participant_id = ?1 AND archived_at IS NULL";
+    // Owner-scoped, so depth is irrelevant and nobody else's room is reached.
+    // The membership predicate is [`SUBSPACE_OWNER_SQL`]'s, minus its
+    // tie-break: that fragment names *the* owner where this asks *is an owner*,
+    // which is the same set while the write guards hold and the safer of the
+    // two if one ever did not.
+    const LIVE_ROOMS_OWNED_BY: &str = "archived_at IS NULL AND parent_space_id IS NOT NULL \
+               AND EXISTS ( \
+                   SELECT 1 FROM space_participant r \
+                   WHERE r.space_id = space.id AND r.participant_id = ?1 \
+                     AND r.role = 'owner' AND r.left_at IS NULL \
+               )";
+    let notebook = space_ids_where(conn, LIVE_NOTEBOOK_OF, participant_id).await?;
+    let rooms = space_ids_where(conn, LIVE_ROOMS_OWNED_BY, participant_id).await?;
     conn.execute(
-        "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
-         WHERE notebook_participant_id = ?1 AND archived_at IS NULL",
+        &format!(
+            "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
+         WHERE {LIVE_NOTEBOOK_OF}"
+        ),
         (Value::Text(participant_id.to_string()), Value::Integer(now)),
     )
     .await
     .map_err(|e| AppError::Database {
         message: format!("failed to archive the retired agent's notebook: {e}"),
     })?;
-    // Owner-scoped, so depth is irrelevant and nobody else's room is reached.
-    // The membership predicate is [`SUBSPACE_OWNER_SQL`]'s, minus its
-    // tie-break: that fragment names *the* owner where this asks *is an owner*,
-    // which is the same set while the write guards hold and the safer of the
-    // two if one ever did not.
     let archived = conn
         .execute(
-            "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
-             WHERE archived_at IS NULL AND parent_space_id IS NOT NULL \
-               AND EXISTS ( \
-                   SELECT 1 FROM space_participant r \
-                   WHERE r.space_id = space.id AND r.participant_id = ?1 \
-                     AND r.role = 'owner' AND r.left_at IS NULL \
-               )",
+            &format!(
+                "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
+             WHERE {LIVE_ROOMS_OWNED_BY}"
+            ),
             (Value::Text(participant_id.to_string()), Value::Integer(now)),
         )
         .await
@@ -3607,8 +3629,36 @@ async fn retire_participant_tx_body(
     let beneath = archive_rooms_under_a_closed_one(conn, now).await?;
     Ok(Retirement {
         retired: true,
+        // The *listing* figure counts what the Library shows: every sub-space,
+        // and never the notebook, which it has never listed.
         listed_spaces_archived: archived as i64 + beneath.len() as i64,
+        // The *announcement* set is every space this closed, notebook
+        // included — a room can be opened from one, so a wait can be
+        // registered against one.
+        archived_spaces: notebook.into_iter().chain(rooms).chain(beneath).collect(),
     })
+}
+
+/// The ids of the spaces matching `predicate`, whose single bind parameter is
+/// `?1` — the read half of an archival that has to name what it closed.
+async fn space_ids_where(
+    conn: &Connection,
+    predicate: &str,
+    bind: &str,
+) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT id FROM space WHERE {predicate}"))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(bind.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(out)
 }
 
 /// Whether a participant is a member of one space — **owned row ∪ live
