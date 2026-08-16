@@ -1080,11 +1080,11 @@ fn router_calls(mock: &chat_harness::MockServer) -> Vec<serde_json::Value> {
 }
 
 fn drain(
-    rx: &mut tokio::sync::broadcast::Receiver<eidola_app_core::changes::Change>,
+    rx: &mut tokio::sync::broadcast::Receiver<eidola_app_core::changes::ChangeEvent>,
 ) -> Vec<eidola_app_core::changes::Change> {
     let mut out = Vec::new();
     while let Ok(c) = rx.try_recv() {
-        out.push(c);
+        out.push(c.change);
     }
     out
 }

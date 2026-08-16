@@ -18,6 +18,21 @@
 //! stale and refresh everything you care about."  The capacity is sized
 //! generously so a slow consumer only lags under extreme write bursts.
 //!
+//! ## Who wrote it
+//!
+//! A subscriber receives a [`ChangeEvent`]: the [`Change`] itself, plus a
+//! [`ChangeOrigin`] saying whether anyone is waiting on the write.  A consumer
+//! that is mid-operation re-reads at its own exit, so a change emitted on that
+//! operation's own call path is already covered by it — while a change emitted
+//! by work app-core drives on its own has nobody to read it in, and a consumer
+//! that drops it while busy loses it for good.
+//!
+//! The origin is **ambient rather than an argument**: [`with_origin`] scopes a
+//! future, and every emission made from inside it is stamped.  Every write path
+//! reaches the bus through the same `emit` it always did, so there is no
+//! per-emission decision to get wrong and no way for a new write inside an
+//! unattended chore to be stamped as something a caller is waiting for.
+//!
 //! ## The `ChangeSource` seam (v2 extension point)
 //!
 //! The [`ChangeSource`] trait is the documented interface between app-core and
@@ -89,6 +104,64 @@ pub enum Change {
 /// stored in the `space` table.
 pub type SpaceId = String;
 
+/// Whether anyone is waiting on the write a [`Change`] announces.
+///
+/// The distinction exists for consumers that own an operation's truth while it
+/// runs: a conversation window drops invalidations for the space it is busy
+/// writing to, because its own exit re-read covers them.  That reasoning holds
+/// only for writes made on the call path of the operation it is running —
+/// which is exactly what this says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeOrigin {
+    /// Emitted while serving a call the consumer itself made.  Whatever that
+    /// call's caller does when it returns — reload, re-list, re-render — comes
+    /// after this write, so a consumer that is mid-operation may treat it as
+    /// already accounted for.
+    Caller,
+    /// Emitted by work app-core drives on its own: a background chore, or a
+    /// turn driver giving a windowless conversation its turns.  No call is
+    /// outstanding, so nothing else is going to read this write in — a
+    /// consumer that drops it while busy loses it until something unrelated
+    /// invalidates the same surface.
+    Unattended,
+}
+
+/// One bus message: a [`Change`] and the [`ChangeOrigin`] it was emitted under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeEvent {
+    pub change: Change,
+    pub origin: ChangeOrigin,
+}
+
+tokio::task_local! {
+    /// The origin stamped onto every change emitted from inside this task.
+    ///
+    /// Ambient rather than threaded through ~30 emission sites and every
+    /// function between them: the question "is a caller waiting on this?" is a
+    /// property of *why this code is running*, not of the individual write, and
+    /// the answer is the same for every write a chore makes.  Task-scoped, so
+    /// concurrent turns cannot read each other's answer.
+    static ORIGIN: ChangeOrigin;
+}
+
+/// Run `f` with every [`Change`] it emits stamped `origin`.
+///
+/// Scoping is per task: work moved onto a *new* task inside `f` (a `spawn`)
+/// starts outside the scope again and falls back to [`ChangeOrigin::Caller`],
+/// which is the safe direction — a mis-stamped `Unattended` would make a
+/// consumer re-read for nothing, but a mis-stamped `Caller` is a dropped
+/// invalidation, and the fallback never produces the second.
+pub async fn with_origin<F: std::future::Future>(origin: ChangeOrigin, f: F) -> F::Output {
+    ORIGIN.scope(origin, f).await
+}
+
+/// The origin in force for the current task, or [`ChangeOrigin::Caller`]
+/// outside any scope (which is every ordinary consumer call, and any emission
+/// made off a tokio task at all).
+fn current_origin() -> ChangeOrigin {
+    ORIGIN.try_with(|o| *o).unwrap_or(ChangeOrigin::Caller)
+}
+
 /// Broadcast capacity for the invalidation bus.  Slow receivers that fall
 /// behind by more than this many messages will receive a
 /// [`tokio::sync::broadcast::error::RecvError::Lagged`] error — callers
@@ -100,11 +173,11 @@ pub const BUS_CAPACITY: usize = 256;
 /// The v1 implementation is an in-process [`broadcast`] channel.
 /// The documented v2 seam is Turso CDC tailing; see module-level docs.
 pub trait ChangeSource {
-    /// Returns a new receiver that will see all [`Change`] messages emitted
-    /// from this point forward.  The receiver is independent of all other
-    /// receivers — dropping it does not affect the channel or other
+    /// Returns a new receiver that will see all [`ChangeEvent`] messages
+    /// emitted from this point forward.  The receiver is independent of all
+    /// other receivers — dropping it does not affect the channel or other
     /// subscribers.
-    fn subscribe(&self) -> broadcast::Receiver<Change>;
+    fn subscribe(&self) -> broadcast::Receiver<ChangeEvent>;
 }
 
 /// In-process broadcast implementation of [`ChangeSource`].
@@ -114,7 +187,7 @@ pub trait ChangeSource {
 /// runtime) holds the [`broadcast::Sender`] for emission.
 #[derive(Clone)]
 pub struct BroadcastSource {
-    sender: broadcast::Sender<Change>,
+    sender: broadcast::Sender<ChangeEvent>,
 }
 
 impl BroadcastSource {
@@ -124,16 +197,20 @@ impl BroadcastSource {
         Self { sender }
     }
 
-    /// Emit a change.  Silently succeeds when there are no active receivers
+    /// Emit a change, stamped with the origin in force for this task (see
+    /// [`with_origin`]).  Silently succeeds when there are no active receivers
     /// (the `send` error variant means "no receivers", not a failure worth
     /// propagating to the write path).
     pub fn emit(&self, change: Change) {
-        let _ = self.sender.send(change);
+        let _ = self.sender.send(ChangeEvent {
+            change,
+            origin: current_origin(),
+        });
     }
 }
 
 impl ChangeSource for BroadcastSource {
-    fn subscribe(&self) -> broadcast::Receiver<Change> {
+    fn subscribe(&self) -> broadcast::Receiver<ChangeEvent> {
         self.sender.subscribe()
     }
 }

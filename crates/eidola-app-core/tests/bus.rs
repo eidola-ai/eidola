@@ -5,6 +5,14 @@
 //! - Errors never emit.
 //! - Two independent subscribers both receive the same events.
 //!
+//! **Every emission also carries a `ChangeOrigin`** saying whether a caller is
+//! waiting on the write. It is ambient rather than per-emission (`changes::
+//! with_origin` scopes a future), so the rule is about *why the code is
+//! running* rather than about each write: work a consumer asked for is
+//! `Caller`, and work app-core drives on its own — the branch summarizer, the
+//! sub-space turn driver — is `Unattended`. The table's rows name it only where
+//! it is not `Caller`.
+//!
 //! Operations that require HTTP (account_allocate, chat) are tested at the
 //! `Inner` db-helper level via `AppCore`'s sync/async surface where possible;
 //! full-HTTP paths are covered by other test suites (updates_check.rs uses
@@ -219,7 +227,7 @@
 //! harness.
 
 use eidola_app_core::db::HUMAN_PARTICIPANT_ID;
-use eidola_app_core::{AppCore, changes::Change};
+use eidola_app_core::{AppCore, changes::Change, changes::ChangeEvent};
 
 fn make_core() -> (AppCore, tempfile::TempDir) {
     // A single crypto-provider install is idempotent across tests.
@@ -234,11 +242,11 @@ fn make_core() -> (AppCore, tempfile::TempDir) {
 // Helper: drain all messages currently available on a receiver (non-blocking).
 // ---------------------------------------------------------------------------
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     loop {
         match rx.try_recv() {
-            Ok(c) => out.push(c),
+            Ok(c) => out.push(c.change),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {

@@ -35,7 +35,7 @@ use chat_harness::{
     memory_section, system_message_with, tool_script,
 };
 use eidola_app_core::AppCore;
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::memory::{MAX_MEMORY_BLOCK_BYTES, MAX_MEMORY_BLOCKS, MEMORY_NOTE};
 
 /// The external backend's model. `remember` rides the same learned capability
@@ -129,10 +129,10 @@ fn tool_results(body: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     while let Ok(c) = rx.try_recv() {
-        out.push(c);
+        out.push(c.change);
     }
     out
 }

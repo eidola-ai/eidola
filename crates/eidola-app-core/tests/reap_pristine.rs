@@ -25,7 +25,7 @@
 use eidola_app_core::db::HUMAN_PARTICIPANT_ID;
 use eidola_app_core::{
     AppCore, ExpectedScope, MembershipRole, NewParticipant, ParticipantOverride, ParticipantUpdate,
-    changes::Change,
+    changes::{Change, ChangeEvent},
 };
 
 // ---------------------------------------------------------------------------
@@ -50,10 +50,10 @@ where
     std::thread::spawn(f).join().unwrap();
 }
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     while let Ok(c) = rx.try_recv() {
-        out.push(c);
+        out.push(c.change);
     }
     out
 }
