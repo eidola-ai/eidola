@@ -350,6 +350,20 @@ enum SpacesCommand {
     },
 }
 
+/// Build this process's `AppCore`.
+///
+/// **The sub-space turn driver is deliberately not started here**, and the GUI
+/// deliberately does start it (`stores::open_app_core`). A delegated
+/// conversation is driven by a loop that plans, takes a turn, and plans again
+/// until the room stops — work measured in model round trips, with no window
+/// waiting on it. This process exits when its command does, so starting that
+/// loop would mean beginning walks it cannot finish and turns whose answers
+/// nobody would be told about.
+///
+/// The consequence is stated rather than hidden: a command here **can** open a
+/// delegated conversation through the API, and that room simply does not run
+/// until the app is next open, at which point its startup sweep picks it up
+/// exactly as it picks up any room a previous run left mid-delegation.
 fn build_core() -> Result<AppCore, AppError> {
     let config_dir = config::default_config_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
