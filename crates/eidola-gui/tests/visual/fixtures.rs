@@ -121,6 +121,7 @@ pub fn kitchen_sink_posts() -> Vec<PostNode> {
         range_start: Some(start),
         range_end: Some(end),
         annotation: None,
+        delegation_end: None,
         snippet: None,
         antecedent_author_label: "Ada".into(),
         antecedent_author_kind: "agent".into(),
@@ -354,6 +355,7 @@ pub fn cross_space_reference_posts() -> Vec<PostNode> {
             range_start: Some(here_start),
             range_end: Some(here_end),
             annotation: None,
+            delegation_end: None,
             snippet: Some(quoted_here.into()),
             // What this space calls the participant — carried on every edge,
             // and deliberately *not* what the rail shows for a post it holds
@@ -369,6 +371,7 @@ pub fn cross_space_reference_posts() -> Vec<PostNode> {
             range_start: Some(0),
             range_end: Some(74),
             annotation: None,
+            delegation_end: None,
             snippet: Some(
                 "competence is exactly what makes the question sharp, not what dissolves it".into(),
             ),
@@ -382,6 +385,7 @@ pub fn cross_space_reference_posts() -> Vec<PostNode> {
             range_start: Some(0),
             range_end: Some(58),
             annotation: None,
+            delegation_end: None,
             snippet: Some("a craft that aims past its object is two crafts, badly joined".into()),
             // A space that overrode this participant's label to empty (the
             // schema's "override to empty"). The kind still names them, and
@@ -397,6 +401,7 @@ pub fn cross_space_reference_posts() -> Vec<PostNode> {
             range_start: Some(0),
             range_end: Some(62),
             annotation: None,
+            delegation_end: None,
             snippet: Some("the shepherd fattens the flock for a table it will not sit at".into()),
             // A perfectly valid label, and long enough to eat the row: the
             // byline is capped, the passage keeps its share.
@@ -503,6 +508,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
         range_start: Some(a_start),
         range_end: Some(a_end),
         annotation: None,
+        delegation_end: None,
         snippet: Some(quoted_a.into()),
         antecedent_author_label: "kimi-k2".into(),
         antecedent_author_kind: "agent".into(),
@@ -532,6 +538,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
             range_start: Some(a_start),
             range_end: Some(a_long_end),
             annotation: None,
+            delegation_end: None,
             snippet: src
                 .get(a_start as usize..a_long_end as usize)
                 .map(String::from),
@@ -545,6 +552,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
             range_start: Some(b_start),
             range_end: Some(b_end),
             annotation: None,
+            delegation_end: None,
             snippet: Some(quoted_b.into()),
             antecedent_author_label: "kimi-k2".into(),
             antecedent_author_kind: "agent".into(),

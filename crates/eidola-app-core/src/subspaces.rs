@@ -106,6 +106,10 @@ pub enum SpawnRefusal {
     CapabilityNotHeld { name: String },
     /// A requested sub-agent is not a live shared agent.
     ParticipantNotEligible { participant_id: String },
+    /// The post the delegation says it is being opened from is not a post of
+    /// the parent conversation. The report attaches there, so an anchor
+    /// pointing somewhere else would answer a conversation nobody asked.
+    AnchorNotInParent { action_id: String },
 }
 
 impl std::fmt::Display for SpawnRefusal {
@@ -159,6 +163,11 @@ impl std::fmt::Display for SpawnRefusal {
                 "{participant_id} is not a shared agent that can be invited into another \
                  conversation"
             ),
+            Self::AnchorNotInParent { action_id } => write!(
+                f,
+                "{action_id} is not a post in this conversation, so a delegation opened from it \
+                 would have nowhere here to report back to"
+            ),
         }
     }
 }
@@ -170,6 +179,9 @@ pub struct SubspaceInfo {
     pub parent_space_id: String,
     /// The agent that spawned it, and is its `role = 'owner'` member.
     pub owner_participant_id: String,
+    /// The post in the parent it was opened from, when the spawn named one —
+    /// where its report attaches. `None` for a spawn that named none.
+    pub parent_action_id: Option<String>,
     pub title: Option<String>,
     pub created_at: i64,
     pub archived_at: Option<i64>,
@@ -181,6 +193,7 @@ impl From<db::SubspaceRow> for SubspaceInfo {
             id: r.id,
             parent_space_id: r.parent_space_id,
             owner_participant_id: r.owner_participant_id,
+            parent_action_id: r.parent_action_id,
             title: r.title,
             created_at: r.created_at,
             archived_at: r.archived_at,
@@ -219,6 +232,7 @@ impl Inner {
     /// trimming the brief, deduping the requested participants, and deriving a
     /// title when none was given. Every refusal leaves zero durable trace and
     /// emits nothing.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_subspace(
         &self,
         parent_space_id: &str,
@@ -227,6 +241,7 @@ impl Inner {
         participants: &[String],
         capabilities: &[String],
         title: Option<&str>,
+        parent_action_id: Option<&str>,
     ) -> Result<SpawnedSubspace, AppError> {
         let brief = brief.trim();
         if brief.is_empty() {
@@ -286,6 +301,7 @@ impl Inner {
             brief_item_id: &brief_item_id,
             participant_ids: &seats,
             capabilities: &names,
+            parent_action_id,
             now,
         };
         let title = match db::spawn_subspace_tx(&conn, &plan).await? {
@@ -306,6 +322,7 @@ impl Inner {
                 id: space_id,
                 parent_space_id: parent_space_id.to_string(),
                 owner_participant_id: owner_participant_id.to_string(),
+                parent_action_id: parent_action_id.map(str::to_string),
                 title: Some(title),
                 created_at: now,
                 archived_at: None,

@@ -45,7 +45,9 @@ pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
     LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
 };
-pub use subspace_driver::MAX_DELEGATION_TURNS;
+pub use subspace_driver::{
+    DelegationEnd, DelegationFailure, MAX_ATTEMPTS_PER_TAIL, MAX_DELEGATION_TURNS,
+};
 pub use subspaces::{
     MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, MAX_SUBAGENTS_PER_SPAWN, SpaceCapability,
     SpawnRefusal, SpawnedSubspace, SubspaceInfo,
@@ -879,7 +881,24 @@ pub struct PostReference {
     /// Quoted byte range within that block's `text_content`, if a quote.
     pub range_start: Option<i64>,
     pub range_end: Option<i64>,
+    /// The **person's note** about this quote, and only that.
+    ///
+    /// The stored column holds either a note somebody wrote or a machine token
+    /// the turn machinery wrote (a delegation's ending — see
+    /// [`Self::delegation_end`]), and the two are split here rather than left
+    /// for each reader to tell apart: a surface that rendered this field
+    /// straight would print `eidola:delegation/…` at a person. `None` when
+    /// there is no note, which includes every edge whose annotation is a token.
     pub annotation: Option<String>,
+    /// How the delegated conversation this passage came from stopped, when this
+    /// edge is a delegation's report.
+    ///
+    /// **Typed rather than a sentence**, because the sentence is the
+    /// presentation layer's to write: what app-core persists is read as-is in
+    /// every language, so the ending is stored as a token and handed over as a
+    /// value (the same layering `AppError` variants cross on). `None` for every
+    /// ordinary quote.
+    pub delegation_end: Option<subspace_driver::DelegationEnd>,
     /// The quoted markdown, resolved from the referenced block's text by
     /// [`quote_snippet`]. `None` for range-less backlinks or when the stored
     /// range no longer maps honestly onto the block (never truncated or
@@ -947,6 +966,24 @@ pub struct ReferenceSpec {
 /// Ordinals are positional — `1..=N` in supplied order, ordinal 0 being the
 /// reply edge's reserved slot — exactly as they are for
 /// [`AppCore::post_with_references`].
+/// What the turn machinery is imposing on a turn, beyond the ordinary contract
+/// a consumer's ask gets. Empty for every turn a consumer asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TurnDirective {
+    /// Passages to put in front of this turn and write onto its answer (see
+    /// [`AttachedReference`]).
+    pub(crate) attached: Vec<AttachedReference>,
+    /// **A turn nobody invited.** The driver's delegation report is a
+    /// mechanical notification, not an invitation to take part, so the
+    /// agent-side decline checkpoint is withdrawn from its registry snapshot:
+    /// a declined report is a delegation that silently never happened, and the
+    /// checkpoint exists for an agent with nothing to add to a *conversation*,
+    /// which this is not. Withdrawing the tool rather than ignoring a decline
+    /// is what makes the outcome unrepresentable instead of handled — a model
+    /// naming `decline` here gets the ordinary unknown-tool result and answers.
+    pub(crate) mechanical: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AttachedReference {
     pub(crate) spec: ReferenceSpec,
@@ -1494,6 +1531,14 @@ struct Inner {
     /// fresh arm arrived while it was walking (see
     /// [`Inner::arm_subspace_driver`]).
     subspace_drivers: Mutex<subspace_driver::DriverRegistry>,
+    /// What this process has already tried for each delegated room's current
+    /// last word — the retry meter that keeps a failing room from being armed
+    /// and billed forever (see `Inner::claim_walk`).
+    subspace_walks: Mutex<subspace_driver::WalkLedger>,
+    /// Delegated rooms waiting for the post they were opened from to be
+    /// answered, mapped to the parent whose next change wakes them (see
+    /// `Inner::report_delegation`).
+    awaiting_anchor: Mutex<std::collections::HashMap<String, String>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
@@ -3295,7 +3340,7 @@ impl Inner {
             let entry = ReferenceEntry {
                 ordinal,
                 target,
-                annotation: a.spec.annotation.clone(),
+                annotation: subspace_driver::annotation_for_model(a.spec.annotation.as_deref()),
                 body,
             };
             out.push('\n');
@@ -5085,7 +5130,7 @@ impl Inner {
         target_action_id: &str,
         mode: ResponseMode,
         budget: Option<i64>,
-        attached: &[AttachedReference],
+        directive: &TurnDirective,
     ) -> Result<TurnPrep, AppError> {
         let cfg = self.load_config();
         let now = now_ms();
@@ -5482,7 +5527,12 @@ impl Inner {
         // `TurnPrep::persist_turn`, which is what makes the words the model
         // reads and the edge the record keeps one thing.
         let attached_block = self
-            .render_attached_references(&db_conn, &thread, &model_participant_id, attached)
+            .render_attached_references(
+                &db_conn,
+                &thread,
+                &model_participant_id,
+                &directive.attached,
+            )
             .await?;
 
         // ---- Thread map (task 21) -----------------------------------------
@@ -5810,12 +5860,31 @@ impl Inner {
         // to reject a `tools` field, the round loop withdraws what this turn
         // added and retries against exactly the registry the consumer asked
         // for (see `TurnPrep::withdraw_auto_tools`).
-        let consumer_tools = Arc::new(
-            self.tools
+        // **The withdrawal is applied to the fallback too.** A turn that
+        // withdraws the decline checkpoint (below) must still not offer it
+        // after a tool-rejection degrade, and the degrade falls back to
+        // *exactly* this snapshot — so taking it out here is what makes the
+        // withdrawal hold on both paths rather than on the happy one only.
+        let consumer_tools = Arc::new({
+            let mut registry = self
+                .tools
                 .read()
                 .expect("tool registry lock poisoned")
-                .clone(),
-        );
+                .clone();
+            if directive.mechanical {
+                registry.withdraw(decline::DECLINE_TOOL_NAME);
+            }
+            registry
+        });
+        // **A turn nobody invited takes the decline checkpoint back out.** It
+        // is the one tool a *consumer* registered that this turn must not
+        // offer: declining is how an agent bows out of a conversation it has
+        // nothing to add to, and a mechanical notification is not one — a
+        // decline there would write a `decision` instead of the post the
+        // notification exists to be, and the thing being notified about would
+        // vanish. Done at the snapshot, so the model never sees the schema and
+        // `declined_reason` (which keys on the registry, not the name) cannot
+        // fire even if it guesses the name.
         let auto_tools = nav_tools || memory_tool || spaces_tool;
         let tool_registry = if auto_tools {
             let mut registry = (*consumer_tools).clone();
@@ -5908,7 +5977,7 @@ impl Inner {
             inf_item_id,
             inf_supersedes,
             inf_reply_to,
-            attached_references: attached.to_vec(),
+            attached_references: directive.attached.clone(),
             context_action_ids,
             trace_action_ids: Vec::new(),
             trace_reply_to: inf_reply_to_for_trace,
@@ -6221,7 +6290,7 @@ impl Inner {
         target_action_id: &str,
         mode: ResponseMode,
         budget: Option<i64>,
-        attached: &[AttachedReference],
+        directive: &TurnDirective,
     ) -> Result<ChatResult, AppError> {
         // The space is already persisted (post created it) before prepare_turn
         // runs, so every setup failure inside it — client build, `/v1/models`
@@ -6238,7 +6307,7 @@ impl Inner {
             target_action_id,
             mode,
             budget,
-            attached,
+            directive,
         ))
         .await?;
 
@@ -6613,7 +6682,7 @@ impl Inner {
             &posted.action_id,
             ResponseMode::Reply,
             None,
-            &[],
+            &TurnDirective::default(),
         )
         .await
     }
@@ -6664,7 +6733,7 @@ impl Inner {
             &tip,
             ResponseMode::Revise,
             None,
-            &[],
+            &TurnDirective::default(),
         )
         .await
     }
@@ -6708,7 +6777,7 @@ impl Inner {
         target_action_id: &str,
         mode: ResponseMode,
         budget: Option<i64>,
-        attached: &[AttachedReference],
+        directive: &TurnDirective,
         sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<ChatResult, AppError> {
         // Setup failures (client build / `/v1/models` fetch / attestation
@@ -6725,7 +6794,7 @@ impl Inner {
             target_action_id,
             mode,
             budget,
-            attached,
+            directive,
         ))
         .await?;
 
@@ -7113,7 +7182,7 @@ impl Inner {
             &posted.action_id,
             ResponseMode::Reply,
             None,
-            &[],
+            &TurnDirective::default(),
             sender,
         )
         .await
@@ -7490,7 +7559,7 @@ impl AppCore {
                         &target_action_id,
                         ResponseMode::Reply,
                         None,
-                        &[],
+                        &TurnDirective::default(),
                         sender,
                     )
                     .await
@@ -7523,7 +7592,7 @@ impl AppCore {
                         &target_action_id,
                         ResponseMode::Reply,
                         None,
-                        &[],
+                        &TurnDirective::default(),
                         sender,
                     )
                     .await
@@ -7805,6 +7874,8 @@ impl AppCore {
                 spend_gate: tokio::sync::Mutex::new(()),
                 subspace_driver_started: std::sync::atomic::AtomicBool::new(false),
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
+                subspace_walks: Mutex::new(std::collections::HashMap::new()),
+                awaiting_anchor: Mutex::new(std::collections::HashMap::new()),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 summary_gate: tokio::sync::Mutex::new(()),
                 summary_triggers: Mutex::new(std::collections::HashMap::new()),
@@ -8747,7 +8818,7 @@ impl AppCore {
                         &posted.action_id,
                         ResponseMode::Reply,
                         Some(budget),
-                        &[],
+                        &TurnDirective::default(),
                     )
                     .await
             })
@@ -8988,12 +9059,31 @@ impl AppCore {
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
     pub async fn test_drive_subspace(&self, space_id: String) -> Result<(), AppError> {
+        self.test_drive_subspace_armed(space_id, true).await
+    }
+
+    /// [`Self::test_drive_subspace`], choosing whether the walk is the kind a
+    /// change signal arms or the kind the startup sweep arms — the difference
+    /// being whether it may wait for the post it was delegated from to be
+    /// answered.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_drive_subspace_armed(
+        &self,
+        space_id: String,
+        by_signal: bool,
+    ) -> Result<(), AppError> {
+        let arm = if by_signal {
+            subspace_driver::Arm::Signal
+        } else {
+            subspace_driver::Arm::Sweep
+        };
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move {
                 changes::with_origin(
                     changes::ChangeOrigin::Unattended,
-                    inner.drive_subspace(space_id),
+                    inner.drive_subspace(space_id, arm),
                 )
                 .await
             })
@@ -9087,11 +9177,23 @@ impl AppCore {
     /// `title` is optional; the brief's opening line names the room when none
     /// is given.
     ///
+    /// **`parent_action_id` is the post the delegation is being opened from**,
+    /// and it is the caller's to supply because only the caller knows it: a
+    /// spawn happens inside the owner's turn, and that turn's target is the
+    /// post the work was asked for on. It is captured durably (`space.
+    /// parent_action_id`, navigational exactly as `parent_space_id` is), so the
+    /// eventual report attaches to that branch rather than to wherever the
+    /// owning agent happened to speak last — which is not the same thing the
+    /// moment anything else is going on in the parent. `None` is honest for a
+    /// caller with no turn behind it (a test, a direct API use); the report
+    /// then falls back to the conversation's own last word.
+    ///
     /// Refusals arrive as [`AppError::SpawnRefused`] carrying a
     /// [`SpawnRefusal`], and leave nothing behind. On success:
     /// [`Change::SpaceIndex`] (the Library lists sub-spaces like any other
     /// conversation), [`Change::Space`] for the new id, and
     /// [`Change::Participants`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_subspace(
         &self,
         parent_space_id: String,
@@ -9100,6 +9202,7 @@ impl AppCore {
         participants: Vec<String>,
         capabilities: Vec<String>,
         title: Option<String>,
+        parent_action_id: Option<String>,
     ) -> Result<SpawnedSubspace, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -9112,6 +9215,7 @@ impl AppCore {
                         &participants,
                         &capabilities,
                         title.as_deref(),
+                        parent_action_id.as_deref(),
                     )
                     .await
             })
@@ -11401,7 +11505,7 @@ impl ReferenceEntry {
         Self {
             ordinal: row.ordinal,
             target,
-            annotation: row.annotation.clone(),
+            annotation: subspace_driver::annotation_for_model(row.annotation.as_deref()),
             body,
         }
     }
@@ -11431,7 +11535,13 @@ impl ReferenceEntry {
         Self {
             ordinal: reference.ordinal,
             target,
-            annotation: reference.annotation.clone(),
+            // A `PostReference` has already split the two apart, so the note is
+            // the note and the ending is typed — and both render the same way
+            // they would off the raw column.
+            annotation: match reference.delegation_end {
+                Some(end) => Some(end.describe()),
+                None => reference.annotation.clone(),
+            },
             body,
         }
     }
@@ -12382,7 +12492,16 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
                     content_block_id: e.content_block_id,
                     range_start: e.range_start,
                     range_end: e.range_end,
-                    annotation: e.annotation,
+                    // The one place the stored column is split into the two
+                    // things it can be, so no reader downstream has to know
+                    // that it can be either.
+                    delegation_end: e
+                        .annotation
+                        .as_deref()
+                        .and_then(subspace_driver::DelegationEnd::parse),
+                    annotation: e
+                        .annotation
+                        .filter(|a| subspace_driver::DelegationEnd::parse(a).is_none()),
                     snippet,
                     antecedent_author_label: e.antecedent_author_label,
                     antecedent_author_kind: e.antecedent_author_kind,
@@ -13859,6 +13978,7 @@ mod tests {
             range_start: Some(0),
             range_end: Some(20),
             annotation: None,
+            delegation_end: None,
             snippet: Some("Because of the moon.".into()),
             antecedent_author_label: "Ada".into(),
             antecedent_author_kind: "agent".into(),
@@ -14079,6 +14199,7 @@ mod tests {
                 range_start: None,
                 range_end: None,
                 annotation: None,
+                delegation_end: None,
                 snippet: Some("Because of the moon.".into()),
                 antecedent_author_label: "Agent".into(),
                 antecedent_author_kind: "agent".into(),
@@ -14090,6 +14211,7 @@ mod tests {
                 range_start: None,
                 range_end: None,
                 annotation: Some("no marker for this one".into()),
+                delegation_end: None,
                 snippet: Some("from another space".into()),
                 antecedent_author_label: "Cy".into(),
                 antecedent_author_kind: "agent".into(),
@@ -14705,6 +14827,7 @@ mod tests {
             range_start: Some(0),
             range_end: Some(7),
             annotation: None,
+            delegation_end: None,
             snippet: Some("passage".into()),
             antecedent_author_label: label.into(),
             antecedent_author_kind: "agent".into(),

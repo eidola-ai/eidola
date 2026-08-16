@@ -100,6 +100,20 @@ fn spawn(
     participants: Vec<String>,
     capabilities: Vec<String>,
 ) -> Result<SpawnedSubspace, AppError> {
+    spawn_from(core, parent, owner, brief, participants, capabilities, None)
+}
+
+/// A spawn that names the post in the parent it is being opened from — what a
+/// turn-scoped caller supplies, and what the eventual report attaches to.
+fn spawn_from(
+    core: &AppCore,
+    parent: &str,
+    owner: &str,
+    brief: &str,
+    participants: Vec<String>,
+    capabilities: Vec<String>,
+    parent_action_id: Option<&str>,
+) -> Result<SpawnedSubspace, AppError> {
     core.runtime().block_on(core.spawn_subspace(
         parent.to_string(),
         owner.to_string(),
@@ -107,6 +121,7 @@ fn spawn(
         participants,
         capabilities,
         None,
+        parent_action_id.map(str::to_string),
     ))
 }
 
@@ -966,6 +981,82 @@ fn a_brief_is_agent_authored_so_the_room_opens_one_cascade_hop_in() {
             }
             other => panic!("a cascade limit of 1 must pause on the brief, got {other:?}"),
         }
+    });
+}
+
+/// **A delegation is opened *from* a post, and that post has to be one here.**
+/// The anchor is what the eventual report attaches to, so one naming another
+/// conversation would answer a conversation nobody asked — and it is decided at
+/// the write like every other guard.
+#[test]
+fn a_spawn_cannot_anchor_to_a_post_in_another_conversation() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let elsewhere = space(&core);
+        let foreign = core
+            .runtime()
+            .block_on(core.post("Not here.".into(), Some(elsewhere)))
+            .expect("post");
+
+        match refusal(
+            spawn_from(
+                &core,
+                &parent,
+                &owner,
+                "Check the tide tables.",
+                vec![],
+                vec![],
+                Some(&foreign.action_id),
+            )
+            .expect_err("a foreign anchor is refused"),
+        ) {
+            SpawnRefusal::AnchorNotInParent { action_id } => {
+                assert_eq!(action_id, foreign.action_id);
+            }
+            other => panic!("expected AnchorNotInParent, got {other:?}"),
+        }
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent))
+                .expect("list")
+                .is_empty(),
+            "a refused spawn leaves nothing behind"
+        );
+
+        // And an anchor that *is* a post here is kept, so the driver can find
+        // it later.
+        let parent2 = space(&core);
+        let owner2 = shared_agent(&core, &parent2, "Pilot");
+        let here = core
+            .runtime()
+            .block_on(core.post("Here.".into(), Some(parent2.clone())))
+            .expect("post");
+        let out = spawn_from(
+            &core,
+            &parent2,
+            &owner2,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+            Some(&here.action_id),
+        )
+        .expect("spawn");
+        assert_eq!(
+            out.space.parent_action_id.as_deref(),
+            Some(here.action_id.as_str())
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.subspace(out.space.id))
+                .expect("read")
+                .expect("a sub-space")
+                .parent_action_id
+                .as_deref(),
+            Some(here.action_id.as_str()),
+            "and it is durable"
+        );
     });
 }
 
