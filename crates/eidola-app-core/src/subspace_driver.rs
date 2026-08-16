@@ -80,8 +80,9 @@ pub(crate) type DriverRegistry = HashMap<String, Option<Arm>>;
 ///
 /// **The two are told apart by provenance, not by shape**, and the distinction
 /// is load-bearing enough to be worth stating twice: the whole of `Sweep`'s
-/// licence to stop waiting is the claim that *nothing can still be in flight*,
-/// and that claim is true only of a process that has just started. Anything a
+/// licence to stop waiting is the claim that *no turn that could answer this
+/// room's anchor is still running*, and the only turn that could is one **this
+/// process** made — a spawn happens inside its owner's turn. Anything a
 /// **live** process does — including recovering from a bus it fell behind on —
 /// is a `Signal`, because a turn it cannot see may be running right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,10 +91,16 @@ pub(crate) enum Arm {
     /// announced, or a re-ask by a process that is already running (lag
     /// recovery). A waiting room keeps waiting.
     Signal,
-    /// **The startup sweep, and only that.** A process that has just started
-    /// cannot be waiting on a turn of its own, so nothing it finds is still in
-    /// flight — which is what makes it safe, and the only thing that makes it
-    /// safe, to stop waiting for an answer here.
+    /// **The startup sweep, and only for a room this process did not open.** A
+    /// process that has just started cannot be waiting on a turn of its own —
+    /// so a room it *finds* was opened by some earlier run, whose turns died
+    /// with it, and nothing can still be coming. That is what makes it safe,
+    /// and the only thing that makes it safe, to stop waiting for an answer
+    /// here. A room this process spawned is the exception the claim has to
+    /// name rather than survive: it was opened inside a turn that may be
+    /// running at this moment, so the sweep arms it as an ordinary
+    /// [`Arm::Signal`] and its wait ends the way every other one does — the
+    /// answer, or the grace.
     Sweep,
     /// A wait's own alarm, come due (see [`ANCHOR_WAIT_GRACE`]). The answer has
     /// had longer than any turn takes and has not come; the room stops holding
@@ -204,6 +211,33 @@ const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 /// depends on no other event: an unrelated post in the parent still never
 /// spends the wait, and a parent that goes quiet forever still ends it.
 pub const ANCHOR_WAIT_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How many delegated rooms this process may be walking at once.
+///
+/// **The backlog is the case this exists for.** Arming is per room and the
+/// registry only stops a room being walked twice — nothing bounded how many
+/// rooms walked at all, so a start that finds a previous run's rooms
+/// outstanding, or a lag recovery that re-asks the question of every one, put
+/// every walk on the runtime at the same instant. Each walk is a chain of
+/// *billed* turns: a hundred rooms is a hundred live requests, a hundred
+/// credential steps queued against each other, and — on a local backend — a
+/// hundred engine loads competing for one pool's memory budget, none of it
+/// asked for by anybody who is looking at the app right now.
+///
+/// **Small on purpose, and the number is not about throughput.** The paying
+/// step is already serialized process-wide (`Inner::spend_gate` holds the
+/// acquire → spend-proof → flip for one request at a time), so concurrency past
+/// a handful buys nothing where it costs money and multiplies everything
+/// around it. What the bound has to leave room for is a room that *stalls*: an
+/// upstream that has gone away takes its attempts and its pause, and must not
+/// hold the queue. Three lets two rooms make progress while one is stuck, and
+/// still means a restart's backlog arrives as a trickle rather than a
+/// stampede.
+///
+/// It bounds **execution**, not arming: a room whose turn has not come keeps
+/// its registry entry, so arms still merge into it (see [`Arm::merge`]) and the
+/// walk that eventually runs runs once, from the room's newest tail.
+pub const MAX_CONCURRENT_WALKS: usize = 3;
 
 /// How many turns one delegation may take, across its whole life.
 ///
@@ -452,6 +486,42 @@ impl Inner {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Record that **this process** is opening `space_id`, so a startup sweep
+    /// cannot later mistake it for a room left behind by an earlier run (see
+    /// [`Inner::rearm_live_subspaces`]).
+    ///
+    /// Called **before** the spawning transaction, not after it: a record
+    /// written afterwards leaves a window in which the room is visible to the
+    /// sweep's enumeration and unrecorded, which is precisely the state the
+    /// record exists to rule out. Marking early can only over-mark — a refused
+    /// spawn leaves an id naming no room, which nothing ever asks about.
+    ///
+    /// **It stops recording once the sweep has been**, which is what keeps this
+    /// from growing for the life of the process: [`Arm::Sweep`] is issued by
+    /// one call, once, and after it has read the record no answer this could
+    /// give would ever be consulted again. `None` is that state, and it is the
+    /// type saying so.
+    pub(crate) fn note_room_spawned_here(&self, space_id: &str) {
+        if let Some(rooms) = self
+            .rooms_spawned_here
+            .lock()
+            .expect("spawn record poisoned")
+            .as_mut()
+        {
+            rooms.insert(space_id.to_string());
+        }
+    }
+
+    /// The rooms this process opened, and the end of the record — see
+    /// [`Inner::note_room_spawned_here`].
+    fn take_rooms_spawned_here(&self) -> std::collections::HashSet<String> {
+        self.rooms_spawned_here
+            .lock()
+            .expect("spawn record poisoned")
+            .take()
+            .unwrap_or_default()
+    }
+
     /// Give `space_id` a driver if it is a room this driver owns and does not
     /// already have one.
     ///
@@ -498,6 +568,19 @@ impl Inner {
         tokio::spawn(async move {
             let mut arm = arm;
             loop {
+                // **The queue is here, behind the registry claim and in front
+                // of the walk** ([`MAX_CONCURRENT_WALKS`]). Claiming the room
+                // first is what keeps this a queue of *rooms* rather than of
+                // tasks: a room waiting for its turn still holds its entry, so
+                // everything that happens meanwhile merges into its pending
+                // arm and the walk that finally runs runs once, from the
+                // newest tail. The permit is per pass, so a room retrying
+                // after a failure gives it up over its pause rather than
+                // holding the queue closed while it waits.
+                let permit = inner.walk_permits.clone().acquire_owned().await;
+                if permit.is_err() {
+                    return; // the semaphore is closed — the process is going away
+                }
                 // Everything this task commits is unattended by construction:
                 // no consumer call is outstanding, so a window that drops the
                 // invalidation while it is busy loses it for good.
@@ -506,6 +589,7 @@ impl Inner {
                     inner.drive_subspace(space_id.clone(), arm),
                 )
                 .await;
+                drop(permit);
                 // **A walk that failed arms itself.** Most failures re-arm the
                 // room for free, because the turn that failed emitted a change
                 // into it — but the ones that matter most do not: a room whose
@@ -565,6 +649,25 @@ impl Inner {
     /// definition of outstanding work do the deciding, rather than keeping a
     /// second, subtly different copy of it here.
     ///
+    /// **A sweep does not claim a room this process opened.** `Arm::Sweep`'s
+    /// whole licence is that no turn which could answer these rooms' anchors is
+    /// still running, and the one turn that could is one this process made — a
+    /// spawn happens *inside* its owner's turn. The enumeration is a query, and
+    /// a spawn committing before it is in its answer, so the licence would
+    /// otherwise be claimed for exactly the room it is false about, and the
+    /// corrective `Signal` from that spawn's own change event could not take it
+    /// back (the merge is strongest-wins, correctly). So this asks what this
+    /// process spawned and arms those as ordinary signals.
+    ///
+    /// **The two reads are ordered, and the order is the whole of it**: the
+    /// rooms are enumerated *first* and the spawn record is taken *after*, so a
+    /// spawn racing the enumeration is either invisible to it (and armed by its
+    /// own change event) or already in the record when the record is read. The
+    /// record is written before the spawning transaction rather than after it,
+    /// for the same reason a space's stamp precedes the write it describes — a
+    /// mark that lands after its row leaves a window in which the row is
+    /// visible and unmarked, and here that window is the hazard itself.
+    ///
     /// Failures are warned about and swallowed: picking delegations back up is
     /// housekeeping, and a process that refused to start over it would cost the
     /// reader everything else.
@@ -574,9 +677,21 @@ impl Inner {
             db::live_subspaces(&conn).await
         }
         .await;
+        // Read after the enumeration, and only where it can matter: this is
+        // the sweep's licence being checked, and every other arm already
+        // claims nothing.
+        let spawned_here = match arm {
+            Arm::Sweep => self.take_rooms_spawned_here(),
+            _ => std::collections::HashSet::new(),
+        };
         match rooms {
             Ok(rooms) => {
                 for room in rooms {
+                    let arm = if spawned_here.contains(&room.id) {
+                        Arm::Signal
+                    } else {
+                        arm
+                    };
                     self.arm_subspace_driver(&room.id, arm);
                 }
             }

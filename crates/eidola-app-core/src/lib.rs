@@ -47,7 +47,7 @@ pub use local_models::{
 };
 pub use subspace_driver::{
     ANCHOR_WAIT_GRACE, DelegationEnd, DelegationFailure, MAX_ATTEMPTS_PER_TAIL,
-    MAX_DELEGATION_TURNS,
+    MAX_CONCURRENT_WALKS, MAX_DELEGATION_TURNS,
 };
 pub use subspaces::{
     MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, MAX_SUBAGENTS_PER_SPAWN, SpaceCapability,
@@ -1560,6 +1560,14 @@ struct Inner {
     /// last word — the retry meter that keeps a failing room from being armed
     /// and billed forever (see `Inner::claim_walk`).
     subspace_walks: Mutex<subspace_driver::WalkLedger>,
+    /// The delegated rooms **this process opened**, until the startup sweep has
+    /// read them (`None` afterwards). A spawn happens inside its owner's turn,
+    /// so these are exactly the rooms the sweep's licence is false about — see
+    /// `Inner::note_room_spawned_here`.
+    rooms_spawned_here: Mutex<Option<std::collections::HashSet<String>>>,
+    /// How many delegated rooms may be walked at once, process-wide — see
+    /// `subspace_driver::MAX_CONCURRENT_WALKS`.
+    walk_permits: Arc<tokio::sync::Semaphore>,
     /// Delegated rooms waiting for the post they were opened from to be
     /// answered, mapped to the parent whose next change wakes them (see
     /// `Inner::report_delegation`).
@@ -8048,6 +8056,10 @@ impl AppCore {
                 subspace_driver_started: std::sync::atomic::AtomicBool::new(false),
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
                 subspace_walks: Mutex::new(std::collections::HashMap::new()),
+                rooms_spawned_here: Mutex::new(Some(std::collections::HashSet::new())),
+                walk_permits: Arc::new(tokio::sync::Semaphore::new(
+                    subspace_driver::MAX_CONCURRENT_WALKS,
+                )),
                 awaiting_anchor: Mutex::new(std::collections::HashMap::new()),
                 anchor_wait_grace_ms: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "test-support")]
@@ -8120,6 +8132,20 @@ impl AppCore {
     /// changes were missed.
     pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<changes::ChangeEvent> {
         self.bus.subscribe()
+    }
+
+    /// The change-bus watermark — every event emitted so far carries a
+    /// `ChangeEvent::seq` strictly below this (see
+    /// [`changes::ChangeSource::current_seq`]).
+    ///
+    /// Sampled by a consumer **immediately before a read**, and kept beside
+    /// whatever that read produced, so it can later answer the only question a
+    /// busy surface really has about a deferred invalidation: *did my own read
+    /// already cover this?* A plain atomic load — no runtime, no database, safe
+    /// from any thread, which is what lets a gpui entity take it on the frame
+    /// it issues the read.
+    pub fn change_seq(&self) -> u64 {
+        self.bus.current_seq()
     }
 
     // -----------------------------------------------------------------------

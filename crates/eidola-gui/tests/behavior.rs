@@ -11648,7 +11648,7 @@ fn space_change_invalidates_the_trace_index(cx: &mut TestAppContext) {
 
     cx.update(|cx| {
         stores.spaces.update(cx, |st, cx| {
-            st.notify_space_changed("s", ChangeOrigin::Caller, cx)
+            st.notify_space_changed("s", ChangeOrigin::Caller, u64::MAX, cx)
         });
     });
     space.read_with(cx, |s, _| {
