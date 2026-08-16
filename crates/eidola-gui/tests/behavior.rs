@@ -16132,3 +16132,92 @@ async fn an_archived_conversation_explains_itself_without_offering_retry(
         );
     });
 }
+
+/// **Quoting composes, so it is gated where composing is.**
+///
+/// Quote and Quote in Reply open a populated, focused draft *in this
+/// conversation*; for a reader who may only watch, that draft's submit is
+/// refused by app-core, so offering them is the window inviting composition it
+/// cannot accept — the same defect the Ask chips had.
+///
+/// **Quote Elsewhere… deliberately stays.** Its draft lands in whichever
+/// conversation the reader picks, very likely one they take part in, and the
+/// passage is theirs to quote because they can read it. Refusing it here would
+/// deny a legitimate act on account of where they happened to be reading; the
+/// destination answers for the destination.
+#[gpui::test]
+fn a_watching_reader_may_quote_elsewhere_but_not_here(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        // A roster that has answered without the reader, and a second cell
+        // saying this is not a notebook: the reader is only watching.
+        s.participants = Some((
+            "s".to_string(),
+            vec![eidola_app_core::ParticipantInfo {
+                id: "agent-a".into(),
+                scope: "global".into(),
+                source: "referenced".into(),
+                kind: "agent".into(),
+                label: "Surveyor".into(),
+                model_ref: Some("gemma4-31b".into()),
+                system_prompt: None,
+                notify_policy: "all".into(),
+                role: "member".into(),
+                reference: None,
+            }],
+        ));
+        s.space_settings = Some((
+            "s".to_string(),
+            eidola_app_core::SpaceSettings {
+                notebook_participant_id: None,
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    let at = point_in_post(&view, &vcx, "a1");
+    select_whole_post(&view, &mut vcx, "a1");
+    right_click(&mut vcx, at);
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.context_menu_items_for_test(),
+            Some(vec![
+                "Copy".to_string(),
+                "Quote Elsewhere…".to_string(),
+                "Select All".to_string(),
+            ]),
+            "the two that compose here are gone; quoting into another \
+             conversation, and reading, are not"
+        );
+    });
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    // And the handler refuses on its own — a keystroke reaches it without
+    // passing either surface that offers it.
+    let drafts_before = view.read_with(&vcx, |v, _| v.draft_parents_for_test().len());
+    vcx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote(&eidola_gui::actions::Quote, window, cx);
+            v.quote_in_reply(&eidola_gui::actions::QuoteInReply, window, cx);
+        })
+    })
+    .unwrap();
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.draft_parents_for_test().len()),
+        drafts_before,
+        "neither handler opened a draft for a reader who may not compose here"
+    );
+}

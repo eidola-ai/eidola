@@ -2606,11 +2606,21 @@ impl Render for SpaceView {
             // registration-is-enablement mechanism as CloseWindow, with the
             // extra selection condition. `note_body_selection` re-renders on
             // exactly the transitions that flip this.
+            // Quoting *elsewhere* lands its draft in whichever conversation
+            // the reader picks, so a selection is the whole of its condition.
             .when(self.post_selection.is_some(), |d| {
-                d.on_action(cx.listener(Self::quote))
-                    .on_action(cx.listener(Self::quote_in_reply))
-                    .on_action(cx.listener(Self::quote_elsewhere))
+                d.on_action(cx.listener(Self::quote_elsewhere))
             })
+            // These two land a draft **here**, so they also need the reader to
+            // be able to act here — registration-is-enablement, so macOS greys
+            // them for a reader who is only watching.
+            .when(
+                self.post_selection.is_some() && self.viewer_may_act(cx),
+                |d| {
+                    d.on_action(cx.listener(Self::quote))
+                        .on_action(cx.listener(Self::quote_in_reply))
+                },
+            )
             // **The sole owner of "Escape closes the context menu."** Key
             // dispatch bubbles inner→outer, so the root runs *last* — after
             // every inner Escape handler (the composer's, an edit session's)

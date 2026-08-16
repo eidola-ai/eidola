@@ -1288,6 +1288,12 @@ fn an_agent_with_no_model_of_its_own_is_refused_a_seat() {
 /// A brief that yields no opening line still has to be findable in the
 /// Library: it carries no snippet either (a brief is not what the listing's
 /// fallback text reads), so a titleless row would be a blank line in a list.
+///
+/// It takes the **owner's label alone**. A title is persisted, and a persisted
+/// string never passes through the presentation layer's translations — so a
+/// sentence written here would be English in every language. A name is not
+/// copy: it is locale-neutral by nature and says the one thing a reader
+/// scanning the Library needs, which is whose room this is.
 #[test]
 fn a_brief_with_no_openable_line_still_names_its_room() {
     run(|| {
@@ -1296,7 +1302,7 @@ fn a_brief_with_no_openable_line_still_names_its_room() {
         let owner = shared_agent(&core, &parent, "Navigator");
 
         let out = spawn(&core, &parent, &owner, "###", vec![], vec![]).expect("spawn");
-        assert_eq!(out.space.title.as_deref(), Some("Delegated by Navigator"));
+        assert_eq!(out.space.title.as_deref(), Some("Navigator"));
         let row = core
             .runtime()
             .block_on(core.list_spaces(true))
@@ -1304,7 +1310,7 @@ fn a_brief_with_no_openable_line_still_names_its_room() {
             .into_iter()
             .find(|s| s.id == out.space.id)
             .expect("listed");
-        assert_eq!(row.title.as_deref(), Some("Delegated by Navigator"));
+        assert_eq!(row.title.as_deref(), Some("Navigator"));
         assert!(
             row.snippet.is_none(),
             "which is exactly why the title has to be there: {row:?}"
