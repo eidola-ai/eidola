@@ -60,7 +60,7 @@ use crate::changes::{Change, ChangeOrigin, with_origin};
 use crate::error::AppError;
 use crate::{
     AttachedReference, AttachmentOrigin, ChatStreamEvent, Inner, NotificationPlan, PlannedTurn,
-    Planner, ReferenceSpec, ResponseMode, TurnDirective, TurnSelector, db,
+    Planner, ReferenceSpec, ResponseMode, TurnDirective, TurnSelector, db, now_ms,
 };
 
 /// The per-room driver registry: room id → whether an arm arrived while its
@@ -100,6 +100,11 @@ pub(crate) type WalkLedger = HashMap<String, Walk>;
 /// an outage is waited out rather than billed against. A restart, or any post
 /// from outside, starts the count over.
 pub const MAX_ATTEMPTS_PER_TAIL: u32 = 3;
+
+/// How long a failed walk waits before trying again. Short — the meter is only
+/// [`MAX_ATTEMPTS_PER_TAIL`] deep, so this is the difference between riding out
+/// a blip and hammering an upstream that is away, not a backoff schedule.
+const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How many turns one delegation may take, across its whole life.
 ///
@@ -375,18 +380,39 @@ impl Inner {
                     inner.drive_subspace(space_id.clone(), arm),
                 )
                 .await;
+                // **A walk that failed arms itself.** Most failures re-arm the
+                // room for free, because the turn that failed emitted a change
+                // into it — but the ones that matter most do not: a room whose
+                // plan was empty from the start, one that paused on its brief,
+                // one whose budget was already spent. Those drive nothing, so
+                // nothing is written into the room, so nothing announces
+                // anything, and a report that failed there would leave the
+                // delegation unreported with no event left in the world to pick
+                // it up until the process restarted. Retrying here makes every
+                // failure take the same path; `claim_walk` is what bounds it,
+                // and a failure changes nothing about the room, so the meter it
+                // reads is the same one every time round and runs out.
+                let failed = result.is_err();
                 if let Err(e) = result {
                     eprintln!(
                         "warning: the delegated conversation {space_id} could not be driven: {e}"
                     );
                 }
-                let mut running = inner.subspace_drivers.lock().expect("driver map poisoned");
-                match running.get_mut(&space_id) {
-                    Some(rearm) if *rearm => *rearm = false,
-                    _ => {
-                        running.remove(&space_id);
-                        return;
+                {
+                    let mut running = inner.subspace_drivers.lock().expect("driver map poisoned");
+                    match running.get_mut(&space_id) {
+                        Some(rearm) if *rearm || failed => *rearm = false,
+                        _ => {
+                            running.remove(&space_id);
+                            return;
+                        }
                     }
+                }
+                if failed {
+                    // A pause between attempts, so a room whose upstream is
+                    // briefly away is retried rather than hammered. Short,
+                    // because the meter is only three deep.
+                    tokio::time::sleep(RETRY_PAUSE).await;
                 }
             }
         });
@@ -443,6 +469,11 @@ impl Inner {
         match walks.get_mut(space_id) {
             Some(walk) if walk.tail == tail => {
                 if walk.attempts >= MAX_ATTEMPTS_PER_TAIL {
+                    eprintln!(
+                        "warning: the delegated conversation {space_id} has been tried \
+                         {MAX_ATTEMPTS_PER_TAIL} times against the same last post and is being \
+                         left alone; a post there, or a restart, will pick it up again"
+                    );
                     return false;
                 }
                 walk.attempts += 1;
@@ -526,18 +557,47 @@ impl Inner {
         space_id: &str,
         tail: String,
     ) -> Result<Option<(DelegationEnd, String)>, AppError> {
+        // When this walk began. Anything posted from here on that the walk did
+        // not write itself came from somewhere else and is owed a hearing —
+        // see the refill below.
+        let began = now_ms();
         // The room's last word *as this walk saw it* — the entry tail until a
         // driven turn produces something newer.
         let mut witness = tail.clone();
+        // Every post this walk has planned off. It is what tells the walk's own
+        // work apart from a stranger's, and there is nothing durable that could:
+        // a post the driver planned and a post nobody has looked at are the same
+        // row, so the only honest record of "I have served this" is the memory
+        // of having done it.
+        let mut served: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Posts whose replies have not been planned yet. A fan-out puts several
         // answers on it at once; taking the newest first walks each thread of
         // the room down before starting the next, which is the order a reader
         // watching the transcript would expect.
         let mut frontier: Vec<String> = vec![tail];
+        #[cfg(feature = "test-support")]
+        let mut paused_once = false;
         loop {
             let Some(post) = frontier.pop() else {
-                return Ok(Some((DelegationEnd::Concluded, witness)));
+                // **Nothing planned is not the same as nothing outstanding.** A
+                // post can land in the room while the walk is walking — a person
+                // asking a question in a room they are watching — and it is on
+                // nobody's frontier: the walk never saw it, and re-deriving "the
+                // tail" would not find it either, because a driven turn has very
+                // likely written something newer since. Refilling from what
+                // actually arrived is what gets that post its turn; without it
+                // the report would name the driven tail, the room would read as
+                // reported, and the question would sit there answered by nobody.
+                let conn = self.db_conn().await?;
+                let arrived = db::posts_in_space_since(&conn, space_id, began).await?;
+                drop(conn);
+                frontier.extend(arrived.into_iter().filter(|id| !served.contains(id)));
+                if frontier.is_empty() {
+                    return Ok(Some((DelegationEnd::Concluded, witness)));
+                }
+                continue;
             };
+            served.insert(post.clone());
             let conn = self.db_conn().await?;
             let live = db::is_live_subspace(&conn, space_id).await?;
             let taken = db::turns_taken_in_space(&conn, space_id).await?;
@@ -584,6 +644,10 @@ impl Inner {
                     Ok(Some(post_action_id)) => {
                         witness = post_action_id.clone();
                         frontier.push(post_action_id);
+                        #[cfg(feature = "test-support")]
+                        if !std::mem::replace(&mut paused_once, true) {
+                            self.pause_in_cascade_window().await;
+                        }
                     }
                     Ok(None) => {}
                     Err(AppError::SpaceArchived { .. }) => return Ok(None),
@@ -614,7 +678,14 @@ impl Inner {
         space_id: &str,
         turn: &PlannedTurn,
     ) -> Result<Option<String>, AppError> {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        // **The receiver is dropped before the turn runs, not held.** Nothing
+        // here watches a delegated room stream; keeping the handle alive would
+        // buffer every delta of every turn for the length of the walk, for a
+        // reader that does not exist. The transport treats a closed channel as
+        // "nobody is listening" (`let _ = sender.send(..)` on every event), so
+        // dropping it is the honest way to say so.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        drop(rx);
         let result = Box::pin(self.run_turn_stream(
             space_id,
             TurnSelector::Participant(turn.participant_id.clone()),
@@ -693,7 +764,7 @@ impl Inner {
                 // for the entry to be there — at the cost of an entry to take
                 // back out on every path that does not wait, which is what
                 // `end_anchor_wait` is for.
-                let waiting = arm == Arm::Signal && self.begin_anchor_wait(sub);
+                self.begin_anchor_wait(sub);
                 #[cfg(feature = "test-support")]
                 self.pause_in_anchor_window().await;
                 match db::last_reply_by_participant(
@@ -718,12 +789,27 @@ impl Inner {
                     // its parent to change, which the answer (or the failure)
                     // will do.
                     //
-                    // It waits **once**, and never when the sweep armed it: a
-                    // process that has just started cannot be waiting on a turn
-                    // of its own, so at that point the answer either exists or
-                    // never will, and the anchor is then the right attachment
-                    // because there is no answer for it to sit beneath.
-                    None if waiting => return Ok(()),
+                    // **It goes on waiting until the answer is actually
+                    // there.** A wake-up is not evidence of one: the parent is
+                    // an ordinary conversation and anything at all can move it,
+                    // so a wait that spent itself on the first wake would attach
+                    // to the anchor because somebody said something unrelated,
+                    // and the answer — arriving a moment later — would become
+                    // the report's sibling instead of its parent. Every wake
+                    // re-asks, and only the answer ends the wait.
+                    //
+                    // **Termination is the sweep, and only the sweep.** Waiting
+                    // costs nothing — no turn, no spend, no row — so an
+                    // indefinite one is not a leak, it is a room correctly
+                    // declining to guess. What it must not be is permanent, and
+                    // the case where the answer never comes at all is a spawning
+                    // turn that died; that process cannot outlive its own crash,
+                    // and the next start's sweep arms with `Arm::Sweep`, which
+                    // never waits — at that moment nothing can still be in
+                    // flight, so the answer either exists or never will, and the
+                    // anchor is then the right attachment because there is
+                    // nothing for the report to sit beneath.
+                    None if arm == Arm::Signal => return Ok(()),
                     None => {
                         self.end_anchor_wait(&sub.id);
                         Some(anchor.to_string())
@@ -769,7 +855,9 @@ impl Inner {
             }],
             mechanical: true,
         };
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        // Dropped before the turn runs, for the reason the driven turns' is.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        drop(rx);
         let result = Box::pin(self.run_turn_stream(
             &sub.parent_space_id,
             TurnSelector::Participant(sub.owner_participant_id.clone()),
@@ -799,21 +887,18 @@ impl Inner {
         Ok(())
     }
 
-    /// Register `sub` against its parent and answer whether this walk may wait
-    /// for the anchor to be answered.
+    /// Register `sub` against its parent, so a change there wakes it.
     ///
-    /// **The registration happens whether or not the wait does**, because it has
-    /// to precede the question it protects (see the call site). A room waits at
-    /// most once per process — a walk that finds itself already registered has
-    /// waited before, and attaches to the anchor instead, so a spawning turn
-    /// that died can never leave a delegation waiting on an answer that is not
-    /// coming.
-    fn begin_anchor_wait(&self, sub: &db::SubspaceRow) -> bool {
+    /// **Unconditional, and before the question it protects** (see the call
+    /// site): the answer can commit between registering and asking, and
+    /// registering second would leave that commit's change looking at an empty
+    /// map. Idempotent — a room that is already waiting stays waiting, because
+    /// a wake-up that found no answer has established nothing.
+    fn begin_anchor_wait(&self, sub: &db::SubspaceRow) {
         self.awaiting_anchor
             .lock()
             .expect("anchor wait map poisoned")
-            .insert(sub.id.clone(), sub.parent_space_id.clone())
-            .is_none()
+            .insert(sub.id.clone(), sub.parent_space_id.clone());
     }
 
     /// Hold the walk inside the anchor window while a test commits the write
@@ -821,17 +906,13 @@ impl Inner {
     /// a `None` — whenever no test has opened one.
     #[cfg(feature = "test-support")]
     async fn pause_in_anchor_window(&self) {
-        let gate = self
-            .anchor_window
-            .lock()
-            .expect("anchor window lock poisoned")
-            .clone();
-        if let Some(tx) = gate {
-            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-            if tx.send(resume_tx).is_ok() {
-                let _ = resume_rx.await;
-            }
-        }
+        pause_in_window(&self.anchor_window).await;
+    }
+
+    /// The same, for the window inside a walk (see `Inner::cascade_window`).
+    #[cfg(feature = "test-support")]
+    async fn pause_in_cascade_window(&self) {
+        pause_in_window(&self.cascade_window).await;
     }
 
     /// Stop waiting: the answer arrived, or there is no longer one to wait for.
@@ -855,6 +936,23 @@ impl Inner {
             .filter(|(_, parent)| parent.as_str() == space_id)
             .map(|(room, _)| room.clone())
             .collect()
+    }
+}
+
+/// Hold here until whoever opened this window lets go. A no-op — one lock and a
+/// `None` — whenever nobody has.
+#[cfg(feature = "test-support")]
+async fn pause_in_window(
+    window: &std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
+    >,
+) {
+    let gate = window.lock().expect("test window lock poisoned").clone();
+    if let Some(tx) = gate {
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        if tx.send(resume_tx).is_ok() {
+            let _ = resume_rx.await;
+        }
     }
 }
 

@@ -110,6 +110,9 @@ pub enum SpawnRefusal {
     /// the parent conversation. The report attaches there, so an anchor
     /// pointing somewhere else would answer a conversation nobody asked.
     AnchorNotInParent { action_id: String },
+    /// No anchor was named and the parent conversation has nothing to attach a
+    /// report to. The room would do its work and then have nowhere to say so.
+    NothingToReportTo,
 }
 
 impl std::fmt::Display for SpawnRefusal {
@@ -167,6 +170,11 @@ impl std::fmt::Display for SpawnRefusal {
                 f,
                 "{action_id} is not a post in this conversation, so a delegation opened from it \
                  would have nowhere here to report back to"
+            ),
+            Self::NothingToReportTo => write!(
+                f,
+                "there is nothing in this conversation to reply to, so work delegated from it \
+                 could never be reported back — say something here first"
             ),
         }
     }

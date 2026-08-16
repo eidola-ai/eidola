@@ -63,11 +63,21 @@ fn setup() -> (MockServer, AppCore, tempfile::TempDir) {
     (mock, core, dir)
 }
 
+/// A parent conversation **with something said in it** — which is what one
+/// always is at a spawn, since a spawn happens inside a turn answering a post.
+/// A conversation with nothing in it has nowhere for a report to land and the
+/// spawn door refuses it (`SpawnRefusal::NothingToReportTo`), so an empty one
+/// would be testing a refusal rather than the thing under test.
 fn space(core: &AppCore) -> String {
-    core.runtime()
+    let id = core
+        .runtime()
         .block_on(core.create_space(None))
         .expect("space")
-        .id
+        .id;
+    core.runtime()
+        .block_on(core.post("What do the tide tables say?".into(), Some(id.clone())))
+        .expect("post");
+    id
 }
 
 /// A **shared** agent taking part in `space` — the only kind of participant
@@ -1057,6 +1067,63 @@ fn a_spawn_cannot_anchor_to_a_post_in_another_conversation() {
             Some(here.action_id.as_str()),
             "and it is durable"
         );
+    });
+}
+
+/// **A delegation that could never be reported is refused before it costs
+/// anything.** The asymmetry is the whole argument: a refused spawn writes
+/// nothing and spends nothing, while a room that runs its turns and then finds
+/// no post in its parent to reply to has spent real money on work nobody will
+/// ever be told about.
+#[test]
+fn a_spawn_with_nowhere_to_report_back_to_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+        let owner = shared_agent(&core, &parent, "Navigator");
+
+        assert!(
+            matches!(
+                refusal(
+                    spawn(
+                        &core,
+                        &parent,
+                        &owner,
+                        "Check the tide tables.",
+                        vec![],
+                        vec![]
+                    )
+                    .expect_err("a conversation with nothing in it is refused")
+                ),
+                SpawnRefusal::NothingToReportTo
+            ),
+            "an empty parent has nowhere for a report to land"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent.clone()))
+                .expect("list")
+                .is_empty(),
+            "and the refusal costs nothing"
+        );
+
+        // One post is all it takes: that post is what the report replies to.
+        core.runtime()
+            .block_on(core.post("Look into the tides.".into(), Some(parent.clone())))
+            .expect("post");
+        spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+        )
+        .expect("now there is somewhere to report back to");
     });
 }
 
