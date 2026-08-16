@@ -1817,12 +1817,17 @@ pub async fn is_live_subspace(conn: &Connection, space_id: &str) -> Result<bool,
 /// restart because the rows do — an in-memory tally would reset the meter every
 /// time the process came back, which is the one way a budget can be escaped.
 /// A turn that failed wrote neither and is deliberately not counted: nothing
-/// was produced and nothing was persisted to produce it from.
+/// was produced and nothing was persisted to produce it from. Driven turns
+/// keep that true by writing no generation on failure; a human's *blocking*
+/// verb in a room writes a `status = 'error'` generation instead, so the
+/// terminal-status filter is what keeps the sentence true of every writer.
+/// Superseded generations stay counted on purpose — each was a turn that ran.
 pub async fn turns_taken_in_space(conn: &Connection, space_id: &str) -> Result<i64, AppError> {
     let mut rows = conn
         .query(
             "SELECT COUNT(*) FROM action \
-             WHERE space_id = ?1 AND action_type IN ('inference', 'decision')",
+             WHERE space_id = ?1 AND action_type IN ('inference', 'decision') \
+               AND status IN ('complete', 'cancelled')",
             (Value::Text(space_id.to_string()),),
         )
         .await
@@ -7467,7 +7472,12 @@ pub async fn action_watermark(conn: &Connection) -> Result<i64, AppError> {
 /// author already replaced — then quotes the retraction into the report
 /// beside the edit. The superseding row's own `rowid` is inside any boundary
 /// its predecessor's is, so restricting to the tip drops nothing that is
-/// still anyone's word.
+/// still anyone's word. The claim is the refill's, exactly: a post the walk
+/// already served and recorded as a **leaf**, then edited, keeps its
+/// superseded id among the leaves while the edit arrives here — the report
+/// quotes both wordings, which is the honest record of a room whose words
+/// changed under the walk, and settlement holds because the current tail is
+/// among the quoted ids.
 pub async fn posts_in_space_since(
     conn: &Connection,
     space_id: &str,
@@ -7512,11 +7522,22 @@ pub async fn last_action_in_space(
     // word has already been reported, which retires a room holding a post
     // nobody answered. `rowid` also totally orders two posts written in the
     // same millisecond, which `created_at` never did.
+    //
+    // **And last means the last word the transcript shows** (`item_current`,
+    // like every read the delegation lifecycle stands on): a failed
+    // regeneration inside the room leaves a current hidden tip, and without
+    // the join the *superseded* generation — still the highest matching
+    // `rowid` — would come back as the tail, so the driver would walk from,
+    // reply beneath, and quote into its report a wording the room no longer
+    // shows. With the join, that item contributes nothing and the tail falls
+    // back to the newest visible post, which is what a reader would call the
+    // room's last word.
     let sql = format!(
-        "SELECT id FROM action \
-         WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
-           AND action_type IN ({POST_ACTION_TYPES_SQL}) \
-         ORDER BY rowid DESC LIMIT 1"
+        "SELECT a.id FROM action a \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         WHERE a.space_id = ?1 AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY a.rowid DESC LIMIT 1"
     );
     let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt
@@ -8972,6 +8993,70 @@ mod tests {
             posts_in_space_since(&conn, "room", boundary).await.unwrap(),
             vec![edit],
             "one arrival, its current words — not the retraction beside them"
+        );
+    }
+
+    /// **The room's last word is the last word the transcript shows.** A
+    /// failed regeneration leaves a current hidden tip; without the
+    /// `item_current` join the *superseded* generation — still the highest
+    /// matching `rowid` — would come back as the tail, and the driver would
+    /// walk from, reply beneath, and quote a wording the room no longer
+    /// shows. And the budget meter must not charge that failure: a driven
+    /// turn writes nothing on failure, and the terminal-status filter keeps
+    /// "a failed turn is uncounted" true of the blocking verbs too.
+    #[tokio::test]
+    async fn a_hidden_tip_is_neither_the_tail_nor_a_spent_turn() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let first = add_user_action(&conn, "room", &user, "the ask", 2_000).await;
+        let second = add_user_action(&conn, "room", &user, "the answer", 3_000).await;
+        assert_eq!(
+            last_action_in_space(&conn, "room").await.unwrap(),
+            Some(second.clone())
+        );
+        let turns_before = turns_taken_in_space(&conn, "room").await.unwrap();
+
+        // A failed regeneration of the newest post: a current, hidden tip.
+        let (item_id, _) = action_item_and_space(&conn, &second)
+            .await
+            .unwrap()
+            .unwrap();
+        insert_action(
+            &conn,
+            &ActionEntry {
+                id: uuid::Uuid::now_v7().to_string(),
+                space_id: "room".to_string(),
+                participant_id: user.clone(),
+                item_id,
+                supersedes_action_id: Some(second),
+                action_type: "inference".to_string(),
+                status: "error".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at: 4_000,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            last_action_in_space(&conn, "room").await.unwrap(),
+            Some(first),
+            "the tail falls back to the newest visible post, not the superseded wording"
+        );
+        assert_eq!(
+            turns_taken_in_space(&conn, "room").await.unwrap(),
+            turns_before,
+            "and the failure spends nothing against the budget"
         );
     }
 

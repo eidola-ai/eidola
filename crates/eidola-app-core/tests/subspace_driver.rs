@@ -1635,11 +1635,11 @@ fn regenerating_a_report_keeps_its_finding_and_its_ending() {
     });
 }
 
-/// The failing sibling of [`MODEL`]: a second upstream that answers every
-/// chat with a 500, registered as backend `ext2`. The caller points a
-/// participant at `FAILING_MODEL` to make its next turn persist a current
-/// `status = 'error'` generation, and points it back afterwards.
-const FAILING_MODEL: &str = "qwen3-8b@ext2";
+/// A model ref routed through the test's second backend, `ext2` — whatever
+/// behavior that test gave its mock (a 500 on every chat via
+/// [`failing_backend`], or a decline). Point a participant here, induce the
+/// turn, and point it back.
+const EXT2_MODEL: &str = "qwen3-8b@ext2";
 
 fn failing_backend(core: &AppCore) -> MockServer {
     let broken = core.runtime().block_on(chat_harness::start(MockConfig {
@@ -1695,9 +1695,9 @@ fn a_failed_regeneration_does_not_settle_the_room() {
         let delivered = report(&core, &parent).expect("the delegation is reported");
 
         let _broken = failing_backend(&core);
-        set_model(&core, &owner, FAILING_MODEL);
+        set_model(&core, &owner, EXT2_MODEL);
         core.runtime()
-            .block_on(core.regenerate(delivered.action_id.clone(), FAILING_MODEL.into()))
+            .block_on(core.regenerate(delivered.action_id.clone(), EXT2_MODEL.into()))
             .expect_err("the regeneration fails upstream");
         assert!(
             reports(&core, &parent).is_empty(),
@@ -1738,9 +1738,9 @@ fn a_failed_regeneration_arms_the_room_it_unsettled() {
 
         let delivered = report(&core, &parent).expect("the delegation is reported");
         let _broken = failing_backend(&core);
-        set_model(&core, &owner, FAILING_MODEL);
+        set_model(&core, &owner, EXT2_MODEL);
         core.runtime()
-            .block_on(core.regenerate(delivered.action_id.clone(), FAILING_MODEL.into()))
+            .block_on(core.regenerate(delivered.action_id.clone(), EXT2_MODEL.into()))
             .expect_err("the regeneration fails upstream");
         set_model(&core, &owner, MODEL);
 
@@ -1774,9 +1774,9 @@ fn a_report_does_not_attach_beneath_a_hidden_answer() {
         // The answer lands — and then a failed regeneration hides it.
         let answer = ask(&core, &parent, &owner, &asked);
         let _broken = failing_backend(&core);
-        set_model(&core, &owner, FAILING_MODEL);
+        set_model(&core, &owner, EXT2_MODEL);
         core.runtime()
-            .block_on(core.regenerate(answer, FAILING_MODEL.into()))
+            .block_on(core.regenerate(answer, EXT2_MODEL.into()))
             .expect_err("the regeneration fails upstream");
         set_model(&core, &owner, MODEL);
 
@@ -1794,6 +1794,160 @@ fn a_report_does_not_attach_beneath_a_hidden_answer() {
                 .expect("the delegation is reported")
                 .parent_action_id
                 .as_deref(),
+            Some(answer2.as_str()),
+            "beneath the visible answer"
+        );
+    });
+}
+
+/// **A branch every responder declines is still a finding.** A decline writes
+/// a decision, not a post — so nothing follows the post, nothing re-plans
+/// from it, and a leaf test shaped on the *plan* ("no turns") rather than on
+/// what the turns produced left it neither leaf nor parent: dropped from the
+/// report, and, when it is the room's newest word, absent from the quoted set
+/// — so the room read as outstanding and re-billed the same declines on
+/// every arm until a second report happened to quote the tail.
+#[test]
+fn a_branch_whose_responders_all_decline_is_still_reported() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        core.register_tool(eidola_app_core::decline::decline_tool())
+            .expect("register the decline checkpoint");
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let answerer = shared_agent(&core, &parent, "Surveyor");
+        let decliner = shared_agent(&core, &parent, "Pilot");
+        // The decliner's upstream declines every turn it is offered.
+        let declining = core.runtime().block_on(chat_harness::start(MockConfig {
+            chat: ChatBehavior::DeclineStreaming,
+            ..MockConfig::default()
+        }));
+        core.runtime()
+            .block_on(core.add_backend(eidola_app_core::NewBackend {
+                id: "ext2".into(),
+                kind: eidola_app_core::BackendKind::OpenAi,
+                display_name: String::new(),
+                base_url: Some(declining.base_url.clone()),
+                api_key: None,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+            }))
+            .expect("add the declining backend");
+        set_model(&core, &decliner, EXT2_MODEL);
+        let out = spawn(&core, &parent, &owner, vec![answerer, decliner]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        // One answer was written; the decliner declined the brief and then
+        // declined that answer — which makes the answer a branch tip nothing
+        // will follow, and the finding the parent is owed.
+        let room = tree(&core, &out.space.id);
+        let findings: Vec<String> = room
+            .iter()
+            .filter(|n| n.action_type == "inference")
+            .map(|n| n.action_id.clone())
+            .collect();
+        assert_eq!(
+            findings.len(),
+            1,
+            "one answer, every other turn declined: {room:?}"
+        );
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report
+                .references
+                .iter()
+                .map(|r| r.antecedent_action_id.clone())
+                .collect::<Vec<_>>(),
+            findings,
+            "the declined-into-silence branch tip is what the report quotes"
+        );
+
+        // And the room is settled — reported on its actual last word, not on
+        // a fallback that left the tail unquoted and the room re-armable.
+        drive(&core, &out.space.id).expect("a settled room is a no-op");
+        assert_eq!(reports(&core, &parent).len(), 1);
+    });
+}
+
+/// **An old alarm cannot expire a new wait.** The grace alarm outlives the
+/// wait that set it, and a room can wait twice: an answer arrives (ending
+/// wait one), is hidden by a failed regeneration, and a continuation post
+/// opens a second wait. An alarm that fired without asking which wait set it
+/// would expire the second on the remainder of the first's clock and attach
+/// the report to the anchor prematurely.
+#[test]
+fn an_old_alarms_grace_does_not_expire_a_new_wait() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        core.test_set_anchor_wait_grace(std::time::Duration::from_millis(2000));
+        core.start_subspace_driver();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        // Wait one begins on the driver's own walk; its alarm is ticking.
+        let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], Some(&asked));
+        wait_until(&core, || {
+            core.test_rooms_awaiting(parent.clone())
+                .contains(&out.space.id)
+        });
+
+        // The answer arrives; the report lands beneath it; wait one is over.
+        let answer = ask(&core, &parent, &owner, &asked);
+        wait_until(&core, || report(&core, &parent).is_some());
+        let first_report = report(&core, &parent)
+            .expect("the delegation is reported")
+            .action_id
+            .clone();
+
+        // A failed regeneration hides the answer, and a post into the room
+        // re-opens the delegation — wait two, under a grace far beyond this
+        // test, while wait one's alarm is still in flight.
+        let _broken = failing_backend(&core);
+        set_model(&core, &owner, EXT2_MODEL);
+        core.runtime()
+            .block_on(core.regenerate(answer, EXT2_MODEL.into()))
+            .expect_err("the regeneration fails upstream");
+        set_model(&core, &owner, MODEL);
+        core.test_set_anchor_wait_grace(std::time::Duration::from_secs(3600));
+        ask(&core, &out.space.id, &helper, &out.brief_action_id);
+        wait_until(&core, || {
+            core.test_rooms_awaiting(parent.clone())
+                .contains(&out.space.id)
+        });
+
+        // Wait one's alarm comes due here. It must answer only for its own
+        // wait: the second report stays held, rather than landing against the
+        // anchor on the remainder of a clock that was never its own.
+        core.runtime().block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+        });
+        assert_eq!(
+            reports(&core, &parent).len(),
+            1,
+            "the stale alarm did not expire the new wait"
+        );
+        assert!(
+            core.test_rooms_awaiting(parent.clone())
+                .contains(&out.space.id),
+            "which goes on waiting for a visible answer"
+        );
+
+        // A fresh answer ends wait two the ordinary way.
+        let answer2 = ask(&core, &parent, &owner, &asked);
+        wait_until(&core, || reports(&core, &parent).len() == 2);
+        // By identity, not tree order: the first report re-roots once its
+        // answer is hidden (the recorded rendering residual), which shuffles
+        // a depth-first flattening.
+        let second = reports(&core, &parent)
+            .into_iter()
+            .find(|r| r.action_id != first_report)
+            .expect("the continuation is reported");
+        assert_eq!(
+            second.parent_action_id.as_deref(),
             Some(answer2.as_str()),
             "beneath the visible answer"
         );

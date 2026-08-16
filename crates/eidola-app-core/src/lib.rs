@@ -1571,7 +1571,14 @@ struct Inner {
     /// Delegated rooms waiting for the post they were opened from to be
     /// answered, mapped to the parent whose next change wakes them (see
     /// `Inner::report_delegation`).
-    awaiting_anchor: Mutex<std::collections::HashMap<String, String>>,
+    /// Room id → (parent space id, wait generation). The generation is what a
+    /// grace alarm answers for: an alarm outlives the wait that set it, and an
+    /// unmarked one firing into a *later* wait on the same room would expire
+    /// that wait on the remainder of an older clock (see
+    /// `Inner::schedule_anchor_grace`).
+    awaiting_anchor: Mutex<std::collections::HashMap<String, (String, u64)>>,
+    /// Monotonic source of anchor-wait generations.
+    anchor_wait_seq: std::sync::atomic::AtomicU64,
     /// How long an anchor wait holds out, in milliseconds; `0` means
     /// `subspace_driver::ANCHOR_WAIT_GRACE`. Only a test moves it — waiting ten
     /// real minutes is not the behaviour worth exercising.
@@ -8092,6 +8099,7 @@ impl AppCore {
                     subspace_driver::MAX_CONCURRENT_WALKS,
                 )),
                 awaiting_anchor: Mutex::new(std::collections::HashMap::new()),
+                anchor_wait_seq: std::sync::atomic::AtomicU64::new(0),
                 anchor_wait_grace_ms: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "test-support")]
                 anchor_window: Mutex::new(None),
