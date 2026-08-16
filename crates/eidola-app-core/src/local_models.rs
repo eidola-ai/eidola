@@ -340,6 +340,30 @@ impl Drop for ReservationGuard {
 /// the identity (two backends may hold same-named files).
 pub(crate) type EngineKey = (String, String);
 
+/// A standing failure for one `(backend, slug)` — everything the surface
+/// showing it needs to offer a way out.
+///
+/// `source_url` is what makes a retry possible for the case where the failure
+/// is *all that is left*: a download that failed left no file, so the row a
+/// snapshot synthesizes for it has nothing to load and nothing to delete, and
+/// the only honest verb is "try that download again" — which needs the URL the
+/// row itself cannot otherwise remember. It is `None` for an engine-load
+/// failure, whose `.gguf` is on disk and whose retry is an ordinary Load.
+pub(crate) struct EngineFailure {
+    pub(crate) message: String,
+    pub(crate) source_url: Option<String>,
+}
+
+impl EngineFailure {
+    /// A failure with no way back to a download — every load-side failure.
+    fn load(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source_url: None,
+        }
+    }
+}
+
 /// All runtime (non-durable) local-inference state, held by `Inner` behind
 /// an `Arc` so transfer/supervisor tasks can outlive individual calls.
 /// Plain `std::sync::Mutex` — never held across an `.await`.
@@ -349,7 +373,7 @@ pub(crate) struct LocalRuntime {
     downloads: StdMutex<HashMap<String, Arc<DownloadEntry>>>,
     engines: StdMutex<HashMap<EngineKey, EngineEntry>>,
     /// Last failure per (backend, slug) — download or load — until retried.
-    failures: StdMutex<HashMap<EngineKey, String>>,
+    failures: StdMutex<HashMap<EngineKey, EngineFailure>>,
     /// Test override for the machine memory budget ([`memory_budget`]).
     budget_override: StdMutex<Option<u64>>,
     /// One-way shutdown latch. Set by [`Inner::shutdown_all_engines`] and
@@ -705,6 +729,42 @@ pub(crate) fn engine_key_for_id(id: &str) -> EngineKey {
     } else {
         (mref.backend_id, mref.model)
     }
+}
+
+/// What a model URL resolves to: where the bytes come from, the file they
+/// land in, and the **slug that identifies the transfer**.
+///
+/// The slug is the identity [`AppCore::download_local_model`] deduplicates on,
+/// so it is also the only honest key for a caller that wants to know whether a
+/// transfer is already under way: equivalent spellings of one model (a Hugging
+/// Face `/blob/` page versus its `/resolve/` object, a `?download=true`
+/// suffix, any two URLs naming the same file) collapse onto it exactly as they
+/// collapse in app-core's own map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelDownloadTarget {
+    /// The URL the bytes are fetched from (normalized).
+    pub url: String,
+    /// The file name they are written under.
+    pub file_name: String,
+    /// The `<slug>` of the resulting `<slug>@local` id — the transfer's identity.
+    pub slug: String,
+}
+
+/// Resolve a pasted or curated model URL to its [`ModelDownloadTarget`].
+///
+/// **The single derivation of a download's identity.** `download_local_model`
+/// resolves through it, and so must anything outside app-core that keys work
+/// on "this download" — a caller that keys on the raw URL instead lets one
+/// transfer be requested twice under two spellings, which is the duplicate
+/// app-core would then refuse.
+pub fn resolve_model_download(input: &str) -> Result<ModelDownloadTarget, AppError> {
+    let (url, file_name) = normalize_model_url(input)?;
+    let slug = slug_for_file(&file_name);
+    Ok(ModelDownloadTarget {
+        url,
+        file_name,
+        slug,
+    })
 }
 
 /// Normalize a pasted model URL into `(download_url, file_name)`.
@@ -1113,7 +1173,7 @@ impl Inner {
         // visible).
         {
             let failures = self.local.failures.lock().expect("failures lock");
-            for ((backend_id, slug), message) in failures.iter() {
+            for ((backend_id, slug), failure) in failures.iter() {
                 if backend_id != crate::backends::LOCAL_BACKEND_ID
                     || models.iter().any(|m| &m.slug == slug)
                 {
@@ -1125,9 +1185,12 @@ impl Inner {
                     display_name: prettify_stem(slug),
                     file_name: format!("{slug}.gguf"),
                     size_bytes: None,
-                    source_url: None,
+                    // Where the failed download was fetching from, so the row
+                    // can afford a retry: it is the only thing left of an
+                    // attempt that put nothing on disk.
+                    source_url: failure.source_url.clone(),
                     status: LocalModelStatus::Available,
-                    last_error: Some(message.clone()),
+                    last_error: Some(failure.message.clone()),
                     // The failure is all that is left — the scan found no file.
                     on_disk: false,
                 });
@@ -1217,7 +1280,7 @@ impl Inner {
                     .lock()
                     .expect("failures lock")
                     .get(&key)
-                    .cloned();
+                    .map(|f| f.message.clone());
 
                 let display_name = sidecar
                     .as_ref()
@@ -1245,8 +1308,11 @@ impl Inner {
     /// [`Change::LocalModels`] emissions. If the URL matches a curated
     /// catalog entry its display name is adopted.
     pub(crate) async fn download_local_model(&self, url: &str) -> Result<String, AppError> {
-        let (download_url, file_name) = normalize_model_url(url)?;
-        let slug = slug_for_file(&file_name);
+        let ModelDownloadTarget {
+            url: download_url,
+            file_name,
+            slug,
+        } = resolve_model_download(url)?;
         let id = engine_model_id(crate::backends::LOCAL_BACKEND_ID, &slug);
         let dir = models_dir(&self.data_dir);
 
@@ -1290,6 +1356,10 @@ impl Inner {
         let bus = self.bus.clone();
         let local = self.local.clone();
         let slug_task = slug.clone();
+        // The normalized URL round-trips through `normalize_model_url` (a
+        // direct `.gguf` URL is its own normal form), so recording it is
+        // enough for a retry to re-enter this method unchanged.
+        let retry_url = download_url.clone();
         // Core-owned transfer task: survives any window; cancellation is the
         // explicit flag, checked between chunks.
         tokio::spawn(async move {
@@ -1302,7 +1372,10 @@ impl Inner {
             if let Err(e) = result {
                 local.failures.lock().expect("failures lock").insert(
                     (crate::backends::LOCAL_BACKEND_ID.to_string(), slug_task),
-                    e.to_string(),
+                    EngineFailure {
+                        message: e.to_string(),
+                        source_url: Some(retry_url),
+                    },
                 );
             }
             bus.emit(Change::LocalModels);
@@ -1374,6 +1447,34 @@ impl Inner {
             .expect("failures lock")
             .remove(&key);
         self.bus.emit(Change::LocalModels);
+        Ok(())
+    }
+
+    /// Forget the standing failure recorded for `id` (`<slug>@<backend>` or a
+    /// bare slug for the managed store).
+    ///
+    /// A failure is a **report**, not state: it names an attempt that already
+    /// ended, and where that attempt left nothing on disk the report is the
+    /// whole row a snapshot synthesizes. So acknowledging it is its own verb —
+    /// [`Self::delete_local_model`] happens to clear one on its way past, but
+    /// that is a file operation, and asking a reader to press Delete to
+    /// dismiss an error is asking them to believe something is being deleted.
+    ///
+    /// Idempotent, and touches nothing else: no file, no engine, no database.
+    /// Emits only when something was actually forgotten, so two windows
+    /// dismissing the same report raise one invalidation.
+    pub(crate) fn dismiss_local_model_failure(&self, id: &str) -> Result<(), AppError> {
+        let key = engine_key_for_id(id);
+        let removed = self
+            .local
+            .failures
+            .lock()
+            .expect("failures lock")
+            .remove(&key)
+            .is_some();
+        if removed {
+            self.bus.emit(Change::LocalModels);
+        }
         Ok(())
     }
 
@@ -1561,7 +1662,7 @@ impl Inner {
                     .lock()
                     .expect("failures lock")
                     .get(key)
-                    .cloned()
+                    .map(|f| f.message.clone())
                     .unwrap_or_else(|| "the engine load was cancelled".into());
                 return Err(AppError::LocalModel { message });
             }
@@ -1846,7 +1947,7 @@ async fn supervise_engine(
             .failures
             .lock()
             .expect("failures lock")
-            .insert(key.clone(), message.to_string());
+            .insert(key.clone(), EngineFailure::load(message));
     };
 
     // **Every** emission in this supervisor goes through here, and it is
@@ -2068,6 +2169,28 @@ mod tests {
             "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf"
         );
         assert_eq!(name, "gemma-4-12b-it-qat-q4_0.gguf");
+    }
+
+    /// Equivalent spellings of one model resolve to one transfer identity.
+    /// Callers key work on that slug — a key taken from the raw text would let
+    /// the same transfer be requested twice, once per spelling.
+    #[test]
+    fn equivalent_spellings_resolve_to_one_slug() {
+        let base = "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf";
+        let file = "gemma-4-12b-it-qat-q4_0.gguf";
+        let spellings = [
+            format!("{base}/resolve/main/{file}"),
+            format!("{base}/blob/main/{file}"),
+            format!("{base}/blob/main/{file}?download=true"),
+            format!("{base}/resolve/main/{file}#fragment"),
+            format!("  {base}/resolve/main/{file}  "),
+        ];
+        let first = resolve_model_download(&spellings[0]).expect("resolves");
+        assert_eq!(first.slug, "gemma-4-12b-it-qat-q4_0");
+        for spelling in &spellings[1..] {
+            let target = resolve_model_download(spelling).expect("resolves");
+            assert_eq!(target, first, "`{spelling}` names the same transfer");
+        }
     }
 
     #[test]

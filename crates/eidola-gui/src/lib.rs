@@ -26,6 +26,7 @@ pub mod settings;
 pub mod solar;
 pub mod space;
 pub mod space_view;
+pub mod startup;
 pub mod status_item;
 pub mod stores;
 pub mod templates_settings;
@@ -109,6 +110,19 @@ pub fn run() {
 /// it (wave 3b, [`crate::status_item`]); the full shutdown is the status
 /// menu's own Quit.
 pub fn run_with(opts: LaunchOptions) {
+    // The one fallible startup step, taken before anything gpui-shaped exists.
+    // It has to happen here rather than inside `run`'s closure: that closure is
+    // driven from AppKit's `applicationDidFinishLaunching:`, an `extern "C"`
+    // frame a panic cannot unwind through, so a refusal the app understands
+    // perfectly well (`DatabaseInUse`) ended as SIGABRT and a macOS crash
+    // report. See [`crate::startup`].
+    let app_core = match stores::open_app_core() {
+        Ok(core) => core,
+        // The locale is resolved here rather than inside the reporter so the
+        // pure read happens once, on the path that needs it.
+        Err(e) => startup::report_and_exit(startup::locale(), &e),
+    };
+
     let application = gpui_platform::application()
         .with_assets(Assets)
         // Named explicitly rather than inherited from `QuitMode::Default`'s
@@ -134,7 +148,7 @@ pub fn run_with(opts: LaunchOptions) {
         // one — the same install-then-wire shape the theme uses.
         i18n::install(cx);
 
-        let stores = Stores::new(cx);
+        let stores = Stores::new(app_core, cx);
 
         // The single app-lifetime bus bridge: forwards every app-core
         // `Change` into a gpui main-thread loop that dispatches to the

@@ -227,6 +227,62 @@ fn a_failed_download_is_listed_but_never_selectable() {
     });
 }
 
+/// The row a failed download leaves behind is the *only* thing that remembers
+/// where it was fetching from, so it has to carry it: with no file and no URL
+/// the surface showing it has nothing to offer but the error text. And
+/// dismissing the report is its own verb — it forgets the failure, and the
+/// synthesized row goes with it.
+#[test]
+fn a_failed_download_remembers_its_url_and_can_be_dismissed() {
+    run(|| {
+        let (core, _dir) = bare_core();
+
+        let mock = core.runtime().block_on(async {
+            let mock = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(500))
+                .mount(&mock)
+                .await;
+            mock
+        });
+        let url = format!("{}/wisp.gguf", mock.uri());
+
+        core.runtime()
+            .block_on(core.download_local_model(url.clone()))
+            .expect("download starts");
+
+        let state = wait_for_state(&core, |s| {
+            s.models
+                .iter()
+                .any(|m| m.slug == "wisp" && m.last_error.is_some())
+        });
+        let row = state.models.iter().find(|m| m.slug == "wisp").unwrap();
+        assert!(!row.on_disk, "nothing was ever written for this row");
+        assert_eq!(
+            row.source_url.as_deref(),
+            Some(url.as_str()),
+            "the row must carry what a retry re-runs"
+        );
+
+        // Dismissing forgets the report; the row was only ever the report.
+        core.runtime()
+            .block_on(core.dismiss_local_model_failure("wisp@local".into()))
+            .expect("dismiss");
+        let state = wait_for_state(&core, |s| !s.models.iter().any(|m| m.slug == "wisp"));
+        assert!(
+            !state.models.iter().any(|m| m.slug == "wisp"),
+            "the dismissed failure left a row behind: {:?}",
+            state.models
+        );
+
+        // Idempotent: a second window dismissing the same report is not an
+        // error.
+        core.runtime()
+            .block_on(core.dismiss_local_model_failure("wisp@local".into()))
+            .expect("dismissing nothing is not a failure");
+    });
+}
+
 #[test]
 fn download_rejects_bad_urls_and_duplicates() {
     run(|| {
