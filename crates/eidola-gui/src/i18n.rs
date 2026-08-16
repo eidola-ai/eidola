@@ -184,6 +184,22 @@ thread_local! {
     static SOURCE_ONLY: Localization = Localization::for_locale(SOURCE_LOCALE);
 }
 
+/// Format a message in a locale named explicitly, with **no `App`** — the entry
+/// the generated `msg_in` accessors call.
+///
+/// It exists for the surfaces that run before gpui does (the startup-failure
+/// alert, which is raised before `Application::run` and so has no `cx` to ask).
+/// Resolving the tag is pure — [`resolve`] over [`system_preferred`] and the
+/// stored preference — so the whole path is available that early.
+///
+/// A tag this build does not ship answers in the source locale, exactly as
+/// [`apply`] refuses one. The bundle is built per call rather than cached: the
+/// callers are a handful of strings on a path that is about to end the process,
+/// and a cache keyed by tag would outlive the reason for it.
+pub fn format_in(tag: &str, id: &str, args: Option<&Args>) -> SharedString {
+    Localization::for_locale(shipped(tag).unwrap_or(SOURCE_LOCALE)).format(id, args)
+}
+
 /// Format a message in the active locale. The generated accessors are the only
 /// intended callers — reaching for this directly gives up the compile-time id
 /// and argument checking that is the point of the codegen.

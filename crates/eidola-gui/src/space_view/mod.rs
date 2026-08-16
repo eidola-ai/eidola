@@ -458,6 +458,19 @@ pub struct SpaceView {
     /// while it paints, so the dismiss can ask *containment* before it clears
     /// and hand the keyboard back only from a band that was holding it.
     pub(crate) band_focus: [FocusHandle; 3],
+    /// The focus handle whichever **transcript failure surface** is painting
+    /// tracks — the centred panel over an empty page, or the stale-read strip
+    /// over posts we still hold.
+    ///
+    /// One handle for both because they are mutually exclusive by
+    /// construction: the panel answers `Failed { prior: None }` and the strip
+    /// `Failed { prior: Some(..) }`, so no frame can paint both and nothing
+    /// can claim it twice. Its Retry is the surface's only tab stop and the
+    /// press unmounts the surface around it (the read leaves `Failed` the
+    /// moment it restarts), so the handle is what
+    /// [`SpaceView::retry_transcript_load`] asks containment of *before* it
+    /// acts — the same shape the bottom bands take.
+    pub(crate) transcript_retry_focus: FocusHandle,
     /// The open right-click menu over one of the space's editors, if any —
     /// window-local transient state, like the band menu and the picker (one
     /// open at a time; see [`context_menu`]).
@@ -934,6 +947,7 @@ impl SpaceView {
             quote_destination: None,
             quote_destination_scroll: gpui::UniformListScrollHandle::new(),
             band_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
+            transcript_retry_focus: cx.focus_handle(),
             context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
@@ -2482,7 +2496,12 @@ impl Render for SpaceView {
                             .w_full()
                             .pt(px(doc_reserve))
                             .pb(px(floating_pad))
-                            .child(body),
+                            .child(body)
+                            // The reading column's empty state when the
+                            // transcript could not be read at all — the one
+                            // page in this window with no composer to act
+                            // from, so it carries its own way back.
+                            .children(self.render_transcript_failure(cx)),
                     );
                 scroll.style().restrict_scroll_to_axis = Some(true);
                 scroll
@@ -2495,6 +2514,11 @@ impl Render for SpaceView {
             // selection while the window moved (task 32). It stays ahead of the
             // composer and minimap, which paint over it as before.
             .child(self.render_title_bar(window, cx))
+            // The stale-read line, floating just under the title band — chrome
+            // over the page, so it is on screen at every scroll offset (the
+            // reader is usually at the tail). After the scroll subtree, so its
+            // hitbox wins over the posts passing beneath it.
+            .children(self.render_transcript_refresh_failure(cx))
             .child(self.render_active_draft(&tree, page_width, window_h, window, cx))
             // The compact bottom action bar for a docked, *inactive* tail
             // draft — the active composer renders its own; this one fades in
@@ -3056,6 +3080,124 @@ impl SpaceView {
         crate::titlebar::make_draggable(band, "space-title-bar", window, cx)
     }
 
+    /// The window's own failure surface, in the reading column's empty state:
+    /// the house `load_error_panel` + Retry over a conversation whose
+    /// **initial** transcript read failed.
+    ///
+    /// This is the one `Loadable` in the window that had no reader
+    /// ([`Space::transcript_visible`] was its only consumer), and a failed
+    /// initial read of it is a genuine dead end rather than a blank page:
+    /// `sync_tail_drafts` correctly declines to mint a tail composer — there is
+    /// no tree to attach one to — so there is nothing the reader can do that
+    /// re-runs the load, and `Space::load_transcript` otherwise re-runs only on
+    /// construction, a bus `Change::Space`, or a mutation's failure exit. The
+    /// way out was another writer's invalidation, or closing every window on
+    /// the space so the registry re-created its entity. Retry is that way out,
+    /// driving the same `Space::load_transcript` everything else does.
+    ///
+    /// Which failures it is offered for is [`Space::transcript_load_failure`]'s
+    /// decision, not this method's: a failed *refresh* takes the quiet strip
+    /// below instead, and a space known not to exist says so through the error
+    /// band — a retry there could only refuse.
+    fn render_transcript_failure(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let detail = self.space.read(cx).transcript_load_failure()?.to_string();
+        Some(
+            v_flex()
+                .w_full()
+                .items_center()
+                // Tracked while it paints, so the Retry below can ask whether
+                // this surface is the one holding the keyboard before it takes
+                // the surface away.
+                .track_focus(&self.transcript_retry_focus)
+                .child(div().w_full().max_w(BODY_MAX_WIDTH).child(
+                    crate::participants::load_error_panel(
+                        "space/transcript/retry",
+                        crate::i18n::msg::space_transcript_failed(cx),
+                        &detail,
+                        crate::i18n::msg::space_transcript_retry(cx),
+                        cx,
+                        cx.listener(|this, _, window, cx| {
+                            this.retry_transcript_load(window, cx);
+                        }),
+                    ),
+                ))
+                .into_any_element(),
+        )
+    }
+
+    /// The other half of the same doctrine: a **refresh** that failed over posts
+    /// this window still holds keeps every one of them and adds the Library's
+    /// quiet "Couldn't refresh — retry" strip — same wording, same register, one
+    /// idiom (`library.rs`, and the quote-destination picker took it too).
+    ///
+    /// It is a line rather than the panel because there is nothing empty to
+    /// fill: the conversation is on screen and readable, and what the reader
+    /// needs to know is only that it is as of the last successful read. Without
+    /// it that fact is invisible — nothing in this window re-reads on its own —
+    /// and the composer is not the answer, because retrying a read must not
+    /// require writing a message.
+    ///
+    /// **It floats at the top edge of the reading viewport, not in the page.**
+    /// The Library puts this line above its rows because there the rows do not
+    /// move under it; a conversation opens at its tail and follows it, so "the
+    /// top of the document" is the one place the reader reliably is *not* —
+    /// in-flow, the common case was a silently stale page with the only cure
+    /// scrolled off-screen. So it is chrome over the page (`absolute`, below the
+    /// title band, painted after the scroll subtree so its hitbox wins), which
+    /// is the scroll indicator's shape: visible at any offset, consuming no
+    /// layout, moving nothing when it appears or goes.
+    ///
+    /// A pill rather than a bare line, because chrome over live text has to stay
+    /// legible as posts pass beneath it — the quiet register is the *type*
+    /// (`text_xs`, muted, hover to foreground), which is the Library's, not the
+    /// absence of a ground.
+    ///
+    /// Deliberately not a fourth **bottom-anchored band**: those are a
+    /// precedence family for *events* (a failed turn, a click just made, a
+    /// paused cascade), each a card that has to be dismissed and ordered against
+    /// the others, while a stale read is a standing property of the page with
+    /// nothing to acknowledge — it ends when the read succeeds.
+    fn render_transcript_refresh_failure(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        self.space.read(cx).transcript_refresh_failure()?;
+        let theme = cx.theme();
+        Some(
+            div()
+                .absolute()
+                .top(TITLE_BAR_RESERVE)
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                // The strip's own half of the handback contract, exactly as
+                // the panel's: this is the surface the press unmounts.
+                .track_focus(&self.transcript_retry_focus)
+                .child(
+                    div()
+                        .id("space-transcript-refresh-retry")
+                        .probe(
+                            "space/transcript/refresh-retry",
+                            Role::Button,
+                            crate::i18n::msg::space_transcript_stale_retry_label(cx),
+                        )
+                        .cursor_pointer()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .hover(|s| s.text_color(theme.foreground))
+                        .child(crate::i18n::msg::space_transcript_stale_retry(cx))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.retry_transcript_load(window, cx);
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// A minimal honest error band pinned over the bottom (Phase 1 surface for a
     /// typed submit failure; onboarding is a later, separate window). Renders
     /// nothing when there's no error.
@@ -3213,8 +3355,42 @@ impl SpaceView {
         let held = self.band_holds_focus(Self::BAND_ERROR, window, cx);
         self.error = None;
         self.space.update(cx, |s, cx| s.clear_failed_turn(cx));
-        self.hand_back_band_focus(held, window, cx);
+        self.hand_back_focus(held, window, cx);
         cx.notify();
+    }
+
+    /// Re-run the transcript read — the reader pressed Retry, on whichever of
+    /// the two failure surfaces is standing.
+    ///
+    /// **Both of those Retrys unmount under the press**, which is why the door
+    /// is here rather than in the render closures: the read leaves `Failed` the
+    /// moment it restarts, so `transcript_load_failure` /
+    /// `transcript_refresh_failure` go `None` and the panel (or the strip) is
+    /// gone with the button the reader activated — its only tab stop, since
+    /// `probe(Role::Button)` derives a real one. Left alone the window holds a
+    /// handle nobody paints: no keystroke reaches anything and Tab restarts
+    /// from the root, the class the bands and `RecordView::close_detail`
+    /// already cure.
+    ///
+    /// The target is [`Self::keyboard_home`], this window's one answer for a
+    /// surface that borrowed the keyboard going away — and the right one from
+    /// either surface. After the panel's press there is nothing on the page to
+    /// stand on, and `keyboard_home` is the view root there; after the strip's
+    /// the posts stay, and it is the reader's own place among them. The reading
+    /// column is not an alternative: `space/conversation` is a `Role::Main`
+    /// landmark, which is neither a tab stop nor focusable, so nothing could
+    /// focus it.
+    pub fn retry_transcript_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.transcript_retry_focus.contains_focused(window, cx);
+        self.space.update(cx, |s, cx| s.retry_transcript_load(cx));
+        self.hand_back_focus(held, window, cx);
+    }
+
+    /// Test seam: the handle the standing transcript-failure surface tracks —
+    /// the subtree a Retry asks containment of.
+    #[doc(hidden)]
+    pub fn transcript_retry_focus_for_test(&self) -> FocusHandle {
+        self.transcript_retry_focus.clone()
     }
 
     /// Whether the band at `slot` is the one holding the keyboard — asked
@@ -3226,9 +3402,9 @@ impl SpaceView {
 
     /// Give the keyboard back where a closing surface's keyboard belongs — the
     /// reader's place in the conversation if they have one, else the view root
-    /// ([`Self::keyboard_home`]) — and only from a band that was holding it, so
-    /// a reader typing beside a notice keeps their caret.
-    fn hand_back_band_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// ([`Self::keyboard_home`]) — and only from a surface that was holding it,
+    /// so a reader typing beside a notice keeps their caret.
+    fn hand_back_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
         if held {
             window.focus(&self.keyboard_home(), cx);
         }
@@ -3257,7 +3433,7 @@ impl SpaceView {
     pub fn dismiss_reference_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let held = self.band_holds_focus(Self::BAND_REFERENCE, window, cx);
         self.reference_notice = None;
-        self.hand_back_band_focus(held, window, cx);
+        self.hand_back_focus(held, window, cx);
         cx.notify();
     }
 
@@ -3373,7 +3549,7 @@ impl SpaceView {
     pub fn dismiss_cascade(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let held = self.band_holds_focus(Self::BAND_CASCADE, window, cx);
         self.cascade_notice = None;
-        self.hand_back_band_focus(held, window, cx);
+        self.hand_back_focus(held, window, cx);
         cx.notify();
     }
 

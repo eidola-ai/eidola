@@ -534,6 +534,162 @@ fn settled_posts_are_articles_carrying_their_text(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// A conversation whose **initial** transcript read failed is the one page in
+/// this window with no composer to act from — `sync_tail_drafts` has no tree to
+/// attach one to — so the reading column carries the way back itself, as the
+/// centred panel.
+///
+/// A failed *refresh* keeps its posts (never a blank page over a page we had)
+/// and takes the Library's quiet strip instead: the reader can still act, but
+/// what they are reading is silently as of the last successful read, and the
+/// composer is not a way to re-run a *read*.
+#[gpui::test]
+fn a_failed_initial_transcript_load_offers_a_retry(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.fail_initial_transcript_load_for_test(cx));
+    });
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/transcript/retry",
+        gpui::Role::Button,
+        "Retry",
+    );
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    assert!(
+        !names.contains(&"space/transcript/refresh-retry".to_string()),
+        "with nothing on screen the panel is the surface, not the strip: {names:?}"
+    );
+
+    // The same failure over posts we still hold: the posts stay, and the quiet
+    // strip says the last read is no longer the last word.
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the question")], cx);
+            s.fail_transcript_refresh_for_test(cx);
+        });
+    });
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/transcript/refresh-retry",
+        gpui::Role::Button,
+        "Retry loading this conversation",
+    );
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    assert!(
+        names.contains(&"space/post/0".to_string()),
+        "a failed refresh never blanks the page it had: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/transcript/retry".to_string()),
+        "and it is not the centred panel — there is nothing empty to fill: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **The stale-read line has to be where the reader is.** A conversation opens
+/// at its tail and follows it, so the top of the document is the one place they
+/// reliably are not — in the page, the line was off-screen in the common case
+/// and the page was silently stale with its only cure scrolled away.
+///
+/// The property is asserted as the thing that was wrong: the strip paints at the
+/// same window position no matter where the page is scrolled to, and inside the
+/// viewport. The page really moves underneath it — the same scroll takes the
+/// first post's own probe off-screen (or out of the frame entirely, which
+/// virtualization does for a post far above the fold).
+#[gpui::test]
+fn a_stale_transcript_says_so_where_the_reader_is(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // A conversation far taller than the window, with a failed refresh over it.
+    let paragraph = "Sunlight is a fairly even mix across the visible spectrum. As it \
+         crosses the atmosphere it meets molecules far smaller than its wavelength, and \
+         those scatter short (blue) wavelengths far more strongly than long (red) ones. "
+        .repeat(12);
+    let posts: Vec<_> = (0..6)
+        .map(|i| {
+            let mut p = probe_post(&format!("a{i}"), &paragraph);
+            if i > 0 {
+                p.parent_action_id = Some(format!("a{}", i - 1));
+            }
+            p
+        })
+        .collect();
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(posts, cx);
+            s.fail_transcript_refresh_for_test(cx);
+        });
+    });
+
+    let at_top = fresh_entries(cx, window);
+    let strip_at_top = at_top
+        .iter()
+        .find(|(n, _)| n == "space/transcript/refresh-retry")
+        .map(|(_, e)| e.bounds)
+        .expect("the strip paints over a stale transcript");
+    let first_post_at_top = at_top
+        .iter()
+        .find(|(n, _)| n == "space/post/0")
+        .map(|(_, e)| e.bounds.origin.y);
+
+    // Park the reader at the document floor, where a conversation lives.
+    view.update(cx, |v, _| v.set_page_scroll_for_test(-100_000.0));
+
+    let at_tail = fresh_entries(cx, window);
+    let strip_at_tail = at_tail
+        .iter()
+        .find(|(n, _)| n == "space/transcript/refresh-retry")
+        .map(|(_, e)| e.bounds)
+        .expect("the strip is still on screen at the tail");
+    assert_eq!(
+        strip_at_tail.origin.y, strip_at_top.origin.y,
+        "the strip is chrome over the page, so scrolling must not move it"
+    );
+
+    let viewport = cx
+        .update_window(window, |_, window, _| window.viewport_size())
+        .expect("viewport");
+    assert!(
+        strip_at_tail.origin.y >= gpui::px(0.)
+            && strip_at_tail.bottom() <= viewport.height
+            && strip_at_tail.bottom() > gpui::px(0.),
+        "the strip must be inside the viewport at the tail: {strip_at_tail:?} in {viewport:?}"
+    );
+
+    // ...and the page genuinely moved under it.
+    let first_post_at_tail = at_tail
+        .iter()
+        .find(|(n, _)| n == "space/post/0")
+        .map(|(_, e)| e.bounds.origin.y);
+    match (first_post_at_top, first_post_at_tail) {
+        (Some(top), Some(tail)) => assert!(
+            tail < top,
+            "the first post should have travelled up the window: {top:?} → {tail:?}"
+        ),
+        (Some(_), None) => {}
+        (None, _) => panic!("the first post never painted, so the scroll proves nothing"),
+    }
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn a_streaming_reply_is_not_an_article(cx: &mut TestAppContext) {
     // The §4 trap: a value bound to streaming text makes assistive technology
@@ -2683,6 +2839,81 @@ fn a_failed_catalog_download_still_affords_downloading(cx: &mut TestAppContext) 
     assert!(
         names.contains(&"settings/backends/local/catalog/0/download".to_string()),
         "a row with no file behind it must keep its Download verb: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The installed row for a failed download is a report, not a model: Load has
+/// no file to open and Delete has no file to remove. It affords **Retry** (the
+/// download the row remembers) and **Dismiss** (the report acknowledged) — and
+/// where the row remembers no URL, only Dismiss, because a Retry with nothing
+/// to re-run is the defect one door over.
+#[gpui::test]
+fn a_failed_download_row_affords_retry_and_dismiss(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::{BackendsSettingsView, BackendsTab};
+
+    let _guard = probes_on();
+
+    let failed = |source_url: Option<&str>| eidola_app_core::LocalModelInfo {
+        id: "wisp@local".into(),
+        slug: "wisp".into(),
+        display_name: "Wisp".into(),
+        file_name: "wisp.gguf".into(),
+        size_bytes: None,
+        source_url: source_url.map(str::to_string),
+        status: eidola_app_core::LocalModelStatus::Available,
+        last_error: Some("HTTP 500".into()),
+        on_disk: false,
+    };
+
+    let open = |cx: &mut TestAppContext, row: eidola_app_core::LocalModelInfo| {
+        let mut state = local_models_fixture();
+        state.models = vec![row];
+        let stores = stub_stores(cx, |s| {
+            s.config_state = Some(probe_config_state());
+            s.eidola_trust = Some(probe_eidola_trust());
+            s.backends = backends_fixture();
+            s.local_models = Some(state);
+        });
+        let (window, view) = open_view(cx, |window, cx| {
+            cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+        });
+        view.update(cx, |v, cx| v.select_tab(BackendsTab::Local, cx));
+        fresh_names(cx, window)
+    };
+
+    let names = open(cx, failed(Some("https://example.com/wisp.gguf")));
+    for expected in [
+        "settings/backends/local/installed/0/retry",
+        "settings/backends/local/installed/0/dismiss",
+        // The error itself still stands beside them.
+        "settings/backends/local/installed/0/error",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "failed-download probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    for absent in [
+        "settings/backends/local/installed/0/load",
+        "settings/backends/local/installed/0/delete",
+    ] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "{absent:?} can only fail on a row with no file: {names:?}"
+        );
+    }
+
+    // No remembered URL, no Retry — the way out is still offered.
+    let names = open(cx, failed(None));
+    assert!(
+        !names.contains(&"settings/backends/local/installed/0/retry".to_string()),
+        "a row that remembers no download must not offer to re-run one: {names:?}"
+    );
+    assert!(
+        names.contains(&"settings/backends/local/installed/0/dismiss".to_string()),
+        "the report must always be dismissible: {names:?}"
     );
 
     probe::set_probes_enabled(false);

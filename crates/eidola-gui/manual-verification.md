@@ -1,4 +1,4 @@
-# Manual verification — macOS status item, the background app, login item
+# Manual verification — macOS status item, the background app, login item, the startup dialog
 
 The AppKit half of the app lifecycle (task 17, waves 3 and 3b) is a live-system surface no test platform reaches (see AGENTS.md → App lifecycle → "What only a human can verify"). This is the release-verification procedure for it. The cheap oracle for the activation policy:
 
@@ -54,9 +54,19 @@ Build: `just build gui` (or `cargo build -p eidola-gui && ./scripts/package-gui-
 24. The Dock icon, the ⌘Tab switcher, and Finder's Get Info all show the hexagon-grid mark — a warm cluster on a dark tile, never the generic blank-document icon (which is what a missing or misnamed `Contents/Resources/AppIcon.icns` gives you). `mdls -name kMDItemDisplayName crates/eidola-gui/build/Eidola.app` is not the oracle here; look at it.
 25. Shrink a Finder window to list view and check the 16 pt slot: the cells should still be countable, not a smudge. That slot is drawn from the reduced-detail master (`brand/AGENTS.md`), so if it looks like the full-detail mark scaled down, the `.icns` was built from the wrong source.
 
+## The startup-failure dialog
+
+The other AppKit surface no test platform reaches: it is an `NSAlert` presented before `Application::run`, so neither the driver nor the visual tier can render it (see AGENTS.md → Startup failures).
+
+26. With Eidola already running, launch a **second** copy from a terminal: `crates/eidola-gui/build/Eidola.app/Contents/MacOS/Eidola`. Expected: a critical alert titled **"Eidola is already open"** whose body names the holding pid and the database path and says to quit it and try again, with a single **Quit** button. Pressing Quit ends that second process (exit status 1) and leaves the first one untouched — same pid, same windows, engines still loaded.
+27. The same line is on stderr either way, so a terminal launch is legible without the dialog.
+28. **No crash report.** The failure this replaced was a `panic_cannot_unwind` inside AppKit's `applicationDidFinishLaunching:` — SIGABRT, exit 134, and macOS's "Eidola quit unexpectedly" report. If you see that report, the construction has moved back inside `Application::run`.
+29. An ordinary launch with nothing else holding the database is unchanged: no dialog, no extra window, the usual first window.
+30. **A refused schema reaches the same dialog.** Hard to stage by hand — turso keeps `user_version` in the WAL, so patching the `.db` header does nothing — so this one is normally taken on trust from `a_refused_schema_surfaces_at_open_database_not_at_construction`. If you do end up with a database from an older build (a `git checkout` across a `LATEST_VERSION` bump), the launch must show "Eidola can't start" quoting the "delete your dev database" message, **not** a window full of failed panes.
+
 ## Regression sweep (nothing here should have moved)
 
-26. Every window still opens and closes normally: space, Library, Record, Settings, Participants, About, Updates, onboarding.
-27. Dock right-click → New Space / Library… still works while a window is open.
-28. `--windowless` still runs with no window and quits on `SIGTERM`. On macOS it starts retired (`UIElement`) with a status item, and its status-menu Quit is a full shutdown.
-29. **Linux is unchanged:** no tray, the windowed app quits with its last window / Ctrl+Q (a full shutdown), and the background layer is `eidola service` + `--windowless`.
+31. Every window still opens and closes normally: space, Library, Record, Settings, Participants, About, Updates, onboarding.
+32. Dock right-click → New Space / Library… still works while a window is open.
+33. `--windowless` still runs with no window and quits on `SIGTERM`. On macOS it starts retired (`UIElement`) with a status item, and its status-menu Quit is a full shutdown.
+34. **Linux is unchanged:** no tray, the windowed app quits with its last window / Ctrl+Q (a full shutdown), and the background layer is `eidola service` + `--windowless`.
