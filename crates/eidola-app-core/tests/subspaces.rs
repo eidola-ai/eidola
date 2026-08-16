@@ -1349,6 +1349,73 @@ fn a_spawn_cannot_anchor_to_a_post_in_another_conversation() {
     });
 }
 
+/// **A delegation is opened from a post the parent currently shows.** A
+/// superseded wording is still a row in that conversation, and a failed
+/// regeneration's hidden `error` tip is its current generation — either would
+/// let the room run and then attach its report to something the transcript
+/// does not render. The spawn asks the transcript's own predicate, so only
+/// the current, terminal, visible post is an anchor.
+#[test]
+fn a_spawn_cannot_anchor_to_a_superseded_wording() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let original = core
+            .runtime()
+            .block_on(core.post("Check Friday.".into(), Some(parent.clone())))
+            .expect("post");
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(original.action_id.clone(), "Check Saturday.".into()))
+            .expect("edit");
+        assert_ne!(
+            edited.action_id, original.action_id,
+            "an edit mints a new generation"
+        );
+
+        match refusal(
+            spawn_from(
+                &core,
+                &parent,
+                &owner,
+                "Check the tide tables.",
+                vec![],
+                vec![],
+                Some(&original.action_id),
+            )
+            .expect_err("a superseded wording is not an anchor"),
+        ) {
+            SpawnRefusal::AnchorNotInParent { action_id } => {
+                assert_eq!(action_id, original.action_id);
+            }
+            other => panic!("expected AnchorNotInParent, got {other:?}"),
+        }
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent.clone()))
+                .expect("list")
+                .is_empty(),
+            "a refused spawn leaves nothing behind"
+        );
+
+        let out = spawn_from(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+            Some(&edited.action_id),
+        )
+        .expect("the current wording is an anchor");
+        assert_eq!(
+            out.space.parent_action_id.as_deref(),
+            Some(edited.action_id.as_str())
+        );
+    });
+}
+
 /// **A delegation that could never be reported is refused before it costs
 /// anything.** The asymmetry is the whole argument: a refused spawn writes
 /// nothing and spends nothing, while a room that runs its turns and then finds
@@ -1817,8 +1884,9 @@ fn a_human_cannot_post_into_a_subspace_without_joining_it() {
             1
         );
 
-        // `chat` reaches the same gate — it is `post` plus a turn, and the
-        // post is what commits first.
+        // `chat` reaches the membership gate first — it is a combined
+        // post-and-turn, and in a live sub-space that combination is refused
+        // before posting, but an unjoined reader still sees NotJoined.
         let err = core
             .runtime()
             .block_on(core.chat(
@@ -1826,7 +1894,7 @@ fn a_human_cannot_post_into_a_subspace_without_joining_it() {
                 MODEL.into(),
                 Some(sub.clone()),
             ))
-            .expect_err("chat posts first, so it is refused first");
+            .expect_err("chat is membership first");
         assert!(matches!(err, AppError::NotJoined { .. }), "{err:?}");
         assert_eq!(
             core.runtime()
@@ -1841,6 +1909,79 @@ fn a_human_cannot_post_into_a_subspace_without_joining_it() {
         core.runtime()
             .block_on(core.post("Ordinary.".into(), Some(parent)))
             .expect("posting where you are a member is unchanged");
+    });
+}
+
+/// **Combined post-and-turn is a cascade, and a live sub-space's cascade
+/// belongs to the driver.** `chat` / `chat_stream` would post and then drive
+/// the same notify-all seat the driver will take — twice the spend. Joining
+/// takes the membership gate out of the way so this is the kind rule that
+/// answers; posting itself remains, because that is what a joined reader
+/// does and what arms the room.
+#[test]
+fn a_combined_ask_in_a_live_subspace_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn");
+        let sub = out.space.id.clone();
+        core.runtime()
+            .block_on(core.add_global_participant(
+                sub.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("join");
+
+        let mut rx = core.subscribe_changes();
+        let _ = drain(&mut rx);
+
+        let chat_err = core
+            .runtime()
+            .block_on(core.chat("Anyone home?".into(), MODEL.into(), Some(sub.clone())))
+            .expect_err("combined chat would double-drive the room");
+        match &chat_err {
+            AppError::DrivenConversation { space_id } => assert_eq!(space_id, &sub),
+            other => panic!("expected DrivenConversation, got {other:?}"),
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream_err = core
+            .runtime()
+            .block_on(core.chat_stream("Anyone home?".into(), MODEL.into(), Some(sub.clone()), tx))
+            .expect_err("combined stream would double-drive the room");
+        match &stream_err {
+            AppError::DrivenConversation { space_id } => assert_eq!(space_id, &sub),
+            other => panic!("expected DrivenConversation, got {other:?}"),
+        }
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a refused combined ask writes nothing and emits nothing"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.get_space_tree(sub.clone()))
+                .expect("tree")
+                .len(),
+            1,
+            "the room still holds only its brief"
+        );
+
+        // Posting is still the joined reader's door — the driver takes the
+        // cascade from there.
+        core.runtime()
+            .block_on(core.post("Now I can speak.".into(), Some(sub)))
+            .expect("a member posts");
     });
 }
 

@@ -344,6 +344,7 @@ impl DelegationFailure {
             | AppError::WrongPostKind { .. }
             | AppError::SpawnRefused { .. }
             | AppError::NotJoined { .. }
+            | AppError::DrivenConversation { .. }
             | AppError::SpaceArchived { .. } => Self::Configuration,
             AppError::ToolLoop { .. }
             | AppError::Internal { .. }

@@ -3742,6 +3742,28 @@ impl Inner {
         Ok(())
     }
 
+    /// Combined post-and-turn (`chat` / `chat_stream`) is a cascade, and a
+    /// live sub-space's cascade belongs to the driver. Membership is asked
+    /// first so an unjoined reader still sees [`AppError::NotJoined`]; a
+    /// joined one is refused here before any write, rather than posting and
+    /// then driving the same notify-all seat the driver's arm will take.
+    async fn refuse_combined_ask_in_subspace(
+        &self,
+        space_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        let Some(space_id) = space_id else {
+            return Ok(());
+        };
+        let conn = self.db_conn().await?;
+        if db::is_live_subspace(&conn, space_id).await? {
+            self.require_human_joined(&conn, space_id).await?;
+            return Err(AppError::DrivenConversation {
+                space_id: space_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Name a write that a space's disappearance made impossible.
     ///
     /// These doors have no rows-affected to read — a foreign key is what
@@ -6894,12 +6916,17 @@ impl Inner {
     /// combined convenience that the CLI and one-shot callers use. Equivalent
     /// to `post` followed by `run_turn(Reply)`: the post persists first (so a
     /// funding failure leaves the saved thought), then the agent replies.
+    ///
+    /// **Not in a live sub-space.** Those rooms belong to the driver; posting
+    /// here and then driving a turn would cascade the same human post twice.
+    /// [`Self::refuse_combined_ask_in_subspace`] is that gate.
     async fn chat(
         &self,
         prompt: &str,
         model: &str,
         space_id: Option<&str>,
     ) -> Result<ChatResult, AppError> {
+        self.refuse_combined_ask_in_subspace(space_id).await?;
         let posted = self.post(space_id, prompt, None, &[]).await?;
         self.run_turn(
             &posted.space_id,
@@ -7392,6 +7419,8 @@ impl Inner {
 
     /// Save a turn and request a streaming response in one gesture (the GUI's
     /// path). Equivalent to `post` followed by `run_turn_stream(Reply)`.
+    ///
+    /// **Not in a live sub-space** — see [`Self::chat`].
     async fn chat_stream(
         &self,
         prompt: &str,
@@ -7400,6 +7429,7 @@ impl Inner {
         reply_to: Option<&str>,
         sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<ChatResult, AppError> {
+        self.refuse_combined_ask_in_subspace(space_id).await?;
         let posted = self.post(space_id, prompt, reply_to, &[]).await?;
         self.run_turn_stream(
             &posted.space_id,
@@ -7703,6 +7733,9 @@ impl AppCore {
     /// `sender` and returns the finalized `ChatResult` when the upstream
     /// stream closes. Drops `sender` on return so receivers see channel
     /// closure as the natural "done" signal.
+    ///
+    /// **Not in a live sub-space.** Combined post-and-turn is a cascade, and
+    /// those rooms belong to the driver (`AppError::DrivenConversation`).
     pub async fn chat_stream(
         &self,
         prompt: String,

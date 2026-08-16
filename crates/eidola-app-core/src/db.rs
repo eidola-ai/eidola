@@ -2143,7 +2143,8 @@ pub(crate) struct SubspacePlan<'a> {
     pub brief_item_id: &'a str,
     /// The post in the parent this delegation is being opened from — the turn's
     /// own target, which the caller knows and this door cannot derive. Written
-    /// to `space.parent_action_id` and validated to be a post of the parent.
+    /// to `space.parent_action_id` and validated to be a post the parent
+    /// **currently shows** (current generation, terminal status, post type).
     pub parent_action_id: Option<&'a str>,
     /// Global agents to seat beside the owner, deduped and in requested order.
     pub participant_ids: &'a [String],
@@ -2288,17 +2289,19 @@ async fn spawn_subspace_tx_body(
 
     // (2b) the anchor, when one was named: the post in the parent this
     // delegation is being opened from. Decided at the write like every other
-    // guard — a post cannot stop being a post, but the space it belongs to is
-    // exactly the thing a caller could get wrong, and an anchor pointing
-    // somewhere else would attach the eventual report to another conversation.
-    if let Some(anchor) = plan.parent_action_id {
-        match action_space_and_type(conn, anchor).await? {
-            Some((space_id, action_type))
-                if space_id == plan.parent_space_id && is_post_action_type(&action_type) => {}
-            _ => refuse!(SpawnRefusal::AnchorNotInParent {
-                action_id: anchor.to_string(),
-            }),
-        }
+    // guard — and it must be a generation the parent **shows**, not merely a
+    // row that was once a post there. A superseded wording, or a failed
+    // regeneration's hidden `error` tip, would let the room run and bill, then
+    // wait for a reply nobody can write to that id; after grace the report
+    // would attach to an item whose tip is not renderable and land at the
+    // conversation root. The transcript's own predicate is the whole of
+    // "somewhere here to report back to".
+    if let Some(anchor) = plan.parent_action_id
+        && !is_visible_post_in_space(conn, plan.parent_space_id, anchor).await?
+    {
+        refuse!(SpawnRefusal::AnchorNotInParent {
+            action_id: anchor.to_string(),
+        });
     }
 
     // (2c) somewhere for the report to land. **Refused here rather than
@@ -5795,6 +5798,36 @@ pub async fn action_space_and_type(
             row.get::<String>(1).map_err(AppError::db)?,
         ))),
     }
+}
+
+/// Whether `action_id` is a **post `space_id` currently shows** — current
+/// generation, terminal status, post type, the transcript's predicate. The
+/// spawn's anchor guard asks this so a delegation cannot be opened from a
+/// generation the parent hides.
+async fn is_visible_post_in_space(
+    conn: &Connection,
+    space_id: &str,
+    action_id: &str,
+) -> Result<bool, AppError> {
+    let sql = format!(
+        "SELECT 1 FROM action a \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         WHERE a.id = ?1 AND a.space_id = ?2 \
+           AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         LIMIT 1"
+    );
+    let mut rows = conn
+        .query(
+            &sql,
+            (
+                Value::Text(action_id.to_string()),
+                Value::Text(space_id.to_string()),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(rows.next().await.map_err(AppError::db)?.is_some())
 }
 
 /// One incoming `reference` edge: a post (elsewhere or in the same space)

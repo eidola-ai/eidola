@@ -27,7 +27,7 @@ use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AppCore, DelegationEnd, DelegationFailure, ExpectedScope, MAX_ATTEMPTS_PER_TAIL,
     MAX_CONCURRENT_WALKS, MAX_DELEGATION_TURNS, NewParticipant, NotificationPlan,
-    ParticipantUpdate, PostNode, SpawnedSubspace,
+    ParticipantUpdate, PostNode, SpawnRefusal, SpawnedSubspace,
 };
 
 /// These turns run over an `openai` backend, so none of them needs a
@@ -1897,6 +1897,75 @@ fn a_report_does_not_attach_beneath_a_hidden_answer() {
     });
 }
 
+/// **A hidden generation is not an anchor.** The spawn captures the post the
+/// report will reply to, and that post has to be one the parent currently
+/// shows. A superseded wording is still a row there; a failed regeneration's
+/// `error` tip is current but not terminal. Either would let the room run
+/// and then attach its report to something `build_post_tree` cannot render.
+#[test]
+fn a_spawn_cannot_anchor_to_a_hidden_tip() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let answer = ask(&core, &parent, &owner, &asked);
+
+        let _broken = failing_backend(&core);
+        set_model(&core, &owner, EXT2_MODEL);
+        core.runtime()
+            .block_on(core.regenerate(answer.clone(), EXT2_MODEL.into()))
+            .expect_err("the regeneration fails upstream");
+        set_model(&core, &owner, MODEL);
+
+        let error_tip = core
+            .runtime()
+            .block_on(core.test_space_actions(parent.clone()))
+            .expect("actions")
+            .into_iter()
+            .find(|a| a.status == "error")
+            .expect("the failed regeneration left a hidden tip")
+            .id;
+
+        for (what, id) in [
+            ("superseded wording", &answer),
+            ("hidden error tip", &error_tip),
+        ] {
+            match core
+                .runtime()
+                .block_on(core.spawn_subspace(
+                    parent.clone(),
+                    owner.clone(),
+                    "Check the tide tables.".into(),
+                    vec![],
+                    vec![],
+                    None,
+                    Some(id.clone()),
+                ))
+                .expect_err("a hidden generation is not an anchor")
+            {
+                AppError::SpawnRefused {
+                    refusal: SpawnRefusal::AnchorNotInParent { action_id },
+                } => {
+                    assert_eq!(&action_id, id, "{what}");
+                }
+                other => panic!("{what}: expected AnchorNotInParent, got {other:?}"),
+            }
+        }
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent.clone()))
+                .expect("list")
+                .is_empty(),
+            "a refused spawn leaves nothing behind"
+        );
+
+        // The human post is still visible, and is still a valid anchor.
+        let out = spawn_from(&core, &parent, &owner, vec![], Some(&asked));
+        assert_eq!(out.space.parent_action_id.as_deref(), Some(asked.as_str()));
+    });
+}
+
 /// **A branch every responder declines is still a finding.** A decline writes
 /// a decision, not a post — so nothing follows the post, nothing re-plans
 /// from it, and a leaf test shaped on the *plan* ("no turns") rather than on
@@ -2893,6 +2962,59 @@ fn a_consumer_cannot_plan_turns_in_a_delegated_room() {
         assert!(
             matches!(&plan, NotificationPlan::Turns(t) if !t.is_empty()),
             "an ordinary conversation still plans for its consumer: {plan:?}"
+        );
+    });
+}
+
+/// Combined `chat` is a cascade, and a live sub-space's cascade belongs to
+/// the driver. Joining lets the human post; the combined door still refuses,
+/// and the running driver still takes the turn that post arms.
+#[test]
+fn a_combined_ask_does_not_double_drive_a_delegated_room() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        core.start_subspace_driver();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+        let sub = out.space.id.clone();
+        wait_until(&core, || tree(&core, &sub).len() == 2);
+
+        core.runtime()
+            .block_on(core.add_global_participant(
+                sub.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("join");
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("Anyone home?".into(), MODEL.into(), Some(sub.clone())))
+            .expect_err("combined chat would double-drive");
+        match err {
+            AppError::DrivenConversation { space_id } => assert_eq!(space_id, sub),
+            other => panic!("expected DrivenConversation, got {other:?}"),
+        }
+
+        core.runtime()
+            .block_on(core.post("Anyone home?".into(), Some(sub.clone())))
+            .expect("a member still posts");
+        wait_until(&core, || {
+            tree(&core, &sub)
+                .iter()
+                .any(|n| n.action_type == "user_input")
+                && tree(&core, &sub).len() >= 4
+        });
+        let room = tree(&core, &sub);
+        assert!(
+            room.iter().any(|n| n.action_type == "user_input"),
+            "the joined post landed: {room:?}"
+        );
+        assert!(
+            room.iter().filter(|n| n.action_type == "inference").count() >= 2,
+            "the driver answered the brief and the human's post: {room:?}"
         );
     });
 }

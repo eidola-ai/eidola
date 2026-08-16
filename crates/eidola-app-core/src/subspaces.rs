@@ -106,9 +106,11 @@ pub enum SpawnRefusal {
     CapabilityNotHeld { name: String },
     /// A requested sub-agent is not a live shared agent.
     ParticipantNotEligible { participant_id: String },
-    /// The post the delegation says it is being opened from is not a post of
-    /// the parent conversation. The report attaches there, so an anchor
-    /// pointing somewhere else would answer a conversation nobody asked.
+    /// The post the delegation says it is being opened from is not a post
+    /// the parent currently shows — wrong conversation, a superseded
+    /// generation, or a hidden tip. The report attaches there, so an
+    /// unshowable anchor would answer a conversation nobody asked, or land
+    /// at the root.
     AnchorNotInParent { action_id: String },
     /// No anchor was named and the parent conversation has nothing to attach a
     /// report to. The room would do its work and then have nowhere to say so.
@@ -168,8 +170,8 @@ impl std::fmt::Display for SpawnRefusal {
             ),
             Self::AnchorNotInParent { action_id } => write!(
                 f,
-                "{action_id} is not a post in this conversation, so a delegation opened from it \
-                 would have nowhere here to report back to"
+                "{action_id} is not a post this conversation currently shows, so a delegation \
+                 opened from it would have nowhere here to report back to"
             ),
             Self::NothingToReportTo => write!(
                 f,
