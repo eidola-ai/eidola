@@ -57,6 +57,15 @@ impl LocalModelsStore {
         }
     }
 
+    /// Test seam: seat a snapshot on a **backend-backed** store, so a test can
+    /// put a row on screen and still exercise the real op slots. (A stub store
+    /// takes its fixture through `LocalModelsStore::stub`, but that one starts
+    /// no tasks, which is exactly what a pending-operation test needs.)
+    #[doc(hidden)]
+    pub fn set_state_for_test(&mut self, state: LocalModelsState) {
+        self.state = Loadable::loaded(state);
+    }
+
     /// The current snapshot.
     pub fn state(&self) -> &Loadable<LocalModelsState> {
         &self.state
@@ -160,10 +169,75 @@ impl LocalModelsStore {
         cx.notify();
     }
 
+    /// Whether this URL's download is **being started** right now — the keyed
+    /// op slot, which is what "in flight" means here (STATE.md: no shared busy
+    /// flags; in-flight is the presence of the task).
+    ///
+    /// It covers the initiating call only. Once app-core has accepted the
+    /// transfer the snapshot's own row carries it (`Downloading`, with Cancel),
+    /// which is the state every surface reads from there on.
+    pub fn download_pending(&self, url: &str) -> bool {
+        self.op_tasks.contains_key(&Self::download_key(url))
+    }
+
+    /// The pending slot's key for a download URL.
+    ///
+    /// **It is the identity app-core deduplicates on, never the spelling a
+    /// door happened to hold** — `resolve_model_download` maps every
+    /// equivalent spelling of one model (a Hugging Face `/blob/` page and its
+    /// `/resolve/` object, a `?download=true` suffix, any two URLs naming the
+    /// same file) onto the one slug app-core keys its transfer map by. The two
+    /// **must** agree: a key that separates what app-core joins lets a second
+    /// door miss the pending lookup, reach app-core, and publish its
+    /// "already downloading" refusal over the transfer that is working —
+    /// exactly the race [`Self::download`]'s non-reentrancy exists to prevent.
+    /// Every read and write of the slot goes through here, so there is one
+    /// derivation and no place for a raw URL to slip back in.
+    ///
+    /// A URL app-core would reject (not a `.gguf`, not http) has no transfer
+    /// identity to key on, so the trimmed text stands in — enough to make a
+    /// repeat of that very paste a no-op while the first is being refused, and
+    /// the refusal is what the reader wants either way. The `?` prefix cannot
+    /// collide with a slug, whose characters app-core restricts.
+    fn download_key(url: &str) -> String {
+        match eidola_app_core::resolve_model_download(url) {
+            Ok(target) => format!("download:{}", target.slug),
+            Err(_) => format!("download:?{}", url.trim()),
+        }
+    }
+
     /// Start a model download (curated entry or pasted URL). The transfer
     /// itself is core-owned; progress arrives via `Change::LocalModels`.
+    ///
+    /// **Not re-entrant for a transfer that is already being started**
+    /// ([`Self::download_key`] decides what "the same transfer" means, and
+    /// answers as app-core does). Several surfaces open onto this one
+    /// operation — a failed row's Retry, the curated catalog's Download, the
+    /// paste-a-URL row — and they all ask for the *same* thing, so a second
+    /// call is one request twice rather than a newer intent. [`Self::run_op`]'s keep-newest
+    /// supersede is the wrong shape for that: the second `op_tasks.insert`
+    /// drops the first continuation while the core call it issued runs on, and
+    /// app-core then refuses the duplicate ("already downloading") — a failure
+    /// published over a transfer that is working, and a slot that clears while
+    /// the real transfer is still being started.
+    ///
+    /// Re-entry is therefore a **no-op**, which is the shape this codebase
+    /// already takes wherever an operation has exactly one meaning
+    /// (`UpdateStore::check_now`'s `checking` flag; `Space`'s exclusive
+    /// `post_runner`). The chained last-wins of the keyed *edit* slots
+    /// (`AgentsStore`, `ParticipantsStore`) is for the opposite case — there a
+    /// successor carries a newer value that must win, and here there is no
+    /// newer value to carry.
+    ///
+    /// It covers the initiating call only, which is all the slot knows about:
+    /// once it clears, the snapshot's own `Downloading` row (with Cancel) is
+    /// what stands in the way, and a press landing after that reaches
+    /// app-core's own honest refusal rather than superseding anything.
     pub fn download(&mut self, url: String, cx: &mut Context<Self>) {
-        let key = format!("download:{url}");
+        if self.download_pending(&url) {
+            return;
+        }
+        let key = Self::download_key(&url);
         self.run_op(key, cx, move |c| async move {
             c.download_local_model(url).await.map(|_| ())
         });
@@ -185,6 +259,16 @@ impl LocalModelsStore {
             cx,
             move |c| async move { c.delete_local_model(id).await },
         );
+    }
+
+    /// Forget a standing download/load failure. Clears the report, nothing
+    /// else — where the failure is all that is left of a download, the row it
+    /// synthesizes goes with it.
+    pub fn dismiss_failure(&mut self, id: String, cx: &mut Context<Self>) {
+        let key = format!("dismiss:{id}");
+        self.run_op(key, cx, move |c| async move {
+            c.dismiss_local_model_failure(id).await
+        });
     }
 
     /// Load a model (spawns its engine; resolves when ready or failed).

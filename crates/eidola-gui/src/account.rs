@@ -713,6 +713,7 @@ impl Render for AccountView {
                     "settings/account/subscription-retry",
                     "Couldn't check your subscription",
                     err,
+                    "Retry",
                     cx,
                     cx.listener(|this, _, _, cx| {
                         this.account.update(cx, |s, cx| s.refresh_subscription(cx));

@@ -43,14 +43,17 @@
 //! app-core — downloads and engine processes are core-owned, so closing
 //! this window interrupts nothing.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use eidola_app_core::{
     BackendInfo, BackendKind, EidolaTrust, LOCAL_MODEL_CATALOG, LocalModelInfo, LocalModelStatus,
     MeasurementInfo, NewBackend,
 };
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, Focusable as _, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, div, prelude::FluentBuilder, px,
+    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable as _,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     ActiveTheme, Sizable, StyledExt,
@@ -65,6 +68,7 @@ use gpui_component::{
 
 use crate::actions::OpenRecord;
 use crate::focus::TabRegion as _;
+use crate::i18n::msg;
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, ConfigStore, LocalModelsStore, Stores};
 
@@ -173,6 +177,24 @@ pub struct BackendsSettingsView {
     intermediate_ca_state: Entity<InputState>,
     /// The inline add-backend form, while one is open.
     add_form: Option<AddForm>,
+    /// The pane's own focus handle — where the keyboard goes when a verb
+    /// unmounts the element that was holding it (see [`Self::hand_back_focus`]).
+    focus_handle: FocusHandle,
+    /// One focus handle per model row, keyed by selection id, minted on first
+    /// render of that row and kept for as long as this pane lives.
+    ///
+    /// A row's verbs are the only tab stops inside it, and the failed-download
+    /// row's two verbs **unmount themselves** — Dismiss takes the whole row
+    /// away, Retry replaces both with Cancel — so the row is the subtree the
+    /// handback rule has to ask about. Per row rather than per pane because the
+    /// question is "was *this* row holding the keyboard": a pointer press moves
+    /// focus nowhere on macOS, so a coarser test would take a keyboard reader's
+    /// place on another row away from them.
+    ///
+    /// Interior-mutable because `render` is `&self` (the height cache and the
+    /// space view's reference queue are the same shape). Bounded by the number
+    /// of local model rows.
+    row_focus: RefCell<HashMap<String, FocusHandle>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -243,8 +265,86 @@ impl BackendsSettingsView {
             root_ca_state,
             intermediate_ca_state,
             add_form: None,
+            focus_handle: cx.focus_handle(),
+            row_focus: RefCell::new(HashMap::new()),
             _subscriptions,
         }
+    }
+
+    /// The pane's focus handle — the surviving surface a verb hands the
+    /// keyboard back to.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
+    /// This model row's focus handle, minted once and reused.
+    fn row_focus(&self, id: &str, cx: &App) -> FocusHandle {
+        self.row_focus
+            .borrow_mut()
+            .entry(id.to_string())
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// Test seam: the handle a model row tracks, once it has painted.
+    #[doc(hidden)]
+    pub fn model_row_focus_for_test(&self, id: &str) -> Option<FocusHandle> {
+        self.row_focus.borrow().get(id).cloned()
+    }
+
+    /// Hand the keyboard back to the pane, but **only from a verb that was
+    /// actually holding it** — the handback rule (`AGENTS.md` → focus): a
+    /// pointer press moves focus nowhere, so restoring unconditionally would
+    /// take a keyboard reader's place somewhere else in the pane away from them.
+    fn hand_back_focus(&self, held: bool, window: &mut Window, cx: &mut App) {
+        if held {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
+    /// Re-run the download a failed row remembers.
+    ///
+    /// **Its own button does not survive this**: the download starts, the bus
+    /// re-reads, and the row comes back as a downloading one whose single verb
+    /// is Cancel — so Retry unmounts under the keyboard exactly as Dismiss does,
+    /// and owes the same handback. (The row itself survives; the tab stop the
+    /// reader is standing on does not, which is what the rule is about.)
+    pub fn retry_failed_download(
+        &mut self,
+        id: &str,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Re-entry while this URL's transfer is being started does nothing:
+        // `LocalModelsStore::download` is where that is decided, for every door
+        // at once. Asked here too so the *press* has no effects of its own —
+        // the handback below would otherwise move a reader who is standing on
+        // this row for an activation that started nothing.
+        if self.local_models.read(cx).download_pending(&url) {
+            return;
+        }
+        let held = self.row_focus(id, cx).contains_focused(window, cx);
+        self.local_models.update(cx, |s, cx| s.download(url, cx));
+        self.hand_back_focus(held, window, cx);
+    }
+
+    /// Forget a standing download failure — which takes the row with it, since
+    /// the failure was the whole of it. Hands the keyboard back for the same
+    /// reason `RecordView::close_detail` does: the element holding it is about
+    /// to stop being painted.
+    pub fn dismiss_failed_download(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let held = self.row_focus(id, cx).contains_focused(window, cx);
+        self.local_models
+            .update(cx, |s, cx| s.dismiss_failure(id.to_string(), cx));
+        // The row is gone; nothing should keep a handle for it alive.
+        self.row_focus.borrow_mut().remove(id);
+        self.hand_back_focus(held, window, cx);
     }
 
     /// Whether the trusted-measurements row is showing its add input (test
@@ -507,6 +607,12 @@ impl BackendsSettingsView {
     // -- Operations (public so behavior tests share the click paths) --------
 
     /// Start downloading whatever URL is in the paste field.
+    ///
+    /// The third door onto `LocalModelsStore::download`, and the one that needs
+    /// no pending state of its own: the field is cleared on submit, so this row
+    /// never stands as a second live control over a URL it just handed off —
+    /// re-typing the same one is a fresh intent, which the store's
+    /// non-reentrancy makes safe rather than racy.
     pub fn submit_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.url_state.read(cx).value().trim().to_string();
         if url.is_empty() {
@@ -739,6 +845,11 @@ impl BackendsSettingsView {
         let theme = cx.theme();
         let id = model.id.clone();
 
+        // A row that is nothing but a standing failure is not a model: its
+        // download left no file, so Load could only fail and Delete has
+        // nothing to delete (see [`failed_download_row`]).
+        let failed_download = failed_download_row(model, managed);
+
         let (status_text, progress): (String, Option<f32>) = match &model.status {
             LocalModelStatus::Downloading { received, total } => match total {
                 Some(t) if *t > 0 => (
@@ -747,6 +858,13 @@ impl BackendsSettingsView {
                 ),
                 _ => (format!("downloading — {}", fmt_size(*received)), None),
             },
+            // The state, not the reason — the error line below carries why.
+            // "downloaded" is what this status says for a scanned file, and
+            // saying it over a row with no file is the plainest lie the pane
+            // can tell.
+            LocalModelStatus::Available if failed_download => {
+                (msg::local_model_not_downloaded(cx).to_string(), None)
+            }
             LocalModelStatus::Available => ("downloaded".into(), None),
             LocalModelStatus::Loading => ("starting engine…".into(), None),
             LocalModelStatus::Loaded { port, pinned, .. } => (
@@ -780,6 +898,65 @@ impl BackendsSettingsView {
                         ),
                     );
                 }
+            }
+            // Retry re-runs the download the row remembers; Dismiss forgets
+            // the report, which is the whole of what this row is. Retry is
+            // offered only where there is a URL to re-run — a row that cannot
+            // remember one affords only the way out.
+            LocalModelStatus::Available if failed_download => {
+                if let Some(url) = model.source_url.clone() {
+                    if self.local_models.read(cx).download_pending(&url) {
+                        // The transfer is being started. Pressing again does
+                        // nothing — `LocalModelsStore::download` is not
+                        // re-entrant for this URL — so a verb here would be a
+                        // live-looking control over a settled decision; the
+                        // slot says what is happening instead: muted text, no
+                        // id, no probe, so not a tab stop and nothing to
+                        // activate. (The pane's register for a state that is
+                        // not a verb, as in the greyed "disabled" marker.)
+                        verbs = verbs.child(
+                            div()
+                                .flex_none()
+                                .text_sm()
+                                .italic()
+                                .text_color(theme.muted_foreground)
+                                .child(msg::local_model_retry_starting(cx)),
+                        );
+                    } else {
+                        let id_r = id.clone();
+                        verbs = verbs.child(
+                            quiet_verb(
+                                SharedString::from(format!("model-retry-{id}")),
+                                msg::local_model_retry(cx),
+                                cx,
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.retry_failed_download(&id_r, url.clone(), window, cx);
+                            }))
+                            .probe(
+                                format!("{probe_prefix}/{idx}/retry"),
+                                gpui::Role::Button,
+                                msg::local_model_retry_label(cx, model.display_name.clone()),
+                            ),
+                        );
+                    }
+                }
+                let id_x = id.clone();
+                verbs = verbs.child(
+                    quiet_verb(
+                        SharedString::from(format!("model-dismiss-{id}")),
+                        msg::local_model_dismiss(cx),
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.dismiss_failed_download(&id_x, window, cx);
+                    }))
+                    .probe(
+                        format!("{probe_prefix}/{idx}/dismiss"),
+                        gpui::Role::Button,
+                        msg::local_model_dismiss_label(cx, model.display_name.clone()),
+                    ),
+                );
             }
             LocalModelStatus::Available => {
                 let id_l = id.clone();
@@ -864,6 +1041,10 @@ impl BackendsSettingsView {
 
         let loaded = matches!(model.status, LocalModelStatus::Loaded { .. });
         let mut row = v_flex()
+            // The row is the subtree a verb's handback asks about: its verbs
+            // are the only tab stops in it, and the failed-download row's two
+            // unmount themselves. Tracked (focusable), never a tab stop.
+            .track_focus(&self.row_focus(&id, cx))
             .w_full()
             .py_2()
             .gap_1()
@@ -1039,6 +1220,30 @@ impl BackendsSettingsView {
                         .text_color(theme.muted_foreground)
                         .flex_none()
                         .child("Installed"),
+                );
+            } else if store.download_pending(entry.url) {
+                // This entry's transfer is being started — by this verb, or by
+                // the failed row's Retry, which re-runs the very same URL. The
+                // store makes a second call a no-op, so the door is presentation
+                // only: the same muted, id-less, probe-less marker the Retry
+                // verb's slot takes (no tab stop, nothing to activate), rather
+                // than a Download that would now do nothing. English like the
+                // rest of this row — the localized set is the failed-download
+                // row (`AGENTS.md` → Localization), and "Installed" is this
+                // slot's other non-verb marker.
+                //
+                // Bounded by the initiating call, like every other reading of
+                // `download_pending`: while the transfer itself runs, this row
+                // still offers Download and a press meets app-core's honest
+                // "already downloading" — which is a refusal, never a
+                // superseded continuation.
+                row = row.child(
+                    div()
+                        .text_sm()
+                        .italic()
+                        .text_color(theme.muted_foreground)
+                        .flex_none()
+                        .child(msg::local_model_retry_starting(cx)),
                 );
             } else {
                 let url = entry.url;
@@ -1411,6 +1616,17 @@ impl Render for BackendsSettingsView {
 
         let mut col = v_flex()
             .id("backends-pane")
+            .track_focus(&self.focus_handle)
+            // **The handback target has to be a node, and a node needs a
+            // role.** gpui registers any element with a tracked handle and an
+            // id as focusable, but `set_focus` only reports a node the tree
+            // actually has — an element with no role never got one, and the
+            // adapter logs "it has an id but no role" and leaves focus at the
+            // window root. So the pane names itself: a landmark it was owed
+            // anyway, and the reason a verb can hand the keyboard back to
+            // something a reader is told about. `Region` is a container role,
+            // so this adds no tab stop.
+            .probe("settings/backends/pane", gpui::Role::Region, "Backends")
             .px_6()
             .py_5()
             .gap_4()
@@ -2434,5 +2650,81 @@ fn fmt_size(bytes: u64) -> String {
         format!("{:.0} MB", bytes as f64 / 1e6)
     } else {
         format!("{:.0} KB", (bytes as f64 / 1e3).max(1.0))
+    }
+}
+
+/// Whether this row is a **standing failure with nothing behind it** — the row
+/// app-core synthesizes for a download that failed and left no file.
+///
+/// It is the one installed row whose verbs cannot be read off the status:
+/// `Available` is also what a scanned idle file carries, so `on_disk` is the
+/// discriminator (app-core's rule — a row is not always a file). Gating on the
+/// status alone offered Load, which has no file to open, and Delete, which has
+/// no file to remove: two verbs that could only fail or do nothing, on the one
+/// row whose whole content is an error. What it affords instead is Retry (the
+/// download again) and Dismiss (the report acknowledged).
+///
+/// Managed-store only: a `llamacpp` backend's rows are scanned files the user
+/// owns, and Eidola never downloaded them, so there is no download to re-run.
+fn failed_download_row(model: &LocalModelInfo, managed: bool) -> bool {
+    managed
+        && !model.on_disk
+        && model.last_error.is_some()
+        && matches!(model.status, LocalModelStatus::Available)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(on_disk: bool, last_error: Option<&str>, status: LocalModelStatus) -> LocalModelInfo {
+        LocalModelInfo {
+            id: "ghost@local".into(),
+            slug: "ghost".into(),
+            display_name: "Ghost".into(),
+            file_name: "ghost.gguf".into(),
+            size_bytes: None,
+            source_url: None,
+            status,
+            last_error: last_error.map(str::to_string),
+            on_disk,
+        }
+    }
+
+    #[test]
+    fn only_a_managed_error_with_no_file_reads_as_a_failed_download() {
+        // The case itself.
+        assert!(failed_download_row(
+            &row(false, Some("HTTP 500"), LocalModelStatus::Available),
+            true
+        ));
+        // A scanned file carrying a *load* failure is still a file: Load and
+        // Delete both mean something there.
+        assert!(!failed_download_row(
+            &row(true, Some("engine exited"), LocalModelStatus::Available),
+            true
+        ));
+        // A row with no error is an ordinary model.
+        assert!(!failed_download_row(
+            &row(true, None, LocalModelStatus::Available),
+            true
+        ));
+        // Mid-download rows have no file either, and they afford Cancel.
+        assert!(!failed_download_row(
+            &row(
+                false,
+                Some("HTTP 500"),
+                LocalModelStatus::Downloading {
+                    received: 1,
+                    total: None
+                }
+            ),
+            true
+        ));
+        // A user-owned llamacpp directory never had a download to re-run.
+        assert!(!failed_download_row(
+            &row(false, Some("HTTP 500"), LocalModelStatus::Available),
+            false
+        ));
     }
 }
