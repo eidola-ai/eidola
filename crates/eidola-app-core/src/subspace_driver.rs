@@ -984,6 +984,16 @@ impl Inner {
                  {MAX_ATTEMPTS_PER_TAIL} times against the same last post and is being \
                  left alone; a post there, or a restart, will pick it up again"
             );
+            // **A spent meter with nothing remembered is a terminal exit.**
+            // The wait is registered before the anchor is asked, so a lookup
+            // that then errors leaves a registration standing and decides
+            // nothing. Once the meter refuses, every later arm hits this same
+            // refuse — keeping the wait would make every post in the parent
+            // pay for a walk that can only no-op, until the grace alarm. A
+            // post in the room, or a restart, starts a fresh meter; neither
+            // needs this wait. A decided failure still keeps its wait (the
+            // branch above): that ending is still owed.
+            self.end_anchor_wait(&space_id);
             return Ok(());
         };
         let (end, leaves) = walked;
@@ -1385,6 +1395,20 @@ impl Inner {
                 self.begin_anchor_wait(sub);
                 #[cfg(feature = "test-support")]
                 self.pause_in_anchor_window().await;
+                #[cfg(feature = "test-support")]
+                if self
+                    .anchor_lookup_faults
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok()
+                {
+                    return Err(AppError::Config {
+                        message: "test: the anchor lookup is made to fail".into(),
+                    });
+                }
                 match db::last_reply_by_participant(
                     &conn,
                     &sub.parent_space_id,

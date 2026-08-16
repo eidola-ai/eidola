@@ -1620,6 +1620,12 @@ struct Inner {
     /// [`AppCore::test_fail_next_subspace_enumerations`].
     #[cfg(feature = "test-support")]
     enumeration_faults: std::sync::atomic::AtomicU32,
+    /// How many upcoming anchor lookups should fail after the wait has been
+    /// registered — the seam behind a spent meter that has nothing to
+    /// deliver (see `Inner::drive_subspace`). Set only by
+    /// [`AppCore::test_fail_next_anchor_lookups`].
+    #[cfg(feature = "test-support")]
+    anchor_lookup_faults: std::sync::atomic::AtomicU32,
     summary_gate: tokio::sync::Mutex<()>,
     /// Space id → the most recent summary trigger's timestamp: the trailing
     /// debounce that keeps an exchange (the post, then the answer it draws)
@@ -8110,6 +8116,8 @@ impl AppCore {
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 enumeration_faults: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(feature = "test-support")]
+                anchor_lookup_faults: std::sync::atomic::AtomicU32::new(0),
                 summary_gate: tokio::sync::Mutex::new(()),
                 summary_triggers: Mutex::new(std::collections::HashMap::new()),
                 memory_gate: tokio::sync::Mutex::new(()),
@@ -9359,6 +9367,18 @@ impl AppCore {
     pub fn test_fail_next_subspace_enumerations(&self, n: u32) {
         self.inner
             .enumeration_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only seam: make the next `n` anchor lookups fail after the wait
+    /// has been registered, the way a transient store error would — what
+    /// leaves a spent meter with nothing remembered to deliver (see
+    /// `Inner::drive_subspace`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_fail_next_anchor_lookups(&self, n: u32) {
+        self.inner
+            .anchor_lookup_faults
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 

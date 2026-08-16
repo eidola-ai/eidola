@@ -1377,6 +1377,42 @@ fn a_spent_meter_still_delivers_the_ending_its_work_decided() {
     });
 }
 
+/// **A spent meter with nothing to deliver stops being waited on.** The wait
+/// is registered before the anchor is asked, so a lookup that then errors
+/// leaves a registration standing and remembers nothing. Once the meter
+/// refuses, every later arm hits the same refuse — keeping the wait would
+/// make every post in the parent pay for a walk that can only no-op. A
+/// decided failure still keeps its wait (`a_wait_after_a_failed_turn_spends_its_attempt`);
+/// this is the path that decided nothing.
+#[test]
+fn a_spent_meter_with_nothing_to_deliver_releases_its_wait() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::Non2xx(500),
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        core.test_fail_next_anchor_lookups(MAX_ATTEMPTS_PER_TAIL);
+        for _ in 0..MAX_ATTEMPTS_PER_TAIL {
+            drive(&core, &out.space.id).expect_err("the lookup fails after the wait is registered");
+        }
+
+        drive(&core, &out.space.id).expect("the meter is spent, the walk is refused");
+        assert!(
+            core.test_rooms_awaiting(parent.clone()).is_empty(),
+            "the wait is released — nothing remains to deliver, so the parent \
+             is not paying for a walk that can only no-op"
+        );
+        assert!(report(&core, &parent).is_none(), "and nothing was reported");
+    });
+}
+
 /// **An ending already decided is delivered, never re-derived.** A walk that
 /// ends while its anchor is unanswered keeps what it decided and hands back
 /// its claim — so a wake before the answer lands would otherwise claim afresh
@@ -1624,6 +1660,67 @@ fn regenerating_a_report_keeps_its_finding_and_its_ending() {
 
         // And the driver still reads the room as reported — off the generation
         // a reader can see, not a superseded one.
+        let requests = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("a second walk");
+        assert_eq!(
+            mock.chat_bodies().len(),
+            requests,
+            "nothing is re-reported and nothing is re-billed"
+        );
+        assert_eq!(reports(&core, &parent).len(), 1, "still one report");
+    });
+}
+
+/// **Re-wording a report under a new author does not un-settle it.** A
+/// regeneration can mint a fresh agent when no seated member matches the
+/// picked model (`TurnSelector::Model`), and the edges travel with the item
+/// — so a settlement read that asked the tip's `participant_id` would treat
+/// the owner's own report as somebody else's quote and the next walk would
+/// post a duplicate. The origin generation is who opened the item.
+#[test]
+fn regenerating_a_report_under_a_new_author_still_settles() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        // A second backend on the same upstream, so the regeneration's model
+        // matches nobody already seated and a new agent is minted.
+        core.runtime()
+            .block_on(core.add_backend(eidola_app_core::NewBackend {
+                id: "ext2".into(),
+                kind: eidola_app_core::BackendKind::OpenAi,
+                display_name: String::new(),
+                base_url: Some(mock.base_url.clone()),
+                api_key: None,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+            }))
+            .expect("add the second backend");
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let before = report(&core, &parent).expect("the delegation is reported");
+        core.runtime()
+            .block_on(core.regenerate(before.action_id.clone(), EXT2_MODEL.to_string()))
+            .expect("regenerate under a model nobody seated has");
+
+        let after = report(&core, &parent).expect("the report is still visible");
+        assert_ne!(
+            after.action_id, before.action_id,
+            "it really is a new generation"
+        );
+        assert_ne!(
+            after.participant.label, before.participant.label,
+            "and a new author — the mint, not the owner re-wording themselves"
+        );
+
         let requests = mock.chat_bodies().len();
         drive(&core, &out.space.id).expect("a second walk");
         assert_eq!(

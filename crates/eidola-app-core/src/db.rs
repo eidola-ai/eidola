@@ -1886,10 +1886,18 @@ pub async fn first_quotable_block(
 /// transcript hides — counting that edge would settle the room on a report
 /// the parent cannot show, durably and across restarts. A report regenerated
 /// *successfully* carries its edges forward (`prepare_turn`'s replication, the
-/// rule `edit_post` has always followed), so the tip answers yes and nothing
-/// changes; the join is what makes the driver's belief and the reader's
+/// rule `edit_post` has always followed), so the tip still answers; the
+/// visibility join is what makes the driver's belief and the reader's
 /// footnote the same fact rather than two that can drift, and it errs toward
 /// reporting again rather than toward silence.
+///
+/// **And the owner is the item's original author, not the tip's.** A
+/// successful regeneration can mint a new agent (`TurnSelector::Model` when
+/// no seated member matches the picked model), and the edges travel with the
+/// item: asking the tip's `participant_id` would treat that re-wording as
+/// somebody else's quote and the next walk would post a duplicate. The origin
+/// generation (`supersedes_action_id IS NULL`) is who opened the item; a
+/// fresh quote by anyone else is a different item and still does not settle.
 pub async fn has_reference_from(
     conn: &Connection,
     space_id: &str,
@@ -1900,8 +1908,10 @@ pub async fn has_reference_from(
         "SELECT 1 FROM action_antecedent aa \
          JOIN action a ON a.id = aa.action_id \
          JOIN item_current ic ON ic.current_action_id = a.id \
+         JOIN action origin ON origin.item_id = a.item_id \
+           AND origin.supersedes_action_id IS NULL \
          WHERE aa.relation = 'reference' AND aa.antecedent_action_id = ?1 \
-           AND a.space_id = ?2 AND a.participant_id = ?3 \
+           AND a.space_id = ?2 AND origin.participant_id = ?3 \
            AND a.status IN ('complete', 'cancelled') \
            AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
          LIMIT 1"
@@ -8759,6 +8769,134 @@ mod tests {
             "and it has not been reported — so the rearmed pass has work to do \
              rather than reading a settled room and exiting"
         );
+    }
+
+    /// **A regenerated report is still the owner's quote.** Settlement asks
+    /// whether the owner has quoted the room's last word, and a successful
+    /// regeneration can change the tip's author (`TurnSelector::Model` mints
+    /// when no seated member matches) while carrying the edges forward. Asking
+    /// the tip's `participant_id` would treat that re-wording as somebody
+    /// else's quote. The origin generation is who opened the item; a fresh
+    /// quote by anyone else is a different item and still does not settle.
+    #[tokio::test]
+    async fn a_report_is_recognized_by_its_original_author() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let owner = ensure_participant(&conn, "agent", "Navigator", None, 1_000)
+            .await
+            .unwrap();
+        let other = ensure_participant(&conn, "agent", "Scribe", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "parent", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+
+        let driven = add_user_action(&conn, "room", &owner, "the helper's answer", 9_000).await;
+        let item = uuid::Uuid::now_v7().to_string();
+        let origin = add_report(
+            &conn,
+            "parent",
+            &owner,
+            &item,
+            None,
+            &driven,
+            "reporting back",
+            9_500,
+        )
+        .await;
+        assert!(
+            has_reference_from(&conn, "parent", &owner, &driven)
+                .await
+                .unwrap(),
+            "the owner's report settles the room"
+        );
+
+        // A regeneration by someone else — the current generation's author is
+        // not the owner, but the item's origin still is, and the edges
+        // travelled with it.
+        let _tip = add_report(
+            &conn,
+            "parent",
+            &other,
+            &item,
+            Some(&origin),
+            &driven,
+            "re-worded",
+            10_000,
+        )
+        .await;
+        assert!(
+            has_reference_from(&conn, "parent", &owner, &driven)
+                .await
+                .unwrap(),
+            "a regenerated report is still the owner's quote"
+        );
+
+        // A fresh quote by someone else is a different item, not a
+        // regeneration of the owner's report.
+        let elsewhere = add_user_action(&conn, "room", &owner, "another finding", 9_100).await;
+        let stranger = add_user_action(&conn, "parent", &other, "quoting too", 10_500).await;
+        insert_reference_antecedent(&conn, &stranger, &elsewhere, 1, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !has_reference_from(&conn, "parent", &owner, &elsewhere)
+                .await
+                .unwrap(),
+            "somebody else's quote does not settle the room"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_report(
+        conn: &Connection,
+        space_id: &str,
+        participant_id: &str,
+        item_id: &str,
+        supersedes: Option<&str>,
+        quoted: &str,
+        text: &str,
+        created_at: i64,
+    ) -> String {
+        let action_id = uuid::Uuid::now_v7().to_string();
+        insert_action(
+            conn,
+            &ActionEntry {
+                id: action_id.clone(),
+                space_id: space_id.to_string(),
+                participant_id: participant_id.to_string(),
+                item_id: item_id.to_string(),
+                supersedes_action_id: supersedes.map(str::to_string),
+                action_type: "inference".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at,
+            },
+        )
+        .await
+        .unwrap();
+        insert_text_content_block(
+            conn,
+            &uuid::Uuid::now_v7().to_string(),
+            &action_id,
+            0,
+            "text",
+            text,
+        )
+        .await
+        .unwrap();
+        insert_reference_antecedent(conn, &action_id, quoted, 1, None, None, None, None)
+            .await
+            .unwrap();
+        action_id
     }
 
     /// **A post is written whole or not at all.** Its action row, its words,
