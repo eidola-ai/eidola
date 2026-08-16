@@ -506,6 +506,49 @@ fn a_post_arriving_mid_walk_is_not_walked_past() {
     });
 }
 
+/// **The line between "already here" and "arrived while I worked" is drawn
+/// before the first read, not after it.** A walk's opening reads are several
+/// awaits wide; a post committing inside them is not the tail the walk started
+/// from, and a boundary taken afterwards would put it before the refill's
+/// window too — belonging to neither, with its own change event spent on a walk
+/// already under way. Staged exactly: the walk is stopped between reading the
+/// room's last post and deciding anything from it, and the post is committed
+/// there.
+#[test]
+fn a_post_landing_between_a_walks_own_reads_is_not_lost() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        let mut window = core.test_open_entry_window();
+        let outsider = std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &out.space.id));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches the entry window");
+            let brief = out.brief_action_id.clone();
+            let outsider = ask(&core, &out.space.id, &owner, &brief);
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+            outsider
+        });
+
+        let room = tree(&core, &out.space.id);
+        assert!(
+            room.iter()
+                .any(|n| n.parent_action_id.as_deref() == Some(outsider.as_str())),
+            "the post that landed between the reads was answered: {:?}",
+            room.iter()
+                .map(|n| (n.action_id.clone(), n.parent_action_id.clone()))
+                .collect::<Vec<_>>()
+        );
+    });
+}
+
 // ===========================================================================
 // Where the report attaches
 // ===========================================================================
@@ -758,6 +801,41 @@ fn recovering_from_a_lagged_bus_does_not_end_a_wait() {
     });
 }
 
+/// **A wait ends by outliving the turn it is waiting on.** The spawning turn
+/// can fail after the room was opened — no reply to the anchor is ever coming,
+/// and nothing durable says so — so the wait sets its own alarm when it begins.
+/// Unrelated parent traffic still never spends it; the clock does.
+#[test]
+fn a_wait_that_outlives_any_turn_reports_against_the_anchor() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        core.test_set_anchor_wait_grace(std::time::Duration::from_millis(150));
+        core.start_subspace_driver();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        // Opened from a post the owner never answers — the shape a spawning
+        // turn that failed after the spawn leaves behind.
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        // Nothing else ever happens in the parent: the alarm is the only thing
+        // that can end this.
+        wait_until(&core, || report(&core, &parent).is_some());
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(asked.as_str()),
+            "attached to the post it was asked on, there being no answer to sit beneath"
+        );
+        assert!(
+            core.test_rooms_awaiting(parent).is_empty(),
+            "and it is no longer waiting on anything"
+        );
+        assert_eq!(out.space.parent_action_id.as_deref(), Some(asked.as_str()));
+    });
+}
+
 /// The other half of the wait: an answer that is never coming. A walk armed by
 /// the startup sweep reports against the post the work was asked on, because at
 /// that moment nothing can still be in flight.
@@ -895,6 +973,86 @@ fn regenerating_a_report_keeps_its_finding_and_its_ending() {
             "nothing is re-reported and nothing is re-billed"
         );
         assert_eq!(reports(&core, &parent).len(), 1, "still one report");
+    });
+}
+
+/// **Every branch's finding comes back, not whichever was written last.** A
+/// delegated room fans out — each helper answers the brief and each branch runs
+/// down to a post nothing follows — and quoting one of those would report one
+/// helper while the room settled as reported, so nothing would ever go back for
+/// the rest.
+#[test]
+fn a_fan_out_reports_every_branchs_finding() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        // Two replies deep is the brief plus one answer each, so both branches
+        // reach the room's reply limit — separately, which is the point.
+        core.runtime()
+            .block_on(core.set_space_cascade_limit(parent.clone(), 2))
+            .expect("cascade limit");
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let a = shared_agent(&core, &parent, "Surveyor");
+        let b = shared_agent(&core, &parent, "Pilot");
+        let out = spawn(&core, &parent, &owner, vec![a, b]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let room = tree(&core, &out.space.id);
+        let findings: Vec<String> = room
+            .iter()
+            .filter(|n| n.action_type == "inference")
+            .map(|n| n.action_id.clone())
+            .collect();
+        assert_eq!(findings.len(), 2, "both helpers answered: {room:?}");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(report.references.len(), 2, "both findings are attached");
+        let quoted: std::collections::BTreeSet<String> = report
+            .references
+            .iter()
+            .map(|r| r.antecedent_action_id.clone())
+            .collect();
+        assert_eq!(
+            quoted,
+            findings
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "and they are the two branches' own tips"
+        );
+        let ordinals: Vec<i64> = report.references.iter().map(|r| r.ordinal).collect();
+        assert_eq!(ordinals, vec![1, 2], "at ordinals 1..=N");
+        assert!(
+            report.references.iter().all(|r| r.snippet.is_some()),
+            "each passage resolves"
+        );
+
+        // Both reach the model that writes the report.
+        let body = mock
+            .chat_bodies()
+            .last()
+            .cloned()
+            .expect("a report request");
+        let attached = flat_messages(&body)
+            .into_iter()
+            .find(|(_, c)| c.contains("Attached to your reply"))
+            .map(|(_, c)| c)
+            .expect("the attached block");
+        assert!(
+            attached.contains("[1] ") && attached.contains("[2] "),
+            "both passages are in front of the turn: {attached}"
+        );
+        assert!(
+            attached.contains("Surveyor") && attached.contains("Pilot"),
+            "each attributed to the helper who found it: {attached}"
+        );
+
+        // And the room settles: its current last word is among what was quoted.
+        let requests = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("a second walk");
+        assert_eq!(mock.chat_bodies().len(), requests, "nothing is re-reported");
+        assert_eq!(reports(&core, &parent).len(), 1);
     });
 }
 

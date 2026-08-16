@@ -640,6 +640,28 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_delegation_report",
+                description: "Space view: a delegated conversation's report — the owning agent's post quoting each helper's finding, the footnote rail saying how that conversation stopped",
+                default_size: size(px(860.), px(620.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(fixtures::delegation_report_posts(), cx)
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_inspector",
                 description: "Space view: the inspector open beside the conversation (a real split — title, cascade stepper, router picker at its Off default)",
                 default_size: size(px(1040.), px(760.)),
