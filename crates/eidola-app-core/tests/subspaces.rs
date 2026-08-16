@@ -2336,3 +2336,123 @@ fn an_unjoined_reader_cannot_spend_or_write_in_a_room_they_only_watch() {
             .expect("posting where you are a member is unchanged");
     });
 }
+
+/// **You may quote what you can read — and reading a sub-space is what the
+/// human bypass grants.**
+///
+/// The reference gate asked bare membership, so a reader who had opened a room
+/// their agents opened between themselves could read a finding and not quote
+/// it: the refusal landed after the draft was composed, on the one flow the
+/// read bypass exists for — carrying something out of a delegated room into
+/// the reader's own conversation.
+///
+/// Widening the gate to the read question grants nothing: quoting **copies**
+/// the excerpt, and the premise is that this author can already read the
+/// passage. The one space they cannot read stays refused, by that function's
+/// own carve-out.
+#[test]
+fn a_human_may_quote_out_of_a_room_they_watch_but_not_out_of_a_notebook() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables for Friday.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn");
+
+        // The reader is not a member of the sub-space — that is the premise.
+        assert!(
+            !core
+                .runtime()
+                .block_on(core.list_space_participants(out.space.id.clone()))
+                .expect("roster")
+                .iter()
+                .any(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+        );
+
+        // Quoting the agent's brief into the reader's *own* conversation.
+        let block = core
+            .runtime()
+            .block_on(core.get_space_tree(out.space.id.clone()))
+            .expect("tree")[0]
+            .blocks[0]
+            .id
+            .clone();
+        let posted = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "Look what it is working on.\n\n{{ embed 1 }}".into(),
+                Some(parent.clone()),
+                None,
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: out.brief_action_id.clone(),
+                    content_block_id: Some(block),
+                    range_start: Some(0),
+                    range_end: Some(5),
+                    annotation: None,
+                }],
+            ))
+            .expect("a reader may quote what they can read");
+
+        // The reference is really there, and resolves.
+        let quoting = core
+            .runtime()
+            .block_on(core.get_space_tree(parent.clone()))
+            .expect("tree")
+            .into_iter()
+            .find(|n| n.action_id == posted.action_id)
+            .expect("the post");
+        assert_eq!(quoting.references.len(), 1);
+        assert_eq!(
+            quoting.references[0].antecedent_action_id,
+            out.brief_action_id
+        );
+        assert!(
+            quoting.references[0].snippet.is_some(),
+            "the passage came with it: {:?}",
+            quoting.references[0]
+        );
+
+        // **A notebook is still refused** — the one space the reader may not
+        // read, and so the one they may not quote.
+        let notebook = core
+            .runtime()
+            .block_on(core.notebook_space_id(owner.clone()))
+            .expect("notebook")
+            .expect("a promoted agent has one");
+        let private = core
+            .runtime()
+            .block_on(core.post("A private note to self.".into(), Some(notebook.clone())))
+            .expect("the human may write in a notebook");
+        let space_of_note = core
+            .runtime()
+            .block_on(core.create_space(Some("Mine".into())))
+            .expect("space")
+            .id;
+        let err = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "Look at this.\n\n{{ embed 1 }}".into(),
+                Some(space_of_note),
+                None,
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: private.action_id.clone(),
+                    content_block_id: None,
+                    range_start: None,
+                    range_end: None,
+                    annotation: None,
+                }],
+            ))
+            .expect_err("a notebook is not the reader's to quote out of");
+        assert!(
+            matches!(err, AppError::NotAParticipant { .. }),
+            "and it refuses without naming anything: {err:?}"
+        );
+    });
+}

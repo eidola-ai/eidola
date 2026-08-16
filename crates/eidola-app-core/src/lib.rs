@@ -370,6 +370,13 @@ pub struct SpaceSettings {
     /// membership is structural, so no Remove may be offered beside it — an
     /// affordance that could only ever be refused.
     pub notebook_participant_id: Option<String>,
+    /// The agent that **owns this sub-space**, if it is one — the other
+    /// structural membership, carried for the same reason and read the same
+    /// way. It records who is answerable for the delegation, whose live-room
+    /// quota it counts against, and who its report goes to, so nothing can end
+    /// it and nothing can grant it back; a roster offering Remove beside that
+    /// row offers a press that can only bounce.
+    pub subspace_owner_participant_id: Option<String>,
 }
 
 impl Default for SpaceSettings {
@@ -378,6 +385,7 @@ impl Default for SpaceSettings {
             cascade_limit: DEFAULT_CASCADE_LIMIT,
             router_model: None,
             notebook_participant_id: None,
+            subspace_owner_participant_id: None,
         }
     }
 }
@@ -3024,11 +3032,33 @@ impl Inner {
                 ),
             });
         }
-        // Rule 1: only a participant of the referenced space may create a
-        // reference to it. Membership is the ACL (task 36), so the fix is an
-        // ordinary grant and a retry — no special machinery, no new concept.
-        // The refusal names nothing about that space (see `NotAParticipant`).
-        if !db::is_space_member(conn, &source_space_id, author_participant_id).await? {
+        // Rule 1, in the words it has always had: **you may quote what you can
+        // read.** So the question asked here is the read one
+        // (`db::may_read_space`), not bare membership — which is what it had
+        // drifted into, and what made the human read bypass incoherent: a
+        // reader can open the rooms their agents opened between themselves,
+        // and quoting a finding out of one into their own conversation is
+        // precisely the oversight the bypass exists for. Asking membership
+        // refused exactly that, deterministically, after the draft was already
+        // composed.
+        //
+        // **Widening it grants nothing new.** Quoting *copies* the excerpt to
+        // the new audience, and the premise is that this author can already
+        // read the passage — they could retype it. The link itself is not a
+        // capability; that is the doctrine's own sentence.
+        //
+        // **And it is author-kind-aware by construction**, so it cannot leak
+        // sideways: `may_read_space` widens for a *human* viewer and for
+        // nobody else, so an agent that is not a member still fails it. Today
+        // that is theoretical — the one caller is `post`, which hard-codes the
+        // shared human as author — but it means a future non-human caller
+        // inherits the membership rule rather than the bypass.
+        //
+        // **A notebook stays refused** by that function's own carve-out: an
+        // agent's private residence is the one space the human may not read,
+        // and so the one they may not quote. The refusal names nothing about
+        // the space either way (see `NotAParticipant`).
+        if !db::may_read_space(conn, &source_space_id, author_participant_id).await? {
             return Err(AppError::NotAParticipant {
                 participant_id: author_participant_id.to_string(),
                 action_id: spec.antecedent_action_id.clone(),
@@ -4247,6 +4277,7 @@ impl Inner {
             cascade_limit,
             router_model: db::space_router_model(&conn, space_id).await?,
             notebook_participant_id: db::notebook_participant_of(&conn, space_id).await?,
+            subspace_owner_participant_id: db::subspace_owner_of(&conn, space_id).await?,
         })
     }
 
