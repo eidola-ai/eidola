@@ -8,6 +8,66 @@ pub enum AppError {
     #[error("not configured: {message}")]
     NotConfigured { message: String },
 
+    /// A turn was asked for in a space that has been **archived**.
+    ///
+    /// Archival is what closes a conversation: the Library stops offering it,
+    /// and retiring an agent archives every room it owned. That has to mean
+    /// *no new work*, or a cascade planned a moment earlier goes on spending
+    /// in a room somebody closed — which matters most exactly where nobody is
+    /// watching, in a human-less sub-space of agents answering each other.
+    ///
+    /// **It stops future turns; it does not abort one already in flight.** A
+    /// turn that got past this gate finishes and persists — the request was
+    /// made, the tokens were spent, and dropping the answer would bill for
+    /// nothing — but its completion re-plans, and planning yields no turns in
+    /// an archived space. Nothing else changes: every membership stands, every
+    /// read still works, the transcript is whole.
+    #[error("this conversation is archived, so it takes no new turns")]
+    SpaceArchived { space_id: String },
+
+    /// The human tried to write into an agent-spawned sub-space they have not
+    /// joined.
+    ///
+    /// Reading one is unconditional (oversight — see `db::may_read_space`);
+    /// *acting* in one is membership, because the roster the models are shown
+    /// has to stay truthful about who is in the room, and because a turn driven
+    /// there spends the reader's credits. The two are not the same permission
+    /// and this is where they part. Raised by every door that acts as the human
+    /// — `post` (and `chat`/`chat_stream` through it), `edit_post`,
+    /// `regenerate`, `respond_stream` — before any write and before any spend.
+    ///
+    /// **Data, not prose.** It carries the `space_id` the caller already named,
+    /// so the surface that raises it can offer the join that would satisfy it,
+    /// and nothing else: the sentence a reader sees is chosen in their own
+    /// locale by the presentation layer (`space-error-not-joined`), and a
+    /// message carried from here would be a second source for it to drift
+    /// from. This `Display` is the log-shaped fallback every other variant has.
+    #[error("this conversation was opened between agents; joining it is what allows posting")]
+    NotJoined { space_id: String },
+
+    /// A post-level write was aimed at a kind of post it does not apply to:
+    /// editing something that is not the human's own input, or regenerating
+    /// something that is not an agent's inferred answer.
+    ///
+    /// Both writes claim a post's *item* — an edit appends a `user_input`
+    /// generation, a regeneration appends an `inference` one — so aimed at the
+    /// wrong kind they do not amend a post, they replace it with a different
+    /// kind of thing. Typed so a surface can withhold the affordance and say
+    /// why, rather than discovering it by writing.
+    #[error("{message}")]
+    WrongPostKind { message: String },
+
+    /// An agent's request to spawn a sub-space was refused — a guard, an
+    /// attenuation check, or an ineligible participant (see
+    /// [`crate::subspaces::SpawnRefusal`], which carries which and says so in
+    /// words a model can act on). Typed rather than a message so the tool that
+    /// exposes the door can render a refusal as a tool result the model
+    /// corrects, instead of failing a turn over it. Nothing was written.
+    #[error("{refusal}")]
+    SpawnRefused {
+        refusal: crate::subspaces::SpawnRefusal,
+    },
+
     /// An HTTP request failed at the transport layer.
     #[error("network error: {message}")]
     Network { message: String },

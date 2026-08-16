@@ -604,7 +604,8 @@ const STAMP_LEDGER: &[(&str, &str)] = &[
     ("update_space_title", "stamps in the same statement"),
     (
         "retire_participant_tx_body",
-        "archives the retired agent's notebook; stamps in the same statement",
+        "archives the retired agent's notebook and the sub-spaces it owned; \
+         stamps in the same statements",
     ),
     // -- births --
     (
@@ -619,6 +620,13 @@ const STAMP_LEDGER: &[(&str, &str)] = &[
     (
         "insert_space",
         "raw helper with no production caller (asserted below)",
+    ),
+    (
+        "spawn_subspace_tx_body",
+        "born stamped in the insert itself: an agent minted this sub-space \
+         deliberately, exactly as a promotion mints a notebook — and the same \
+         transaction writes its brief, so it has an action before it has \
+         existed for anyone",
     ),
     // -- participant + membership writes --
     (
@@ -701,11 +709,22 @@ fn the_stamp_ledger_covers_every_space_write() {
         false
     };
 
+    // Every form a declaration takes, longest first — the loop takes the first
+    // head that matches, and a form missing here credits the write to the
+    // function *above* it, which is a ledger entry that proves nothing about
+    // the write it names.
     let mut current_fn = "<file scope>";
     let mut found: std::collections::BTreeSet<&str> = Default::default();
     for line in production.lines() {
         let trimmed = line.trim_start();
-        for head in ["pub async fn ", "async fn ", "pub fn ", "fn "] {
+        for head in [
+            "pub(crate) async fn ",
+            "pub async fn ",
+            "async fn ",
+            "pub(crate) fn ",
+            "pub fn ",
+            "fn ",
+        ] {
             if let Some(rest) = trimmed.strip_prefix(head) {
                 let name: String = rest
                     .chars()
@@ -769,7 +788,14 @@ fn a_stamp_is_written_before_the_statements_it_covers() {
     let mut current = "<file scope>";
     for line in &lines {
         let trimmed = line.trim_start();
-        for head in ["pub async fn ", "async fn ", "pub fn ", "fn "] {
+        for head in [
+            "pub(crate) async fn ",
+            "pub async fn ",
+            "async fn ",
+            "pub(crate) fn ",
+            "pub fn ",
+            "fn ",
+        ] {
             if let Some(rest) = trimmed.strip_prefix(head) {
                 let name_len = rest
                     .chars()

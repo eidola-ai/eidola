@@ -257,6 +257,40 @@ CREATE UNIQUE INDEX idx_space_notebook_participant
     WHERE notebook_participant_id IS NOT NULL;
 
 -- ============================================================
+-- Space capabilities: the attenuation snapshot.
+--
+-- An agent-spawned sub-space (space.parent_space_id) holds the
+-- capabilities its spawner held in the parent at the moment of
+-- the spawn, and never more. The rows are written inside the
+-- spawning transaction and are immutable afterwards: a capability
+-- gained in the parent later does not reach a sub-space that
+-- already exists, and the remedy for a grant someone regrets is
+-- archiving the sub-space rather than editing this table.
+--
+-- Absence of a row IS absence of the capability, which is what
+-- makes "a sub-space holding a grant its spawner lacked" an
+-- invalid state checkable once, at mint, against data — rather
+-- than a rule every future consumer has to remember. A grant is
+-- COPIED from the parent's row, never composed by the requester,
+-- so `config` cannot be widened on the way down either.
+--
+-- The table is empty in practice today: nothing in the harness is
+-- gated on it yet (tool availability is fully derived from the
+-- registry, the backend probe and the participant's scope). The
+-- shape is the point — a future capability arrives as a `name` +
+-- `config` row flowing through the spawn-time check instead of as
+-- a new security surface.
+-- ============================================================
+CREATE TABLE space_capability (
+    space_id  TEXT NOT NULL REFERENCES space(id),
+    name      TEXT NOT NULL,
+    -- JSON, capability-specific; `{}` when the capability is a bare
+    -- grant with nothing to configure.
+    config    TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (space_id, name)
+);
+
+-- ============================================================
 -- Space template: a reusable blueprint for new spaces. A DB-backed
 -- registry (soft-remove, backend-registry style) so a config
 -- pointing at a removed template fails honestly and revives
@@ -457,6 +491,17 @@ CREATE TABLE action (
     action_type     TEXT NOT NULL CHECK (action_type IN (
                         'user_input',
                         'inference',
+                        -- A post an agent wrote directly rather than by
+                        -- inferring it: today the brief that opens an
+                        -- agent-spawned sub-space, written by the owning
+                        -- agent inside the spawning transaction. It is a
+                        -- POST (it renders, it is replied to, it notifies,
+                        -- it may be quoted) and it is neither of the two
+                        -- above: `user_input` would attribute it to a human
+                        -- on every surface that maps that type to the human
+                        -- role, and `inference` would claim a model call and
+                        -- a spend that never happened.
+                        'brief',
                         'tool_call',
                         'tool_result',
                         'retrieval',

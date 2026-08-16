@@ -6,7 +6,7 @@ Eidola is a privacy-preserving AI chat system: an OpenAI-compatible proxy server
 
 | Area | Doc |
 |---|---|
-| Shared app core (chat path, participants, wallet, local DB, local models, memory, tools) | `crates/eidola-app-core/AGENTS.md` |
+| Shared app core (chat path, participants, sub-spaces, wallet, local DB, local models, memory, tools) | `crates/eidola-app-core/AGENTS.md` |
 | Server (endpoints, env vars, billing, TEE integration, upstream trust) | `crates/eidola-server/AGENTS.md` |
 | GUI (gpui app: windows, theme, state doctrine, a11y, testing) | `crates/eidola-gui/AGENTS.md` + `crates/eidola-gui/STATE.md` |
 | Markdown editor widget | `crates/gpui-markdown-editor/AGENTS.md` |

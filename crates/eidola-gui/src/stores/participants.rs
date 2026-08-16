@@ -125,6 +125,23 @@ impl ParticipantsStore {
         );
     }
 
+    /// Test-only: fail a refresh **over whatever is cached** — the production
+    /// transition (`Loadable::resolve(Err(..))`), which keeps the prior
+    /// snapshot on screen. Distinct from [`Self::set_failed_for_test`], which
+    /// stages a failed *initial* load: the retained-prior state is the one
+    /// where a cell is answered and failing at the same time, and every
+    /// consumer that reads it through `value()` goes on showing the prior.
+    #[doc(hidden)]
+    pub fn fail_refresh_for_test(&mut self, space_id: &str, error: &str) {
+        let entry = self
+            .spaces
+            .entry(space_id.to_string())
+            .or_insert(Loadable::NotLoaded);
+        *entry = std::mem::take(entry).resolve(Err(eidola_app_core::error::AppError::Config {
+            message: error.to_string(),
+        }));
+    }
+
     pub fn list(&self, space_id: &str) -> &[ParticipantInfo] {
         self.participants(space_id)
             .value()
