@@ -12,7 +12,6 @@ use gpui::{
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::MarkdownEditor;
 
-use crate::loadable::Loadable;
 use crate::probe::Probe as _;
 
 use crate::overlay::{Contain as _, Overlay};
@@ -524,6 +523,20 @@ impl SpaceView {
     /// answered. Loading is [`Self::ensure_viewer_gate`]'s job; deciding is
     /// this one's, every frame.
     ///
+    /// **Known means `Loadable::value()`, the same read the rendering uses.**
+    /// A refresh that fails over a good snapshot resolves to `Failed { prior }`
+    /// and every consumer goes on showing the prior — `ParticipantsStore::list`,
+    /// which is what `space_agents` and so the Ask chips read, resolves through
+    /// `value()` for exactly that reason. A gate that instead asked for
+    /// `Loaded` called that state unknown, and its unknowns are not neutral: the
+    /// roster's answered "may act", so a failed refresh handed the verbs back
+    /// *over the very roster that proves the reader is not a member*, with the
+    /// chips rendering from that same retained list. Asking the one question
+    /// both sides ask is what makes them unable to disagree. It cuts the other
+    /// way on the second cell too, where the mismatch was merely wrong rather
+    /// than dangerous: a notebook whose settings refresh failed kept a prior
+    /// that says "notebook" and would have stayed suppressed on it.
+    ///
     /// **An unknown answers whichever way costs least, and that is not the same
     /// answer twice:**
     ///
@@ -542,9 +555,7 @@ impl SpaceView {
     ///   the whole reason the two unknowns answer differently.
     pub(crate) fn viewer_may_act(&self, cx: &gpui::App) -> bool {
         let id = self.space.read(cx).id();
-        let Loadable::Loaded { value: roster, .. } =
-            self.stores.participants.read(cx).participants(id)
-        else {
+        let Some(roster) = self.stores.participants.read(cx).participants(id).value() else {
             return true;
         };
         if roster
@@ -553,9 +564,9 @@ impl SpaceView {
         {
             return true;
         }
-        match self.stores.space_settings.read(cx).settings(id) {
-            Loadable::Loaded { value, .. } => value.notebook_participant_id.is_some(),
-            _ => false,
+        match self.stores.space_settings.read(cx).settings(id).value() {
+            Some(settings) => settings.notebook_participant_id.is_some(),
+            None => false,
         }
     }
 
@@ -566,9 +577,10 @@ impl SpaceView {
     /// is always a member — never loads it at all.
     pub(crate) fn ensure_viewer_gate(&mut self, cx: &mut Context<Self>) {
         let id = self.space.read(cx).id().to_string();
-        let Loadable::Loaded { value: roster, .. } =
-            self.stores.participants.read(cx).participants(&id)
-        else {
+        // The same read the verdict takes: a roster retained through a failed
+        // refresh is an answered roster, and if it lacks the reader the second
+        // cell is still the thing that would settle the question.
+        let Some(roster) = self.stores.participants.read(cx).participants(&id).value() else {
             return;
         };
         if roster

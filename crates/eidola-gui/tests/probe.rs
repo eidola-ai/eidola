@@ -6889,3 +6889,148 @@ fn the_acting_gates_cells_re_drive_its_loading() {
         );
     }
 }
+
+/// **A cell that is answered and failing is still answered.**
+///
+/// A refresh that fails over a good snapshot resolves to `Failed { prior }`,
+/// and every consumer goes on showing the prior — `ParticipantsStore::list`,
+/// which is what the Ask chips render from, reads through `Loadable::value()`
+/// for exactly that reason. A gate that asked instead for `Loaded` called that
+/// state unknown, and the roster's unknown means "may act": so a failed
+/// refresh handed the verbs back *over the very roster that proves the reader
+/// is not a member*, with the chips drawn from that same retained list.
+///
+/// The cure is that both sides ask `value()`, so they cannot disagree about
+/// whether the roster is known. This walks it on both cells, in both
+/// directions.
+#[gpui::test]
+fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+    });
+    let participants = stores.participants.clone();
+    let settings = stores.space_settings.clone();
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12.");
+    answer.action_type = "inference".into();
+    answer.model = Some("gemma4-31b".into());
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a1", cx));
+    });
+
+    let agent_roster = vec![eidola_app_core::ParticipantInfo {
+        id: "agent-a".into(),
+        scope: "global".into(),
+        source: "referenced".into(),
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+        model_ref: Some("gemma4-31b".into()),
+        system_prompt: None,
+        notify_policy: "all".into(),
+        role: "member".into(),
+        reference: None,
+    }];
+
+    // A roster without the reader, and an answered second cell: suppressed.
+    cx.update(|cx| {
+        participants.update(cx, |p, cx| {
+            p.seed_for_test("s", agent_roster.clone());
+            cx.notify();
+        });
+        settings.update(cx, |s, cx| {
+            s.seed_for_test("s", eidola_app_core::SpaceSettings::default());
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"space/band/add".to_string()),
+        "precondition: a watching reader has no door into Reply or Ask: {names:?}"
+    );
+
+    // **The roster's refresh now fails over that snapshot.** The chips would
+    // render from the retained list, so the gate has to keep reading it too.
+    cx.update(|cx| {
+        participants.update(cx, |p, cx| {
+            p.fail_refresh_for_test("s", "network");
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"space/band/add".to_string()),
+        "a roster kept through a failed refresh still proves the reader is not a member: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/post/0/regenerate".to_string()),
+        "and the per-post verbs stay with it: {names:?}"
+    );
+
+    // **The same rule on the other cell, in the other direction.** A notebook
+    // whose settings refresh fails keeps a prior that says "notebook" — and
+    // reading only `Loaded` there would suppress on it, which is wrong in the
+    // safe direction rather than the dangerous one, but wrong all the same.
+    cx.update(|cx| {
+        settings.update(cx, |s, cx| {
+            s.seed_for_test(
+                "s",
+                eidola_app_core::SpaceSettings {
+                    notebook_participant_id: Some("agent-a".into()),
+                    ..Default::default()
+                },
+            );
+            s.fail_refresh_for_test("s", "network");
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/band/add".to_string()),
+        "a notebook's retained settings still say notebook: {names:?}"
+    );
+
+    // And an ordinary room with a retained roster keeps everything.
+    cx.update(|cx| {
+        participants.update(cx, |p, cx| {
+            let mut with_human = agent_roster.clone();
+            with_human.push(eidola_app_core::ParticipantInfo {
+                id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                scope: "global".into(),
+                source: "referenced".into(),
+                kind: "human".into(),
+                label: "User".into(),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: "explicit".into(),
+                role: "owner".into(),
+                reference: None,
+            });
+            p.seed_for_test("s", with_human);
+            p.fail_refresh_for_test("s", "network");
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/0/regenerate".to_string())
+            && names.contains(&"space/band/add".to_string()),
+        "a member's verbs survive a failed refresh of the roster that names them: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
