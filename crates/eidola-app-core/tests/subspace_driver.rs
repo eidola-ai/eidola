@@ -1258,6 +1258,156 @@ fn a_wait_that_follows_no_failure_spends_nothing() {
     });
 }
 
+/// **A spent meter must not stand between a decided ending and its delivery.**
+/// Three failed walks against one last word close the room to further walking,
+/// correctly — each drove billed turns. But with the anchor unanswered every
+/// one of them held its report back, so the ending was decided and never told;
+/// and when the answer finally landed, the arm it raised met the spent meter
+/// and exited. The meter bounds *work*, and delivering a decision is not work.
+#[test]
+fn a_spent_meter_still_delivers_the_ending_its_work_decided() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], Some(&asked));
+
+        // The helper's turns fail at preparation — a backend that is not there
+        // — so each walk decides a failure and then has nowhere to report it.
+        core.runtime()
+            .block_on(core.update_space_participant(
+                helper,
+                ParticipantUpdate {
+                    model_ref: Some(Some("nowhere@missing".into())),
+                    ..ParticipantUpdate::default()
+                },
+                ExpectedScope::Global,
+            ))
+            .expect("point the helper at nothing");
+
+        for _ in 0..(MAX_ATTEMPTS_PER_TAIL + 2) {
+            drive(&core, &out.space.id).expect("a walk that ends in a wait is not an error");
+            assert!(
+                report(&core, &parent).is_none(),
+                "there is nowhere to report until the anchor is answered"
+            );
+        }
+
+        // The answer lands. The walking allowance is long spent — and the
+        // delegation still owes the parent its outcome.
+        let answer = ask(&core, &parent, &owner, &asked);
+        let requests = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("the ending is delivered");
+
+        let report = report(&core, &parent).expect("the failure is reported, not swallowed");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(answer.as_str()),
+            "beneath the answer it was holding out for"
+        );
+        assert!(
+            matches!(
+                report.references[0].delegation_end,
+                Some(DelegationEnd::TurnFailed { .. })
+            ),
+            "carrying the ending the spent work decided: {:?}",
+            report.references[0].delegation_end
+        );
+        assert_eq!(
+            mock.chat_bodies().len() - requests,
+            1,
+            "and it cost exactly the one report — no plan, no re-driven turn"
+        );
+
+        // Delivered once and done: the room is settled, not re-reported.
+        let after = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("a settled room is a no-op");
+        assert_eq!(mock.chat_bodies().len(), after);
+        assert_eq!(reports(&core, &parent).len(), 1);
+    });
+}
+
+/// **A walk that stops early still carries what arrived while it walked.** The
+/// refill used to belong to the concluding path alone, so a post landing during
+/// a walk that ran out of budget was on nobody's frontier and in nobody's
+/// leaves: the report named the driven tail, the room read as reported on that
+/// word, and the arrival sat there unserved *and* unquoted in a room nothing
+/// would walk again. It cannot be answered — that is what a spent budget means
+/// — but it can be reported, which is the difference between a question the
+/// owner can act on and one nobody ever sees.
+#[test]
+fn a_budget_stopped_walk_reports_what_arrived_while_it_walked() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        // Wide enough that the cascade guard never fires: the budget is what
+        // stops this walk.
+        core.runtime()
+            .block_on(core.set_space_cascade_limit(parent.clone(), 1_000))
+            .expect("cascade limit");
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let a = shared_agent(&core, &parent, "Surveyor");
+        let b = shared_agent(&core, &parent, "Pilot");
+        let out = spawn(&core, &parent, &owner, vec![a, b]);
+        let room = out.space.id.clone();
+        core.runtime()
+            .block_on(core.add_global_participant(
+                room.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("the reader joins the room they are watching");
+
+        // The reader's question lands after the walk has started driving.
+        let mut window = core.test_open_cascade_window();
+        let arrival = std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &room));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches its window");
+            let arrival = core
+                .runtime()
+                .block_on(core.post("But what about Friday?".into(), Some(room.clone())))
+                .expect("a post into the room")
+                .action_id;
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+            arrival
+        });
+
+        let report = report(&core, &parent).expect("a spent budget is reported");
+        assert_eq!(
+            report.references[0].delegation_end,
+            Some(DelegationEnd::BudgetSpent {
+                limit: MAX_DELEGATION_TURNS
+            }),
+            "the room stopped on its budget"
+        );
+        assert!(
+            report
+                .references
+                .iter()
+                .any(|r| r.antecedent_action_id == arrival),
+            "and the question that arrived while it walked is in the report, \
+             unanswered but not lost"
+        );
+
+        // And the room really is settled — nothing walks it again holding an
+        // invisible question.
+        assert!(
+            core.runtime()
+                .block_on(core.get_space_tree(room.clone()))
+                .expect("tree")
+                .iter()
+                .any(|n| n.action_id == arrival),
+            "the arrival is a post of the room like any other"
+        );
+    });
+}
+
 /// A quoted passage is attributed by the space it was written in, and that has
 /// to survive the author being retired between saying it and its being
 /// reported — the record retirement promises to leave alone.
