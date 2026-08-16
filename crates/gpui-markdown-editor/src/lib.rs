@@ -19,6 +19,7 @@ pub mod element;
 pub mod embed;
 pub mod escapes;
 pub mod event;
+pub mod formatting;
 pub mod highlight;
 pub mod image;
 pub mod math;
@@ -36,11 +37,12 @@ pub use editor::{
     DeleteWordBackward, DeleteWordForward, DocumentEnd, DocumentStart, Down, EditorCommand,
     EmbedChromeCounts, End, Enter, Home, Left, MarkdownEditor, MarkdownEditorState, Paste,
     PastePlain, Redo, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown, ShiftEnd,
-    ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft, ShiftWordRight, Tab, Undo,
-    Up, WordLeft, WordRight, init,
+    ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft, ShiftWordRight, Tab,
+    ToggleBold, ToggleItalic, Undo, Up, WordLeft, WordRight, init,
 };
 pub use embed::{EmbedMap, embed_marker, parse_embed_text};
 pub use event::{EditorEvent, MarkdownEditorEvent};
+pub use formatting::InlineFormat;
 pub use highlight::HighlightSet;
 pub use parser::parse;
 pub use render::render;
