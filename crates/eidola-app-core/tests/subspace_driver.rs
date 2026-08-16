@@ -1635,6 +1635,83 @@ fn regenerating_a_report_keeps_its_finding_and_its_ending() {
     });
 }
 
+/// **A failed regeneration must not settle the room.** Regenerating a report
+/// against a failing upstream persists a **current `status = 'error'`**
+/// generation carrying the report's replicated edges, and the transcript hides
+/// it — so the parent shows no report, while a lifecycle read that counted any
+/// current edge kept the room settled: durably, across restarts, the paid
+/// result never recreated. Settlement reads by the transcript's own
+/// visibility predicate, so a report the parent cannot show does not settle
+/// anything.
+#[test]
+fn a_failed_regeneration_does_not_settle_the_room() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+        drive(&core, &out.space.id).expect("the room is driven");
+        let delivered = report(&core, &parent).expect("the delegation is reported");
+
+        // A second upstream that only fails, and the owner pointed at it.
+        let broken = core.runtime().block_on(chat_harness::start(MockConfig {
+            chat: ChatBehavior::Non2xx(500),
+            ..MockConfig::default()
+        }));
+        core.runtime()
+            .block_on(core.add_backend(eidola_app_core::NewBackend {
+                id: "ext2".into(),
+                kind: eidola_app_core::BackendKind::OpenAi,
+                display_name: String::new(),
+                base_url: Some(broken.base_url.clone()),
+                api_key: None,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+            }))
+            .expect("add the failing backend");
+        core.runtime()
+            .block_on(core.update_space_participant(
+                owner.clone(),
+                ParticipantUpdate {
+                    model_ref: Some(Some("qwen3-8b@ext2".into())),
+                    ..ParticipantUpdate::default()
+                },
+                ExpectedScope::Global,
+            ))
+            .expect("point the owner at it");
+        core.runtime()
+            .block_on(core.regenerate(delivered.action_id.clone(), "qwen3-8b@ext2".into()))
+            .expect_err("the regeneration fails upstream");
+        assert!(
+            reports(&core, &parent).is_empty(),
+            "the error generation is current, so the parent shows no report"
+        );
+
+        // Pointed back at a working upstream, the next walk re-reports: the
+        // room's last word is quoted by nothing the parent shows, so the
+        // delegation is outstanding again.
+        core.runtime()
+            .block_on(core.update_space_participant(
+                owner,
+                ParticipantUpdate {
+                    model_ref: Some(Some(MODEL.to_string())),
+                    ..ParticipantUpdate::default()
+                },
+                ExpectedScope::Global,
+            ))
+            .expect("point the owner back");
+        drive(&core, &out.space.id).expect("the room is re-walked");
+        assert_eq!(
+            reports(&core, &parent).len(),
+            1,
+            "the paid result is recreated rather than lost behind a hidden error"
+        );
+    });
+}
+
 /// **A replicated attachment is not asked for permission, and is still asked
 /// what it may quote.** The two are different questions: quoting copies, so
 /// re-asking permission at a re-wording would rewrite history — but *what may

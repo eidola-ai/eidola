@@ -5070,59 +5070,34 @@ impl Inner {
             }
         }
 
-        // Edits are the human's — recorded against the shared "User" participant.
-        let user_participant_id = db::HUMAN_PARTICIPANT_ID.to_string();
+        // The surviving references, replicated at their original ordinals
+        // (stable across generations — see `ReferenceSpec`'s ordinal
+        // convention).
+        let surviving: Vec<db::ReferenceEdgeRow> = tip_references
+            .into_iter()
+            .filter(|r| !remove_references.contains(&r.ordinal))
+            .collect();
 
+        // One transaction, like `post`: the new generation supersedes the tip
+        // the moment its row lands, so written piecewise the item's current
+        // generation would say nothing until the tail of writes caught up.
         let new_action_id = Uuid::now_v7().to_string();
-        db::insert_action(
+        db::edit_post_tx(
             &db_conn,
-            &db::ActionEntry {
-                id: new_action_id.clone(),
-                space_id: space_id.clone(),
-                participant_id: user_participant_id,
-                item_id: item_id.clone(),
-                supersedes_action_id: Some(tip),
-                action_type: "user_input".to_string(),
-                status: "complete".to_string(),
-                intent: None,
-                model: None,
-                input_tokens: None,
-                output_tokens: None,
-                credits_consumed: None,
+            &db::EditPostPlan {
+                space_id: &space_id,
+                // Edits are the human's — the shared "User" participant.
+                participant_id: db::HUMAN_PARTICIPANT_ID,
+                action_id: &new_action_id,
+                item_id: &item_id,
+                supersedes_action_id: &tip,
+                text: new_prompt,
+                reply_to: reply_parent.as_deref(),
+                references: &surviving,
                 created_at: now,
             },
         )
         .await?;
-        db::insert_text_content_block(
-            &db_conn,
-            &Uuid::now_v7().to_string(),
-            &new_action_id,
-            0,
-            "text",
-            new_prompt,
-        )
-        .await?;
-        if let Some(ref ante) = reply_parent {
-            db::insert_action_antecedent(&db_conn, &new_action_id, ante, 0, "reply").await?;
-        }
-        // Replicate surviving references at their original ordinals (stable
-        // across generations — see `ReferenceSpec`'s ordinal convention).
-        for r in &tip_references {
-            if remove_references.contains(&r.ordinal) {
-                continue;
-            }
-            db::insert_reference_antecedent(
-                &db_conn,
-                &new_action_id,
-                &r.antecedent_action_id,
-                r.ordinal,
-                r.content_block_id.as_deref(),
-                r.range_start,
-                r.range_end,
-                r.annotation.as_deref(),
-            )
-            .await?;
-        }
 
         // Content changed (Space), and the listing's snippet / last-activity may
         // change (SpaceIndex). message_count does NOT change — list_spaces counts
@@ -11024,8 +10999,63 @@ impl TurnPrep {
     /// process — and is deliberately excluded from every context query
     /// (`db::get_upstream_context` / `db::get_space_actions_for_context` join
     /// only `text` blocks), so persisting it never changes what a model reads.
+    ///
+    /// **One transaction**, the `db::post_tx` cure for the `db::post_tx`
+    /// defect: the inference row lands with a terminal status, so written
+    /// piecewise the post exists and says nothing for as long as its text and
+    /// edges take — a state every reader keyed on the action is entitled to,
+    /// and one of them acts on it (the sub-space driver's refill takes posts
+    /// by commit order, so it could plan and bill a turn against a blank
+    /// reply). Everything here is a local adjacent write — the upstream call
+    /// is long over — and this prep's connection is the turn's own, so
+    /// nothing else can join the transaction.
     #[allow(clippy::too_many_arguments)]
     async fn persist_turn(
+        &self,
+        action_status: &str,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        reasoning: &str,
+        content: &str,
+        request_body_json: &serde_json::Value,
+        request_at: i64,
+        response_at: i64,
+        http_status: u16,
+        response_body: Vec<u8>,
+    ) -> Result<String, AppError> {
+        db::begin_write(&self.db_conn).await?;
+        let persisted = self
+            .persist_turn_body(
+                action_status,
+                input_tokens,
+                output_tokens,
+                reasoning,
+                content,
+                request_body_json,
+                request_at,
+                response_at,
+                http_status,
+                response_body,
+            )
+            .await;
+        match persisted {
+            Ok(id) => {
+                self.db_conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map_err(AppError::db)?;
+                Ok(id)
+            }
+            Err(e) => {
+                // Best-effort rollback; propagate the original error regardless.
+                let _ = self.db_conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_turn_body(
         &self,
         action_status: &str,
         input_tokens: Option<i64>,

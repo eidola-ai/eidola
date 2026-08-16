@@ -242,7 +242,7 @@ pub async fn open(data_dir: &Path) -> Result<Database, AppError> {
 /// the winner's committed state and decides against *that*, which is what the
 /// grant's promote-or-join branch (and #279's promote / retire / remove
 /// guards) were always meant to do (Codex review, PR #280).
-async fn begin_write(conn: &Connection) -> Result<(), AppError> {
+pub(crate) async fn begin_write(conn: &Connection) -> Result<(), AppError> {
     conn.execute("BEGIN IMMEDIATE", ())
         .await
         .map_err(AppError::db)?;
@@ -1872,27 +1872,38 @@ pub async fn first_quotable_block(
 /// somebody posts into the room, and identical after a restart. A status column
 /// would have to be written, kept in step with continuation, and believed.
 ///
-/// **Only a current generation answers it**, because the question is really
-/// "does the parent show this?" — and a superseded generation shows nobody
-/// anything. A report that was regenerated carries its edges forward
-/// (`prepare_turn`'s replication, the rule `edit_post` has always followed), so
-/// the tip answers yes and nothing changes; the join is what makes the driver's
-/// belief and the reader's footnote the same fact rather than two that can
-/// drift, and it errs toward reporting again rather than toward silence.
+/// **Only a generation the parent actually shows answers it.** Current,
+/// because a superseded generation shows nobody anything — and in a terminal
+/// status and a post type, the same predicate `get_space_tree_data` renders
+/// by, because "current" alone is not "visible": a report regenerated against
+/// a failing upstream persists a **current `status = 'error'`** generation
+/// carrying the report's replicated edges (`persist_turn`), which the
+/// transcript hides — counting that edge would settle the room on a report
+/// the parent cannot show, durably and across restarts. A report regenerated
+/// *successfully* carries its edges forward (`prepare_turn`'s replication, the
+/// rule `edit_post` has always followed), so the tip answers yes and nothing
+/// changes; the join is what makes the driver's belief and the reader's
+/// footnote the same fact rather than two that can drift, and it errs toward
+/// reporting again rather than toward silence.
 pub async fn has_reference_from(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
     antecedent_action_id: &str,
 ) -> Result<bool, AppError> {
+    let sql = format!(
+        "SELECT 1 FROM action_antecedent aa \
+         JOIN action a ON a.id = aa.action_id \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         WHERE aa.relation = 'reference' AND aa.antecedent_action_id = ?1 \
+           AND a.space_id = ?2 AND a.participant_id = ?3 \
+           AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         LIMIT 1"
+    );
     let mut rows = conn
         .query(
-            "SELECT 1 FROM action_antecedent aa \
-             JOIN action a ON a.id = aa.action_id \
-             JOIN item_current ic ON ic.current_action_id = a.id \
-             WHERE aa.relation = 'reference' AND aa.antecedent_action_id = ?1 \
-               AND a.space_id = ?2 AND a.participant_id = ?3 \
-             LIMIT 1",
+            &sql,
             (
                 Value::Text(antecedent_action_id.to_string()),
                 Value::Text(space_id.to_string()),
@@ -5334,6 +5345,103 @@ async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, Ap
     Ok(auto_titled)
 }
 
+/// Everything an edit writes, validated by the caller before this is opened.
+/// See [`edit_post_tx`].
+pub(crate) struct EditPostPlan<'a> {
+    pub space_id: &'a str,
+    pub participant_id: &'a str,
+    /// The new generation's id.
+    pub action_id: &'a str,
+    pub item_id: &'a str,
+    /// The current tip this edit supersedes.
+    pub supersedes_action_id: &'a str,
+    pub text: &'a str,
+    /// The tip's reply edge, replicated.
+    pub reply_to: Option<&'a str>,
+    /// The surviving reference edges, replicated **at their original
+    /// ordinals** (stable across generations — see `ReferenceSpec`'s ordinal
+    /// convention).
+    pub references: &'a [ReferenceEdgeRow],
+    pub created_at: i64,
+}
+
+/// Append an edit — the new `user_input` generation, its text, its reply edge
+/// and its surviving references — **in one `BEGIN IMMEDIATE` transaction.**
+///
+/// The same cure, for the same defect, as [`post_tx`]: a post is not its
+/// action row, and an edit is sharper still — its new row *supersedes* the
+/// tip, so written as separate autocommitted statements the item's current
+/// generation says nothing for as long as the tail of writes takes, and a
+/// reader keyed on the action (the sub-space driver's refill takes posts by
+/// commit order) is entitled to that state and can plan and bill against it.
+/// Nothing here spends or calls out; the caller validates before it opens
+/// this, so a refused edit still writes nothing and cannot half-write either.
+pub(crate) async fn edit_post_tx(
+    conn: &Connection,
+    plan: &EditPostPlan<'_>,
+) -> Result<(), AppError> {
+    begin_write(conn).await?;
+    match edit_post_tx_body(conn, plan).await {
+        Ok(()) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn edit_post_tx_body(conn: &Connection, plan: &EditPostPlan<'_>) -> Result<(), AppError> {
+    insert_action(
+        conn,
+        &ActionEntry {
+            id: plan.action_id.to_string(),
+            space_id: plan.space_id.to_string(),
+            participant_id: plan.participant_id.to_string(),
+            item_id: plan.item_id.to_string(),
+            supersedes_action_id: Some(plan.supersedes_action_id.to_string()),
+            action_type: "user_input".to_string(),
+            status: "complete".to_string(),
+            intent: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            credits_consumed: None,
+            created_at: plan.created_at,
+        },
+    )
+    .await?;
+    insert_text_content_block(
+        conn,
+        &uuid::Uuid::now_v7().to_string(),
+        plan.action_id,
+        0,
+        "text",
+        plan.text,
+    )
+    .await?;
+    if let Some(ante) = plan.reply_to {
+        insert_action_antecedent(conn, plan.action_id, ante, 0, "reply").await?;
+    }
+    for r in plan.references {
+        insert_reference_antecedent(
+            conn,
+            plan.action_id,
+            &r.antecedent_action_id,
+            r.ordinal,
+            r.content_block_id.as_deref(),
+            r.range_start,
+            r.range_end,
+            r.annotation.as_deref(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
@@ -8713,6 +8821,93 @@ mod tests {
             reply_antecedent(&conn, &good).await.unwrap().as_deref(),
             Some(first.as_str()),
             "and so is its place in the thread"
+        );
+    }
+
+    /// **An edit lands whole or not at all — and an edit is the sharper case.**
+    /// Its new row *supersedes* the tip the moment it lands, so written as
+    /// separate autocommitted statements the item's **current** generation
+    /// said nothing for as long as the tail of writes took — the same window
+    /// [`a_post_is_written_whole_or_not_at_all`] closes, opened over a post
+    /// that already had words.
+    #[tokio::test]
+    async fn an_edit_lands_whole_or_not_at_all() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let first = add_user_action(&conn, "room", &user, "the ask", 2_000).await;
+        let (item_id, _) = action_item_and_space(&conn, &first).await.unwrap().unwrap();
+
+        // An edit whose *last* write cannot land: a replicated reference names
+        // an action that does not exist, which the foreign key refuses. The
+        // new generation and its text are already written when that happens.
+        let doomed = uuid::Uuid::now_v7().to_string();
+        let err = edit_post_tx(
+            &conn,
+            &EditPostPlan {
+                space_id: "room",
+                participant_id: &user,
+                action_id: &doomed,
+                item_id: &item_id,
+                supersedes_action_id: &first,
+                text: "about that",
+                reply_to: None,
+                references: &[ReferenceEdgeRow {
+                    ordinal: 1,
+                    antecedent_action_id: "no-such-action".into(),
+                    content_block_id: None,
+                    range_start: None,
+                    range_end: None,
+                    annotation: None,
+                    block_text: None,
+                    antecedent_action_type: "user_input".into(),
+                    antecedent_author_label: "User".into(),
+                    block_type: None,
+                }],
+                created_at: 3_000,
+            },
+        )
+        .await
+        .expect_err("a reference to an action that does not exist cannot be written");
+        assert!(matches!(err, AppError::Database { .. }), "{err:?}");
+
+        assert_eq!(
+            current_tip_of_item(&conn, "room", &item_id).await.unwrap(),
+            Some(first.clone()),
+            "the tip is untouched — no current generation with no words"
+        );
+        assert!(
+            first_content_block(&conn, &doomed).await.unwrap().is_none(),
+            "and no orphaned text block"
+        );
+
+        // The same edit, written whole: the tip moves in one event.
+        let good = uuid::Uuid::now_v7().to_string();
+        edit_post_tx(
+            &conn,
+            &EditPostPlan {
+                space_id: "room",
+                participant_id: &user,
+                action_id: &good,
+                item_id: &item_id,
+                supersedes_action_id: &first,
+                text: "about that",
+                reply_to: None,
+                references: &[],
+                created_at: 3_000,
+            },
+        )
+        .await
+        .expect("a valid edit lands");
+        assert_eq!(
+            current_tip_of_item(&conn, "room", &item_id).await.unwrap(),
+            Some(good),
+            "the edit is the current generation, words and all"
         );
     }
 
