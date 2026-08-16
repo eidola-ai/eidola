@@ -2243,6 +2243,21 @@ async fn spawn_subspace_tx_body(
         }
     }
 
+    // (2c) somewhere for the report to land. **Refused here rather than
+    // discovered there**, because the asymmetry is total: a refused spawn costs
+    // nothing at all, while a delegation that runs its turns and then finds no
+    // post to reply to has spent real money on work nobody will ever be told
+    // about. An anchor is itself such a post (guard 2b proved it), so this only
+    // ever bites a caller with no turn behind it opening a delegation from a
+    // conversation where nothing has been said.
+    if plan.parent_action_id.is_none()
+        && last_action_in_space(conn, plan.parent_space_id)
+            .await?
+            .is_none()
+    {
+        refuse!(SpawnRefusal::NothingToReportTo);
+    }
+
     // (3) depth.
     let depth = space_depth(conn, plan.parent_space_id).await? + 1;
     if depth > MAX_SPAWN_DEPTH {
@@ -7012,6 +7027,36 @@ pub async fn get_space_tree_data(
 }
 
 /// Returns the ID of the last terminal action in a space (for antecedent linking).
+/// Every **post** in `space_id` written at or after `since`, oldest first.
+///
+/// What a turn driver asks at the end of a walk to find the posts that arrived
+/// while it was walking: subtract the ones it served itself and what is left is
+/// somebody else's, still unanswered. Ordered oldest first so they are taken up
+/// in the order they were written.
+pub async fn posts_in_space_since(
+    conn: &Connection,
+    space_id: &str,
+    since: i64,
+) -> Result<Vec<String>, AppError> {
+    let sql = format!(
+        "SELECT id FROM action \
+         WHERE space_id = ?1 AND created_at >= ?2 \
+           AND status IN ('complete', 'cancelled') \
+           AND action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY created_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string()), Value::Integer(since)])
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(out)
+}
+
 pub async fn last_action_in_space(
     conn: &Connection,
     space_id: &str,

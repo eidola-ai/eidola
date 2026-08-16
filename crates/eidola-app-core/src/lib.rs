@@ -1570,6 +1570,15 @@ struct Inner {
     #[cfg(feature = "test-support")]
     anchor_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **inside a walk**, once, after its first driven
+    /// turn. The interleaving that matters there is a post arriving in the room
+    /// while the driver is working in it, early enough that the driver writes
+    /// something newer afterwards — which is precisely what makes it invisible
+    /// to any later look at "the tail". Same shape and same reason as
+    /// [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    cascade_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
@@ -7941,6 +7950,8 @@ impl AppCore {
                 awaiting_anchor: Mutex::new(std::collections::HashMap::new()),
                 #[cfg(feature = "test-support")]
                 anchor_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                cascade_window: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 summary_gate: tokio::sync::Mutex::new(()),
                 summary_triggers: Mutex::new(std::collections::HashMap::new()),
@@ -9130,6 +9141,22 @@ impl AppCore {
             .anchor_window
             .lock()
             .expect("anchor window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: stop the next walk once inside its cascade, after its
+    /// first driven turn (see `Inner::cascade_window`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_cascade_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .cascade_window
+            .lock()
+            .expect("cascade window lock poisoned") = Some(tx);
         rx
     }
 

@@ -457,6 +457,55 @@ fn a_report_into_an_archived_parent_is_refused_and_stays_outstanding() {
     });
 }
 
+/// **A post that arrives while the driver is working gets its turn.** It is on
+/// nobody's frontier — the walk never saw it — and by the time the walk ends a
+/// driven turn has very likely written something newer, so re-deriving "the
+/// tail" would look straight past it: the report would name the driven tail,
+/// the room would read as reported, and the question would sit there answered
+/// by nobody. Staged exactly: the walk is stopped after its first driven turn
+/// and the post is committed there.
+#[test]
+fn a_post_arriving_mid_walk_is_not_walked_past() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        let mut window = core.test_open_cascade_window();
+        let outsider = std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &out.space.id));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches the cascade window");
+            // Somebody asks a question in the room, mid-walk. Driven turns will
+            // write newer posts after this one, which is what hides it.
+            let brief = out.brief_action_id.clone();
+            let outsider = ask(&core, &out.space.id, &owner, &brief);
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+            outsider
+        });
+
+        // It was planned off: something in the room replies to it.
+        let room = tree(&core, &out.space.id);
+        assert!(
+            room.iter()
+                .any(|n| n.parent_action_id.as_deref() == Some(outsider.as_str())),
+            "the post that arrived mid-walk was answered: {:?}",
+            room.iter()
+                .map(|n| (n.action_id.clone(), n.parent_action_id.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report(&core, &parent).is_some(),
+            "and the delegation still reported"
+        );
+    });
+}
+
 // ===========================================================================
 // Where the report attaches
 // ===========================================================================
@@ -503,11 +552,9 @@ fn a_report_attaches_beneath_the_owners_answer_to_the_post_it_was_asked_on() {
 
 /// **A delegation whose spawning turn has not answered yet waits**, rather than
 /// planting its report as the first reply and leaving the agent's own answer
-/// indented beneath it. It waits once, and a walk armed by the startup sweep
-/// never waits at all — a process that has just started cannot be waiting on a
-/// turn of its own.
+/// indented beneath it.
 #[test]
-fn a_report_waits_for_the_answer_it_belongs_under_and_never_waits_twice() {
+fn a_report_waits_for_the_answer_it_belongs_under() {
     run(|| {
         let (_mock, core, _dir) = setup();
         let parent = parent_with_a_post(&core);
@@ -574,6 +621,50 @@ fn an_answer_landing_inside_the_anchor_window_is_not_lost() {
             report.parent_action_id.as_deref(),
             Some(answer.as_str()),
             "and beneath the answer that landed in the window"
+        );
+    });
+}
+
+/// **An unrelated wake does not spend the wait.** The room is registered
+/// against its *parent*, and a parent is an ordinary conversation where
+/// anything at all can happen — so a wait that gave up on the first wake would
+/// attach the report to the anchor because somebody said something else, and
+/// the real answer, landing a moment later, would become the report's sibling
+/// instead of the post it belongs under.
+#[test]
+fn an_unrelated_post_in_the_parent_does_not_spend_the_wait() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        drive(&core, &out.space.id).expect("the room is driven");
+        assert!(report(&core, &parent).is_none(), "it waits");
+
+        // Something unrelated happens in the parent, twice, and wakes the room
+        // both times. The answer it is waiting for is still not there.
+        for line in ["Meanwhile:", "And another thing:"] {
+            core.runtime()
+                .block_on(core.post(line.into(), Some(parent.clone())))
+                .expect("post");
+            drive(&core, &out.space.id).expect("the room is woken");
+            assert!(
+                report(&core, &parent).is_none(),
+                "an unrelated post is not the answer, so the wait stands"
+            );
+        }
+
+        // The answer arrives, and only then does it report — beneath it.
+        let answer = ask(&core, &parent, &owner, &asked);
+        drive(&core, &out.space.id).expect("the room reports");
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(answer.as_str()),
+            "beneath the answer, not beside it"
         );
     });
 }
@@ -1004,6 +1095,54 @@ fn a_room_that_keeps_failing_is_not_retried_forever() {
         // here, because a post into the room needs a turn and the upstream is
         // what is down. `a_spent_budget_survives_a_restart` walks that arm on a
         // healthy upstream.
+    });
+}
+
+/// **A report that fails with nothing else going on retries itself.** Most
+/// failures are re-armed for free by the turn that failed writing into the room
+/// — but a room that drives nothing writes nothing, so nothing announces
+/// anything, and a report that failed there would leave the delegation
+/// unreported with no event left in the world to pick it up. An owner-only room
+/// is exactly that shape: its plan is empty from the first post.
+#[test]
+fn a_failed_report_with_no_turn_behind_it_still_tries_again() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::Non2xx(500),
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        core.start_subspace_driver();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        // No helpers: the room's plan is empty from the brief onwards, so it
+        // drives nothing and writes nothing.
+        let out = spawn(&core, &parent, &owner, vec![]);
+
+        let reports_attempted = |core: &AppCore| {
+            let _ = core;
+            mock.chat_bodies()
+                .iter()
+                .filter(|b| {
+                    flat_messages(b)
+                        .iter()
+                        .any(|(_, c)| c.contains("Attached to your reply"))
+                })
+                .count()
+        };
+        // One walk is two requests (a 500 costs the tool-capability degrade its
+        // one retry), so anything past two is a walk that armed itself.
+        wait_until(&core, || reports_attempted(&core) > 2);
+        let settled = reports_attempted(&core);
+        assert!(
+            settled <= 2 * MAX_ATTEMPTS_PER_TAIL as usize,
+            "and it is bounded by the meter: {settled} attempts"
+        );
+        assert_eq!(
+            tree(&core, &out.space.id).len(),
+            1,
+            "the room drove nothing"
+        );
     });
 }
 
