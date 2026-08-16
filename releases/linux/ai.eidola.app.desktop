@@ -4,9 +4,11 @@
 # the shell, icon, dock pinning).
 #
 # The Icon key names a themed icon shipped beside this file as
-# icons/hicolor/{scalable,48x48,128x128,256x256}/apps/ai.eidola.app.{svg,png},
-# installed to share/icons/ by the Nix artifact. Generated from the vector
-# master by `just update-brand` — see brand/AGENTS.md.
+# icons/hicolor/{scalable,symbolic,48x48,128x128,256x256}/apps/ai.eidola.app{,-symbolic}.{svg,png},
+# installed to share/icons/ by the Nix artifact. The scalable SVG follows
+# prefers-color-scheme; the symbolic SVG is the bare mark in currentColor;
+# the PNGs are the light flattened tile. Generated from the vector master
+# by `just update-brand` — see brand/AGENTS.md.
 [Desktop Entry]
 Type=Application
 Name=Eidola
