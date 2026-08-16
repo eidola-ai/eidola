@@ -164,6 +164,18 @@ pub(crate) enum Report {
 pub(crate) struct Walk {
     tail: String,
     attempts: u32,
+    /// **An ending this room reached and could not deliver.** A walk decides an
+    /// outcome and then reports it, and the report can be held back — the owner
+    /// has not answered the post the delegation was opened from yet, so the
+    /// report has nowhere to sit. The decision is not re-derivable afterwards
+    /// (a failed turn leaves nothing durable saying it failed), so it is kept
+    /// here, beside the meter, keyed on the same last word: while the room's
+    /// last word is unchanged the ending is still true of it, and the moment
+    /// anything is posted the key changes and this goes with it.
+    ///
+    /// It is what lets a room whose *work* allowance is spent still deliver
+    /// what that work already decided — see [`Inner::drive_subspace`].
+    decided: Option<(DelegationEnd, Vec<String>)>,
 }
 
 /// The per-room walk ledger: room id → what has been tried against its current
@@ -745,11 +757,6 @@ impl Inner {
         match walks.get_mut(space_id) {
             Some(walk) if walk.tail == tail => {
                 if walk.attempts >= MAX_ATTEMPTS_PER_TAIL {
-                    eprintln!(
-                        "warning: the delegated conversation {space_id} has been tried \
-                         {MAX_ATTEMPTS_PER_TAIL} times against the same last post and is being \
-                         left alone; a post there, or a restart, will pick it up again"
-                    );
                     return false;
                 }
                 walk.attempts += 1;
@@ -760,11 +767,50 @@ impl Inner {
                     Walk {
                         tail: tail.to_string(),
                         attempts: 1,
+                        decided: None,
                     },
                 );
             }
         }
         true
+    }
+
+    /// Keep an ending this walk decided but could not deliver, against the last
+    /// word it was decided about (see [`Walk::decided`]).
+    fn remember_ending(&self, space_id: &str, tail: &str, end: DelegationEnd, leaves: &[String]) {
+        let mut walks = self.subspace_walks.lock().expect("walk map poisoned");
+        if let Some(walk) = walks.get_mut(space_id)
+            && walk.tail == tail
+        {
+            walk.decided = Some((end, leaves.to_vec()));
+        }
+    }
+
+    /// The ending this room already reached against `tail`, if one is waiting
+    /// to be delivered.
+    fn remembered_ending(
+        &self,
+        space_id: &str,
+        tail: &str,
+    ) -> Option<(DelegationEnd, Vec<String>)> {
+        let walks = self.subspace_walks.lock().expect("walk map poisoned");
+        walks
+            .get(space_id)
+            .filter(|walk| walk.tail == tail)
+            .and_then(|walk| walk.decided.clone())
+    }
+
+    /// Drop a remembered ending: it was delivered, or the attempt to deliver it
+    /// failed. **A failed delivery forgets**, which is what bounds delivery to
+    /// the work that earned it: the next pass finds nothing to deliver and
+    /// meets the work meter, which is spent.
+    fn forget_ending(&self, space_id: &str, tail: &str) {
+        let mut walks = self.subspace_walks.lock().expect("walk map poisoned");
+        if let Some(walk) = walks.get_mut(space_id)
+            && walk.tail == tail
+        {
+            walk.decided = None;
+        }
     }
 
     /// Give back the attempt a walk claimed, when it turns out not to have been
@@ -840,19 +886,48 @@ impl Inner {
         drop(conn);
         // Asked *after* the outstanding check, so a settled room costs no
         // attempt and a room that is genuinely stuck cannot spend forever.
-        if !self.claim_walk(&space_id, &tail) {
-            return Ok(());
-        }
-
-        // Boxed, like every other await on the turn path: `run_turn_stream`'s
-        // state machine is the largest in the crate, and stacking this walk's
-        // frame on top of it overflows a worker stack.
-        let Some((end, leaves)) =
-            Box::pin(self.cascade_subspace(&space_id, tail.clone(), since_row)).await?
-        else {
-            self.end_anchor_wait(&space_id);
-            return Ok(()); // the room closed under us; nothing to report
+        //
+        // **The meter bounds work, and delivering a decision is not work.** A
+        // walk that failed keeps its claim, so three failures against one last
+        // word close the room to further walking — correctly, because each one
+        // drove billed turns. But the ending those walks decided may still be
+        // undelivered: with the anchor unanswered, every one of them held its
+        // report back. When the answer finally lands, the arm it raises used to
+        // meet the spent meter and exit, and the failure the parent was owed
+        // was never told — the notification the meter exists to protect,
+        // refused by the meter itself. So a refused walk asks whether an ending
+        // is waiting to go out (see [`Walk::decided`]) and, if one is, delivers
+        // it: no plan, no turn, no re-derivation — the pass costs exactly the
+        // one report the delegation has owed all along. Delivery cannot loop,
+        // because a failed delivery forgets the ending and the next pass meets
+        // the same spent meter with nothing to deliver.
+        let claimed = self.claim_walk(&space_id, &tail);
+        let walked = if claimed {
+            // Boxed, like every other await on the turn path:
+            // `run_turn_stream`'s state machine is the largest in the crate,
+            // and stacking this walk's frame on top of it overflows a worker
+            // stack.
+            match Box::pin(self.cascade_subspace(&space_id, tail.clone(), since_row)).await? {
+                Some(walked) => walked,
+                None => {
+                    self.end_anchor_wait(&space_id);
+                    return Ok(()); // the room closed under us; nothing to report
+                }
+            }
+        } else {
+            match self.remembered_ending(&space_id, &tail) {
+                Some(decided) => decided,
+                None => {
+                    eprintln!(
+                        "warning: the delegated conversation {space_id} has been tried \
+                         {MAX_ATTEMPTS_PER_TAIL} times against the same last post and is being \
+                         left alone; a post there, or a restart, will pick it up again"
+                    );
+                    return Ok(());
+                }
+            }
         };
+        let (end, leaves) = walked;
         // **A wait tried nothing — but a failure before the wait tried
         // something.** The meter bounds retries of work that failed, and a walk
         // that ended by waiting for the post it was delegated from failed at
@@ -867,9 +942,23 @@ impl Inner {
         // that gives its claim away. So the release is for a wait that follows
         // no failure; a failure keeps its claim, and the meter binds on it.
         let failed_a_turn = matches!(end, DelegationEnd::TurnFailed { .. });
-        let outcome = Box::pin(self.report_delegation(&sub, end, leaves, arm)).await;
-        if matches!(outcome, Ok(Report::Waiting)) && !failed_a_turn {
-            self.release_walk(&space_id, &tail);
+        let outcome = Box::pin(self.report_delegation(&sub, end, leaves.clone(), arm)).await;
+        match outcome {
+            // Held back: keep the ending, so the arm that finally finds the
+            // anchor answered can deliver it whether or not the meter has room
+            // for more work by then.
+            Ok(Report::Waiting) => {
+                self.remember_ending(&space_id, &tail, end, &leaves);
+                if claimed && !failed_a_turn {
+                    self.release_walk(&space_id, &tail);
+                }
+            }
+            // Delivered, or there was nothing to deliver to. Either way this
+            // ending is done with.
+            Ok(Report::Settled) => self.forget_ending(&space_id, &tail),
+            // The delivery itself failed. Forgetting is what keeps a decided
+            // ending from being retried past the work that earned it.
+            Err(_) => self.forget_ending(&space_id, &tail),
         }
         outcome.map(|_| ())
     }
@@ -971,12 +1060,19 @@ impl Inner {
             // room whose budget is spent may cost a router inference, and the
             // turns it returned could not be driven anyway.
             if taken >= MAX_DELEGATION_TURNS {
-                return Ok(Some((
-                    DelegationEnd::BudgetSpent {
-                        limit: MAX_DELEGATION_TURNS,
-                    },
-                    finish(with(leaves, post), &frontier, &tail),
-                )));
+                return self
+                    .stop_walk(
+                        space_id,
+                        DelegationEnd::BudgetSpent {
+                            limit: MAX_DELEGATION_TURNS,
+                        },
+                        with(leaves, post),
+                        &frontier,
+                        &tail,
+                        since_row,
+                        &served,
+                    )
+                    .await;
             }
             let turns = match self
                 .plan_and_refine(space_id, &post, Planner::Driver)
@@ -1001,12 +1097,19 @@ impl Inner {
                 let taken = db::turns_taken_in_space(&conn, space_id).await?;
                 drop(conn);
                 if taken >= MAX_DELEGATION_TURNS {
-                    return Ok(Some((
-                        DelegationEnd::BudgetSpent {
-                            limit: MAX_DELEGATION_TURNS,
-                        },
-                        finish(with(leaves, post), &frontier, &tail),
-                    )));
+                    return self
+                        .stop_walk(
+                            space_id,
+                            DelegationEnd::BudgetSpent {
+                                limit: MAX_DELEGATION_TURNS,
+                            },
+                            with(leaves, post),
+                            &frontier,
+                            &tail,
+                            since_row,
+                            &served,
+                        )
+                        .await;
                 }
                 match Box::pin(self.drive_planned_turn(space_id, &turn)).await {
                     // A turn that wrote a post is a post to re-plan from, and
@@ -1027,14 +1130,64 @@ impl Inner {
                         eprintln!(
                             "warning: a turn in the delegated conversation {space_id} failed: {e}"
                         );
-                        return Ok(Some((
-                            DelegationEnd::failed(&e),
-                            finish(with(leaves, post), &frontier, &tail),
-                        )));
+                        return self
+                            .stop_walk(
+                                space_id,
+                                DelegationEnd::failed(&e),
+                                with(leaves, post),
+                                &frontier,
+                                &tail,
+                                since_row,
+                                &served,
+                            )
+                            .await;
                     }
                 }
             }
         }
+    }
+
+    /// Close a walk that is stopping **while it still had somewhere to go** —
+    /// the turn budget spent, or a turn that failed.
+    ///
+    /// **The refill belongs to every ending, not to the concluding one.** A
+    /// post can land in the room while the walk is walking, and the walk that
+    /// stops early never reaches the frontier-empty branch where those
+    /// arrivals are collected — so it reported the driven tail, the room read
+    /// as reported on that word, and the arrival sat there unserved *and*
+    /// unquoted, in a room nothing would walk again. The refill is therefore
+    /// asked here too, and asked the same way: what has arrived since the walk
+    /// opened, minus what the walk served itself.
+    ///
+    /// **What differs is where the arrivals go, and it follows from the
+    /// ending.** Concluding, the room may still take turns, so an arrival goes
+    /// on the *frontier* and gets one. Here the room may not: the budget is
+    /// spent or a turn just failed, and driving anything more is the thing the
+    /// ending exists to stop. So an arrival becomes a **leaf** — quoted into
+    /// the report like every other tip the walk reached, unanswered but not
+    /// lost. That is the honest reading of a spent budget: *the room may take
+    /// no more turns, and the report still carries what arrived*, so the owner
+    /// learns of the question and can open a new delegation for it, rather than
+    /// the room retiring with it invisible.
+    #[allow(clippy::too_many_arguments)]
+    async fn stop_walk(
+        &self,
+        space_id: &str,
+        end: DelegationEnd,
+        leaves: Vec<String>,
+        frontier: &[String],
+        tail: &str,
+        since_row: i64,
+        served: &std::collections::HashSet<String>,
+    ) -> Result<Option<(DelegationEnd, Vec<String>)>, AppError> {
+        let conn = self.db_conn().await?;
+        let arrived = db::posts_in_space_since(&conn, space_id, since_row).await?;
+        drop(conn);
+        // The frontier first — those were next in line — then what arrived,
+        // oldest first, which is the newest end of the room.
+        let mut unwalked: Vec<String> = frontier.to_vec();
+        unwalked.extend(arrived.into_iter().filter(|id| !served.contains(id)));
+        Ok(Some((end, finish(leaves, &unwalked, tail))))
     }
 
     /// One driven turn — the same door `respond_stream_as` takes, minus a
