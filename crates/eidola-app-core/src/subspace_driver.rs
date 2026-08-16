@@ -59,8 +59,8 @@ use std::sync::Arc;
 use crate::changes::{Change, ChangeOrigin, with_origin};
 use crate::error::AppError;
 use crate::{
-    AttachedReference, ChatStreamEvent, Inner, NotificationPlan, PlannedTurn, Planner,
-    ReferenceSpec, ResponseMode, TurnDirective, TurnSelector, db,
+    AttachedReference, AttachmentOrigin, ChatStreamEvent, Inner, NotificationPlan, PlannedTurn,
+    Planner, ReferenceSpec, ResponseMode, TurnDirective, TurnSelector, db,
 };
 
 /// The per-room driver registry: room id → whether an arm arrived while its
@@ -682,6 +682,20 @@ impl Inner {
         // owner's own answer there.
         let target = match sub.parent_action_id.as_deref() {
             Some(anchor) => {
+                // **Registered before the question is asked, not after it.**
+                // The answer can commit between the two, and its
+                // `Change::Space` is the only thing that would ever wake this
+                // room again: asking first and registering second leaves a
+                // window in which that change finds nothing registered, and the
+                // registration that follows then waits for a wake-up already
+                // gone by. Registering first closes it by ordering — a commit
+                // is either early enough for the query to see it or late enough
+                // for the entry to be there — at the cost of an entry to take
+                // back out on every path that does not wait, which is what
+                // `end_anchor_wait` is for.
+                let waiting = arm == Arm::Signal && self.begin_anchor_wait(sub);
+                #[cfg(feature = "test-support")]
+                self.pause_in_anchor_window().await;
                 match db::last_reply_by_participant(
                     &conn,
                     &sub.parent_space_id,
@@ -690,7 +704,10 @@ impl Inner {
                 )
                 .await?
                 {
-                    Some(answer) => Some(answer),
+                    Some(answer) => {
+                        self.end_anchor_wait(&sub.id);
+                        Some(answer)
+                    }
                     // **The owner has not answered the anchor yet**, which is
                     // not an ordinary absence: a spawn happens inside the
                     // owner's turn, so this state means that turn is still in
@@ -706,8 +723,11 @@ impl Inner {
                     // of its own, so at that point the answer either exists or
                     // never will, and the anchor is then the right attachment
                     // because there is no answer for it to sit beneath.
-                    None if arm == Arm::Signal && self.defer_for_anchor(sub) => return Ok(()),
-                    None => Some(anchor.to_string()),
+                    None if waiting => return Ok(()),
+                    None => {
+                        self.end_anchor_wait(&sub.id);
+                        Some(anchor.to_string())
+                    }
                 }
             }
             // A spawn that named no anchor — a direct API caller with no turn
@@ -732,6 +752,10 @@ impl Inner {
 
         let directive = TurnDirective {
             attached: vec![AttachedReference {
+                // Ordinal 0 is the reply edge's; a report quotes exactly one
+                // thing, so the finding is 1.
+                ordinal: 1,
+                origin: AttachmentOrigin::Authored,
                 spec: ReferenceSpec {
                     antecedent_action_id: witness,
                     content_block_id,
@@ -771,33 +795,57 @@ impl Inner {
                 ),
             });
         }
-        self.awaiting_anchor
-            .lock()
-            .expect("anchor wait map poisoned")
-            .remove(&sub.id);
+        self.end_anchor_wait(&sub.id);
         Ok(())
     }
 
-    /// Record that `sub` is waiting for its anchor to be answered, and answer
-    /// whether it may wait. A room waits at most once per process — the second
-    /// time round it attaches to the anchor instead, so a spawning turn that
-    /// died can never leave a delegation waiting on an answer that is not
+    /// Register `sub` against its parent and answer whether this walk may wait
+    /// for the anchor to be answered.
+    ///
+    /// **The registration happens whether or not the wait does**, because it has
+    /// to precede the question it protects (see the call site). A room waits at
+    /// most once per process — a walk that finds itself already registered has
+    /// waited before, and attaches to the anchor instead, so a spawning turn
+    /// that died can never leave a delegation waiting on an answer that is not
     /// coming.
-    fn defer_for_anchor(&self, sub: &db::SubspaceRow) -> bool {
-        let mut waiting = self
-            .awaiting_anchor
+    fn begin_anchor_wait(&self, sub: &db::SubspaceRow) -> bool {
+        self.awaiting_anchor
             .lock()
-            .expect("anchor wait map poisoned");
-        if waiting.contains_key(&sub.id) {
-            waiting.remove(&sub.id);
-            return false;
+            .expect("anchor wait map poisoned")
+            .insert(sub.id.clone(), sub.parent_space_id.clone())
+            .is_none()
+    }
+
+    /// Hold the walk inside the anchor window while a test commits the write
+    /// the window is about (see `Inner::anchor_window`). A no-op — one lock and
+    /// a `None` — whenever no test has opened one.
+    #[cfg(feature = "test-support")]
+    async fn pause_in_anchor_window(&self) {
+        let gate = self
+            .anchor_window
+            .lock()
+            .expect("anchor window lock poisoned")
+            .clone();
+        if let Some(tx) = gate {
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            if tx.send(resume_tx).is_ok() {
+                let _ = resume_rx.await;
+            }
         }
-        waiting.insert(sub.id.clone(), sub.parent_space_id.clone());
-        true
+    }
+
+    /// Stop waiting: the answer arrived, or there is no longer one to wait for.
+    /// Called on every path out of the anchor question that is not a wait, so
+    /// the registration a wait needed cannot outlive it.
+    fn end_anchor_wait(&self, space_id: &str) {
+        self.awaiting_anchor
+            .lock()
+            .expect("anchor wait map poisoned")
+            .remove(space_id);
     }
 
     /// The rooms waiting on a change in `space_id` — see
-    /// [`Inner::defer_for_anchor`]. A pure in-memory lookup, because it is
+    /// [`Inner::begin_anchor_wait`]. A pure in-memory lookup, because it is
     /// asked of every `Change::Space` in the process.
     fn rooms_awaiting(&self, space_id: &str) -> Vec<String> {
         self.awaiting_anchor

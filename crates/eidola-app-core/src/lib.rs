@@ -984,8 +984,29 @@ pub(crate) struct TurnDirective {
     pub(crate) mechanical: bool,
 }
 
+/// Where an attachment came from, which decides one thing: whether it is
+/// gated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttachmentOrigin {
+    /// Written by the turn machinery for this turn. Validated at the authoring
+    /// seam ([`Inner::validate_agent_reference_spec`]) like any other authored
+    /// reference.
+    Authored,
+    /// Carried forward from the generation this turn supersedes. **Not gated**,
+    /// for the reason `edit_post`'s replication is not: quoting copies, the
+    /// passage is already here, and re-asking permission at a re-wording would
+    /// rewrite history whenever the answer had changed since.
+    Replicated,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AttachedReference {
+    /// The edge's ordinal within the answering post — the shared key
+    /// ([`ReferenceSpec`]'s convention; ordinal 0 is the reply slot). Carried
+    /// rather than derived from position because a replicated edge keeps the
+    /// ordinal it already had, exactly as an edit's does.
+    pub(crate) ordinal: i64,
+    pub(crate) origin: AttachmentOrigin,
     pub(crate) spec: ReferenceSpec,
     /// How the **source** space names the quoted post's author.
     ///
@@ -1539,6 +1560,16 @@ struct Inner {
     /// answered, mapped to the parent whose next change wakes them (see
     /// `Inner::report_delegation`).
     awaiting_anchor: Mutex<std::collections::HashMap<String, String>>,
+    /// Test-only rendezvous inside the anchor window — the few instructions
+    /// between a room registering itself against its parent and asking whether
+    /// that parent has answered. A lost wake-up lives or dies on the *order* of
+    /// those two, and order is not something a test can observe from outside:
+    /// this lets one stop the walk in the window, commit the answer, and let it
+    /// go, which is the interleaving the ordering exists to survive. Compiled
+    /// out of release builds with the rest of the `test-support` seam.
+    #[cfg(feature = "test-support")]
+    anchor_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
@@ -3307,10 +3338,15 @@ impl Inner {
             return Ok(None);
         }
         let mut out = ATTACHED_BLOCK_HEADING.to_string();
-        for (i, a) in attached.iter().enumerate() {
-            self.validate_agent_reference_spec(conn, author_participant_id, &a.spec)
-                .await?;
-            let ordinal = (i + 1) as i64;
+        for a in attached {
+            // A replicated edge is not being authored, so it is not asked for
+            // permission — see [`AttachmentOrigin`]. It still renders, because
+            // a turn re-wording a report has to be shown what it is reporting.
+            if a.origin == AttachmentOrigin::Authored {
+                self.validate_agent_reference_spec(conn, author_participant_id, &a.spec)
+                    .await?;
+            }
+            let ordinal = a.ordinal;
             let target = match thread.node_for_action(&a.spec.antecedent_action_id) {
                 Some(n) => ReferenceTarget::Addressable {
                     item_id: n.item_id.clone(),
@@ -5526,13 +5562,40 @@ impl Inner {
         // else and are written onto the persisted `inference` by
         // `TurnPrep::persist_turn`, which is what makes the words the model
         // reads and the edge the record keeps one thing.
+        // **A regeneration carries the superseded generation's references
+        // forward.** `edit_post` has always done this — an edge can be a fact
+        // of the *turn* rather than of its wording — and a regenerated report
+        // is the sharpest case there is: the finding it quotes and the ending
+        // it records are facts of the delegation, not of the sentence the model
+        // happened to produce. Dropping them would take the visible footnote
+        // away while the delegation went on counting as reported, which is the
+        // one state the whole derived lifecycle must not reach.
+        //
+        // It is also what makes the regenerated turn *honest*: `Revise`
+        // withholds the generation being replaced from the context, so without
+        // this the model would be asked to re-word a report on a finding it was
+        // never shown.
+        let mut attached = directive.attached.clone();
+        if mode == ResponseMode::Revise {
+            for r in db::reference_antecedents(&db_conn, target_action_id).await? {
+                attached.push(AttachedReference {
+                    // The ordinal it already had — stable across generations,
+                    // exactly as an edit keeps them.
+                    ordinal: r.ordinal,
+                    origin: AttachmentOrigin::Replicated,
+                    author_label: db::post_author_label(&db_conn, &r.antecedent_action_id).await?,
+                    spec: ReferenceSpec {
+                        antecedent_action_id: r.antecedent_action_id,
+                        content_block_id: r.content_block_id,
+                        range_start: r.range_start,
+                        range_end: r.range_end,
+                        annotation: r.annotation,
+                    },
+                });
+            }
+        }
         let attached_block = self
-            .render_attached_references(
-                &db_conn,
-                &thread,
-                &model_participant_id,
-                &directive.attached,
-            )
+            .render_attached_references(&db_conn, &thread, &model_participant_id, &attached)
             .await?;
 
         // ---- Thread map (task 21) -----------------------------------------
@@ -5977,7 +6040,7 @@ impl Inner {
             inf_item_id,
             inf_supersedes,
             inf_reply_to,
-            attached_references: directive.attached.clone(),
+            attached_references: attached,
             context_action_ids,
             trace_action_ids: Vec::new(),
             trace_reply_to: inf_reply_to_for_trace,
@@ -7876,6 +7939,8 @@ impl AppCore {
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
                 subspace_walks: Mutex::new(std::collections::HashMap::new()),
                 awaiting_anchor: Mutex::new(std::collections::HashMap::new()),
+                #[cfg(feature = "test-support")]
+                anchor_window: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 summary_gate: tokio::sync::Mutex::new(()),
                 summary_triggers: Mutex::new(std::collections::HashMap::new()),
@@ -9046,6 +9111,26 @@ impl AppCore {
             .spawn(async move { inner.refresh_branch_summaries(&space_id).await })
             .await
             .map_err(join_err)?
+    }
+
+    /// Test-only seam: stop the next anchor wait inside its window (see
+    /// `Inner::anchor_window`).
+    ///
+    /// Each walk that reaches the window sends a resume handle down the
+    /// returned channel and blocks until it is used, so a test can commit the
+    /// very write the window is about and prove the ordering survives it.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_anchor_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .anchor_window
+            .lock()
+            .expect("anchor window lock poisoned") = Some(tx);
+        rx
     }
 
     /// Test-only seam: drive one delegated room to a stop and deliver its
@@ -10749,12 +10834,12 @@ impl TurnPrep {
         // means. A turn that ends without an inference (a decline, the round
         // cap) writes none of them, because there is no post for a quote to
         // hang on.
-        for (i, attached) in self.attached_references.iter().enumerate() {
+        for attached in &self.attached_references {
             db::insert_reference_antecedent(
                 &self.db_conn,
                 &inference_action_id,
                 &attached.spec.antecedent_action_id,
-                (i + 1) as i64,
+                attached.ordinal,
                 attached.spec.content_block_id.as_deref(),
                 attached.spec.range_start,
                 attached.spec.range_end,
