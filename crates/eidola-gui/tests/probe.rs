@@ -3281,6 +3281,76 @@ fn space_inspector_a_notebooks_owner_is_not_removable(cx: &mut TestAppContext) {
     );
 }
 
+/// **A sub-space's owner carries no Remove either** — the other structural
+/// membership, suppressed the same way and for the same shape of reason.
+///
+/// The owner row records who is answerable for the delegation, whose live-room
+/// quota it counts against and who its report goes to; nothing can end it and
+/// nothing can grant it back, so app-core refuses. An affordance that could
+/// only be refused has no business on the row — and the space's own settings
+/// are what say which participant that is, exactly as they do for a notebook.
+///
+/// Both arms, so this proves suppression rather than an empty roster: the
+/// owner has no Remove, and an ordinary member of the same room keeps one.
+#[gpui::test]
+fn space_inspector_a_sub_spaces_owner_is_not_removable(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some(probe_participants());
+        s.space_settings = Some((
+            "demo".into(),
+            eidola_app_core::SpaceSettings {
+                subspace_owner_participant_id: Some("agent-1".into()),
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/inspector/participants/editor/save".to_string()),
+        "the row is still an editor: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/inspector/participants/agent-1/remove".to_string()),
+        "a sub-space's owner must not be offered removal from the room it opened: {names:?}"
+    );
+
+    // The same roster, with the ownership pointing elsewhere: this agent is an
+    // ordinary member of a delegated room, and keeps its Remove.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some(probe_participants());
+        s.space_settings = Some((
+            "demo".into(),
+            eidola_app_core::SpaceSettings {
+                subspace_owner_participant_id: Some("some-other-agent".into()),
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/inspector/participants/agent-1/remove".to_string()),
+        "an ordinary member of a sub-space is removable like anyone else: {names:?}"
+    );
+}
+
 fn participants_inspector_stores(cx: &mut TestAppContext) -> Stores {
     stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
