@@ -1181,6 +1181,83 @@ fn an_owners_departure_from_the_parent_leaves_no_room_retrying() {
     });
 }
 
+/// **A wait tried nothing — but a failure before the wait tried something.**
+/// Giving the attempt back on every `Waiting` handed a dead upstream an
+/// unbounded retry: a broken helper turn with an unanswered anchor ends in
+/// exactly that outcome, and the release reopened the one circuit the meter
+/// exists to close, at the one exit that gives its claim away.
+#[test]
+fn a_wait_after_a_failed_turn_spends_its_attempt() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::Non2xx(500),
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        // Opened from a post the owner has not answered: the walk's report ends
+        // in a wait, and reaches it without an upstream call of its own — so
+        // every request counted here is the helper's failing turn.
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        let mut sent = Vec::new();
+        for _ in 0..8 {
+            drive(&core, &out.space.id).expect("a walk that ends in a wait is not an error");
+            sent.push(mock.chat_bodies().len());
+        }
+
+        assert!(sent[0] > 0, "it does try — a blip has to be able to heal");
+        assert_eq!(
+            *sent.last().expect("eight arms"),
+            sent[MAX_ATTEMPTS_PER_TAIL as usize - 1],
+            "and it stops once the meter is spent, rather than retrying a dead \
+             upstream for as long as the anchor goes unanswered: {sent:?}"
+        );
+        assert!(
+            core.test_rooms_awaiting(parent).contains(&out.space.id),
+            "the delegation is still outstanding, which is the truth"
+        );
+    });
+}
+
+/// The other half of that discrimination: a wait with no failure behind it
+/// spends nothing, however often it comes round. A parent is an ordinary
+/// conversation and anything can move it, so charging the room an attempt per
+/// wake would spend its whole allowance on unrelated posts and then refuse the
+/// walk the real answer finally arms.
+#[test]
+fn a_wait_that_follows_no_failure_spends_nothing() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        // Far more waits than the meter would allow if one counted.
+        for _ in 0..(MAX_ATTEMPTS_PER_TAIL + 3) {
+            drive(&core, &out.space.id).expect("the room waits");
+            assert!(report(&core, &parent).is_none(), "it is still waiting");
+        }
+
+        // The answer arrives, and the walk it arms is not refused.
+        let answer = ask(&core, &parent, &owner, &asked);
+        drive(&core, &out.space.id).expect("the room reports");
+        assert_eq!(
+            report(&core, &parent)
+                .expect("the delegation is reported")
+                .parent_action_id
+                .as_deref(),
+            Some(answer.as_str()),
+            "beneath the answer it was holding out for"
+        );
+    });
+}
+
 /// A quoted passage is attributed by the space it was written in, and that has
 /// to survive the author being retired between saying it and its being
 /// reported — the record retirement promises to leave alone.
@@ -1559,6 +1636,109 @@ fn a_wide_walk_reports_every_tip_and_not_a_roster_sized_tail() {
             .action_id
             .clone();
         assert!(quoted.contains(&last), "the room reads as reported");
+    });
+}
+
+/// **A burst of findings is bounded as a block, and what is not shown is
+/// named.** Clipping each passage bounds one entry and says nothing about how
+/// many there are — the walk attaches a tip per branch it reached, and posts
+/// into a room somebody is watching make those branches. Unbounded, the block
+/// crowds out the conversation the report is written into and at the far end
+/// overflows the request, taking the delivery with it. So the block has a
+/// ceiling, the edges are all written regardless, and the model is told what it
+/// is not being shown rather than left to assume it has read everything.
+#[test]
+fn an_over_budget_burst_still_delivers_and_says_what_it_withheld() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        // Nobody is seated beside the owner, and the owner answers only when
+        // spoken to explicitly — so every post below is a branch nothing
+        // follows, which is exactly what a tip is.
+        let out = spawn(&core, &parent, &owner, vec![]);
+        let room = out.space.id.clone();
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                room.clone(),
+                owner.clone(),
+                eidola_app_core::ParticipantOverride {
+                    notify_policy: Some(Some("explicit".into())),
+                    ..Default::default()
+                },
+            ))
+            .expect("the owner answers only an explicit ask");
+        core.runtime()
+            .block_on(core.add_global_participant(
+                room.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("the reader joins the room they are watching");
+
+        // A burst that lands while the walk is in its opening reads: each one
+        // is a tip the report has to carry, and each is long enough that a
+        // dozen of them cannot fit in one block.
+        let long = |n: usize| format!("SOUNDING {n}. {}", "detail that runs on. ".repeat(120));
+        let mut window = core.test_open_entry_window();
+        std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &room));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches its opening window");
+            for n in 1..=12 {
+                core.runtime()
+                    .block_on(core.post(long(n), Some(room.clone())))
+                    .expect("a post into the room");
+            }
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+        });
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.references.len(),
+            13,
+            "every tip is an edge on the answer — the brief and all twelve posts"
+        );
+        assert!(
+            report.references.iter().all(|r| r.snippet.is_some()),
+            "and every one of them resolves for the reader"
+        );
+
+        let body = mock
+            .chat_bodies()
+            .last()
+            .cloned()
+            .expect("a report request");
+        let attached = flat_messages(&body)
+            .into_iter()
+            .find(|(_, c)| c.contains("Attached to your reply"))
+            .map(|(_, c)| c)
+            .expect("the attached block");
+
+        assert!(
+            attached.contains("SOUNDING 1."),
+            "the oldest findings are the ones shown: {attached}"
+        );
+        assert!(
+            !attached.contains("SOUNDING 12."),
+            "and the block stops rather than running on forever"
+        );
+        assert!(
+            attached.contains("not shown here") && attached.contains("further passages"),
+            "the model is told its view is partial: {attached}"
+        );
+        assert!(
+            attached.contains("a reader can open each one"),
+            "and told the passages travel with its post anyway: {attached}"
+        );
+        assert!(
+            attached.len() < 20_000,
+            "the block is bounded, not merely trimmed: {} bytes",
+            attached.len()
+        );
     });
 }
 

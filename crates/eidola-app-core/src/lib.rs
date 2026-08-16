@@ -3404,6 +3404,12 @@ impl Inner {
             return Ok(None);
         }
         let mut out = ATTACHED_BLOCK_HEADING.to_string();
+        let budget = ATTACHED_BLOCK_MAX_BYTES;
+        // Ordinals whose passage did not fit, in order. Every attachment is
+        // still validated and still written — this decides only what the model
+        // is shown (see below).
+        let mut withheld: Vec<i64> = Vec::new();
+        let mut shown = 0usize;
         for a in attached {
             // A replicated edge is not being authored, so it is not asked for
             // **permission** — see [`AttachmentOrigin`]. It still renders,
@@ -3478,8 +3484,31 @@ impl Inner {
                 annotation: subspace_driver::annotation_for_model(a.spec.annotation.as_deref()),
                 body,
             };
+            // **The block has a ceiling as well as its passages.** Clipping
+            // each passage bounds one entry and nothing bounds their number:
+            // the walk attaches a tip per branch it reached, and a burst of
+            // posts into a watched room makes those branches — so an unbounded
+            // block can crowd out the conversation the report is being written
+            // into, or overflow the request entirely and take the delivery with
+            // it. Oldest first, because the walk found them in that order and a
+            // delegation reads forwards.
+            let rendered = entry.render();
+            if !withheld.is_empty() || (shown > 0 && out.len() + 1 + rendered.len() > budget) {
+                withheld.push(ordinal);
+                continue;
+            }
             out.push('\n');
-            out.push_str(&entry.render());
+            out.push_str(&rendered);
+            shown += 1;
+        }
+        // **What is not shown is named, not hidden.** Every one of these edges
+        // is written onto the answer whatever happens here, so the reader's
+        // footnote rail is complete and each passage is one click away; what
+        // the model would otherwise lack is the knowledge that it is writing
+        // about a part of what it is reporting.
+        if !withheld.is_empty() {
+            out.push('\n');
+            out.push_str(&attached_withheld_note(&withheld));
         }
         Ok(Some(out))
     }
@@ -4901,70 +4930,45 @@ impl Inner {
 
         let action_id = Uuid::now_v7().to_string();
         let item_id = Uuid::now_v7().to_string();
-        db::insert_action(
+
+        // A space with no title and no prior post earns one from this post's
+        // opening line — decided here, out of values already read, and applied
+        // inside the write below.
+        let auto_title = (space_title.is_none() && last_action_id.is_none())
+            .then(|| derive_space_title(prompt))
+            .flatten();
+        // The structural `reply` edge: the explicit `reply_to` target
+        // (branching there) when given, otherwise the space's tail (linear
+        // continuation). A first post in a space has neither. Ordinal 0 is the
+        // reply edge's reserved slot (see `ReferenceSpec`); references take
+        // `1..=N` in supplied order, the post's `{{ embed N }}` numbering.
+        let reply_ante = reply_to
+            .map(str::to_string)
+            .or_else(|| last_action_id.clone());
+
+        // **One transaction, because a post is one thing.** Written as separate
+        // statements the action row lands first and the words, the thread
+        // position and the quotations follow it — and in that window the post
+        // exists and says nothing, which a reader keyed on the action is
+        // entitled to and the sub-space driver's refill will *act* on, planning
+        // and billing a turn against an empty post. See `db::post_tx`. The
+        // validations above stay in front of it, where a refusal belongs: they
+        // are reads, and now they leave neither a trace nor a fragment.
+        let auto_titled = db::post_tx(
             &db_conn,
-            &db::ActionEntry {
-                id: action_id.clone(),
-                space_id: space_id.clone(),
-                participant_id: user_participant_id,
-                item_id: item_id.clone(),
-                supersedes_action_id: None,
-                action_type: "user_input".to_string(),
-                status: "complete".to_string(),
-                intent: None,
-                model: None,
-                input_tokens: None,
-                output_tokens: None,
-                credits_consumed: None,
+            &db::PostPlan {
+                space_id: &space_id,
+                participant_id: &user_participant_id,
+                action_id: &action_id,
+                item_id: &item_id,
+                text: prompt,
+                auto_title: auto_title.as_deref(),
+                reply_to: reply_ante.as_deref(),
+                references,
                 created_at: now,
             },
         )
         .await?;
-        db::insert_text_content_block(
-            &db_conn,
-            &Uuid::now_v7().to_string(),
-            &action_id,
-            0,
-            "text",
-            prompt,
-        )
-        .await?;
-
-        let mut auto_titled = false;
-        if space_title.is_none()
-            && last_action_id.is_none()
-            && let Some(title) = derive_space_title(prompt)
-        {
-            auto_titled = db::update_space_title(&db_conn, &space_id, &title, now).await?;
-        }
-
-        // Link the structural `reply` edge: to the explicit `reply_to` target
-        // (branching there) when given, otherwise to the space's tail (linear
-        // continuation). A first post in a space has neither. Ordinal 0 is the
-        // reply edge's reserved slot (see `ReferenceSpec`).
-        let reply_ante = reply_to
-            .map(str::to_string)
-            .or_else(|| last_action_id.clone());
-        if let Some(ref ante_id) = reply_ante {
-            db::insert_action_antecedent(&db_conn, &action_id, ante_id, 0, "reply").await?;
-        }
-
-        // Reference edges at ordinals 1..=N in supplied order — the post's
-        // `{{ embed N }}` numbering. These ride the post's existing
-        // emissions below (no new exit point).
-        for (i, spec) in references.iter().enumerate() {
-            db::insert_reference_antecedent(
-                &db_conn,
-                &action_id,
-                &spec.antecedent_action_id,
-                (i + 1) as i64,
-                spec.content_block_id.as_deref(),
-                spec.range_start,
-                spec.range_end,
-                spec.annotation.as_deref(),
-            )
-            .await?;
-        }
 
         self.bus.emit(Change::Space(space_id.clone()));
         if is_new_space || auto_titled {
@@ -11657,6 +11661,48 @@ const REFERENCE_BLOCK_HEADING: &str = "Passages this post quotes:";
 const ATTACHED_BLOCK_HEADING: &str = "Attached to your reply as a quoted reference, numbered \
      as shown — write what it means in your own words; the passage travels with your post, so \
      there is no need to repeat it:";
+
+/// How much of the whole attached block is rendered into the turn that reports
+/// on it. The **edges** are all written either way — this bounds a prompt.
+///
+/// Clipping each passage ([`ATTACHED_PASSAGE_MAX_BYTES`]) bounds one entry and
+/// says nothing about how many there are: the sub-space driver attaches a tip
+/// per branch its walk reached, and a burst of posts into a room somebody is
+/// watching makes those branches. Unbounded, the block crowds out the
+/// conversation the report is being written into, and at the far end overflows
+/// the request and takes the delivery with it — the one outcome a terminal
+/// report may not have.
+///
+/// The figure is the app's own register rather than a guess:
+/// [`subspaces::MAX_SUBAGENTS_PER_SPAWN`] seats × one full
+/// [`ATTACHED_PASSAGE_MAX_BYTES`] passage each — a whole room's worth of
+/// distinct voices, each at full length. Past that a walk's fan-out is the same
+/// voices again, and what the model needs then is not more text but to know
+/// there is more (see `attached_withheld_note`).
+const ATTACHED_BLOCK_MAX_BYTES: usize =
+    subspaces::MAX_SUBAGENTS_PER_SPAWN as usize * ATTACHED_PASSAGE_MAX_BYTES;
+
+/// The line that closes an attached block whose passages did not all fit —
+/// **the model is told what it is not being shown.**
+///
+/// It names how many and at which ordinals, and says the two things that keep
+/// the report honest: they are attached to the answer regardless, and a reader
+/// can follow each one. A model that knows its view is partial writes "the
+/// helpers also reported on X and Y" rather than claiming to have read
+/// everything.
+fn attached_withheld_note(withheld: &[i64]) -> String {
+    let count = withheld.len();
+    let range = match (withheld.first(), withheld.last()) {
+        (Some(first), Some(last)) if first != last => format!("[{first}]–[{last}]"),
+        (Some(only), _) => format!("[{only}]"),
+        _ => String::new(),
+    };
+    let passages = if count == 1 { "passage" } else { "passages" };
+    format!(
+        "\n{count} further {passages} at {range} are attached to your reply but not shown here — \
+         they travel with your post and a reader can open each one."
+    )
+}
 
 /// How much of one attached passage is *rendered* into the turn that reports on
 /// it. The **edge** keeps the whole range either way — this bounds a prompt,

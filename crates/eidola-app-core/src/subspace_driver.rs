@@ -853,14 +853,22 @@ impl Inner {
             self.end_anchor_wait(&space_id);
             return Ok(()); // the room closed under us; nothing to report
         };
+        // **A wait tried nothing — but a failure before the wait tried
+        // something.** The meter bounds retries of work that failed, and a walk
+        // that ended by waiting for the post it was delegated from failed at
+        // nothing and left the room's last word unchanged, so charging it an
+        // attempt would spend the room's whole allowance on three unrelated
+        // posts in the parent and then refuse the walk the real answer finally
+        // arms. That reasoning is about the *wait*, and it stops being true the
+        // moment the walk in front of it broke a turn: a failed turn with an
+        // unanswered anchor ends in exactly the same `Waiting`, and giving the
+        // attempt back there hands a dead upstream an unbounded retry — the
+        // one circuit `claim_walk` exists to close, reopened by the one exit
+        // that gives its claim away. So the release is for a wait that follows
+        // no failure; a failure keeps its claim, and the meter binds on it.
+        let failed_a_turn = matches!(end, DelegationEnd::TurnFailed { .. });
         let outcome = Box::pin(self.report_delegation(&sub, end, leaves, arm)).await;
-        // **Waiting is not an attempt.** The meter bounds retries of work that
-        // failed; a walk that ended by waiting for the post it was delegated
-        // from tried nothing and failed at nothing, and the room's last word is
-        // unchanged — so counting it would spend the room's whole allowance on
-        // three unrelated posts in the parent and then refuse the walk that the
-        // real answer finally arms.
-        if matches!(outcome, Ok(Report::Waiting)) {
+        if matches!(outcome, Ok(Report::Waiting)) && !failed_a_turn {
             self.release_walk(&space_id, &tail);
         }
         outcome.map(|_| ())
@@ -934,7 +942,14 @@ impl Inner {
                 let conn = self.db_conn().await?;
                 let arrived = db::posts_in_space_since(&conn, space_id, since_row).await?;
                 drop(conn);
-                frontier.extend(arrived.into_iter().filter(|id| !served.contains(id)));
+                // **Pushed newest-first so they come off oldest-first.** The
+                // frontier is a stack — taking the newest first is what walks
+                // one thread of a fan-out down before starting the next — and
+                // a refill is not a fan-out but a stretch of conversation,
+                // which reads forwards. Reversed here, the batch is taken up
+                // in the order it was written, which is what the read that
+                // produced it already promises.
+                frontier.extend(arrived.into_iter().rev().filter(|id| !served.contains(id)));
                 if frontier.is_empty() {
                     let end = match paused {
                         Some((depth, limit)) => DelegationEnd::Paused { depth, limit },
