@@ -101,7 +101,7 @@ const-oid = { version = "0.9", features = ["db"] }
 der = { version = "0.7", features = ["pem", "alloc"] }
 spki = { version = "0.7", features = ["pem"] }
 x509-cert = "0.2"
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 signature = "2"
 regex = "1"
