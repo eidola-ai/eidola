@@ -6807,6 +6807,15 @@ impl Inner {
             // Inference (error status) + request rows committed; Wallet was
             // emitted at spend start. post owns the user-turn SpaceIndex.
             self.bus.emit(Change::Space(prep.space_id.clone()));
+            // The error generation is current and the transcript hides it, so
+            // any delegated room this turn's replicated edges quoted has just
+            // become outstanding again (`db::has_reference_from` reads
+            // visibility) — and nothing else can say so: the parent's own
+            // emission maps back to no settled room (its wait ended at
+            // delivery, and the supervisor knows the parent as ordinary). So
+            // the rooms are announced here, and the driver's entry checks
+            // decide what is actually owed.
+            self.announce_rooms_quoted_by(prep).await;
             self.bus.emit(Change::Record);
             return Err(AppError::Server {
                 status: status.as_u16(),
@@ -6834,6 +6843,38 @@ impl Inner {
             response_action_id: Some(response_action_id),
             declined: None,
         }))
+    }
+
+    /// Emit `Change::Space` for every **other** space this turn's attached
+    /// references quote — the delegated rooms whose reports the turn's
+    /// persisted generation now stands in front of.
+    ///
+    /// Called on the blocking loop's non-2xx exit, where the persisted
+    /// generation is a current `error` the transcript hides: a report those
+    /// edges replicated is then a report the parent no longer shows, and the
+    /// room it settled is outstanding again with no event left in the world
+    /// to arm it. An announcement is cheap and self-limiting — the driver's
+    /// entry checks read the rows — and an ordinary turn has no attached
+    /// references, so this is a no-op everywhere but the paths that carry
+    /// them. Failures are swallowed for the caller's reason: this rides an
+    /// error exit that must still return the turn's own error.
+    async fn announce_rooms_quoted_by(&self, prep: &TurnPrep) {
+        let mut announced: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for attached in &prep.attached_references {
+            match db::action_item_and_space(&prep.db_conn, &attached.spec.antecedent_action_id)
+                .await
+            {
+                Ok(Some((_, space_id))) => {
+                    if space_id != prep.space_id && announced.insert(space_id.clone()) {
+                        self.bus.emit(Change::Space(space_id));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("warning: a quoted room could not be resolved to announce: {e}");
+                }
+            }
+        }
     }
 
     /// Save a turn and request a (blocking) response in one gesture — the
@@ -10726,8 +10767,56 @@ impl TurnPrep {
     /// output when the model produced any alongside its calls, then one
     /// `tool_use` block per call (`tool_name` + `tool_call_id` + the raw
     /// arguments string in `data`).
+    /// One transaction, like every other multi-statement action writer (the
+    /// `persist_turn` rationale): the intermediate states are then not
+    /// something any reader — or a crash — can keep.
     #[allow(clippy::too_many_arguments)]
     async fn persist_tool_call_action(
+        &mut self,
+        calls: &[ParsedToolCall],
+        reasoning: &str,
+        content: &str,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        request_body_json: &serde_json::Value,
+        request_at: i64,
+        response_at: i64,
+        http_status: u16,
+        response_body: Vec<u8>,
+    ) -> Result<String, AppError> {
+        db::begin_write(&self.db_conn).await?;
+        let written = self
+            .persist_tool_call_action_body(
+                calls,
+                reasoning,
+                content,
+                input_tokens,
+                output_tokens,
+                request_body_json,
+                request_at,
+                response_at,
+                http_status,
+                response_body,
+            )
+            .await;
+        match written {
+            Ok(id) => {
+                self.db_conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map_err(AppError::db)?;
+                Ok(id)
+            }
+            Err(e) => {
+                // Best-effort rollback; propagate the original error regardless.
+                let _ = self.db_conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_call_action_body(
         &mut self,
         calls: &[ParsedToolCall],
         reasoning: &str,
@@ -10843,6 +10932,28 @@ impl TurnPrep {
         &mut self,
         outcomes: &[ToolOutcome],
     ) -> Result<String, AppError> {
+        db::begin_write(&self.db_conn).await?;
+        let written = self.persist_tool_result_action_body(outcomes).await;
+        match written {
+            Ok(id) => {
+                self.db_conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map_err(AppError::db)?;
+                Ok(id)
+            }
+            Err(e) => {
+                // Best-effort rollback; propagate the original error regardless.
+                let _ = self.db_conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn persist_tool_result_action_body(
+        &mut self,
+        outcomes: &[ToolOutcome],
+    ) -> Result<String, AppError> {
         let action_id = Uuid::now_v7().to_string();
         let status = if outcomes.iter().all(|o| o.ok) {
             "complete"
@@ -10938,6 +11049,25 @@ impl TurnPrep {
     /// visible in the Record, invisible as a post. Rendering it as "saw this,
     /// declined" is a GUI follow-up, not something the write side decides.
     async fn persist_decision(&mut self, reason: &str) -> Result<String, AppError> {
+        db::begin_write(&self.db_conn).await?;
+        let written = self.persist_decision_body(reason).await;
+        match written {
+            Ok(id) => {
+                self.db_conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map_err(AppError::db)?;
+                Ok(id)
+            }
+            Err(e) => {
+                // Best-effort rollback; propagate the original error regardless.
+                let _ = self.db_conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn persist_decision_body(&mut self, reason: &str) -> Result<String, AppError> {
         let action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &self.db_conn,
