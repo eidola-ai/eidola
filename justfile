@@ -160,7 +160,8 @@ update-openapi:
     ./scripts/update-server-openapi.sh
 
 # Regenerate every identity asset from the brand geometry (macOS only —
-# the .icns needs iconutil). See brand/AGENTS.md.
+# the .icns needs iconutil; Assets.car needs actool + ictool). See
+# brand/AGENTS.md.
 update-brand:
     python3 brand/generate.py
 

@@ -36,3 +36,6 @@ crates/eidola-gui/tests/snapshots/
 # Brand asset generator scratch
 __pycache__/
 brand/.render/
+brand/.render-*/
+brand/.iconset-*/
+brand/.preview/
