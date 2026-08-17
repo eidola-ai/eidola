@@ -611,6 +611,96 @@ fn a_regeneration_mid_walk_is_planned_once_at_its_visible_tip() {
     });
 }
 
+/// **A failed regeneration of the starting tail is not quoted.** The walk
+/// snapshots the room's last word, then awaits before it remaps the first
+/// pop; a fail-regen in that window leaves a hidden `error` tip. Skipping it
+/// is right — and used to empty the leaf set, so `finish` fell back to the
+/// snapshot, which settlement no longer recognizes. The fallback is that
+/// tail as a reader can still see it, or the room's current last word.
+#[test]
+fn a_failed_regeneration_of_the_starting_tail_is_not_quoted() {
+    run(|| {
+        // The driver streams and `regenerate` does not.
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper.clone()]);
+        let room = out.space.id.clone();
+        core.runtime()
+            .block_on(core.add_global_participant(
+                room.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("the reader joins so they can regenerate");
+
+        // The last word is an inference, so a failed regeneration can hide it.
+        // A brief is the wrong kind.
+        let brief = out.brief_action_id.clone();
+        let old = ask(&core, &room, &helper, &brief);
+
+        let _broken = failing_backend(&core);
+        set_model(&core, &helper, EXT2_MODEL);
+
+        // Drop the window so the settlement walk is not paused at the same seam.
+        {
+            let mut window = core.test_open_entry_window();
+            std::thread::scope(|scope| {
+                let walking = scope.spawn(|| drive(&core, &room));
+                let resume = core
+                    .runtime()
+                    .block_on(window.recv())
+                    .expect("the walk reaches its opening window");
+                core.runtime()
+                    .block_on(core.regenerate(old.clone(), EXT2_MODEL.into()))
+                    .expect_err("the regeneration fails upstream");
+                set_model(&core, &helper, MODEL);
+                resume.send(()).expect("the walk resumes");
+                walking.join().expect("the walk finishes").expect("driven");
+            });
+        }
+
+        let error_tip = core
+            .runtime()
+            .block_on(core.test_space_actions(room.clone()))
+            .expect("actions")
+            .into_iter()
+            .find(|a| a.status == "error")
+            .expect("the failed regeneration left a hidden tip")
+            .id;
+        let delivered = report(&core, &parent).expect("the delegation is reported");
+        let quoted: Vec<&str> = delivered
+            .references
+            .iter()
+            .map(|r| r.antecedent_action_id.as_str())
+            .collect();
+        assert!(
+            !quoted.contains(&old.as_str()),
+            "the superseded wording is not a finding: {quoted:?}"
+        );
+        assert!(
+            !quoted.contains(&error_tip.as_str()),
+            "nor the hidden error tip: {quoted:?}"
+        );
+        assert!(
+            quoted.contains(&brief.as_str()),
+            "the room's remaining visible last word is: {quoted:?}"
+        );
+
+        drive(&core, &room).expect("a second walk");
+        assert_eq!(
+            reports(&core, &parent).len(),
+            1,
+            "quoting the visible last word settled the room"
+        );
+    });
+}
+
 /// **The line between "already here" and "arrived while I worked" is drawn
 /// before the first read, not after it.** A walk's opening reads are several
 /// awaits wide; a post committing inside them is not the tail the walk started
