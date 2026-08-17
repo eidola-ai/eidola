@@ -645,7 +645,8 @@ impl Inner {
                 // and a failure changes nothing about the room, so the meter it
                 // reads is the same one every time round and runs out.
                 let failed = result.is_err();
-                if let Err(e) = result {
+                let waiting = matches!(result, Ok(Report::Waiting));
+                if let Err(ref e) = result {
                     eprintln!(
                         "warning: the delegated conversation {space_id} could not be driven: {e}"
                     );
@@ -653,15 +654,23 @@ impl Inner {
                 {
                     let mut running = inner.subspace_drivers.lock().expect("driver map poisoned");
                     match running.get_mut(&space_id) {
-                        // Another pass, on the strongest licence in play: what
-                        // arrived while this one ran, merged with the one it
-                        // ran under, so neither is dropped by the other (see
-                        // [`Arm::merge`]). A retry after a failure keeps its
-                        // own arm for the same reason — the failure did not
-                        // take back what the walk was allowed to conclude.
+                        // Another pass, on the strongest licence in play for
+                        // *this* wait: what arrived while this one ran, merged
+                        // with the one it ran under (see [`Arm::merge`]). A
+                        // retry after a failure keeps its own arm for the same
+                        // reason — the failure did not take back what the walk
+                        // was allowed to conclude. A **successful delivery**
+                        // spends that licence: a Grace queued after the answer
+                        // was found would otherwise skip the ten-minute wait
+                        // of a later continuation. Pending work still runs,
+                        // but as an ordinary signal.
                         Some(pending) if pending.is_some() || failed => {
                             if let Some(next) = pending.take() {
-                                arm = arm.merge(next);
+                                arm = if failed || waiting {
+                                    arm.merge(next)
+                                } else {
+                                    Arm::Signal
+                                };
                             }
                         }
                         _ => {
@@ -874,7 +883,11 @@ impl Inner {
     /// driver owns, is archived, or has already had its last word reported —
     /// which is what makes arming cheap enough to do from a signal every post
     /// raises.
-    pub(crate) async fn drive_subspace(&self, space_id: String, arm: Arm) -> Result<(), AppError> {
+    pub(crate) async fn drive_subspace(
+        &self,
+        space_id: String,
+        arm: Arm,
+    ) -> Result<Report, AppError> {
         let conn = self.db_conn().await?;
         // **Taken before the reads it divides, and taken from the rows.** This
         // is the line between "already in front of me" and "arrived while I was
@@ -900,15 +913,15 @@ impl Inner {
         // long as the process lives. Each terminal exit below clears it.
         let Some(sub) = db::subspace(&conn, &space_id).await? else {
             self.end_anchor_wait(&space_id);
-            return Ok(()); // not a delegated room
+            return Ok(Report::Settled); // not a delegated room
         };
         if sub.archived_at.is_some() {
             self.end_anchor_wait(&space_id);
-            return Ok(()); // archival stops new work, here as everywhere
+            return Ok(Report::Settled); // archival stops new work, here as everywhere
         }
         let Some(tail) = db::last_action_in_space(&conn, &space_id).await? else {
             self.end_anchor_wait(&space_id);
-            return Ok(()); // a room with no posts — unreachable, a brief opens every one
+            return Ok(Report::Settled); // a room with no posts — unreachable, a brief opens every one
         };
         // The entry window is a caller-controlled pause. A turn must not hold
         // a connection across an await it does not own — the same rule as
@@ -929,7 +942,7 @@ impl Inner {
         .await?
         {
             self.end_anchor_wait(&space_id);
-            return Ok(());
+            return Ok(Report::Settled);
         }
         drop(conn);
         // **An ending already decided against this last word is delivered, not
@@ -979,7 +992,7 @@ impl Inner {
                 Some(walked) => walked,
                 None => {
                     self.end_anchor_wait(&space_id);
-                    return Ok(()); // the room closed under us; nothing to report
+                    return Ok(Report::Settled); // the room closed under us; nothing to report
                 }
             }
         } else if let Some(decided) = remembered {
@@ -1000,7 +1013,7 @@ impl Inner {
             // needs this wait. A decided failure still keeps its wait (the
             // branch above): that ending is still owed.
             self.end_anchor_wait(&space_id);
-            return Ok(());
+            return Ok(Report::Settled);
         };
         let (end, leaves) = walked;
         // **A wait tried nothing — but a failure before the wait tried
@@ -1038,7 +1051,13 @@ impl Inner {
             // ending from being retried past the work that earned it.
             Err(_) => self.forget_ending(&space_id),
         }
-        outcome.map(|_| ())
+        outcome
+    }
+
+    /// Plan one hop of a walk. A thin name so the cascade can match on the
+    /// `Result` without the `?` that used to skip [`Self::stop_walk`].
+    async fn plan_walk(&self, space_id: &str, post: &str) -> Result<NotificationPlan, AppError> {
+        self.plan_and_refine(space_id, post, Planner::Driver).await
     }
 
     /// The plan → drive → re-plan walk, ending at the first terminal outcome.
@@ -1182,17 +1201,34 @@ impl Inner {
                     )
                     .await;
             }
-            let turns = match self
-                .plan_and_refine(space_id, &post, Planner::Driver)
-                .await?
-            {
-                NotificationPlan::Paused { depth, limit } => {
+            let turns = match self.plan_walk(space_id, &post).await {
+                Ok(NotificationPlan::Paused { depth, limit }) => {
                     planned += 1;
                     paused.get_or_insert((depth, limit));
                     leaves.push(post.clone());
                     continue;
                 }
-                NotificationPlan::Turns(turns) => turns,
+                Ok(NotificationPlan::Turns(turns)) => turns,
+                Err(AppError::SpaceArchived { .. }) => return Ok(None),
+                Err(e) => {
+                    // Same door as a driven turn that failed: the error's own
+                    // words stop here, the report carries a category, and the
+                    // room is not left outstanding with nothing to arm it.
+                    eprintln!(
+                        "warning: planning in the delegated conversation {space_id} failed: {e}"
+                    );
+                    return self
+                        .stop_walk(
+                            space_id,
+                            DelegationEnd::failed(&e),
+                            with(leaves, post),
+                            &frontier,
+                            &tail,
+                            since_row,
+                            &served,
+                        )
+                        .await;
+                }
             };
             // A hop that persists a turn is already in `taken`. Counting it
             // here as well would spend the ceiling twice on the common path.
@@ -1214,6 +1250,13 @@ impl Inner {
             for turn in turns {
                 let conn = self.db_conn().await?;
                 let taken = db::turns_taken_in_space(&conn, space_id).await?;
+                // **The target is a generation, not an item.** A fan-out
+                // shares one `target_action_id` across several responders and
+                // drives them in sequence; an edit or regeneration of that
+                // post after the first reply would otherwise leave the rest
+                // answering wording the transcript has hidden, and the refill
+                // would then plan the replacement too.
+                let target = db::visible_tip_of_action(&conn, &turn.target_action_id).await?;
                 drop(conn);
                 if taken.saturating_add(planned) >= MAX_DELEGATION_TURNS {
                     return self
@@ -1230,6 +1273,13 @@ impl Inner {
                         )
                         .await;
                 }
+                let Some(target) = target else {
+                    continue;
+                };
+                let turn = PlannedTurn {
+                    target_action_id: target,
+                    ..turn
+                };
                 match Box::pin(self.drive_planned_turn(space_id, &turn)).await {
                     // A turn that wrote a post is a post to re-plan from, and
                     // the room's newest word; a turn that declined wrote a
@@ -1343,6 +1393,35 @@ impl Inner {
         db::last_action_in_space(conn, space_id).await
     }
 
+    /// Each finding as a reader can still see it. An edit or regeneration that
+    /// lands after the walk collected the id is one wording; a hidden tip is
+    /// skipped. An empty set falls back the way [`finish`] does.
+    async fn visible_quoted_leaves(
+        conn: &turso::Connection,
+        space_id: &str,
+        leaves: &[String],
+    ) -> Result<Vec<String>, AppError> {
+        let mut quoted: Vec<String> = Vec::new();
+        for id in leaves {
+            let Some(tip) = db::visible_tip_of_action(conn, id).await? else {
+                continue;
+            };
+            if !quoted.contains(&tip) {
+                quoted.push(tip);
+            }
+        }
+        if quoted.is_empty() {
+            let fallback = match leaves.first() {
+                Some(id) => Self::visible_fallback(conn, space_id, id).await?,
+                None => db::last_action_in_space(conn, space_id).await?,
+            };
+            if let Some(tip) = fallback {
+                quoted.push(tip);
+            }
+        }
+        Ok(quoted)
+    }
+
     /// One driven turn — the same door `respond_stream_as` takes, minus a
     /// consumer to stream to.
     ///
@@ -1407,45 +1486,10 @@ impl Inner {
             self.end_anchor_wait(&sub.id);
             return Ok(Report::Settled);
         }
-        // One attachment per finding, at ordinals `1..=N` in the order the walk
-        // found them — every one of them, because each is a branch nothing
-        // followed and only the room's own last word among them settles the
-        // delegation (see [`finish`]). The **edge** names the whole passage; the
-        // report turn's *rendering* of it is what is clipped, at the seam every
-        // attached passage renders through.
-        let mut attached: Vec<AttachedReference> = Vec::with_capacity(leaves.len());
-        for (i, leaf) in leaves.iter().enumerate() {
-            let (content_block_id, range_start, range_end) =
-                match db::first_quotable_block(&conn, leaf).await? {
-                    Some((block_id, text)) if !text.is_empty() => {
-                        (Some(block_id), Some(0), Some(text.len() as i64))
-                    }
-                    // No text to quote still gets an edge — a pointer to the
-                    // post rather than a quote of it, which is what a
-                    // range-less reference means everywhere.
-                    _ => (None, None, None),
-                };
-            // Named the way every other reference read names an author: the
-            // label that post's **own space** gives them, with no liveness
-            // filter — so an agent retired between writing the finding and its
-            // being reported is still named, rather than degrading to an
-            // anonymous post from somewhere else.
-            let author_label = db::post_author_label(&conn, leaf).await?;
-            attached.push(AttachedReference {
-                ordinal: (i + 1) as i64,
-                origin: AttachmentOrigin::Authored,
-                spec: ReferenceSpec {
-                    antecedent_action_id: leaf.clone(),
-                    content_block_id,
-                    range_start,
-                    range_end,
-                    // Typed, not a sentence: this is persisted, and a persisted
-                    // sentence is read as-is in every language.
-                    annotation: Some(end.token()),
-                },
-                author_label,
-            });
-        }
+        // The anchor window is a caller-controlled pause. A turn must not hold
+        // a connection across an await it does not own, and a test that writes
+        // a finding during the pause needs the lock.
+        drop(conn);
 
         // Where it attaches. The anchor is the post in the parent this
         // delegation was opened from, captured at the spawn because only the
@@ -1481,6 +1525,7 @@ impl Inner {
                         message: "test: the anchor lookup is made to fail".into(),
                     });
                 }
+                let conn = self.db_conn().await?;
                 match db::last_reply_by_participant(
                     &conn,
                     &sub.parent_space_id,
@@ -1540,21 +1585,67 @@ impl Inner {
             // behind it. The owner's own last word is the best available guess
             // and the conversation's tail is the fallback behind that; both are
             // honest, and neither is as good as an anchor.
-            None => match db::last_post_by_participant(
-                &conn,
-                &sub.parent_space_id,
-                &sub.owner_participant_id,
-            )
-            .await?
-            {
-                Some(id) => Some(id),
-                None => db::last_action_in_space(&conn, &sub.parent_space_id).await?,
-            },
+            None => {
+                let conn = self.db_conn().await?;
+                match db::last_post_by_participant(
+                    &conn,
+                    &sub.parent_space_id,
+                    &sub.owner_participant_id,
+                )
+                .await?
+                {
+                    Some(id) => Some(id),
+                    None => db::last_action_in_space(&conn, &sub.parent_space_id).await?,
+                }
+            }
         };
         let Some(target) = target else {
             self.end_anchor_wait(&sub.id);
             return Ok(Report::Settled); // an empty parent has nothing to reply to
         };
+
+        // **The findings are generations, remapped immediately before the
+        // turn.** An edit or regeneration that lands after the walk collected
+        // them — including during the anchor wait above — would otherwise
+        // quote wording the transcript has hidden, and settlement reads the
+        // visible last word, which is no longer that id. Ordinary human quotes
+        // are not remapped at persist: those name a concrete generation on
+        // purpose. This is the report's own attachments.
+        let conn = self.db_conn().await?;
+        let leaves = Self::visible_quoted_leaves(&conn, &sub.id, &leaves).await?;
+        let mut attached: Vec<AttachedReference> = Vec::with_capacity(leaves.len());
+        for (i, leaf) in leaves.iter().enumerate() {
+            let (content_block_id, range_start, range_end) =
+                match db::first_quotable_block(&conn, leaf).await? {
+                    Some((block_id, text)) if !text.is_empty() => {
+                        (Some(block_id), Some(0), Some(text.len() as i64))
+                    }
+                    // No text to quote still gets an edge — a pointer to the
+                    // post rather than a quote of it, which is what a
+                    // range-less reference means everywhere.
+                    _ => (None, None, None),
+                };
+            // Named the way every other reference read names an author: the
+            // label that post's **own space** gives them, with no liveness
+            // filter — so an agent retired between writing the finding and its
+            // being reported is still named, rather than degrading to an
+            // anonymous post from somewhere else.
+            let author_label = db::post_author_label(&conn, leaf).await?;
+            attached.push(AttachedReference {
+                ordinal: (i + 1) as i64,
+                origin: AttachmentOrigin::Authored,
+                spec: ReferenceSpec {
+                    antecedent_action_id: leaf.clone(),
+                    content_block_id,
+                    range_start,
+                    range_end,
+                    // Typed, not a sentence: this is persisted, and a persisted
+                    // sentence is read as-is in every language.
+                    annotation: Some(end.token()),
+                },
+                author_label,
+            });
+        }
         drop(conn);
 
         let directive = TurnDirective {

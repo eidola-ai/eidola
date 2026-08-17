@@ -1614,6 +1614,12 @@ struct Inner {
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
     ordinary_spaces: Mutex<std::collections::HashSet<String>>,
+    /// How many upcoming plans should fail, the way a transient store error
+    /// would — the seam behind a planner failure becoming a reported ending
+    /// (see [`Inner::plan_walk`]). Set only by
+    /// [`AppCore::test_fail_next_plans`].
+    #[cfg(feature = "test-support")]
+    plan_faults: std::sync::atomic::AtomicU32,
     /// How many upcoming live-room enumerations should fail, the way a
     /// transient store error would — the seam behind the sweep's retry (see
     /// `Inner::rearm_live_subspaces`). Set only by
@@ -7560,6 +7566,21 @@ impl Inner {
         post_action_id: &str,
         planner: Planner,
     ) -> Result<NotificationPlan, AppError> {
+        #[cfg(feature = "test-support")]
+        if planner == Planner::Driver
+            && self
+                .plan_faults
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+        {
+            return Err(AppError::Config {
+                message: "test: the plan is made to fail".into(),
+            });
+        }
         // **A delegated room's turns belong to the driver, and only to it.**
         // An agent-spawned sub-space has no window of its own, so app-core
         // gives it turns itself (see [`subspace_driver`]); a consumer that also
@@ -8147,6 +8168,8 @@ impl AppCore {
                 #[cfg(feature = "test-support")]
                 entry_window: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
+                #[cfg(feature = "test-support")]
+                plan_faults: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(feature = "test-support")]
                 enumeration_faults: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(feature = "test-support")]
@@ -9392,6 +9415,17 @@ impl AppCore {
             .await;
     }
 
+    /// Test-only seam: make the next `n` plans fail, the way a transient store
+    /// error would — what turns a planner failure into a reported ending
+    /// rather than a walk that dies with the room still outstanding.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_fail_next_plans(&self, n: u32) {
+        self.inner
+            .plan_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Test-only seam: make the next `n` live-room enumerations fail, the way
     /// a transient store error would — what the sweep's retry recovers from
     /// (see `Inner::rearm_live_subspaces`).
@@ -9488,6 +9522,7 @@ impl AppCore {
             })
             .await
             .map_err(join_err)?
+            .map(|_| ())
     }
 
     /// Test-only seam: pin the engine-pool memory budget so eviction tests

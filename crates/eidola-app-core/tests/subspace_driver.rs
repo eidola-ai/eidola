@@ -428,6 +428,39 @@ fn a_failed_turn_is_reported_rather_than_swallowed() {
     });
 }
 
+/// **A planner failure is a reported ending, not a walk that dies.**
+/// `plan_and_refine` used to `?` out of the cascade, which skipped
+/// `stop_walk` and left the room outstanding with nothing to arm it until
+/// the process restarted. A configuration fault here is the same channel a
+/// driven turn already takes.
+#[test]
+fn a_failed_plan_is_reported_rather_than_swallowed() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        core.test_fail_next_plans(1);
+        drive(&core, &out.space.id).expect("a failed plan is not a failed drive");
+
+        assert_eq!(
+            tree(&core, &out.space.id).len(),
+            1,
+            "the failing plan wrote no post"
+        );
+        let report = report(&core, &parent).expect("failure is information, not silence");
+        assert_eq!(
+            report.references[0].delegation_end,
+            Some(DelegationEnd::TurnFailed {
+                reason: DelegationFailure::Configuration
+            }),
+            "the failure is reported as a bounded category"
+        );
+    });
+}
+
 /// **Closing a conversation stops the delegation it was running, before the
 /// report gate ever comes into it.** An archived parent would refuse the report
 /// at the gate every turn meets — but that state is no longer one a room can
@@ -611,6 +644,97 @@ fn a_regeneration_mid_walk_is_planned_once_at_its_visible_tip() {
     });
 }
 
+/// **An edit of a fan-out's target is answered at its visible tip.** Two
+/// helpers share one `target_action_id`; they are driven in sequence. An edit
+/// after the first reply used to leave the second answering wording the
+/// transcript had hidden. Remapping each target before it is driven makes the
+/// remaining turns quote the edit. (A brief cannot be edited — `WrongPostKind`
+/// — so the target here is a human post. Regenerating the first helper's
+/// *answer* is a different seam: that id sits on the frontier, not on the
+/// remaining turns' target.)
+#[test]
+fn an_edit_of_a_fan_out_target_is_answered_at_its_visible_tip() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let a = shared_agent(&core, &parent, "Surveyor");
+        let b = shared_agent(&core, &parent, "Pilot");
+        let out = spawn(&core, &parent, &owner, vec![a, b]);
+        let room = out.space.id.clone();
+        core.runtime()
+            .block_on(core.add_global_participant(
+                room.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("the reader joins so they can post and edit");
+
+        let old = core
+            .runtime()
+            .block_on(core.post("What about Friday?".into(), Some(room.clone())))
+            .expect("the watched-room post")
+            .action_id;
+
+        let mut window = core.test_open_cascade_window();
+        let (old, tip) = std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &room));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches its window");
+            let first = core
+                .runtime()
+                .block_on(core.test_space_actions(room.clone()))
+                .expect("actions")
+                .into_iter()
+                .find(|a| a.action_type == "inference")
+                .expect("the first helper has answered");
+            assert_eq!(
+                first.reply_to.as_deref(),
+                Some(old.as_str()),
+                "the first helper answered the wording that was visible then"
+            );
+            let tip = core
+                .runtime()
+                .block_on(core.edit_post(old.clone(), "What about Saturday?".into()))
+                .expect("edit the target")
+                .action_id;
+            assert_ne!(tip, old, "it really is a new generation");
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+            (old, tip)
+        });
+
+        let replies: Vec<(String, Option<String>)> = core
+            .runtime()
+            .block_on(core.test_space_actions(room.clone()))
+            .expect("actions")
+            .into_iter()
+            .filter(|a| a.action_type == "inference")
+            .map(|a| (a.id, a.reply_to))
+            .collect();
+        let to_old = replies
+            .iter()
+            .filter(|(_, parent)| parent.as_deref() == Some(old.as_str()))
+            .count();
+        assert_eq!(
+            to_old, 1,
+            "only the reply written before the edit names the old generation: {replies:?}"
+        );
+        assert!(
+            replies
+                .iter()
+                .any(|(_, parent)| parent.as_deref() == Some(tip.as_str())),
+            "a later helper answered the visible edit: {replies:?}"
+        );
+    });
+}
+
 /// **A failed regeneration of the starting tail is not quoted.** The walk
 /// snapshots the room's last word, then awaits before it remaps the first
 /// pop; a fail-regen in that window leaves a hidden `error` tip. Skipping it
@@ -690,6 +814,89 @@ fn a_failed_regeneration_of_the_starting_tail_is_not_quoted() {
         assert!(
             quoted.contains(&brief.as_str()),
             "the room's remaining visible last word is: {quoted:?}"
+        );
+
+        drive(&core, &room).expect("a second walk");
+        assert_eq!(
+            reports(&core, &parent).len(),
+            1,
+            "quoting the visible last word settled the room"
+        );
+    });
+}
+
+/// **A regeneration of a finding is quoted at its visible tip.** The walk
+/// collects leaves, then awaits in the report's anchor window before it
+/// attaches them; a regen in that window used to leave the report naming the
+/// old generation, so settlement — which reads the visible last word — failed
+/// and another cascade was billed. Remapping at attach, after the wait, makes
+/// the quote the wording a reader still sees. Ordinary human quotes are not
+/// remapped at persist: those name a concrete generation on purpose.
+#[test]
+fn a_regeneration_of_a_finding_is_quoted_at_its_visible_tip() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        // The owner has already answered, so the report can attach after the
+        // pause rather than waiting. The pause is still taken — that is the
+        // window a finding can change in.
+        ask(&core, &parent, &owner, &asked);
+        let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], Some(&asked));
+        let room = out.space.id.clone();
+        core.runtime()
+            .block_on(core.add_global_participant(
+                room.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("the reader joins so they can regenerate");
+
+        let mut window = core.test_open_anchor_window();
+        let (old, tip) = std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &room));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches the report's window");
+            let old = tree(&core, &room)
+                .into_iter()
+                .find(|n| n.action_type == "inference")
+                .expect("the helper has answered")
+                .action_id;
+            core.runtime()
+                .block_on(core.regenerate(old.clone(), MODEL.to_string()))
+                .expect("regenerate the finding");
+            let tip = tree(&core, &room)
+                .into_iter()
+                .find(|n| n.action_type == "inference")
+                .expect("the regenerated finding is visible")
+                .action_id;
+            assert_ne!(tip, old, "it really is a new generation");
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+            (old, tip)
+        });
+
+        let delivered = report(&core, &parent).expect("the delegation is reported");
+        let quoted: Vec<&str> = delivered
+            .references
+            .iter()
+            .map(|r| r.antecedent_action_id.as_str())
+            .collect();
+        assert!(
+            quoted.contains(&tip.as_str()),
+            "the visible finding is what the report quotes: {quoted:?}"
+        );
+        assert!(
+            !quoted.contains(&old.as_str()),
+            "the superseded wording is not a finding: {quoted:?}"
         );
 
         drive(&core, &room).expect("a second walk");
