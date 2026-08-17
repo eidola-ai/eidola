@@ -203,6 +203,14 @@ pub const MAX_ATTEMPTS_PER_TAIL: u32 = 3;
 /// a blip and hammering an upstream that is away, not a backoff schedule.
 const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How many times the owner may retry a report whose generation was
+/// withdrawn at persist because a finding or the attach target moved while
+/// the model request was in flight. The cascade has already finished; these
+/// are extra report turns, not extra walks. Past this the ending is kept and
+/// the room waits to be armed again, so a reader who keeps regenerating
+/// cannot bill an unbounded number of reports and cannot force a re-cascade.
+const MAX_REPORT_ATTEMPTS: u32 = 3;
+
 /// How long a delegation holds out for the post it was opened from to be
 /// answered before reporting against that post instead.
 ///
@@ -1476,224 +1484,226 @@ impl Inner {
         leaves: Vec<String>,
         arm: Arm,
     ) -> Result<Report, AppError> {
-        let conn = self.db_conn().await?;
-        // **The room is re-read one last time before anything acts.** An
-        // archival can land during the walk — a retirement archives every room
-        // its agent owned — and a report about a conversation somebody closed
-        // is a message nobody asked for about work nobody wants continued. One
-        // read, the same shape as every other liveness gate here.
-        if !db::is_live_subspace(&conn, &sub.id).await? {
-            self.end_anchor_wait(&sub.id);
-            return Ok(Report::Settled);
-        }
-        // The anchor window is a caller-controlled pause. A turn must not hold
-        // a connection across an await it does not own, and a test that writes
-        // a finding during the pause needs the lock.
-        drop(conn);
-
-        // Where it attaches. The anchor is the post in the parent this
-        // delegation was opened from, captured at the spawn because only the
-        // caller knew it; the report belongs on *that* branch, beneath the
-        // owner's own answer there.
-        let target = match sub.parent_action_id.as_deref() {
-            Some(anchor) => {
-                // **Registered before the question is asked, not after it.**
-                // The answer can commit between the two, and its
-                // `Change::Space` is the only thing that would ever wake this
-                // room again: asking first and registering second leaves a
-                // window in which that change finds nothing registered, and the
-                // registration that follows then waits for a wake-up already
-                // gone by. Registering first closes it by ordering — a commit
-                // is either early enough for the query to see it or late enough
-                // for the entry to be there — at the cost of an entry to take
-                // back out on every path that does not wait, which is what
-                // `end_anchor_wait` is for.
-                self.begin_anchor_wait(sub);
-                #[cfg(feature = "test-support")]
-                self.pause_in_anchor_window().await;
-                #[cfg(feature = "test-support")]
-                if self
-                    .anchor_lookup_faults
-                    .fetch_update(
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                        |n| n.checked_sub(1),
-                    )
-                    .is_ok()
-                {
-                    return Err(AppError::Config {
-                        message: "test: the anchor lookup is made to fail".into(),
-                    });
-                }
-                let conn = self.db_conn().await?;
-                match db::last_reply_by_participant(
-                    &conn,
-                    &sub.parent_space_id,
-                    &sub.owner_participant_id,
-                    anchor,
-                )
-                .await?
-                {
-                    Some(answer) => {
-                        self.end_anchor_wait(&sub.id);
-                        Some(answer)
-                    }
-                    // **The owner has not answered the anchor yet**, which is
-                    // not an ordinary absence: a spawn happens inside the
-                    // owner's turn, so this state means that turn is still in
-                    // flight (or failed). Reporting now would make the report
-                    // the first reply to the anchor and the owner's own answer
-                    // an indented branch off it — durably the wrong way round.
-                    // So the delegation stays outstanding and the room waits for
-                    // its parent to change, which the answer (or the failure)
-                    // will do.
-                    //
-                    // **It goes on waiting until the answer is actually
-                    // there.** A wake-up is not evidence of one: the parent is
-                    // an ordinary conversation and anything at all can move it,
-                    // so a wait that spent itself on the first wake would attach
-                    // to the anchor because somebody said something unrelated,
-                    // and the answer — arriving a moment later — would become
-                    // the report's sibling instead of its parent. Every wake
-                    // re-asks, and only the answer ends the wait.
-                    //
-                    // **Termination is a licence, and a signal is not one.**
-                    // Waiting costs nothing — no turn, no spend, no row — so an
-                    // indefinite one is not a leak, it is a room correctly
-                    // declining to guess. What it must not be is permanent, so
-                    // two arms end it and both claim something a wake-up does
-                    // not: this wait's own alarm (`Arm::Grace`), set when it
-                    // began and honoured whenever it arrives — including on a
-                    // room that happens to be mid-walk, which is why the
-                    // pending arm is a value — and the startup sweep behind it
-                    // for a process that died inside the grace. The case where
-                    // the answer never comes at all is a spawning
-                    // turn that died; that process cannot outlive its own crash,
-                    // and the next start's sweep arms with `Arm::Sweep`, which
-                    // never waits — at that moment nothing can still be in
-                    // flight, so the answer either exists or never will, and the
-                    // anchor is then the right attachment because there is
-                    // nothing for the report to sit beneath.
-                    None if arm == Arm::Signal => return Ok(Report::Waiting),
-                    None => {
-                        self.end_anchor_wait(&sub.id);
-                        Some(anchor.to_string())
-                    }
-                }
-            }
-            // A spawn that named no anchor — a direct API caller with no turn
-            // behind it. The owner's own last word is the best available guess
-            // and the conversation's tail is the fallback behind that; both are
-            // honest, and neither is as good as an anchor.
-            None => {
-                let conn = self.db_conn().await?;
-                match db::last_post_by_participant(
-                    &conn,
-                    &sub.parent_space_id,
-                    &sub.owner_participant_id,
-                )
-                .await?
-                {
-                    Some(id) => Some(id),
-                    None => db::last_action_in_space(&conn, &sub.parent_space_id).await?,
-                }
-            }
-        };
-        let Some(target) = target else {
-            self.end_anchor_wait(&sub.id);
-            return Ok(Report::Settled); // an empty parent has nothing to reply to
-        };
-
-        // **The findings are generations, remapped immediately before the
-        // turn and again at persist.** An edit or regeneration that lands
-        // after the walk collected them — including during the anchor wait
-        // above — would otherwise quote wording the transcript has hidden,
-        // and settlement reads the visible last word, which is no longer
-        // that id. Ordinary human quotes are not remapped at persist: those
-        // name a concrete generation on purpose. This is the report's own
-        // attachments; persist rewrites them inside the transaction so a
-        // regen while the model request is in flight is still the visible
-        // tip.
-        let conn = self.db_conn().await?;
-        let leaves = Self::visible_quoted_leaves(&conn, &sub.id, &leaves).await?;
-        let mut attached: Vec<AttachedReference> = Vec::with_capacity(leaves.len());
-        for (i, leaf) in leaves.iter().enumerate() {
-            let (content_block_id, range_start, range_end) =
-                match db::first_quotable_block(&conn, leaf).await? {
-                    Some((block_id, text)) if !text.is_empty() => {
-                        (Some(block_id), Some(0), Some(text.len() as i64))
-                    }
-                    // No text to quote still gets an edge — a pointer to the
-                    // post rather than a quote of it, which is what a
-                    // range-less reference means everywhere.
-                    _ => (None, None, None),
-                };
-            // Named the way every other reference read names an author: the
-            // label that post's **own space** gives them, with no liveness
-            // filter — so an agent retired between writing the finding and its
-            // being reported is still named, rather than degrading to an
-            // anonymous post from somewhere else.
-            let author_label = db::post_author_label(&conn, leaf).await?;
-            attached.push(AttachedReference {
-                ordinal: (i + 1) as i64,
-                origin: AttachmentOrigin::Authored,
-                spec: ReferenceSpec {
-                    antecedent_action_id: leaf.clone(),
-                    content_block_id,
-                    range_start,
-                    range_end,
-                    // Typed, not a sentence: this is persisted, and a persisted
-                    // sentence is read as-is in every language.
-                    annotation: Some(end.token()),
-                },
-                author_label,
-            });
-        }
-        drop(conn);
-
-        let directive = TurnDirective {
-            attached,
-            mechanical: true,
-            reporting_on: Some(sub.id.clone()),
-        };
-        // Dropped before the turn runs, for the reason the driven turns' is.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
-        drop(rx);
-        let result = Box::pin(self.run_turn_stream(
-            &sub.parent_space_id,
-            TurnSelector::Participant(sub.owner_participant_id.clone()),
-            &target,
-            ResponseMode::Reply,
-            None,
-            &directive,
-            tx,
-        ))
-        .await?;
-        // **A report that wrote no post is not a report.** The reference edge
-        // rides the answer, so without one the delegation has said nothing and
-        // is still outstanding — which is the truth, and saying so loudly is
-        // what keeps it from being mistaken for a delivery. Unreachable while
-        // the directive withdraws the decline checkpoint (the only way a turn
-        // ends postless), and kept as the thing that would notice if it stopped
-        // being.
-        if result.response_action_id.is_none() {
-            // A closed room suppresses the generation at persist. Anything
-            // else postless is the unreachable decline, which we still
-            // refuse so it cannot be mistaken for a delivery.
+        for _attempt in 0..MAX_REPORT_ATTEMPTS {
             let conn = self.db_conn().await?;
+            // **The room is re-read one last time before anything acts.** An
+            // archival can land during the walk — a retirement archives every room
+            // its agent owned — and a report about a conversation somebody closed
+            // is a message nobody asked for about work nobody wants continued. One
+            // read, the same shape as every other liveness gate here.
             if !db::is_live_subspace(&conn, &sub.id).await? {
                 self.end_anchor_wait(&sub.id);
                 return Ok(Report::Settled);
             }
-            return Err(AppError::Internal {
-                message: format!(
-                    "the report for delegated conversation {} produced no post",
-                    sub.id
-                ),
-            });
+            // The anchor window is a caller-controlled pause. A turn must not hold
+            // a connection across an await it does not own, and a test that writes
+            // a finding during the pause needs the lock.
+            drop(conn);
+
+            // Where it attaches. The anchor is the post in the parent this
+            // delegation was opened from, captured at the spawn because only the
+            // caller knew it; the report belongs on *that* branch, beneath the
+            // owner's own answer there.
+            let target = match sub.parent_action_id.as_deref() {
+                Some(anchor) => {
+                    // **Registered before the question is asked, not after it.**
+                    // The answer can commit between the two, and its
+                    // `Change::Space` is the only thing that would ever wake this
+                    // room again: asking first and registering second leaves a
+                    // window in which that change finds nothing registered, and the
+                    // registration that follows then waits for a wake-up already
+                    // gone by. Registering first closes it by ordering — a commit
+                    // is either early enough for the query to see it or late enough
+                    // for the entry to be there — at the cost of an entry to take
+                    // back out on every path that does not wait, which is what
+                    // `end_anchor_wait` is for.
+                    self.begin_anchor_wait(sub);
+                    #[cfg(feature = "test-support")]
+                    self.pause_in_anchor_window().await;
+                    #[cfg(feature = "test-support")]
+                    if self
+                        .anchor_lookup_faults
+                        .fetch_update(
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                            |n| n.checked_sub(1),
+                        )
+                        .is_ok()
+                    {
+                        return Err(AppError::Config {
+                            message: "test: the anchor lookup is made to fail".into(),
+                        });
+                    }
+                    let conn = self.db_conn().await?;
+                    match db::last_reply_by_participant(
+                        &conn,
+                        &sub.parent_space_id,
+                        &sub.owner_participant_id,
+                        anchor,
+                    )
+                    .await?
+                    {
+                        Some(answer) => {
+                            self.end_anchor_wait(&sub.id);
+                            Some(answer)
+                        }
+                        // **The owner has not answered the anchor yet**, which is
+                        // not an ordinary absence: a spawn happens inside the
+                        // owner's turn, so this state means that turn is still in
+                        // flight (or failed). Reporting now would make the report
+                        // the first reply to the anchor and the owner's own answer
+                        // an indented branch off it — durably the wrong way round.
+                        // So the delegation stays outstanding and the room waits for
+                        // its parent to change, which the answer (or the failure)
+                        // will do.
+                        //
+                        // **It goes on waiting until the answer is actually
+                        // there.** A wake-up is not evidence of one: the parent is
+                        // an ordinary conversation and anything at all can move it,
+                        // so a wait that spent itself on the first wake would attach
+                        // to the anchor because somebody said something unrelated,
+                        // and the answer — arriving a moment later — would become
+                        // the report's sibling instead of its parent. Every wake
+                        // re-asks, and only the answer ends the wait.
+                        //
+                        // **Termination is a licence, and a signal is not one.**
+                        // Waiting costs nothing — no turn, no spend, no row — so an
+                        // indefinite one is not a leak, it is a room correctly
+                        // declining to guess. What it must not be is permanent, so
+                        // two arms end it and both claim something a wake-up does
+                        // not: this wait's own alarm (`Arm::Grace`), set when it
+                        // began and honoured whenever it arrives — including on a
+                        // room that happens to be mid-walk, which is why the
+                        // pending arm is a value — and the startup sweep behind it
+                        // for a process that died inside the grace. The case where
+                        // the answer never comes at all is a spawning
+                        // turn that died; that process cannot outlive its own crash,
+                        // and the next start's sweep arms with `Arm::Sweep`, which
+                        // never waits — at that moment nothing can still be in
+                        // flight, so the answer either exists or never will, and the
+                        // anchor is then the right attachment because there is
+                        // nothing for the report to sit beneath.
+                        None if arm == Arm::Signal => return Ok(Report::Waiting),
+                        None => {
+                            self.end_anchor_wait(&sub.id);
+                            Some(anchor.to_string())
+                        }
+                    }
+                }
+                // A spawn that named no anchor — a direct API caller with no turn
+                // behind it. The owner's own last word is the best available guess
+                // and the conversation's tail is the fallback behind that; both are
+                // honest, and neither is as good as an anchor.
+                None => {
+                    let conn = self.db_conn().await?;
+                    match db::last_post_by_participant(
+                        &conn,
+                        &sub.parent_space_id,
+                        &sub.owner_participant_id,
+                    )
+                    .await?
+                    {
+                        Some(id) => Some(id),
+                        None => db::last_action_in_space(&conn, &sub.parent_space_id).await?,
+                    }
+                }
+            };
+            let Some(target) = target else {
+                self.end_anchor_wait(&sub.id);
+                return Ok(Report::Settled); // an empty parent has nothing to reply to
+            };
+
+            // **The findings are generations, remapped immediately before the
+            // turn.** An edit or regeneration that lands after the walk collected
+            // them — including during the anchor wait above — would otherwise
+            // quote wording the transcript has hidden, and settlement reads the
+            // visible last word, which is no longer that id. Persist does not
+            // rewrite the edges: a regen while the model request is in flight
+            // would then attach a footnote to wording the report never saw. The
+            // generation is withdrawn instead, and this loop retries against the
+            // visible tips. Ordinary human quotes are not remapped at persist:
+            // those name a concrete generation on purpose.
+            let conn = self.db_conn().await?;
+            let quoted = Self::visible_quoted_leaves(&conn, &sub.id, &leaves).await?;
+            let mut attached: Vec<AttachedReference> = Vec::with_capacity(quoted.len());
+            for (i, leaf) in quoted.iter().enumerate() {
+                let (content_block_id, range_start, range_end) =
+                    match db::first_quotable_block(&conn, leaf).await? {
+                        Some((block_id, text)) if !text.is_empty() => {
+                            (Some(block_id), Some(0), Some(text.len() as i64))
+                        }
+                        // No text to quote still gets an edge — a pointer to the
+                        // post rather than a quote of it, which is what a
+                        // range-less reference means everywhere.
+                        _ => (None, None, None),
+                    };
+                // Named the way every other reference read names an author: the
+                // label that post's **own space** gives them, with no liveness
+                // filter — so an agent retired between writing the finding and its
+                // being reported is still named, rather than degrading to an
+                // anonymous post from somewhere else.
+                let author_label = db::post_author_label(&conn, leaf).await?;
+                attached.push(AttachedReference {
+                    ordinal: (i + 1) as i64,
+                    origin: AttachmentOrigin::Authored,
+                    spec: ReferenceSpec {
+                        antecedent_action_id: leaf.clone(),
+                        content_block_id,
+                        range_start,
+                        range_end,
+                        // Typed, not a sentence: this is persisted, and a persisted
+                        // sentence is read as-is in every language.
+                        annotation: Some(end.token()),
+                    },
+                    author_label,
+                });
+            }
+            drop(conn);
+
+            let directive = TurnDirective {
+                attached,
+                mechanical: true,
+                reporting_on: Some(sub.id.clone()),
+            };
+            // Dropped before the turn runs, for the reason the driven turns' is.
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            drop(rx);
+            let result = Box::pin(self.run_turn_stream(
+                &sub.parent_space_id,
+                TurnSelector::Participant(sub.owner_participant_id.clone()),
+                &target,
+                ResponseMode::Reply,
+                None,
+                &directive,
+                tx,
+            ))
+            .await?;
+            // **A report that wrote no post is not a report.** The reference edge
+            // rides the answer, so without one the delegation has said nothing and
+            // is still outstanding. A closed room is settled; a finding or attach
+            // target that moved is retried against the wording a reader still
+            // sees. Anything else postless is the unreachable decline — after
+            // the last attempt the room waits rather than being mistaken for a
+            // delivery.
+            if result.response_action_id.is_none() {
+                // A closed room suppresses the generation at persist. A finding
+                // or attach target that moved in flight does the same, so this
+                // loop can rebuild the attachments and retry.
+                let conn = self.db_conn().await?;
+                if !db::is_live_subspace(&conn, &sub.id).await? {
+                    self.end_anchor_wait(&sub.id);
+                    return Ok(Report::Settled);
+                }
+                continue;
+            }
+            self.end_anchor_wait(&sub.id);
+            return Ok(Report::Settled);
         }
-        self.end_anchor_wait(&sub.id);
-        Ok(Report::Settled)
+        // The last persist was withdrawn and the room is still live. Keep
+        // the ending so the next arm is delivery-only, and wait on the
+        // parent so a hidden attach target can become visible again.
+        self.begin_anchor_wait(sub);
+        Ok(Report::Waiting)
     }
 
     /// Register `sub` against its parent, so a change there wakes it.
