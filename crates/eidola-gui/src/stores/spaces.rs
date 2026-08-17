@@ -388,6 +388,15 @@ impl SpacesStore {
         self.reap_after_creation.contains(space_id)
     }
 
+    /// Test seam: whether a disposal for `space_id` has been issued and has
+    /// not yet settled. Pair of [`Self::disposal_deferred_for_test`]: a close
+    /// that still finds the insert in flight defers; a close that finds it
+    /// done issues, and a reopen before that task's first poll sees this.
+    #[doc(hidden)]
+    pub fn disposal_in_flight_for_test(&self, space_id: &str) -> bool {
+        self.reap_tasks.contains_key(space_id)
+    }
+
     /// Test seam: the spaces app-core reported it actually deleted (see the
     /// `disposed` field).
     #[doc(hidden)]
