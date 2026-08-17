@@ -911,9 +911,11 @@ fn a_regeneration_of_a_finding_is_quoted_at_its_visible_tip() {
 /// **A finding regenerated while the report is in flight is quoted at its
 /// visible tip.** The remap before the turn starts is not enough: a joined
 /// reader can edit or regenerate after the attachments were built and
-/// while the model request is on the wire. Persist remaps again, inside
-/// the transaction that writes the edges, so settlement reads the wording
-/// a reader still sees.
+/// while the model request is on the wire. Persist refuses to rewrite the
+/// edges onto wording the model never saw — it withdraws the generation
+/// instead, and the report retries against the visible tip. Ordinary human
+/// quotes are not remapped at persist: those name a concrete generation on
+/// purpose.
 #[test]
 fn a_regeneration_during_the_report_is_quoted_at_its_visible_tip() {
     run(|| {
@@ -958,11 +960,13 @@ fn a_regeneration_during_the_report_is_quoted_at_its_visible_tip() {
                 .expect("the regenerated finding is visible")
                 .action_id;
             assert_ne!(tip, old, "it really is a new generation");
+            // The withdrawn persist retries; drop the window so the retry
+            // is not held at the same seam.
             resume.send(()).expect("the walk resumes");
+            drop(window);
             walking.join().expect("the walk finishes").expect("driven");
             (old, tip)
         });
-        drop(window);
 
         let delivered = report(&core, &parent).expect("the delegation is reported");
         let quoted: Vec<&str> = delivered
@@ -984,6 +988,140 @@ fn a_regeneration_during_the_report_is_quoted_at_its_visible_tip() {
             reports(&core, &parent).len(),
             1,
             "quoting the visible last word settled the room"
+        );
+    });
+}
+
+/// **An answer regenerated while the report is in flight is reattached.**
+/// Persist-time remap of the findings does not revalidate the post the
+/// report replies to. A successful regeneration of that answer would leave
+/// the report sitting under wording it never read; withdrawing the
+/// generation and retrying looks up the visible tip and attaches there.
+#[test]
+fn a_regeneration_of_the_answer_during_the_report_reattaches() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let answer = ask(&core, &parent, &owner, &asked);
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        let room = out.space.id.clone();
+
+        let mut window = core.test_open_report_persist_window();
+        let tip = std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &room));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches the report's persist window");
+            core.runtime()
+                .block_on(core.regenerate(answer.clone(), MODEL.to_string()))
+                .expect("regenerate the owner's answer while the report is in flight");
+            let tip = tree(&core, &parent)
+                .into_iter()
+                .find(|n| n.parent_action_id.as_deref() == Some(asked.as_str()))
+                .expect("the regenerated answer is visible")
+                .action_id;
+            assert_ne!(tip, answer, "it really is a new generation");
+            resume.send(()).expect("the walk resumes");
+            drop(window);
+            walking.join().expect("the walk finishes").expect("driven");
+            tip
+        });
+
+        let delivered = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            delivered.parent_action_id.as_deref(),
+            Some(tip.as_str()),
+            "beneath the visible answer, not the wording the model never saw"
+        );
+        let raw_target = core
+            .runtime()
+            .block_on(core.test_space_actions(parent.clone()))
+            .expect("actions")
+            .into_iter()
+            .find(|a| a.id == delivered.action_id)
+            .expect("the report row")
+            .reply_to;
+        assert_eq!(
+            raw_target.as_deref(),
+            Some(tip.as_str()),
+            "the persisted reply names the generation the model was shown, not a superseded one rendering remaps to"
+        );
+        assert_ne!(
+            raw_target.as_deref(),
+            Some(answer.as_str()),
+            "the superseded answer is not the attach target"
+        );
+
+        drive(&core, &room).expect("a second walk");
+        assert_eq!(
+            reports(&core, &parent).len(),
+            1,
+            "attaching beneath the visible answer settled the room"
+        );
+    });
+}
+
+/// **A failed regeneration of the answer while the report is in flight
+/// holds the wait.** The selected target is no longer a visible generation,
+/// so persist withdraws the report rather than planting it at the
+/// conversation root. The retry finds nothing visible to sit beneath and
+/// waits until a fresh answer exists.
+#[test]
+fn a_failed_regeneration_of_the_answer_during_the_report_waits() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let answer = ask(&core, &parent, &owner, &asked);
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        let room = out.space.id.clone();
+
+        let mut window = core.test_open_report_persist_window();
+        std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &room));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches the report's persist window");
+            let _broken = failing_backend(&core);
+            set_model(&core, &owner, EXT2_MODEL);
+            core.runtime()
+                .block_on(core.regenerate(answer.clone(), EXT2_MODEL.into()))
+                .expect_err("the regeneration fails upstream");
+            set_model(&core, &owner, MODEL);
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+        });
+        drop(window);
+
+        assert!(
+            report(&core, &parent).is_none(),
+            "a hidden answer is not attached beneath — the wait holds"
+        );
+
+        let answer2 = ask(&core, &parent, &owner, &asked);
+        drive(&core, &room).expect("the room reports once a visible answer exists");
+        assert_eq!(
+            report(&core, &parent)
+                .expect("the delegation is reported")
+                .parent_action_id
+                .as_deref(),
+            Some(answer2.as_str()),
+            "beneath the visible answer"
         );
     });
 }

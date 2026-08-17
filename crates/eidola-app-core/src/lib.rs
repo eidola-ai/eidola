@@ -986,8 +986,9 @@ pub(crate) struct TurnDirective {
     pub(crate) mechanical: bool,
     /// The delegated room a mechanical report is about. Rechecked at persist
     /// so a close that lands while the model request is in flight does not
-    /// write a message about a conversation somebody closed. `None` for every
-    /// other turn.
+    /// write a message about a conversation somebody closed, and so a finding
+    /// or attach target that moved in that window can withdraw the generation
+    /// and retry. `None` for every other turn.
     pub(crate) reporting_on: Option<String>,
 }
 
@@ -1617,10 +1618,11 @@ struct Inner {
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
     /// Test-only rendezvous **immediately before a mechanical report
     /// persists**, after the model request has returned and before the
-    /// generation is committed. A regen of a finding, or an archival of the
-    /// delegated room, that lands while that request is in flight is what
-    /// persist-time remap and liveness exist to survive; this is how a test
-    /// stages them. Same shape as [`Inner::anchor_window`].
+    /// generation is committed. A regen of a finding or of the attach
+    /// target, or an archival of the delegated room, that lands while that
+    /// request is in flight is what persist-time revalidation exists to
+    /// survive; this is how a test stages them. Same shape as
+    /// [`Inner::anchor_window`].
     #[cfg(feature = "test-support")]
     persist_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
@@ -6864,7 +6866,8 @@ impl Inner {
             )
             .await?;
         if response_action_id.is_none() {
-            // A mechanical report whose room closed in flight: the request
+            // A mechanical report whose room closed, or whose attachments
+            // or attach target moved, while it was in flight: the request
             // is in the Record, the parent gained no post.
             self.bus.emit(Change::Record);
             return Ok(RoundOutcome::Final(ChatResult {
@@ -10770,6 +10773,20 @@ struct SpendPrep {
     pre_cred_id: String,
 }
 
+/// Persist-time verdict for a mechanical report. Ordinary turns skip the
+/// check and take [`MechanicalReportGate::Proceed`].
+enum MechanicalReportGate {
+    /// The generation the model produced still names live, visible wording.
+    Proceed,
+    /// The delegated room closed while the request was in flight — keep the
+    /// exchange in the Record and write no post.
+    Closed,
+    /// A finding or the attach target moved after the model consumed it.
+    /// Withdraw the generation so the driver can retry against what a reader
+    /// now sees.
+    Stale,
+}
+
 impl TurnPrep {
     /// Withdraw the navigation tools this turn attached, falling back to the
     /// registry the consumer configured. Idempotent, and a no-op for a turn
@@ -11289,7 +11306,8 @@ impl TurnPrep {
     /// plan, with its reply edge), the context-assembly record (exactly the
     /// actions fed upstream), the response content blocks, and the request row
     /// — and return the inference action id (`None` when a mechanical report
-    /// was suppressed because its room closed in flight). Emissions stay with
+    /// was suppressed: the room closed in flight, or a finding or attach
+    /// target moved after the model consumed it). Emissions stay with
     /// the caller (they differ per exit point; see the table in `tests/bus.rs`).
     ///
     /// `reasoning` is the model's own "thinking" output, when the upstream
@@ -11311,14 +11329,15 @@ impl TurnPrep {
     /// is long over — and this prep's connection is the turn's own, so
     /// nothing else can join the transaction.
     ///
-    /// **A mechanical report revalidates inside this transaction.** Authored
-    /// attachments are remapped to the wording a reader still sees, and the
-    /// room they report on is re-read: a close or a regen that landed while
-    /// the model request was in flight must not persist a quote of hidden
-    /// wording, or a message about a conversation somebody closed. Ordinary
-    /// human quotes are not remapped — those name a concrete generation.
-    /// `None` means the generation was suppressed (the request is still in
-    /// the Record); every other turn returns `Some`.
+    /// **A mechanical report revalidates inside this transaction.** The room
+    /// it reports on is re-read, and each authored attachment and the attach
+    /// target must still be the visible generation the model was shown: a
+    /// close, or a regen that landed while the request was in flight, must
+    /// not persist a quote of wording the report never saw, a reply under a
+    /// hidden answer, or a message about a conversation somebody closed.
+    /// Ordinary human quotes are not checked this way — those name a
+    /// concrete generation. `None` means the generation was suppressed (the
+    /// request is still in the Record); every other turn returns `Some`.
     #[allow(clippy::too_many_arguments)]
     async fn persist_turn(
         &mut self,
@@ -11364,78 +11383,37 @@ impl TurnPrep {
         }
     }
 
-    /// Remap this report's authored attachments to the visible tip, and say
-    /// whether the room they report on is still live. Called inside the persist
-    /// transaction, so the edges and the generation commit together.
-    async fn revalidate_mechanical_report(&mut self) -> Result<bool, AppError> {
+    /// Whether this mechanical report may still be written. Called inside the
+    /// persist transaction so a close or a regen that landed while the model
+    /// request was in flight cannot commit a generation about wording the
+    /// model never saw, or about a room somebody closed. Ordinary turns
+    /// skip the check.
+    async fn revalidate_mechanical_report(&self) -> Result<MechanicalReportGate, AppError> {
         if !self.mechanical {
-            return Ok(true);
+            return Ok(MechanicalReportGate::Proceed);
         }
-        let annotation = self
-            .attached_references
-            .iter()
-            .find_map(|a| a.spec.annotation.clone());
-        let mut remapped: Vec<AttachedReference> = Vec::new();
+        if let Some(room) = &self.reporting_on
+            && !db::is_live_subspace(&self.db_conn, room).await?
+        {
+            return Ok(MechanicalReportGate::Closed);
+        }
         for attached in &self.attached_references {
             if attached.origin != AttachmentOrigin::Authored {
-                remapped.push(attached.clone());
                 continue;
             }
-            let Some(tip) =
-                db::visible_tip_of_action(&self.db_conn, &attached.spec.antecedent_action_id)
-                    .await?
-            else {
-                continue;
-            };
-            remapped.push(
-                Self::authored_attachment(
-                    &self.db_conn,
-                    remapped.len() as i64 + 1,
-                    tip,
-                    attached.spec.annotation.clone(),
-                )
-                .await?,
-            );
+            let tip = db::visible_tip_of_action(&self.db_conn, &attached.spec.antecedent_action_id)
+                .await?;
+            if tip.as_deref() != Some(attached.spec.antecedent_action_id.as_str()) {
+                return Ok(MechanicalReportGate::Stale);
+            }
         }
-        if remapped.is_empty()
-            && let Some(room) = &self.reporting_on
-            && let Some(tip) = db::last_action_in_space(&self.db_conn, room).await?
-        {
-            remapped.push(Self::authored_attachment(&self.db_conn, 1, tip, annotation).await?);
+        if let Some(target) = &self.inf_reply_to {
+            let tip = db::visible_tip_of_action(&self.db_conn, target).await?;
+            if tip.as_deref() != Some(target.as_str()) {
+                return Ok(MechanicalReportGate::Stale);
+            }
         }
-        self.attached_references = remapped;
-        match &self.reporting_on {
-            Some(room) => db::is_live_subspace(&self.db_conn, room).await,
-            None => Ok(true),
-        }
-    }
-
-    async fn authored_attachment(
-        conn: &turso::Connection,
-        ordinal: i64,
-        tip: String,
-        annotation: Option<String>,
-    ) -> Result<AttachedReference, AppError> {
-        let (content_block_id, range_start, range_end) =
-            match db::first_quotable_block(conn, &tip).await? {
-                Some((block_id, text)) if !text.is_empty() => {
-                    (Some(block_id), Some(0), Some(text.len() as i64))
-                }
-                _ => (None, None, None),
-            };
-        let author_label = db::post_author_label(conn, &tip).await?;
-        Ok(AttachedReference {
-            ordinal,
-            origin: AttachmentOrigin::Authored,
-            spec: ReferenceSpec {
-                antecedent_action_id: tip,
-                content_block_id,
-                range_start,
-                range_end,
-                annotation,
-            },
-            author_label,
-        })
+        Ok(MechanicalReportGate::Proceed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11452,19 +11430,23 @@ impl TurnPrep {
         http_status: u16,
         response_body: Vec<u8>,
     ) -> Result<Option<String>, AppError> {
-        if !self.revalidate_mechanical_report().await? {
-            // The room closed while the report was in flight. Keep the
-            // exchange in the Record and write no post about work nobody
-            // wants continued.
-            self.insert_unattached_request(
-                request_body_json,
-                request_at,
-                response_at,
-                http_status,
-                response_body,
-            )
-            .await?;
-            return Ok(None);
+        match self.revalidate_mechanical_report().await? {
+            MechanicalReportGate::Proceed => {}
+            MechanicalReportGate::Closed | MechanicalReportGate::Stale => {
+                // Keep the exchange in the Record. Closed: write no post
+                // about work nobody wants continued. Stale: the model wrote
+                // about wording a reader no longer sees, so the driver
+                // retries rather than settling a misleading footnote.
+                self.insert_unattached_request(
+                    request_body_json,
+                    request_at,
+                    response_at,
+                    http_status,
+                    response_body,
+                )
+                .await?;
+                return Ok(None);
+            }
         }
         let inference_action_id = Uuid::now_v7().to_string();
         db::insert_action(
@@ -11495,11 +11477,10 @@ impl TurnPrep {
         // the ordinals they were shown under — so the numbering in the prompt,
         // the edge in the record, and the footnote a reader sees are one
         // sequence. Ordinary turns write the specs validated at preparation.
-        // A mechanical report remaps authored attachments immediately above,
-        // inside this transaction, so a regen that landed in flight is the
-        // wording a reader still sees. A turn that ends without an inference
-        // (a decline, the round cap) writes none of them, because there is no
-        // post for a quote to hang on.
+        // A mechanical report has already refused to persist if those specs
+        // no longer name the visible generations the model was shown. A turn
+        // that ends without an inference (a decline, the round cap) writes
+        // none of them, because there is no post for a quote to hang on.
         for attached in &self.attached_references {
             db::insert_reference_antecedent(
                 &self.db_conn,
