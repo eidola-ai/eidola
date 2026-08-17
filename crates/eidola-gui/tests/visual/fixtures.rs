@@ -6,7 +6,7 @@
 //! public `eidola_app_core` types — keep it that way so the example (which
 //! links the library, not the test tree) can `#[path]`-include it.
 
-use eidola_app_core::{PostBlock, PostNode, PostParticipant, PostReference};
+use eidola_app_core::{DelegationEnd, PostBlock, PostNode, PostParticipant, PostReference};
 
 /// Build a fixture `PostNode` for the branch/generation snapshot cases. The
 /// flattener's depth/branch metadata is supplied directly so the render can be
@@ -121,6 +121,7 @@ pub fn kitchen_sink_posts() -> Vec<PostNode> {
         range_start: Some(start),
         range_end: Some(end),
         annotation: None,
+        delegation_end: None,
         snippet: None,
         antecedent_author_label: "Ada".into(),
         antecedent_author_kind: "agent".into(),
@@ -354,6 +355,7 @@ pub fn cross_space_reference_posts() -> Vec<PostNode> {
             range_start: Some(here_start),
             range_end: Some(here_end),
             annotation: None,
+            delegation_end: None,
             snippet: Some(quoted_here.into()),
             // What this space calls the participant — carried on every edge,
             // and deliberately *not* what the rail shows for a post it holds
@@ -369,6 +371,7 @@ pub fn cross_space_reference_posts() -> Vec<PostNode> {
             range_start: Some(0),
             range_end: Some(74),
             annotation: None,
+            delegation_end: None,
             snippet: Some(
                 "competence is exactly what makes the question sharp, not what dissolves it".into(),
             ),
@@ -382,6 +385,7 @@ pub fn cross_space_reference_posts() -> Vec<PostNode> {
             range_start: Some(0),
             range_end: Some(58),
             annotation: None,
+            delegation_end: None,
             snippet: Some("a craft that aims past its object is two crafts, badly joined".into()),
             // A space that overrode this participant's label to empty (the
             // schema's "override to empty"). The kind still names them, and
@@ -397,6 +401,7 @@ pub fn cross_space_reference_posts() -> Vec<PostNode> {
             range_start: Some(0),
             range_end: Some(62),
             annotation: None,
+            delegation_end: None,
             snippet: Some("the shepherd fattens the flock for a table it will not sit at".into()),
             // A perfectly valid label, and long enough to eat the row: the
             // byline is capped, the passage keeps its share.
@@ -407,6 +412,73 @@ pub fn cross_space_reference_posts() -> Vec<PostNode> {
     ];
 
     vec![here, reply]
+}
+
+/// A delegation's report as its parent conversation holds it: the owning agent
+/// posts, quoting each helper's finding out of the room it opened, and every
+/// edge carries the ending the driver recorded. Two branches, so the rail shows
+/// what a fan-out actually comes back as.
+pub fn delegation_report_posts() -> Vec<PostNode> {
+    let asked = fixture_post(
+        "d1",
+        "human",
+        "user",
+        "user_input",
+        "Before we commit to Friday: is the tide going to be a problem?",
+        0,
+        false,
+        1,
+    );
+    let mut answer = fixture_post(
+        "d2",
+        "agent",
+        "Navigator",
+        "inference",
+        "I've asked the two of them to look at it properly.",
+        0,
+        false,
+        2,
+    );
+    answer.parent_action_id = Some("d1".into());
+
+    let mut report = fixture_post(
+        "d3",
+        "agent",
+        "Navigator",
+        "inference",
+        "Both came back the same way: Friday morning is fine, Friday evening is not.          Surveyor has the tables; Pilot has the approach.",
+        0,
+        false,
+        3,
+    );
+    report.parent_action_id = Some("d2".into());
+    report.references = vec![
+        PostReference {
+            antecedent_action_id: "s-1".into(),
+            ordinal: 1,
+            content_block_id: Some("blk-surveyor".into()),
+            range_start: Some(0),
+            range_end: Some(66),
+            annotation: None,
+            delegation_end: Some(DelegationEnd::Paused { depth: 2, limit: 2 }),
+            snippet: Some("high water is 06:12 and 18:40; the evening one is the spring".into()),
+            antecedent_author_label: "Surveyor".into(),
+            antecedent_author_kind: "agent".into(),
+        },
+        PostReference {
+            antecedent_action_id: "s-2".into(),
+            ordinal: 2,
+            content_block_id: Some("blk-pilot".into()),
+            range_start: Some(0),
+            range_end: Some(58),
+            annotation: None,
+            delegation_end: Some(DelegationEnd::Paused { depth: 2, limit: 2 }),
+            snippet: Some("we would be crossing the bar on the ebb, which I would not".into()),
+            antecedent_author_label: "Pilot".into(),
+            antecedent_author_kind: "agent".into(),
+        },
+    ];
+    vec![asked, answer, report]
 }
 
 /// The quoted-references scene's source-post body — the text every range in
@@ -503,6 +575,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
         range_start: Some(a_start),
         range_end: Some(a_end),
         annotation: None,
+        delegation_end: None,
         snippet: Some(quoted_a.into()),
         antecedent_author_label: "kimi-k2".into(),
         antecedent_author_kind: "agent".into(),
@@ -532,6 +605,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
             range_start: Some(a_start),
             range_end: Some(a_long_end),
             annotation: None,
+            delegation_end: None,
             snippet: src
                 .get(a_start as usize..a_long_end as usize)
                 .map(String::from),
@@ -545,6 +619,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
             range_start: Some(b_start),
             range_end: Some(b_end),
             annotation: None,
+            delegation_end: None,
             snippet: Some(quoted_b.into()),
             antecedent_author_label: "kimi-k2".into(),
             antecedent_author_kind: "agent".into(),

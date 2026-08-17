@@ -8,6 +8,7 @@ pub mod error;
 pub mod local_models;
 pub mod memory;
 pub mod router;
+pub mod subspace_driver;
 pub mod subspaces;
 pub mod summaries;
 pub mod tools;
@@ -44,10 +45,15 @@ pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
     LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
 };
+pub use subspace_driver::{
+    ANCHOR_WAIT_GRACE, DelegationEnd, DelegationFailure, MAX_ATTEMPTS_PER_TAIL,
+    MAX_CONCURRENT_WALKS, MAX_DELEGATION_TURNS,
+};
 pub use subspaces::{
     MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, MAX_SUBAGENTS_PER_SPAWN, SpaceCapability,
     SpawnRefusal, SpawnedSubspace, SubspaceInfo,
 };
+use utility::clip_middle;
 
 // ============================================================================
 // Data transfer types — returned from `AppCore` methods to the apps
@@ -772,6 +778,22 @@ pub struct PlannedTurn {
     pub cascade_depth: i64,
 }
 
+/// Who is asking for a notification plan — and therefore who would drive the
+/// turns it returns.
+///
+/// The distinction exists for exactly one room: an agent-spawned sub-space,
+/// whose turns are app-core's own to drive (see [`subspace_driver`]). See
+/// [`Inner::plan_and_refine`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Planner {
+    /// A consumer of this crate — a window, the CLI — which will drive what it
+    /// is handed.
+    Consumer,
+    /// The sub-space turn driver, which is the only thing that may drive a
+    /// delegated room.
+    Driver,
+}
+
 /// The outcome of planning notifications for a post.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NotificationPlan {
@@ -861,7 +883,24 @@ pub struct PostReference {
     /// Quoted byte range within that block's `text_content`, if a quote.
     pub range_start: Option<i64>,
     pub range_end: Option<i64>,
+    /// The **person's note** about this quote, and only that.
+    ///
+    /// The stored column holds either a note somebody wrote or a machine token
+    /// the turn machinery wrote (a delegation's ending — see
+    /// [`Self::delegation_end`]), and the two are split here rather than left
+    /// for each reader to tell apart: a surface that rendered this field
+    /// straight would print `eidola:delegation/…` at a person. `None` when
+    /// there is no note, which includes every edge whose annotation is a token.
     pub annotation: Option<String>,
+    /// How the delegated conversation this passage came from stopped, when this
+    /// edge is a delegation's report.
+    ///
+    /// **Typed rather than a sentence**, because the sentence is the
+    /// presentation layer's to write: what app-core persists is read as-is in
+    /// every language, so the ending is stored as a token and handed over as a
+    /// value (the same layering `AppError` variants cross on). `None` for every
+    /// ordinary quote.
+    pub delegation_end: Option<subspace_driver::DelegationEnd>,
     /// The quoted markdown, resolved from the referenced block's text by
     /// [`quote_snippet`]. `None` for range-less backlinks or when the stored
     /// range no longer maps honestly onto the block (never truncated or
@@ -912,6 +951,81 @@ pub struct ReferenceSpec {
     pub range_start: Option<i64>,
     pub range_end: Option<i64>,
     pub annotation: Option<String>,
+}
+
+/// A reference the **turn machinery** attaches to a turn, rather than one a
+/// model asked for: the passage is rendered into that turn's context, and the
+/// same spec becomes a `relation='reference'` edge on the `inference` the turn
+/// persists.
+///
+/// The two halves are one thing on purpose. A model cannot be asked to report
+/// on a passage it was never shown, and a report whose passage is not attached
+/// leaves the next reader — human or model — with prose about material they
+/// cannot reach. Attaching it *mechanically* is also what keeps the edge
+/// honest: it names a concrete generation the driver read, never one the model
+/// guessed at, and the model has no way to write an edge at all.
+///
+/// Ordinals are positional — `1..=N` in supplied order, ordinal 0 being the
+/// reply edge's reserved slot — exactly as they are for
+/// [`AppCore::post_with_references`].
+/// What the turn machinery is imposing on a turn, beyond the ordinary contract
+/// a consumer's ask gets. Empty for every turn a consumer asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TurnDirective {
+    /// Passages to put in front of this turn and write onto its answer (see
+    /// [`AttachedReference`]).
+    pub(crate) attached: Vec<AttachedReference>,
+    /// **A turn nobody invited.** The driver's delegation report is a
+    /// mechanical notification, not an invitation to take part, so the
+    /// agent-side decline checkpoint is withdrawn from its registry snapshot:
+    /// a declined report is a delegation that silently never happened, and the
+    /// checkpoint exists for an agent with nothing to add to a *conversation*,
+    /// which this is not. Withdrawing the tool rather than ignoring a decline
+    /// is what makes the outcome unrepresentable instead of handled — a model
+    /// naming `decline` here gets the ordinary unknown-tool result and answers.
+    pub(crate) mechanical: bool,
+    /// The delegated room a mechanical report is about. Rechecked at persist
+    /// so a close that lands while the model request is in flight does not
+    /// write a message about a conversation somebody closed, and so a finding
+    /// or attach target that moved in that window can withdraw the generation
+    /// and retry. `None` for every other turn.
+    pub(crate) reporting_on: Option<String>,
+}
+
+/// Where an attachment came from, which decides one thing: whether it is
+/// gated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttachmentOrigin {
+    /// Written by the turn machinery for this turn. Validated at the authoring
+    /// seam ([`Inner::validate_agent_reference_spec`]) like any other authored
+    /// reference.
+    Authored,
+    /// Carried forward from the generation this turn supersedes. **Not asked
+    /// for permission**, for the reason `edit_post`'s replication is not:
+    /// quoting copies, the passage is already here, and re-asking permission at
+    /// a re-wording would rewrite history whenever the answer had changed
+    /// since. **The shape rule still applies** — what may be quoted at all is
+    /// not a permission (see [`Inner::render_attached_references`]).
+    Replicated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AttachedReference {
+    /// The edge's ordinal within the answering post — the shared key
+    /// ([`ReferenceSpec`]'s convention; ordinal 0 is the reply slot). Carried
+    /// rather than derived from position because a replicated edge keeps the
+    /// ordinal it already had, exactly as an edit's does.
+    pub(crate) ordinal: i64,
+    pub(crate) origin: AttachmentOrigin,
+    pub(crate) spec: ReferenceSpec,
+    /// How the **source** space names the quoted post's author.
+    ///
+    /// Carried rather than looked up because a cross-space passage cannot be
+    /// attributed from anything the reading space knows: the reading space may
+    /// never have met that participant, and a per-space override there would be
+    /// the wrong name for it anyway. `None` where the source space names the
+    /// author nothing (the schema's "override to empty" is a real state).
+    pub(crate) author_label: Option<String>,
 }
 
 /// An incoming reference: some current-generation post quoting a range of the
@@ -1439,6 +1553,101 @@ struct Inner {
     /// Serializes background branch-summary passes (see [`summaries`]). One
     /// pass at a time, and each re-reads the cache inside the gate, so a burst
     /// of posts collapses into one generation per branch.
+    /// Whether this process drives agent-spawned sub-spaces (see
+    /// [`AppCore::start_subspace_driver`]). **Off by default**, like every
+    /// other agentic capability here: a room with no window still takes real,
+    /// billed turns, so the consumer opts in.
+    subspace_driver_started: std::sync::atomic::AtomicBool,
+    /// The rooms a driver task is currently walking, each mapped to whether a
+    /// fresh arm arrived while it was walking (see
+    /// [`Inner::arm_subspace_driver`]).
+    subspace_drivers: Mutex<subspace_driver::DriverRegistry>,
+    /// What this process has already tried for each delegated room's current
+    /// last word — the retry meter that keeps a failing room from being armed
+    /// and billed forever (see `Inner::claim_walk`).
+    subspace_walks: Mutex<subspace_driver::WalkLedger>,
+    /// The delegated rooms **this process opened**, until the startup sweep has
+    /// read them (`None` afterwards). A spawn happens inside its owner's turn,
+    /// so these are exactly the rooms the sweep's licence is false about — see
+    /// `Inner::note_room_spawned_here`.
+    rooms_spawned_here: Mutex<Option<std::collections::HashSet<String>>>,
+    /// How many delegated rooms may be walked at once, process-wide — see
+    /// `subspace_driver::MAX_CONCURRENT_WALKS`.
+    walk_permits: Arc<tokio::sync::Semaphore>,
+    /// Delegated rooms waiting for the post they were opened from to be
+    /// answered, mapped to the parent whose next change wakes them (see
+    /// `Inner::report_delegation`).
+    /// Room id → (parent space id, wait generation). The generation is what a
+    /// grace alarm answers for: an alarm outlives the wait that set it, and an
+    /// unmarked one firing into a *later* wait on the same room would expire
+    /// that wait on the remainder of an older clock (see
+    /// `Inner::schedule_anchor_grace`).
+    awaiting_anchor: Mutex<std::collections::HashMap<String, (String, u64)>>,
+    /// Monotonic source of anchor-wait generations.
+    anchor_wait_seq: std::sync::atomic::AtomicU64,
+    /// How long an anchor wait holds out, in milliseconds; `0` means
+    /// `subspace_driver::ANCHOR_WAIT_GRACE`. Only a test moves it — waiting ten
+    /// real minutes is not the behaviour worth exercising.
+    anchor_wait_grace_ms: std::sync::atomic::AtomicU64,
+    /// Test-only rendezvous inside the anchor window — the few instructions
+    /// between a room registering itself against its parent and asking whether
+    /// that parent has answered. A lost wake-up lives or dies on the *order* of
+    /// those two, and order is not something a test can observe from outside:
+    /// this lets one stop the walk in the window, commit the answer, and let it
+    /// go, which is the interleaving the ordering exists to survive. Compiled
+    /// out of release builds with the rest of the `test-support` seam.
+    #[cfg(feature = "test-support")]
+    anchor_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **inside a walk**, once, after its first driven
+    /// turn. The interleaving that matters there is a post arriving in the room
+    /// while the driver is working in it, early enough that the driver writes
+    /// something newer afterwards — which is precisely what makes it invisible
+    /// to any later look at "the tail". Same shape and same reason as
+    /// [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    cascade_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **between a walk's reads**, after it has read the
+    /// room's last post and before it has decided anything from it. That is
+    /// where a post used to fall between two stools — too late for the tail,
+    /// too early for the refill's window — so it is where a test has to be able
+    /// to put one. Same shape and same reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    entry_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **immediately before a mechanical report
+    /// persists**, after the model request has returned and before the
+    /// generation is committed. A regen of a finding or of the attach
+    /// target, or an archival of the delegated room, that lands while that
+    /// request is in flight is what persist-time revalidation exists to
+    /// survive; this is how a test stages them. Same shape as
+    /// [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    persist_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Space ids established not to be live delegated rooms — the driver's
+    /// negative cache. Sound because neither `parent_space_id` nor archival can
+    /// turn back (see `Inner::is_ordinary_space`).
+    ordinary_spaces: Mutex<std::collections::HashSet<String>>,
+    /// How many upcoming plans should fail, the way a transient store error
+    /// would — the seam behind a planner failure becoming a reported ending
+    /// (see [`Inner::plan_walk`]). Set only by
+    /// [`AppCore::test_fail_next_plans`].
+    #[cfg(feature = "test-support")]
+    plan_faults: std::sync::atomic::AtomicU32,
+    /// How many upcoming live-room enumerations should fail, the way a
+    /// transient store error would — the seam behind the sweep's retry (see
+    /// `Inner::rearm_live_subspaces`). Set only by
+    /// [`AppCore::test_fail_next_subspace_enumerations`].
+    #[cfg(feature = "test-support")]
+    enumeration_faults: std::sync::atomic::AtomicU32,
+    /// How many upcoming anchor lookups should fail after the wait has been
+    /// registered — the seam behind a spent meter that has nothing to
+    /// deliver (see `Inner::drive_subspace`). Set only by
+    /// [`AppCore::test_fail_next_anchor_lookups`].
+    #[cfg(feature = "test-support")]
+    anchor_lookup_faults: std::sync::atomic::AtomicU32,
     summary_gate: tokio::sync::Mutex<()>,
     /// Space id → the most recent summary trigger's timestamp: the trailing
     /// debounce that keeps an exchange (the post, then the answer it draws)
@@ -3017,21 +3226,7 @@ impl Inner {
         author_participant_id: &str,
         spec: &ReferenceSpec,
     ) -> Result<(), AppError> {
-        let Some((source_space_id, source_action_type)) =
-            db::action_space_and_type(conn, &spec.antecedent_action_id).await?
-        else {
-            return Err(AppError::NotConfigured {
-                message: format!("referenced action not found: {}", spec.antecedent_action_id),
-            });
-        };
-        if !db::is_post_action_type(&source_action_type) {
-            return Err(AppError::NotConfigured {
-                message: format!(
-                    "action {} is a {source_action_type}, not a post — only posts can be quoted",
-                    spec.antecedent_action_id
-                ),
-            });
-        }
+        let source_space_id = Self::reference_source_space(conn, spec).await?;
         // Rule 1, in the words it has always had: **you may quote what you can
         // read.** So the question asked here is the read one
         // (`db::may_read_space`), not bare membership — which is what it had
@@ -3064,6 +3259,113 @@ impl Inner {
                 action_id: spec.antecedent_action_id.clone(),
             });
         }
+        // **The ending namespace is not a caller's to write.** `annotation`
+        // holds either a person's note about their quote or this crate's own
+        // record of how a delegated conversation ended, and a reader tells them
+        // apart by the prefix alone — so a supplied note that claimed it would
+        // vanish from every surface that shows a note and appear on every
+        // surface that shows an ending, forging lifecycle state on somebody
+        // else's quote. Refused here, at the one door that takes an annotation
+        // from outside, rather than defended in each of the readers: what the
+        // driver writes is not a caller's value and needs no exemption.
+        if spec
+            .annotation
+            .as_deref()
+            .is_some_and(subspace_driver::is_reserved_annotation)
+        {
+            return Err(AppError::NotConfigured {
+                message: format!(
+                    "a reference annotation may not begin with `{}` — that prefix is reserved for \
+                     the app's own record of how a delegated conversation ended",
+                    subspace_driver::DELEGATION_END_PREFIX
+                ),
+            });
+        }
+        Self::validate_reference_shape(conn, spec).await
+    }
+
+    /// The **agent-authored** reference seam: the same structural rule as
+    /// [`Inner::validate_reference_spec`], asked of an agent.
+    ///
+    /// It is a second gate rather than a widened first one because the two
+    /// answer *different* questions about who may read the passage, and only
+    /// one of them may ever widen. The human gate asks `db::may_read_space`,
+    /// which grants a human viewer oversight of rooms they are not in; an agent
+    /// gets `db::is_space_member`, the rule every other model-facing gate
+    /// applies (`read_post`'s per-call follow check, `participant_spaces`), so
+    /// an agent can attach only a passage out of a room it actually takes part
+    /// in. Sharing the read gate would have handed every agent the human's
+    /// bypass the first time a non-human caller appeared.
+    ///
+    /// The shape rule is deliberately *not* duplicated: what a reference may
+    /// name — a post, and only a post's `text` block — is the same question
+    /// whoever asks it, and one copy is what keeps the two from drifting.
+    ///
+    /// Today's caller is the sub-space turn driver, attaching a delegated
+    /// room's last post to the owning agent's report in the parent. The owner
+    /// is a member of that room by construction (its `role = 'owner'`
+    /// membership is what makes it the owner), so this holds by construction
+    /// too — which is exactly why it is asked rather than assumed.
+    async fn validate_agent_reference_spec(
+        &self,
+        conn: &turso::Connection,
+        author_participant_id: &str,
+        spec: &ReferenceSpec,
+    ) -> Result<(), AppError> {
+        let source_space_id = Self::reference_source_space(conn, spec).await?;
+        if !db::is_space_member(conn, &source_space_id, author_participant_id).await? {
+            return Err(AppError::NotAParticipant {
+                participant_id: author_participant_id.to_string(),
+                action_id: spec.antecedent_action_id.clone(),
+            });
+        }
+        Self::validate_reference_shape(conn, spec).await
+    }
+
+    /// The space a spec's antecedent lives in, once it is established that the
+    /// antecedent exists and is a **post** — the half of the reference rule
+    /// that is about *what kind of thing* is being quoted, and therefore the
+    /// same for every author.
+    async fn reference_source_space(
+        conn: &turso::Connection,
+        spec: &ReferenceSpec,
+    ) -> Result<String, AppError> {
+        let Some((source_space_id, source_action_type)) =
+            db::action_space_and_type(conn, &spec.antecedent_action_id).await?
+        else {
+            return Err(AppError::NotConfigured {
+                message: format!("referenced action not found: {}", spec.antecedent_action_id),
+            });
+        };
+        if !db::is_post_action_type(&source_action_type) {
+            return Err(AppError::NotConfigured {
+                message: format!(
+                    "action {} is a {source_action_type}, not a post — only posts can be quoted",
+                    spec.antecedent_action_id
+                ),
+            });
+        }
+        Ok(source_space_id)
+    }
+
+    /// Everything about a spec that does not depend on who is writing it: the
+    /// antecedent being a post at all, the range/block pairing, the block
+    /// belonging to the antecedent, the block being quotable, and the byte
+    /// range mapping honestly onto it.
+    ///
+    /// **The whole author-independent rule is here**, the post-kind half
+    /// included, because the one thing that must never depend on how an edge
+    /// arrived is *what may be quoted*. The permission gates read the
+    /// antecedent for its space and this reads it again for its type — one
+    /// point read either of them could have handed the other, and worth paying
+    /// twice for a rule no caller can be trusted to have asked half of: the
+    /// half that was left outside is precisely the half a path skipping the
+    /// gate skipped (see [`Inner::render_attached_references`]).
+    async fn validate_reference_shape(
+        conn: &turso::Connection,
+        spec: &ReferenceSpec,
+    ) -> Result<(), AppError> {
+        Self::reference_source_space(conn, spec).await?;
         if spec.range_start.is_some() != spec.range_end.is_some() {
             return Err(AppError::NotConfigured {
                 message: "reference range_start/range_end must be given together".into(),
@@ -3113,6 +3415,143 @@ impl Inner {
             }
         }
         Ok(())
+    }
+
+    /// Validate the references the turn machinery is attaching to this turn and
+    /// render them as the trailing block's leading section — or `None` when
+    /// there are none, which is every ordinary turn.
+    ///
+    /// **Validation and rendering are one pass** because they read the same
+    /// row: the block's text answers both "does this range map honestly" and
+    /// "what does the passage say". Refusing here rather than at the write is
+    /// what makes a bad attachment cost nothing — no engine started, no
+    /// credential spent, no action written — and it is the agent-authored gate
+    /// ([`Inner::validate_agent_reference_spec`]) that decides it, since the
+    /// author is the responding participant.
+    ///
+    /// The entries render through [`ReferenceEntry`] like every other quoted
+    /// passage, so the model reads an attached passage in the dialect it reads
+    /// a quoted one — attributed, numbered, blockquoted. A target the turn's
+    /// own snapshot holds is named by handle; a cross-space one is named by the
+    /// author label the caller carried from the source space.
+    async fn render_attached_references(
+        &self,
+        conn: &turso::Connection,
+        thread: &ThreadSnapshot,
+        author_participant_id: &str,
+        attached: &[AttachedReference],
+    ) -> Result<Option<String>, AppError> {
+        if attached.is_empty() {
+            return Ok(None);
+        }
+        let mut out = ATTACHED_BLOCK_HEADING.to_string();
+        let budget = ATTACHED_BLOCK_MAX_BYTES;
+        // Ordinals whose passage did not fit, in order. Every attachment is
+        // still validated and still written — this decides only what the model
+        // is shown (see below).
+        let mut withheld: Vec<i64> = Vec::new();
+        let mut shown = 0usize;
+        for a in attached {
+            // A replicated edge is not being authored, so it is not asked for
+            // **permission** — see [`AttachmentOrigin`]. It still renders,
+            // because a turn re-wording a report has to be shown what it is
+            // reporting, and that is exactly why the *shape* rule is asked of
+            // it anyway: what may be quoted at all is not a permission, it is
+            // an audience boundary the whole app maintains, and rendering is
+            // the act that would cross it. An edge written below the create
+            // gate (`test_insert_unvalidated_reference`, or some future writer
+            // beneath it) could otherwise name a `tool_call`, a `decision`, a
+            // `memory` block or a post's `thinking` block, and be expanded
+            // straight into the regenerating model's context — the one thing
+            // every other read path withholds. Every read path re-applies the
+            // rule for edges below the seam; this one is a read path.
+            match a.origin {
+                AttachmentOrigin::Authored => {
+                    self.validate_agent_reference_spec(conn, author_participant_id, &a.spec)
+                        .await?
+                }
+                AttachmentOrigin::Replicated => {
+                    Self::validate_reference_shape(conn, &a.spec).await?
+                }
+            }
+            let ordinal = a.ordinal;
+            let target = match thread.node_for_action(&a.spec.antecedent_action_id) {
+                Some(n) => ReferenceTarget::Addressable {
+                    item_id: n.item_id.clone(),
+                    label: n.participant.label.clone(),
+                },
+                None => ReferenceTarget::Elsewhere {
+                    label: a.author_label.as_deref().and_then(non_blank),
+                },
+            };
+            let body = match (a.spec.content_block_id.as_deref(), a.spec.range_start) {
+                (None, _) | (_, None) => ReferenceBody::Backlink,
+                (Some(block_id), Some(rs)) => {
+                    let re = a.spec.range_end.unwrap_or(rs);
+                    // The validation above already proved this block exists,
+                    // belongs to the antecedent, is quotable and maps this
+                    // range — so anything unresolvable here is a row that moved
+                    // between two reads, which degrades to the same honest
+                    // "the range no longer maps" the human's rail shows.
+                    db::content_block_owner_text(conn, block_id)
+                        .await?
+                        .and_then(|(_, _, text)| {
+                            text.and_then(|t| {
+                                // **Rendered within a budget, while the edge
+                                // keeps the whole range.** An attached set is
+                                // machine-made and one entry wide per branch
+                                // the walk reached, and a passage is a range
+                                // its author chose with nothing bounding its
+                                // length — so a single finding could fill this
+                                // turn's context by itself and the ones beside
+                                // it would say nothing. Eliding the middle is
+                                // the rule the app's other model-facing prompts
+                                // already use (`utility::clip_middle`), and it
+                                // costs the edge nothing: the range on the
+                                // record still describes the passage exactly,
+                                // and the human's footnote rail resolves it
+                                // whole — this elides a *rendering*, the way a
+                                // preview does.
+                                quote_snippet(&t, rs, re)
+                                    .map(|s| clip_middle(s, ATTACHED_PASSAGE_MAX_BYTES))
+                            })
+                        })
+                        .map_or(ReferenceBody::UnresolvedRange, ReferenceBody::Passage)
+                }
+            };
+            let entry = ReferenceEntry {
+                ordinal,
+                target,
+                annotation: subspace_driver::annotation_for_model(a.spec.annotation.as_deref()),
+                body,
+            };
+            // **The block has a ceiling as well as its passages.** Clipping
+            // each passage bounds one entry and nothing bounds their number:
+            // the walk attaches a tip per branch it reached, and a burst of
+            // posts into a watched room makes those branches — so an unbounded
+            // block can crowd out the conversation the report is being written
+            // into, or overflow the request entirely and take the delivery with
+            // it. Oldest first, because the walk found them in that order and a
+            // delegation reads forwards.
+            let rendered = entry.render();
+            if !withheld.is_empty() || (shown > 0 && out.len() + 1 + rendered.len() > budget) {
+                withheld.push(ordinal);
+                continue;
+            }
+            out.push('\n');
+            out.push_str(&rendered);
+            shown += 1;
+        }
+        // **What is not shown is named, not hidden.** Every one of these edges
+        // is written onto the answer whatever happens here, so the reader's
+        // footnote rail is complete and each passage is one click away; what
+        // the model would otherwise lack is the knowledge that it is writing
+        // about a part of what it is reporting.
+        if !withheld.is_empty() {
+            out.push('\n');
+            out.push_str(&attached_withheld_note(&withheld));
+        }
+        Ok(Some(out))
     }
 
     /// Render each upstream-context post the way every model-facing path
@@ -3319,6 +3758,28 @@ impl Inner {
             && !db::is_space_member(conn, space_id, db::HUMAN_PARTICIPANT_ID).await?
         {
             return Err(AppError::NotJoined {
+                space_id: space_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Combined post-and-turn (`chat` / `chat_stream`) is a cascade, and a
+    /// live sub-space's cascade belongs to the driver. Membership is asked
+    /// first so an unjoined reader still sees [`AppError::NotJoined`]; a
+    /// joined one is refused here before any write, rather than posting and
+    /// then driving the same notify-all seat the driver's arm will take.
+    async fn refuse_combined_ask_in_subspace(
+        &self,
+        space_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        let Some(space_id) = space_id else {
+            return Ok(());
+        };
+        let conn = self.db_conn().await?;
+        if db::is_live_subspace(&conn, space_id).await? {
+            self.require_human_joined(&conn, space_id).await?;
+            return Err(AppError::DrivenConversation {
                 space_id: space_id.to_string(),
             });
         }
@@ -3922,13 +4383,18 @@ impl Inner {
         // stay silent about the one it did not — which is why the count comes
         // back from inside the write rather than from a read after it.
         //
-        // Nothing else is emitted, and that is checked rather than assumed: no
-        // store reads a *single* space's archival (`SpaceSettings` carries the
-        // cascade limit, the router and the notebook owner, not `archived_at`),
-        // so a `Space(id)` here would announce a change no subscriber can
-        // observe. `archive_space` emits `SpaceIndex` alone for the same
-        // reason.
+        // And **every room this closed is closed properly** — announced, and
+        // released from any wait it was holding (`Inner::close_rooms`, the one
+        // thing all three archival doors owe a room). Retirement is the door
+        // that reaches a room without touching its parent, so nothing about the
+        // parent can announce it and the room's own standing registration would
+        // otherwise be left for the grace alarm to clear ten minutes later,
+        // making every post in that parent pay for a no-op walk until then.
+        // Which is why the transaction answers with the ids and not only the
+        // count: the count decides the *listing* announcement, and only a list
+        // can say which rooms to close out.
         self.bus.emit(Change::Participants);
+        self.close_rooms(&retirement.archived_spaces);
         if retirement.listed_spaces_archived > 0 {
             self.bus.emit(Change::SpaceIndex);
         }
@@ -3953,46 +4419,53 @@ impl Inner {
         // be overtaken by another window's promotion, and a soft-remove aimed at
         // a row that has since become global retires a shared agent outright.
         // See `db::remove_space_participant_tx`.
-        let removed =
-            match db::remove_space_participant_tx(&conn, space_id, participant_id, now_ms()).await?
-            {
-                // Structural, and unrecoverable if obeyed: the notebook exists only
-                // for this agent, is where its `core` memory lives, and nothing can
-                // grant a notebook membership back. Refused by the write itself, so
-                // a promotion landing mid-flight cannot slip one past.
-                db::SpaceRemoval::RefusedNotebookOwner => {
-                    let who = db::get_participant(&conn, participant_id)
-                        .await?
-                        .map(|p| p.label)
-                        .unwrap_or_else(|| "that agent".to_string());
-                    return Err(AppError::Config {
-                        message: format!(
-                            "this space is {who}'s notebook — it is where its memory lives, so it \
+        let departure =
+            db::remove_space_participant_tx(&conn, space_id, participant_id, now_ms()).await?;
+        let removed = match departure.outcome {
+            // Structural, and unrecoverable if obeyed: the notebook exists only
+            // for this agent, is where its `core` memory lives, and nothing can
+            // grant a notebook membership back. Refused by the write itself, so
+            // a promotion landing mid-flight cannot slip one past.
+            db::SpaceRemoval::RefusedNotebookOwner => {
+                let who = db::get_participant(&conn, participant_id)
+                    .await?
+                    .map(|p| p.label)
+                    .unwrap_or_else(|| "that agent".to_string());
+                return Err(AppError::Config {
+                    message: format!(
+                        "this space is {who}'s notebook — it is where its memory lives, so it \
                          cannot leave it"
-                        ),
-                    });
-                }
-                // The other structural membership, refused in the same
-                // statement and for the same shape of reason: the owner row is
-                // the whole of what records who is answerable for a delegation,
-                // whose live-room quota it counts against, and who its report
-                // goes to, and nothing can grant a sub-space ownership back.
-                db::SpaceRemoval::RefusedSubspaceOwner => {
-                    let who = db::get_participant(&conn, participant_id)
-                        .await?
-                        .map(|p| p.label)
-                        .unwrap_or_else(|| "that agent".to_string());
-                    return Err(AppError::Config {
-                        message: format!(
-                            "{who} opened this conversation and is answerable for it, so it \
+                    ),
+                });
+            }
+            // The other structural membership, refused in the same
+            // statement and for the same shape of reason: the owner row is
+            // the whole of what records who is answerable for a delegation,
+            // whose live-room quota it counts against, and who its report
+            // goes to, and nothing can grant a sub-space ownership back.
+            db::SpaceRemoval::RefusedSubspaceOwner => {
+                let who = db::get_participant(&conn, participant_id)
+                    .await?
+                    .map(|p| p.label)
+                    .unwrap_or_else(|| "that agent".to_string());
+                return Err(AppError::Config {
+                    message: format!(
+                        "{who} opened this conversation and is answerable for it, so it \
                              cannot leave it — archive the conversation instead"
-                        ),
-                    });
-                }
-                outcome => outcome != db::SpaceRemoval::NothingToDo,
-            };
+                    ),
+                });
+            }
+            outcome => outcome != db::SpaceRemoval::NothingToDo,
+        };
+        // **A departure closes the delegations it was running for this
+        // conversation** (`db::close_delegations_run_for`), and closes them the
+        // way every archival door does — see [`Inner::close_rooms`].
+        self.close_rooms(&departure.archived_spaces);
         if removed {
             self.bus.emit(Change::Participants);
+        }
+        if !departure.archived_spaces.is_empty() {
+            self.bus.emit(Change::SpaceIndex);
         }
         Ok(removed)
     }
@@ -4378,13 +4851,25 @@ impl Inner {
         })
     }
 
+    /// Archive a conversation **and the delegations it was running** — see
+    /// `db::archive_space_tx` for why closing a room closes what hangs beneath
+    /// it.
+    ///
+    /// **Every closed room is closed properly** — announced, and released from
+    /// any wait it was holding ([`Inner::close_rooms`]) — and the Library hears
+    /// once (`Change::SpaceIndex`). The announcement is what carries the
+    /// closure to a window open on one of these rooms, and to any *other*
+    /// delegation registered against one of them as its parent; the release is
+    /// the closed room's own registration, which nothing on the bus can deliver
+    /// because an archived room is never armed.
     async fn archive_space(&self, space_id: &str) -> Result<bool, AppError> {
         let db_conn = self.db_conn().await?;
-        let archived = db::archive_space(&db_conn, space_id, now_ms()).await?;
-        if archived {
+        let archived = db::archive_space_tx(&db_conn, space_id, now_ms()).await?;
+        self.close_rooms(&archived);
+        if !archived.is_empty() {
             self.bus.emit(Change::SpaceIndex);
         }
-        Ok(archived)
+        Ok(!archived.is_empty())
     }
 
     async fn discard_if_pristine(&self, space_id: &str) -> Result<bool, AppError> {
@@ -4508,70 +4993,45 @@ impl Inner {
 
         let action_id = Uuid::now_v7().to_string();
         let item_id = Uuid::now_v7().to_string();
-        db::insert_action(
+
+        // A space with no title and no prior post earns one from this post's
+        // opening line — decided here, out of values already read, and applied
+        // inside the write below.
+        let auto_title = (space_title.is_none() && last_action_id.is_none())
+            .then(|| derive_space_title(prompt))
+            .flatten();
+        // The structural `reply` edge: the explicit `reply_to` target
+        // (branching there) when given, otherwise the space's tail (linear
+        // continuation). A first post in a space has neither. Ordinal 0 is the
+        // reply edge's reserved slot (see `ReferenceSpec`); references take
+        // `1..=N` in supplied order, the post's `{{ embed N }}` numbering.
+        let reply_ante = reply_to
+            .map(str::to_string)
+            .or_else(|| last_action_id.clone());
+
+        // **One transaction, because a post is one thing.** Written as separate
+        // statements the action row lands first and the words, the thread
+        // position and the quotations follow it — and in that window the post
+        // exists and says nothing, which a reader keyed on the action is
+        // entitled to and the sub-space driver's refill will *act* on, planning
+        // and billing a turn against an empty post. See `db::post_tx`. The
+        // validations above stay in front of it, where a refusal belongs: they
+        // are reads, and now they leave neither a trace nor a fragment.
+        let auto_titled = db::post_tx(
             &db_conn,
-            &db::ActionEntry {
-                id: action_id.clone(),
-                space_id: space_id.clone(),
-                participant_id: user_participant_id,
-                item_id: item_id.clone(),
-                supersedes_action_id: None,
-                action_type: "user_input".to_string(),
-                status: "complete".to_string(),
-                intent: None,
-                model: None,
-                input_tokens: None,
-                output_tokens: None,
-                credits_consumed: None,
+            &db::PostPlan {
+                space_id: &space_id,
+                participant_id: &user_participant_id,
+                action_id: &action_id,
+                item_id: &item_id,
+                text: prompt,
+                auto_title: auto_title.as_deref(),
+                reply_to: reply_ante.as_deref(),
+                references,
                 created_at: now,
             },
         )
         .await?;
-        db::insert_text_content_block(
-            &db_conn,
-            &Uuid::now_v7().to_string(),
-            &action_id,
-            0,
-            "text",
-            prompt,
-        )
-        .await?;
-
-        let mut auto_titled = false;
-        if space_title.is_none()
-            && last_action_id.is_none()
-            && let Some(title) = derive_space_title(prompt)
-        {
-            auto_titled = db::update_space_title(&db_conn, &space_id, &title, now).await?;
-        }
-
-        // Link the structural `reply` edge: to the explicit `reply_to` target
-        // (branching there) when given, otherwise to the space's tail (linear
-        // continuation). A first post in a space has neither. Ordinal 0 is the
-        // reply edge's reserved slot (see `ReferenceSpec`).
-        let reply_ante = reply_to
-            .map(str::to_string)
-            .or_else(|| last_action_id.clone());
-        if let Some(ref ante_id) = reply_ante {
-            db::insert_action_antecedent(&db_conn, &action_id, ante_id, 0, "reply").await?;
-        }
-
-        // Reference edges at ordinals 1..=N in supplied order — the post's
-        // `{{ embed N }}` numbering. These ride the post's existing
-        // emissions below (no new exit point).
-        for (i, spec) in references.iter().enumerate() {
-            db::insert_reference_antecedent(
-                &db_conn,
-                &action_id,
-                &spec.antecedent_action_id,
-                (i + 1) as i64,
-                spec.content_block_id.as_deref(),
-                spec.range_start,
-                spec.range_end,
-                spec.annotation.as_deref(),
-            )
-            .await?;
-        }
 
         self.bus.emit(Change::Space(space_id.clone()));
         if is_new_space || auto_titled {
@@ -4667,59 +5127,34 @@ impl Inner {
             }
         }
 
-        // Edits are the human's — recorded against the shared "User" participant.
-        let user_participant_id = db::HUMAN_PARTICIPANT_ID.to_string();
+        // The surviving references, replicated at their original ordinals
+        // (stable across generations — see `ReferenceSpec`'s ordinal
+        // convention).
+        let surviving: Vec<db::ReferenceEdgeRow> = tip_references
+            .into_iter()
+            .filter(|r| !remove_references.contains(&r.ordinal))
+            .collect();
 
+        // One transaction, like `post`: the new generation supersedes the tip
+        // the moment its row lands, so written piecewise the item's current
+        // generation would say nothing until the tail of writes caught up.
         let new_action_id = Uuid::now_v7().to_string();
-        db::insert_action(
+        db::edit_post_tx(
             &db_conn,
-            &db::ActionEntry {
-                id: new_action_id.clone(),
-                space_id: space_id.clone(),
-                participant_id: user_participant_id,
-                item_id: item_id.clone(),
-                supersedes_action_id: Some(tip),
-                action_type: "user_input".to_string(),
-                status: "complete".to_string(),
-                intent: None,
-                model: None,
-                input_tokens: None,
-                output_tokens: None,
-                credits_consumed: None,
+            &db::EditPostPlan {
+                space_id: &space_id,
+                // Edits are the human's — the shared "User" participant.
+                participant_id: db::HUMAN_PARTICIPANT_ID,
+                action_id: &new_action_id,
+                item_id: &item_id,
+                supersedes_action_id: &tip,
+                text: new_prompt,
+                reply_to: reply_parent.as_deref(),
+                references: &surviving,
                 created_at: now,
             },
         )
         .await?;
-        db::insert_text_content_block(
-            &db_conn,
-            &Uuid::now_v7().to_string(),
-            &new_action_id,
-            0,
-            "text",
-            new_prompt,
-        )
-        .await?;
-        if let Some(ref ante) = reply_parent {
-            db::insert_action_antecedent(&db_conn, &new_action_id, ante, 0, "reply").await?;
-        }
-        // Replicate surviving references at their original ordinals (stable
-        // across generations — see `ReferenceSpec`'s ordinal convention).
-        for r in &tip_references {
-            if remove_references.contains(&r.ordinal) {
-                continue;
-            }
-            db::insert_reference_antecedent(
-                &db_conn,
-                &new_action_id,
-                &r.antecedent_action_id,
-                r.ordinal,
-                r.content_block_id.as_deref(),
-                r.range_start,
-                r.range_end,
-                r.annotation.as_deref(),
-            )
-            .await?;
-        }
 
         // Content changed (Space), and the listing's snippet / last-activity may
         // change (SpaceIndex). message_count does NOT change — list_spaces counts
@@ -4896,6 +5331,7 @@ impl Inner {
         target_action_id: &str,
         mode: ResponseMode,
         budget: Option<i64>,
+        directive: &TurnDirective,
     ) -> Result<TurnPrep, AppError> {
         let cfg = self.load_config();
         let now = now_ms();
@@ -5281,6 +5717,52 @@ impl Inner {
             .expand_context_embeds(&db_conn, &thread, context_rows)
             .await?;
 
+        // ---- Attached references ------------------------------------------
+        //
+        // Passages the turn machinery is putting in front of this turn (see
+        // [`AttachedReference`]): validated here, ahead of every acting step
+        // and ahead of the charge estimate, so a bad one costs a refusal rather
+        // than a spend — the same place and the same reason the archival gate
+        // sits first. They render exactly as a quoted passage renders anywhere
+        // else and are written onto the persisted `inference` by
+        // `TurnPrep::persist_turn`, which is what makes the words the model
+        // reads and the edge the record keeps one thing.
+        // **A regeneration carries the superseded generation's references
+        // forward.** `edit_post` has always done this — an edge can be a fact
+        // of the *turn* rather than of its wording — and a regenerated report
+        // is the sharpest case there is: the finding it quotes and the ending
+        // it records are facts of the delegation, not of the sentence the model
+        // happened to produce. Dropping them would take the visible footnote
+        // away while the delegation went on counting as reported, which is the
+        // one state the whole derived lifecycle must not reach.
+        //
+        // It is also what makes the regenerated turn *honest*: `Revise`
+        // withholds the generation being replaced from the context, so without
+        // this the model would be asked to re-word a report on a finding it was
+        // never shown.
+        let mut attached = directive.attached.clone();
+        if mode == ResponseMode::Revise {
+            for r in db::reference_antecedents(&db_conn, target_action_id).await? {
+                attached.push(AttachedReference {
+                    // The ordinal it already had — stable across generations,
+                    // exactly as an edit keeps them.
+                    ordinal: r.ordinal,
+                    origin: AttachmentOrigin::Replicated,
+                    author_label: db::post_author_label(&db_conn, &r.antecedent_action_id).await?,
+                    spec: ReferenceSpec {
+                        antecedent_action_id: r.antecedent_action_id,
+                        content_block_id: r.content_block_id,
+                        range_start: r.range_start,
+                        range_end: r.range_end,
+                        annotation: r.annotation,
+                    },
+                });
+            }
+        }
+        let attached_block = self
+            .render_attached_references(&db_conn, &thread, &model_participant_id, &attached)
+            .await?;
+
         // ---- Thread map (task 21) -----------------------------------------
         //
         // The spine this turn is being shown: the deduped context action ids,
@@ -5476,7 +5958,7 @@ impl Inner {
         // The identity line leads the notes, i.e. immediately after the
         // charter: identity governs what follows.
         let mut notes: Vec<&str> = vec![identity_note.as_str(), HEADER_PROTOCOL_NOTE];
-        if has_map || roster_block.is_some() {
+        if has_map || roster_block.is_some() || attached_block.is_some() {
             notes.push(TRAILING_BLOCK_NOTE);
         }
         if has_map {
@@ -5572,7 +6054,12 @@ impl Inner {
         // roster-only shape (a linear space with three or more participants)
         // had no pointer at all and no note framing it, so the metadata read as
         // the current request (Codex review, PR #294).
+        // An attached passage leads the block. It is the one section that is
+        // about *this* turn rather than about the room — the thing the turn was
+        // started to have written about — so it is read before the standing
+        // facts of who is here and what else exists.
         let mut sections: Vec<String> = Vec::new();
+        sections.extend(attached_block);
         sections.extend(roster_block);
         if has_map {
             sections.push(thread.render_map(&forks));
@@ -5601,12 +6088,31 @@ impl Inner {
         // to reject a `tools` field, the round loop withdraws what this turn
         // added and retries against exactly the registry the consumer asked
         // for (see `TurnPrep::withdraw_auto_tools`).
-        let consumer_tools = Arc::new(
-            self.tools
+        // **The withdrawal is applied to the fallback too.** A turn that
+        // withdraws the decline checkpoint (below) must still not offer it
+        // after a tool-rejection degrade, and the degrade falls back to
+        // *exactly* this snapshot — so taking it out here is what makes the
+        // withdrawal hold on both paths rather than on the happy one only.
+        let consumer_tools = Arc::new({
+            let mut registry = self
+                .tools
                 .read()
                 .expect("tool registry lock poisoned")
-                .clone(),
-        );
+                .clone();
+            if directive.mechanical {
+                registry.withdraw(decline::DECLINE_TOOL_NAME);
+            }
+            registry
+        });
+        // **A turn nobody invited takes the decline checkpoint back out.** It
+        // is the one tool a *consumer* registered that this turn must not
+        // offer: declining is how an agent bows out of a conversation it has
+        // nothing to add to, and a mechanical notification is not one — a
+        // decline there would write a `decision` instead of the post the
+        // notification exists to be, and the thing being notified about would
+        // vanish. Done at the snapshot, so the model never sees the schema and
+        // `declined_reason` (which keys on the registry, not the name) cannot
+        // fire even if it guesses the name.
         let auto_tools = nav_tools || memory_tool || spaces_tool;
         let tool_registry = if auto_tools {
             let mut registry = (*consumer_tools).clone();
@@ -5699,6 +6205,9 @@ impl Inner {
             inf_item_id,
             inf_supersedes,
             inf_reply_to,
+            attached_references: attached,
+            mechanical: directive.mechanical,
+            reporting_on: directive.reporting_on.clone(),
             context_action_ids,
             trace_action_ids: Vec::new(),
             trace_reply_to: inf_reply_to_for_trace,
@@ -6003,6 +6512,7 @@ impl Inner {
     /// Preparation and persistence are shared with the streaming twin
     /// (`prepare_turn` / [`TurnPrep::persist_turn`]); this transport reads one
     /// JSON body per round and takes the inline-refund fast path.
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         &self,
         space_id: &str,
@@ -6010,6 +6520,7 @@ impl Inner {
         target_action_id: &str,
         mode: ResponseMode,
         budget: Option<i64>,
+        directive: &TurnDirective,
     ) -> Result<ChatResult, AppError> {
         // The space is already persisted (post created it) before prepare_turn
         // runs, so every setup failure inside it — client build, `/v1/models`
@@ -6020,8 +6531,15 @@ impl Inner {
         // live across the whole round. Keeping it on the heap keeps the turn's
         // own state machine — already the largest in the crate — off the worker
         // stack.
-        let mut prep =
-            Box::pin(self.prepare_turn(space_id, selector, target_action_id, mode, budget)).await?;
+        let mut prep = Box::pin(self.prepare_turn(
+            space_id,
+            selector,
+            target_action_id,
+            mode,
+            budget,
+            directive,
+        ))
+        .await?;
 
         // One iteration per model request. `run_turn_round` is boxed: the
         // per-round future (request, SSE-free body read, refund, persistence)
@@ -6325,6 +6843,10 @@ impl Inner {
             }
         }
 
+        #[cfg(feature = "test-support")]
+        if prep.mechanical {
+            self.pause_in_report_persist_window().await;
+        }
         let response_action_id = prep
             .persist_turn(
                 if status.is_success() {
@@ -6343,11 +6865,36 @@ impl Inner {
                 response_text.as_bytes().to_vec(),
             )
             .await?;
+        if response_action_id.is_none() {
+            // A mechanical report whose room closed, or whose attachments
+            // or attach target moved, while it was in flight: the request
+            // is in the Record, the parent gained no post.
+            self.bus.emit(Change::Record);
+            return Ok(RoundOutcome::Final(ChatResult {
+                space_id: prep.space_id.clone(),
+                content: response_content,
+                model: prep.model.clone(),
+                input_tokens,
+                output_tokens,
+                credits_charged: prep.total_credits as i64,
+                response_action_id: None,
+                declined: None,
+            }));
+        }
 
         if !status.is_success() {
             // Inference (error status) + request rows committed; Wallet was
             // emitted at spend start. post owns the user-turn SpaceIndex.
             self.bus.emit(Change::Space(prep.space_id.clone()));
+            // The error generation is current and the transcript hides it, so
+            // any delegated room this turn's replicated edges quoted has just
+            // become outstanding again (`db::has_reference_from` reads
+            // visibility) — and nothing else can say so: the parent's own
+            // emission maps back to no settled room (its wait ended at
+            // delivery, and the supervisor knows the parent as ordinary). So
+            // the rooms are announced here, and the driver's entry checks
+            // decide what is actually owed.
+            self.announce_rooms_quoted_by(prep).await;
             self.bus.emit(Change::Record);
             return Err(AppError::Server {
                 status: status.as_u16(),
@@ -6372,21 +6919,58 @@ impl Inner {
             input_tokens,
             output_tokens,
             credits_charged: prep.total_credits as i64,
-            response_action_id: Some(response_action_id),
+            response_action_id,
             declined: None,
         }))
+    }
+
+    /// Emit `Change::Space` for every **other** space this turn's attached
+    /// references quote — the delegated rooms whose reports the turn's
+    /// persisted generation now stands in front of.
+    ///
+    /// Called on the blocking loop's non-2xx exit, where the persisted
+    /// generation is a current `error` the transcript hides: a report those
+    /// edges replicated is then a report the parent no longer shows, and the
+    /// room it settled is outstanding again with no event left in the world
+    /// to arm it. An announcement is cheap and self-limiting — the driver's
+    /// entry checks read the rows — and an ordinary turn has no attached
+    /// references, so this is a no-op everywhere but the paths that carry
+    /// them. Failures are swallowed for the caller's reason: this rides an
+    /// error exit that must still return the turn's own error.
+    async fn announce_rooms_quoted_by(&self, prep: &TurnPrep) {
+        let mut announced: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for attached in &prep.attached_references {
+            match db::action_item_and_space(&prep.db_conn, &attached.spec.antecedent_action_id)
+                .await
+            {
+                Ok(Some((_, space_id))) => {
+                    if space_id != prep.space_id && announced.insert(space_id.clone()) {
+                        self.bus.emit(Change::Space(space_id));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("warning: a quoted room could not be resolved to announce: {e}");
+                }
+            }
+        }
     }
 
     /// Save a turn and request a (blocking) response in one gesture — the
     /// combined convenience that the CLI and one-shot callers use. Equivalent
     /// to `post` followed by `run_turn(Reply)`: the post persists first (so a
     /// funding failure leaves the saved thought), then the agent replies.
+    ///
+    /// **Not in a live sub-space.** Those rooms belong to the driver; posting
+    /// here and then driving a turn would cascade the same human post twice.
+    /// [`Self::refuse_combined_ask_in_subspace`] is that gate.
     async fn chat(
         &self,
         prompt: &str,
         model: &str,
         space_id: Option<&str>,
     ) -> Result<ChatResult, AppError> {
+        self.refuse_combined_ask_in_subspace(space_id).await?;
         let posted = self.post(space_id, prompt, None, &[]).await?;
         self.run_turn(
             &posted.space_id,
@@ -6394,6 +6978,7 @@ impl Inner {
             &posted.action_id,
             ResponseMode::Reply,
             None,
+            &TurnDirective::default(),
         )
         .await
     }
@@ -6444,6 +7029,7 @@ impl Inner {
             &tip,
             ResponseMode::Revise,
             None,
+            &TurnDirective::default(),
         )
         .await
     }
@@ -6487,6 +7073,7 @@ impl Inner {
         target_action_id: &str,
         mode: ResponseMode,
         budget: Option<i64>,
+        directive: &TurnDirective,
         sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<ChatResult, AppError> {
         // Setup failures (client build / `/v1/models` fetch / attestation
@@ -6497,8 +7084,15 @@ impl Inner {
         // live across the whole round. Keeping it on the heap keeps the turn's
         // own state machine — already the largest in the crate — off the worker
         // stack.
-        let mut prep =
-            Box::pin(self.prepare_turn(space_id, selector, target_action_id, mode, budget)).await?;
+        let mut prep = Box::pin(self.prepare_turn(
+            space_id,
+            selector,
+            target_action_id,
+            mode,
+            budget,
+            directive,
+        ))
+        .await?;
 
         for round in 1..=MAX_TURN_ROUNDS {
             let mut outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
@@ -6831,6 +7425,10 @@ impl Inner {
         }
 
         // --- the final round ---------------------------------------------
+        #[cfg(feature = "test-support")]
+        if prep.mechanical {
+            self.pause_in_report_persist_window().await;
+        }
         let response_action_id = prep
             .persist_turn(
                 "complete",
@@ -6845,6 +7443,19 @@ impl Inner {
                 response_buf,
             )
             .await?;
+        if response_action_id.is_none() {
+            self.bus.emit(Change::Record);
+            return Ok(RoundOutcome::Final(ChatResult {
+                space_id: prep.space_id.clone(),
+                content: full_content,
+                model: prep.model.clone(),
+                input_tokens,
+                output_tokens,
+                credits_charged: prep.total_credits as i64,
+                response_action_id: None,
+                declined: None,
+            }));
+        }
 
         // All durable writes succeeded — emit per affected domain. post owns the
         // SpaceIndex (new space / auto-title). Local turns touched no
@@ -6862,13 +7473,15 @@ impl Inner {
             input_tokens,
             output_tokens,
             credits_charged: prep.total_credits as i64,
-            response_action_id: Some(response_action_id),
+            response_action_id,
             declined: None,
         }))
     }
 
     /// Save a turn and request a streaming response in one gesture (the GUI's
     /// path). Equivalent to `post` followed by `run_turn_stream(Reply)`.
+    ///
+    /// **Not in a live sub-space** — see [`Self::chat`].
     async fn chat_stream(
         &self,
         prompt: &str,
@@ -6877,6 +7490,7 @@ impl Inner {
         reply_to: Option<&str>,
         sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<ChatResult, AppError> {
+        self.refuse_combined_ask_in_subspace(space_id).await?;
         let posted = self.post(space_id, prompt, reply_to, &[]).await?;
         self.run_turn_stream(
             &posted.space_id,
@@ -6884,6 +7498,7 @@ impl Inner {
             &posted.action_id,
             ResponseMode::Reply,
             None,
+            &TurnDirective::default(),
             sender,
         )
         .await
@@ -7004,7 +7619,44 @@ impl Inner {
         &self,
         space_id: &str,
         post_action_id: &str,
+        planner: Planner,
     ) -> Result<NotificationPlan, AppError> {
+        #[cfg(feature = "test-support")]
+        if planner == Planner::Driver
+            && self
+                .plan_faults
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+        {
+            return Err(AppError::Config {
+                message: "test: the plan is made to fail".into(),
+            });
+        }
+        // **A delegated room's turns belong to the driver, and only to it.**
+        // An agent-spawned sub-space has no window of its own, so app-core
+        // gives it turns itself (see [`subspace_driver`]); a consumer that also
+        // planned one and drove what it got back would double every turn in the
+        // room, at twice the spend. So the door a consumer can reach answers no
+        // turns there, and the driver's own door — this same computation, one
+        // argument different — is the only one that does. Ownership is then a
+        // property of the code rather than of a convention each consumer has to
+        // keep, and it holds for the CLI exactly as it holds for the GUI.
+        //
+        // Nothing is hidden by it: an explicit ask (`respond_stream_as`) still
+        // works in a sub-space, because an explicit ask never comes through
+        // planning at all — a human looking at a delegated room can still ask
+        // somebody there a question. What they cannot do is start a cascade
+        // that the driver is already responsible for.
+        if planner == Planner::Consumer {
+            let conn = self.db_conn().await?;
+            if db::is_live_subspace(&conn, space_id).await? {
+                return Ok(NotificationPlan::Turns(Vec::new()));
+            }
+        }
         let plan = self.mechanical_plan(space_id, post_action_id).await?;
         Ok(self
             .refine_notifications(space_id, post_action_id, plan)
@@ -7030,7 +7682,7 @@ impl Inner {
     ) -> Result<SubmitResult, AppError> {
         let post = self.post(space_id, text, reply_to, references).await?;
         let plan = self
-            .plan_and_refine(&post.space_id, &post.action_id)
+            .plan_and_refine(&post.space_id, &post.action_id, Planner::Consumer)
             .await?;
         Ok(SubmitResult { post, plan })
     }
@@ -7157,6 +7809,9 @@ impl AppCore {
     /// `sender` and returns the finalized `ChatResult` when the upstream
     /// stream closes. Drops `sender` on return so receivers see channel
     /// closure as the natural "done" signal.
+    ///
+    /// **Not in a live sub-space.** Combined post-and-turn is a cascade, and
+    /// those rooms belong to the driver (`AppError::DrivenConversation`).
     pub async fn chat_stream(
         &self,
         prompt: String,
@@ -7238,6 +7893,7 @@ impl AppCore {
                         &target_action_id,
                         ResponseMode::Reply,
                         None,
+                        &TurnDirective::default(),
                         sender,
                     )
                     .await
@@ -7270,6 +7926,7 @@ impl AppCore {
                         &target_action_id,
                         ResponseMode::Reply,
                         None,
+                        &TurnDirective::default(),
                         sender,
                     )
                     .await
@@ -7396,6 +8053,13 @@ impl AppCore {
     /// extra notifications, never lost ones). Explicit asks
     /// ([`Self::respond_stream`] / [`Self::respond_stream_as`]) never come
     /// through here at all.
+    ///
+    /// **An agent-spawned sub-space answers no turns here**, whatever its
+    /// participants' notify policies say: a delegated room's turns belong to
+    /// app-core's own driver (see [`Self::start_subspace_driver`]), and a
+    /// consumer that drove what it was handed would double every turn in the
+    /// room. Nothing is withheld by it — an explicit ask into such a room still
+    /// works, because an explicit ask never plans.
     pub async fn plan_notifications(
         &self,
         space_id: String,
@@ -7403,7 +8067,11 @@ impl AppCore {
     ) -> Result<NotificationPlan, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.plan_and_refine(&space_id, &post_action_id).await })
+            .spawn(async move {
+                inner
+                    .plan_and_refine(&space_id, &post_action_id, Planner::Consumer)
+                    .await
+            })
             .await
             .map_err(join_err)?
     }
@@ -7538,6 +8206,31 @@ impl AppCore {
                 bus,
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
+                subspace_driver_started: std::sync::atomic::AtomicBool::new(false),
+                subspace_drivers: Mutex::new(std::collections::HashMap::new()),
+                subspace_walks: Mutex::new(std::collections::HashMap::new()),
+                rooms_spawned_here: Mutex::new(Some(std::collections::HashSet::new())),
+                walk_permits: Arc::new(tokio::sync::Semaphore::new(
+                    subspace_driver::MAX_CONCURRENT_WALKS,
+                )),
+                awaiting_anchor: Mutex::new(std::collections::HashMap::new()),
+                anchor_wait_seq: std::sync::atomic::AtomicU64::new(0),
+                anchor_wait_grace_ms: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(feature = "test-support")]
+                anchor_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                cascade_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                entry_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                persist_window: Mutex::new(None),
+                ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
+                #[cfg(feature = "test-support")]
+                plan_faults: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(feature = "test-support")]
+                enumeration_faults: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(feature = "test-support")]
+                anchor_lookup_faults: std::sync::atomic::AtomicU32::new(0),
                 summary_gate: tokio::sync::Mutex::new(()),
                 summary_triggers: Mutex::new(std::collections::HashMap::new()),
                 memory_gate: tokio::sync::Mutex::new(()),
@@ -7586,9 +8279,12 @@ impl AppCore {
     /// Subscribe to the invalidation bus.
     ///
     /// Returns a [`tokio::sync::broadcast::Receiver`] that receives a
-    /// [`changes::Change`] after every successful durable write in this
-    /// `AppCore` instance.  The receiver is independent — dropping it does
-    /// not affect the bus or other subscribers.
+    /// [`changes::ChangeEvent`] after every successful durable write in this
+    /// `AppCore` instance — the change itself, plus a [`changes::ChangeOrigin`]
+    /// saying whether a caller is waiting on that write (see the module docs;
+    /// a consumer that drops invalidations while it is busy must not drop the
+    /// unattended ones).  The receiver is independent — dropping it does not
+    /// affect the bus or other subscribers.
     ///
     /// ## Lagged receivers
     ///
@@ -7596,8 +8292,22 @@ impl AppCore {
     /// it will receive [`tokio::sync::broadcast::error::RecvError::Lagged`].
     /// Treat that as "refresh everything you care about" — at least that many
     /// changes were missed.
-    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<changes::Change> {
+    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<changes::ChangeEvent> {
         self.bus.subscribe()
+    }
+
+    /// The change-bus watermark — every event emitted so far carries a
+    /// `ChangeEvent::seq` strictly below this (see
+    /// [`changes::ChangeSource::current_seq`]).
+    ///
+    /// Sampled by a consumer **immediately before a read**, and kept beside
+    /// whatever that read produced, so it can later answer the only question a
+    /// busy surface really has about a deferred invalidation: *did my own read
+    /// already cover this?* A plain atomic load — no runtime, no database, safe
+    /// from any thread, which is what lets a gpui entity take it on the frame
+    /// it issues the read.
+    pub fn change_seq(&self) -> u64 {
+        self.bus.current_seq()
     }
 
     // -----------------------------------------------------------------------
@@ -7976,6 +8686,35 @@ impl AppCore {
                 tokio::time::sleep(updates::POLL_INTERVAL).await;
             }
         });
+    }
+
+    /// Start driving **agent-spawned sub-spaces** in this process (see
+    /// [`subspace_driver`]).
+    ///
+    /// A sub-space has no window, so nothing outside app-core can give it
+    /// turns; this is what does. Turning it on arms every live delegated room
+    /// that still has work outstanding — the restart path, decided from the
+    /// rows rather than from anything stored — and then keeps arming rooms as
+    /// posts land in them, which is what makes a delegation resumable by simply
+    /// posting into it.
+    ///
+    /// **Off by default and one-way**, exactly like
+    /// [`Self::start_update_polling`] and for the same reason
+    /// [`Self::set_memory_enabled`] is off: what it drives are real, billed
+    /// turns in rooms nobody is looking at, so a consumer opts in rather than
+    /// inherits it. Idempotent — a second call does nothing.
+    pub fn start_subspace_driver(&self) {
+        if self
+            .inner
+            .subspace_driver_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let inner = self.inner.clone();
+        let bus = self.bus.subscribe();
+        self.runtime
+            .spawn(async move { subspace_driver::supervise(inner, bus).await });
     }
 
     // -----------------------------------------------------------------------
@@ -8447,6 +9186,7 @@ impl AppCore {
                         &posted.action_id,
                         ResponseMode::Reply,
                         Some(budget),
+                        &TurnDirective::default(),
                     )
                     .await
             })
@@ -8676,6 +9416,188 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Test-only seam: stop the next anchor wait inside its window (see
+    /// `Inner::anchor_window`).
+    ///
+    /// Each walk that reaches the window sends a resume handle down the
+    /// returned channel and blocks until it is used, so a test can commit the
+    /// very write the window is about and prove the ordering survives it.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_anchor_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .anchor_window
+            .lock()
+            .expect("anchor window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: shorten how long an anchor wait holds out before its own
+    /// alarm comes due (see `subspace_driver::ANCHOR_WAIT_GRACE`). What is
+    /// worth exercising is what happens when it does, not the waiting.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_set_anchor_wait_grace(&self, grace: std::time::Duration) {
+        self.inner.anchor_wait_grace_ms.store(
+            grace.as_millis().max(1) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Test-only seam: the delegated rooms currently waiting on `space_id` as
+    /// their parent — the registration that makes a change there wake them.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_rooms_awaiting(&self, space_id: String) -> Vec<String> {
+        self.inner.rooms_awaiting(&space_id)
+    }
+
+    /// Test-only seam: recover from a bus this process fell behind on, the way
+    /// the supervisor does — without having to overflow a real channel.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_recover_from_lag(&self) {
+        let inner = self.inner.clone();
+        let _ = self
+            .runtime
+            .spawn(async move {
+                inner
+                    .rearm_live_subspaces(subspace_driver::Arm::Signal)
+                    .await;
+            })
+            .await;
+    }
+
+    /// Test-only seam: make the next `n` plans fail, the way a transient store
+    /// error would — what turns a planner failure into a reported ending
+    /// rather than a walk that dies with the room still outstanding.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_fail_next_plans(&self, n: u32) {
+        self.inner
+            .plan_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only seam: make the next `n` live-room enumerations fail, the way
+    /// a transient store error would — what the sweep's retry recovers from
+    /// (see `Inner::rearm_live_subspaces`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_fail_next_subspace_enumerations(&self, n: u32) {
+        self.inner
+            .enumeration_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only seam: make the next `n` anchor lookups fail after the wait
+    /// has been registered, the way a transient store error would — what
+    /// leaves a spent meter with nothing remembered to deliver (see
+    /// `Inner::drive_subspace`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_fail_next_anchor_lookups(&self, n: u32) {
+        self.inner
+            .anchor_lookup_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only seam: stop the next walk between reading the room's last post
+    /// and deciding anything from it (see `Inner::entry_window`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_entry_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .entry_window
+            .lock()
+            .expect("entry window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: stop the next walk once inside its cascade, after its
+    /// first driven turn (see `Inner::cascade_window`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_cascade_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .cascade_window
+            .lock()
+            .expect("cascade window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: stop the next mechanical report immediately before its
+    /// generation is committed (see `Inner::persist_window`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_report_persist_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .persist_window
+            .lock()
+            .expect("persist window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: drive one delegated room to a stop and deliver its
+    /// report, awaited to completion.
+    ///
+    /// Production arms this from the change bus and runs it detached
+    /// ([`Self::start_subspace_driver`]); awaiting the same pass is what makes
+    /// a driver's effects assertable without a poll loop. It is the same
+    /// function, under the same unattended origin, so what a test exercises is
+    /// what a room gets.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_drive_subspace(&self, space_id: String) -> Result<(), AppError> {
+        self.test_drive_subspace_armed(space_id, true).await
+    }
+
+    /// [`Self::test_drive_subspace`], choosing whether the walk is the kind a
+    /// change signal arms or the kind the startup sweep arms — the difference
+    /// being whether it may wait for the post it was delegated from to be
+    /// answered.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_drive_subspace_armed(
+        &self,
+        space_id: String,
+        by_signal: bool,
+    ) -> Result<(), AppError> {
+        let arm = if by_signal {
+            subspace_driver::Arm::Signal
+        } else {
+            subspace_driver::Arm::Sweep
+        };
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                changes::with_origin(
+                    changes::ChangeOrigin::Unattended,
+                    inner.drive_subspace(space_id, arm),
+                )
+                .await
+            })
+            .await
+            .map_err(join_err)?
+            .map(|_| ())
+    }
+
     /// Test-only seam: pin the engine-pool memory budget so eviction tests
     /// are deterministic on any machine.
     #[doc(hidden)]
@@ -8762,11 +9684,23 @@ impl AppCore {
     /// `title` is optional; the brief's opening line names the room when none
     /// is given.
     ///
+    /// **`parent_action_id` is the post the delegation is being opened from**,
+    /// and it is the caller's to supply because only the caller knows it: a
+    /// spawn happens inside the owner's turn, and that turn's target is the
+    /// post the work was asked for on. It is captured durably (`space.
+    /// parent_action_id`, navigational exactly as `parent_space_id` is), so the
+    /// eventual report attaches to that branch rather than to wherever the
+    /// owning agent happened to speak last — which is not the same thing the
+    /// moment anything else is going on in the parent. `None` is honest for a
+    /// caller with no turn behind it (a test, a direct API use); the report
+    /// then falls back to the conversation's own last word.
+    ///
     /// Refusals arrive as [`AppError::SpawnRefused`] carrying a
     /// [`SpawnRefusal`], and leave nothing behind. On success:
     /// [`Change::SpaceIndex`] (the Library lists sub-spaces like any other
     /// conversation), [`Change::Space`] for the new id, and
     /// [`Change::Participants`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_subspace(
         &self,
         parent_space_id: String,
@@ -8775,6 +9709,7 @@ impl AppCore {
         participants: Vec<String>,
         capabilities: Vec<String>,
         title: Option<String>,
+        parent_action_id: Option<String>,
     ) -> Result<SpawnedSubspace, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -8787,6 +9722,7 @@ impl AppCore {
                         &participants,
                         &capabilities,
                         title.as_deref(),
+                        parent_action_id.as_deref(),
                     )
                     .await
             })
@@ -9736,6 +10672,16 @@ struct TurnPrep {
     inf_item_id: String,
     inf_supersedes: Option<String>,
     inf_reply_to: Option<String>,
+    /// The references the turn machinery attached to this turn (see
+    /// [`AttachedReference`]): validated and rendered into the context at
+    /// preparation, written onto the persisted `inference` as
+    /// `relation='reference'` edges at ordinals `1..=N` by
+    /// [`TurnPrep::persist_turn`]. Empty for every turn a consumer asked for.
+    attached_references: Vec<AttachedReference>,
+    /// See [`TurnDirective::mechanical`].
+    mechanical: bool,
+    /// See [`TurnDirective::reporting_on`].
+    reporting_on: Option<String>,
     /// The actions fed upstream at preparation, **in the order their messages
     /// were sent** — the posts of the spine with each one's replayed trace
     /// rounds (task 33) spliced in ahead of the answer they produced. Built by
@@ -9825,6 +10771,20 @@ struct SpendPrep {
     spend_proof: SpendProof<128>,
     pre_refund: PreRefund,
     pre_cred_id: String,
+}
+
+/// Persist-time verdict for a mechanical report. Ordinary turns skip the
+/// check and take [`MechanicalReportGate::Proceed`].
+enum MechanicalReportGate {
+    /// The generation the model produced still names live, visible wording.
+    Proceed,
+    /// The delegated room closed while the request was in flight — keep the
+    /// exchange in the Record and write no post.
+    Closed,
+    /// A finding or the attach target moved after the model consumed it.
+    /// Withdraw the generation so the driver can retry against what a reader
+    /// now sees.
+    Stale,
 }
 
 impl TurnPrep {
@@ -9994,8 +10954,56 @@ impl TurnPrep {
     /// output when the model produced any alongside its calls, then one
     /// `tool_use` block per call (`tool_name` + `tool_call_id` + the raw
     /// arguments string in `data`).
+    /// One transaction, like every other multi-statement action writer (the
+    /// `persist_turn` rationale): the intermediate states are then not
+    /// something any reader — or a crash — can keep.
     #[allow(clippy::too_many_arguments)]
     async fn persist_tool_call_action(
+        &mut self,
+        calls: &[ParsedToolCall],
+        reasoning: &str,
+        content: &str,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        request_body_json: &serde_json::Value,
+        request_at: i64,
+        response_at: i64,
+        http_status: u16,
+        response_body: Vec<u8>,
+    ) -> Result<String, AppError> {
+        db::begin_write(&self.db_conn).await?;
+        let written = self
+            .persist_tool_call_action_body(
+                calls,
+                reasoning,
+                content,
+                input_tokens,
+                output_tokens,
+                request_body_json,
+                request_at,
+                response_at,
+                http_status,
+                response_body,
+            )
+            .await;
+        match written {
+            Ok(id) => {
+                self.db_conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map_err(AppError::db)?;
+                Ok(id)
+            }
+            Err(e) => {
+                // Best-effort rollback; propagate the original error regardless.
+                let _ = self.db_conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_call_action_body(
         &mut self,
         calls: &[ParsedToolCall],
         reasoning: &str,
@@ -10111,6 +11119,28 @@ impl TurnPrep {
         &mut self,
         outcomes: &[ToolOutcome],
     ) -> Result<String, AppError> {
+        db::begin_write(&self.db_conn).await?;
+        let written = self.persist_tool_result_action_body(outcomes).await;
+        match written {
+            Ok(id) => {
+                self.db_conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map_err(AppError::db)?;
+                Ok(id)
+            }
+            Err(e) => {
+                // Best-effort rollback; propagate the original error regardless.
+                let _ = self.db_conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn persist_tool_result_action_body(
+        &mut self,
+        outcomes: &[ToolOutcome],
+    ) -> Result<String, AppError> {
         let action_id = Uuid::now_v7().to_string();
         let status = if outcomes.iter().all(|o| o.ok) {
             "complete"
@@ -10206,6 +11236,25 @@ impl TurnPrep {
     /// visible in the Record, invisible as a post. Rendering it as "saw this,
     /// declined" is a GUI follow-up, not something the write side decides.
     async fn persist_decision(&mut self, reason: &str) -> Result<String, AppError> {
+        db::begin_write(&self.db_conn).await?;
+        let written = self.persist_decision_body(reason).await;
+        match written {
+            Ok(id) => {
+                self.db_conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map_err(AppError::db)?;
+                Ok(id)
+            }
+            Err(e) => {
+                // Best-effort rollback; propagate the original error regardless.
+                let _ = self.db_conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn persist_decision_body(&mut self, reason: &str) -> Result<String, AppError> {
         let action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &self.db_conn,
@@ -10256,8 +11305,10 @@ impl TurnPrep {
     /// Persist the turn's durable rows — the inference action (per the attach
     /// plan, with its reply edge), the context-assembly record (exactly the
     /// actions fed upstream), the response content blocks, and the request row
-    /// — and return the inference action id. Emissions stay with the caller
-    /// (they differ per exit point; see the table in `tests/bus.rs`).
+    /// — and return the inference action id (`None` when a mechanical report
+    /// was suppressed: the room closed in flight, or a finding or attach
+    /// target moved after the model consumed it). Emissions stay with
+    /// the caller (they differ per exit point; see the table in `tests/bus.rs`).
     ///
     /// `reasoning` is the model's own "thinking" output, when the upstream
     /// emitted any (streaming `delta.reasoning_content` / `delta.reasoning`,
@@ -10267,9 +11318,29 @@ impl TurnPrep {
     /// process — and is deliberately excluded from every context query
     /// (`db::get_upstream_context` / `db::get_space_actions_for_context` join
     /// only `text` blocks), so persisting it never changes what a model reads.
+    ///
+    /// **One transaction**, the `db::post_tx` cure for the `db::post_tx`
+    /// defect: the inference row lands with a terminal status, so written
+    /// piecewise the post exists and says nothing for as long as its text and
+    /// edges take — a state every reader keyed on the action is entitled to,
+    /// and one of them acts on it (the sub-space driver's refill takes posts
+    /// by commit order, so it could plan and bill a turn against a blank
+    /// reply). Everything here is a local adjacent write — the upstream call
+    /// is long over — and this prep's connection is the turn's own, so
+    /// nothing else can join the transaction.
+    ///
+    /// **A mechanical report revalidates inside this transaction.** The room
+    /// it reports on is re-read, and each authored attachment and the attach
+    /// target must still be the visible generation the model was shown: a
+    /// close, or a regen that landed while the request was in flight, must
+    /// not persist a quote of wording the report never saw, a reply under a
+    /// hidden answer, or a message about a conversation somebody closed.
+    /// Ordinary human quotes are not checked this way — those name a
+    /// concrete generation. `None` means the generation was suppressed (the
+    /// request is still in the Record); every other turn returns `Some`.
     #[allow(clippy::too_many_arguments)]
     async fn persist_turn(
-        &self,
+        &mut self,
         action_status: &str,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
@@ -10280,7 +11351,103 @@ impl TurnPrep {
         response_at: i64,
         http_status: u16,
         response_body: Vec<u8>,
-    ) -> Result<String, AppError> {
+    ) -> Result<Option<String>, AppError> {
+        db::begin_write(&self.db_conn).await?;
+        let persisted = self
+            .persist_turn_body(
+                action_status,
+                input_tokens,
+                output_tokens,
+                reasoning,
+                content,
+                request_body_json,
+                request_at,
+                response_at,
+                http_status,
+                response_body,
+            )
+            .await;
+        match persisted {
+            Ok(id) => {
+                self.db_conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map_err(AppError::db)?;
+                Ok(id)
+            }
+            Err(e) => {
+                // Best-effort rollback; propagate the original error regardless.
+                let _ = self.db_conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether this mechanical report may still be written. Called inside the
+    /// persist transaction so a close or a regen that landed while the model
+    /// request was in flight cannot commit a generation about wording the
+    /// model never saw, or about a room somebody closed. Ordinary turns
+    /// skip the check.
+    async fn revalidate_mechanical_report(&self) -> Result<MechanicalReportGate, AppError> {
+        if !self.mechanical {
+            return Ok(MechanicalReportGate::Proceed);
+        }
+        if let Some(room) = &self.reporting_on
+            && !db::is_live_subspace(&self.db_conn, room).await?
+        {
+            return Ok(MechanicalReportGate::Closed);
+        }
+        for attached in &self.attached_references {
+            if attached.origin != AttachmentOrigin::Authored {
+                continue;
+            }
+            let tip = db::visible_tip_of_action(&self.db_conn, &attached.spec.antecedent_action_id)
+                .await?;
+            if tip.as_deref() != Some(attached.spec.antecedent_action_id.as_str()) {
+                return Ok(MechanicalReportGate::Stale);
+            }
+        }
+        if let Some(target) = &self.inf_reply_to {
+            let tip = db::visible_tip_of_action(&self.db_conn, target).await?;
+            if tip.as_deref() != Some(target.as_str()) {
+                return Ok(MechanicalReportGate::Stale);
+            }
+        }
+        Ok(MechanicalReportGate::Proceed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_turn_body(
+        &mut self,
+        action_status: &str,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        reasoning: &str,
+        content: &str,
+        request_body_json: &serde_json::Value,
+        request_at: i64,
+        response_at: i64,
+        http_status: u16,
+        response_body: Vec<u8>,
+    ) -> Result<Option<String>, AppError> {
+        match self.revalidate_mechanical_report().await? {
+            MechanicalReportGate::Proceed => {}
+            MechanicalReportGate::Closed | MechanicalReportGate::Stale => {
+                // Keep the exchange in the Record. Closed: write no post
+                // about work nobody wants continued. Stale: the model wrote
+                // about wording a reader no longer sees, so the driver
+                // retries rather than settling a misleading footnote.
+                self.insert_unattached_request(
+                    request_body_json,
+                    request_at,
+                    response_at,
+                    http_status,
+                    response_body,
+                )
+                .await?;
+                return Ok(None);
+            }
+        }
         let inference_action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &self.db_conn,
@@ -10305,6 +11472,27 @@ impl TurnPrep {
         if let Some(ref ante) = self.inf_reply_to {
             db::insert_action_antecedent(&self.db_conn, &inference_action_id, ante, 0, "reply")
                 .await?;
+        }
+        // The attached passages become this answer's own reference edges, at
+        // the ordinals they were shown under — so the numbering in the prompt,
+        // the edge in the record, and the footnote a reader sees are one
+        // sequence. Ordinary turns write the specs validated at preparation.
+        // A mechanical report has already refused to persist if those specs
+        // no longer name the visible generations the model was shown. A turn
+        // that ends without an inference (a decline, the round cap) writes
+        // none of them, because there is no post for a quote to hang on.
+        for attached in &self.attached_references {
+            db::insert_reference_antecedent(
+                &self.db_conn,
+                &inference_action_id,
+                &attached.spec.antecedent_action_id,
+                attached.ordinal,
+                attached.spec.content_block_id.as_deref(),
+                attached.spec.range_start,
+                attached.spec.range_end,
+                attached.spec.annotation.as_deref(),
+            )
+            .await?;
         }
 
         // Record context assembly: exactly the actions fed into this
@@ -10395,7 +11583,7 @@ impl TurnPrep {
         )
         .await?;
 
-        Ok(inference_action_id)
+        Ok(Some(inference_action_id))
     }
 }
 
@@ -10890,6 +12078,82 @@ fn canonicalize_model_ref(model_ref: &str) -> String {
 /// footnote a model reads is one dialect wherever it reaches the post.
 const REFERENCE_BLOCK_HEADING: &str = "Passages this post quotes:";
 
+/// Heading of the trailing section carrying the passages the turn machinery has
+/// attached to *this* turn (see [`AttachedReference`]).
+///
+/// It says what the numbering means, because the number is load-bearing twice
+/// over: it is the ordinal of the edge the answer will carry, and it is what a
+/// reader of that answer will see in their footnote rail. The sentence asks for
+/// the model's own words rather than a restatement, because the passage is
+/// already attached — repeating it would say the same thing twice to everyone
+/// downstream.
+const ATTACHED_BLOCK_HEADING: &str = "Attached to your reply as a quoted reference, numbered \
+     as shown — write what it means in your own words; the passage travels with your post, so \
+     there is no need to repeat it:";
+
+/// How much of the whole attached block is rendered into the turn that reports
+/// on it. The **edges** are all written either way — this bounds a prompt.
+///
+/// Clipping each passage ([`ATTACHED_PASSAGE_MAX_BYTES`]) bounds one entry and
+/// says nothing about how many there are: the sub-space driver attaches a tip
+/// per branch its walk reached, and a burst of posts into a room somebody is
+/// watching makes those branches. Unbounded, the block crowds out the
+/// conversation the report is being written into, and at the far end overflows
+/// the request and takes the delivery with it — the one outcome a terminal
+/// report may not have.
+///
+/// The figure is the app's own register rather than a guess:
+/// [`subspaces::MAX_SUBAGENTS_PER_SPAWN`] seats × one full
+/// [`ATTACHED_PASSAGE_MAX_BYTES`] passage each — a whole room's worth of
+/// distinct voices, each at full length. Past that a walk's fan-out is the same
+/// voices again, and what the model needs then is not more text but to know
+/// there is more (see `attached_withheld_note`).
+const ATTACHED_BLOCK_MAX_BYTES: usize =
+    subspaces::MAX_SUBAGENTS_PER_SPAWN as usize * ATTACHED_PASSAGE_MAX_BYTES;
+
+/// The line that closes an attached block whose passages did not all fit —
+/// **the model is told what it is not being shown.**
+///
+/// It names how many and at which ordinals, and says the two things that keep
+/// the report honest: they are attached to the answer regardless, and a reader
+/// can follow each one. A model that knows its view is partial writes "the
+/// helpers also reported on X and Y" rather than claiming to have read
+/// everything.
+fn attached_withheld_note(withheld: &[i64]) -> String {
+    let count = withheld.len();
+    let range = match (withheld.first(), withheld.last()) {
+        (Some(first), Some(last)) if first != last => format!("[{first}]–[{last}]"),
+        (Some(only), _) => format!("[{only}]"),
+        _ => String::new(),
+    };
+    let passages = if count == 1 { "passage" } else { "passages" };
+    format!(
+        "\n{count} further {passages} at {range} are attached to your reply but not shown here — \
+         they travel with your post and a reader can open each one."
+    )
+}
+
+/// How much of one attached passage is *rendered* into the turn that reports on
+/// it. The **edge** keeps the whole range either way — this bounds a prompt,
+/// not a record.
+///
+/// An attached set is the one place a turn's context grows with something
+/// nobody chose post by post: the sub-space driver attaches one passage per
+/// branch its walk reached, and a passage is a range with nothing bounding its
+/// length, so one long finding could take the whole context and leave the
+/// findings beside it saying nothing. That is the same failure the chore
+/// prompts already budget against, and this is the same cure — elide the middle
+/// ([`utility::clip_middle`]), so both ends of a passage are paid for before
+/// its bulk is.
+///
+/// The figure is read off that register rather than invented: it is a small
+/// multiple of the branch summarizer's per-post budget, because a finding is
+/// what a report is *about* rather than chrome around it. With the walk's own
+/// ceiling on how many tips there can be — one per driven turn
+/// (`subspace_driver::MAX_DELEGATION_TURNS`) plus what arrived while it walked
+/// — the whole block is bounded without capping how many branches come back.
+const ATTACHED_PASSAGE_MAX_BYTES: usize = 1_500;
+
 /// The byline of a quoted post this reader cannot address: a reference names a
 /// *concrete generation*, which may have been superseded, or may live in
 /// another space entirely (references are the cross-space mechanism). It also
@@ -11036,7 +12300,7 @@ impl ReferenceEntry {
         Self {
             ordinal: row.ordinal,
             target,
-            annotation: row.annotation.clone(),
+            annotation: subspace_driver::annotation_for_model(row.annotation.as_deref()),
             body,
         }
     }
@@ -11066,7 +12330,13 @@ impl ReferenceEntry {
         Self {
             ordinal: reference.ordinal,
             target,
-            annotation: reference.annotation.clone(),
+            // A `PostReference` has already split the two apart, so the note is
+            // the note and the ending is typed — and both render the same way
+            // they would off the raw column.
+            annotation: match reference.delegation_end {
+                Some(end) => Some(end.describe()),
+                None => reference.annotation.clone(),
+            },
             body,
         }
     }
@@ -12017,7 +13287,16 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
                     content_block_id: e.content_block_id,
                     range_start: e.range_start,
                     range_end: e.range_end,
-                    annotation: e.annotation,
+                    // The one place the stored column is split into the two
+                    // things it can be, so no reader downstream has to know
+                    // that it can be either.
+                    delegation_end: e
+                        .annotation
+                        .as_deref()
+                        .and_then(subspace_driver::DelegationEnd::parse),
+                    annotation: e
+                        .annotation
+                        .filter(|a| subspace_driver::DelegationEnd::parse(a).is_none()),
                     snippet,
                     antecedent_author_label: e.antecedent_author_label,
                     antecedent_author_kind: e.antecedent_author_kind,
@@ -13494,6 +14773,7 @@ mod tests {
             range_start: Some(0),
             range_end: Some(20),
             annotation: None,
+            delegation_end: None,
             snippet: Some("Because of the moon.".into()),
             antecedent_author_label: "Ada".into(),
             antecedent_author_kind: "agent".into(),
@@ -13714,6 +14994,7 @@ mod tests {
                 range_start: None,
                 range_end: None,
                 annotation: None,
+                delegation_end: None,
                 snippet: Some("Because of the moon.".into()),
                 antecedent_author_label: "Agent".into(),
                 antecedent_author_kind: "agent".into(),
@@ -13725,6 +15006,7 @@ mod tests {
                 range_start: None,
                 range_end: None,
                 annotation: Some("no marker for this one".into()),
+                delegation_end: None,
                 snippet: Some("from another space".into()),
                 antecedent_author_label: "Cy".into(),
                 antecedent_author_kind: "agent".into(),
@@ -14340,6 +15622,7 @@ mod tests {
             range_start: Some(0),
             range_end: Some(7),
             annotation: None,
+            delegation_end: None,
             snippet: Some("passage".into()),
             antecedent_author_label: label.into(),
             antecedent_author_kind: "agent".into(),

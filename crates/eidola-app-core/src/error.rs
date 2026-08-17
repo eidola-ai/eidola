@@ -45,6 +45,19 @@ pub enum AppError {
     #[error("this conversation was opened between agents; joining it is what allows posting")]
     NotJoined { space_id: String },
 
+    /// Combined post-and-turn (`chat` / `chat_stream`) was asked in a live
+    /// sub-space. Those rooms take their turns from the driver; this door
+    /// would post and then start a second cascade alongside it, at twice the
+    /// spend. Posting (`post` / `submit`) and an explicit ask
+    /// (`respond_stream_as`) remain. Asked after the membership gate, so an
+    /// unjoined reader still sees [`Self::NotJoined`].
+    ///
+    /// **Data, not prose.** Same shape as [`Self::NotJoined`]: the space id
+    /// the caller named, and a log-shaped `Display`. The sentence a reader
+    /// sees is the presentation layer's.
+    #[error("this conversation takes its own turns, so a combined ask would double them")]
+    DrivenConversation { space_id: String },
+
     /// A post-level write was aimed at a kind of post it does not apply to:
     /// editing something that is not the human's own input, or regenerating
     /// something that is not an agent's inferred answer.

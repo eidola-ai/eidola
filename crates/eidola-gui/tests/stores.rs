@@ -22,8 +22,8 @@
 
 use std::sync::Arc;
 
-use eidola_app_core::AppCore;
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeOrigin};
+use eidola_app_core::{AppCore, SpaceMessage};
 use gpui::{AppContext, TestAppContext};
 
 use eidola_gui::stores::{self, SpacesStore, Stores};
@@ -1953,6 +1953,245 @@ fn a_participants_change_arriving_mid_operation_is_replayed(cx: &mut TestAppCont
     wait_until(cx, "the deferred invalidation is replayed", |cx| {
         byline(cx).as_deref() == Some("Skipper")
     });
+}
+
+/// **A write nobody is waiting on is deferred while the space is busy, and
+/// replayed** — the `Change::Space` half of the same rule the participants
+/// change above obeys.
+///
+/// The exit reload an in-flight operation performs is several reads, so a post
+/// committing while they run is caught by none of them; dropping its signal
+/// loses it until something unrelated re-reads. The one that reaches a busy
+/// window in practice is app-core's own sub-space driver posting a delegation's
+/// report into the conversation the reader is mid-turn in.
+#[gpui::test]
+fn an_unattended_space_change_arriving_mid_operation_is_replayed(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let count = |cx: &mut TestAppContext| space.read_with(cx, |s, _| s.messages().len());
+    wait_until(cx, "the transcript loads", |cx| count(cx) == 1);
+
+    // A turn owns the transcript's truth.
+    space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+
+    // Something else writes into this very space while that runs.
+    core.runtime()
+        .block_on(core.post(
+            "And the moon is nobody's.".into(),
+            Some(posted.space_id.clone()),
+        ))
+        .expect("a second post");
+    cx.update(|cx| {
+        stores::dispatch_change_event_for_test(
+            &stores,
+            Some(Change::Space(posted.space_id.clone())),
+            ChangeOrigin::Unattended,
+            core.change_seq(),
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        count(cx),
+        1,
+        "the busy gate still holds the reload off while the operation runs"
+    );
+
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    wait_until(cx, "the deferred invalidation is replayed", |cx| {
+        count(cx) == 2
+    });
+}
+
+/// **And a caller-origin write is not dropped for being somebody's.**
+/// `ChangeOrigin::Caller` says a call is outstanding, never that the call is
+/// *this* entity's — so another window's write into the conversation this one
+/// is streaming in was dropped as though some read of ours contained it, and
+/// nothing did. Archiving from the Library is the live case (that write
+/// announces the room it closed); a post is what makes the loss observable.
+#[gpui::test]
+fn a_caller_space_change_from_another_window_is_replayed(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let count = |cx: &mut TestAppContext| space.read_with(cx, |s, _| s.messages().len());
+    wait_until(cx, "the transcript loads", |cx| count(cx) == 1);
+
+    space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+    core.runtime()
+        .block_on(core.post(
+            "And the moon is nobody's.".into(),
+            Some(posted.space_id.clone()),
+        ))
+        .expect("a second post");
+    // Announced the way another window's write is: a caller is waiting on it,
+    // and it is nothing this entity has read.
+    cx.update(|cx| {
+        stores::dispatch_change_for_test(&stores, Some(Change::Space(posted.space_id.clone())), cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        count(cx),
+        1,
+        "the busy gate still holds the reload off while the operation runs"
+    );
+
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    wait_until(
+        cx,
+        "the deferred write is replayed once the space settles",
+        |cx| count(cx) == 2,
+    );
+}
+
+/// **And an own write still buys no redundant re-read.** Every post raises
+/// `Change::Space`, and almost all of them are the busy operation's own — its
+/// exit reload covers those, and the entity can now say so exactly: a write
+/// announced below the mark that reload was taken at had already committed when
+/// it began. Discharging by comparison rather than by re-reading is what keeps
+/// the property the ownership test was protecting, without its false premise.
+#[gpui::test]
+fn a_caller_space_change_the_read_already_covers_costs_no_re_read(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let count = |cx: &mut TestAppContext| space.read_with(cx, |s, _| s.messages().len());
+    wait_until(cx, "the transcript loads", |cx| count(cx) == 1);
+
+    // A write from before that read: its announcement is numbered below the
+    // mark the load took, which is what "already on screen" means here.
+    space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+    core.runtime()
+        .block_on(core.post(
+            "And the moon is nobody's.".into(),
+            Some(posted.space_id.clone()),
+        ))
+        .expect("a second post");
+    cx.update(|cx| {
+        stores::dispatch_change_event_for_test(
+            &stores,
+            Some(Change::Space(posted.space_id.clone())),
+            ChangeOrigin::Caller,
+            1,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+
+    // Asked of the settle itself: a replay issues the read synchronously, so
+    // an empty load slot the instant the operation clears is the observable
+    // that no re-read was bought (a count taken here would also read 1 while
+    // one was merely in flight).
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    assert!(
+        space.read_with(cx, |s, _| !s.has_pending_load_for_test()),
+        "a change the entity's own read already contained is discharged silently"
+    );
+    cx.run_until_parked();
+    assert_eq!(count(cx), 1, "and nothing re-read it afterwards either");
+}
+
+/// **Two reads landing out of order do not take the newer one off the screen,
+/// and the watermark never claims more than the screen holds.** Two reads are
+/// in flight whenever a fan-out settles two turns, and each carries the mark it
+/// began at; `merge_from_db` *replaces* the transcript, so an older snapshot
+/// landing last removes the newer response — and keeping the higher mark anyway
+/// makes it describe a transcript nobody is looking at, so a deferred
+/// invalidation between the two marks discharges as covered while the write it
+/// announced is absent. Rejecting the older read holds both halves.
+#[gpui::test]
+fn a_transcript_read_that_lands_out_of_order_is_rejected(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let count = |cx: &mut TestAppContext| space.read_with(cx, |s, _| s.messages().len());
+    wait_until(cx, "the transcript loads", |cx| count(cx) == 1);
+
+    let older = core.change_seq();
+    core.runtime()
+        .block_on(core.post(
+            "And the moon is nobody's.".into(),
+            Some(posted.space_id.clone()),
+        ))
+        .expect("a second post");
+    let newer = core.change_seq();
+    assert!(newer > older, "the second post moved the write stream");
+
+    let two = vec![
+        SpaceMessage {
+            role: "user".into(),
+            content: "The tide is the moon's doing.".into(),
+        },
+        SpaceMessage {
+            role: "user".into(),
+            content: "And the moon is nobody's.".into(),
+        },
+    ];
+    let one = vec![SpaceMessage {
+        role: "user".into(),
+        content: "The tide is the moon's doing.".into(),
+    }];
+
+    // The later read lands first — as a fan-out's second turn does when it
+    // finishes ahead of its sibling.
+    space.update(cx, |s, cx| {
+        assert!(
+            s.apply_loaded_transcript_at_for_test(two, newer, cx),
+            "the newer read applies"
+        );
+    });
+    assert_eq!(count(cx), 2);
+
+    // Its sibling, which began earlier, lands after it.
+    space.update(cx, |s, cx| {
+        assert!(
+            !s.apply_loaded_transcript_at_for_test(one, older, cx),
+            "an older read does not apply over a newer one"
+        );
+    });
+    assert_eq!(
+        count(cx),
+        2,
+        "the response the reader can see does not disappear and come back"
+    );
+    assert_eq!(
+        space.read_with(cx, |s, _| s.transcript_covers_through_for_test()),
+        newer,
+        "and the mark still answers for exactly what is on screen"
+    );
 }
 
 /// A ⌘N space's row commits behind its window, and the very first Send must

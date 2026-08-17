@@ -9,7 +9,7 @@
 mod chat_harness;
 
 use chat_harness::{ChatBehavior, MockConfig, with_account};
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::error::AppError;
 use eidola_app_core::{AppCore, ChatStreamEvent, LocalModelStatus};
 
@@ -21,11 +21,11 @@ where
 }
 
 /// Drain all currently-available bus messages (non-blocking).
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     loop {
         match rx.try_recv() {
-            Ok(c) => out.push(c),
+            Ok(c) => out.push(c.change),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {

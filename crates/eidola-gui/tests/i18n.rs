@@ -251,6 +251,9 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 // fails here rather than on a reader's screen.
                 args.set("version", "0.0.0");
                 args.set("model", "Gemma 4 27B");
+                args.set("depth", 4);
+                args.set("limit", 4);
+                args.set("reason", "upstream");
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),

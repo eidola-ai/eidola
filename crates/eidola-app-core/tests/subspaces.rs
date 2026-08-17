@@ -24,7 +24,7 @@
 mod chat_harness;
 
 use chat_harness::{ChatBehavior, MockConfig, MockServer, flat_messages};
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AppCore, MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, MAX_SUBAGENTS_PER_SPAWN,
@@ -63,11 +63,21 @@ fn setup() -> (MockServer, AppCore, tempfile::TempDir) {
     (mock, core, dir)
 }
 
+/// A parent conversation **with something said in it** — which is what one
+/// always is at a spawn, since a spawn happens inside a turn answering a post.
+/// A conversation with nothing in it has nowhere for a report to land and the
+/// spawn door refuses it (`SpawnRefusal::NothingToReportTo`), so an empty one
+/// would be testing a refusal rather than the thing under test.
 fn space(core: &AppCore) -> String {
-    core.runtime()
+    let id = core
+        .runtime()
         .block_on(core.create_space(None))
         .expect("space")
-        .id
+        .id;
+    core.runtime()
+        .block_on(core.post("What do the tide tables say?".into(), Some(id.clone())))
+        .expect("post");
+    id
 }
 
 /// A **shared** agent taking part in `space` — the only kind of participant
@@ -100,6 +110,20 @@ fn spawn(
     participants: Vec<String>,
     capabilities: Vec<String>,
 ) -> Result<SpawnedSubspace, AppError> {
+    spawn_from(core, parent, owner, brief, participants, capabilities, None)
+}
+
+/// A spawn that names the post in the parent it is being opened from — what a
+/// turn-scoped caller supplies, and what the eventual report attaches to.
+fn spawn_from(
+    core: &AppCore,
+    parent: &str,
+    owner: &str,
+    brief: &str,
+    participants: Vec<String>,
+    capabilities: Vec<String>,
+    parent_action_id: Option<&str>,
+) -> Result<SpawnedSubspace, AppError> {
     core.runtime().block_on(core.spawn_subspace(
         parent.to_string(),
         owner.to_string(),
@@ -107,6 +131,7 @@ fn spawn(
         participants,
         capabilities,
         None,
+        parent_action_id.map(str::to_string),
     ))
 }
 
@@ -117,10 +142,10 @@ fn refusal(err: AppError) -> SpawnRefusal {
     }
 }
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     while let Ok(c) = rx.try_recv() {
-        out.push(c);
+        out.push(c.change);
     }
     out
 }
@@ -548,6 +573,285 @@ fn an_owner_holds_the_live_limit_and_archiving_frees_a_slot() {
     });
 }
 
+/// **An owner leaving a conversation closes what it was running for it.** The
+/// two rules about that one membership are not in tension: an owner cannot
+/// leave the *room* (nothing can grant that membership back), and an owner
+/// leaving the *parent* takes its delegations there with it — every report they
+/// could still write is a turn in a conversation the writer is no longer part
+/// of, refused for that reason, forever, against a meter nobody reads and a
+/// live-room slot nobody gets back. A room under a conversation nobody left is
+/// untouched: leaving one says nothing about another.
+#[test]
+fn an_owner_leaving_a_conversation_closes_the_delegations_it_ran_for_it() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let elsewhere = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        // The same agent is also at work in another conversation.
+        core.runtime()
+            .block_on(core.add_global_participant(
+                elsewhere.clone(),
+                owner.clone(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("join the other conversation");
+
+        let here = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![helper.clone()],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+        // A room the helper opened from *that* room — beneath what is closing.
+        let nested = spawn(
+            &core,
+            &here,
+            &helper,
+            "A sub-errand of my own.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+        let other = spawn(
+            &core,
+            &elsewhere,
+            &owner,
+            "A different errand.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+
+        let mut rx = core.subscribe_changes();
+        assert!(
+            core.runtime()
+                .block_on(core.remove_space_participant(parent.clone(), owner.clone()))
+                .expect("an ordinary departure from an ordinary conversation")
+        );
+
+        let archived = |id: &str| -> bool {
+            core.runtime()
+                .block_on(core.test_space_archived(id.to_string()))
+                .expect("archived?")
+        };
+        assert!(
+            archived(&here),
+            "the delegation it was running for this conversation is closed"
+        );
+        assert!(
+            archived(&nested),
+            "and what that room had delegated onward goes with it"
+        );
+        assert!(
+            !archived(&other),
+            "a room under a conversation nobody left is untouched"
+        );
+        assert!(
+            !archived(&parent),
+            "and the conversation itself is not archived by somebody leaving it"
+        );
+
+        // The quota those rooms held is released; the one elsewhere still counts.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(owner.clone()))
+                .unwrap()
+                .len(),
+            1,
+            "only the room under the conversation it is still in"
+        );
+
+        // Each closed room announces itself — what releases a delegation
+        // waiting on one of them as its parent — beside the roster and listing.
+        let seen = drain(&mut rx);
+        for id in [&here, &nested] {
+            assert!(
+                seen.contains(&Change::Space(id.clone())),
+                "each closed room announces itself: {seen:?}"
+            );
+        }
+        assert!(seen.contains(&Change::Participants), "{seen:?}");
+        assert!(seen.contains(&Change::SpaceIndex), "{seen:?}");
+
+        // The owner is out of the parent, and the room's own ownership record
+        // is untouched — archival is not a departure.
+        assert!(
+            core.runtime()
+                .block_on(core.list_space_participants(parent.clone()))
+                .expect("roster")
+                .iter()
+                .all(|p| p.id != owner),
+            "it really left the conversation"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.subspace(here.clone()))
+                .unwrap()
+                .expect("still a sub-space")
+                .owner_participant_id,
+            owner,
+            "and the closed room still records who was answerable for it"
+        );
+    });
+}
+
+/// **Closing a conversation closes what it delegated, all the way down.**
+///
+/// A delegation exists to serve the room it was opened from. Left live under an
+/// archived one it can never finish: its report is a turn in that archived
+/// parent, which is refused at the gate every turn meets, so the room keeps
+/// being armed, keeps failing to report, holds a live-room slot of an owner
+/// nobody retired, and waits on an anchor no post will ever answer — with no
+/// un-archive door anywhere to get it back out. The rule is therefore held at
+/// the archival's own write, at every depth and whoever owns what it reaches.
+#[test]
+fn archiving_a_conversation_closes_the_delegations_beneath_it() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+
+        // parent → room → nested → deepest, each level opened by whichever
+        // agent is standing in the room above it.
+        let room = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![helper.clone()],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+        let nested = spawn(
+            &core,
+            &room,
+            &helper,
+            "A sub-errand of my own.",
+            vec![owner.clone()],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+        let deepest = spawn(
+            &core,
+            &nested,
+            &owner,
+            "And one below that.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+        // A delegation under a conversation nobody is closing: the descent must
+        // not reach it.
+        let untouched = space(&core);
+        let bystander = shared_agent(&core, &untouched, "Bystander");
+        let elsewhere = spawn(
+            &core,
+            &untouched,
+            &bystander,
+            "Somewhere else.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+
+        let mut rx = core.subscribe_changes();
+        assert!(
+            core.runtime()
+                .block_on(core.archive_space(parent.clone()))
+                .expect("archive")
+        );
+
+        let archived = |id: &str| -> bool {
+            core.runtime()
+                .block_on(core.test_space_archived(id.to_string()))
+                .expect("archived?")
+        };
+        assert!(archived(&parent), "the conversation itself");
+        assert!(archived(&room), "the delegation it was running");
+        assert!(
+            archived(&nested),
+            "and the one that room delegated onward, owned by another agent"
+        );
+        assert!(archived(&deepest), "at every depth, not just the first");
+        assert!(
+            !archived(&elsewhere),
+            "and nothing under a conversation that was not closed"
+        );
+
+        // The slots those rooms held are released with them — derived from
+        // liveness, so nothing had to remember to do it.
+        assert!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(owner.clone()))
+                .unwrap()
+                .is_empty(),
+            "the closed rooms stop counting against the agent that opened them"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(helper.clone()))
+                .unwrap()
+                .is_empty(),
+            "the other owner's room is closed too — its purpose went with the room above it"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(bystander.clone()))
+                .unwrap()
+                .len(),
+            1,
+            "and an owner whose conversation nobody closed keeps its room"
+        );
+
+        // Every closed room announces itself, which is what releases a
+        // delegation registered against one of them as its parent; the Library
+        // hears once.
+        let seen = drain(&mut rx);
+        for id in [&parent, &room, &nested, &deepest] {
+            assert!(
+                seen.contains(&Change::Space(id.clone())),
+                "each closed room announces itself: {seen:?}"
+            );
+        }
+        assert!(seen.contains(&Change::SpaceIndex), "{seen:?}");
+        assert!(
+            !seen.contains(&Change::Space(elsewhere.clone())),
+            "and a room nothing happened to says nothing: {seen:?}"
+        );
+
+        // Archival is still a visibility choice: the transcripts survive.
+        assert!(listed(&core, &nested));
+        assert_eq!(
+            core.runtime()
+                .block_on(core.get_space_tree(nested.clone()))
+                .expect("tree")
+                .len(),
+            1,
+            "the brief is still there to read"
+        );
+    });
+}
+
 // ===========================================================================
 // Attenuation — the adversarial arm
 // ===========================================================================
@@ -876,11 +1180,17 @@ fn the_brief_notifies_the_sub_agents_and_reaches_their_turn_as_a_post() {
 
         // A brief is a post, so planning off it is planning off a post — and
         // the sub-agent's `all` override is what makes it fire in a room with
-        // no human to post.
-        let plan = core
-            .runtime()
-            .block_on(core.plan_notifications(out.space.id.clone(), out.brief_action_id.clone()))
-            .expect("plan");
+        // no human to post. Asked of the mechanical computation, because the
+        // consumer-facing door deliberately answers no turns for a delegated
+        // room — those belong to app-core's own driver (see
+        // `tests/subspace_driver.rs`).
+        let plan =
+            core.runtime()
+                .block_on(core.mechanical_notification_plan(
+                    out.space.id.clone(),
+                    out.brief_action_id.clone(),
+                ))
+                .expect("plan");
         let turns = match plan {
             NotificationPlan::Turns(t) => t,
             other => panic!("expected turns, got {other:?}"),
@@ -952,7 +1262,7 @@ fn a_brief_is_agent_authored_so_the_room_opens_one_cascade_hop_in() {
 
         match core
             .runtime()
-            .block_on(core.plan_notifications(out.space.id, out.brief_action_id))
+            .block_on(core.mechanical_notification_plan(out.space.id, out.brief_action_id))
             .expect("plan")
         {
             NotificationPlan::Paused { depth, limit } => {
@@ -960,6 +1270,206 @@ fn a_brief_is_agent_authored_so_the_room_opens_one_cascade_hop_in() {
             }
             other => panic!("a cascade limit of 1 must pause on the brief, got {other:?}"),
         }
+    });
+}
+
+/// **A delegation is opened *from* a post, and that post has to be one here.**
+/// The anchor is what the eventual report attaches to, so one naming another
+/// conversation would answer a conversation nobody asked — and it is decided at
+/// the write like every other guard.
+#[test]
+fn a_spawn_cannot_anchor_to_a_post_in_another_conversation() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let elsewhere = space(&core);
+        let foreign = core
+            .runtime()
+            .block_on(core.post("Not here.".into(), Some(elsewhere)))
+            .expect("post");
+
+        match refusal(
+            spawn_from(
+                &core,
+                &parent,
+                &owner,
+                "Check the tide tables.",
+                vec![],
+                vec![],
+                Some(&foreign.action_id),
+            )
+            .expect_err("a foreign anchor is refused"),
+        ) {
+            SpawnRefusal::AnchorNotInParent { action_id } => {
+                assert_eq!(action_id, foreign.action_id);
+            }
+            other => panic!("expected AnchorNotInParent, got {other:?}"),
+        }
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent))
+                .expect("list")
+                .is_empty(),
+            "a refused spawn leaves nothing behind"
+        );
+
+        // And an anchor that *is* a post here is kept, so the driver can find
+        // it later.
+        let parent2 = space(&core);
+        let owner2 = shared_agent(&core, &parent2, "Pilot");
+        let here = core
+            .runtime()
+            .block_on(core.post("Here.".into(), Some(parent2.clone())))
+            .expect("post");
+        let out = spawn_from(
+            &core,
+            &parent2,
+            &owner2,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+            Some(&here.action_id),
+        )
+        .expect("spawn");
+        assert_eq!(
+            out.space.parent_action_id.as_deref(),
+            Some(here.action_id.as_str())
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.subspace(out.space.id))
+                .expect("read")
+                .expect("a sub-space")
+                .parent_action_id
+                .as_deref(),
+            Some(here.action_id.as_str()),
+            "and it is durable"
+        );
+    });
+}
+
+/// **A delegation is opened from a post the parent currently shows.** A
+/// superseded wording is still a row in that conversation, and a failed
+/// regeneration's hidden `error` tip is its current generation — either would
+/// let the room run and then attach its report to something the transcript
+/// does not render. The spawn asks the transcript's own predicate, so only
+/// the current, terminal, visible post is an anchor.
+#[test]
+fn a_spawn_cannot_anchor_to_a_superseded_wording() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let original = core
+            .runtime()
+            .block_on(core.post("Check Friday.".into(), Some(parent.clone())))
+            .expect("post");
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(original.action_id.clone(), "Check Saturday.".into()))
+            .expect("edit");
+        assert_ne!(
+            edited.action_id, original.action_id,
+            "an edit mints a new generation"
+        );
+
+        match refusal(
+            spawn_from(
+                &core,
+                &parent,
+                &owner,
+                "Check the tide tables.",
+                vec![],
+                vec![],
+                Some(&original.action_id),
+            )
+            .expect_err("a superseded wording is not an anchor"),
+        ) {
+            SpawnRefusal::AnchorNotInParent { action_id } => {
+                assert_eq!(action_id, original.action_id);
+            }
+            other => panic!("expected AnchorNotInParent, got {other:?}"),
+        }
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent.clone()))
+                .expect("list")
+                .is_empty(),
+            "a refused spawn leaves nothing behind"
+        );
+
+        let out = spawn_from(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+            Some(&edited.action_id),
+        )
+        .expect("the current wording is an anchor");
+        assert_eq!(
+            out.space.parent_action_id.as_deref(),
+            Some(edited.action_id.as_str())
+        );
+    });
+}
+
+/// **A delegation that could never be reported is refused before it costs
+/// anything.** The asymmetry is the whole argument: a refused spawn writes
+/// nothing and spends nothing, while a room that runs its turns and then finds
+/// no post in its parent to reply to has spent real money on work nobody will
+/// ever be told about.
+#[test]
+fn a_spawn_with_nowhere_to_report_back_to_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+        let owner = shared_agent(&core, &parent, "Navigator");
+
+        assert!(
+            matches!(
+                refusal(
+                    spawn(
+                        &core,
+                        &parent,
+                        &owner,
+                        "Check the tide tables.",
+                        vec![],
+                        vec![]
+                    )
+                    .expect_err("a conversation with nothing in it is refused")
+                ),
+                SpawnRefusal::NothingToReportTo
+            ),
+            "an empty parent has nowhere for a report to land"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent.clone()))
+                .expect("list")
+                .is_empty(),
+            "and the refusal costs nothing"
+        );
+
+        // One post is all it takes: that post is what the report replies to.
+        core.runtime()
+            .block_on(core.post("Look into the tides.".into(), Some(parent.clone())))
+            .expect("post");
+        spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+        )
+        .expect("now there is somewhere to report back to");
     });
 }
 
@@ -1374,8 +1884,9 @@ fn a_human_cannot_post_into_a_subspace_without_joining_it() {
             1
         );
 
-        // `chat` reaches the same gate — it is `post` plus a turn, and the
-        // post is what commits first.
+        // `chat` reaches the membership gate first — it is a combined
+        // post-and-turn, and in a live sub-space that combination is refused
+        // before posting, but an unjoined reader still sees NotJoined.
         let err = core
             .runtime()
             .block_on(core.chat(
@@ -1383,7 +1894,7 @@ fn a_human_cannot_post_into_a_subspace_without_joining_it() {
                 MODEL.into(),
                 Some(sub.clone()),
             ))
-            .expect_err("chat posts first, so it is refused first");
+            .expect_err("chat is membership first");
         assert!(matches!(err, AppError::NotJoined { .. }), "{err:?}");
         assert_eq!(
             core.runtime()
@@ -1398,6 +1909,79 @@ fn a_human_cannot_post_into_a_subspace_without_joining_it() {
         core.runtime()
             .block_on(core.post("Ordinary.".into(), Some(parent)))
             .expect("posting where you are a member is unchanged");
+    });
+}
+
+/// **Combined post-and-turn is a cascade, and a live sub-space's cascade
+/// belongs to the driver.** `chat` / `chat_stream` would post and then drive
+/// the same notify-all seat the driver will take — twice the spend. Joining
+/// takes the membership gate out of the way so this is the kind rule that
+/// answers; posting itself remains, because that is what a joined reader
+/// does and what arms the room.
+#[test]
+fn a_combined_ask_in_a_live_subspace_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn");
+        let sub = out.space.id.clone();
+        core.runtime()
+            .block_on(core.add_global_participant(
+                sub.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("join");
+
+        let mut rx = core.subscribe_changes();
+        let _ = drain(&mut rx);
+
+        let chat_err = core
+            .runtime()
+            .block_on(core.chat("Anyone home?".into(), MODEL.into(), Some(sub.clone())))
+            .expect_err("combined chat would double-drive the room");
+        match &chat_err {
+            AppError::DrivenConversation { space_id } => assert_eq!(space_id, &sub),
+            other => panic!("expected DrivenConversation, got {other:?}"),
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream_err = core
+            .runtime()
+            .block_on(core.chat_stream("Anyone home?".into(), MODEL.into(), Some(sub.clone()), tx))
+            .expect_err("combined stream would double-drive the room");
+        match &stream_err {
+            AppError::DrivenConversation { space_id } => assert_eq!(space_id, &sub),
+            other => panic!("expected DrivenConversation, got {other:?}"),
+        }
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a refused combined ask writes nothing and emits nothing"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.get_space_tree(sub.clone()))
+                .expect("tree")
+                .len(),
+            1,
+            "the room still holds only its brief"
+        );
+
+        // Posting is still the joined reader's door — the driver takes the
+        // cascade from there.
+        core.runtime()
+            .block_on(core.post("Now I can speak.".into(), Some(sub)))
+            .expect("a member posts");
     });
 }
 
@@ -1693,12 +2277,15 @@ fn retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts() {
             live.space.id
         );
 
-        // The other agent's room is left alone — its owner is still live and
-        // still answerable for it — and it reads fine with its parent link
-        // pointing at an archived room.
+        // **The other agent's room goes with it.** Its owner is not being
+        // retired, but its *purpose* is: a delegation exists to serve the
+        // conversation above it, and that conversation is now closed — so its
+        // report would be a turn the archived parent refuses, leaving it
+        // outstanding forever against a meter nobody reads. The relation
+        // survives intact; only its liveness ends.
         assert!(
-            archived_at(&core, &nested).is_none(),
-            "nobody else's delegation is closed by this retirement"
+            archived_at(&core, &nested).is_some(),
+            "a delegation beneath a closed room is closed with it"
         );
         let relation = core
             .runtime()
@@ -1707,13 +2294,12 @@ fn retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts() {
             .expect("still a sub-space");
         assert_eq!(relation.parent_space_id, live.space.id);
         assert_eq!(relation.owner_participant_id, helper);
-        assert_eq!(
+        assert!(
             core.runtime()
                 .block_on(core.live_subspaces_owned_by(helper.clone()))
                 .unwrap()
-                .len(),
-            1,
-            "and it still counts against the agent that opened it"
+                .is_empty(),
+            "and the slot it held against its own owner's quota is released"
         );
 
         // An already-archived room is not archived twice: its timestamp is
@@ -1723,13 +2309,21 @@ fn retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts() {
 
         // Emissions: the roster changed, and so did the Library — because a
         // sub-space *is* a Library row, unlike the notebook this same
-        // transaction also archived.
+        // transaction also archived. And **every room it closed is announced**,
+        // the notebook included: a room can be opened from one, so a wait can
+        // be registered against one, and the announcement is what wakes it.
         let seen = drain(&mut rx);
         assert!(seen.contains(&Change::Participants), "{seen:?}");
         assert!(
             seen.contains(&Change::SpaceIndex),
             "archiving a listed room moved the listing: {seen:?}"
         );
+        for id in [&live.space.id, &nested] {
+            assert!(
+                seen.contains(&Change::Space(id.clone())),
+                "each closed room announces itself: {seen:?}"
+            );
+        }
 
         // And the unchanged half: retiring an agent that owns no live room
         // says nothing about the Library, because the notebook it archives is
@@ -1793,7 +2387,7 @@ fn retiring_an_owner_stops_the_helpers_mid_cascade() {
         // pending work retirement has to catch.
         let pending = match core
             .runtime()
-            .block_on(core.plan_notifications(sub.clone(), out.brief_action_id.clone()))
+            .block_on(core.mechanical_notification_plan(sub.clone(), out.brief_action_id.clone()))
             .expect("plan")
         {
             NotificationPlan::Turns(t) => t.into_iter().next().expect("the helper's turn"),
@@ -1828,7 +2422,12 @@ fn retiring_an_owner_stops_the_helpers_mid_cascade() {
         assert!(
             matches!(
                 core.runtime()
-                    .block_on(core.plan_notifications(sub.clone(), out.brief_action_id.clone()))
+                    .block_on(
+                        core.mechanical_notification_plan(
+                            sub.clone(),
+                            out.brief_action_id.clone(),
+                        ),
+                    )
                     .expect("plan"),
                 NotificationPlan::Turns(t) if t.is_empty()
             ),
@@ -2017,7 +2616,7 @@ fn a_notify_all_owner_is_quiet_among_its_helpers_and_answers_a_human() {
             .expect("an answer");
         let planned = match core
             .runtime()
-            .block_on(core.plan_notifications(out.space.id.clone(), answer))
+            .block_on(core.mechanical_notification_plan(out.space.id.clone(), answer))
             .expect("plan")
         {
             NotificationPlan::Turns(t) => {
@@ -2053,7 +2652,7 @@ fn a_notify_all_owner_is_quiet_among_its_helpers_and_answers_a_human() {
             .expect("and posts");
         let planned = match core
             .runtime()
-            .block_on(core.plan_notifications(out.space.id.clone(), asked.action_id))
+            .block_on(core.mechanical_notification_plan(out.space.id.clone(), asked.action_id))
             .expect("plan")
         {
             NotificationPlan::Turns(t) => {
@@ -2185,7 +2784,7 @@ fn a_sub_space_owners_policy_cannot_be_edited_back_into_the_cascade() {
             .expect("an answer");
         match core
             .runtime()
-            .block_on(core.plan_notifications(sub.clone(), answer))
+            .block_on(core.mechanical_notification_plan(sub.clone(), answer))
             .expect("plan")
         {
             NotificationPlan::Turns(t) => {
