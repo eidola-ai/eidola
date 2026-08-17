@@ -910,11 +910,16 @@ impl Inner {
             self.end_anchor_wait(&space_id);
             return Ok(()); // a room with no posts — unreachable, a brief opens every one
         };
+        // The entry window is a caller-controlled pause. A turn must not hold
+        // a connection across an await it does not own — the same rule as
+        // inference — and a test that writes during the pause needs the lock.
+        drop(conn);
         #[cfg(feature = "test-support")]
         self.pause_in_entry_window().await;
         // The whole of "is there anything to do here", asked of the rows. A
         // reported tail is a delegation whose last word the parent already has;
         // anything posted since makes a new tail, and the answer flips back.
+        let conn = self.db_conn().await?;
         if db::has_reference_from(
             &conn,
             &sub.parent_space_id,
@@ -1125,7 +1130,10 @@ impl Inner {
                         Some((depth, limit)) => DelegationEnd::Paused { depth, limit },
                         None => DelegationEnd::Concluded,
                     };
-                    return Ok(Some((end, finish(leaves, &frontier, &tail))));
+                    let conn = self.db_conn().await?;
+                    let quoted = Self::visible_fallback(&conn, space_id, &tail).await?;
+                    drop(conn);
+                    return Ok(Some((end, finish(leaves, &frontier, quoted.as_deref()))));
                 }
                 continue;
             };
@@ -1145,6 +1153,9 @@ impl Inner {
             // The item's visible tip is the one post; no visible tip is
             // nothing to plan (a failed regeneration's hidden `error`).
             let Some(post) = post else {
+                // The queued generation is done with: refill must not hand
+                // the same hidden tip back on the next empty-frontier pass.
+                served.insert(queued);
                 continue;
             };
             if !served.insert(post.clone()) {
@@ -1302,10 +1313,27 @@ impl Inner {
                 unwalked.push(tip);
             }
         }
+        let quoted = Self::visible_fallback(&conn, space_id, tail).await?;
         drop(conn);
         // The frontier first — those were next in line — then what arrived,
         // oldest first, which is the newest end of the room.
-        Ok(Some((end, finish(leaves, &unwalked, tail))))
+        Ok(Some((end, finish(leaves, &unwalked, quoted.as_deref()))))
+    }
+
+    /// The starting tail as a reader can still see it, or the room's current
+    /// last word if that item is gone. A failed regeneration that lands after
+    /// the tail was snapshotted leaves a hidden `error` tip; quoting the
+    /// snapshot would name wording the transcript has replaced, and settlement
+    /// reads the newest *visible* last word, which is no longer that id.
+    async fn visible_fallback(
+        conn: &turso::Connection,
+        space_id: &str,
+        entry_tail: &str,
+    ) -> Result<Option<String>, AppError> {
+        if let Some(tip) = db::visible_tip_of_action(conn, entry_tail).await? {
+            return Ok(Some(tip));
+        }
+        db::last_action_in_space(conn, space_id).await
     }
 
     /// One driven turn — the same door `respond_stream_as` takes, minus a
@@ -1710,8 +1738,11 @@ impl Inner {
 
 /// The posts a report will quote: every branch tip the walk followed, plus —
 /// where the walk stopped short — the post it stopped at and anything still
-/// waiting on its frontier, which nothing followed either. Deduped, oldest first, and never empty: a walk that got no
-/// further than the room's first post still has that post to show.
+/// waiting on its frontier, which nothing followed either. Deduped, oldest first.
+/// Empty only when nothing the walk reached is still visible — a failed
+/// regeneration of the starting tail after it was snapshotted, with no other
+/// finding left to show. The fallback is that tail as a reader can still see
+/// it, never the snapshot of a generation the transcript has hidden.
 ///
 /// **Every tip, and no cap.** The seat guard bounds a room's roster and never
 /// bounded its frontier: every seat is notify-all, so one post's fan-out puts
@@ -1733,14 +1764,16 @@ impl Inner {
 /// middle out of a post. The block is then bounded by the walk's own ceiling:
 /// at most one tip per driven turn ([`MAX_DELEGATION_TURNS`]) plus whatever
 /// arrived while it walked, each within one clipped passage.
-fn finish(mut leaves: Vec<String>, unwalked: &[String], entry_tail: &str) -> Vec<String> {
+fn finish(mut leaves: Vec<String>, unwalked: &[String], entry_tail: Option<&str>) -> Vec<String> {
     // Anything still on the frontier when the walk stopped is a tip nothing
     // followed either — it just never got its turn.
     leaves.extend(unwalked.iter().cloned());
     let mut seen = std::collections::HashSet::new();
     leaves.retain(|id| seen.insert(id.clone()));
-    if leaves.is_empty() {
-        leaves.push(entry_tail.to_string());
+    if leaves.is_empty()
+        && let Some(tail) = entry_tail
+    {
+        leaves.push(tail.to_string());
     }
     leaves
 }
