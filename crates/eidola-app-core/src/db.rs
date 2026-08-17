@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 7;
+const LATEST_VERSION: i64 = 9;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -242,7 +242,7 @@ pub async fn open(data_dir: &Path) -> Result<Database, AppError> {
 /// the winner's committed state and decides against *that*, which is what the
 /// grant's promote-or-join branch (and #279's promote / retire / remove
 /// guards) were always meant to do (Codex review, PR #280).
-async fn begin_write(conn: &Connection) -> Result<(), AppError> {
+pub(crate) async fn begin_write(conn: &Connection) -> Result<(), AppError> {
     conn.execute("BEGIN IMMEDIATE", ())
         .await
         .map_err(AppError::db)?;
@@ -1618,6 +1618,10 @@ pub struct SubspaceRow {
     pub parent_space_id: String,
     /// The `role = 'owner'` member — the agent that spawned it.
     pub owner_participant_id: String,
+    /// The post in the parent the delegation was opened from, when the spawn
+    /// named one. It is where the report attaches, so the answer lands on the
+    /// branch the work was asked for on. `None` for a spawn that named none.
+    pub parent_action_id: Option<String>,
     pub title: Option<String>,
     pub created_at: i64,
     pub archived_at: Option<i64>,
@@ -1712,29 +1716,31 @@ fn subspace_row(row: &turso::Row) -> Result<SubspaceRow, AppError> {
         id: row.get::<String>(0).map_err(AppError::db)?,
         parent_space_id: row.get::<String>(1).map_err(AppError::db)?,
         owner_participant_id: row.get::<String>(2).map_err(AppError::db)?,
-        title: row.get::<Option<String>>(3).map_err(AppError::db)?,
-        created_at: row.get::<i64>(4).map_err(AppError::db)?,
-        archived_at: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+        parent_action_id: row.get::<Option<String>>(3).map_err(AppError::db)?,
+        title: row.get::<Option<String>>(4).map_err(AppError::db)?,
+        created_at: row.get::<i64>(5).map_err(AppError::db)?,
+        archived_at: row.get::<Option<i64>>(6).map_err(AppError::db)?,
     })
 }
 
 async fn subspace_rows(
     conn: &Connection,
     where_clause: &str,
-    param: &str,
+    param: Option<&str>,
 ) -> Result<Vec<SubspaceRow>, AppError> {
     let sql = format!(
-        "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.title, s.created_at, \
-                s.archived_at \
+        "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.parent_action_id, s.title, \
+                s.created_at, s.archived_at \
          FROM space s \
          WHERE s.parent_space_id IS NOT NULL AND {SUBSPACE_OWNER_SQL} IS NOT NULL \
            AND {where_clause} \
          ORDER BY s.created_at ASC"
     );
-    let mut rows = conn
-        .query(&sql, (Value::Text(param.to_string()),))
-        .await
-        .map_err(AppError::db)?;
+    let mut rows = match param {
+        Some(p) => conn.query(&sql, (Value::Text(p.to_string()),)).await,
+        None => conn.query(&sql, ()).await,
+    }
+    .map_err(AppError::db)?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(AppError::db)? {
         out.push(subspace_row(&row)?);
@@ -1748,7 +1754,7 @@ pub async fn subspaces_of(
     conn: &Connection,
     parent_space_id: &str,
 ) -> Result<Vec<SubspaceRow>, AppError> {
-    subspace_rows(conn, "s.parent_space_id = ?1", parent_space_id).await
+    subspace_rows(conn, "s.parent_space_id = ?1", Some(parent_space_id)).await
 }
 
 /// Every **live** (non-archived) sub-space this participant owns — the set the
@@ -1761,7 +1767,7 @@ pub async fn live_subspaces_owned_by(
     subspace_rows(
         conn,
         &format!("s.archived_at IS NULL AND {SUBSPACE_OWNER_SQL} = ?1"),
-        owner_participant_id,
+        Some(owner_participant_id),
     )
     .await
 }
@@ -1770,7 +1776,275 @@ pub async fn live_subspaces_owned_by(
 /// row, i.e. when it is an ordinary space. The read behind "who do I report to,
 /// and where" for a sub-space id.
 pub async fn subspace(conn: &Connection, space_id: &str) -> Result<Option<SubspaceRow>, AppError> {
-    Ok(subspace_rows(conn, "s.id = ?1", space_id).await?.pop())
+    Ok(subspace_rows(conn, "s.id = ?1", Some(space_id))
+        .await?
+        .pop())
+}
+
+/// Every **live** sub-space, whoever owns it — what a turn driver enumerates
+/// when it starts, to pick up the rooms a previous run left mid-delegation.
+///
+/// Ordered oldest first, so a restart resumes delegations in the order they
+/// were opened rather than in whatever order the planner reached them.
+pub async fn live_subspaces(conn: &Connection) -> Result<Vec<SubspaceRow>, AppError> {
+    subspace_rows(conn, "s.archived_at IS NULL", None).await
+}
+
+/// Whether `space_id` is a sub-space that still takes work: it has a parent, it
+/// has an owner, and it is not archived.
+///
+/// One row read on the space's primary key. It is the question asked of every
+/// `Change::Space` a driver hears, so it is deliberately narrower than
+/// [`subspace`] — no owner join, no columns to build a row out of.
+pub async fn is_live_subspace(conn: &Connection, space_id: &str) -> Result<bool, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM space \
+             WHERE id = ?1 AND parent_space_id IS NOT NULL AND archived_at IS NULL",
+            (Value::Text(space_id.to_string()),),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(rows.next().await.map_err(AppError::db)?.is_some())
+}
+
+/// How many turns have been taken in `space_id` — the count a per-delegation
+/// turn budget is spent against.
+///
+/// **Derived, never stored.** A turn ends in exactly one durable act: the
+/// `inference` it persists, or the `decision` the decline checkpoint writes
+/// instead. Counting those rows is counting turns, and the answer survives a
+/// restart because the rows do — an in-memory tally would reset the meter every
+/// time the process came back, which is the one way a budget can be escaped.
+/// A turn that failed wrote neither and is deliberately not counted: nothing
+/// was produced and nothing was persisted to produce it from. Driven turns
+/// keep that true by writing no generation on failure; a human's *blocking*
+/// verb in a room writes a `status = 'error'` generation instead, so the
+/// terminal-status filter is what keeps the sentence true of every writer.
+/// Superseded generations stay counted on purpose — each was a turn that ran.
+pub async fn turns_taken_in_space(conn: &Connection, space_id: &str) -> Result<i64, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM action \
+             WHERE space_id = ?1 AND action_type IN ('inference', 'decision') \
+               AND status IN ('complete', 'cancelled')",
+            (Value::Text(space_id.to_string()),),
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<i64>(0).map_err(AppError::db),
+        None => Ok(0),
+    }
+}
+
+/// `(id, text)` of an action's first quotable ([`QUOTABLE_BLOCK_TYPE`]) content
+/// block — what a driver quotes when it attaches a post to a turn it is about
+/// to run. `None` for an action with no text block (a decline, a trace).
+pub async fn first_quotable_block(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<(String, String)>, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT id, text_content FROM content_block \
+             WHERE action_id = ?1 AND block_type = ?2 AND text_content IS NOT NULL \
+             ORDER BY ordinal ASC LIMIT 1",
+            (
+                Value::Text(action_id.to_string()),
+                Value::Text(QUOTABLE_BLOCK_TYPE.to_string()),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<String>(1).map_err(AppError::db)?,
+        ))),
+    }
+}
+
+/// Whether `participant_id` has already quoted `antecedent_action_id` in
+/// `space_id` — the read that answers "has this delegation already been
+/// reported?"
+///
+/// **This is what keeps a delegation's lifecycle derived** rather than stored.
+/// A driver's terminal act is a turn in the parent quoting the delegated room's
+/// last post; asking whether that edge exists asks whether the room's *current*
+/// tail has been reported, which is true after a report, false again the moment
+/// somebody posts into the room, and identical after a restart. A status column
+/// would have to be written, kept in step with continuation, and believed.
+///
+/// **Only a generation the parent actually shows answers it.** Current,
+/// because a superseded generation shows nobody anything — and in a terminal
+/// status and a post type, the same predicate `get_space_tree_data` renders
+/// by, because "current" alone is not "visible": a report regenerated against
+/// a failing upstream persists a **current `status = 'error'`** generation
+/// carrying the report's replicated edges (`persist_turn`), which the
+/// transcript hides — counting that edge would settle the room on a report
+/// the parent cannot show, durably and across restarts. A report regenerated
+/// *successfully* carries its edges forward (`prepare_turn`'s replication, the
+/// rule `edit_post` has always followed), so the tip still answers; the
+/// visibility join is what makes the driver's belief and the reader's
+/// footnote the same fact rather than two that can drift, and it errs toward
+/// reporting again rather than toward silence.
+///
+/// **And the owner is the item's original author, not the tip's.** A
+/// successful regeneration can mint a new agent (`TurnSelector::Model` when
+/// no seated member matches the picked model), and the edges travel with the
+/// item: asking the tip's `participant_id` would treat that re-wording as
+/// somebody else's quote and the next walk would post a duplicate. The origin
+/// generation (`supersedes_action_id IS NULL`) is who opened the item; a
+/// fresh quote by anyone else is a different item and still does not settle.
+pub async fn has_reference_from(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    antecedent_action_id: &str,
+) -> Result<bool, AppError> {
+    let sql = format!(
+        "SELECT 1 FROM action_antecedent aa \
+         JOIN action a ON a.id = aa.action_id \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         JOIN action origin ON origin.item_id = a.item_id \
+           AND origin.supersedes_action_id IS NULL \
+         WHERE aa.relation = 'reference' AND aa.antecedent_action_id = ?1 \
+           AND a.space_id = ?2 AND origin.participant_id = ?3 \
+           AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         LIMIT 1"
+    );
+    let mut rows = conn
+        .query(
+            &sql,
+            (
+                Value::Text(antecedent_action_id.to_string()),
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(rows.next().await.map_err(AppError::db)?.is_some())
+}
+
+/// The most recent **post** `participant_id` wrote in `space_id` **replying
+/// directly to `antecedent_action_id`** — the owner's own answer to the post a
+/// delegation was opened from, which is where that delegation's report belongs.
+///
+/// A direct reply rather than any descendant, because the relationship is
+/// exact: a spawn happens inside a turn, and that turn persists its answer as a
+/// reply to the very post it was answering. Newest — by **commit order**, the
+/// one ordering a writer's clock cannot contradict (see [`action_watermark`])
+/// — and **a generation the parent shows** (current, terminal status, post
+/// type — the transcript's predicate, as settlement reads it): an answer
+/// whose regeneration failed leaves a current `status = 'error'` tip, and a
+/// superseded generation that matched here would end the wait and put the
+/// report beneath an answer rendering resolves to nothing — at the
+/// conversation root, not under the owner's visible word. With the item's tip
+/// hidden nothing of that item matches, so the wait goes on waiting, which is
+/// the honest reading: the visible answer is gone until a regeneration lands
+/// or the grace alarm ends the wait against the anchor.
+///
+/// **And the owner is the item's original author, not the tip's** — the same
+/// join [`has_reference_from`] uses, for the same reason. A successful
+/// regeneration can mint a new agent (`TurnSelector::Model` when no seated
+/// member matches the picked model) and the reply edge travels with the item,
+/// so asking the tip's `participant_id` would miss the owner's own re-worded
+/// answer and wait out the grace alarm, attaching the report to the anchor as
+/// a sibling of a word the parent already shows.
+///
+/// **This resolves an answer, not *the* answer, and the gap is recorded rather
+/// than closed.** If the same owner answers the same post twice without one
+/// superseding the other — two concurrent explicit asks on one target, which is
+/// the only way to get there — the report attaches beneath the newer of the
+/// two, which may not be the turn the spawn happened inside. Nothing durable
+/// distinguishes them: a turn's rounds chain off *the post it answers*,
+/// deliberately never off its own inference (which a capped or budget-stopped
+/// turn never writes), so there is no edge from a spawning round to that turn's
+/// own answer. The one durable trace that relates them at all is
+/// `context_assembly`, and it is not one-to-one — a later turn replaying a
+/// trace records the same round in its own assembly, so the join answers a set.
+/// Recording the spawning round on the room would need a caller that could
+/// supply it, and there is none: nothing exposes the spawn door as a tool, and
+/// `tools::Tool::call` receives parsed arguments and no turn identity at all.
+/// So the residual is exactly this: **same owner, same anchor, two live answers
+/// — the report lands under the newer.** No report is lost, and the inversion
+/// the wait exists to prevent cannot happen either way, because both candidates
+/// are answers *of that owner to that anchor*: the report still sits beneath
+/// one of them rather than above it. Building for it before a caller exists
+/// would be machinery for a shape that has not been designed yet.
+pub async fn last_reply_by_participant(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    antecedent_action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = format!(
+        "SELECT a.id FROM action a \
+         JOIN action_antecedent aa \
+           ON aa.action_id = a.id AND aa.relation = 'reply' \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         JOIN action origin ON origin.item_id = a.item_id \
+           AND origin.supersedes_action_id IS NULL \
+         WHERE a.space_id = ?1 AND origin.participant_id = ?2 \
+           AND aa.antecedent_action_id = ?3 \
+           AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY a.rowid DESC LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Text(antecedent_action_id.to_string()),
+        ])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// The most recent — by **commit order** — **post** `participant_id` wrote in
+/// `space_id`, or `None` when they have written none. The fallback a report
+/// takes when its spawn named no anchor — see [`last_reply_by_participant`]
+/// for the anchored path, including why only a generation the parent shows
+/// may answer (the same `item_current` + visibility predicate) and why the
+/// owner is the item's original author, not the tip's.
+pub async fn last_post_by_participant(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = format!(
+        "SELECT a.id FROM action a \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         JOIN action origin ON origin.item_id = a.item_id \
+           AND origin.supersedes_action_id IS NULL \
+         WHERE a.space_id = ?1 AND origin.participant_id = ?2 \
+           AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY a.rowid DESC LIMIT 1"
+    );
+    let mut rows = conn
+        .query(
+            &sql,
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
 }
 
 /// How deep a space sits in the `parent_space_id` chain: 0 for a space nobody
@@ -1880,6 +2154,11 @@ pub(crate) struct SubspacePlan<'a> {
     pub brief: &'a str,
     pub brief_action_id: &'a str,
     pub brief_item_id: &'a str,
+    /// The post in the parent this delegation is being opened from — the turn's
+    /// own target, which the caller knows and this door cannot derive. Written
+    /// to `space.parent_action_id` and validated to be a post the parent
+    /// **currently shows** (current generation, terminal status, post type).
+    pub parent_action_id: Option<&'a str>,
     /// Global agents to seat beside the owner, deduped and in requested order.
     pub participant_ids: &'a [String],
     /// Capability names requested; each must already be held by the parent,
@@ -2021,6 +2300,38 @@ async fn spawn_subspace_tx_body(
         });
     }
 
+    // (2b) the anchor, when one was named: the post in the parent this
+    // delegation is being opened from. Decided at the write like every other
+    // guard — and it must be a generation the parent **shows**, not merely a
+    // row that was once a post there. A superseded wording, or a failed
+    // regeneration's hidden `error` tip, would let the room run and bill, then
+    // wait for a reply nobody can write to that id; after grace the report
+    // would attach to an item whose tip is not renderable and land at the
+    // conversation root. The transcript's own predicate is the whole of
+    // "somewhere here to report back to".
+    if let Some(anchor) = plan.parent_action_id
+        && !is_visible_post_in_space(conn, plan.parent_space_id, anchor).await?
+    {
+        refuse!(SpawnRefusal::AnchorNotInParent {
+            action_id: anchor.to_string(),
+        });
+    }
+
+    // (2c) somewhere for the report to land. **Refused here rather than
+    // discovered there**, because the asymmetry is total: a refused spawn costs
+    // nothing at all, while a delegation that runs its turns and then finds no
+    // post to reply to has spent real money on work nobody will ever be told
+    // about. An anchor is itself such a post (guard 2b proved it), so this only
+    // ever bites a caller with no turn behind it opening a delegation from a
+    // conversation where nothing has been said.
+    if plan.parent_action_id.is_none()
+        && last_action_in_space(conn, plan.parent_space_id)
+            .await?
+            .is_none()
+    {
+        refuse!(SpawnRefusal::NothingToReportTo);
+    }
+
     // (3) depth.
     let depth = space_depth(conn, plan.parent_space_id).await? + 1;
     if depth > MAX_SPAWN_DEPTH {
@@ -2114,9 +2425,9 @@ async fn spawn_subspace_tx_body(
     // the brief below means it could never have been reaped anyway.
     conn.execute(
         "INSERT INTO space \
-         (id, parent_space_id, title, linkability, cascade_limit, router_model, \
-          created_at, touched_at) \
-         VALUES (?1, ?2, ?3, 'unlinked', ?4, ?5, ?6, ?6)",
+         (id, parent_space_id, parent_action_id, title, linkability, cascade_limit, \
+          router_model, created_at, touched_at) \
+         VALUES (?1, ?2, ?7, ?3, 'unlinked', ?4, ?5, ?6, ?6)",
         (
             Value::Text(plan.space_id.to_string()),
             Value::Text(plan.parent_space_id.to_string()),
@@ -2124,6 +2435,7 @@ async fn spawn_subspace_tx_body(
             Value::Integer(parent_cascade_limit),
             opt_str(parent_router_model.as_deref()),
             Value::Integer(plan.now),
+            opt_str(plan.parent_action_id),
         ),
     )
     .await
@@ -3231,10 +3543,17 @@ pub async fn list_grantable_agents(
 /// **Library lists** it archived on the way (the notebook is never one — the
 /// listing excludes notebooks in both its branches — so this counts sub-spaces
 /// and is what decides whether the caller announces a listing change).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retirement {
     pub retired: bool,
+    /// How many spaces the Library lists were archived — what the `SpaceIndex`
+    /// emission is decided from. Never counts the notebook.
     pub listed_spaces_archived: i64,
+    /// **Every space this retirement closed**, notebook included, so the
+    /// caller can do what every archival door does: announce each one and end
+    /// any wait it was holding. A count cannot say *which*, and the rooms are
+    /// exactly the things a delegation can be registered against.
+    pub archived_spaces: Vec<String>,
 }
 
 /// Retire a global agent: the soft-remove **and** the archival of every space
@@ -3268,13 +3587,14 @@ pub struct Retirement {
 /// opposite of what retirement is for, and it would contradict the notebook
 /// arm standing beside it in this very function.
 ///
-/// **Only the retiring agent's own rooms are touched.** The statement selects
-/// by *ownership*, not by descent, so it reaches the agent's sub-spaces at
-/// every depth and reaches nobody else's: a sub-space that another agent
-/// spawned from one of these keeps its live owner and stays live, with its
-/// parent link pointing at an archived room. That is the honest state — its
-/// owner is still answerable for it — and nothing reads a parent's
-/// `archived_at` to decide anything about a child.
+/// **The agent's own rooms are selected by ownership, and what hangs beneath
+/// them goes with them.** The statement selects by *ownership*, not by descent,
+/// so it reaches the agent's sub-spaces at every depth and nobody else's rooms
+/// *by that clause* — and then [`archive_rooms_under_a_closed_one`] closes what
+/// those rooms had delegated onward, whoever owns it. A nested room's owner is
+/// not being retired, but its *purpose* is: it exists to serve the conversation
+/// above it, and that conversation is closed, so its report is a turn an
+/// archived parent refuses and its delegation would stay outstanding forever.
 ///
 /// The participant row itself always survives (soft-remove), so every
 /// `action.participant_id` in the trail stays resolvable; retirement is about
@@ -3307,41 +3627,91 @@ async fn retire_participant_tx_body(
         return Ok(Retirement {
             retired: false,
             listed_spaces_archived: 0,
+            archived_spaces: Vec::new(),
         });
     }
+    // **Read before written, on both arms**, because the caller needs the ids
+    // and not only the count: every door that closes a room announces it and
+    // ends any wait it was holding (see [`Retirement::archived_spaces`]), and a
+    // rows-affected figure cannot say *which*. The predicate is the same in the
+    // select and the update, so the two describe one set — nothing can land in
+    // between, the whole body being one `BEGIN IMMEDIATE` transaction.
+    const LIVE_NOTEBOOK_OF: &str = "notebook_participant_id = ?1 AND archived_at IS NULL";
+    // Owner-scoped, so depth is irrelevant and nobody else's room is reached.
+    // The membership predicate is [`SUBSPACE_OWNER_SQL`]'s, minus its
+    // tie-break: that fragment names *the* owner where this asks *is an owner*,
+    // which is the same set while the write guards hold and the safer of the
+    // two if one ever did not.
+    const LIVE_ROOMS_OWNED_BY: &str = "archived_at IS NULL AND parent_space_id IS NOT NULL \
+               AND EXISTS ( \
+                   SELECT 1 FROM space_participant r \
+                   WHERE r.space_id = space.id AND r.participant_id = ?1 \
+                     AND r.role = 'owner' AND r.left_at IS NULL \
+               )";
+    let notebook = space_ids_where(conn, LIVE_NOTEBOOK_OF, participant_id).await?;
+    let rooms = space_ids_where(conn, LIVE_ROOMS_OWNED_BY, participant_id).await?;
     conn.execute(
-        "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
-         WHERE notebook_participant_id = ?1 AND archived_at IS NULL",
+        &format!(
+            "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
+         WHERE {LIVE_NOTEBOOK_OF}"
+        ),
         (Value::Text(participant_id.to_string()), Value::Integer(now)),
     )
     .await
     .map_err(|e| AppError::Database {
         message: format!("failed to archive the retired agent's notebook: {e}"),
     })?;
-    // Owner-scoped, so depth is irrelevant and nobody else's room is reached.
-    // The membership predicate is [`SUBSPACE_OWNER_SQL`]'s, minus its
-    // tie-break: that fragment names *the* owner where this asks *is an owner*,
-    // which is the same set while the write guards hold and the safer of the
-    // two if one ever did not.
     let archived = conn
         .execute(
-            "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
-             WHERE archived_at IS NULL AND parent_space_id IS NOT NULL \
-               AND EXISTS ( \
-                   SELECT 1 FROM space_participant r \
-                   WHERE r.space_id = space.id AND r.participant_id = ?1 \
-                     AND r.role = 'owner' AND r.left_at IS NULL \
-               )",
+            &format!(
+                "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
+             WHERE {LIVE_ROOMS_OWNED_BY}"
+            ),
             (Value::Text(participant_id.to_string()), Value::Integer(now)),
         )
         .await
         .map_err(|e| AppError::Database {
             message: format!("failed to archive the retired agent's sub-spaces: {e}"),
         })?;
+    // And the delegations *those* rooms were themselves running, at any depth
+    // and whoever owns them — see [`archive_rooms_under_a_closed_one`]. A room
+    // exists to serve the conversation above it, so one that can never report
+    // is not a room somebody else is still answerable for; it is work nobody
+    // will ever be told the result of. Counted into the listing figure because
+    // every sub-space is a Library row.
+    let beneath = archive_rooms_under_a_closed_one(conn, now).await?;
     Ok(Retirement {
         retired: true,
-        listed_spaces_archived: archived as i64,
+        // The *listing* figure counts what the Library shows: every sub-space,
+        // and never the notebook, which it has never listed.
+        listed_spaces_archived: archived as i64 + beneath.len() as i64,
+        // The *announcement* set is every space this closed, notebook
+        // included — a room can be opened from one, so a wait can be
+        // registered against one.
+        archived_spaces: notebook.into_iter().chain(rooms).chain(beneath).collect(),
     })
+}
+
+/// The ids of the spaces matching `predicate`, whose single bind parameter is
+/// `?1` — the read half of an archival that has to name what it closed.
+async fn space_ids_where(
+    conn: &Connection,
+    predicate: &str,
+    bind: &str,
+) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT id FROM space WHERE {predicate}"))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(bind.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(out)
 }
 
 /// Whether a participant is a member of one space — **owned row ∪ live
@@ -3956,12 +4326,28 @@ pub enum SpaceRemoval {
 /// (`promote_participant_tx` requires `scope = 'space' AND removed_at IS NULL`),
 /// so whichever transaction commits first, the loser refuses cleanly rather than
 /// writing through a premise that has expired.
+/// What a departure did: which of the two ways it ended, and **every
+/// delegation it closed on the way out**.
+///
+/// The second half is the same rule archival and retirement already apply, said
+/// of the third door that can end an agent's part in a conversation: a room an
+/// agent opened *for* this conversation exists to serve it, and an agent that
+/// is no longer in the conversation can no longer report to it — every report
+/// it tried would act as a participant that has left and be refused, forever,
+/// against a meter nobody reads and a live-room slot nobody gets back.
+pub struct SpaceDeparture {
+    pub outcome: SpaceRemoval,
+    /// The rooms closed with the departure, so the caller can announce each one
+    /// (which is what releases a delegation waiting on it as its parent).
+    pub archived_spaces: Vec<String>,
+}
+
 pub async fn remove_space_participant_tx(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
     now: i64,
-) -> Result<SpaceRemoval, AppError> {
+) -> Result<SpaceDeparture, AppError> {
     begin_write(conn).await?;
     match remove_space_participant_tx_body(conn, space_id, participant_id, now).await {
         Ok(outcome) => {
@@ -3980,7 +4366,7 @@ async fn remove_space_participant_tx_body(
     space_id: &str,
     participant_id: &str,
     now: i64,
-) -> Result<SpaceRemoval, AppError> {
+) -> Result<SpaceDeparture, AppError> {
     // Either branch changes the space's roster, and the transaction makes the
     // stamp atomic with whichever one lands; a `NothingToDo` over-marks, which
     // keeps a space rather than losing one.
@@ -3999,7 +4385,10 @@ async fn remove_space_participant_tx_body(
         .await
         .map_err(AppError::db)?;
     if struck > 0 {
-        return Ok(SpaceRemoval::SoftRemoved);
+        return Ok(SpaceDeparture {
+            outcome: SpaceRemoval::SoftRemoved,
+            archived_spaces: close_delegations_run_for(conn, space_id, participant_id, now).await?,
+        });
     }
     // The two **structural** memberships are guarded **in the leave's own
     // `WHERE`**, for the reason the soft-remove is guarded above: a promotion
@@ -4030,15 +4419,88 @@ async fn remove_space_participant_tx_body(
         .await
         .map_err(AppError::db)?;
     if left > 0 {
-        return Ok(SpaceRemoval::Left);
+        return Ok(SpaceDeparture {
+            outcome: SpaceRemoval::Left,
+            archived_spaces: close_delegations_run_for(conn, space_id, participant_id, now).await?,
+        });
     }
+    let refused = |outcome| SpaceDeparture {
+        outcome,
+        archived_spaces: Vec::new(),
+    };
     if notebook_participant_of(conn, space_id).await?.as_deref() == Some(participant_id) {
-        return Ok(SpaceRemoval::RefusedNotebookOwner);
+        return Ok(refused(SpaceRemoval::RefusedNotebookOwner));
     }
     if subspace_owner_of(conn, space_id).await?.as_deref() == Some(participant_id) {
-        return Ok(SpaceRemoval::RefusedSubspaceOwner);
+        return Ok(refused(SpaceRemoval::RefusedSubspaceOwner));
     }
-    Ok(SpaceRemoval::NothingToDo)
+    Ok(refused(SpaceRemoval::NothingToDo))
+}
+
+/// Archive every live delegation `participant_id` was running **for
+/// `space_id`** — the rooms it owns whose parent is the conversation it has
+/// just left — and everything beneath them.
+///
+/// **Two rules about one membership, and they are not in tension.** An owner
+/// cannot leave the *room* it owns (`SpaceRemoval::RefusedSubspaceOwner`,
+/// guarded in the leave's own `WHERE`): that membership is the whole record of
+/// who is answerable for the delegation, and nothing can grant it back. An
+/// owner leaving the *parent* is an ordinary departure and is allowed — and it
+/// takes the delegations it opened there with it, because their purpose was to
+/// serve that conversation and their reports are turns it can no longer take:
+/// every one would act as a participant that has left and be refused. The first
+/// rule protects a room from losing its owner; the second stops a room outliving
+/// the reason it existed. Together they say one thing — a delegation and the
+/// conversation it was opened from stand or fall together.
+///
+/// Scoped by `parent_space_id`, so an agent's rooms under *other* conversations
+/// are untouched: leaving one conversation says nothing about another.
+async fn close_delegations_run_for(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    now: i64,
+) -> Result<Vec<String>, AppError> {
+    const OWNED_UNDER_THIS_PARENT: &str = "archived_at IS NULL AND parent_space_id = ?1          AND EXISTS (              SELECT 1 FROM space_participant r              WHERE r.space_id = space.id AND r.participant_id = ?2                AND r.role = 'owner' AND r.left_at IS NULL          )";
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT id FROM space WHERE {OWNED_UNDER_THIS_PARENT}"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut archived = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        archived.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    if archived.is_empty() {
+        return Ok(archived);
+    }
+    conn.execute(
+        &format!(
+            "UPDATE space SET archived_at = ?3, touched_at = COALESCE(touched_at, ?3) \
+             WHERE {OWNED_UNDER_THIS_PARENT}"
+        ),
+        (
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to close the delegations of a departing owner: {e}"),
+    })?;
+    // And whatever those rooms had delegated onward, at any depth and whoever
+    // owns it — the invariant every archival restores.
+    archived.extend(archive_rooms_under_a_closed_one(conn, now).await?);
+    Ok(archived)
 }
 
 /// The participant a space is the **notebook** of, if it is one — the reverse of
@@ -4817,6 +5279,210 @@ pub struct ActionEntry {
 ///
 /// `participant_scope` is `NOT NULL`, so an unknown participant fails loudly
 /// here instead of inserting a NULL echo (which MATCH SIMPLE would then skip).
+/// Everything one saved post is made of — see [`post_tx`].
+pub(crate) struct PostPlan<'a> {
+    pub space_id: &'a str,
+    pub participant_id: &'a str,
+    pub action_id: &'a str,
+    pub item_id: &'a str,
+    pub text: &'a str,
+    /// The title to derive onto the space, when this post is the one that earns
+    /// the space a name. `None` leaves the title alone.
+    pub auto_title: Option<&'a str>,
+    /// The structural `reply` antecedent at ordinal 0: the explicit branch
+    /// target, or the space's tail, or nothing for a space's first post.
+    pub reply_to: Option<&'a str>,
+    /// Quoted references at ordinals `1..=N` in supplied order — already
+    /// validated by the caller, which is where a refusal belongs.
+    pub references: &'a [crate::ReferenceSpec],
+    pub created_at: i64,
+}
+
+/// Write one post — **the action, its text, its reply edge, its quoted
+/// references and any title it earns, in one `BEGIN IMMEDIATE` transaction.**
+/// Answers whether the space took a derived title.
+///
+/// **A post is not its action row.** Written as separate autocommitted
+/// statements, the row lands first and its text, its place in the thread and
+/// its quotations follow — so for as long as those take, the post exists and
+/// says nothing. Every reader keyed on the action is entitled to it in that
+/// window, and one of them acts: the sub-space driver's refill takes posts by
+/// commit order, so it can plan and *bill* a turn against a post with no words
+/// in it, and by the time the writer's own change event arms the room again the
+/// driven reply may already have settled it. Rendering has the same exposure
+/// with a gentler ending (a blank row in an open window).
+///
+/// The transaction is what makes "a post" a single event, and it is the same
+/// cure `instantiate_template` took for the same class of defect: a space
+/// without its participants is not a space, and a post without its words is not
+/// a post. Nothing here spends or calls out — the writes are local and
+/// adjacent, which is what makes them transaction-able at all — and the caller
+/// validates before it opens this, so a refusal still writes nothing and now
+/// cannot half-write either.
+pub(crate) async fn post_tx(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, AppError> {
+    begin_write(conn).await?;
+    match post_tx_body(conn, plan).await {
+        Ok(auto_titled) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(auto_titled)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, AppError> {
+    insert_action(
+        conn,
+        &ActionEntry {
+            id: plan.action_id.to_string(),
+            space_id: plan.space_id.to_string(),
+            participant_id: plan.participant_id.to_string(),
+            item_id: plan.item_id.to_string(),
+            supersedes_action_id: None,
+            action_type: "user_input".to_string(),
+            status: "complete".to_string(),
+            intent: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            credits_consumed: None,
+            created_at: plan.created_at,
+        },
+    )
+    .await?;
+    insert_text_content_block(
+        conn,
+        &uuid::Uuid::now_v7().to_string(),
+        plan.action_id,
+        0,
+        "text",
+        plan.text,
+    )
+    .await?;
+    let auto_titled = match plan.auto_title {
+        Some(title) => update_space_title(conn, plan.space_id, title, plan.created_at).await?,
+        None => false,
+    };
+    if let Some(ante) = plan.reply_to {
+        insert_action_antecedent(conn, plan.action_id, ante, 0, "reply").await?;
+    }
+    for (i, spec) in plan.references.iter().enumerate() {
+        insert_reference_antecedent(
+            conn,
+            plan.action_id,
+            &spec.antecedent_action_id,
+            (i + 1) as i64,
+            spec.content_block_id.as_deref(),
+            spec.range_start,
+            spec.range_end,
+            spec.annotation.as_deref(),
+        )
+        .await?;
+    }
+    Ok(auto_titled)
+}
+
+/// Everything an edit writes, validated by the caller before this is opened.
+/// See [`edit_post_tx`].
+pub(crate) struct EditPostPlan<'a> {
+    pub space_id: &'a str,
+    pub participant_id: &'a str,
+    /// The new generation's id.
+    pub action_id: &'a str,
+    pub item_id: &'a str,
+    /// The current tip this edit supersedes.
+    pub supersedes_action_id: &'a str,
+    pub text: &'a str,
+    /// The tip's reply edge, replicated.
+    pub reply_to: Option<&'a str>,
+    /// The surviving reference edges, replicated **at their original
+    /// ordinals** (stable across generations — see `ReferenceSpec`'s ordinal
+    /// convention).
+    pub references: &'a [ReferenceEdgeRow],
+    pub created_at: i64,
+}
+
+/// Append an edit — the new `user_input` generation, its text, its reply edge
+/// and its surviving references — **in one `BEGIN IMMEDIATE` transaction.**
+///
+/// The same cure, for the same defect, as [`post_tx`]: a post is not its
+/// action row, and an edit is sharper still — its new row *supersedes* the
+/// tip, so written as separate autocommitted statements the item's current
+/// generation says nothing for as long as the tail of writes takes, and a
+/// reader keyed on the action (the sub-space driver's refill takes posts by
+/// commit order) is entitled to that state and can plan and bill against it.
+/// Nothing here spends or calls out; the caller validates before it opens
+/// this, so a refused edit still writes nothing and cannot half-write either.
+pub(crate) async fn edit_post_tx(
+    conn: &Connection,
+    plan: &EditPostPlan<'_>,
+) -> Result<(), AppError> {
+    begin_write(conn).await?;
+    match edit_post_tx_body(conn, plan).await {
+        Ok(()) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn edit_post_tx_body(conn: &Connection, plan: &EditPostPlan<'_>) -> Result<(), AppError> {
+    insert_action(
+        conn,
+        &ActionEntry {
+            id: plan.action_id.to_string(),
+            space_id: plan.space_id.to_string(),
+            participant_id: plan.participant_id.to_string(),
+            item_id: plan.item_id.to_string(),
+            supersedes_action_id: Some(plan.supersedes_action_id.to_string()),
+            action_type: "user_input".to_string(),
+            status: "complete".to_string(),
+            intent: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            credits_consumed: None,
+            created_at: plan.created_at,
+        },
+    )
+    .await?;
+    insert_text_content_block(
+        conn,
+        &uuid::Uuid::now_v7().to_string(),
+        plan.action_id,
+        0,
+        "text",
+        plan.text,
+    )
+    .await?;
+    if let Some(ante) = plan.reply_to {
+        insert_action_antecedent(conn, plan.action_id, ante, 0, "reply").await?;
+    }
+    for r in plan.references {
+        insert_reference_antecedent(
+            conn,
+            plan.action_id,
+            &r.antecedent_action_id,
+            r.ordinal,
+            r.content_block_id.as_deref(),
+            r.range_start,
+            r.range_end,
+            r.annotation.as_deref(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
@@ -4986,25 +5652,64 @@ impl ReferenceEdgeRow {
 /// `edit_post` to replicate references onto a new generation and by the
 /// upstream-context embed expansion — which also renders each passage's
 /// byline, hence the author join (on the **antecedent's** space).
+/// How a post's author is **named**, as one SQL fragment every reader shares.
+///
+/// Two things about it are load-bearing and both are easy to get wrong
+/// separately: the label is the one that post's **own space** gives the author
+/// (a reading space's override is that space's name for somebody, and using it
+/// on a cross-space passage misattributes it), and there is **no liveness
+/// filter** — who wrote a post goes on being named after they retire, which is
+/// exactly the record retirement promises to leave alone. Expects the author's
+/// action to be in scope as `ant`, and binds `p` / `sp`.
+const POST_AUTHOR_LABEL_SQL: &str = "COALESCE(sp.override_label, p.label)";
+
+/// The joins [`POST_AUTHOR_LABEL_SQL`] reads from.
+const POST_AUTHOR_JOIN_SQL: &str = "JOIN participant p ON p.id = ant.participant_id \
+     LEFT JOIN space_participant sp \
+       ON sp.space_id = ant.space_id AND sp.participant_id = ant.participant_id";
+
+/// How a post's author is named, for a reader holding the post rather than an
+/// edge to it — the same fragment [`reference_antecedents`] joins, asked
+/// directly, so a passage cannot be attributed one way in a prompt and another
+/// way in the record. `None` for an action that does not exist.
+pub async fn post_author_label(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {POST_AUTHOR_LABEL_SQL} FROM action ant {POST_AUTHOR_JOIN_SQL} \
+             WHERE ant.id = ?1"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
 pub async fn reference_antecedents(
     conn: &Connection,
     action_id: &str,
 ) -> Result<Vec<ReferenceEdgeRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT aa.ordinal, aa.antecedent_action_id, aa.content_block_id, \
                     aa.range_start, aa.range_end, aa.annotation, cb.text_content, \
                     ant.action_type, cb.block_type, \
-                    COALESCE(sp.override_label, p.label) \
+                    {POST_AUTHOR_LABEL_SQL} \
              FROM action_antecedent aa \
              JOIN action ant ON ant.id = aa.antecedent_action_id \
-             JOIN participant p ON p.id = ant.participant_id \
-             LEFT JOIN space_participant sp \
-               ON sp.space_id = ant.space_id AND sp.participant_id = ant.participant_id \
+             {POST_AUTHOR_JOIN_SQL} \
              LEFT JOIN content_block cb ON cb.id = aa.content_block_id \
              WHERE aa.action_id = ?1 AND aa.relation = 'reference' \
              ORDER BY aa.ordinal ASC",
-        )
+        ))
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -5105,6 +5810,64 @@ pub async fn action_space_and_type(
             row.get::<String>(0).map_err(AppError::db)?,
             row.get::<String>(1).map_err(AppError::db)?,
         ))),
+    }
+}
+
+/// Whether `action_id` is a **post `space_id` currently shows** — current
+/// generation, terminal status, post type, the transcript's predicate. The
+/// spawn's anchor guard asks this so a delegation cannot be opened from a
+/// generation the parent hides.
+async fn is_visible_post_in_space(
+    conn: &Connection,
+    space_id: &str,
+    action_id: &str,
+) -> Result<bool, AppError> {
+    let sql = format!(
+        "SELECT 1 FROM action a \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         WHERE a.id = ?1 AND a.space_id = ?2 \
+           AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         LIMIT 1"
+    );
+    let mut rows = conn
+        .query(
+            &sql,
+            (
+                Value::Text(action_id.to_string()),
+                Value::Text(space_id.to_string()),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(rows.next().await.map_err(AppError::db)?.is_some())
+}
+
+/// The post `action_id`'s item currently shows, or `None` if that item has no
+/// visible tip — superseded wording, a hidden `error` generation, a missing
+/// row. The walk asks this of every frontier id before planning it, so an
+/// edit or regeneration that landed while a sibling branch was walking is
+/// one wording, not two.
+pub async fn visible_tip_of_action(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = format!(
+        "SELECT tip.id FROM action a \
+         JOIN item_current ic ON ic.item_id = a.item_id AND ic.space_id = a.space_id \
+         JOIN action tip ON tip.id = ic.current_action_id \
+         WHERE a.id = ?1 \
+           AND tip.status IN ('complete', 'cancelled') \
+           AND tip.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         LIMIT 1"
+    );
+    let mut rows = conn
+        .query(&sql, (Value::Text(action_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
     }
 }
 
@@ -6749,7 +7512,81 @@ pub async fn get_space_tree_data(
     })
 }
 
-/// Returns the ID of the last terminal action in a space (for antecedent linking).
+/// The high-water mark of the `action` table: **no row above this existed when
+/// this was read.**
+///
+/// The boundary a walk divides "already in front of me" from "arrived while I
+/// was working" with, and it is `rowid` rather than a clock because a clock
+/// cannot answer the question. Every writer here samples `now_ms()` *before*
+/// its transaction — `Inner::post` takes it above several awaited validations —
+/// so a row's `created_at` can predate a reader that its commit postdates.
+/// Anything deciding "did this arrive after me" from that timestamp therefore
+/// misses exactly the writes that raced it. `rowid` is assigned by the store at
+/// insert, and writers here are serialized (`BEGIN IMMEDIATE`, one writer at a
+/// time), so it *is* commit order: a row inserted after this read is above this
+/// number, and a row at or below it was already visible.
+///
+/// Table-wide rather than per space, which is both cheaper (`MAX(rowid)` is a
+/// seek to the last row, not a scan of a space's actions) and a stronger claim
+/// — a later insert anywhere is above it.
+pub async fn action_watermark(conn: &Connection) -> Result<i64, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT COALESCE(MAX(rowid), 0) FROM action")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(0),
+        Some(row) => row.get::<i64>(0).map_err(AppError::db),
+    }
+}
+
+/// Every **post** in `space_id` written after `since_row` (see
+/// [`action_watermark`]), oldest first.
+///
+/// What a turn driver asks at the end of a walk to find the posts that arrived
+/// while it was walking: subtract the ones it served itself and what is left is
+/// somebody else's, still unanswered. Ordered by `rowid`, which is the order
+/// they were *committed* — the order a reader watching the room saw them
+/// appear, and the only order that agrees with the boundary.
+///
+/// **Current generations only.** An arrival that is edited before this read
+/// runs is one post, not two: without the join both generations land on the
+/// walk's frontier, and the walk plans and bills a turn against wording its
+/// author already replaced — then quotes the retraction into the report
+/// beside the edit. The superseding row's own `rowid` is inside any boundary
+/// its predecessor's is, so restricting to the tip drops nothing that is
+/// still anyone's word. The claim is the refill's, exactly: a post the walk
+/// already served and recorded as a **leaf**, then edited, keeps its
+/// superseded id among the leaves while the edit arrives here — the report
+/// quotes both wordings, which is the honest record of a room whose words
+/// changed under the walk, and settlement holds because the current tail is
+/// among the quoted ids.
+pub async fn posts_in_space_since(
+    conn: &Connection,
+    space_id: &str,
+    since_row: i64,
+) -> Result<Vec<String>, AppError> {
+    let sql = format!(
+        "SELECT a.id FROM action a \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         WHERE a.space_id = ?1 AND a.rowid > ?2 \
+           AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY a.rowid ASC"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string()), Value::Integer(since_row)])
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(out)
+}
+
 pub async fn last_action_in_space(
     conn: &Connection,
     space_id: &str,
@@ -6761,11 +7598,30 @@ pub async fn last_action_in_space(
     // would give the next post a parent that no rendered view contains,
     // orphaning it into a second thread root. Restricting to post types keeps
     // "the space's tail" meaning what every reader means by it.
+    //
+    // **Last means last-committed** ([`action_watermark`]): every writer samples
+    // `now_ms()` above its own transaction, so a post stamped early and
+    // committed late is not the newest by `created_at` and *is* the room's last
+    // word — and picking the other one tells the delegation driver its last
+    // word has already been reported, which retires a room holding a post
+    // nobody answered. `rowid` also totally orders two posts written in the
+    // same millisecond, which `created_at` never did.
+    //
+    // **And last means the last word the transcript shows** (`item_current`,
+    // like every read the delegation lifecycle stands on): a failed
+    // regeneration inside the room leaves a current hidden tip, and without
+    // the join the *superseded* generation — still the highest matching
+    // `rowid` — would come back as the tail, so the driver would walk from,
+    // reply beneath, and quote into its report a wording the room no longer
+    // shows. With the join, that item contributes nothing and the tail falls
+    // back to the newest visible post, which is what a reader would call the
+    // room's last word.
     let sql = format!(
-        "SELECT id FROM action \
-         WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
-           AND action_type IN ({POST_ACTION_TYPES_SQL}) \
-         ORDER BY created_at DESC LIMIT 1"
+        "SELECT a.id FROM action a \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         WHERE a.space_id = ?1 AND a.status IN ('complete', 'cancelled') \
+           AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY a.rowid DESC LIMIT 1"
     );
     let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt
@@ -6982,11 +7838,51 @@ pub async fn space_action_ids(conn: &Connection, space_id: &str) -> Result<Vec<S
     Ok(ids)
 }
 
-pub async fn archive_space(
+/// Archive a space **and every live delegation beneath it**, in one
+/// transaction, answering with every space id that was archived (the named one
+/// first).
+///
+/// **A delegation exists to serve the conversation it was opened from**, so
+/// closing that conversation closes them: a sub-space under an archived room is
+/// a room whose helpers go on being paid to answer a question nobody will ever
+/// be told the answer to. Its report is a turn in the archived parent, which
+/// that parent refuses at the same gate every other turn meets — so the
+/// delegation stays outstanding forever, retrying against its meter, holding a
+/// live-room slot of an owner who is not being retired, and waiting on an
+/// anchor no post will ever answer. There is no un-archive door anywhere, so
+/// none of that is a state anything recovers from.
+///
+/// **Recursive down `parent_space_id`, and inside the transaction.** The room
+/// being closed may hold delegations of its own at any depth, and a nested one
+/// may be owned by a *different* agent: that agent is not being retired, but
+/// the purpose of its room is gone with the conversation above it, which is the
+/// thing that decides this. Doing it in the archival's own transaction is what
+/// makes "a live room under a closed one" unrepresentable rather than a state
+/// somebody has to notice.
+pub async fn archive_space_tx(
     conn: &Connection,
     space_id: &str,
     archived_at: i64,
-) -> Result<bool, AppError> {
+) -> Result<Vec<String>, AppError> {
+    begin_write(conn).await?;
+    match archive_space_tx_body(conn, space_id, archived_at).await {
+        Ok(archived) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(archived)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn archive_space_tx_body(
+    conn: &Connection,
+    space_id: &str,
+    archived_at: i64,
+) -> Result<Vec<String>, AppError> {
     let changed = conn
         .execute(
             "UPDATE space SET archived_at = ?2, \
@@ -7001,7 +7897,63 @@ pub async fn archive_space(
         .map_err(|e| AppError::Database {
             message: format!("failed to archive space: {e}"),
         })?;
-    Ok(changed > 0)
+    if changed == 0 {
+        // Nothing was closed here — an unknown space, or one already archived —
+        // so there is nothing new beneath it to close either.
+        return Ok(Vec::new());
+    }
+    let mut archived = vec![space_id.to_string()];
+    archived.extend(archive_rooms_under_a_closed_one(conn, archived_at).await?);
+    Ok(archived)
+}
+
+/// Archive every live sub-space whose parent is archived, repeatedly, until
+/// none is left — the descent [`archive_space_tx`] and [`retire_participant_tx`]
+/// both need, stated as the invariant it restores rather than as a walk.
+///
+/// **The invariant is "no live delegation under a closed room"**, and asking it
+/// of the rows rather than carrying a list of roots is what makes one statement
+/// serve both doors: an archival names one space, a retirement names an agent's
+/// whole set, and neither has to tell this how deep to go. Each round archives
+/// the children of everything closed so far, so a chain of any depth is closed
+/// in as many rounds as it is deep; a round that archives nothing ends it, which
+/// also makes the loop cycle-safe (the column is a self-referencing FK with no
+/// cycle constraint, and a space already archived never matches again).
+async fn archive_rooms_under_a_closed_one(
+    conn: &Connection,
+    archived_at: i64,
+) -> Result<Vec<String>, AppError> {
+    const LIVE_UNDER_A_CLOSED_ONE: &str = "archived_at IS NULL AND parent_space_id IN \
+         (SELECT id FROM space WHERE archived_at IS NOT NULL)";
+    let mut archived = Vec::new();
+    loop {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id FROM space WHERE {LIVE_UNDER_A_CLOSED_ONE}"
+            ))
+            .await
+            .map_err(AppError::db)?;
+        let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+        let mut round = Vec::new();
+        while let Some(row) = rows.next().await.map_err(AppError::db)? {
+            round.push(row.get::<String>(0).map_err(AppError::db)?);
+        }
+        if round.is_empty() {
+            return Ok(archived);
+        }
+        conn.execute(
+            &format!(
+                "UPDATE space SET archived_at = ?1, touched_at = COALESCE(touched_at, ?1) \
+                 WHERE {LIVE_UNDER_A_CLOSED_ONE}"
+            ),
+            (Value::Integer(archived_at),),
+        )
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to archive the delegations under a closed conversation: {e}"),
+        })?;
+        archived.extend(round);
+    }
 }
 
 /// Set a space's title, answering **whether a row took it**.
@@ -7788,13 +8740,54 @@ mod tests {
         assert_eq!(get_user_version(&conn).await.unwrap(), LATEST_VERSION);
     }
 
+    /// **A sub-space's anchor is a post in its parent, and the schema says so.**
+    /// `parent_action_id` alone only proves the row exists; the compound FK
+    /// `(parent_action_id, parent_space_id) → action(id, space_id)` is what
+    /// makes "an action from somewhere else" unrepresentable.
+    #[tokio::test]
+    async fn a_subspace_anchor_must_belong_to_its_parent() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let author = ensure_participant(&conn, "agent", "Navigator", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "here", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "elsewhere", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let here_post = add_user_action(&conn, "here", &author, "in the parent", 2_000).await;
+        let else_post = add_user_action(&conn, "elsewhere", &author, "somewhere else", 2_000).await;
+
+        conn.execute(
+            "INSERT INTO space (id, parent_space_id, parent_action_id, linkability, created_at) \
+             VALUES ('ok', 'here', ?1, 'unlinked', 3_000)",
+            (Value::Text(here_post.clone()),),
+        )
+        .await
+        .expect("an anchor in the named parent must be accepted");
+
+        let mismatch = conn
+            .execute(
+                "INSERT INTO space (id, parent_space_id, parent_action_id, linkability, created_at) \
+                 VALUES ('bad', 'here', ?1, 'unlinked', 3_000)",
+                (Value::Text(else_post),),
+            )
+            .await;
+        assert!(
+            mismatch.is_err(),
+            "an anchor that lives in another conversation must be refused: {mismatch:?}"
+        );
+    }
+
     async fn add_user_action(
         conn: &Connection,
         space_id: &str,
         participant_id: &str,
         text: &str,
         created_at: i64,
-    ) {
+    ) -> String {
         let action_id = uuid::Uuid::now_v7().to_string();
         insert_action(
             conn,
@@ -7826,6 +8819,686 @@ mod tests {
         )
         .await
         .unwrap();
+        action_id
+    }
+
+    /// **The room's last word is the last one committed**, which is the whole
+    /// of what the delegation driver's lifecycle stands on: *is there work
+    /// outstanding* is "has the owner quoted the room's last word back to the
+    /// parent", so choosing the wrong post as the last word answers the
+    /// question about somebody else's post.
+    ///
+    /// Staged as it actually happens: a reader's post into a watched room is
+    /// stamped (`now_ms()`, above the writer's own transaction) before a
+    /// driven reply that commits first, so it is *older* by `created_at` and
+    /// *newer* by commit. Ordered by the clock, the tail is the driven reply —
+    /// which the owner has already quoted — so the room reads as reported and
+    /// retires holding a post nobody answered, and the rearmed pass reads the
+    /// same wrong tail and exits again.
+    #[tokio::test]
+    async fn the_rooms_last_word_is_the_last_committed_not_the_last_stamped() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        let owner = ensure_participant(&conn, "agent", "Navigator", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "parent", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+
+        // The room's driven reply, and the owner's report in the parent
+        // quoting it — the room is settled on that word.
+        let driven = add_user_action(&conn, "room", &owner, "the helper's answer", 9_000).await;
+        let report = add_user_action(&conn, "parent", &owner, "reporting back", 9_500).await;
+        insert_reference_antecedent(&conn, &report, &driven, 1, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            has_reference_from(&conn, "parent", &owner, &driven)
+                .await
+                .unwrap(),
+            "the driven reply is the word the parent has"
+        );
+
+        // The reader's post: stamped before that reply, committed after it.
+        let watched = add_user_action(&conn, "room", &user, "but what about Friday?", 8_000).await;
+
+        assert_eq!(
+            last_action_in_space(&conn, "room")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(watched.as_str()),
+            "the last word is the post that landed last, not the one stamped last"
+        );
+        assert!(
+            !has_reference_from(&conn, "parent", &owner, &watched)
+                .await
+                .unwrap(),
+            "and it has not been reported — so the rearmed pass has work to do \
+             rather than reading a settled room and exiting"
+        );
+    }
+
+    /// **A regenerated report is still the owner's quote.** Settlement asks
+    /// whether the owner has quoted the room's last word, and a successful
+    /// regeneration can change the tip's author (`TurnSelector::Model` mints
+    /// when no seated member matches) while carrying the edges forward. Asking
+    /// the tip's `participant_id` would treat that re-wording as somebody
+    /// else's quote. The origin generation is who opened the item; a fresh
+    /// quote by anyone else is a different item and still does not settle.
+    #[tokio::test]
+    async fn a_report_is_recognized_by_its_original_author() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let owner = ensure_participant(&conn, "agent", "Navigator", None, 1_000)
+            .await
+            .unwrap();
+        let other = ensure_participant(&conn, "agent", "Scribe", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "parent", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+
+        let driven = add_user_action(&conn, "room", &owner, "the helper's answer", 9_000).await;
+        let item = uuid::Uuid::now_v7().to_string();
+        let origin = add_report(
+            &conn,
+            "parent",
+            &owner,
+            &item,
+            None,
+            &driven,
+            "reporting back",
+            9_500,
+        )
+        .await;
+        assert!(
+            has_reference_from(&conn, "parent", &owner, &driven)
+                .await
+                .unwrap(),
+            "the owner's report settles the room"
+        );
+
+        // A regeneration by someone else — the current generation's author is
+        // not the owner, but the item's origin still is, and the edges
+        // travelled with it.
+        let _tip = add_report(
+            &conn,
+            "parent",
+            &other,
+            &item,
+            Some(&origin),
+            &driven,
+            "re-worded",
+            10_000,
+        )
+        .await;
+        assert!(
+            has_reference_from(&conn, "parent", &owner, &driven)
+                .await
+                .unwrap(),
+            "a regenerated report is still the owner's quote"
+        );
+
+        // A fresh quote by someone else is a different item, not a
+        // regeneration of the owner's report.
+        let elsewhere = add_user_action(&conn, "room", &owner, "another finding", 9_100).await;
+        let stranger = add_user_action(&conn, "parent", &other, "quoting too", 10_500).await;
+        insert_reference_antecedent(&conn, &stranger, &elsewhere, 1, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !has_reference_from(&conn, "parent", &owner, &elsewhere)
+                .await
+                .unwrap(),
+            "somebody else's quote does not settle the room"
+        );
+    }
+
+    /// **An answer regenerated under a new author is still the owner's
+    /// answer.** `last_reply_by_participant` is where a report attaches, and
+    /// asking the tip's `participant_id` would miss a successful regeneration
+    /// that minted a new agent — the wait would run out to grace and the
+    /// report would land on the anchor as a sibling of a word the parent
+    /// already shows. The origin generation is who opened the item; the tip
+    /// is what the parent shows.
+    #[tokio::test]
+    async fn an_answer_is_recognized_by_its_original_author() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let owner = ensure_participant(&conn, "agent", "Navigator", None, 1_000)
+            .await
+            .unwrap();
+        let other = ensure_participant(&conn, "agent", "Scribe", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "parent", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let asked = add_user_action(&conn, "parent", &owner, "what about Friday?", 2_000).await;
+        let item = uuid::Uuid::now_v7().to_string();
+        let origin = add_reply(
+            &conn,
+            "parent",
+            &owner,
+            &item,
+            None,
+            &asked,
+            "Friday looks clear",
+            3_000,
+        )
+        .await;
+        assert_eq!(
+            last_reply_by_participant(&conn, "parent", &owner, &asked)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(origin.as_str()),
+            "the owner's own answer"
+        );
+
+        let tip = add_reply(
+            &conn,
+            "parent",
+            &other,
+            &item,
+            Some(&origin),
+            &asked,
+            "Friday looks clear, re-worded",
+            4_000,
+        )
+        .await;
+        assert_eq!(
+            last_reply_by_participant(&conn, "parent", &owner, &asked)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(tip.as_str()),
+            "a regenerated answer is still the owner's reply"
+        );
+        assert_eq!(
+            last_post_by_participant(&conn, "parent", &owner)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(tip.as_str()),
+            "and still their last word"
+        );
+        assert_eq!(
+            visible_tip_of_action(&conn, &origin)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(tip.as_str()),
+            "a queued origin remaps to the wording the parent shows"
+        );
+        assert_eq!(
+            visible_tip_of_action(&conn, &tip).await.unwrap().as_deref(),
+            Some(tip.as_str()),
+            "and a current tip remaps to itself"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_reply(
+        conn: &Connection,
+        space_id: &str,
+        participant_id: &str,
+        item_id: &str,
+        supersedes: Option<&str>,
+        antecedent: &str,
+        text: &str,
+        created_at: i64,
+    ) -> String {
+        let action_id = uuid::Uuid::now_v7().to_string();
+        insert_action(
+            conn,
+            &ActionEntry {
+                id: action_id.clone(),
+                space_id: space_id.to_string(),
+                participant_id: participant_id.to_string(),
+                item_id: item_id.to_string(),
+                supersedes_action_id: supersedes.map(str::to_string),
+                action_type: "inference".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at,
+            },
+        )
+        .await
+        .unwrap();
+        insert_text_content_block(
+            conn,
+            &uuid::Uuid::now_v7().to_string(),
+            &action_id,
+            0,
+            "text",
+            text,
+        )
+        .await
+        .unwrap();
+        insert_action_antecedent(conn, &action_id, antecedent, 0, "reply")
+            .await
+            .unwrap();
+        action_id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_report(
+        conn: &Connection,
+        space_id: &str,
+        participant_id: &str,
+        item_id: &str,
+        supersedes: Option<&str>,
+        quoted: &str,
+        text: &str,
+        created_at: i64,
+    ) -> String {
+        let action_id = uuid::Uuid::now_v7().to_string();
+        insert_action(
+            conn,
+            &ActionEntry {
+                id: action_id.clone(),
+                space_id: space_id.to_string(),
+                participant_id: participant_id.to_string(),
+                item_id: item_id.to_string(),
+                supersedes_action_id: supersedes.map(str::to_string),
+                action_type: "inference".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at,
+            },
+        )
+        .await
+        .unwrap();
+        insert_text_content_block(
+            conn,
+            &uuid::Uuid::now_v7().to_string(),
+            &action_id,
+            0,
+            "text",
+            text,
+        )
+        .await
+        .unwrap();
+        insert_reference_antecedent(conn, &action_id, quoted, 1, None, None, None, None)
+            .await
+            .unwrap();
+        action_id
+    }
+
+    /// **A post is written whole or not at all.** Its action row, its words,
+    /// its place in the thread and its quotations were separate autocommitted
+    /// statements, so for as long as the tail of them took, the post existed
+    /// and said nothing — a state every reader keyed on the action could see
+    /// and the sub-space driver's refill would *act* on, planning and billing a
+    /// turn against an empty post. One transaction is what makes the post one
+    /// event; the fragment is then not a state anything can observe, which is
+    /// the only way to hold a reader to it.
+    #[tokio::test]
+    async fn a_post_is_written_whole_or_not_at_all() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let first = add_user_action(&conn, "room", &user, "the ask", 2_000).await;
+
+        // A post whose *last* write cannot land: the reference edge names an
+        // action that does not exist, which the foreign key refuses. Everything
+        // before it — the action, its text, the title, the reply edge — is
+        // already written when that happens.
+        let doomed = uuid::Uuid::now_v7().to_string();
+        let err = post_tx(
+            &conn,
+            &PostPlan {
+                space_id: "room",
+                participant_id: &user,
+                action_id: &doomed,
+                item_id: &uuid::Uuid::now_v7().to_string(),
+                text: "about that",
+                auto_title: Some("A title it must not keep"),
+                reply_to: Some(&first),
+                references: &[crate::ReferenceSpec {
+                    antecedent_action_id: "no-such-action".into(),
+                    content_block_id: None,
+                    range_start: None,
+                    range_end: None,
+                    annotation: None,
+                }],
+                created_at: 3_000,
+            },
+        )
+        .await
+        .expect_err("a reference to an action that does not exist cannot be written");
+        assert!(matches!(err, AppError::Database { .. }), "{err:?}");
+
+        assert_eq!(
+            space_action_ids(&conn, "room").await.unwrap(),
+            vec![first.clone()],
+            "the half-written post is gone entirely — no action for a reader to find"
+        );
+        assert!(
+            first_content_block(&conn, &doomed).await.unwrap().is_none(),
+            "and no orphaned text block"
+        );
+        assert!(
+            get_space(&conn, "room")
+                .await
+                .unwrap()
+                .unwrap()
+                .title
+                .is_none(),
+            "and no title from a post that was never written"
+        );
+
+        // The same post, written whole: everything arrives together.
+        let good = uuid::Uuid::now_v7().to_string();
+        assert!(
+            post_tx(
+                &conn,
+                &PostPlan {
+                    space_id: "room",
+                    participant_id: &user,
+                    action_id: &good,
+                    item_id: &uuid::Uuid::now_v7().to_string(),
+                    text: "about that",
+                    auto_title: Some("Named by its first post"),
+                    reply_to: Some(&first),
+                    references: &[],
+                    created_at: 4_000,
+                },
+            )
+            .await
+            .unwrap(),
+            "the space took the title"
+        );
+        assert!(
+            first_content_block(&conn, &good)
+                .await
+                .unwrap()
+                .is_some_and(|(_, text)| text.as_deref() == Some("about that")),
+            "the words are there the moment the action is"
+        );
+        assert_eq!(
+            reply_antecedent(&conn, &good).await.unwrap().as_deref(),
+            Some(first.as_str()),
+            "and so is its place in the thread"
+        );
+    }
+
+    /// **An edit lands whole or not at all — and an edit is the sharper case.**
+    /// Its new row *supersedes* the tip the moment it lands, so written as
+    /// separate autocommitted statements the item's **current** generation
+    /// said nothing for as long as the tail of writes took — the same window
+    /// [`a_post_is_written_whole_or_not_at_all`] closes, opened over a post
+    /// that already had words.
+    #[tokio::test]
+    async fn an_edit_lands_whole_or_not_at_all() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let first = add_user_action(&conn, "room", &user, "the ask", 2_000).await;
+        let (item_id, _) = action_item_and_space(&conn, &first).await.unwrap().unwrap();
+
+        // An edit whose *last* write cannot land: a replicated reference names
+        // an action that does not exist, which the foreign key refuses. The
+        // new generation and its text are already written when that happens.
+        let doomed = uuid::Uuid::now_v7().to_string();
+        let err = edit_post_tx(
+            &conn,
+            &EditPostPlan {
+                space_id: "room",
+                participant_id: &user,
+                action_id: &doomed,
+                item_id: &item_id,
+                supersedes_action_id: &first,
+                text: "about that",
+                reply_to: None,
+                references: &[ReferenceEdgeRow {
+                    ordinal: 1,
+                    antecedent_action_id: "no-such-action".into(),
+                    content_block_id: None,
+                    range_start: None,
+                    range_end: None,
+                    annotation: None,
+                    block_text: None,
+                    antecedent_action_type: "user_input".into(),
+                    antecedent_author_label: "User".into(),
+                    block_type: None,
+                }],
+                created_at: 3_000,
+            },
+        )
+        .await
+        .expect_err("a reference to an action that does not exist cannot be written");
+        assert!(matches!(err, AppError::Database { .. }), "{err:?}");
+
+        assert_eq!(
+            current_tip_of_item(&conn, "room", &item_id).await.unwrap(),
+            Some(first.clone()),
+            "the tip is untouched — no current generation with no words"
+        );
+        assert!(
+            first_content_block(&conn, &doomed).await.unwrap().is_none(),
+            "and no orphaned text block"
+        );
+
+        // The same edit, written whole: the tip moves in one event.
+        let good = uuid::Uuid::now_v7().to_string();
+        edit_post_tx(
+            &conn,
+            &EditPostPlan {
+                space_id: "room",
+                participant_id: &user,
+                action_id: &good,
+                item_id: &item_id,
+                supersedes_action_id: &first,
+                text: "about that",
+                reply_to: None,
+                references: &[],
+                created_at: 3_000,
+            },
+        )
+        .await
+        .expect("a valid edit lands");
+        assert_eq!(
+            current_tip_of_item(&conn, "room", &item_id).await.unwrap(),
+            Some(good),
+            "the edit is the current generation, words and all"
+        );
+    }
+
+    /// **The refill serves an arrival's current words, once.** An arrival
+    /// edited before the refill runs is one post, not two: returning both
+    /// generations puts both on the walk's frontier, and the walk plans and
+    /// bills a turn against wording its author already replaced — then quotes
+    /// the retraction into the report beside the edit.
+    #[tokio::test]
+    async fn the_refill_serves_only_current_generations() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let boundary = action_watermark(&conn).await.unwrap();
+
+        // A post arrives after the boundary and is edited before the refill.
+        let orig = add_user_action(&conn, "room", &user, "first wording", 2_000).await;
+        let (item_id, _) = action_item_and_space(&conn, &orig).await.unwrap().unwrap();
+        let edit = uuid::Uuid::now_v7().to_string();
+        edit_post_tx(
+            &conn,
+            &EditPostPlan {
+                space_id: "room",
+                participant_id: &user,
+                action_id: &edit,
+                item_id: &item_id,
+                supersedes_action_id: &orig,
+                text: "second wording",
+                reply_to: None,
+                references: &[],
+                created_at: 3_000,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            posts_in_space_since(&conn, "room", boundary).await.unwrap(),
+            vec![edit],
+            "one arrival, its current words — not the retraction beside them"
+        );
+    }
+
+    /// **The room's last word is the last word the transcript shows.** A
+    /// failed regeneration leaves a current hidden tip; without the
+    /// `item_current` join the *superseded* generation — still the highest
+    /// matching `rowid` — would come back as the tail, and the driver would
+    /// walk from, reply beneath, and quote a wording the room no longer
+    /// shows. And the budget meter must not charge that failure: a driven
+    /// turn writes nothing on failure, and the terminal-status filter keeps
+    /// "a failed turn is uncounted" true of the blocking verbs too.
+    #[tokio::test]
+    async fn a_hidden_tip_is_neither_the_tail_nor_a_spent_turn() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let first = add_user_action(&conn, "room", &user, "the ask", 2_000).await;
+        let second = add_user_action(&conn, "room", &user, "the answer", 3_000).await;
+        assert_eq!(
+            last_action_in_space(&conn, "room").await.unwrap(),
+            Some(second.clone())
+        );
+        let turns_before = turns_taken_in_space(&conn, "room").await.unwrap();
+
+        // A failed regeneration of the newest post: a current, hidden tip.
+        let (item_id, _) = action_item_and_space(&conn, &second)
+            .await
+            .unwrap()
+            .unwrap();
+        insert_action(
+            &conn,
+            &ActionEntry {
+                id: uuid::Uuid::now_v7().to_string(),
+                space_id: "room".to_string(),
+                participant_id: user.clone(),
+                item_id,
+                supersedes_action_id: Some(second),
+                action_type: "inference".to_string(),
+                status: "error".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at: 4_000,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            last_action_in_space(&conn, "room").await.unwrap(),
+            Some(first),
+            "the tail falls back to the newest visible post, not the superseded wording"
+        );
+        assert_eq!(
+            turns_taken_in_space(&conn, "room").await.unwrap(),
+            turns_before,
+            "and the failure spends nothing against the budget"
+        );
+    }
+
+    /// **The walk boundary is commit order, and a clock cannot stand in for
+    /// it.** Every writer in this crate samples `now_ms()` above its own
+    /// transaction — `Inner::post` takes it before several awaited validations
+    /// — so a post's `created_at` can predate a reader that its commit
+    /// postdates. A refill that asked "written at or after my start time" then
+    /// missed exactly the posts that raced it, and missing one is a loss: the
+    /// walk drives on, its own newer answer becomes the room's last word, the
+    /// report settles the room on that word, and the unserved post sits in a
+    /// room that reads as reported.
+    #[tokio::test]
+    async fn the_refill_boundary_is_commit_order_not_the_writers_clock() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let early = add_user_action(&conn, "room", &user, "before the walk", 5_000).await;
+
+        // The walk opens here.
+        let since = action_watermark(&conn).await.unwrap();
+        assert!(since > 0, "the mark names a row that exists");
+
+        // A post whose author stamped it *before* the walk opened and whose
+        // insert lands after — the interleaving `Inner::post` makes reachable
+        // by sampling its clock above its awaits.
+        let raced =
+            add_user_action(&conn, "room", &user, "stamped early, landed late", 4_000).await;
+        // And an ordinary one after it.
+        let later = add_user_action(&conn, "room", &user, "plainly later", 9_000).await;
+
+        let arrived = posts_in_space_since(&conn, "room", since).await.unwrap();
+        assert_eq!(
+            arrived,
+            vec![raced.clone(), later.clone()],
+            "both arrivals are served, in the order they were committed"
+        );
+        assert!(
+            !arrived.contains(&early),
+            "and what was already in front of the walk is not served twice"
+        );
+
+        // The mark moves with the writes, so a second walk opening now sees
+        // nothing outstanding.
+        let next = action_watermark(&conn).await.unwrap();
+        assert!(next > since);
+        assert!(
+            posts_in_space_since(&conn, "room", next)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -7859,7 +9532,10 @@ mod tests {
         insert_space(&conn, "space-d", Some("Old"), "unlinked", 500)
             .await
             .unwrap();
-        assert!(archive_space(&conn, "space-d", 6_000).await.unwrap());
+        assert_eq!(
+            archive_space_tx(&conn, "space-d", 6_000).await.unwrap(),
+            vec!["space-d".to_string()]
+        );
 
         let rows = list_spaces(&conn, false).await.unwrap();
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
@@ -9340,7 +11016,8 @@ mod tests {
         assert_eq!(
             remove_space_participant_tx(&conn, "s-new", "p-new", 3)
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome,
             SpaceRemoval::Left,
             "the premise expired, so the removal ends the membership instead"
         );
@@ -9364,7 +11041,8 @@ mod tests {
         assert_eq!(
             remove_space_participant_tx(&conn, "s-owned", "p-owned", 3)
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome,
             SpaceRemoval::SoftRemoved
         );
         assert!(
@@ -9379,7 +11057,8 @@ mod tests {
         assert_eq!(
             remove_space_participant_tx(&conn, "s-owned", "p-owned", 4)
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome,
             SpaceRemoval::NothingToDo
         );
     }

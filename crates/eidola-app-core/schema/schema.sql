@@ -197,6 +197,15 @@ CREATE INDEX idx_connection_attestation
 CREATE TABLE space (
     id                TEXT PRIMARY KEY,        -- UUIDv7
     parent_space_id   TEXT REFERENCES space(id),
+    -- Navigational in exactly the sense parent_space_id is, one level
+    -- finer: "this space was derived from that *post*". Written only by
+    -- the sub-space spawn door, which is reached from inside a turn and
+    -- so knows the post being answered when the delegation was opened.
+    -- It is what a delegation's report attaches to, so the answer stays
+    -- on the branch the work was asked for on rather than wherever the
+    -- owning agent happened to speak last. Fixed at birth and never
+    -- updated: it records a fact about the space's origin, not its state.
+    parent_action_id  TEXT REFERENCES action(id),
     title             TEXT,
     linkability       TEXT NOT NULL CHECK (linkability IN (
                           'linked', 'unlinked', 'public'
@@ -248,7 +257,13 @@ CREATE TABLE space (
     -- it can carry that is not is a caller-supplied `title`, which is a user
     -- saying what this conversation is for, so a titled creation is born
     -- stamped.
-    touched_at        INTEGER
+    touched_at        INTEGER,
+    -- The action named above must live in the parent named beside it.
+    -- A single-column FK only proves the row exists; this tuple is the
+    -- navigational fact the column records. MATCH SIMPLE: an ordinary
+    -- space (both NULL) and an anchorless spawn (action NULL) skip it.
+    FOREIGN KEY (parent_action_id, parent_space_id)
+        REFERENCES action (id, space_id)
 );
 
 -- One notebook per agent.
@@ -580,6 +595,9 @@ CREATE UNIQUE INDEX idx_one_root_per_item
 
 -- Parent key for the compound supersedes FK.
 CREATE UNIQUE INDEX idx_action_id_item ON action (id, item_id);
+
+-- Parent key for space (parent_action_id, parent_space_id) → action.
+CREATE UNIQUE INDEX idx_action_id_space ON action (id, space_id);
 
 -- ============================================================
 -- Action antecedent: the causal graph (a DAG). Every edge points

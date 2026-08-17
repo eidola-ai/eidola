@@ -885,6 +885,7 @@ mod tests {
             range_end: Some(1),
             snippet: Some(snippet.to_string()),
             annotation: None,
+            delegation_end: None,
             antecedent_author_label: "Ada".into(),
             antecedent_author_kind: "agent".into(),
         }

@@ -4254,6 +4254,7 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
             range_start: Some(0),
             range_end: Some(4),
             annotation: None,
+            delegation_end: None,
             snippet: Some("an earlier passage".into()),
             antecedent_author_label: "Ada".into(),
             antecedent_author_kind: "agent".into(),
@@ -4265,6 +4266,7 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
             range_start: Some(0),
             range_end: Some(4),
             annotation: None,
+            delegation_end: None,
             snippet: None, // the honest "quoted an earlier version" row
             antecedent_author_label: "Ada".into(),
             antecedent_author_kind: "agent".into(),
@@ -4410,6 +4412,7 @@ fn space_footnote_rail_names_a_cross_space_author(cx: &mut TestAppContext) {
             range_start: Some(0),
             range_end: Some(4),
             annotation: None,
+            delegation_end: None,
             snippet: Some(snippet.into()),
             antecedent_author_label: label.into(),
             antecedent_author_kind: kind.into(),
@@ -4525,6 +4528,7 @@ fn space_footnote_rail_names_a_cross_space_author_the_way_the_gutter_would(
         range_start: Some(0),
         range_end: Some(4),
         annotation: None,
+        delegation_end: None,
         snippet: Some("a passage from another conversation".into()),
         antecedent_author_label: "gemma-4-E4B_q4_0-it@local".into(),
         antecedent_author_kind: "agent".into(),
@@ -4539,6 +4543,73 @@ fn space_footnote_rail_names_a_cross_space_author_the_way_the_gutter_would(
         "space/post/0/footnote/1",
         gpui::Role::Link,
         "Reference 1: Gemma 4 E4B — a passage from another conversation",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **A delegation's ending reaches the reader, in their own language.** The
+/// edge carries a value — app-core persists a token, because a persisted
+/// sentence is read as-is everywhere — so the words are the presentation
+/// layer's, and a reader who cannot see the row hears them too.
+#[gpui::test]
+fn space_footnote_rail_says_how_a_delegated_conversation_stopped(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut report = probe_post("a1", "Both came back the same way.");
+    report.references = vec![
+        eidola_app_core::PostReference {
+            antecedent_action_id: "s1".into(),
+            ordinal: 1,
+            content_block_id: Some("b1".into()),
+            range_start: Some(0),
+            range_end: Some(4),
+            annotation: None,
+            delegation_end: Some(eidola_app_core::DelegationEnd::Paused { depth: 2, limit: 2 }),
+            snippet: Some("the evening one is the spring".into()),
+            antecedent_author_label: "Surveyor".into(),
+            antecedent_author_kind: "agent".into(),
+        },
+        eidola_app_core::PostReference {
+            antecedent_action_id: "s2".into(),
+            ordinal: 2,
+            content_block_id: Some("b2".into()),
+            range_start: Some(0),
+            range_end: Some(4),
+            annotation: None,
+            delegation_end: Some(eidola_app_core::DelegationEnd::TurnFailed {
+                reason: eidola_app_core::DelegationFailure::Upstream,
+            }),
+            snippet: Some("we would be crossing the bar on the ebb".into()),
+            antecedent_author_label: "Pilot".into(),
+            antecedent_author_kind: "agent".into(),
+        },
+    ];
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![report], cx));
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/footnote/1",
+        gpui::Role::Link,
+        "Reference 1: Surveyor — reached its reply limit (2 of 2) — the evening one is the spring",
+    );
+    assert_probe(
+        &entries,
+        "space/post/0/footnote/2",
+        gpui::Role::Link,
+        "Reference 2: Pilot — stopped: the model could not be reached — we would be crossing the \
+         bar on the ebb",
     );
 
     probe::set_probes_enabled(false);
@@ -4570,6 +4641,7 @@ fn space_footnote_rail_speaks_a_long_byline_in_full(cx: &mut TestAppContext) {
         range_start: Some(0),
         range_end: Some(4),
         annotation: None,
+        delegation_end: None,
         snippet: Some("the passage itself".into()),
         antecedent_author_label: long.into(),
         antecedent_author_kind: "agent".into(),

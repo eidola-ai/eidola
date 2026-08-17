@@ -25,7 +25,7 @@
 use eidola_app_core::db::HUMAN_PARTICIPANT_ID;
 use eidola_app_core::{
     AppCore, ExpectedScope, MembershipRole, NewParticipant, ParticipantOverride, ParticipantUpdate,
-    changes::Change,
+    changes::{Change, ChangeEvent},
 };
 
 // ---------------------------------------------------------------------------
@@ -50,10 +50,10 @@ where
     std::thread::spawn(f).join().unwrap();
 }
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     while let Ok(c) = rx.try_recv() {
-        out.push(c);
+        out.push(c.change);
     }
     out
 }
@@ -600,7 +600,17 @@ const STAMP_LEDGER: &[(&str, &str)] = &[
     // -- space row writes, stamp folded into the statement --
     ("set_space_cascade_limit", "stamps in the same statement"),
     ("set_space_router_model", "stamps in the same statement"),
-    ("archive_space", "stamps in the same statement"),
+    ("archive_space_tx_body", "stamps in the same statement"),
+    (
+        "archive_rooms_under_a_closed_one",
+        "archives the delegations beneath a closed conversation; stamps in the \
+         same statement",
+    ),
+    (
+        "close_delegations_run_for",
+        "archives the delegations a departing owner was running for the space \
+         it left; stamps in the same statement",
+    ),
     ("update_space_title", "stamps in the same statement"),
     (
         "retire_participant_tx_body",

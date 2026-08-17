@@ -38,7 +38,7 @@ use chat_harness::{
     ChatBehavior, HUMAN_LABEL, MODEL, MockConfig, MockServer, SUMMARY_PROMPT_HEAD, SummaryBehavior,
     flat_messages, map_entry, map_entry_summarized, thread_map, with_account,
 };
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::{AppCore, ChatStreamEvent, post_handle};
 
 const SUMMARY: &str = "They dig into spring tides and settle on the sun-moon alignment.";
@@ -110,10 +110,10 @@ fn summary_actions(core: &AppCore, space: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     while let Ok(c) = rx.try_recv() {
-        out.push(c);
+        out.push(c.change);
     }
     out
 }
