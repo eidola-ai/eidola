@@ -70,10 +70,21 @@ enum AtomEligibility {
 
 #[derive(Debug, Clone)]
 struct Atom {
+    /// Full source extent used for selection and delimiter planning.
     range: Range<usize>,
+    /// Parser-owned bytes that represent this atom's semantic content. For a
+    /// backslash escape this excludes the leading backslash pulldown omits.
+    semantic_range: Range<usize>,
     styled: bool,
     eligibility: AtomEligibility,
     context: Vec<InlineContext>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedAtom {
+    source_range: Range<usize>,
+    owner: Range<usize>,
+    semantic_range: Range<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +184,7 @@ pub(crate) fn toggle(state: EditorState, format: InlineFormat) -> EditorState {
     }
 
     let next_tree = parse(&candidate.markdown);
+
     if block_fingerprint(&tree) != block_fingerprint(&next_tree)
         || protected_inline_fingerprint(&state.markdown, &tree)
             != protected_inline_fingerprint(&candidate.markdown, &next_tree)
@@ -295,7 +307,28 @@ fn push_inline_groups(
             .min()
             .unwrap_or(0);
         let group_end = group.iter().map(|child| child.range.end).max().unwrap_or(0);
-        let resolved = escapes::scan(markdown.as_bytes(), group_start..group_end, &[]);
+        let mut text_ranges = Vec::new();
+        for child in group.iter() {
+            collect_text_ranges(child, &mut text_ranges);
+        }
+        let scan_start = group_start.saturating_sub(1).max(node.range.start);
+        let resolved: Vec<ResolvedAtom> =
+            escapes::scan(markdown.as_bytes(), scan_start..group_end, &[])
+                .into_iter()
+                .filter_map(|span| {
+                    let owner = text_ranges
+                        .iter()
+                        .find(|range| overlaps(range, &span.source_range))?
+                        .clone();
+                    let semantic_range = owner.start.max(span.source_range.start)
+                        ..owner.end.min(span.source_range.end);
+                    Some(ResolvedAtom {
+                        source_range: span.source_range,
+                        owner,
+                        semantic_range,
+                    })
+                })
+                .collect();
         let mut atoms = Vec::new();
         let mut formats = Vec::new();
         for child in group.drain(..) {
@@ -317,8 +350,16 @@ fn push_inline_groups(
         if atoms.is_empty() {
             return;
         }
-        let mut start = group_start;
-        let mut end = group_end;
+        let mut start = atoms
+            .iter()
+            .map(|atom| atom.range.start)
+            .min()
+            .unwrap_or(group_start);
+        let mut end = atoms
+            .iter()
+            .map(|atom| atom.range.end)
+            .max()
+            .unwrap_or(group_end);
         if let Some(range) = &clamp {
             start = start.max(range.start);
             end = end.min(range.end);
@@ -342,9 +383,24 @@ fn push_inline_groups(
     flush(&mut group, out);
 }
 
+fn collect_text_ranges(node: &SyntaxNode, out: &mut Vec<Range<usize>>) {
+    match node.kind {
+        NodeKind::Text => out.push(node.range.clone()),
+        NodeKind::InlineCode { .. }
+        | NodeKind::InlineMath { .. }
+        | NodeKind::DisplayMath { .. }
+        | NodeKind::Image { .. } => {}
+        _ => {
+            for child in &node.children {
+                collect_text_ranges(child, out);
+            }
+        }
+    }
+}
+
 fn collect_inline(
     node: &SyntaxNode,
-    resolved: &[escapes::ResolvedSpan],
+    resolved: &[ResolvedAtom],
     inherited: bool,
     format: InlineFormat,
     context: &mut Vec<InlineContext>,
@@ -381,12 +437,14 @@ fn collect_inline(
         NodeKind::Text => collect_text_atoms(node, resolved, styled, context, atoms),
         NodeKind::InlineCode { .. } | NodeKind::InlineMath { .. } => atoms.push(Atom {
             range: node.range.clone(),
+            semantic_range: node.range.clone(),
             styled,
             eligibility: AtomEligibility::Whole,
             context: context.clone(),
         }),
         NodeKind::Image { .. } => atoms.push(Atom {
             range: node.range.clone(),
+            semantic_range: node.range.clone(),
             styled,
             eligibility: AtomEligibility::Never,
             context: context.clone(),
@@ -405,7 +463,7 @@ fn collect_inline(
 
 fn collect_text_atoms(
     node: &SyntaxNode,
-    resolved: &[escapes::ResolvedSpan],
+    resolved: &[ResolvedAtom],
     styled: bool,
     context: &[InlineContext],
     atoms: &mut Vec<Atom>,
@@ -415,32 +473,36 @@ fn collect_text_atoms(
         .iter()
         .filter(|span| overlaps(&span.source_range, &node.range))
     {
-        // Pulldown can split one raw escape across adjacent Text events. The
-        // first event owns the full atomic span; later overlapping events skip
-        // the portion already represented by that atom.
-        if span.source_range.start < node.range.start {
-            start = start.max(span.source_range.end);
-            continue;
-        }
-        if start < span.source_range.start {
+        let represented_start = span.source_range.start.max(node.range.start);
+        if start < represented_start {
+            let range = start..represented_start;
             atoms.push(Atom {
-                range: start..span.source_range.start,
+                semantic_range: range.clone(),
+                range,
                 styled,
                 eligibility: AtomEligibility::Partial,
                 context: context.to_vec(),
             });
         }
-        atoms.push(Atom {
-            range: span.source_range.clone(),
-            styled,
-            eligibility: AtomEligibility::Atomic,
-            context: context.to_vec(),
-        });
-        start = span.source_range.end;
+        if span.owner == node.range {
+            atoms.push(Atom {
+                range: span.source_range.clone(),
+                semantic_range: span.semantic_range.clone(),
+                styled,
+                eligibility: AtomEligibility::Atomic,
+                context: context.to_vec(),
+            });
+        }
+        // A resolved span may cover bytes represented by more than one Text
+        // event. Only the first overlapping event owns the atom; every later
+        // event still skips its represented portion to avoid duplicate atoms.
+        start = start.max(span.source_range.end);
     }
     if start < node.range.end {
+        let range = start..node.range.end;
         atoms.push(Atom {
-            range: start..node.range.end,
+            semantic_range: range.clone(),
+            range,
             styled,
             eligibility: AtomEligibility::Partial,
             context: context.to_vec(),
@@ -647,7 +709,7 @@ fn plan_island(
             if members.contains(&index) {
                 continue;
             }
-            if touches(&node.content, &component) || overlaps(&node.range, &component) {
+            if touches(&node.range, &component) {
                 component.start = component.start.min(node.content.start);
                 component.end = component.end.max(node.content.end);
                 members.push(index);
@@ -659,6 +721,10 @@ fn plan_island(
         }
     }
 
+    let removed_delimiters: Vec<Range<usize>> = members
+        .iter()
+        .flat_map(|index| island.formats[*index].delimiters.iter().cloned())
+        .collect();
     let mut coverage: Vec<Range<usize>> = members
         .iter()
         .map(|index| island.formats[*index].content.clone())
@@ -670,6 +736,10 @@ fn plan_island(
         coverage.push(selected.clone());
         merge_ranges(coverage)
     };
+    // Source-adjacent styled/plain content is separated only by the target
+    // node's delimiter bytes. Those delimiters are removed below, so merge
+    // across them before re-emitting one component around the combined text.
+    let desired = merge_ranges_across_delimiters(desired, &removed_delimiters);
     let desired = split_at_inline_contexts(markdown, island, &desired);
 
     for index in &members {
@@ -696,11 +766,11 @@ fn plan_island(
     // style changes only where this command can act; all opposite inline
     // styles must remain exactly as parsed before the edit.
     for atom in &island.atoms {
-        if !overlaps(&atom.range, &component) {
+        if !overlaps(&atom.range, &component) || atom.eligibility == AtomEligibility::Never {
             continue;
         }
-        let start = atom.range.start;
-        let end = atom.range.end;
+        let start = atom.semantic_range.start;
+        let end = atom.semantic_range.end;
         let original = styles_for_atom(atom, format);
         let selected_atom = atom_participates(atom, &selected);
         for (relative, ch) in markdown[start..end].char_indices() {
@@ -750,6 +820,46 @@ fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
         }
     }
     out
+}
+
+fn merge_ranges_across_delimiters(
+    mut ranges: Vec<Range<usize>>,
+    delimiters: &[Range<usize>],
+) -> Vec<Range<usize>> {
+    ranges.sort_by_key(|range| range.start);
+    let mut delimiters = delimiters.to_vec();
+    delimiters.sort_by_key(|range| range.start);
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(last) = out.last_mut()
+            && (range.start <= last.end || gap_is_covered(last.end..range.start, &delimiters))
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            out.push(range);
+        }
+    }
+    out
+}
+
+fn gap_is_covered(gap: Range<usize>, delimiters: &[Range<usize>]) -> bool {
+    if gap.is_empty() {
+        return true;
+    }
+    let mut cursor = gap.start;
+    for delimiter in delimiters {
+        if delimiter.end <= cursor {
+            continue;
+        }
+        if delimiter.start > cursor {
+            return false;
+        }
+        cursor = cursor.max(delimiter.end);
+        if cursor >= gap.end {
+            return true;
+        }
+    }
+    false
 }
 
 fn subtract_ranges(ranges: &[Range<usize>], removed: &Range<usize>) -> Vec<Range<usize>> {
@@ -1316,7 +1426,10 @@ mod tests {
         assert_eq!(whole.markdown, "*&#38;*");
 
         let escaped = apply(r"\#", Selection::Cursor(1), InlineFormat::Strong);
-        assert_eq!(escaped.markdown, r"\#");
+        assert_eq!(escaped.markdown, r"**\#**");
+
+        let whole_escape = apply(r"\#", Selection::range(0, 2), InlineFormat::Emphasis);
+        assert_eq!(whole_escape.markdown, r"*\#*");
 
         let partial_escape = apply(r"\#", Selection::range(1, 2), InlineFormat::Strong);
         assert_eq!(partial_escape.markdown, r"\#");
@@ -1348,5 +1461,25 @@ mod tests {
             InlineFormat::Strong,
         );
         assert_eq!(state.markdown, "**before** ![alt](url) **after**");
+
+        let styled = "**before ![alt](url) after**";
+        let removed = apply(
+            styled,
+            Selection::range(0, styled.len()),
+            InlineFormat::Strong,
+        );
+        assert_eq!(removed.markdown, mixed);
+    }
+
+    #[test]
+    fn applying_format_merges_with_an_adjacent_target_span() {
+        let after = apply_marked("**a**⟦b⟧", InlineFormat::Strong);
+        assert_eq!(after.markdown, "**ab**");
+
+        let before = apply_marked("⟦a⟧**b**", InlineFormat::Strong);
+        assert_eq!(before.markdown, "**ab**");
+
+        let emphasis = apply_marked("*a*⟦b⟧", InlineFormat::Emphasis);
+        assert_eq!(emphasis.markdown, "*ab*");
     }
 }
