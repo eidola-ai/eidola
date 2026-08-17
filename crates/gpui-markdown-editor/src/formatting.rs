@@ -15,6 +15,7 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::embed;
+use crate::escapes;
 use crate::parser::parse;
 use crate::state::{EditorState, Selection};
 use crate::syntax::{NodeKind, SyntaxNode};
@@ -55,11 +56,23 @@ struct InlineContext {
     range: Range<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomEligibility {
+    /// Ordinary text can be formatted over any selected subrange.
+    Partial,
+    /// Code and math can only be formatted when selected as a whole construct.
+    Whole,
+    /// A resolved escape/entity is one semantic glyph and formats atomically.
+    Atomic,
+    /// Formatting has no visual meaning for an image; it is a hard boundary.
+    Never,
+}
+
 #[derive(Debug, Clone)]
 struct Atom {
     range: Range<usize>,
     styled: bool,
-    opaque: bool,
+    eligibility: AtomEligibility,
     context: Vec<InlineContext>,
 }
 
@@ -83,6 +96,19 @@ struct Edit {
     replacement: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InlineStyles {
+    strong: bool,
+    emphasis: bool,
+    strikethrough: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StyleExpectation {
+    offset: usize,
+    styles: InlineStyles,
+}
+
 pub(crate) fn toggle(state: EditorState, format: InlineFormat) -> EditorState {
     let tree = parse(&state.markdown);
     let mut islands = Vec::new();
@@ -99,7 +125,8 @@ pub(crate) fn toggle(state: EditorState, format: InlineFormat) -> EditorState {
         islands[*island_index]
             .atoms
             .iter()
-            .filter(|atom| overlaps(&atom.range, selected))
+            .filter(|atom| atom_participates(atom, selected))
+            .filter(|atom| atom_has_substantive_overlap(&state.markdown, atom, selected))
             .all(|atom| atom.styled)
     });
 
@@ -131,21 +158,35 @@ pub(crate) fn toggle(state: EditorState, format: InlineFormat) -> EditorState {
     }
 
     let markdown = apply_edits(&state.markdown, &edits);
-    let next_tree = parse(&markdown);
+    let selection = remap_selection(state.selection, &edits);
+    let candidate = crate::update::enforce_invariants(EditorState {
+        markdown: markdown.clone(),
+        selection,
+        embeds: state.embeds.clone(),
+    });
+    // Formatting is validated against the same canonical buffer the editable
+    // update pipeline will commit. Conservatively refuse candidates that need
+    // an additional invariant rewrite: offset lineage would otherwise be lost,
+    // and passes such as marker-space injection can change block semantics.
+    if candidate.markdown != markdown {
+        return state;
+    }
+
+    let next_tree = parse(&candidate.markdown);
     if block_fingerprint(&tree) != block_fingerprint(&next_tree)
         || protected_inline_fingerprint(&state.markdown, &tree)
-            != protected_inline_fingerprint(&markdown, &next_tree)
-        || !expectations_hold(&next_tree, &edits, &expectations, format)
+            != protected_inline_fingerprint(&candidate.markdown, &next_tree)
+        || resolved_span_fingerprint(&state.markdown, &tree)
+            != resolved_span_fingerprint(&candidate.markdown, &next_tree)
+        || embed_fingerprint(&state.markdown, &state.embeds)
+            != embed_fingerprint(&candidate.markdown, &state.embeds)
+        || !opposite_styles_hold(&state.markdown, &tree, &next_tree, &edits, format)
+        || !expectations_hold(&next_tree, &edits, &expectations)
     {
         return state;
     }
 
-    let selection = remap_selection(state.selection, &edits);
-    EditorState {
-        markdown,
-        selection,
-        embeds: state.embeds,
-    }
+    candidate
 }
 
 fn collect_islands(
@@ -164,21 +205,21 @@ fn collect_islands(
                 let sole_display_math = node.children.len() == 1
                     && matches!(node.children[0].kind, NodeKind::DisplayMath { .. });
                 if !mapped_embed && !sole_display_math {
-                    push_inline_groups(node, None, format, out);
+                    push_inline_groups(node, markdown, None, format, out);
                 }
                 collect_block_children(&node.children, markdown, embeds, format, out);
             }
             NodeKind::Heading { content_range, .. } => {
-                push_inline_groups(node, Some(content_range.clone()), format, out);
+                push_inline_groups(node, markdown, Some(content_range.clone()), format, out);
                 collect_block_children(&node.children, markdown, embeds, format, out);
             }
             NodeKind::TableCell => {
-                push_inline_groups(node, Some(node.range.clone()), format, out);
+                push_inline_groups(node, markdown, Some(node.range.clone()), format, out);
             }
             NodeKind::ListItem { .. } => {
                 // Tight list items carry inline children directly. Nested lists
                 // and loose-item paragraphs recurse as separate islands.
-                push_inline_groups(node, None, format, out);
+                push_inline_groups(node, markdown, None, format, out);
                 collect_block_children(&node.children, markdown, embeds, format, out);
             }
             NodeKind::CodeBlock { .. } | NodeKind::DisplayMath { .. } | NodeKind::ThematicBreak => {
@@ -238,6 +279,7 @@ fn is_inline_node(kind: &NodeKind) -> bool {
 
 fn push_inline_groups(
     node: &SyntaxNode,
+    markdown: &str,
     clamp: Option<Range<usize>>,
     format: InlineFormat,
     out: &mut Vec<Island>,
@@ -253,11 +295,13 @@ fn push_inline_groups(
             .min()
             .unwrap_or(0);
         let group_end = group.iter().map(|child| child.range.end).max().unwrap_or(0);
+        let resolved = escapes::scan(markdown.as_bytes(), group_start..group_end, &[]);
         let mut atoms = Vec::new();
         let mut formats = Vec::new();
         for child in group.drain(..) {
             collect_inline(
                 child,
+                &resolved,
                 false,
                 format,
                 &mut Vec::new(),
@@ -300,6 +344,7 @@ fn push_inline_groups(
 
 fn collect_inline(
     node: &SyntaxNode,
+    resolved: &[escapes::ResolvedSpan],
     inherited: bool,
     format: InlineFormat,
     context: &mut Vec<InlineContext>,
@@ -333,29 +378,73 @@ fn collect_inline(
     }
 
     match &node.kind {
-        NodeKind::Text => atoms.push(Atom {
+        NodeKind::Text => collect_text_atoms(node, resolved, styled, context, atoms),
+        NodeKind::InlineCode { .. } | NodeKind::InlineMath { .. } => atoms.push(Atom {
             range: node.range.clone(),
             styled,
-            opaque: false,
+            eligibility: AtomEligibility::Whole,
             context: context.clone(),
         }),
-        NodeKind::InlineCode { .. } | NodeKind::InlineMath { .. } | NodeKind::Image { .. } => {
-            atoms.push(Atom {
-                range: node.range.clone(),
-                styled,
-                opaque: true,
-                context: context.clone(),
-            });
-        }
+        NodeKind::Image { .. } => atoms.push(Atom {
+            range: node.range.clone(),
+            styled,
+            eligibility: AtomEligibility::Never,
+            context: context.clone(),
+        }),
         NodeKind::DisplayMath { .. } => {}
         _ => {
             for child in &node.children {
-                collect_inline(child, styled, format, context, atoms, formats);
+                collect_inline(child, resolved, styled, format, context, atoms, formats);
             }
         }
     }
     if pushed_context {
         context.pop();
+    }
+}
+
+fn collect_text_atoms(
+    node: &SyntaxNode,
+    resolved: &[escapes::ResolvedSpan],
+    styled: bool,
+    context: &[InlineContext],
+    atoms: &mut Vec<Atom>,
+) {
+    let mut start = node.range.start;
+    for span in resolved
+        .iter()
+        .filter(|span| overlaps(&span.source_range, &node.range))
+    {
+        // Pulldown can split one raw escape across adjacent Text events. The
+        // first event owns the full atomic span; later overlapping events skip
+        // the portion already represented by that atom.
+        if span.source_range.start < node.range.start {
+            start = start.max(span.source_range.end);
+            continue;
+        }
+        if start < span.source_range.start {
+            atoms.push(Atom {
+                range: start..span.source_range.start,
+                styled,
+                eligibility: AtomEligibility::Partial,
+                context: context.to_vec(),
+            });
+        }
+        atoms.push(Atom {
+            range: span.source_range.clone(),
+            styled,
+            eligibility: AtomEligibility::Atomic,
+            context: context.to_vec(),
+        });
+        start = span.source_range.end;
+    }
+    if start < node.range.end {
+        atoms.push(Atom {
+            range: start..node.range.end,
+            styled,
+            eligibility: AtomEligibility::Partial,
+            context: context.to_vec(),
+        });
     }
 }
 
@@ -380,10 +469,17 @@ fn selected_ranges(state: &EditorState, islands: &[Island]) -> Vec<(usize, Range
         let cursor = state.selection.head();
         for (index, island) in islands.iter().enumerate() {
             for atom in &island.atoms {
-                if !atom.opaque && cursor >= atom.range.start && cursor <= atom.range.end {
-                    if let Some(range) = word_range_at(&state.markdown, &atom.range, cursor) {
-                        return vec![(index, range)];
+                if cursor < atom.range.start || cursor > atom.range.end {
+                    continue;
+                }
+                match atom.eligibility {
+                    AtomEligibility::Partial => {
+                        if let Some(range) = word_range_at(&state.markdown, &atom.range, cursor) {
+                            return vec![(index, range)];
+                        }
                     }
+                    AtomEligibility::Atomic => return vec![(index, atom.range.clone())],
+                    AtomEligibility::Whole | AtomEligibility::Never => {}
                 }
             }
         }
@@ -398,12 +494,7 @@ fn selected_ranges(state: &EditorState, islands: &[Island]) -> Vec<(usize, Range
             let qualified: Vec<&Atom> = island
                 .atoms
                 .iter()
-                .filter(|atom| {
-                    overlaps(&atom.range, &selected)
-                        && (!atom.opaque
-                            || (selected.start <= atom.range.start
-                                && selected.end >= atom.range.end))
-                })
+                .filter(|atom| atom_participates(atom, &selected))
                 .collect();
             let first = qualified.first()?;
             let last = qualified.last()?;
@@ -420,6 +511,25 @@ fn selected_ranges(state: &EditorState, islands: &[Island]) -> Vec<(usize, Range
             trim_whitespace(&state.markdown, start..end).map(|range| (index, range))
         })
         .collect()
+}
+
+fn atom_participates(atom: &Atom, selected: &Range<usize>) -> bool {
+    if !overlaps(&atom.range, selected) {
+        return false;
+    }
+    match atom.eligibility {
+        AtomEligibility::Partial => true,
+        AtomEligibility::Whole | AtomEligibility::Atomic => {
+            selected.start <= atom.range.start && selected.end >= atom.range.end
+        }
+        AtomEligibility::Never => false,
+    }
+}
+
+fn atom_has_substantive_overlap(markdown: &str, atom: &Atom, selected: &Range<usize>) -> bool {
+    let start = atom.range.start.max(selected.start);
+    let end = atom.range.end.min(selected.end);
+    start < end && markdown[start..end].chars().any(|ch| !ch.is_whitespace())
 }
 
 fn word_range_at(markdown: &str, atom: &Range<usize>, cursor: usize) -> Option<Range<usize>> {
@@ -461,7 +571,7 @@ fn split_at_inline_contexts(
 ) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     for desired in ranges {
-        let mut group_context: Option<&[InlineContext]> = None;
+        let mut group_context: Option<Vec<InlineContext>> = None;
         let mut group_range: Option<Range<usize>> = None;
         for atom in island
             .atoms
@@ -472,16 +582,42 @@ fn split_at_inline_contexts(
             if part.start >= part.end {
                 continue;
             }
-            if group_context.is_some_and(|context| context != atom.context.as_slice()) {
+
+            // Existing style over an inert/partially-selected atom must survive
+            // a neighboring edit, but a new style must never bridge across it.
+            let include = match atom.eligibility {
+                AtomEligibility::Partial => true,
+                AtomEligibility::Whole | AtomEligibility::Atomic => {
+                    atom.styled
+                        || (desired.start <= atom.range.start && desired.end >= atom.range.end)
+                }
+                AtomEligibility::Never => atom.styled,
+            };
+            if !include {
                 if let Some(range) = group_range
                     .take()
                     .and_then(|range| trim_whitespace(markdown, range))
                 {
                     out.push(range);
                 }
+                group_context = None;
+                continue;
             }
-            if group_context.is_none_or(|context| context != atom.context.as_slice()) {
-                group_context = Some(atom.context.as_slice());
+
+            if group_context
+                .as_ref()
+                .is_some_and(|context| context.as_slice() != atom.context.as_slice())
+                && let Some(range) = group_range
+                    .take()
+                    .and_then(|range| trim_whitespace(markdown, range))
+            {
+                out.push(range);
+            }
+            if group_context
+                .as_ref()
+                .is_none_or(|context| context.as_slice() != atom.context.as_slice())
+            {
+                group_context = Some(atom.context.clone());
                 group_range = Some(part);
             } else if let Some(range) = &mut group_range {
                 range.end = part.end;
@@ -501,7 +637,7 @@ fn plan_island(
     remove: bool,
     format: InlineFormat,
     edits: &mut Vec<Edit>,
-    expectations: &mut Vec<(usize, bool)>,
+    expectations: &mut Vec<StyleExpectation>,
 ) {
     let mut component = selected.clone();
     let mut members = Vec::new();
@@ -555,34 +691,50 @@ fn plan_island(
         });
     }
 
-    // Verify every semantic atom in the affected component: selected atoms
-    // receive the command's result, while styled content outside a partial
-    // removal must remain styled after the component is split.
+    // Verify every substantive source character in the affected component,
+    // including both unselected sides of a partially touched atom. The target
+    // style changes only where this command can act; all opposite inline
+    // styles must remain exactly as parsed before the edit.
     for atom in &island.atoms {
         if !overlaps(&atom.range, &component) {
             continue;
         }
-        if let Some(sample) = first_substantive_byte(markdown, atom, &selected) {
-            let expected = if overlaps(&atom.range, &selected) {
-                !remove
-            } else {
-                atom.styled
-            };
-            expectations.push((sample, expected));
+        let start = atom.range.start;
+        let end = atom.range.end;
+        let original = styles_for_atom(atom, format);
+        let selected_atom = atom_participates(atom, &selected);
+        for (relative, ch) in markdown[start..end].char_indices() {
+            if ch.is_whitespace() {
+                continue;
+            }
+            let offset = start + relative;
+            let mut styles = original;
+            if selected_atom && selected.start <= offset && offset < selected.end {
+                match format {
+                    InlineFormat::Strong => styles.strong = !remove,
+                    InlineFormat::Emphasis => styles.emphasis = !remove,
+                }
+            }
+            expectations.push(StyleExpectation { offset, styles });
         }
     }
 }
 
-fn first_substantive_byte(markdown: &str, atom: &Atom, selected: &Range<usize>) -> Option<usize> {
-    let start = atom.range.start.max(selected.start);
-    let end = atom.range.end.min(selected.end);
-    if start >= end {
-        return None;
+fn styles_for_atom(atom: &Atom, format: InlineFormat) -> InlineStyles {
+    let mut styles = InlineStyles::default();
+    match format {
+        InlineFormat::Strong => styles.strong = atom.styled,
+        InlineFormat::Emphasis => styles.emphasis = atom.styled,
     }
-    markdown[start..end]
-        .char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
-        .map(|(offset, _)| start + offset)
+    for context in &atom.context {
+        match context.kind {
+            InlineContextKind::Strong => styles.strong = true,
+            InlineContextKind::Emphasis => styles.emphasis = true,
+            InlineContextKind::Strikethrough => styles.strikethrough = true,
+            InlineContextKind::Link => {}
+        }
+    }
+    styles
 }
 
 fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
@@ -675,24 +827,85 @@ fn map_offset(offset: usize, edits: &[Edit], after_insertions: bool) -> usize {
     ((offset as isize) + shift).max(0) as usize
 }
 
+fn opposite_styles_hold(
+    markdown: &str,
+    original: &[SyntaxNode],
+    candidate: &[SyntaxNode],
+    edits: &[Edit],
+    target: InlineFormat,
+) -> bool {
+    fn visit(
+        markdown: &str,
+        nodes: &[SyntaxNode],
+        original: &[SyntaxNode],
+        candidate: &[SyntaxNode],
+        edits: &[Edit],
+        target: InlineFormat,
+    ) -> bool {
+        for node in nodes {
+            if matches!(
+                node.kind,
+                NodeKind::Text
+                    | NodeKind::InlineCode { .. }
+                    | NodeKind::InlineMath { .. }
+                    | NodeKind::Image { .. }
+            ) {
+                for (relative, _) in markdown[node.range.clone()].char_indices() {
+                    let offset = node.range.start + relative;
+                    let Some(before) = inline_styles_at(original, offset, InlineStyles::default())
+                    else {
+                        return false;
+                    };
+                    let mapped = map_offset(offset, edits, true);
+                    let Some(after) = inline_styles_at(candidate, mapped, InlineStyles::default())
+                    else {
+                        return false;
+                    };
+                    let unchanged = match target {
+                        InlineFormat::Strong => before.emphasis == after.emphasis,
+                        InlineFormat::Emphasis => before.strong == after.strong,
+                    } && before.strikethrough == after.strikethrough;
+                    if !unchanged {
+                        return false;
+                    }
+                }
+            } else if !visit(markdown, &node.children, original, candidate, edits, target) {
+                return false;
+            }
+        }
+        true
+    }
+
+    visit(markdown, original, original, candidate, edits, target)
+}
+
 fn expectations_hold(
     tree: &[SyntaxNode],
     edits: &[Edit],
-    expectations: &[(usize, bool)],
-    format: InlineFormat,
+    expectations: &[StyleExpectation],
 ) -> bool {
-    expectations.iter().all(|(offset, expected)| {
-        let mapped = map_offset(*offset, edits, true);
-        style_at(tree, mapped, format, false) == *expected
+    expectations.iter().all(|expectation| {
+        let mapped = map_offset(expectation.offset, edits, true);
+        inline_styles_at(tree, mapped, InlineStyles::default()) == Some(expectation.styles)
     })
 }
 
-fn style_at(nodes: &[SyntaxNode], offset: usize, format: InlineFormat, inherited: bool) -> bool {
+fn inline_styles_at(
+    nodes: &[SyntaxNode],
+    offset: usize,
+    inherited: InlineStyles,
+) -> Option<InlineStyles> {
     for node in nodes {
         if offset < node.range.start || offset >= node.range.end {
             continue;
         }
-        let styled = inherited || format.matches(&node.kind);
+        let mut styles = inherited;
+        match node.kind {
+            NodeKind::Strong { .. } => styles.strong = true,
+            NodeKind::Emphasis { .. } => styles.emphasis = true,
+            NodeKind::Strikethrough { .. } => styles.strikethrough = true,
+            _ => {}
+        }
         if matches!(
             node.kind,
             NodeKind::Text
@@ -700,13 +913,26 @@ fn style_at(nodes: &[SyntaxNode], offset: usize, format: InlineFormat, inherited
                 | NodeKind::InlineMath { .. }
                 | NodeKind::Image { .. }
         ) {
-            return styled;
+            return Some(styles);
         }
-        if style_at(&node.children, offset, format, styled) {
-            return true;
+        if let Some(styles) = inline_styles_at(&node.children, offset, styles) {
+            return Some(styles);
         }
     }
-    false
+    None
+}
+
+#[cfg(test)]
+fn style_at(nodes: &[SyntaxNode], offset: usize, format: InlineFormat, inherited: bool) -> bool {
+    let mut styles = InlineStyles::default();
+    match format {
+        InlineFormat::Strong => styles.strong = inherited,
+        InlineFormat::Emphasis => styles.emphasis = inherited,
+    }
+    inline_styles_at(nodes, offset, styles).is_some_and(|styles| match format {
+        InlineFormat::Strong => styles.strong,
+        InlineFormat::Emphasis => styles.emphasis,
+    })
 }
 
 fn protected_inline_fingerprint(markdown: &str, nodes: &[SyntaxNode]) -> Vec<String> {
@@ -743,6 +969,61 @@ fn protected_inline_walk(markdown: &str, nodes: &[SyntaxNode], out: &mut Vec<Str
     }
 }
 
+fn resolved_span_fingerprint(markdown: &str, tree: &[SyntaxNode]) -> Vec<(String, String)> {
+    let verbatim = formatting_verbatim_ranges(tree);
+    escapes::scan(markdown.as_bytes(), 0..markdown.len(), &verbatim)
+        .into_iter()
+        .map(|span| (markdown[span.source_range].to_string(), span.display))
+        .collect()
+}
+
+fn formatting_verbatim_ranges(tree: &[SyntaxNode]) -> Vec<Range<usize>> {
+    fn walk(nodes: &[SyntaxNode], out: &mut Vec<Range<usize>>) {
+        for node in nodes {
+            match &node.kind {
+                NodeKind::CodeBlock { .. }
+                | NodeKind::InlineCode { .. }
+                | NodeKind::InlineMath { .. }
+                | NodeKind::DisplayMath { .. } => out.push(node.range.clone()),
+                NodeKind::Link {
+                    delimiter_ranges, ..
+                }
+                | NodeKind::Image {
+                    delimiter_ranges, ..
+                } => {
+                    if let Some(destination) = delimiter_ranges.get(1) {
+                        out.push(destination.clone());
+                    }
+                }
+                _ => {}
+            }
+            walk(&node.children, out);
+        }
+    }
+
+    let mut ranges = Vec::new();
+    walk(tree, &mut ranges);
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn embed_fingerprint(markdown: &str, embeds: &embed::EmbedMap) -> Vec<(u64, String)> {
+    embed::embed_blocks(markdown, embeds)
+        .into_iter()
+        .map(|block| (block.ordinal, markdown[block.range].to_string()))
+        .collect()
+}
+
 fn block_fingerprint(nodes: &[SyntaxNode]) -> Vec<String> {
     let mut out = Vec::new();
     fingerprint_walk(nodes, &mut out);
@@ -752,12 +1033,18 @@ fn block_fingerprint(nodes: &[SyntaxNode]) -> Vec<String> {
 fn fingerprint_walk(nodes: &[SyntaxNode], out: &mut Vec<String>) {
     for node in nodes {
         match &node.kind {
-            NodeKind::Paragraph => out.push("paragraph".into()),
+            NodeKind::Paragraph => {
+                if let Some(url) = sole_image_url(node) {
+                    out.push(format!("paragraph:sole-image:{url}"));
+                } else {
+                    out.push("paragraph".into());
+                }
+            }
             NodeKind::Heading { level, .. } => out.push(format!("heading:{level}")),
             NodeKind::CodeBlock { .. } => out.push("code".into()),
             NodeKind::BlockQuote { .. } => out.push("blockquote".into()),
             NodeKind::List { kind } => out.push(format!("list:{kind:?}")),
-            NodeKind::ListItem { .. } => out.push("item".into()),
+            NodeKind::ListItem { task, .. } => out.push(format!("item:task={task:?}")),
             NodeKind::Table { alignments } => out.push(format!("table:{}", alignments.len())),
             NodeKind::TableRow { is_header } => out.push(format!("row:{is_header}")),
             NodeKind::TableCell => out.push("cell".into()),
@@ -766,6 +1053,18 @@ fn fingerprint_walk(nodes: &[SyntaxNode], out: &mut Vec<String>) {
         }
         fingerprint_walk(&node.children, out);
     }
+}
+
+fn sole_image_url(node: &SyntaxNode) -> Option<&str> {
+    let mut image = None;
+    for child in &node.children {
+        match &child.kind {
+            NodeKind::Image { dest_url, .. } if image.is_none() => image = Some(dest_url.as_str()),
+            NodeKind::SoftBreak | NodeKind::HardBreak => {}
+            _ => return None,
+        }
+    }
+    image
 }
 
 fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
@@ -950,5 +1249,104 @@ mod tests {
     fn removing_format_that_would_create_a_list_is_refused() {
         let state = apply("**- item**", Selection::range(0, 10), InlineFormat::Strong);
         assert_eq!(state.markdown, "**- item**");
+    }
+
+    #[test]
+    fn partial_removal_rejects_ambiguous_delimiters_that_change_unselected_style() {
+        let state = apply_marked("***a⟦b⟧c***", InlineFormat::Strong);
+        assert_eq!(state.markdown, "***abc***");
+    }
+
+    #[test]
+    fn whitespace_between_styled_spans_does_not_vote_against_removal() {
+        let markdown = "**abc** **def**";
+        let state = apply(
+            markdown,
+            Selection::range(0, markdown.len()),
+            InlineFormat::Strong,
+        );
+        assert_eq!(state.markdown, "abc def");
+    }
+
+    #[test]
+    fn removing_format_cannot_materialize_task_list_syntax() {
+        for markdown in ["- **[ ] foo**", "- **[x] foo**"] {
+            let state = apply(
+                markdown,
+                Selection::range(0, markdown.len()),
+                InlineFormat::Strong,
+            );
+            assert_eq!(state.markdown, markdown);
+        }
+    }
+
+    #[test]
+    fn removing_format_cannot_materialize_a_mapped_embed() {
+        let markdown = "**{{ embed 1 }}**";
+        let state = toggle(
+            EditorState {
+                markdown: markdown.into(),
+                selection: Selection::range(0, markdown.len()),
+                embeds: embed::EmbedMap::new([(1, "embedded content".into())]),
+            },
+            InlineFormat::Strong,
+        );
+        assert_eq!(state.markdown, markdown);
+        assert!(embed::embed_blocks(&state.markdown, &state.embeds).is_empty());
+    }
+
+    #[test]
+    fn post_format_canonicalization_cannot_materialize_a_list() {
+        for markdown in ["**-foo**", "**+foo**"] {
+            let state = apply(
+                markdown,
+                Selection::range(0, markdown.len()),
+                InlineFormat::Strong,
+            );
+            assert_eq!(state.markdown, markdown);
+        }
+    }
+
+    #[test]
+    fn resolved_spans_are_atomic_formatting_units() {
+        let caret = apply("&amp;", Selection::Cursor(2), InlineFormat::Strong);
+        assert_eq!(caret.markdown, "**&amp;**");
+
+        let whole = apply("&#38;", Selection::range(0, 5), InlineFormat::Emphasis);
+        assert_eq!(whole.markdown, "*&#38;*");
+
+        let escaped = apply(r"\#", Selection::Cursor(1), InlineFormat::Strong);
+        assert_eq!(escaped.markdown, r"\#");
+
+        let partial_escape = apply(r"\#", Selection::range(1, 2), InlineFormat::Strong);
+        assert_eq!(partial_escape.markdown, r"\#");
+
+        let partial = apply("&amp;", Selection::range(1, 4), InlineFormat::Strong);
+        assert_eq!(partial.markdown, "&amp;");
+    }
+
+    #[test]
+    fn target_formatting_cannot_materialize_an_opposite_inline_style() {
+        let state = apply("~~a~", Selection::range(0, 1), InlineFormat::Strong);
+        assert_eq!(state.markdown, "~~a~");
+    }
+
+    #[test]
+    fn images_are_inert_boundaries_for_inline_formatting() {
+        let image = "![alt](url)";
+        let standalone = apply(
+            image,
+            Selection::range(0, image.len()),
+            InlineFormat::Strong,
+        );
+        assert_eq!(standalone.markdown, image);
+
+        let mixed = "before ![alt](url) after";
+        let state = apply(
+            mixed,
+            Selection::range(0, mixed.len()),
+            InlineFormat::Strong,
+        );
+        assert_eq!(state.markdown, "**before** ![alt](url) **after**");
     }
 }
