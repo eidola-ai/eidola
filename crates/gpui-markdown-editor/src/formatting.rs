@@ -838,22 +838,22 @@ mod tests {
     #[test]
     fn applying_italic_splits_at_a_strong_boundary() {
         let state = apply_marked(
-            "Alpha **bravo ⟦charley** delta⟧ echo.",
+            "Alpha **bravo ⟦charlie** delta⟧ echo.",
             InlineFormat::Emphasis,
         );
-        assert_eq!(state.markdown, "Alpha **bravo *charley*** *delta* echo.");
+        assert_eq!(state.markdown, "Alpha **bravo *charlie*** *delta* echo.");
     }
 
     #[test]
     fn applying_strong_splits_at_an_emphasis_boundary() {
-        let state = apply_marked("Alpha *bravo ⟦charley* delta⟧ echo.", InlineFormat::Strong);
-        assert_eq!(state.markdown, "Alpha *bravo **charley*** **delta** echo.");
+        let state = apply_marked("Alpha *bravo ⟦charlie* delta⟧ echo.", InlineFormat::Strong);
+        assert_eq!(state.markdown, "Alpha *bravo **charlie*** **delta** echo.");
     }
 
     #[test]
     fn partial_removal_preserves_the_opposite_style_without_crossing_it() {
-        let state = apply_marked("*alpha **⟦bravo⟧** charley*", InlineFormat::Emphasis);
-        assert_eq!(state.markdown, "*alpha* **bravo** *charley*");
+        let state = apply_marked("*alpha **⟦bravo⟧** charlie*", InlineFormat::Emphasis);
+        assert_eq!(state.markdown, "*alpha* **bravo** *charlie*");
     }
 
     #[test]
@@ -884,42 +884,42 @@ mod tests {
     #[test]
     fn a_selection_leaving_a_link_splits_at_the_link_boundary() {
         let state = apply_marked(
-            "Alpha [bravo ⟦charley](https://example.test) delta⟧ echo.",
+            "Alpha [bravo ⟦charlie](https://example.test) delta⟧ echo.",
             InlineFormat::Strong,
         );
         assert_eq!(
             state.markdown,
-            "Alpha [bravo **charley**](https://example.test) **delta** echo."
+            "Alpha [bravo **charlie**](https://example.test) **delta** echo."
         );
     }
 
     #[test]
     fn nested_link_and_strong_contexts_split_independently() {
         let state = apply_marked(
-            "[**bravo ⟦charley** delta](https://example.test) echo⟧",
+            "[**bravo ⟦charlie** delta](https://example.test) echo⟧",
             InlineFormat::Emphasis,
         );
         assert_eq!(
             state.markdown,
-            "[**bravo *charley*** *delta*](https://example.test) *echo*"
+            "[**bravo *charlie*** *delta*](https://example.test) *echo*"
         );
     }
 
     #[test]
     fn strikethrough_is_an_inline_boundary_too() {
-        let state = apply_marked("~~alpha ⟦bravo~~ charley⟧", InlineFormat::Emphasis);
-        assert_eq!(state.markdown, "~~alpha *bravo*~~ *charley*");
+        let state = apply_marked("~~alpha ⟦bravo~~ charlie⟧", InlineFormat::Emphasis);
+        assert_eq!(state.markdown, "~~alpha *bravo*~~ *charlie*");
     }
 
     #[test]
     fn removing_an_outer_style_from_link_text_keeps_the_link_intact() {
         let state = apply_marked(
-            "*alpha [⟦bravo⟧](https://example.test) charley*",
+            "*alpha [⟦bravo⟧](https://example.test) charlie*",
             InlineFormat::Emphasis,
         );
         assert_eq!(
             state.markdown,
-            "*alpha* [bravo](https://example.test) *charley*"
+            "*alpha* [bravo](https://example.test) *charlie*"
         );
     }
 
