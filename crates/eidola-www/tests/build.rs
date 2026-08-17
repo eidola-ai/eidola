@@ -1,7 +1,7 @@
 //! End-to-end build test against the real repo content: builds the actual
 //! site into a temp dir and asserts the structural invariants (routes,
-//! link rewriting, feed, assets). Content-only regressions are also
-//! caught in CI by the website workflow's validating build.
+//! link rewriting, assets). Content-only regressions are also caught in
+//! CI by the website workflow's validating build.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -131,7 +131,6 @@ fn builds_the_real_site() {
     assert!(client.contains("<p class=\"docs-nav-title\">Start here</p>"));
     assert!(docs_index.contains("<a href=\"/docs/\" aria-current=\"page\">Overview</a>"));
     assert!(!home.contains("docs-sidebar"));
-    assert!(!read(&out, "blog/index.html").contains("docs-sidebar"));
 
     // In-page ToC: on structured docs (entries link the generated
     // heading ids), never on plain pages like privacy.
@@ -156,13 +155,13 @@ fn builds_the_real_site() {
     assert!(!home.contains("page-edit"));
     assert!(!read(&out, "privacy/index.html").contains("page-edit"));
 
-    // Blog: index and feed exist even with no published posts; the draft
-    // example post must not publish.
-    let blog = read(&out, "blog/index.html");
-    assert!(blog.contains("<h1>Blog</h1>"));
-    assert!(!blog.contains("example-post"));
+    // Blog: with no published posts the index, feed, and chrome are
+    // omitted; the draft example post must not publish.
+    assert!(!out.join("blog/index.html").exists());
+    assert!(!out.join("blog/atom.xml").exists());
     assert!(!out.join("blog/example-post/index.html").exists());
-    assert!(read(&out, "blog/atom.xml").contains("<feed"));
+    assert!(!home.contains("href=\"/blog/\""));
+    assert!(!home.contains("atom.xml"));
 
     // Assets: generated palette css, handwritten css, runtime js, fonts,
     // root-level static files.
@@ -176,14 +175,15 @@ fn builds_the_real_site() {
     assert!(out.join("favicon.svg").exists());
     assert!(out.join("apple-touch-icon.png").exists());
 
-    // Sitemap covers the key routes.
+    // Sitemap covers the key routes, and omits the unpublished blog.
     let sitemap = read(&out, "sitemap.xml");
-    for route in ["/", "/docs/client/", "/blog/", "/privacy/", "/terms/"] {
+    for route in ["/", "/docs/client/", "/privacy/", "/terms/"] {
         assert!(
             sitemap.contains(&format!("<loc>https://www.eidola.ai{route}</loc>")),
             "sitemap missing {route}"
         );
     }
+    assert!(!sitemap.contains("/blog/"));
 
     fs::remove_dir_all(&out).ok();
 }
@@ -200,9 +200,15 @@ fn drafts_are_included_when_requested() {
 
     let post = read(&out, "blog/example-post/index.html");
     assert!(post.contains("draft-notice"));
-    // Drafts render but never enter the feed or sitemap.
-    assert!(!read(&out, "blog/atom.xml").contains("example-post"));
+    // Drafts render on the index (so they can be found) but never enter
+    // the feed or sitemap. With no published posts the feed is omitted.
+    let blog = read(&out, "blog/index.html");
+    assert!(blog.contains("example-post"));
+    assert!(read(&out, "sitemap.xml").contains("/blog/"));
+    assert!(!out.join("blog/atom.xml").exists());
     assert!(!read(&out, "sitemap.xml").contains("example-post"));
+    assert!(read(&out, "index.html").contains("href=\"/blog/\""));
+    assert!(!read(&out, "index.html").contains("atom.xml"));
 
     fs::remove_dir_all(&out).ok();
 }
