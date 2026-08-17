@@ -1096,8 +1096,9 @@ impl Inner {
         // **Planning is work**, even when it drives nothing. A router that
         // selects nobody bills an inference and writes no row, so `taken`
         // would stay still while a burst of watched-room posts paid for an
-        // unbounded number of planning calls. Each `plan_and_refine` in this
-        // walk counts against the same ceiling persisted turns do; the count
+        // unbounded number of planning calls. Empty and paused hops in this
+        // walk share the ceiling with persisted turns (`taken + planned`);
+        // hops that drove a turn are already in `taken`. The empty-hop count
         // is the walk's, because a restart sees only the tail and a reported
         // budget-stop settles the room.
         let mut planned: i64 = 0;
@@ -1163,8 +1164,10 @@ impl Inner {
             }
             // The budget is checked before the plan, not after it: planning a
             // room whose budget is spent may cost a router inference, and the
-            // turns it returned could not be driven anyway.
-            if taken >= MAX_DELEGATION_TURNS || planned >= MAX_DELEGATION_TURNS {
+            // turns it returned could not be driven anyway. The two meters
+            // share the ceiling — a room one turn short of it has one hop
+            // left, not a fresh 32 empty router calls.
+            if taken.saturating_add(planned) >= MAX_DELEGATION_TURNS {
                 return self
                     .stop_walk(
                         space_id,
@@ -1191,7 +1194,11 @@ impl Inner {
                 }
                 NotificationPlan::Turns(turns) => turns,
             };
-            planned += 1;
+            // A hop that persists a turn is already in `taken`. Counting it
+            // here as well would spend the ceiling twice on the common path.
+            if turns.is_empty() {
+                planned += 1;
+            }
             // **Nothing follows this one, so it is a finding** — decided
             // after the turns run, not from the plan's shape. A post whose
             // plan comes back empty is where a branch of the room stopped
@@ -1208,7 +1215,7 @@ impl Inner {
                 let conn = self.db_conn().await?;
                 let taken = db::turns_taken_in_space(&conn, space_id).await?;
                 drop(conn);
-                if taken >= MAX_DELEGATION_TURNS {
+                if taken.saturating_add(planned) >= MAX_DELEGATION_TURNS {
                     return self
                         .stop_walk(
                             space_id,

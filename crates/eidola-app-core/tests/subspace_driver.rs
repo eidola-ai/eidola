@@ -2841,9 +2841,9 @@ fn a_delegation_stops_at_its_turn_budget_and_says_so() {
 /// **Empty router hops still spend the budget.** A router that selects nobody
 /// bills an inference and writes no row, so `turns_taken_in_space` would stay
 /// still while a burst of watched-room posts paid for an unbounded number of
-/// planning calls. Each `plan_and_refine` in the walk counts against the same
-/// ceiling persisted turns do. The first hop runs without a router so the
-/// cascade window is reachable; the router is armed inside it.
+/// planning calls. Empty hops in the walk share the ceiling with persisted
+/// turns. The first hop runs without a router so the cascade window is
+/// reachable; the router is armed inside it.
 #[test]
 fn empty_router_hops_still_spend_the_delegation_budget() {
     run(|| {
@@ -2908,6 +2908,83 @@ fn empty_router_hops_still_spend_the_delegation_budget() {
         assert!(
             router_calls as i64 <= MAX_DELEGATION_TURNS,
             "the router is not billed past the ceiling: {router_calls} calls"
+        );
+    });
+}
+
+/// **Empty router hops share the ceiling with persisted turns.** Bounding
+/// `planned` in isolation let a room one turn short of the limit make 32
+/// more paid router calls while `taken` stayed still. They share one
+/// ceiling, so one turn of room left is one hop, not a fresh budget.
+#[test]
+fn empty_router_hops_share_the_budget_with_persisted_turns() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            router: RouterBehavior::Reply(r#"{"notify": []}"#.into()),
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        core.runtime()
+            .block_on(core.set_space_cascade_limit(parent.clone(), 1_000))
+            .expect("cascade limit");
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper.clone()]);
+        let room = out.space.id.clone();
+        core.runtime()
+            .block_on(core.add_global_participant(
+                room.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("the reader joins the room they are watching");
+
+        let brief = out.brief_action_id.clone();
+        for _ in 0..(MAX_DELEGATION_TURNS - 1) {
+            ask(&core, &room, &helper, &brief);
+        }
+
+        core.test_register_loaded_local_model("local", ROUTER_SLUG, mock.port());
+        core.runtime()
+            .block_on(core.set_space_router_model(room.clone(), Some(ROUTER_MODEL.into())))
+            .expect("set the room's router");
+
+        {
+            let mut window = core.test_open_entry_window();
+            std::thread::scope(|scope| {
+                let walking = scope.spawn(|| drive(&core, &room));
+                let resume = core
+                    .runtime()
+                    .block_on(window.recv())
+                    .expect("the walk reaches its opening window");
+                for i in 0..(MAX_DELEGATION_TURNS + 8) {
+                    core.runtime()
+                        .block_on(core.post(format!("And what about day {i}?"), Some(room.clone())))
+                        .expect("a post into the room");
+                }
+                resume.send(()).expect("the walk resumes");
+                walking.join().expect("the walk finishes").expect("driven");
+            });
+        }
+
+        let report = report(&core, &parent).expect("a spent budget is reported");
+        assert_eq!(
+            report.references[0].delegation_end,
+            Some(DelegationEnd::BudgetSpent {
+                limit: MAX_DELEGATION_TURNS
+            }),
+            "the shared ceiling binds"
+        );
+        let router_calls = mock
+            .chat_bodies()
+            .iter()
+            .filter(|b| b["model"] == ROUTER_MODEL)
+            .count();
+        assert!(
+            router_calls as i64 <= 1,
+            "one turn of room left is one empty hop, not a fresh 32: {router_calls} calls"
         );
     });
 }
