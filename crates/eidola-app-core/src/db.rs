@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 8;
+const LATEST_VERSION: i64 = 9;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -8738,6 +8738,47 @@ mod tests {
         let conn = db.connect().unwrap();
         initialize(&conn).await.unwrap();
         assert_eq!(get_user_version(&conn).await.unwrap(), LATEST_VERSION);
+    }
+
+    /// **A sub-space's anchor is a post in its parent, and the schema says so.**
+    /// `parent_action_id` alone only proves the row exists; the compound FK
+    /// `(parent_action_id, parent_space_id) → action(id, space_id)` is what
+    /// makes "an action from somewhere else" unrepresentable.
+    #[tokio::test]
+    async fn a_subspace_anchor_must_belong_to_its_parent() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let author = ensure_participant(&conn, "agent", "Navigator", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "here", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "elsewhere", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let here_post = add_user_action(&conn, "here", &author, "in the parent", 2_000).await;
+        let else_post = add_user_action(&conn, "elsewhere", &author, "somewhere else", 2_000).await;
+
+        conn.execute(
+            "INSERT INTO space (id, parent_space_id, parent_action_id, linkability, created_at) \
+             VALUES ('ok', 'here', ?1, 'unlinked', 3_000)",
+            (Value::Text(here_post.clone()),),
+        )
+        .await
+        .expect("an anchor in the named parent must be accepted");
+
+        let mismatch = conn
+            .execute(
+                "INSERT INTO space (id, parent_space_id, parent_action_id, linkability, created_at) \
+                 VALUES ('bad', 'here', ?1, 'unlinked', 3_000)",
+                (Value::Text(else_post),),
+            )
+            .await;
+        assert!(
+            mismatch.is_err(),
+            "an anchor that lives in another conversation must be refused: {mismatch:?}"
+        );
     }
 
     async fn add_user_action(

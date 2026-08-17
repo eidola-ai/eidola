@@ -984,6 +984,11 @@ pub(crate) struct TurnDirective {
     /// is what makes the outcome unrepresentable instead of handled — a model
     /// naming `decline` here gets the ordinary unknown-tool result and answers.
     pub(crate) mechanical: bool,
+    /// The delegated room a mechanical report is about. Rechecked at persist
+    /// so a close that lands while the model request is in flight does not
+    /// write a message about a conversation somebody closed. `None` for every
+    /// other turn.
+    pub(crate) reporting_on: Option<String>,
 }
 
 /// Where an attachment came from, which decides one thing: whether it is
@@ -1609,6 +1614,15 @@ struct Inner {
     /// to put one. Same shape and same reason as [`Inner::anchor_window`].
     #[cfg(feature = "test-support")]
     entry_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **immediately before a mechanical report
+    /// persists**, after the model request has returned and before the
+    /// generation is committed. A regen of a finding, or an archival of the
+    /// delegated room, that lands while that request is in flight is what
+    /// persist-time remap and liveness exist to survive; this is how a test
+    /// stages them. Same shape as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    persist_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
@@ -6190,6 +6204,8 @@ impl Inner {
             inf_supersedes,
             inf_reply_to,
             attached_references: attached,
+            mechanical: directive.mechanical,
+            reporting_on: directive.reporting_on.clone(),
             context_action_ids,
             trace_action_ids: Vec::new(),
             trace_reply_to: inf_reply_to_for_trace,
@@ -6825,6 +6841,10 @@ impl Inner {
             }
         }
 
+        #[cfg(feature = "test-support")]
+        if prep.mechanical {
+            self.pause_in_report_persist_window().await;
+        }
         let response_action_id = prep
             .persist_turn(
                 if status.is_success() {
@@ -6843,6 +6863,21 @@ impl Inner {
                 response_text.as_bytes().to_vec(),
             )
             .await?;
+        if response_action_id.is_none() {
+            // A mechanical report whose room closed in flight: the request
+            // is in the Record, the parent gained no post.
+            self.bus.emit(Change::Record);
+            return Ok(RoundOutcome::Final(ChatResult {
+                space_id: prep.space_id.clone(),
+                content: response_content,
+                model: prep.model.clone(),
+                input_tokens,
+                output_tokens,
+                credits_charged: prep.total_credits as i64,
+                response_action_id: None,
+                declined: None,
+            }));
+        }
 
         if !status.is_success() {
             // Inference (error status) + request rows committed; Wallet was
@@ -6881,7 +6916,7 @@ impl Inner {
             input_tokens,
             output_tokens,
             credits_charged: prep.total_credits as i64,
-            response_action_id: Some(response_action_id),
+            response_action_id,
             declined: None,
         }))
     }
@@ -7387,6 +7422,10 @@ impl Inner {
         }
 
         // --- the final round ---------------------------------------------
+        #[cfg(feature = "test-support")]
+        if prep.mechanical {
+            self.pause_in_report_persist_window().await;
+        }
         let response_action_id = prep
             .persist_turn(
                 "complete",
@@ -7401,6 +7440,19 @@ impl Inner {
                 response_buf,
             )
             .await?;
+        if response_action_id.is_none() {
+            self.bus.emit(Change::Record);
+            return Ok(RoundOutcome::Final(ChatResult {
+                space_id: prep.space_id.clone(),
+                content: full_content,
+                model: prep.model.clone(),
+                input_tokens,
+                output_tokens,
+                credits_charged: prep.total_credits as i64,
+                response_action_id: None,
+                declined: None,
+            }));
+        }
 
         // All durable writes succeeded — emit per affected domain. post owns the
         // SpaceIndex (new space / auto-title). Local turns touched no
@@ -7418,7 +7470,7 @@ impl Inner {
             input_tokens,
             output_tokens,
             credits_charged: prep.total_credits as i64,
-            response_action_id: Some(response_action_id),
+            response_action_id,
             declined: None,
         }))
     }
@@ -8167,6 +8219,8 @@ impl AppCore {
                 cascade_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 entry_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                persist_window: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 plan_faults: std::sync::atomic::AtomicU32::new(0),
@@ -9481,6 +9535,22 @@ impl AppCore {
         rx
     }
 
+    /// Test-only seam: stop the next mechanical report immediately before its
+    /// generation is committed (see `Inner::persist_window`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_report_persist_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .persist_window
+            .lock()
+            .expect("persist window lock poisoned") = Some(tx);
+        rx
+    }
+
     /// Test-only seam: drive one delegated room to a stop and deliver its
     /// report, awaited to completion.
     ///
@@ -10605,6 +10675,10 @@ struct TurnPrep {
     /// `relation='reference'` edges at ordinals `1..=N` by
     /// [`TurnPrep::persist_turn`]. Empty for every turn a consumer asked for.
     attached_references: Vec<AttachedReference>,
+    /// See [`TurnDirective::mechanical`].
+    mechanical: bool,
+    /// See [`TurnDirective::reporting_on`].
+    reporting_on: Option<String>,
     /// The actions fed upstream at preparation, **in the order their messages
     /// were sent** — the posts of the spine with each one's replayed trace
     /// rounds (task 33) spliced in ahead of the answer they produced. Built by
@@ -11214,8 +11288,9 @@ impl TurnPrep {
     /// Persist the turn's durable rows — the inference action (per the attach
     /// plan, with its reply edge), the context-assembly record (exactly the
     /// actions fed upstream), the response content blocks, and the request row
-    /// — and return the inference action id. Emissions stay with the caller
-    /// (they differ per exit point; see the table in `tests/bus.rs`).
+    /// — and return the inference action id (`None` when a mechanical report
+    /// was suppressed because its room closed in flight). Emissions stay with
+    /// the caller (they differ per exit point; see the table in `tests/bus.rs`).
     ///
     /// `reasoning` is the model's own "thinking" output, when the upstream
     /// emitted any (streaming `delta.reasoning_content` / `delta.reasoning`,
@@ -11235,9 +11310,18 @@ impl TurnPrep {
     /// reply). Everything here is a local adjacent write — the upstream call
     /// is long over — and this prep's connection is the turn's own, so
     /// nothing else can join the transaction.
+    ///
+    /// **A mechanical report revalidates inside this transaction.** Authored
+    /// attachments are remapped to the wording a reader still sees, and the
+    /// room they report on is re-read: a close or a regen that landed while
+    /// the model request was in flight must not persist a quote of hidden
+    /// wording, or a message about a conversation somebody closed. Ordinary
+    /// human quotes are not remapped — those name a concrete generation.
+    /// `None` means the generation was suppressed (the request is still in
+    /// the Record); every other turn returns `Some`.
     #[allow(clippy::too_many_arguments)]
     async fn persist_turn(
-        &self,
+        &mut self,
         action_status: &str,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
@@ -11248,7 +11332,7 @@ impl TurnPrep {
         response_at: i64,
         http_status: u16,
         response_body: Vec<u8>,
-    ) -> Result<String, AppError> {
+    ) -> Result<Option<String>, AppError> {
         db::begin_write(&self.db_conn).await?;
         let persisted = self
             .persist_turn_body(
@@ -11280,9 +11364,83 @@ impl TurnPrep {
         }
     }
 
+    /// Remap this report's authored attachments to the visible tip, and say
+    /// whether the room they report on is still live. Called inside the persist
+    /// transaction, so the edges and the generation commit together.
+    async fn revalidate_mechanical_report(&mut self) -> Result<bool, AppError> {
+        if !self.mechanical {
+            return Ok(true);
+        }
+        let annotation = self
+            .attached_references
+            .iter()
+            .find_map(|a| a.spec.annotation.clone());
+        let mut remapped: Vec<AttachedReference> = Vec::new();
+        for attached in &self.attached_references {
+            if attached.origin != AttachmentOrigin::Authored {
+                remapped.push(attached.clone());
+                continue;
+            }
+            let Some(tip) =
+                db::visible_tip_of_action(&self.db_conn, &attached.spec.antecedent_action_id)
+                    .await?
+            else {
+                continue;
+            };
+            remapped.push(
+                Self::authored_attachment(
+                    &self.db_conn,
+                    remapped.len() as i64 + 1,
+                    tip,
+                    attached.spec.annotation.clone(),
+                )
+                .await?,
+            );
+        }
+        if remapped.is_empty()
+            && let Some(room) = &self.reporting_on
+            && let Some(tip) = db::last_action_in_space(&self.db_conn, room).await?
+        {
+            remapped.push(Self::authored_attachment(&self.db_conn, 1, tip, annotation).await?);
+        }
+        self.attached_references = remapped;
+        match &self.reporting_on {
+            Some(room) => db::is_live_subspace(&self.db_conn, room).await,
+            None => Ok(true),
+        }
+    }
+
+    async fn authored_attachment(
+        conn: &turso::Connection,
+        ordinal: i64,
+        tip: String,
+        annotation: Option<String>,
+    ) -> Result<AttachedReference, AppError> {
+        let (content_block_id, range_start, range_end) =
+            match db::first_quotable_block(conn, &tip).await? {
+                Some((block_id, text)) if !text.is_empty() => {
+                    (Some(block_id), Some(0), Some(text.len() as i64))
+                }
+                _ => (None, None, None),
+            };
+        let author_label = db::post_author_label(conn, &tip).await?;
+        Ok(AttachedReference {
+            ordinal,
+            origin: AttachmentOrigin::Authored,
+            spec: ReferenceSpec {
+                antecedent_action_id: tip,
+                content_block_id,
+                range_start,
+                range_end,
+                annotation,
+            },
+            author_label,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn persist_turn_body(
-        &self,
+        &mut self,
         action_status: &str,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
@@ -11293,7 +11451,21 @@ impl TurnPrep {
         response_at: i64,
         http_status: u16,
         response_body: Vec<u8>,
-    ) -> Result<String, AppError> {
+    ) -> Result<Option<String>, AppError> {
+        if !self.revalidate_mechanical_report().await? {
+            // The room closed while the report was in flight. Keep the
+            // exchange in the Record and write no post about work nobody
+            // wants continued.
+            self.insert_unattached_request(
+                request_body_json,
+                request_at,
+                response_at,
+                http_status,
+                response_body,
+            )
+            .await?;
+            return Ok(None);
+        }
         let inference_action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &self.db_conn,
@@ -11320,13 +11492,14 @@ impl TurnPrep {
                 .await?;
         }
         // The attached passages become this answer's own reference edges, at
-        // the ordinals the model was shown them under — so the numbering in the
-        // prompt, the edge in the record, and the footnote a reader sees are
-        // one sequence. They were validated at preparation, before any spend;
-        // nothing here decides anything, which is what "attached mechanically"
-        // means. A turn that ends without an inference (a decline, the round
-        // cap) writes none of them, because there is no post for a quote to
-        // hang on.
+        // the ordinals they were shown under — so the numbering in the prompt,
+        // the edge in the record, and the footnote a reader sees are one
+        // sequence. Ordinary turns write the specs validated at preparation.
+        // A mechanical report remaps authored attachments immediately above,
+        // inside this transaction, so a regen that landed in flight is the
+        // wording a reader still sees. A turn that ends without an inference
+        // (a decline, the round cap) writes none of them, because there is no
+        // post for a quote to hang on.
         for attached in &self.attached_references {
             db::insert_reference_antecedent(
                 &self.db_conn,
@@ -11429,7 +11602,7 @@ impl TurnPrep {
         )
         .await?;
 
-        Ok(inference_action_id)
+        Ok(Some(inference_action_id))
     }
 }
 

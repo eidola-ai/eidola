@@ -1605,12 +1605,15 @@ impl Inner {
         };
 
         // **The findings are generations, remapped immediately before the
-        // turn.** An edit or regeneration that lands after the walk collected
-        // them — including during the anchor wait above — would otherwise
-        // quote wording the transcript has hidden, and settlement reads the
-        // visible last word, which is no longer that id. Ordinary human quotes
-        // are not remapped at persist: those name a concrete generation on
-        // purpose. This is the report's own attachments.
+        // turn and again at persist.** An edit or regeneration that lands
+        // after the walk collected them — including during the anchor wait
+        // above — would otherwise quote wording the transcript has hidden,
+        // and settlement reads the visible last word, which is no longer
+        // that id. Ordinary human quotes are not remapped at persist: those
+        // name a concrete generation on purpose. This is the report's own
+        // attachments; persist rewrites them inside the transaction so a
+        // regen while the model request is in flight is still the visible
+        // tip.
         let conn = self.db_conn().await?;
         let leaves = Self::visible_quoted_leaves(&conn, &sub.id, &leaves).await?;
         let mut attached: Vec<AttachedReference> = Vec::with_capacity(leaves.len());
@@ -1651,6 +1654,7 @@ impl Inner {
         let directive = TurnDirective {
             attached,
             mechanical: true,
+            reporting_on: Some(sub.id.clone()),
         };
         // Dropped before the turn runs, for the reason the driven turns' is.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
@@ -1673,6 +1677,14 @@ impl Inner {
         // ends postless), and kept as the thing that would notice if it stopped
         // being.
         if result.response_action_id.is_none() {
+            // A closed room suppresses the generation at persist. Anything
+            // else postless is the unreachable decline, which we still
+            // refuse so it cannot be mistaken for a delivery.
+            let conn = self.db_conn().await?;
+            if !db::is_live_subspace(&conn, &sub.id).await? {
+                self.end_anchor_wait(&sub.id);
+                return Ok(Report::Settled);
+            }
             return Err(AppError::Internal {
                 message: format!(
                     "the report for delegated conversation {} produced no post",
@@ -1781,6 +1793,13 @@ impl Inner {
     #[cfg(feature = "test-support")]
     async fn pause_in_entry_window(&self) {
         pause_in_window(&self.entry_window).await;
+    }
+
+    /// The same, for the window immediately before a mechanical report
+    /// persists (see `Inner::persist_window`).
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn pause_in_report_persist_window(&self) {
+        pause_in_window(&self.persist_window).await;
     }
 
     /// **What every door that closes a room owes it**: announce the room, and

@@ -305,14 +305,18 @@ impl LocalModelsStore {
     /// core call in this operation's keyed slot, and surface a failure in
     /// `op_error`. Success needs no local action — the bus-driven refresh
     /// carries the new state.
+    ///
+    /// **Notify after the slot is occupied**, not before. A paint that runs
+    /// off the notify must see `download_pending` (and its siblings) as true,
+    /// or a failed row's Retry is still in the tree for a second press.
     fn run_op<F, Fut>(&mut self, key: String, cx: &mut Context<Self>, f: F)
     where
         F: FnOnce(Arc<AppCore>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), eidola_app_core::error::AppError>> + Send + 'static,
     {
         self.op_error = None;
-        cx.notify();
         let Some(core) = self.app_core.clone() else {
+            cx.notify();
             return;
         };
         let slot_key = key.clone();
@@ -327,5 +331,6 @@ impl LocalModelsStore {
             });
         });
         self.op_tasks.insert(key, task);
+        cx.notify();
     }
 }
