@@ -580,6 +580,12 @@ fn template_router_write_survives_a_refresh_landing_mid_op(cx: &mut TestAppConte
 
 /// Poll `run_until_parked` until `pred` holds — a write-then-relist round-trips
 /// through the tokio runtime, which `run_until_parked` alone can return before.
+///
+/// The predicate must observe the **gpui** side of that round-trip when the
+/// next step is a store call that depends on it. `backed_stores` allows
+/// parking, so a `block_on` of the core can see the durable write while the
+/// store's continuation is still queued. The reopen-before-verdict
+/// regression is the one that caught that window.
 fn wait_until(
     cx: &mut TestAppContext,
     what: &str,
@@ -2563,6 +2569,14 @@ fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut Test
 /// told the row is there. The submit at the end is what proves the release:
 /// a save waits on exactly that gate, so a space left undecided would hang
 /// instead of writing.
+///
+/// The interleaving is staged rather than hoped for. Waiting on the database
+/// row is not waiting on the store's insert continuation: `allow_parking`
+/// lets a `block_on` of the core see the commit while `instantiations` still
+/// holds the key, and a close that finds it defers instead of disposing —
+/// so the reopen would open decided. Holding the entity until *it* is told
+/// the row committed is what means the continuation has run; closing and
+/// reopening in one pass is what means the disposal's task has not.
 #[gpui::test]
 fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
     let (stores, _dir) = backed_stores(cx);
@@ -2570,18 +2584,24 @@ fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
 
     let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
     let space_id = entity.read_with(cx, |s, _| s.id().to_string());
+    wait_until(
+        cx,
+        "the insert's continuation has released the entity",
+        |cx| !entity.read_with(cx, |s, _| s.row_undecided_for_test()),
+    );
+    // The entity dies with its last window in production; here the test is
+    // the only holder, so it has to let go for the close to mean a disposal.
     drop(entity);
-    wait_until(cx, "the space's row commits", |_| {
-        space_row_exists(&core, &space_id)
-    });
 
-    // The close, and — before the disposal's task gets a turn — a reopen.
-    stores
-        .spaces
-        .update(cx, |s, cx| s.window_closed(space_id.clone(), false, cx));
-    let reopened = stores
-        .spaces
-        .update(cx, |s, cx| s.open(space_id.clone(), cx));
+    let reopened = stores.spaces.update(cx, |s, cx| {
+        s.window_closed(space_id.clone(), false, cx);
+        assert!(
+            s.disposal_in_flight_for_test(&space_id),
+            "the insert has settled, so the close issues a disposal rather \
+             than deferring behind it"
+        );
+        s.open(space_id.clone(), cx)
+    });
     assert!(
         reopened.read_with(cx, |s, _| s.row_undecided_for_test()),
         "the window opens undecided — a disposal is in flight for this id, so \
