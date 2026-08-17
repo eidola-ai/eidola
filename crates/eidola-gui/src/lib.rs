@@ -37,8 +37,8 @@ pub mod wallet;
 pub mod window_input;
 
 use gpui::{
-    App, AppContext, Bounds, KeyBinding, Menu, MenuItem, OsAction, TitlebarOptions, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, point, px, size,
+    App, AppContext, Bounds, KeyBinding, Menu, MenuItem, OsAction, TitlebarOptions, Unbind,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px, size,
 };
 use gpui_component::Root;
 use gpui_component_assets::Assets;
@@ -495,8 +495,21 @@ pub fn install_keybindings(cx: &mut App) {
         KeyBinding::new("secondary-shift-l", OpenRecord, None),
         KeyBinding::new("secondary-w", CloseWindow, None),
         KeyBinding::new("secondary-q", Quit, None),
-        // ⌥⌘I shows/hides the space window's inspector (Xcode/Finder); gpui's
-        // element inspector — a development overlay — took ⌥⇧⌘I.
+        // gpui-component installs its development inspector on ⌘⌥I (macOS)
+        // and Ctrl+Shift+I (Linux). Remove both defaults first: otherwise the
+        // upstream action still claims a chord that the space inspector needs.
+        KeyBinding::new(
+            "cmd-alt-i",
+            Unbind("inspector::ToggleInspector".into()),
+            None,
+        ),
+        KeyBinding::new(
+            "ctrl-shift-i",
+            Unbind("inspector::ToggleInspector".into()),
+            None,
+        ),
+        // ⌥⌘I shows/hides the space window's inspector (Xcode/Finder); the
+        // development overlay uses the shifted variant instead.
         KeyBinding::new("secondary-alt-i", ToggleInspector, None),
         KeyBinding::new("secondary-alt-shift-i", ToggleElementInspector, None),
         // View → type size. ⌘0 / Ctrl+0 resets; ⌘=/⌘+ zooms in (both the bare

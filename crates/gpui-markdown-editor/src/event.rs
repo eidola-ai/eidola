@@ -10,6 +10,7 @@
 //!   pressed, the text changed) and the host owns the *meaning* (submit vs
 //!   post, commit-edit vs new-post).
 
+use crate::formatting::InlineFormat;
 use crate::state::Selection;
 
 /// Outward events published by `MarkdownEditorState` via `EventEmitter`.
@@ -94,6 +95,11 @@ pub enum EditorEvent {
     InsertLineBreak,
     DeleteBackward,
     DeleteForward,
+    /// Toggle semantic inline formatting over the selected content, or the
+    /// word under a collapsed caret. The parser-driven transform splits at
+    /// block-layer boundaries and refuses candidates that would change the
+    /// document's block structure.
+    ToggleInlineFormat(InlineFormat),
     SetSelection(Selection),
 
     /// Increase the nesting level of the list item containing the
