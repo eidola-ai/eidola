@@ -1948,6 +1948,14 @@ pub async fn has_reference_from(
 /// the honest reading: the visible answer is gone until a regeneration lands
 /// or the grace alarm ends the wait against the anchor.
 ///
+/// **And the owner is the item's original author, not the tip's** — the same
+/// join [`has_reference_from`] uses, for the same reason. A successful
+/// regeneration can mint a new agent (`TurnSelector::Model` when no seated
+/// member matches the picked model) and the reply edge travels with the item,
+/// so asking the tip's `participant_id` would miss the owner's own re-worded
+/// answer and wait out the grace alarm, attaching the report to the anchor as
+/// a sibling of a word the parent already shows.
+///
 /// **This resolves an answer, not *the* answer, and the gap is recorded rather
 /// than closed.** If the same owner answers the same post twice without one
 /// superseding the other — two concurrent explicit asks on one target, which is
@@ -1979,7 +1987,9 @@ pub async fn last_reply_by_participant(
          JOIN action_antecedent aa \
            ON aa.action_id = a.id AND aa.relation = 'reply' \
          JOIN item_current ic ON ic.current_action_id = a.id \
-         WHERE a.space_id = ?1 AND a.participant_id = ?2 \
+         JOIN action origin ON origin.item_id = a.item_id \
+           AND origin.supersedes_action_id IS NULL \
+         WHERE a.space_id = ?1 AND origin.participant_id = ?2 \
            AND aa.antecedent_action_id = ?3 \
            AND a.status IN ('complete', 'cancelled') \
            AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
@@ -2004,7 +2014,8 @@ pub async fn last_reply_by_participant(
 /// `space_id`, or `None` when they have written none. The fallback a report
 /// takes when its spawn named no anchor — see [`last_reply_by_participant`]
 /// for the anchored path, including why only a generation the parent shows
-/// may answer (the same `item_current` + visibility predicate).
+/// may answer (the same `item_current` + visibility predicate) and why the
+/// owner is the item's original author, not the tip's.
 pub async fn last_post_by_participant(
     conn: &Connection,
     space_id: &str,
@@ -2013,7 +2024,9 @@ pub async fn last_post_by_participant(
     let sql = format!(
         "SELECT a.id FROM action a \
          JOIN item_current ic ON ic.current_action_id = a.id \
-         WHERE a.space_id = ?1 AND a.participant_id = ?2 \
+         JOIN action origin ON origin.item_id = a.item_id \
+           AND origin.supersedes_action_id IS NULL \
+         WHERE a.space_id = ?1 AND origin.participant_id = ?2 \
            AND a.status IN ('complete', 'cancelled') \
            AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
          ORDER BY a.rowid DESC LIMIT 1"
@@ -5830,6 +5843,34 @@ async fn is_visible_post_in_space(
     Ok(rows.next().await.map_err(AppError::db)?.is_some())
 }
 
+/// The post `action_id`'s item currently shows, or `None` if that item has no
+/// visible tip — superseded wording, a hidden `error` generation, a missing
+/// row. The walk asks this of every frontier id before planning it, so an
+/// edit or regeneration that landed while a sibling branch was walking is
+/// one wording, not two.
+pub async fn visible_tip_of_action(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = format!(
+        "SELECT tip.id FROM action a \
+         JOIN item_current ic ON ic.item_id = a.item_id AND ic.space_id = a.space_id \
+         JOIN action tip ON tip.id = ic.current_action_id \
+         WHERE a.id = ?1 \
+           AND tip.status IN ('complete', 'cancelled') \
+           AND tip.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         LIMIT 1"
+    );
+    let mut rows = conn
+        .query(&sql, (Value::Text(action_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
 /// One incoming `reference` edge: a post (elsewhere or in the same space)
 /// referencing the queried action. Restricted to referrers that are their
 /// item's **current generation** with terminal status — the set whose quotes
@@ -8882,6 +8923,138 @@ mod tests {
                 .unwrap(),
             "somebody else's quote does not settle the room"
         );
+    }
+
+    /// **An answer regenerated under a new author is still the owner's
+    /// answer.** `last_reply_by_participant` is where a report attaches, and
+    /// asking the tip's `participant_id` would miss a successful regeneration
+    /// that minted a new agent — the wait would run out to grace and the
+    /// report would land on the anchor as a sibling of a word the parent
+    /// already shows. The origin generation is who opened the item; the tip
+    /// is what the parent shows.
+    #[tokio::test]
+    async fn an_answer_is_recognized_by_its_original_author() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let owner = ensure_participant(&conn, "agent", "Navigator", None, 1_000)
+            .await
+            .unwrap();
+        let other = ensure_participant(&conn, "agent", "Scribe", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "parent", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        let asked = add_user_action(&conn, "parent", &owner, "what about Friday?", 2_000).await;
+        let item = uuid::Uuid::now_v7().to_string();
+        let origin = add_reply(
+            &conn,
+            "parent",
+            &owner,
+            &item,
+            None,
+            &asked,
+            "Friday looks clear",
+            3_000,
+        )
+        .await;
+        assert_eq!(
+            last_reply_by_participant(&conn, "parent", &owner, &asked)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(origin.as_str()),
+            "the owner's own answer"
+        );
+
+        let tip = add_reply(
+            &conn,
+            "parent",
+            &other,
+            &item,
+            Some(&origin),
+            &asked,
+            "Friday looks clear, re-worded",
+            4_000,
+        )
+        .await;
+        assert_eq!(
+            last_reply_by_participant(&conn, "parent", &owner, &asked)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(tip.as_str()),
+            "a regenerated answer is still the owner's reply"
+        );
+        assert_eq!(
+            last_post_by_participant(&conn, "parent", &owner)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(tip.as_str()),
+            "and still their last word"
+        );
+        assert_eq!(
+            visible_tip_of_action(&conn, &origin)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(tip.as_str()),
+            "a queued origin remaps to the wording the parent shows"
+        );
+        assert_eq!(
+            visible_tip_of_action(&conn, &tip).await.unwrap().as_deref(),
+            Some(tip.as_str()),
+            "and a current tip remaps to itself"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_reply(
+        conn: &Connection,
+        space_id: &str,
+        participant_id: &str,
+        item_id: &str,
+        supersedes: Option<&str>,
+        antecedent: &str,
+        text: &str,
+        created_at: i64,
+    ) -> String {
+        let action_id = uuid::Uuid::now_v7().to_string();
+        insert_action(
+            conn,
+            &ActionEntry {
+                id: action_id.clone(),
+                space_id: space_id.to_string(),
+                participant_id: participant_id.to_string(),
+                item_id: item_id.to_string(),
+                supersedes_action_id: supersedes.map(str::to_string),
+                action_type: "inference".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at,
+            },
+        )
+        .await
+        .unwrap();
+        insert_text_content_block(
+            conn,
+            &uuid::Uuid::now_v7().to_string(),
+            &action_id,
+            0,
+            "text",
+            text,
+        )
+        .await
+        .unwrap();
+        insert_action_antecedent(conn, &action_id, antecedent, 0, "reply")
+            .await
+            .unwrap();
+        action_id
     }
 
     #[allow(clippy::too_many_arguments)]
