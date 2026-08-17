@@ -16467,6 +16467,11 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
         "the press owns the operation while it runs"
     );
 
+    // The pane observes the store; park so that notify dirties it before we
+    // ask the tree whether Retry is still there. Drawing without that flush
+    // can paint the previous frame, where Retry was still a live control.
+    cx.run_until_parked();
+
     // ...and the control is gone, so there is no second press to make.
     probe::clear_window(window.window_id().as_u64());
     draw_window(cx, window);
