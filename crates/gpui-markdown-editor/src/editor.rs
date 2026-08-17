@@ -27,6 +27,7 @@ use gpui_component::Theme;
 
 use crate::element::{BlockElement, LaidOutBlock};
 use crate::event::{EditorEvent, MarkdownEditorEvent};
+use crate::formatting::InlineFormat;
 use crate::parser::parse;
 use crate::render::{render, render_readonly};
 use crate::render_spec::RenderSpec;
@@ -130,6 +131,10 @@ actions!(
         /// line (the byte before its trailing `\n`). Default macOS
         /// keybinding: `cmd-delete`.
         DeleteToLineEnd,
+        /// Toggle bold over the semantic selection or the word under the caret.
+        ToggleBold,
+        /// Toggle italic over the semantic selection or the word under the caret.
+        ToggleItalic,
         SelectAll,
         Copy,
         Cut,
@@ -1421,6 +1426,12 @@ impl MarkdownEditorState {
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::DeleteForward, cx);
     }
+    fn toggle_bold(&mut self, _: &ToggleBold, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorEvent::ToggleInlineFormat(InlineFormat::Strong), cx);
+    }
+    fn toggle_italic(&mut self, _: &ToggleItalic, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorEvent::ToggleInlineFormat(InlineFormat::Emphasis), cx);
+    }
     fn enter(&mut self, action: &Enter, _: &mut Window, cx: &mut Context<Self>) {
         if action.secondary {
             // ⌘↩ / ⌘⇧↩ — a submit-intent chord. The editor reports the chord
@@ -2356,6 +2367,8 @@ impl RenderOnce for MarkdownEditor {
                 .on_action(window.listener_for(&state, MarkdownEditorState::delete_word_forward))
                 .on_action(window.listener_for(&state, MarkdownEditorState::delete_to_line_start))
                 .on_action(window.listener_for(&state, MarkdownEditorState::delete_to_line_end))
+                .on_action(window.listener_for(&state, MarkdownEditorState::toggle_bold))
+                .on_action(window.listener_for(&state, MarkdownEditorState::toggle_italic))
                 .on_action(window.listener_for(&state, MarkdownEditorState::cut))
                 .on_action(window.listener_for(&state, MarkdownEditorState::paste))
                 .on_action(window.listener_for(&state, MarkdownEditorState::paste_plain))
@@ -2577,6 +2590,10 @@ pub fn init(cx: &mut App) {
         gpui::KeyBinding::new("secondary-x", Cut, ctx),
         gpui::KeyBinding::new("secondary-v", Paste, ctx),
         gpui::KeyBinding::new("secondary-shift-v", PastePlain, ctx),
+        // Semantic inline formatting (⌘B/⌘I on macOS, Ctrl+B/Ctrl+I
+        // elsewhere). The update pipeline owns all delimiter/context logic.
+        gpui::KeyBinding::new("secondary-b", ToggleBold, ctx),
+        gpui::KeyBinding::new("secondary-i", ToggleItalic, ctx),
         // Undo / redo — the `secondary-` alias, scoped to the editor context
         // so they coexist with `gpui_component::Input`'s own bindings.
         gpui::KeyBinding::new("secondary-z", Undo, ctx),

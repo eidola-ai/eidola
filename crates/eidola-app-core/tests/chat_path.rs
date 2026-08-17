@@ -28,7 +28,7 @@ use chat_harness::{
     Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, TRAILING_BLOCK_NOTE, flat_messages, map_entry,
     roster, system_message, system_message_with, thread_map, trailing, with_account,
 };
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::error::AppError;
 use eidola_app_core::{AppCore, ChatStreamEvent};
 
@@ -54,11 +54,11 @@ where
 }
 
 /// Drain all currently-available bus messages (non-blocking).
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     loop {
         match rx.try_recv() {
-            Ok(c) => out.push(c),
+            Ok(c) => out.push(c.change),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {

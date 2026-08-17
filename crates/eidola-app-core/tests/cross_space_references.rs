@@ -26,7 +26,7 @@
 mod chat_harness;
 
 use chat_harness::{ChatBehavior, MockConfig, MockServer, ToolScript, flat_messages, tool_script};
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::error::AppError;
 use eidola_app_core::tools::FOLLOW_DENIED;
 use eidola_app_core::{AppCore, PostResult, ReferenceSpec, post_handle};
@@ -134,10 +134,10 @@ fn quote_of(core: &AppCore, space: &str, action_id: &str, passage: &str) -> Refe
     }
 }
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     while let Ok(c) = rx.try_recv() {
-        out.push(c);
+        out.push(c.change);
     }
     out
 }

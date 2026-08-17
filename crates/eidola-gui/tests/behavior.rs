@@ -11,7 +11,7 @@
 //! 4. Assert against the view/core's public state with `read_with`.
 
 use eidola_app_core::AppCore;
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeOrigin};
 use eidola_app_core::error::AppError;
 use eidola_app_core::updates::{
     Claim, ClaimDelta, ClaimsComparison, UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease,
@@ -10086,6 +10086,7 @@ fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
             range_start: Some(0),
             range_end: Some(4),
             annotation: None,
+            delegation_end: None,
             snippet: Some("some passage".into()),
             antecedent_author_label: "Ada".into(),
             antecedent_author_kind: "agent".into(),
@@ -10097,6 +10098,7 @@ fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
             range_start: Some(0),
             range_end: Some(4),
             annotation: None,
+            delegation_end: None,
             // The stored range no longer maps — the rail says so rather than
             // guessing at a remap.
             snippet: None,
@@ -11645,9 +11647,9 @@ fn space_change_invalidates_the_trace_index(cx: &mut TestAppContext) {
     space.read_with(cx, |s, _| assert_eq!(s.traces_for("a1").len(), 1));
 
     cx.update(|cx| {
-        stores
-            .spaces
-            .update(cx, |st, cx| st.notify_space_changed("s", cx));
+        stores.spaces.update(cx, |st, cx| {
+            st.notify_space_changed("s", ChangeOrigin::Caller, u64::MAX, cx)
+        });
     });
     space.read_with(cx, |s, _| {
         assert!(
@@ -16464,6 +16466,11 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
             .read_with(cx, |s, _| s.download_pending(&url)),
         "the press owns the operation while it runs"
     );
+
+    // The pane observes the store; park so that notify dirties it before we
+    // ask the tree whether Retry is still there. Drawing without that flush
+    // can paint the previous frame, where Retry was still a live control.
+    cx.run_until_parked();
 
     // ...and the control is gone, so there is no second press to make.
     probe::clear_window(window.window_id().as_u64());
