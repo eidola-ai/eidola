@@ -51,8 +51,8 @@ Build: `just build gui` (or `cargo build -p eidola-gui && ./scripts/package-gui-
 
 ## The app icon
 
-24. The Dock icon, the ⌘Tab switcher, and Finder's Get Info all show the hexagon-grid mark — a warm cluster on a dark tile, never the generic blank-document icon (which is what a missing or misnamed `Contents/Resources/AppIcon.icns` gives you). `mdls -name kMDItemDisplayName crates/eidola-gui/build/Eidola.app` is not the oracle here; look at it.
-25. Shrink a Finder window to list view and check the 16 pt slot: the cells should still be countable, not a smudge. That slot is drawn from the reduced-detail master (`brand/AGENTS.md`), so if it looks like the full-detail mark scaled down, the `.icns` was built from the wrong source.
+24. The Dock icon, the ⌘Tab switcher, and Finder's Get Info all show the hexagon-grid mark — ink on paper in Circadian Day, a warm cluster on the night tile in Night, never the generic blank-document icon (which is what a missing or misnamed `Contents/Resources/AppIcon.icns` / `Assets.car` gives you). On Tahoe, Appearance → Icon style Tinted should recolor the ground and leave the mark white. `mdls -name kMDItemDisplayName crates/eidola-gui/build/Eidola.app` is not the oracle here; look at it.
+25. Shrink a Finder window to list view and check the 16 pt slot: the cells should still be countable, not a smudge. That slot is drawn from the reduced-detail master into the `.icns` (`brand/AGENTS.md`), so if it looks like the full-detail mark scaled down, the `.icns` was built from the wrong source. Tahoe may serve the catalog instead; the `.icns` is the fallback and the pre-Tahoe path.
 
 ## The startup-failure dialog
 

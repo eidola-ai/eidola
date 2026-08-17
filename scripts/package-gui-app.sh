@@ -53,14 +53,22 @@ cp "$EXECUTABLE" "$APP_DIR/Contents/MacOS/Eidola"
 cp "$REPO_ROOT/crates/eidola-gui/Support/Info.plist" "$APP_DIR/Contents/"
 
 # App icon. Committed, generated from the vector master by `just update-brand`
-# (see brand/AGENTS.md); the name matches CFBundleIconFile in Info.plist.
+# (see brand/AGENTS.md). The .icns matches CFBundleIconFile (pre-Tahoe);
+# Assets.car matches CFBundleIconName (Tahoe light / dark / tinted).
 ICON="$REPO_ROOT/crates/eidola-gui/Support/AppIcon.icns"
+CAR="$REPO_ROOT/crates/eidola-gui/Support/Assets.car"
 if [[ ! -f "$ICON" ]]; then
   echo "error: app icon not found at $ICON" >&2
   echo "  Run 'just update-brand' to regenerate it." >&2
   exit 1
 fi
+if [[ ! -f "$CAR" ]]; then
+  echo "error: asset catalog not found at $CAR" >&2
+  echo "  Run 'just update-brand' to regenerate it." >&2
+  exit 1
+fi
 cp "$ICON" "$APP_DIR/Contents/Resources/"
+cp "$CAR" "$APP_DIR/Contents/Resources/"
 
 # Bundle the on-device inference engine sidecar, if one is available. This
 # is best-effort for dev: the `local` backend needs a `llama-server` next to
