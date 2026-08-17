@@ -908,6 +908,135 @@ fn a_regeneration_of_a_finding_is_quoted_at_its_visible_tip() {
     });
 }
 
+/// **A finding regenerated while the report is in flight is quoted at its
+/// visible tip.** The remap before the turn starts is not enough: a joined
+/// reader can edit or regenerate after the attachments were built and
+/// while the model request is on the wire. Persist remaps again, inside
+/// the transaction that writes the edges, so settlement reads the wording
+/// a reader still sees.
+#[test]
+fn a_regeneration_during_the_report_is_quoted_at_its_visible_tip() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        ask(&core, &parent, &owner, &asked);
+        let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], Some(&asked));
+        let room = out.space.id.clone();
+        core.runtime()
+            .block_on(core.add_global_participant(
+                room.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("the reader joins so they can regenerate");
+
+        let mut window = core.test_open_report_persist_window();
+        let (old, tip) = std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &room));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches the report's persist window");
+            let old = tree(&core, &room)
+                .into_iter()
+                .find(|n| n.action_type == "inference")
+                .expect("the helper has answered")
+                .action_id;
+            core.runtime()
+                .block_on(core.regenerate(old.clone(), MODEL.to_string()))
+                .expect("regenerate the finding while the report is in flight");
+            let tip = tree(&core, &room)
+                .into_iter()
+                .find(|n| n.action_type == "inference")
+                .expect("the regenerated finding is visible")
+                .action_id;
+            assert_ne!(tip, old, "it really is a new generation");
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+            (old, tip)
+        });
+        drop(window);
+
+        let delivered = report(&core, &parent).expect("the delegation is reported");
+        let quoted: Vec<&str> = delivered
+            .references
+            .iter()
+            .map(|r| r.antecedent_action_id.as_str())
+            .collect();
+        assert!(
+            quoted.contains(&tip.as_str()),
+            "the visible finding is what the report quotes: {quoted:?}"
+        );
+        assert!(
+            !quoted.contains(&old.as_str()),
+            "the superseded wording is not a finding: {quoted:?}"
+        );
+
+        drive(&core, &room).expect("a second walk");
+        assert_eq!(
+            reports(&core, &parent).len(),
+            1,
+            "quoting the visible last word settled the room"
+        );
+    });
+}
+
+/// **Closing the delegated room while its report is in flight writes
+/// nothing into the parent.** Archiving the child does not archive the
+/// parent, so the parent's turn gate cannot stop it; persist re-reads
+/// liveness and suppresses the generation.
+#[test]
+fn closing_the_delegated_room_during_its_report_writes_nothing() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        ask(&core, &parent, &owner, &asked);
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        let room = out.space.id.clone();
+
+        let mut window = core.test_open_report_persist_window();
+        std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &room));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches the report's persist window");
+            core.runtime()
+                .block_on(core.archive_space(room.clone()))
+                .expect("archive the delegated room, not its parent");
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+        });
+        drop(window);
+
+        assert!(
+            core.runtime()
+                .block_on(core.test_space_archived(room.clone()))
+                .expect("archived?"),
+            "the delegated room is closed"
+        );
+        assert!(
+            report(&core, &parent).is_none(),
+            "nothing was written into the parent about a room somebody closed"
+        );
+        drive(&core, &room).expect("a closed room is a no-op");
+        assert!(
+            report(&core, &parent).is_none(),
+            "a later walk does not deliver the suppressed report either"
+        );
+    });
+}
+
 /// **The line between "already here" and "arrived while I worked" is drawn
 /// before the first read, not after it.** A walk's opening reads are several
 /// awaits wide; a post committing inside them is not the tail the walk started

@@ -257,7 +257,13 @@ CREATE TABLE space (
     -- it can carry that is not is a caller-supplied `title`, which is a user
     -- saying what this conversation is for, so a titled creation is born
     -- stamped.
-    touched_at        INTEGER
+    touched_at        INTEGER,
+    -- The action named above must live in the parent named beside it.
+    -- A single-column FK only proves the row exists; this tuple is the
+    -- navigational fact the column records. MATCH SIMPLE: an ordinary
+    -- space (both NULL) and an anchorless spawn (action NULL) skip it.
+    FOREIGN KEY (parent_action_id, parent_space_id)
+        REFERENCES action (id, space_id)
 );
 
 -- One notebook per agent.
@@ -589,6 +595,9 @@ CREATE UNIQUE INDEX idx_one_root_per_item
 
 -- Parent key for the compound supersedes FK.
 CREATE UNIQUE INDEX idx_action_id_item ON action (id, item_id);
+
+-- Parent key for space (parent_action_id, parent_space_id) → action.
+CREATE UNIQUE INDEX idx_action_id_space ON action (id, space_id);
 
 -- ============================================================
 -- Action antecedent: the causal graph (a DAG). Every edge points
