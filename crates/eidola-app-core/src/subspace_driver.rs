@@ -1088,10 +1088,18 @@ impl Inner {
         // the room down before starting the next, which is the order a reader
         // watching the transcript would expect.
         let mut frontier: Vec<String> = vec![tail.clone()];
+        // **Planning is work**, even when it drives nothing. A router that
+        // selects nobody bills an inference and writes no row, so `taken`
+        // would stay still while a burst of watched-room posts paid for an
+        // unbounded number of planning calls. Each `plan_and_refine` in this
+        // walk counts against the same ceiling persisted turns do; the count
+        // is the walk's, because a restart sees only the tail and a reported
+        // budget-stop settles the room.
+        let mut planned: i64 = 0;
         #[cfg(feature = "test-support")]
         let mut paused_once = false;
         loop {
-            let Some(post) = frontier.pop() else {
+            let Some(queued) = frontier.pop() else {
                 // **Nothing planned is not the same as nothing outstanding.** A
                 // post can land in the room while the walk is walking — a person
                 // asking a question in a room they are watching — and it is on
@@ -1121,18 +1129,31 @@ impl Inner {
                 }
                 continue;
             };
-            served.insert(post.clone());
             let conn = self.db_conn().await?;
             let live = db::is_live_subspace(&conn, space_id).await?;
             let taken = db::turns_taken_in_space(&conn, space_id).await?;
+            let post = db::visible_tip_of_action(&conn, &queued).await?;
             drop(conn);
             if !live {
                 return Ok(None);
             }
+            // **The queued id is a generation, not an item.** An edit or
+            // regeneration that lands while a sibling branch is walking leaves
+            // the old id on the frontier; planning it would bill replies
+            // against wording the transcript has hidden, and the refill would
+            // then also return the replacement, so both wordings get a turn.
+            // The item's visible tip is the one post; no visible tip is
+            // nothing to plan (a failed regeneration's hidden `error`).
+            let Some(post) = post else {
+                continue;
+            };
+            if !served.insert(post.clone()) {
+                continue;
+            }
             // The budget is checked before the plan, not after it: planning a
             // room whose budget is spent may cost a router inference, and the
             // turns it returned could not be driven anyway.
-            if taken >= MAX_DELEGATION_TURNS {
+            if taken >= MAX_DELEGATION_TURNS || planned >= MAX_DELEGATION_TURNS {
                 return self
                     .stop_walk(
                         space_id,
@@ -1152,12 +1173,14 @@ impl Inner {
                 .await?
             {
                 NotificationPlan::Paused { depth, limit } => {
+                    planned += 1;
                     paused.get_or_insert((depth, limit));
                     leaves.push(post.clone());
                     continue;
                 }
                 NotificationPlan::Turns(turns) => turns,
             };
+            planned += 1;
             // **Nothing follows this one, so it is a finding** — decided
             // after the turns run, not from the plan's shape. A post whose
             // plan comes back empty is where a branch of the room stopped
@@ -1264,11 +1287,24 @@ impl Inner {
     ) -> Result<Option<(DelegationEnd, Vec<String>)>, AppError> {
         let conn = self.db_conn().await?;
         let arrived = db::posts_in_space_since(&conn, space_id, since_row).await?;
+        // Leftover frontier ids are generations, same as a pop: quote the
+        // item's visible tip, or skip a hidden one, rather than naming wording
+        // the transcript has replaced.
+        let mut unwalked: Vec<String> = Vec::new();
+        for id in frontier
+            .iter()
+            .chain(arrived.iter().filter(|id| !served.contains(*id)))
+        {
+            let Some(tip) = db::visible_tip_of_action(&conn, id).await? else {
+                continue;
+            };
+            if !served.contains(&tip) && !unwalked.contains(&tip) {
+                unwalked.push(tip);
+            }
+        }
         drop(conn);
         // The frontier first — those were next in line — then what arrived,
         // oldest first, which is the newest end of the room.
-        let mut unwalked: Vec<String> = frontier.to_vec();
-        unwalked.extend(arrived.into_iter().filter(|id| !served.contains(id)));
         Ok(Some((end, finish(leaves, &unwalked, tail))))
     }
 

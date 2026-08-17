@@ -22,7 +22,9 @@
 
 mod chat_harness;
 
-use chat_harness::{ChatBehavior, MockConfig, MockServer, flat_messages};
+use chat_harness::{
+    ChatBehavior, MockConfig, MockServer, ROUTER_MODEL, ROUTER_SLUG, RouterBehavior, flat_messages,
+};
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AppCore, DelegationEnd, DelegationFailure, ExpectedScope, MAX_ATTEMPTS_PER_TAIL,
@@ -512,6 +514,94 @@ fn a_post_arriving_mid_walk_is_not_walked_past() {
             "the post that arrived mid-walk was answered: {:?}",
             room.iter()
                 .map(|n| (n.action_id.clone(), n.parent_action_id.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report(&core, &parent).is_some(),
+            "and the delegation still reported"
+        );
+    });
+}
+
+/// **A regeneration mid-walk is one wording, not two.** An edit or
+/// regeneration that lands while a sibling branch is walking leaves the old
+/// id on the frontier; planning it would bill replies against wording the
+/// transcript has hidden, and the refill would then also return the
+/// replacement. The walk remaps each queued id to the item's visible tip
+/// before planning, so the new generation is the one post.
+#[test]
+fn a_regeneration_mid_walk_is_planned_once_at_its_visible_tip() {
+    run(|| {
+        // The driver streams and `regenerate` does not.
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let a = shared_agent(&core, &parent, "Surveyor");
+        let b = shared_agent(&core, &parent, "Pilot");
+        let out = spawn(&core, &parent, &owner, vec![a, b]);
+        let room = out.space.id.clone();
+        core.runtime()
+            .block_on(core.add_global_participant(
+                room.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("the reader joins so they can regenerate");
+
+        let mut window = core.test_open_cascade_window();
+        let (old, tip) = std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &room));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches its window");
+            let first = tree(&core, &room)
+                .into_iter()
+                .find(|n| n.action_type == "inference")
+                .expect("the first helper has answered");
+            let old = first.action_id.clone();
+            core.runtime()
+                .block_on(core.regenerate(old.clone(), MODEL.to_string()))
+                .expect("regenerate the first helper's answer");
+            let tip = tree(&core, &room)
+                .into_iter()
+                .find(|n| n.action_type == "inference")
+                .expect("the regenerated answer is visible")
+                .action_id;
+            assert_ne!(tip, old, "it really is a new generation");
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+            (old, tip)
+        });
+
+        let room_tree = tree(&core, &room);
+        let replies_to_tip = room_tree
+            .iter()
+            .filter(|n| n.parent_action_id.as_deref() == Some(tip.as_str()))
+            .count();
+        // The human's regenerate re-authors the item under a seated member who
+        // already has that model — here the owner — so both helpers reply to
+        // the new wording. Planning the superseded generation as well would
+        // add a third child from the helper who originally wrote it.
+        assert_eq!(
+            replies_to_tip,
+            2,
+            "the visible generation is planned once — not superseded {old} \
+             and then replacement {tip}: {:?}",
+            room_tree
+                .iter()
+                .map(|n| {
+                    (
+                        n.participant.label.clone(),
+                        n.action_id.clone(),
+                        n.parent_action_id.clone(),
+                        n.generation,
+                    )
+                })
                 .collect::<Vec<_>>()
         );
         assert!(
@@ -1897,11 +1987,67 @@ fn a_report_does_not_attach_beneath_a_hidden_answer() {
     });
 }
 
-/// **A hidden generation is not an anchor.** The spawn captures the post the
-/// report will reply to, and that post has to be one the parent currently
-/// shows. A superseded wording is still a row there; a failed regeneration's
-/// `error` tip is current but not terminal. Either would let the room run
-/// and then attach its report to something `build_post_tree` cannot render.
+/// **A regenerated answer is still the owner's reply.** A successful
+/// regeneration can mint a new agent when no seated member matches the
+/// picked model, and asking the tip's `participant_id` would miss it: the
+/// wait would run out to grace and the report would land on the anchor as a
+/// sibling of a word the parent already shows. The origin generation is who
+/// opened the item; the tip is what the parent shows.
+#[test]
+fn a_regenerated_answer_is_still_the_owners_reply() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        core.runtime()
+            .block_on(core.add_backend(eidola_app_core::NewBackend {
+                id: "ext2".into(),
+                kind: eidola_app_core::BackendKind::OpenAi,
+                display_name: String::new(),
+                base_url: Some(mock.base_url.clone()),
+                api_key: None,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+            }))
+            .expect("add the second backend");
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        drive(&core, &out.space.id).expect("the walk runs");
+        assert!(report(&core, &parent).is_none(), "it waits for the answer");
+
+        let origin = ask(&core, &parent, &owner, &asked);
+        core.runtime()
+            .block_on(core.regenerate(origin.clone(), EXT2_MODEL.to_string()))
+            .expect("regenerate under a model nobody seated has");
+        let tip = tree(&core, &parent)
+            .into_iter()
+            .find(|n| n.parent_action_id.as_deref() == Some(asked.as_str()))
+            .expect("the regenerated answer is visible");
+        assert_ne!(tip.action_id, origin, "it really is a new generation");
+        assert_ne!(
+            tip.participant.label, "Navigator",
+            "and a new author — the mint, not the owner re-wording themselves"
+        );
+
+        drive(&core, &out.space.id).expect("the room reports");
+        assert_eq!(
+            report(&core, &parent)
+                .expect("the delegation is reported")
+                .parent_action_id
+                .as_deref(),
+            Some(tip.action_id.as_str()),
+            "beneath the regenerated answer, not the anchor"
+        );
+    });
+}
 #[test]
 fn a_spawn_cannot_anchor_to_a_hidden_tip() {
     run(|| {
@@ -2598,6 +2744,80 @@ fn a_delegation_stops_at_its_turn_budget_and_says_so() {
                 limit: MAX_DELEGATION_TURNS
             }),
             "budget exhaustion is information, not silence"
+        );
+    });
+}
+
+/// **Empty router hops still spend the budget.** A router that selects nobody
+/// bills an inference and writes no row, so `turns_taken_in_space` would stay
+/// still while a burst of watched-room posts paid for an unbounded number of
+/// planning calls. Each `plan_and_refine` in the walk counts against the same
+/// ceiling persisted turns do. The first hop runs without a router so the
+/// cascade window is reachable; the router is armed inside it.
+#[test]
+fn empty_router_hops_still_spend_the_delegation_budget() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            router: RouterBehavior::Reply(r#"{"notify": []}"#.into()),
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        core.runtime()
+            .block_on(core.set_space_cascade_limit(parent.clone(), 1_000))
+            .expect("cascade limit");
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let a = shared_agent(&core, &parent, "Surveyor");
+        let b = shared_agent(&core, &parent, "Pilot");
+        let out = spawn(&core, &parent, &owner, vec![a, b]);
+        let room = out.space.id.clone();
+        core.runtime()
+            .block_on(core.add_global_participant(
+                room.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("the reader joins the room they are watching");
+
+        let mut window = core.test_open_cascade_window();
+        std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &room));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches its window");
+            // Armed *inside* the window: a router on the brief that selects
+            // nobody would drive no turn, and this window would never open.
+            core.test_register_loaded_local_model("local", ROUTER_SLUG, mock.port());
+            core.runtime()
+                .block_on(core.set_space_router_model(room.clone(), Some(ROUTER_MODEL.into())))
+                .expect("set the room's router");
+            for i in 0..(MAX_DELEGATION_TURNS + 8) {
+                core.runtime()
+                    .block_on(core.post(format!("And what about day {i}?"), Some(room.clone())))
+                    .expect("a post into the room");
+            }
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+        });
+
+        let report = report(&core, &parent).expect("a spent budget is reported");
+        assert_eq!(
+            report.references[0].delegation_end,
+            Some(DelegationEnd::BudgetSpent {
+                limit: MAX_DELEGATION_TURNS
+            }),
+            "planning hops bind the budget, not only persisted turns"
+        );
+        let router_calls = mock
+            .chat_bodies()
+            .iter()
+            .filter(|b| b["model"] == ROUTER_MODEL)
+            .count();
+        assert!(
+            router_calls as i64 <= MAX_DELEGATION_TURNS,
+            "the router is not billed past the ceiling: {router_calls} calls"
         );
     });
 }
