@@ -5,6 +5,14 @@
 //! - Errors never emit.
 //! - Two independent subscribers both receive the same events.
 //!
+//! **Every emission also carries a `ChangeOrigin`** saying whether a caller is
+//! waiting on the write. It is ambient rather than per-emission (`changes::
+//! with_origin` scopes a future), so the rule is about *why the code is
+//! running* rather than about each write: work a consumer asked for is
+//! `Caller`, and work app-core drives on its own — the branch summarizer, the
+//! sub-space turn driver — is `Unattended`. The table's rows name it only where
+//! it is not `Caller`.
+//!
 //! Operations that require HTTP (account_allocate, chat) are tested at the
 //! `Inner` db-helper level via `AppCore`'s sync/async surface where possible;
 //! full-HTTP paths are covered by other test suites (updates_check.rs uses
@@ -38,8 +46,8 @@
 //! | `chat` — refund-from-body `process_refund` fails | User turn | `Space(id)`, `SpaceIndex`? | No — needs a malformed inline refund (low value: identical emission set to the tested arms) |
 //! | `chat_stream` (Ok arm) — `flush_attestations` fails | User turn | `Space(id)`, `SpaceIndex`? | No — `flush_attestations` is a no-op under the no-attestation seam |
 //! | `chat_stream` — mid-SSE read failure (`chunk` `Err`) | User turn | `Space(id)`, `SpaceIndex`? | `chat_path.rs` (`mid_sse_abort_*`) |
-//! | `chat` — non-2xx response, after `insert_request` | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record` | `chat_path.rs` (`non_2xx_emits_record_and_space_*`) |
-//! | `chat`/`chat_stream` — non-2xx that the round loop will retry with the turn's own tools withdrawn (task 21's tool-rejection degrade) | Request row only — deliberately **no** inference generation, so the retry can still claim the turn's item identity | `Space(id)`, `Record`; on a spending backend also `Wallet`, because the retry acquires its own hold (the rejected attempt's is settled first) | `chat_path.rs` (`a_backend_that_rejects_tools_degrades_to_a_toolless_retry`; `a_rejected_tools_field_on_a_spending_backend_settles_both_holds` for the spend arm) |
+//! | `chat` — non-2xx response, after `insert_request` | Space, user-message, request rows; a current `status='error'` inference generation | `Space(id)`, `SpaceIndex`?, `Record`; **plus `Space(room)` per other space the turn's attached references quote** (`Inner::announce_rooms_quoted_by` — a Revise's replicated edges make the error generation hide a delegation report, and nothing else can arm the room it unsettled) | `chat_path.rs` (`non_2xx_emits_record_and_space_*`); `subspace_driver.rs` (`a_failed_regeneration_arms_the_room_it_unsettled` for the quoted-rooms arm) |
+//! | `chat`/`chat_stream` — non-2xx that the round loop will retry with the turn's own tools withdrawn (the tool-rejection degrade) | Request row only — deliberately **no** inference generation, so the retry can still claim the turn's item identity | `Space(id)`, `Record`; on a spending backend also `Wallet`, because the retry acquires its own hold (the rejected attempt's is settled first) | `chat_path.rs` (`a_backend_that_rejects_tools_degrades_to_a_toolless_retry`; `a_rejected_tools_field_on_a_spending_backend_settles_both_holds` for the spend arm) |
 //! | `chat_stream` — non-2xx response, after `insert_request` inside that branch | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record`; `Wallet` if refund recovered | `chat_path.rs` (`streaming_non_2xx_*`, `non_2xx_with_refund_recovery_*`, `non_2xx_with_failed_refund_recovery_*`) |
 //!
 //! | `run_turn`/`run_turn_stream` — tool round persisted, then the **round cap** binds | The posted user turn; every executed round's `tool_call` + `tool_result` actions and request rows; the capped round's `tool_call` + request row (its tools are deliberately *not* executed) | `Space(id)`, `Record`; `Wallet` at each round's spend start; **error is `AppError::ToolLoop`** | `chat_path.rs` (`round_cap_ends_the_turn_honestly_with_the_rounds_persisted`) |
@@ -51,11 +59,19 @@
 //!
 //! | `remember` — one **memory block** committed mid-turn (task 35; the turn-scoped tool, see `memory`) | A `memory` action authored by the responding participant in the block's **residence** space, carrying the new contents and (optionally) `reference` edges to the posts it learned from; a revision **supersedes** that block's tip within one item, and a fresh block also inserts its `memory_block` identity row | `Space(residence)` per committed block. **No `SpaceIndex`** (nothing was posted) and **no `Record`** (the tool writes no request row; the round that carried the call writes its own). A refused call — name, size or the per-owner block ceiling — is decided **before any write** and emits nothing at all | `agent_memory.rs` (`a_committed_memory_block_emits_space`; the two budget tests pin the zero-trace refusals) |
 //!
-//! | `spawn_subspace` — an **agent-spawned sub-space minted** (the delegation door; see `subspaces`). One transaction writes the whole room: the `space` row (parent link, the parent's cascade limit and router, born stamped), the owner's `role = 'owner'` membership, each sub-agent's membership with `override_notify_policy = 'all'`, the **brief** as the first post (an agent-authored `brief` action, which is why the space is never pristine), and the capability snapshot | `SpaceIndex` (the Library lists sub-spaces like any other conversation), `Space(sub_id)` (it has a transcript to read) and `Participants` (a roster was written) — one per thing the instantiation wrote, the `create_space` rule. **Nothing about the parent**, which gained nothing. A refusal — a guard, an attenuation check, an ineligible or model-less participant — rolls back to nothing and emits nothing at all. Every door that acts as the human in such a room — `post`, `edit_post`, `regenerate`, `respond_stream` — is refused before any write *and before any spend* (`AppError::NotJoined`), so each commits nothing and emits nothing | `subspaces.rs` (`a_spawn_opens_a_titled_room_with_no_human_in_it`; `a_refused_spawn_writes_nothing_at_all` for the zero-trace arm) |
+//! | `spawn_subspace` — an **agent-spawned sub-space minted** (the delegation door; see `subspaces`). One transaction writes the whole room: the `space` row (parent link, the parent's cascade limit and router, born stamped), the owner's `role = 'owner'` membership, each sub-agent's membership with `override_notify_policy = 'all'`, the **brief** as the first post (an agent-authored `brief` action, which is why the space is never pristine), and the capability snapshot | `SpaceIndex` (the Library lists sub-spaces like any other conversation), `Space(sub_id)` (it has a transcript to read) and `Participants` (a roster was written) — one per thing the instantiation wrote, the `create_space` rule. **Nothing about the parent**, which gained nothing. A refusal — a guard, an attenuation check, an ineligible or model-less participant, an anchor the parent does not currently show — rolls back to nothing and emits nothing at all. Every door that acts as the human in such a room — `post`, `edit_post`, `regenerate`, `respond_stream` — is refused before any write *and before any spend* (`AppError::NotJoined`), so each commits nothing and emits nothing | `subspaces.rs` (`a_spawn_opens_a_titled_room_with_no_human_in_it`; `a_refused_spawn_writes_nothing_at_all` for the zero-trace arm; `a_spawn_cannot_anchor_to_a_superseded_wording` and `subspace_driver.rs`'s `a_spawn_cannot_anchor_to_a_hidden_tip` for the current-post predicate) |
+//! | `chat`/`chat_stream` — asked in a **live sub-space** (`AppError::DrivenConversation`; membership first so an unjoined reader still sees `NotJoined`) | Nothing at all. Combined post-and-turn is a cascade, and those rooms belong to the driver; the gate lands before `post`, so a refusal is zero-trace | **No emissions** | `subspaces.rs` (`a_combined_ask_in_a_live_subspace_is_refused`; the unjoined arm is `a_human_cannot_post_into_a_subspace_without_joining_it`); `subspace_driver.rs` (`a_combined_ask_does_not_double_drive_a_delegated_room`) |
+//!
+//! | The **sub-space turn driver** — one driven turn in a delegated room (`subspace_driver`; the same `run_turn_stream` door `respond_stream_as` takes, with no consumer to stream to) | Exactly what any turn writes: the `inference`, its rounds, the request row | `Space(sub_id)`, `Record` — the ordinary turn emissions — but every one of them carries `ChangeOrigin::Unattended`, because no consumer call is outstanding and nothing else is going to read the write in. A window busy in that room must therefore **defer** the invalidation rather than drop it | `subspace_driver.rs` (`a_delegated_room_takes_its_turns_with_nobody_watching`); the GUI half in `eidola-gui`'s `stores.rs` (`an_unattended_space_change_arriving_mid_operation_is_replayed`, and `a_caller_space_change_arriving_mid_operation_is_dropped` for the other arm) |
+//! | The **sub-space turn driver** — the owner's **report** delivered into the parent (the delegation's one terminal act, whichever of the four outcomes ended it) | An `inference` by the owning agent in the parent, replying to its own last post there, carrying a `relation='reference'` edge at ordinal 1 that quotes **every branch tip the walk reached, remapped to the wording a reader still sees** (its witness, never a fresh read of the tail; an edit or regeneration of a finding before persist is the visible generation, not the snapshot — a regen while the report HTTP is in flight withdraws that generation so the report retries against the wording the model will actually see, rather than rewriting the footnote onto text it never read) — attached by the driver at the authoring seam, annotated with a *token* naming what ended the room (`DelegationEnd::token`, never a sentence), and attached beneath the owner's own answer to the post the delegation was opened from. A **regeneration** of that report replicates the edge onto the new generation at its own ordinal (`prepare_turn` on `Revise`, the rule `edit_post` already follows), so re-wording a report neither loses its finding nor re-opens the delegation. `BudgetSpent` can bind on the walk's empty planning hops together with persisted `inference`/`decision` rows: an empty router plan writes nothing, so the durable meter would not stop a burst of watched-room posts from billing an unbounded number of router calls, and bounding those hops in isolation would let a room one turn short of the ceiling make 32 more paid calls | `Space(parent_id)`, `Record`, `Wallet` where the parent's backend spends — an ordinary turn's emissions, again all `Unattended`. **No `SpaceIndex`** (`post` owns that, and the driver posts nothing) | `subspace_driver.rs` (`a_finished_delegation_reports_back_with_the_rooms_last_word_attached`, `a_room_that_pauses_at_its_cascade_guard_says_so`, `a_delegation_stops_at_its_turn_budget_and_says_so`, `empty_router_hops_still_spend_the_delegation_budget`, `empty_router_hops_share_the_budget_with_persisted_turns`, `a_failed_turn_is_reported_rather_than_swallowed`, `a_failed_plan_is_reported_rather_than_swallowed`, `a_regeneration_during_the_report_is_quoted_at_its_visible_tip`, `a_regeneration_of_the_answer_during_the_report_reattaches`, `a_failed_regeneration_of_the_answer_during_the_report_waits`) |
+//! | The **sub-space turn driver** — nothing to do: the room is archived, is not a sub-space at all, its last word has already been reported (the derived "is there work outstanding" read), this process has already walked that same last word `MAX_ATTEMPTS_PER_TAIL` times, or the report is waiting for the post the delegation was opened from to be answered | Nothing at all — the check is three reads and precedes every planning call, so an armed driver on a settled room starts no engine, sends no request and writes no row | **No emissions** | `subspace_driver.rs` (`the_driver_never_drives_an_archived_room`, `a_spent_budget_survives_a_restart`) |
+//! | The **sub-space turn driver** — the **parent** is archived, so the report cannot be delivered. No longer a state a room rests in (archiving a conversation closes its delegations in the same transaction), so this is what a walk already past the room's own liveness read would meet: the report writes nothing, refused by `prepare_turn`'s archival gate before any spend | The room's own driven turns, where the archival landed mid-walk | The driven turns' `Space(sub_id)` + `Record`; nothing for the parent. The room's last word stays unreported, which is what a later run reads as still outstanding | `subspace_driver.rs` (`closing_a_conversation_stops_the_delegation_it_was_running` pins the resting state; the mid-walk arm is held by construction — one read before anything acts) |
+//! | The **sub-space turn driver** — the **delegated room** is archived while its report is in flight. Archiving the child does not archive the parent, so the parent's turn gate cannot stop it; persist re-reads liveness and suppresses the generation | The room's own driven turns; the report's unattached request row in the Record | The driven turns' `Space(sub_id)` + `Record`; nothing for the parent | `subspace_driver.rs` (`closing_the_delegated_room_during_its_report_writes_nothing`) |
+//! | `archive_space` — a conversation closed, **and every live delegation beneath it** (recursively down `parent_space_id`, in the archival's own transaction: a room exists to serve the conversation above it, and one left live under a closed parent could only retry a report that parent refuses, forever) | The `archived_at` stamp on each closed room | `Space(id)` **per closed room** — one room's row changed, and it is what releases a delegation registered against it as its parent — plus one `SpaceIndex`. Nothing at all when the write struck nothing (an unknown or already-archived space) | `subspaces.rs` (`archiving_a_conversation_closes_the_delegations_beneath_it`); `subspace_driver.rs` (`a_delegation_beneath_a_closed_conversation_stops_and_lets_go`); `bus.rs` (`archive_space_emits_space_index`, `archive_space_no_emit_when_space_does_not_exist`) |
 //!
 //! | `run_turn`/`run_turn_stream` — the space is **archived** (`AppError::SpaceArchived`, raised by `prepare_turn`'s single read of the space row, which answers existence and availability together) | Nothing at all. The refusal lands before the credential, before the request and before any action — a turn planned while the space was open and driven after it closed writes nothing and spends nothing. `chat`/`chat_stream` still committed their *post* first, so that post's `Space(id)` (+`SpaceIndex`) is the post's own emission, exactly as it is for a funding failure; `respond_stream`, `respond_stream_as` and `regenerate` add no post and so emit nothing whatsoever | **No emissions** | `participants_orchestration.rs` (`an_archived_space_plans_no_turns_and_starts_none` — every entry point refused, no upstream request, no action written); `subspaces.rs` (`retiring_an_owner_stops_the_helpers_mid_cascade`, the case that made it matter) |
 //!
-//! | `retire_participant` — a shared agent **retired**, which also archives every space that existed only because of it: its notebook, and every **live sub-space it owned** (owner-scoped, so at every depth and nobody else's; see `subspaces`) | `Participants` always; `SpaceIndex` **exactly when a space the Library lists was archived** — never for the notebook (excluded from `list_spaces` on both axes), always for a sub-space (an ordinary Library row). The count is returned from inside the transaction (`db::Retirement`), never re-read after it. No per-space emission: nothing reads a single space's `archived_at`, so a `Space(id)` would announce what no subscriber can observe | `subspaces.rs` (`retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts`, which pins both arms); `bus.rs` (`promote_and_retire_emit_participants_only` for the notebook-only case) |
+//! | `retire_participant` — a shared agent **retired**, which also archives every space that existed only because of it: its notebook, every **live sub-space it owned** (owner-scoped, so at every depth), and the delegations *those* rooms were themselves running, whoever owns them (see `subspaces`) | `Participants` always; `SpaceIndex` **exactly when a space the Library lists was archived** — never for the notebook (excluded from `list_spaces` on both axes), always for a sub-space (an ordinary Library row). The count is returned from inside the transaction (`db::Retirement`), never re-read after it. **Plus `Space(id)` per closed room**, notebook included, and the wait each room was holding is ended beside it (`Inner::close_rooms`, what all three archival doors owe a room): retirement reaches a room without touching its parent, so nothing about the parent can announce it, and the room's own registration would otherwise stand until the grace alarm — making every post in that parent pay for a no-op walk until then | `subspaces.rs` (`retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts`, which pins both arms); `subspace_driver.rs` (`retiring_an_owner_releases_the_wait_its_room_was_holding`); `bus.rs` (`promote_and_retire_move_no_library_listing` for the notebook-only case) |
 //!
 //! | `discard_if_pristine` — an **untouched space deleted** (the app's one real delete; every other removal is soft). The space's `space_participant` rows, the `participant` rows it owns and the `space` row itself, in one transaction that re-asks the whole pristineness predicate before it strikes | `SpaceIndex`, **and only when it deleted**. Nothing else: no `Participants` (the roster it removed belonged to a space that no longer exists, and no surface can be reading it — the trigger is the last window closing) and no `Space(id)` (there is no space to announce). A refusal — any action in the space, any configuration ever written, a notebook — commits nothing and says nothing | `reap_pristine.rs` (`an_untouched_space_is_discarded_with_its_whole_footprint`, `discarding_an_unknown_space_is_a_plain_no`, and the door sweep for the refusals) |
 //! | The **startup sweep** — the same delete applied to every pristine space at the local database's first open, catching the blanks a session that crashed never closed its windows on | `SpaceIndex` once, when the sweep took at least one space; nothing at all when it took none. The sweep runs inside the database's first-open initializer, so it is over before any read in this process is answered | `reap_pristine.rs` (`the_startup_sweep_takes_the_orphans_and_leaves_the_rest`, `a_sweep_with_nothing_to_take_says_nothing`) |
@@ -125,7 +141,14 @@
 //! chat path. Per-space participant CRUD emits `Change::Participants`
 //! (`add_space_participant` / `update_space_participant` /
 //! `remove_space_participant`, each after its durable write; a rejected update
-//! emits nothing). The space-template registry emits `Change::Templates`
+//! emits nothing). **A departure that closes delegations says so too**:
+//! `remove_space_participant` archives the rooms the departing agent was
+//! running for the conversation it left, and emits `Change::Space` per closed
+//! room plus one `SpaceIndex` beside its `Participants` — the same
+//! announcement-per-closed-room `archive_space` makes, and for the same reason
+//! (it is what releases a delegation registered against one of them as its
+//! parent). Covered by `an_owner_leaving_a_conversation_closes_the_delegations_it_ran_for_it`
+//! (`subspaces.rs`). The space-template registry emits `Change::Templates`
 //! (`create_template` / `update_template` / `remove_template` /
 //! `template_from_space`), and `set_default_template` emits **both**
 //! `Change::Config` (the config key) and `Change::Templates` (the default
@@ -184,13 +207,22 @@
 //! keeps its id and its scope, the trail still resolves it, and its memory is
 //! untouched; what ends is its availability. One transaction — the
 //! `participant.removed_at` soft-remove **and** its notebook's archival ("the
-//! notebook is archived with its agent") — emitting **`Change::Participants`
-//! only**. Not `SpaceIndex`, by the same argument promotion makes and for the
+//! notebook is archived with its agent") — emitting **`Change::Participants`**
+//! always. Not `SpaceIndex`, by the same argument promotion makes and for the
 //! same reason `archive_space` *does* emit it: the rule is "did the Library
-//! listing change", and a notebook was never in it. `list_global_agents` is a
+//! listing change", and a notebook was never in it. **Every space the
+//! transaction archived is also announced** (`Change::Space` per room, the
+//! notebook included) and released from any wait it was holding — the one
+//! thing all three archival doors owe a room (`Inner::close_rooms`), and
+//! retirement is the door that reaches a room without touching its parent, so
+//! nothing about the parent could ever announce it. Covered by
+//! `retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts`
+//! (`subspaces.rs`) and
+//! `retiring_an_owner_releases_the_wait_its_room_was_holding`
+//! (`subspace_driver.rs`). `list_global_agents` is a
 //! pure read and emits nothing. Refusals (unknown, already retired, the shared
 //! human, a space-owned participant, a non-agent) are decided before any write.
-//! Covered by `promote_and_retire_emit_participants_only` below and
+//! Covered by `promote_and_retire_move_no_library_listing` below and
 //! `global_agents.rs`'s `retiring_a_shared_agent_archives_its_notebook_and_keeps_its_trail`
 //! / `retirement_refuses_everything_that_is_not_a_shared_agent`.
 //!
@@ -219,7 +251,7 @@
 //! harness.
 
 use eidola_app_core::db::HUMAN_PARTICIPANT_ID;
-use eidola_app_core::{AppCore, changes::Change};
+use eidola_app_core::{AppCore, changes::Change, changes::ChangeEvent};
 
 fn make_core() -> (AppCore, tempfile::TempDir) {
     // A single crypto-provider install is idempotent across tests.
@@ -234,11 +266,11 @@ fn make_core() -> (AppCore, tempfile::TempDir) {
 // Helper: drain all messages currently available on a receiver (non-blocking).
 // ---------------------------------------------------------------------------
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     loop {
         match rx.try_recv() {
-            Ok(c) => out.push(c),
+            Ok(c) => out.push(c.change),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
@@ -603,6 +635,13 @@ fn archive_space_emits_space_index() {
         assert!(
             changes.contains(&Change::SpaceIndex),
             "archive_space should emit SpaceIndex; got {changes:?}"
+        );
+        // And the room's own row changed, which is what carries the closure to
+        // anything waiting on this space (a delegation registered against it as
+        // its parent) without a second wiring.
+        assert!(
+            changes.contains(&Change::Space(space.id.clone())),
+            "archive_space should announce the room it closed; got {changes:?}"
         );
     });
 }
@@ -1592,14 +1631,16 @@ fn add_update_remove_participant_emit_participants() {
     });
 }
 
-/// The two library exit points of task 36 — promotion and retirement — each
-/// emit **`Participants` and nothing else**, though both write a `space` row.
-/// The space in question is a notebook, which `list_spaces` excludes
-/// unconditionally, so a `SpaceIndex` would invalidate a store with nothing new
-/// to read. (`archive_space` emits `SpaceIndex` for exactly the opposite
-/// reason: the space it archives is one the Library lists.)
+/// The two library exit points — promotion and retirement — both write a
+/// notebook's `space` row without ever moving the Library's listing: a
+/// notebook is excluded from `list_spaces` unconditionally, so a `SpaceIndex`
+/// would invalidate a store with nothing new to read. (`archive_space` emits
+/// `SpaceIndex` for exactly the opposite reason: the space it archives is one
+/// the Library lists.) Retirement still announces the notebook it closed with
+/// a `Change::Space(id)` — every room an archival closes is announced — which
+/// is pinned here beside the listing silence.
 #[test]
-fn promote_and_retire_emit_participants_only() {
+fn promote_and_retire_move_no_library_listing() {
     run_in_thread(|| {
         let (core, _dir) = make_core();
         let space = core.runtime().block_on(core.create_space(None)).unwrap();
@@ -1670,6 +1711,13 @@ fn promote_and_retire_emit_participants_only() {
         assert!(
             !emitted.contains(&Change::SpaceIndex),
             "the notebook it archived was never listed: {emitted:?}"
+        );
+        // The notebook is still a space this transaction closed, and every
+        // closed room is announced — a delegation can be opened from a
+        // notebook, so a wait can be registered against one.
+        assert!(
+            emitted.contains(&Change::Space(outcome.notebook_space_id.clone())),
+            "the notebook it closed announces itself: {emitted:?}"
         );
         assert!(
             core.runtime()

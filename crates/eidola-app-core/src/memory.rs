@@ -187,6 +187,11 @@ pub(crate) enum MemoryRefusal {
     /// durable and its notebook is archived, so the write is refused rather
     /// than landing behind the retirement.
     OwnerRetired,
+    /// The annotation claims the reserved delegation-ending namespace. A
+    /// provenance annotation is a person's — or an agent's — own note about
+    /// the source it names, written into the same column a delegation's ending
+    /// rides, and readers tell the two apart by prefix alone.
+    ReservedAnnotation,
 }
 
 impl std::fmt::Display for MemoryRefusal {
@@ -217,6 +222,12 @@ impl std::fmt::Display for MemoryRefusal {
                 f,
                 "that is {bytes} bytes; one block holds at most {MAX_MEMORY_BLOCK_BYTES}. Keep \
                  only what stays true and write it shorter"
+            ),
+            Self::ReservedAnnotation => write!(
+                f,
+                "an annotation may not begin with `{}` — that prefix is reserved for the app's own \
+                 record of how a delegated conversation ended. Say it in your own words instead",
+                crate::subspace_driver::DELEGATION_END_PREFIX
             ),
             Self::TooManyBlocks { existing } => write!(
                 f,
@@ -438,6 +449,18 @@ impl Inner {
             Ok(t) => t,
             Err(r) => return Ok(MemoryOutcome::Refused(r)),
         };
+        // Provenance annotations ride the same `action_antecedent.annotation`
+        // column a delegation's ending does, and readers tell the two apart by
+        // prefix alone — so no door that takes one from outside may write into
+        // that namespace (see `subspace_driver::is_reserved_annotation`).
+        // Refused as a value, before anything is read, like the two above.
+        if req
+            .annotation
+            .as_deref()
+            .is_some_and(crate::subspace_driver::is_reserved_annotation)
+        {
+            return Ok(MemoryOutcome::Refused(MemoryRefusal::ReservedAnnotation));
+        }
 
         let conn = self.db_conn().await?;
         let _gate = self.memory_gate.lock().await;

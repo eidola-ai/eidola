@@ -219,6 +219,25 @@ fn register_space(s: &mut Snapshots) {
         },
     );
 
+    // A delegated conversation's report as its parent holds it: two helpers'
+    // findings quoted on one post, each rail row saying how that conversation
+    // stopped — in the reader's language, from the value the edge carries.
+    s.add(
+        "space_delegation_report",
+        size(px(860.), px(620.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let view =
+                    SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(super::fixtures::delegation_report_posts(), cx)
+                });
+                view
+            })
+        },
+    );
+
     // Trace visibility: an answered turn's tool rounds expanded under its own
     // reply, and three declines stacked in the gap under the post they
     // answered — one quiet line per turn, each naming its own agent.

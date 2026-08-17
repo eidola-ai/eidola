@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use eidola_app_core::changes::ChangeOrigin;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AppCore, ChatResult, ChatStreamEvent, IncomingReference, NotificationPlan, PostNode,
@@ -471,7 +472,17 @@ pub struct Space {
     /// A transcript invalidation that arrived while this space owned the
     /// transcript's truth, deferred rather than dropped — see
     /// [`Self::invalidate_transcript`] and [`Self::settle_transcript_debt`].
+    ///
+    /// This one is the *undecidable* debt: a rename, a lagged bus, anything
+    /// that arrives without a place in the write stream. It is always replayed.
     pending_transcript_refresh: bool,
+    /// The highest `ChangeEvent::seq` deferred while busy, `0` for none — the
+    /// *decidable* debt (see [`Self::settle_transcript_debt`]).
+    pending_transcript_seq: u64,
+    /// The change-bus watermark the transcript in hand was read at: every write
+    /// numbered below it had committed before that read began, so the read
+    /// contains it. `0` until the first read lands.
+    transcript_covers_through: u64,
     /// **Incoming references**, keyed by the quoted post's action id: every
     /// current-generation post quoting a range of that post
     /// (`AppCore::references_to`). This is the data behind the source-post
@@ -631,6 +642,8 @@ impl Space {
             failed_turn: None,
             load_task: None,
             pending_transcript_refresh: false,
+            pending_transcript_seq: 0,
+            transcript_covers_through: 0,
             incoming_refs: HashMap::new(),
             incoming_ref_tasks: HashMap::new(),
             traces: Loadable::NotLoaded,
@@ -760,6 +773,8 @@ impl Space {
             failed_turn: None,
             load_task: None,
             pending_transcript_refresh: false,
+            pending_transcript_seq: 0,
+            transcript_covers_through: 0,
             incoming_refs: HashMap::new(),
             incoming_ref_tasks: HashMap::new(),
             traces: Loadable::NotLoaded,
@@ -1281,20 +1296,48 @@ impl Space {
     /// own completion. Routed through the bus-bridge dispatch in
     /// `stores::dispatch_change`.
     ///
-    /// **Residual, deliberately not deferred** like
-    /// [`Self::invalidate_transcript`]: that exit reload is several reads, so a
-    /// *foreign* write committing while they run is caught by none of them and
-    /// its signal was dropped here. Deferring it too is one line — but this
-    /// signal fires on every post, and almost every one of them is this space's
-    /// own write, already in the exit reload; recording every one would buy a
-    /// redundant whole-tree re-read at the end of every turn to close a window
-    /// only another window's or the CLI's concurrent post can open. Worth its
-    /// own task, with a way to tell our own writes from a stranger's.
-    pub fn on_space_changed(&mut self, changed_id: &str, cx: &mut Context<Self>) {
+    /// **Nothing is dropped while busy; what differs is what it costs.** This
+    /// fires on every post, and almost every one is this space's own write,
+    /// already contained in the operation's exit reload — replaying those would
+    /// buy a redundant whole-tree re-read at the end of every turn, which is
+    /// the property worth keeping. But the exit reload is several reads, so a
+    /// write committing *while they run* is caught by none of them, and
+    /// dropping its signal loses it until something unrelated re-reads.
+    ///
+    /// **`Caller` was the wrong test for which of the two a signal is.** It
+    /// says a call is outstanding, never that the call is *this* entity's — so
+    /// another window archiving the conversation this one is streaming in, or
+    /// posting into it, was dropped as if some read of ours covered it, and
+    /// nothing did. Ownership was only ever a proxy for the question that
+    /// matters, and it is wrong in both directions: a write of somebody else's
+    /// that landed before our read *is* covered, and one of our own that landed
+    /// during it is not.
+    ///
+    /// So the debt is recorded either way and the question is asked at the
+    /// discharge, against the read the operation actually took (see
+    /// [`Self::settle_transcript_debt`]): a `Caller` signal carries its place
+    /// in the write stream (`ChangeEvent::seq`) and is discharged silently when
+    /// the exit read covered it; an `Unattended` one — a background chore, or
+    /// the driver posting a delegation's report here — takes the unconditional
+    /// path [`Self::invalidate_transcript`] takes, because nobody is waiting on
+    /// it and there is nothing to weigh a re-read against.
+    pub fn on_space_changed(
+        &mut self,
+        changed_id: &str,
+        origin: ChangeOrigin,
+        seq: u64,
+        cx: &mut Context<Self>,
+    ) {
         if self.id != changed_id {
             return;
         }
         if self.is_busy() {
+            match origin {
+                ChangeOrigin::Unattended => self.pending_transcript_refresh = true,
+                ChangeOrigin::Caller => {
+                    self.pending_transcript_seq = self.pending_transcript_seq.max(seq)
+                }
+            }
             return;
         }
         self.load_transcript(cx);
@@ -1336,11 +1379,68 @@ impl Space {
     /// ([`Self::fail_mutation`] / [`Self::fail_turn`]), and a read issued while
     /// nothing is in flight discharges the debt by construction, which is what
     /// [`Self::load_transcript`] records.
+    ///
+    /// **The decidable debt is discharged by comparison, not by re-reading.**
+    /// A `Caller` signal deferred while busy carries its place in the write
+    /// stream, and the operation that has just settled took its own read at a
+    /// known place ([`Self::transcript_covers_through`]) — so a write announced
+    /// *below* that mark had committed before the read began and is already on
+    /// screen. That is the common case and it costs nothing, which is the whole
+    /// point of asking: an own write is answered by the operation's own exit
+    /// reload, exactly as it always was. What is left is a write that landed
+    /// while those reads ran — from this entity or from any other window — and
+    /// that one is re-read, because nothing else will.
     fn settle_transcript_debt(&mut self, cx: &mut Context<Self>) {
-        if !self.pending_transcript_refresh || self.is_busy() {
+        if self.is_busy() {
+            return;
+        }
+        let uncovered = self.pending_transcript_seq >= self.transcript_covers_through
+            && self.pending_transcript_seq > 0;
+        if !self.pending_transcript_refresh && !uncovered {
+            self.pending_transcript_seq = 0;
             return;
         }
         self.load_transcript(cx);
+    }
+
+    /// Apply a freshly read transcript — **unless it is older than what is
+    /// already on screen.** Answers whether it applied.
+    ///
+    /// **The invariant is that the watermark answers for exactly what is
+    /// visible**, and this is the one place that can hold it. Two reads in
+    /// flight at once (a fan-out settles two turns; a load races an exit
+    /// reload) can land in either order, and `merge_from_db` *replaces* the
+    /// transcript — it carries disclosure state across by position, but the
+    /// content is whatever it was handed. So an older snapshot landing last
+    /// takes the newer response off the screen, and taking the higher mark
+    /// anyway makes the watermark describe a transcript nobody is looking at:
+    /// a deferred invalidation between the two marks then discharges as
+    /// "already covered" while the write it announced is absent.
+    ///
+    /// Rejecting the older read is the cure that holds both halves at once —
+    /// the visible transcript never goes backwards, and the mark never claims
+    /// more than the transcript contains. The alternative (apply it and lower
+    /// the mark to match) keeps the watermark honest by letting the reader
+    /// watch a response disappear and come back, which is a worse thing to
+    /// show and no cheaper to reason about. Nothing is lost by refusing: the
+    /// snapshot that *is* on screen was read later, so it contains everything
+    /// this one did.
+    ///
+    /// Equal marks apply: two reads that began at the same point describe the
+    /// same writes, and the later one is free to carry the streamed reasoning
+    /// its caller captured.
+    fn apply_transcript_read(
+        &mut self,
+        messages: Vec<ChatMessageView>,
+        covers_through: u64,
+        new_reasoning: Option<(Option<String>, String)>,
+    ) -> bool {
+        if covers_through < self.transcript_covers_through {
+            return false;
+        }
+        self.merge_from_db(messages, new_reasoning);
+        self.transcript_covers_through = covers_through;
+        true
     }
 
     // -- Transcript loading ------------------------------------------------
@@ -1359,6 +1459,7 @@ impl Space {
     fn load_transcript(&mut self, cx: &mut Context<Self>) {
         if !self.is_busy() {
             self.pending_transcript_refresh = false;
+            self.pending_transcript_seq = 0;
         }
         let Some(app_core) = self.app_core.clone() else {
             return;
@@ -1401,7 +1502,7 @@ impl Space {
                         message: "fetch space tree task cancelled".into(),
                     })
                 })
-                .map(views_from_nodes);
+                .map(|(nodes, covers_through)| (views_from_nodes(nodes), covers_through));
             let _ = this.update(cx, |this, cx| {
                 let _ = this.apply_loaded_transcript(result, cx);
                 this.load_task = None;
@@ -1424,7 +1525,7 @@ impl Space {
     /// depth.) Returns whether the load was applied.
     fn apply_loaded_transcript(
         &mut self,
-        result: Result<Vec<ChatMessageView>, AppError>,
+        result: Result<(Vec<ChatMessageView>, u64), AppError>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.is_busy() {
@@ -1432,8 +1533,12 @@ impl Space {
             return false;
         }
         match result {
-            Ok(messages) => {
-                self.merge_from_db(messages, None);
+            Ok((messages, covers_through)) => {
+                // A load that began before what is already on screen is stale
+                // twice over — see [`Self::apply_transcript_read`].
+                if !self.apply_transcript_read(messages, covers_through, None) {
+                    return false;
+                }
                 cx.emit(SpaceEvent::MessagesChanged);
             }
             Err(error) => {
@@ -1474,7 +1579,7 @@ impl Space {
         &mut self,
         seq: u64,
         result: &ChatResult,
-        msgs: Result<Vec<ChatMessageView>, AppError>,
+        msgs: Result<(Vec<ChatMessageView>, u64), AppError>,
         cx: &mut Context<Self>,
     ) {
         let captured = self
@@ -1484,12 +1589,18 @@ impl Space {
             .map(|s| s.response.reasoning.clone());
         self.streams.retain(|s| s.seq != seq);
         match msgs {
-            Ok(messages) => {
+            Ok((messages, covers)) => {
                 let attach = captured
                     .filter(|r| !r.is_empty())
                     .filter(|_| result.declined.is_none())
                     .map(|r| (result.response_action_id.clone(), r));
-                self.merge_from_db(messages, attach);
+                // A sibling turn's later read may already be on screen; this
+                // one does not take it back off (see
+                // [`Self::apply_transcript_read`]). The reasoning it captured
+                // goes with it, which costs nothing — the snapshot that *is*
+                // showing was read later, so it carries the same `thinking`
+                // block from the row.
+                self.apply_transcript_read(messages, covers, attach);
                 cx.emit(SpaceEvent::MessagesChanged);
                 cx.emit(SpaceEvent::StreamEnded);
             }
@@ -1729,12 +1840,12 @@ impl Space {
                                 message: "fetch space tree task cancelled".into(),
                             })
                         })
-                        .map(views_from_nodes);
+                        .map(|(nodes, covers)| (views_from_nodes(nodes), covers));
                     let _ = this.update(cx, |this, cx| {
                         this.post_runner = None;
                         match msgs {
-                            Ok(messages) => {
-                                this.merge_from_db(messages, None);
+                            Ok((messages, covers)) => {
+                                this.apply_transcript_read(messages, covers, None);
                                 cx.emit(SpaceEvent::MessagesChanged);
                                 // A plain post ends no stream, but it is the
                                 // same "this space settled" announcement the
@@ -1933,12 +2044,12 @@ impl Space {
                             message: "fetch space tree task cancelled".into(),
                         })
                     })
-                    .map(views_from_nodes);
+                    .map(|(nodes, covers)| (views_from_nodes(nodes), covers));
                 let _ = this.update(cx, |this, cx| {
                     this.post_runner = None;
                     match msgs {
-                        Ok(messages) => {
-                            this.merge_from_db(messages, None);
+                        Ok((messages, covers)) => {
+                            this.apply_transcript_read(messages, covers, None);
                             cx.emit(SpaceEvent::MessagesChanged);
                             cx.emit(SpaceEvent::StreamEnded);
                         }
@@ -2115,7 +2226,7 @@ impl Space {
                                 message: "fetch space tree task cancelled".into(),
                             })
                         })
-                        .map(views_from_nodes);
+                        .map(|(nodes, covers)| (views_from_nodes(nodes), covers));
                     let _ = this.update(cx, |this, cx| {
                         this.apply_turn_success(seq, &result, msgs, cx)
                     });
@@ -2431,7 +2542,11 @@ impl Space {
                 action_id: "decision-1".into(),
             }),
         };
-        self.apply_turn_success(seq, &result, Ok(views_from_nodes(nodes)), cx);
+        // The synthetic read covers everything announced so far, which is
+        // what a real exit reload's watermark says (`bridge::get_space_tree`
+        // samples it beside the read).
+        let covers = self.app_core.as_ref().map_or(u64::MAX, |c| c.change_seq());
+        self.apply_turn_success(seq, &result, Ok((views_from_nodes(nodes), covers)), cx);
     }
 
     /// Test-only: whether a transcript load is in flight (the load slot is
@@ -2451,8 +2566,31 @@ impl Space {
         messages: Vec<SpaceMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let views = messages.into_iter().map(ChatMessageView::new).collect();
-        self.apply_loaded_transcript(Ok(views), cx)
+        let covers = self.app_core.as_ref().map_or(u64::MAX, |c| c.change_seq());
+        self.apply_loaded_transcript_at_for_test(messages, covers, cx)
+    }
+
+    /// [`Self::apply_loaded_transcript_for_test`] naming the change-bus
+    /// watermark the read began at — the seam for staging two reads that land
+    /// out of order, which is not something a test can arrange from outside
+    /// (both reads sample the mark inside the bridge, in the order they are
+    /// issued).
+    #[doc(hidden)]
+    pub fn apply_loaded_transcript_at_for_test(
+        &mut self,
+        messages: Vec<SpaceMessage>,
+        covers_through: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let views: Vec<ChatMessageView> = messages.into_iter().map(ChatMessageView::new).collect();
+        self.apply_loaded_transcript(Ok((views, covers_through)), cx)
+    }
+
+    /// Test-only: the change-bus watermark the transcript on screen was read
+    /// at — the claim [`Self::apply_transcript_read`] keeps honest.
+    #[doc(hidden)]
+    pub fn transcript_covers_through_for_test(&self) -> u64 {
+        self.transcript_covers_through
     }
 
     /// Test-only: drive the exclusive-mutation failure completion exactly as

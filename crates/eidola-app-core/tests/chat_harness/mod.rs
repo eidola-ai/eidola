@@ -82,6 +82,12 @@ pub enum ChatBehavior {
     OkBlockingNoInlineRefund,
     /// 200 SSE stream: content + reasoning deltas, usage, `[DONE]`.
     OkStreaming,
+    /// A plain success in **whichever transport asked** — SSE for a streaming
+    /// request, JSON for a blocking one. One behaviour for a test that must
+    /// exercise both twins against one upstream, which is otherwise impossible:
+    /// `OkBlocking` answers a streamed ask with a body its parser reads as no
+    /// content at all.
+    OkEitherTransport,
     /// As `OkStreaming`, but the model mimics the per-message header
     /// scaffolding: its content starts with a header-shaped line. Exercises
     /// strip-on-receipt.
@@ -1278,6 +1284,22 @@ async fn handle_chat(
             }
             write_json(stream, 200, &body.to_string()).await
         }
+        ChatBehavior::OkEitherTransport => {
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
+            }
+            let mut body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
         ChatBehavior::RejectToolsUnparseable => {
             if request.get("tools").is_some() {
                 // The handler body never runs, so: no `refund` in the
@@ -1758,6 +1780,27 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
         .block_on(core.set_base_url(mock.base_url.clone()))
         .expect("set base url");
     (mock, core, dir)
+}
+
+/// Re-open an `AppCore` over a directory a previous one used — the **restart**
+/// seam.
+///
+/// The single-writer lock is held for the life of an `AppCore`, so the caller
+/// must have dropped the previous one. Everything durable is on disk, so what
+/// comes back is the same profile with none of the previous process's memory:
+/// exactly the state a guard that is supposed to survive a restart has to be
+/// held against.
+pub fn reopen_core(dir: &tempfile::TempDir, base_url: &str) -> AppCore {
+    let config_dir = dir.path().to_path_buf();
+    let data_dir = dir.path().join("data");
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("plain http client");
+    let core = AppCore::with_test_http_client(config_dir, data_dir, client).expect("reopen core");
+    core.runtime()
+        .block_on(core.set_base_url(base_url.to_string()))
+        .expect("set base url");
+    core
 }
 
 /// Configure account credentials so auto-provisioning can reach the balance /

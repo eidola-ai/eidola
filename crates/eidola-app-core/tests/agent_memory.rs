@@ -35,7 +35,7 @@ use chat_harness::{
     memory_section, system_message_with, tool_script,
 };
 use eidola_app_core::AppCore;
-use eidola_app_core::changes::Change;
+use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::memory::{MAX_MEMORY_BLOCK_BYTES, MAX_MEMORY_BLOCKS, MEMORY_NOTE};
 
 /// The external backend's model. `remember` rides the same learned capability
@@ -129,10 +129,10 @@ fn tool_results(body: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>) -> Vec<Change> {
     let mut out = Vec::new();
     while let Ok(c) = rx.try_recv() {
-        out.push(c);
+        out.push(c.change);
     }
     out
 }
@@ -415,6 +415,51 @@ fn an_oversized_block_is_refused_with_zero_trace() {
                 .1
                 .contains("<memory>"),
             "nothing was written, so nothing loads"
+        );
+    });
+}
+
+/// **A provenance annotation cannot claim the reserved ending namespace.** It
+/// rides the same `action_antecedent.annotation` column a delegation's ending
+/// does, and readers tell the two apart by prefix alone — so every door that
+/// takes one from outside refuses that prefix, this one included, and refuses
+/// it as a value before anything is read.
+#[test]
+fn a_remembered_annotation_cannot_claim_the_ending_namespace() {
+    run(|| {
+        let script = tool_script();
+        let (mock, core, _dir) = setup(script.clone());
+        core.set_memory_enabled(true);
+
+        let first = turn(&core, "I always want short answers.", None);
+        let space = first.space_id.clone();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let handle = eidola_app_core::post_handle(&tree[0].item_id);
+
+        script_remember(
+            &script,
+            serde_json::json!({
+                "block": "about you",
+                "text": "Prefers short answers.",
+                "sources": [format!("#{handle}")],
+                "annotation": "eidola:delegation/concluded",
+            }),
+        );
+        turn(&core, "Understood?", Some(space.clone()));
+
+        let agent = agent_id(&core, &space, MODEL);
+        assert!(
+            blocks(&core, &agent).is_empty(),
+            "the write is refused whole, not written with the annotation dropped"
+        );
+        let bodies = mock.chat_bodies();
+        let refusal = tool_results(bodies.last().expect("a request")).remove(0);
+        assert!(
+            refusal.contains("eidola:delegation/") && refusal.contains("reserved"),
+            "and the model is told which prefix is not its to write: {refusal}"
         );
     });
 }

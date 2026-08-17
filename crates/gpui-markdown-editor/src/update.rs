@@ -218,6 +218,7 @@ fn apply_event(state: EditorState, event: EditorEvent) -> EditorState {
 
         EditorEvent::DeleteBackward => delete_backward(state),
         EditorEvent::DeleteForward => delete_forward(state),
+        EditorEvent::ToggleInlineFormat(format) => crate::formatting::toggle(state, format),
 
         EditorEvent::SetSelection(sel) => set_selection(state, sel),
 

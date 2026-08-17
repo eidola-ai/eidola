@@ -248,13 +248,24 @@ pub fn regenerate(
 
 /// Load a space's threaded-post render tree (the reopened-space initial load
 /// and the post-stream reload). The flattened `PostNode` list the transcript
-/// renders from — see `AppCore::get_space_tree`.
+/// renders from — see `AppCore::get_space_tree` — **and the change-bus
+/// watermark this read may claim to cover**.
+///
+/// The watermark is sampled here rather than at the four call sites, and it is
+/// sampled *before* the read: an invalidation numbered below it announced a
+/// write that had already committed when this read began, so this read saw it;
+/// one numbered at or above may have landed while the read was running, and
+/// only that one still has to be replayed. Taking it beside the read is what
+/// keeps the pairing honest — a caller cannot sample it late, or forget to.
 pub fn get_space_tree(
     core: Arc<AppCore>,
     space_id: String,
-) -> oneshot::Receiver<Result<Vec<PostNode>, AppError>> {
+) -> oneshot::Receiver<Result<(Vec<PostNode>, u64), AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.get_space_tree(space_id).await
+        let covers_through = core.change_seq();
+        core.get_space_tree(space_id)
+            .await
+            .map(|nodes| (nodes, covers_through))
     })
 }
 

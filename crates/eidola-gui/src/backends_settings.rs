@@ -327,6 +327,7 @@ impl BackendsSettingsView {
         let held = self.row_focus(id, cx).contains_focused(window, cx);
         self.local_models.update(cx, |s, cx| s.download(url, cx));
         self.hand_back_focus(held, window, cx);
+        cx.notify();
     }
 
     /// Forget a standing download failure — which takes the row with it, since

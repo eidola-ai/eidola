@@ -18,8 +18,8 @@ use gpui_component::Root;
 use gpui_markdown_editor::editor::{
     Backspace, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward, DeleteWordForward,
     DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Redo, Right, SelectAll, ShiftEnd,
-    ShiftHome, ShiftRight, ShiftTab, ShiftWordLeft, ShiftWordRight, Tab, Undo, Up, WordLeft,
-    WordRight,
+    ShiftHome, ShiftRight, ShiftTab, ShiftWordLeft, ShiftWordRight, Tab, ToggleBold, ToggleItalic,
+    Undo, Up, WordLeft, WordRight,
 };
 use gpui_markdown_editor::{
     BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, MarkdownEditorState,
@@ -152,6 +152,46 @@ fn enter_action_inserts_paragraph_break(cx: &mut TestAppContext) {
     editor.read_with(cx, |e, _| {
         assert_eq!(e.value(), "ab\n\nc");
         assert_eq!(e.cursor_offset(), 4);
+    });
+}
+
+#[gpui::test]
+fn bold_and_italic_actions_toggle_the_word_under_the_caret(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "one two".into(),
+        selection: Selection::Cursor(5),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+
+    dispatch(cx, handle, &editor, ToggleBold);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "one **two**");
+        assert!(e.selection().is_collapsed());
+    });
+
+    dispatch(cx, handle, &editor, ToggleItalic);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "one ***two***");
+        assert!(e.selection().is_collapsed());
+    });
+}
+
+#[gpui::test]
+fn formatting_action_is_one_undo_step(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "**abcdef**".into(),
+        selection: Selection::range(4, 6),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial.clone());
+
+    dispatch(cx, handle, &editor, ToggleBold);
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "**ab**cd**ef**"));
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), initial.markdown);
+        assert_eq!(e.selection(), initial.selection);
     });
 }
 
