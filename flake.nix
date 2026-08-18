@@ -386,6 +386,9 @@
           # arch all clustered in one rules.rs path string + cascading
           # codesign hash). `$NIX_BUILD_TOP` is only knowable at sandbox
           # runtime so this must go through preBuild, not the RUSTFLAGS attr.
+          # The llama.cpp sidecar has the C/ObjC equivalent (`-ffile-prefix-map`
+          # in `llamaServer`); both are required for the macOS universal
+          # narHash to be a function of source.
           preBuild = ''
             export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix $NIX_BUILD_TOP=/build"
           '';
@@ -618,8 +621,26 @@
             tag = "b${llamaServerVersion}";
             hash = "sha256-FheVvdqpF3pqxmovFXBh65iNAH+lSM+jqGrM8CpLHF8=";
           };
+          # python3 is only for the Darwin LC_UUID zeroing in postInstall.
+          nativeBuildInputs = (o.nativeBuildInputs or [ ]) ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            pkgs.python3
+          ];
           preConfigure = ''
             prependToVar cmakeFlags "-DLLAMA_BUILD_COMMIT:STRING=${llamaServerCommit}"
+            # $NIX_BUILD_TOP is only knowable at sandbox runtime
+            # (`nix-NNNN-NNNNNNNN`). llama.cpp bakes those paths into the
+            # binary via `__FILE__` (~209 assertion / log strings). The
+            # decimal width of the build-instance id varies per invocation,
+            # which shifts `__cstring` size, Mach-O section layout, and every
+            # pointer into the string table — empirically the whole
+            # macos-universal narHash drift vs CI (PR #317). Same class of
+            # leak the Rust builds already close with `--remap-path-prefix`.
+            # Darwin's cc-wrapper does not apply `-ffile-prefix-map` the way
+            # Linux's does, so this has to be explicit. The cc-wrapper reads
+            # NIX_CFLAGS_COMPILE at compile time, so CMake cannot bake it
+            # away; ObjC `.m` files go through the same wrapper.
+            export NIX_CFLAGS_COMPILE="$NIX_CFLAGS_COMPILE -ffile-prefix-map=$NIX_BUILD_TOP=/build -fmacro-prefix-map=$NIX_BUILD_TOP=/build"
+            export NIX_CXXFLAGS_COMPILE="$NIX_CXXFLAGS_COMPILE -ffile-prefix-map=$NIX_BUILD_TOP=/build -fmacro-prefix-map=$NIX_BUILD_TOP=/build"
           '';
           cmakeFlags = o.cmakeFlags ++ [
             "-DLLAMA_CURL=OFF"
@@ -636,10 +657,49 @@
           # embeds llama.cpp's libs into the binary, so the sibling llama-*
           # tools, the `llama` symlink, and the installed headers/archives are
           # all dead weight for a sidecar.
-          postInstall = (o.postInstall or "") + ''
-            find "$out/bin" -mindepth 1 ! -name llama-server -delete
-            rm -rf "$out/include" "$out/lib"
-          '';
+          postInstall =
+            (o.postInstall or "")
+            + ''
+              find "$out/bin" -mindepth 1 ! -name llama-server -delete
+              rm -rf "$out/include" "$out/lib"
+            ''
+            + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+              # ld64's LC_UUID includes nondeterministic linker state even
+              # when the compiled code is identical (same reason the
+              # universal wrapper zeros the Rust slices). Zero it here so
+              # the sidecar NAR itself is a function of source; autoSign
+              # re-signs in postFixup.
+              chmod u+w "$out/bin/llama-server"
+              python3 -c '
+              import struct, sys
+              def zero_uuid(data, offset):
+                  magic = struct.unpack_from("<I", data, offset)[0]
+                  assert magic == 0xFEEDFACF, f"bad Mach-O magic at {offset:#x}"
+                  ncmds = struct.unpack_from("<I", data, offset + 16)[0]
+                  pos = offset + 32
+                  for _ in range(ncmds):
+                      cmd, cmdsize = struct.unpack_from("<II", data, pos)
+                      if cmd == 0x1B:
+                          data[pos + 8 : pos + 24] = b"\x00" * 16
+                          return
+                      pos += cmdsize
+                  sys.exit(f"LC_UUID not found at offset {offset:#x}")
+
+              path = sys.argv[1]
+              with open(path, "r+b") as f:
+                  data = bytearray(f.read())
+              magic = struct.unpack_from(">I", data, 0)[0]
+              if magic == 0xCAFEBABE:
+                  nfat = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(nfat):
+                      offset = struct.unpack_from(">I", data, 8 + i * 20 + 8)[0]
+                      zero_uuid(data, offset)
+              else:
+                  zero_uuid(data, 0)
+              with open(path, "wb") as f:
+                  f.write(data)
+              ' "$out/bin/llama-server"
+            '';
         });
 
         # signapple — the independent `apply` our own reattach is checked
@@ -806,7 +866,9 @@ with open(path, "wb") as f:
                 # binary; app-core accepts a sibling `llama-server` next to the
                 # exe. arm64-only (see the GUI bundle below for the rationale);
                 # the autoSignDarwinBinariesHook postFixup pass walks every
-                # Mach-O in $out and (re-)signs this one too.
+                # Mach-O in $out and (re-)signs this one too. The sidecar
+                # derivation is the reproducibility boundary (path remap +
+                # Darwin LC_UUID zero); copying it is then deterministic.
                 cp ${llamaServer}/bin/llama-server "$out/bin/llama-server"
                 chmod u+w "$out/bin/llama-server"
               '';
@@ -954,9 +1016,9 @@ with open(path, "wb") as f:
                 # stays the escape hatch. Recorded as a product decision in
                 # AGENTS.md.
                 #
-                # No LC_UUID zeroing here (unlike the main binary): the sidecar
-                # is a separate derivation whose output hash Nix already fixes,
-                # so it contributes a stable path — copying it is deterministic.
+                # The sidecar derivation remaps `$NIX_BUILD_TOP` out of
+                # `__FILE__` and zeros LC_UUID on Darwin, so its NAR is a
+                # function of source; copying it is then deterministic.
                 # autoSignDarwinBinariesHook's postFixup walks every Mach-O in
                 # $out, so this sidecar is (re-)signed with the same deterministic
                 # ad-hoc signature as the main binary; no explicit sign call.
