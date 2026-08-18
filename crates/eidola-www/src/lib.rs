@@ -5,8 +5,9 @@
 //! binary). It renders three content sources into one site:
 //!
 //! - `www/pages/*.md` — standalone pages (`index.md` is the home page)
-//! - `www/blog/YYYY-MM-DD-<slug>.md` — blog posts (`/blog/<slug>/`), plus
-//!   a generated index and Atom feed
+//! - `www/blog/YYYY-MM-DD-<slug>.md` — blog posts (`/blog/<slug>/`); the
+//!   index, Atom feed, and Blog chrome are generated only when there is
+//!   something to put in them
 //! - `docs/**/*.md` — the repo docs, rendered under `/docs/` with `.md`
 //!   links rewritten to routes (or GitHub for files the site doesn't host)
 //!
@@ -122,7 +123,13 @@ fn load_page(path: &Path, kind: PageKind, route: String, source_dir: &str) -> Re
     })
 }
 
-fn write_page(out: &Path, page: &Page, docs_nav: Option<&[NavSection]>) -> Result<(), Error> {
+fn write_page(
+    out: &Path,
+    page: &Page,
+    docs_nav: Option<&[NavSection]>,
+    has_blog: bool,
+    has_feed: bool,
+) -> Result<(), Error> {
     let rel = page.route.trim_matches('/');
     let dir = if rel.is_empty() {
         out.to_path_buf()
@@ -130,7 +137,10 @@ fn write_page(out: &Path, page: &Page, docs_nav: Option<&[NavSection]>) -> Resul
         out.join(rel)
     };
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join("index.html"), layout(page, docs_nav))?;
+    fs::write(
+        dir.join("index.html"),
+        layout(page, docs_nav, has_blog, has_feed),
+    )?;
     if let Some(raw) = &page.source_raw {
         fs::write(dir.join("source.md"), raw)?;
     }
@@ -237,29 +247,24 @@ fn collect_docs(dir: &Path, prefix: &str, into: &mut Vec<String>) -> Result<(), 
 }
 
 fn blog_index(posts: &[Page]) -> Page {
-    let mut html = String::from("<h1>Blog</h1>\n");
-    if posts.is_empty() {
-        html.push_str("<p>Nothing here yet. Subscribe to the <a href=\"/blog/atom.xml\">feed</a> — articles are coming.</p>\n");
-    } else {
-        html.push_str("<ul class=\"post-list\">\n");
-        for post in posts {
-            let date = post.date.as_deref().unwrap_or("");
-            let snippet = post
-                .description
-                .as_deref()
-                .map(|d| format!("<p>{}</p>", escape_html(d)))
-                .unwrap_or_default();
-            html.push_str(&format!(
-                "<li><time datetime=\"{date}\">{human}</time><a href=\"{route}\">{title}</a>{snippet}</li>\n",
-                date = escape_html(date),
-                human = escape_html(&render::human_date(date)),
-                route = escape_html(&post.route),
-                title = escape_html(&post.title),
-                snippet = snippet,
-            ));
-        }
-        html.push_str("</ul>\n");
+    let mut html = String::from("<h1>Blog</h1>\n<ul class=\"post-list\">\n");
+    for post in posts {
+        let date = post.date.as_deref().unwrap_or("");
+        let snippet = post
+            .description
+            .as_deref()
+            .map(|d| format!("<p>{}</p>", escape_html(d)))
+            .unwrap_or_default();
+        html.push_str(&format!(
+            "<li><time datetime=\"{date}\">{human}</time><a href=\"{route}\">{title}</a>{snippet}</li>\n",
+            date = escape_html(date),
+            human = escape_html(&render::human_date(date)),
+            route = escape_html(&post.route),
+            title = escape_html(&post.title),
+            snippet = snippet,
+        ));
     }
+    html.push_str("</ul>\n");
     Page {
         kind: PageKind::Page,
         route: "/blog/".into(),
@@ -413,6 +418,8 @@ pub fn build(opts: &BuildOptions) -> Result<BuildStats, Error> {
     pages.retain(|p| opts.include_drafts || !p.draft);
 
     let published_posts: Vec<&Page> = posts.iter().filter(|p| !p.draft).collect();
+    let has_blog = !posts.is_empty();
+    let has_feed = !published_posts.is_empty();
 
     // Write everything.
     let stats = BuildStats {
@@ -421,25 +428,29 @@ pub fn build(opts: &BuildOptions) -> Result<BuildStats, Error> {
         docs: doc_pages.len(),
     };
     for page in &pages {
-        write_page(&opts.out, page, None)?;
+        write_page(&opts.out, page, None, has_blog, has_feed)?;
         routes.push(page.route.clone());
     }
-    let index = blog_index(&posts);
-    write_page(&opts.out, &index, None)?;
-    routes.push(index.route.clone());
+    if has_blog {
+        let index = blog_index(&posts);
+        write_page(&opts.out, &index, None, has_blog, has_feed)?;
+        routes.push(index.route.clone());
+    }
     for post in &posts {
-        write_page(&opts.out, post, None)?;
+        write_page(&opts.out, post, None, has_blog, has_feed)?;
         if !post.draft {
             routes.push(post.route.clone());
         }
     }
     for page in &doc_pages {
-        write_page(&opts.out, page, Some(&docs_nav))?;
+        write_page(&opts.out, page, Some(&docs_nav), has_blog, has_feed)?;
         routes.push(page.route.clone());
     }
 
-    fs::create_dir_all(opts.out.join("blog"))?;
-    fs::write(opts.out.join("blog/atom.xml"), atom_feed(&published_posts))?;
+    if has_feed {
+        fs::create_dir_all(opts.out.join("blog"))?;
+        fs::write(opts.out.join("blog/atom.xml"), atom_feed(&published_posts))?;
+    }
 
     routes.sort();
     fs::write(opts.out.join("sitemap.xml"), sitemap(&routes))?;

@@ -1,9 +1,9 @@
 {
-  "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=c891a209c641907e1cb150fad113bfbb2f47f638e5c6959d50073547d72a4ddf",
+  "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=06227009c142651b92cf5b3534c0f5975d4a57bf5733650dd291da08d86efafa",
   "schema_version": 1,
-  "snp_measurement": "f6804689c2339a3133679a974860bf945086fb544f1bdaf42be1d1f24da3eda3c2b2172f73f907e80d824f550992664a",
+  "snp_measurement": "3d4bf3e5105d21ffc7078d52719644df09b5c942bf3d840e7f73c96f11da53aca7239876349ffbbae709784761de9a21",
   "tdx_measurement": {
     "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-    "rtmr2": "e683b3c39be815469e72f39da9f132b6303a4eceb8822888260ee691eb4d2ac3fac89a158285a284810596d46b4d5356"
+    "rtmr2": "5f935649c7fbc57c9fa930def584520c1df54b646ae040caf0db46e24854575b182f40b8f88db4f70bc4a31f75d9d3cc"
   }
 }

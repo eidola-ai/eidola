@@ -98,8 +98,14 @@ pub fn human_date(iso: &str) -> String {
 }
 
 /// Render a full page. `docs_nav` supplies the docs sidebar, rendered on
-/// `Doc` pages only.
-pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
+/// `Doc` pages only. Blog nav and the Atom `<link>` are included only when
+/// the build produced them (`has_blog` / `has_feed`).
+pub fn layout(
+    page: &Page,
+    docs_nav: Option<&[NavSection]>,
+    has_blog: bool,
+    has_feed: bool,
+) -> String {
     let title = match page.kind {
         PageKind::Home => "Eidola".to_string(),
         _ => format!("{} · Eidola", escape_html(&page.title)),
@@ -114,7 +120,11 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
             )
         })
         .unwrap_or_default();
-    let feed = "<link rel=\"alternate\" type=\"application/atom+xml\" title=\"Eidola blog\" href=\"/blog/atom.xml\">\n";
+    let feed = if has_feed {
+        "<link rel=\"alternate\" type=\"application/atom+xml\" title=\"Eidola blog\" href=\"/blog/atom.xml\">\n"
+    } else {
+        ""
+    };
     let canonical = format!("{}{}", BASE_URL, page.route);
     let nav_class = |prefix: &str| {
         if page.route.starts_with(prefix) {
@@ -122,6 +132,14 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
         } else {
             ""
         }
+    };
+    let blog_nav = if has_blog {
+        format!(
+            "<a href=\"/blog/\"{nav_blog}>Blog</a>\n",
+            nav_blog = nav_class("/blog/"),
+        )
+    } else {
+        String::new()
     };
     let byline = match (&page.kind, &page.date) {
         (PageKind::Post, Some(date)) => format!(
@@ -268,8 +286,7 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
 <header class="site-header">
 <a class="wordmark" href="/">Eidola</a>
 <nav>
-<a href="/blog/"{nav_blog}>Blog</a>
-<a href="/docs/"{nav_docs}>Docs</a>
+{blog_nav}<a href="/docs/"{nav_docs}>Docs</a>
 <a href="https://github.com/eidola-ai/eidola">GitHub</a>
 </nav>
 </header>
@@ -297,7 +314,7 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
         description = description,
         canonical = canonical,
         feed = feed,
-        nav_blog = nav_class("/blog/"),
+        blog_nav = blog_nav,
         nav_docs = nav_class("/docs/"),
         main_class = main_class,
         sidebar = sidebar,
@@ -342,6 +359,10 @@ mod tests {
         }
     }
 
+    fn page_html(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
+        layout(page, docs_nav, true, true)
+    }
+
     #[test]
     fn versioned_pages_get_meta_and_version_line() {
         let mut page = doc_page();
@@ -350,7 +371,7 @@ mod tests {
         page.version = Some(3);
         page.effective = Some("2026-08-01".into());
         page.source_sha256 = Some("ab".repeat(32));
-        let html = layout(&page, None);
+        let html = page_html(&page, None);
         assert!(html.contains("<meta name=\"eidola:version\" content=\"3\">"));
         assert!(html.contains(&format!(
             "<meta name=\"eidola:source-sha256\" content=\"{}\">",
@@ -364,7 +385,7 @@ mod tests {
         );
 
         // Unversioned pages get none of it.
-        let html = layout(&doc_page(), None);
+        let html = page_html(&doc_page(), None);
         assert!(!html.contains("eidola:version"));
         assert!(!html.contains("doc-version"));
     }
@@ -375,7 +396,7 @@ mod tests {
         page.route = "/docs/privacy-guarantees/".into();
         page.source_path = Some("docs/privacy-guarantees.md".into());
         page.source_sha256 = Some("cd".repeat(32));
-        let html = layout(&page, None);
+        let html = page_html(&page, None);
         assert!(html.contains(&format!(
             "<meta name=\"eidola:source-sha256\" content=\"{}\">",
             "cd".repeat(32)
@@ -391,11 +412,27 @@ mod tests {
 
     #[test]
     fn layout_marks_active_nav_and_titles() {
-        let html = layout(&doc_page(), None);
+        let html = page_html(&doc_page(), None);
         assert!(html.contains("<title>The client · Eidola</title>"));
         assert!(html.contains("<a href=\"/docs/\" class=\"active\">"));
+        assert!(html.contains("<a href=\"/blog/\">Blog</a>"));
         assert!(html.contains("atom.xml"));
         assert!(html.contains("rel=\"canonical\" href=\"https://www.eidola.ai/docs/client/\""));
+    }
+
+    #[test]
+    fn blog_chrome_is_omitted_when_the_build_has_no_posts() {
+        let html = layout(&doc_page(), None, false, false);
+        assert!(!html.contains("href=\"/blog/\""));
+        assert!(!html.contains("atom.xml"));
+        assert!(html.contains("<a href=\"/docs/\" class=\"active\">"));
+    }
+
+    #[test]
+    fn feed_link_is_independent_of_blog_nav() {
+        let html = layout(&doc_page(), None, true, false);
+        assert!(html.contains("<a href=\"/blog/\">Blog</a>"));
+        assert!(!html.contains("atom.xml"));
     }
 
     #[test]
@@ -413,7 +450,7 @@ mod tests {
                 },
             ],
         }];
-        let html = layout(&doc_page(), Some(&nav));
+        let html = page_html(&doc_page(), Some(&nav));
         assert!(html.contains("class=\"docs-sidebar\""));
         assert!(html.contains("class=\"docs-nav-inline\""));
         assert!(html.contains("<a href=\"/docs/client/\" aria-current=\"page\">The client</a>"));
@@ -424,13 +461,13 @@ mod tests {
         let mut home = doc_page();
         home.kind = PageKind::Home;
         home.route = "/".into();
-        let html = layout(&home, Some(&nav));
+        let html = page_html(&home, Some(&nav));
         assert!(!html.contains("docs-sidebar"));
     }
 
     #[test]
     fn docs_pages_get_edit_links() {
-        let html = layout(&doc_page(), None);
+        let html = page_html(&doc_page(), None);
         assert!(html.contains(
             "<a href=\"https://github.com/eidola-ai/eidola/edit/main/docs/client.md\">Edit this page on GitHub</a>"
         ));
@@ -439,7 +476,7 @@ mod tests {
         let mut post = doc_page();
         post.kind = PageKind::Post;
         post.source_path = None;
-        assert!(!layout(&post, None).contains("page-edit"));
+        assert!(!page_html(&post, None).contains("page-edit"));
     }
 
     #[test]
@@ -458,7 +495,7 @@ mod tests {
             heading(3, "one-a", "One A"),
             heading(2, "two", "Two"),
         ];
-        let html = layout(&page, None);
+        let html = page_html(&page, None);
         assert!(html.contains("class=\"toc\""));
         assert!(html.contains("<li class=\"toc-h1\"><a href=\"#the-client\">The client</a></li>"));
         assert!(html.contains("<li class=\"toc-h3\"><a href=\"#one-a\">One A</a></li>"));
@@ -472,7 +509,7 @@ mod tests {
             heading(2, "only", "Only"),
             heading(2, "other", "Other"),
         ];
-        let html = layout(&short, None);
+        let html = page_html(&short, None);
         assert!(!html.contains("class=\"toc\""));
         assert!(!html.contains("/assets/toc.js"));
 
@@ -484,6 +521,6 @@ mod tests {
             heading(2, "b", "B"),
             heading(2, "c", "C"),
         ];
-        assert!(!layout(&plain, None).contains("class=\"toc\""));
+        assert!(!page_html(&plain, None).contains("class=\"toc\""));
     }
 }
