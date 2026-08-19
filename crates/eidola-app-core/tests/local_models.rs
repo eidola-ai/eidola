@@ -930,43 +930,50 @@ fn the_supervisors_shutdown_arm_emits_nothing() {
 ///
 /// The hang is reproduced deterministically by pointing the injected HTTP
 /// client at a proxy that accepts connections and never answers.
+/// A core whose HTTP client is pointed at a proxy that accepts connections
+/// and never answers, with a sleeping fake engine already configured: every
+/// `/health` probe hangs for as long as the test cares to watch.
+///
+/// The returned runtime owns the proxy and must outlive the core.
+fn core_with_a_hanging_health_endpoint(
+    dir: &std::path::Path,
+) -> (std::sync::Arc<AppCore>, tokio::runtime::Runtime) {
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+
+    // A listener that accepts and never responds. Sockets are held so the
+    // connection stays open rather than being closed under the client.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    rt.spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{proxy_port}")).unwrap())
+        .build()
+        .expect("client");
+    let core =
+        AppCore::with_test_http_client(dir.to_path_buf(), dir.join("data"), client).expect("core");
+
+    let models_dir = dir.join("data").join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
+    core.set_llama_server_path(Some(write_sleeping_engine(dir)))
+        .unwrap();
+    (std::sync::Arc::new(core), rt)
+}
+
 #[test]
 fn a_hanging_health_probe_does_not_swallow_the_shutdown_signal() {
     run(|| {
-        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let dir = tempfile::tempdir().expect("tempdir");
-
-        // A listener that accepts and never responds. Sockets are held so the
-        // connection stays open rather than being closed under the client.
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let listener = rt
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let proxy_port = listener.local_addr().unwrap().port();
-        rt.spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((sock, _)) = listener.accept().await {
-                held.push(sock);
-            }
-        });
-
-        let client = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{proxy_port}")).unwrap())
-            .build()
-            .expect("client");
-        let core = AppCore::with_test_http_client(
-            dir.path().to_path_buf(),
-            dir.path().join("data"),
-            client,
-        )
-        .expect("open core");
-        let core = std::sync::Arc::new(core);
-
-        let models_dir = dir.path().join("data").join("models");
-        std::fs::create_dir_all(&models_dir).unwrap();
-        std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
-        core.set_llama_server_path(Some(write_sleeping_engine(dir.path())))
-            .unwrap();
+        let (core, rt) = core_with_a_hanging_health_endpoint(dir.path());
 
         let handle = core.runtime().spawn({
             let core = core.clone();
@@ -989,6 +996,49 @@ fn a_hanging_health_probe_does_not_swallow_the_shutdown_signal() {
             .expect("the signal must be observed even mid-probe")
             .expect("join");
         assert!(outcome.is_err(), "a cancelled load reports failure");
+
+        drop(core);
+        rt.shutdown_background();
+    });
+}
+
+/// The five-minute readiness budget must bind **each probe**, not merely the
+/// gaps between them.
+///
+/// A `/health` endpoint that accepts the request and never answers is exactly
+/// what a warming engine can look like (the socket is accepted while a
+/// multi-gigabyte model loads, and this client sets no request timeout). With
+/// the deadline checked only at the top of the loop, such a probe left the
+/// supervisor waiting on the shutdown signal alone: the documented budget
+/// never expired, the load never failed, and every caller joining the warming
+/// engine waited for a load that would never end.
+#[test]
+fn a_hanging_health_probe_still_hits_the_readiness_deadline() {
+    run(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (core, rt) = core_with_a_hanging_health_endpoint(dir.path());
+        core.test_set_engine_ready_timeout(std::time::Duration::from_millis(1500));
+
+        let handle = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.load_local_model("sleeper@local".into()).await }
+        });
+        let err = core
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(20), handle).await
+            })
+            .expect("the readiness deadline must fire even inside a probe")
+            .expect("join")
+            .expect_err("a load that never became ready must fail");
+        assert!(
+            err.to_string().contains("did not become ready within 1s"),
+            "got {err}"
+        );
+        assert!(
+            core.running_engines().is_empty(),
+            "the timed-out load leaves no entry behind"
+        );
 
         drop(core);
         rt.shutdown_background();

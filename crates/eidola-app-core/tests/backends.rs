@@ -692,3 +692,132 @@ fn openai_backend_models_come_from_listing_when_not_pinned() {
         assert!(models[0].request_credits.is_none());
     });
 }
+
+/// An engine may not outlive the backend row that gave it its meaning.
+///
+/// Engines are keyed by `(backend_id, slug)` and removal is a *soft* remove —
+/// re-adding the same id revives the row. So an engine left registered under
+/// a removed backend is inherited by its revival: point the revived backend at
+/// a different models directory that happens to hold the same file name, and
+/// the next load of `<slug>@<id>` finds the old ready entry, returns
+/// immediately, and every turn runs against the previous file while Settings
+/// describes the new directory.
+#[test]
+fn removing_a_backend_retires_its_engines_so_a_revival_cannot_inherit_them() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let old_models = dir.path().join("old-models");
+        let new_models = dir.path().join("new-models");
+        std::fs::create_dir_all(&old_models).unwrap();
+        std::fs::create_dir_all(&new_models).unwrap();
+        // The same file name in both directories — the trap a revival springs.
+        std::fs::write(old_models.join("tiny.gguf"), b"old").unwrap();
+        std::fs::write(new_models.join("tiny.gguf"), b"new").unwrap();
+
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &old_models.display().to_string(),
+                Some("/usr/bin/false"),
+                true,
+            )))
+            .expect("add backend");
+        core.test_register_loaded_local_model("my-box", "tiny", 51234);
+        // A managed-store engine stands by to prove the sweep is scoped.
+        core.test_register_loaded_local_model("local", "keep", 51235);
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.remove_backend("my-box".into()))
+            .expect("remove");
+
+        let running: Vec<String> = core.running_engines().into_iter().map(|e| e.id).collect();
+        assert_eq!(
+            running,
+            vec!["keep@local".to_string()],
+            "the removed backend's engine must be gone, and only it"
+        );
+        let emitted = drain(&mut rx);
+        assert!(
+            emitted.contains(&Change::LocalModels),
+            "retiring an engine is a local-models change: {emitted:?}"
+        );
+
+        // Revive the id over a different directory. The engine that served
+        // the *old* directory's `tiny.gguf` must not answer for the new one:
+        // the load has to start a real engine, which `/usr/bin/false` makes
+        // fail honestly rather than silently succeeding against port 51234.
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &new_models.display().to_string(),
+                Some("/usr/bin/false"),
+                true,
+            )))
+            .expect("revive backend");
+        let err = core
+            .runtime()
+            .block_on(core.load_local_model("tiny@my-box".into()))
+            .expect_err("the revived backend must load its own file, not inherit an engine");
+        assert!(err.to_string().contains("exited during load"), "got {err}");
+    });
+}
+
+/// The same rule, for the two other ways a row stops meaning what it meant:
+/// repointing it at another models directory, and disabling it (a backend
+/// that may not serve a turn has no business holding gigabytes).
+#[test]
+fn repointing_or_disabling_a_backend_retires_its_engines() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &first.display().to_string(),
+                None,
+                true,
+            )))
+            .expect("add backend");
+        core.test_register_loaded_local_model("my-box", "tiny", 51236);
+
+        core.runtime()
+            .block_on(core.update_backend(
+                "my-box".into(),
+                BackendUpdate {
+                    models_dir: Some(Some(second.display().to_string())),
+                    ..Default::default()
+                },
+            ))
+            .expect("repoint");
+        assert!(
+            core.running_engines().is_empty(),
+            "an engine started from the old directory may not survive the repoint"
+        );
+
+        // An update that leaves the directory alone keeps the engine.
+        core.test_register_loaded_local_model("my-box", "tiny", 51237);
+        core.runtime()
+            .block_on(core.update_backend(
+                "my-box".into(),
+                BackendUpdate {
+                    display_name: Some("My Box".into()),
+                    ..Default::default()
+                },
+            ))
+            .expect("rename");
+        assert_eq!(core.running_engines().len(), 1, "a rename changes nothing");
+
+        core.runtime()
+            .block_on(core.set_backend_enabled("my-box".into(), false))
+            .expect("disable");
+        assert!(
+            core.running_engines().is_empty(),
+            "a disabled backend keeps no engines"
+        );
+    });
+}

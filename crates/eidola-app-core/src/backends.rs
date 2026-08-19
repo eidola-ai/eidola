@@ -398,6 +398,11 @@ impl Inner {
                 message: format!("no backend named `{id}` is configured"),
             });
         }
+        if !enabled {
+            // A disabled backend cannot serve a turn, so nothing may keep
+            // running under its id.
+            self.retire_engines_for(id);
+        }
         self.bus.emit(Change::Backends);
         Ok(())
     }
@@ -482,6 +487,19 @@ impl Inner {
             }
         }
 
+        // Repointing a backend at another models directory (or another
+        // `llama-server`) changes what `<slug>@<id>` *means*, so the engines
+        // already running under that id belong to a configuration that is
+        // about to stop existing — see [`Self::retire_backend_engines`].
+        let repointed = update
+            .models_dir
+            .as_ref()
+            .is_some_and(|d| d.as_deref() != row.models_dir.as_deref())
+            || update.engine_path.as_ref().is_some_and(|p| {
+                p.as_deref().map(|p| p.trim()).filter(|p| !p.is_empty())
+                    != row.engine_path.as_deref()
+            });
+
         let overrides_json = update
             .model_overrides
             .map(|o| overrides_to_json(o.as_deref()));
@@ -518,6 +536,9 @@ impl Inner {
                 message: format!("no backend named `{id}` is configured"),
             });
         }
+        if repointed {
+            self.retire_engines_for(id);
+        }
         self.bus.emit(Change::Backends);
         Ok(())
     }
@@ -535,8 +556,19 @@ impl Inner {
                 message: format!("no backend named `{id}` is configured"),
             });
         }
+        self.retire_engines_for(id);
         self.bus.emit(Change::Backends);
         Ok(())
+    }
+
+    /// Stop every engine registered under `backend_id` — the row that gave
+    /// those engines their meaning has gone or changed, and an engine may not
+    /// outlive its configuration (`Inner::retire_backend_engines`). Emits
+    /// [`Change::LocalModels`] only when something was actually retired.
+    fn retire_engines_for(&self, backend_id: &str) {
+        if self.retire_backend_engines(backend_id) > 0 {
+            self.bus.emit(Change::LocalModels);
+        }
     }
 
     /// The models a backend offers, as selectable entries whose `id` is the

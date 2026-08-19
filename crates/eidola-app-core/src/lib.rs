@@ -9606,6 +9606,14 @@ impl AppCore {
         self.inner.local.set_memory_budget_for_test(budget);
     }
 
+    /// Test-only seam: shorten the engine readiness budget (five minutes in
+    /// production) so a test can watch the load deadline fire.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_set_engine_ready_timeout(&self, timeout: std::time::Duration) {
+        self.inner.local.set_ready_timeout_for_test(timeout);
+    }
+
     /// List spaces, most recently active first. Archived spaces are
     /// excluded unless `include_archived` is set.
     pub async fn list_spaces(&self, include_archived: bool) -> Result<Vec<SpaceInfo>, AppError> {

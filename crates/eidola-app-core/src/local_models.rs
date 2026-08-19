@@ -267,9 +267,39 @@ struct DownloadEntry {
     cancel: AtomicBool,
 }
 
+/// Identity of one engine **instance** — a single `llama-server` child and
+/// the supervisor task that owns it.
+///
+/// The engines map is keyed by `(backend_id, slug)`, which is the *name* of
+/// a load, not the identity of a process: unload the model and load it again
+/// and the same key names a different child. A supervisor is therefore not
+/// allowed to reason about "the entry under my key" — its own entry may
+/// already have been removed by an unload and replaced by a newer load's,
+/// and mutating that one by name is how a stale actor marks a
+/// still-warming replacement ready, or deletes it outright on its way to
+/// reporting a failure that belongs to a process nobody is waiting for.
+///
+/// So every mutation a supervisor (or a reservation guard) makes names the
+/// instance it owns, and the runtime applies it only if that instance still
+/// holds the key. The counter is process-global and monotonic, so a value
+/// is never reused and a stale actor cannot forge a live one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct EngineInstance(u64);
+
+impl EngineInstance {
+    /// Allocate the next instance identity.
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// A running (or warming-up) engine subprocess. The supervisor task owns
 /// the child process; this entry is the control handle.
 struct EngineEntry {
+    /// Which engine instance this entry *is* — see [`EngineInstance`]. Only
+    /// the owner of this identity may mark it ready or retire it.
+    instance: EngineInstance,
     port: u16,
     context_tokens: u32,
     ready: bool,
@@ -312,24 +342,24 @@ impl Drop for EngineLease {
 struct ReservationGuard {
     local: Arc<LocalRuntime>,
     bus: BroadcastSource,
-    key: Option<EngineKey>,
+    /// The reservation to roll back — **by instance**, so a rollback that
+    /// runs after an unload-then-reload cycle cannot take the replacement
+    /// down with it.
+    reservation: Option<(EngineKey, EngineInstance)>,
 }
 
 impl ReservationGuard {
     /// The supervisor now owns the entry; the guard stands down.
     fn defuse(mut self) {
-        self.key = None;
+        self.reservation = None;
     }
 }
 
 impl Drop for ReservationGuard {
     fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.local
-                .engines
-                .lock()
-                .expect("engines lock")
-                .remove(&key);
+        if let Some((key, instance)) = self.reservation.take()
+            && self.local.retire_instance(&key, instance)
+        {
             self.bus.emit(Change::LocalModels);
         }
     }
@@ -376,6 +406,10 @@ pub(crate) struct LocalRuntime {
     failures: StdMutex<HashMap<EngineKey, EngineFailure>>,
     /// Test override for the machine memory budget ([`memory_budget`]).
     budget_override: StdMutex<Option<u64>>,
+    /// Test override for the engine readiness budget
+    /// ([`ENGINE_READY_TIMEOUT`]), so a test can watch the deadline fire
+    /// without waiting out the real one.
+    ready_timeout_override: StdMutex<Option<std::time::Duration>>,
     /// One-way shutdown latch. Set by [`Inner::shutdown_all_engines`] and
     /// checked by [`Self::reserve_engine`] — **both under the `engines`
     /// lock**, which is what makes it race-free; the atomic is only here
@@ -436,15 +470,17 @@ impl LocalRuntime {
     /// loads of different models can never both conclude that the same free
     /// memory covers them (each sees the other's reservation in its own
     /// plan). Returns `Ok(None)` when an entry for `key` already exists
-    /// (join that load) and `Ok(Some(victims))` when the reservation is in
-    /// place; `Err` refuses without reserving or unloading anything.
+    /// (join that load) and `Ok(Some((instance, victims)))` when the
+    /// reservation is in place — the instance identity being what the
+    /// spawned supervisor must present for every later mutation of the
+    /// entry. `Err` refuses without reserving or unloading anything.
     fn reserve_engine(
         &self,
         key: &EngineKey,
         port: u16,
         footprint: u64,
         shutdown: tokio::sync::oneshot::Sender<()>,
-    ) -> Result<Option<Vec<EngineKey>>, String> {
+    ) -> Result<Option<(EngineInstance, Vec<EngineKey>)>, String> {
         let mut engines = self.engines.lock().expect("engines lock");
         // The shutdown authority is checked *here*, inside the reservation's
         // critical section and under the same lock the drain takes — not by
@@ -468,9 +504,11 @@ impl LocalRuntime {
             })
             .collect();
         let victims = plan_evictions(footprint, self.memory_budget(), &snapshot)?;
+        let instance = EngineInstance::next();
         engines.insert(
             key.clone(),
             EngineEntry {
+                instance,
                 port,
                 context_tokens: LOCAL_CONTEXT_TOKENS,
                 ready: false,
@@ -481,7 +519,86 @@ impl LocalRuntime {
                 in_flight: Arc::new(AtomicU64::new(0)),
             },
         );
-        Ok(Some(victims))
+        Ok(Some((instance, victims)))
+    }
+
+    /// Mark a warming entry ready — **only if `instance` still holds `key`**.
+    /// Returns whether it did; `false` means this instance was unloaded (and
+    /// possibly replaced) while it warmed up, and its caller owes its child a
+    /// kill rather than a promotion.
+    fn mark_engine_ready(&self, key: &EngineKey, instance: EngineInstance) -> bool {
+        let mut engines = self.engines.lock().expect("engines lock");
+        match engines.get_mut(key) {
+            Some(e) if e.instance == instance => {
+                e.ready = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop an entry — **only if `instance` still holds `key`**. Returns
+    /// whether it did. Used by every path that ends one engine's life on the
+    /// engine's own account (a rolled-back reservation, a supervisor's
+    /// failure); the user-driven verbs remove by key, because "unload
+    /// whatever is loaded under this id" is exactly what they mean.
+    fn retire_instance(&self, key: &EngineKey, instance: EngineInstance) -> bool {
+        let mut engines = self.engines.lock().expect("engines lock");
+        match engines.get(key) {
+            Some(e) if e.instance == instance => {
+                engines.remove(key);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record one instance's failure and retire it.
+    ///
+    /// The report is filed only when it can still be about the row a surface
+    /// would show: the failing instance still holds the key (and is removed
+    /// under the same lock), or the key holds nothing at all. A newer
+    /// instance under the key keeps its own state — a dead process's
+    /// complaint must not become the live one's error, and must certainly not
+    /// delete it.
+    fn fail_instance(&self, key: &EngineKey, instance: EngineInstance, message: String) {
+        let mut engines = self.engines.lock().expect("engines lock");
+        match engines.get(key) {
+            Some(e) if e.instance == instance => {
+                engines.remove(key);
+            }
+            Some(_) => return,
+            None => {}
+        }
+        self.failures
+            .lock()
+            .expect("failures lock")
+            .insert(key.clone(), EngineFailure::load(message));
+    }
+
+    /// Take the entry loaded under `key`, whatever instance it is — the
+    /// user-driven unload. The caller owns the returned shutdown sender.
+    fn take_engine(&self, key: &EngineKey) -> Option<EngineEntry> {
+        self.engines.lock().expect("engines lock").remove(key)
+    }
+
+    /// Take every entry belonging to `backend_id`.
+    ///
+    /// A backend row's models directory (and the engine binary that serves
+    /// it) is what gives `(backend_id, slug)` its meaning, so a row that is
+    /// removed, disabled, or repointed at another directory leaves every
+    /// engine registered under its id describing a configuration that no
+    /// longer exists. Left in place, the next load of the same slug joins the
+    /// old engine and turns run against the previous file while every surface
+    /// describes the new one. The caller owns the returned shutdown senders.
+    fn take_backend_engines(&self, backend_id: &str) -> Vec<EngineEntry> {
+        let mut engines = self.engines.lock().expect("engines lock");
+        let keys: Vec<EngineKey> = engines
+            .keys()
+            .filter(|(b, _)| b == backend_id)
+            .cloned()
+            .collect();
+        keys.iter().filter_map(|k| engines.remove(k)).collect()
     }
 
     /// Run `f` — the engine spawn — only if no quit-time shutdown has begun,
@@ -531,6 +648,29 @@ impl LocalRuntime {
         *self.budget_override.lock().expect("budget lock") = Some(budget);
     }
 
+    /// How long a load may take to reach `/health` = 200
+    /// ([`ENGINE_READY_TIMEOUT`]), or the test override. One reading serves
+    /// the spawning supervisor and every caller joining its load, so the two
+    /// cannot disagree about when the budget is spent.
+    fn ready_timeout(&self) -> std::time::Duration {
+        (*self
+            .ready_timeout_override
+            .lock()
+            .expect("ready timeout lock"))
+        .unwrap_or(ENGINE_READY_TIMEOUT)
+    }
+
+    /// Test seam: shorten the engine readiness budget so a test can observe
+    /// the deadline without waiting out the real five minutes.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_ready_timeout_for_test(&self, timeout: std::time::Duration) {
+        *self
+            .ready_timeout_override
+            .lock()
+            .expect("ready timeout lock") = Some(timeout);
+    }
+
     /// Test seam: register a fake "ready" engine at an arbitrary port so
     /// integration tests can route local turns at a mock upstream without
     /// spawning a real llama-server.
@@ -557,6 +697,7 @@ impl LocalRuntime {
         self.engines.lock().expect("engines lock").insert(
             (backend_id.to_string(), slug.to_string()),
             EngineEntry {
+                instance: EngineInstance::next(),
                 port,
                 context_tokens: LOCAL_CONTEXT_TOKENS,
                 ready: true,
@@ -1583,17 +1724,19 @@ impl Inner {
             .map_err(|message| AppError::LocalModel {
                 message: format!("cannot load `{model_id}`: {message}"),
             })?;
-        let Some(victims) = reserved else {
+        let Some((instance, victims)) = reserved else {
             // Raced another load between the presence check and here — join
             // that load instead of double-spawning.
             return self.await_engine_ready(&key).await;
         };
         // Until the supervisor takes ownership at spawn, an error return
-        // (or this future being dropped) must roll the reservation back.
+        // (or this future being dropped) must roll the reservation back —
+        // this reservation, named by instance, never whatever holds the key
+        // by then.
         let reservation = ReservationGuard {
             local: self.local.clone(),
             bus: self.bus.clone(),
-            key: Some(key.clone()),
+            reservation: Some((key.clone(), instance)),
         };
         self.local
             .failures
@@ -1634,7 +1777,18 @@ impl Inner {
         // authority is the shutdown channel (map removal → send) — and if
         // the whole runtime is torn down, `kill_on_drop` reaps the child.
         tokio::spawn(async move {
-            supervise_engine(command, port, http, shutdown_rx, ready_tx, bus, local, key).await;
+            supervise_engine(
+                command,
+                port,
+                http,
+                shutdown_rx,
+                ready_tx,
+                bus,
+                local,
+                key,
+                instance,
+            )
+            .await;
         });
 
         match ready_rx.await {
@@ -1650,7 +1804,8 @@ impl Inner {
     /// `Ok`, entry gone (load failed / unloaded) → the recorded failure, or
     /// a timeout mirroring the loader's own budget.
     async fn await_engine_ready(&self, key: &EngineKey) -> Result<(), AppError> {
-        let deadline = std::time::Instant::now() + ENGINE_READY_TIMEOUT;
+        let budget = self.local.ready_timeout();
+        let deadline = std::time::Instant::now() + budget;
         loop {
             if self.local.ready_engine(&key.0, &key.1).is_some() {
                 return Ok(());
@@ -1668,10 +1823,7 @@ impl Inner {
             }
             if std::time::Instant::now() >= deadline {
                 return Err(AppError::LocalModel {
-                    message: format!(
-                        "engine did not become ready within {}s",
-                        ENGINE_READY_TIMEOUT.as_secs()
-                    ),
+                    message: format!("engine did not become ready within {}s", budget.as_secs()),
                 });
             }
             tokio::time::sleep(ENGINE_POLL_INTERVAL).await;
@@ -1704,11 +1856,7 @@ impl Inner {
     /// Unload a model: signal its supervisor, which kills the subprocess.
     pub(crate) async fn unload_local_model(&self, id: &str) -> Result<(), AppError> {
         let key = engine_key_for_id(id);
-        let entry = {
-            let mut engines = self.local.engines.lock().expect("engines lock");
-            engines.remove(&key)
-        };
-        match entry {
+        match self.local.take_engine(&key) {
             Some(e) => {
                 // Supervisor may already be gone (crash path); either way the
                 // map entry is removed, which is the user-visible state.
@@ -1770,6 +1918,26 @@ impl Inner {
         for entry in entries {
             // Supervisor may already be gone (crash path); the map removal
             // is the user-visible state either way.
+            let _ = entry.shutdown.send(());
+        }
+        count
+    }
+
+    /// Stop every engine registered under `backend_id`, returning how many
+    /// were signalled.
+    ///
+    /// Called when a backend row stops meaning what it meant — removed,
+    /// disabled, or repointed at another models directory (see
+    /// [`LocalRuntime::take_backend_engines`] for why an engine may not
+    /// outlive that). Like [`Self::unload_local_model`] this *signals*; the
+    /// supervisor task owns the child and does the kill. It does not emit —
+    /// the caller knows what else changed at the same moment.
+    pub(crate) fn retire_backend_engines(&self, backend_id: &str) -> usize {
+        let entries = self.local.take_backend_engines(backend_id);
+        let count = entries.len();
+        for entry in entries {
+            // The supervisor may already be gone (crash path); the map
+            // removal is the user-visible state either way.
             let _ = entry.shutdown.send(());
         }
         count
@@ -1940,14 +2108,15 @@ async fn supervise_engine(
     bus: BroadcastSource,
     local: Arc<LocalRuntime>,
     key: EngineKey,
+    instance: EngineInstance,
 ) {
+    // Every map mutation below names `instance`, never the bare key: this
+    // task can resume after its own entry was unloaded and a newer load
+    // registered its engine under the same `(backend, slug)`, and a stale
+    // supervisor must not mark that replacement ready or delete it while
+    // reporting its own child's death. See [`EngineInstance`].
     let fail = |message: &str| {
-        local.engines.lock().expect("engines lock").remove(&key);
-        local
-            .failures
-            .lock()
-            .expect("failures lock")
-            .insert(key.clone(), EngineFailure::load(message));
+        local.fail_instance(&key, instance, message.to_string());
     };
 
     // **Every** emission in this supervisor goes through here, and it is
@@ -2018,7 +2187,8 @@ async fn supervise_engine(
     };
 
     let health_url = format!("http://127.0.0.1:{port}/health");
-    let deadline = std::time::Instant::now() + ENGINE_READY_TIMEOUT;
+    let ready_timeout = local.ready_timeout();
+    let deadline = tokio::time::Instant::now() + ready_timeout;
 
     // Phase 1: wait for readiness. The child's exit is observed via
     // `try_wait` between polls so no `&mut child` borrow spans the select.
@@ -2039,7 +2209,7 @@ async fn supervise_engine(
         if let Ok(Some(status)) = child.try_wait() {
             break LoadEnd::Exited(status.code());
         }
-        if std::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             break LoadEnd::TimedOut;
         }
         // The probe must race the shutdown signal, not precede it.
@@ -2052,8 +2222,17 @@ async fn supervise_engine(
         // its signal into a receiver nobody was watching, the drain's brief
         // grace expired, `exit()` followed, and the child outlived the
         // process — the orphan the whole teardown exists to prevent.
+        //
+        // It must race the readiness deadline for the same reason. A hang
+        // *inside* one probe is indistinguishable from a hang between them,
+        // and the loop's own deadline check is above this await: an endpoint
+        // that accepts the request and never answers would otherwise leave
+        // this select waiting on shutdown alone, the documented load budget
+        // never enforced, and every caller joining the warming engine stuck
+        // for as long as the socket stays open.
         let ready = tokio::select! {
             _ = &mut shutdown_rx => break LoadEnd::Shutdown,
+            _ = tokio::time::sleep_until(deadline) => break LoadEnd::TimedOut,
             resp = http.get(&health_url).send() => {
                 matches!(resp, Ok(r) if r.status().is_success())
             }
@@ -2088,7 +2267,7 @@ async fn supervise_engine(
             let _ = child.wait().await;
             let message = format!(
                 "llama-server did not become ready within {}s. Last output:\n{}",
-                ENGINE_READY_TIMEOUT.as_secs(),
+                ready_timeout.as_secs(),
                 tail_text(),
             );
             fail(&message);
@@ -2098,19 +2277,12 @@ async fn supervise_engine(
         }
     }
 
-    // Ready — flip the map entry (it may have been removed by a concurrent
-    // unload, in which case we shut down instead of serving a ghost). The
-    // decision happens under the lock; the kill happens after it drops.
-    let still_wanted = {
-        let mut engines = local.engines.lock().expect("engines lock");
-        match engines.get_mut(&key) {
-            Some(e) => {
-                e.ready = true;
-                true
-            }
-            None => false,
-        }
-    };
+    // Ready — flip *our* map entry. It may have been removed by a concurrent
+    // unload (and the key may already carry a newer load's engine), in which
+    // case there is nothing of ours to promote and we shut down instead of
+    // serving a ghost — or, worse, advertising someone else's warming child
+    // as ready. The decision happens under the lock; the kill after it drops.
+    let still_wanted = local.mark_engine_ready(&key, instance);
     if !still_wanted {
         let _ = child.start_kill();
         let _ = child.wait().await;
@@ -2326,11 +2498,11 @@ mod tests {
 
         let key_a = ("local".to_string(), "a".to_string());
         let (tx_a, _rx_a) = tokio::sync::oneshot::channel();
-        assert_eq!(
-            runtime.reserve_engine(&key_a, 4001, 6 * GIB, tx_a).unwrap(),
-            Some(Vec::new()),
-            "the first load fits with no evictions"
-        );
+        let (_instance, victims) = runtime
+            .reserve_engine(&key_a, 4001, 6 * GIB, tx_a)
+            .unwrap()
+            .expect("the first load fits with no evictions");
+        assert_eq!(victims, Vec::<EngineKey>::new());
 
         let key_b = ("local".to_string(), "b".to_string());
         let (tx_b, _rx_b) = tokio::sync::oneshot::channel();
@@ -2395,6 +2567,102 @@ mod tests {
             runtime.spawn_unless_shutting_down(|| "spawned"),
             None,
             "once the drain has run, nothing may start a child"
+        );
+    }
+
+    /// An engine entry belongs to one **instance**, and a supervisor whose
+    /// instance is gone may not touch what took its place.
+    ///
+    /// Unload-then-reload puts a second engine under the same
+    /// `(backend, slug)` while the first supervisor is still alive: its
+    /// health probe may already have succeeded, or its child may have exited,
+    /// at the same moment the shutdown signal arrived — and `select!` is free
+    /// to take either arm. A mutation addressed by key alone would then mark a
+    /// replacement that is still loading as ready (routing turns at a port
+    /// nothing serves yet) or, on the failure paths, delete the replacement
+    /// outright, leaving its subprocess running with no entry through which
+    /// anyone could ever unload it.
+    #[test]
+    fn a_stale_supervisor_cannot_touch_the_engine_that_replaced_it() {
+        let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+        let key = ("local".to_string(), "tiny".to_string());
+
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (first, _) = runtime
+            .reserve_engine(&key, 5001, GIB, tx1)
+            .unwrap()
+            .expect("reserved");
+        // The user unloads (by key — that verb means "whatever is loaded
+        // here") and immediately loads again: a second instance, same key.
+        assert!(runtime.take_engine(&key).is_some());
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        let (second, _) = runtime
+            .reserve_engine(&key, 5002, GIB, tx2)
+            .unwrap()
+            .expect("reserved again");
+        assert_ne!(first, second, "instances are never reused");
+
+        // The first supervisor's health probe finally answers.
+        assert!(
+            !runtime.mark_engine_ready(&key, first),
+            "a stale instance may not promote anything"
+        );
+        assert!(
+            runtime.ready_engine(&key.0, &key.1).is_none(),
+            "the replacement is still warming and must not be advertised"
+        );
+
+        // ...and then its child's death is reported.
+        runtime.fail_instance(&key, first, "llama-server exited".into());
+        assert!(
+            runtime.engine_present(&key),
+            "a stale instance may not delete the engine that replaced it"
+        );
+        assert!(
+            runtime
+                .failures
+                .lock()
+                .expect("failures lock")
+                .get(&key)
+                .is_none(),
+            "nor pin its own failure on the live engine's row"
+        );
+
+        // The live instance still owns its entry, and its own mutations land.
+        assert!(runtime.mark_engine_ready(&key, second));
+        assert_eq!(
+            runtime.ready_engine(&key.0, &key.1),
+            Some(("http://127.0.0.1:5002".to_string(), LOCAL_CONTEXT_TOKENS))
+        );
+        runtime.fail_instance(&key, second, "llama-server exited".into());
+        assert!(!runtime.engine_present(&key));
+        assert!(
+            runtime
+                .failures
+                .lock()
+                .expect("failures lock")
+                .contains_key(&key),
+            "the owning instance's failure is the one that gets reported"
+        );
+    }
+
+    /// Every engine of one backend goes when that backend's row does — and
+    /// nothing else does. See `Inner::retire_backend_engines`.
+    #[test]
+    fn retiring_a_backend_takes_its_engines_and_only_its_engines() {
+        let runtime = LocalRuntime::default();
+        runtime.register_for_test("my-box", "tiny", 5101);
+        runtime.register_for_test("my-box", "other", 5102);
+        runtime.register_for_test("local", "tiny", 5103);
+
+        let taken = runtime.take_backend_engines("my-box");
+        assert_eq!(taken.len(), 2);
+        assert!(!runtime.engine_present(&("my-box".into(), "tiny".into())));
+        assert!(runtime.engine_present(&("local".into(), "tiny".into())));
+        assert!(
+            runtime.take_backend_engines("my-box").is_empty(),
+            "idempotent"
         );
     }
 
@@ -2501,10 +2769,10 @@ mod tests {
 
     #[test]
     fn the_bundled_engine_rule_is_a_sibling_and_nothing_else() {
-        // The sidecar moved from Contents/Resources/bin into Contents/MacOS
-        // (task 55: Apple expects a bundle's executables there, and it makes
-        // the resolver one rule on every platform). The old location must be
-        // gone, not merely deprioritized — a stale candidate would keep a
+        // The bundle's sidecar lives in Contents/MacOS, where Apple expects a
+        // bundle's executables — which is also what makes the resolver one
+        // rule on every platform. The Contents/Resources/bin location must be
+        // absent, not merely deprioritized — a stale candidate would keep a
         // half-migrated bundle silently working and let the two layouts drift.
         let exe = PathBuf::from("/app/Contents/MacOS/Eidola");
         assert_eq!(
