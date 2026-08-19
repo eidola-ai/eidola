@@ -57,6 +57,11 @@ BUILDKIT_IMAGE="moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b
 # `--platform linux/amd64` selects the amd64 variant on any host.
 NIX_IMAGE="nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894"
 
+# `artifact-manifest.json` schema. Distinct from `server-enclave.json`
+# (`schema_version: 1`). Bump when the artifact-entry shape changes (schema
+# 2 added `archiveSha256` on Nix rows). See docs/verification.md.
+MANIFEST_SCHEMA_VERSION=2
+
 # CVM image artifacts for enclave measurement computation.
 # The OVMF firmware version is pinned to match tinfoilsh/measure-image-action.
 CVM_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/eidola/cvm"
@@ -510,7 +515,7 @@ print_oci_partial_for_targets() {
   local -a targets=("$@")
   local target digest jq_filter
 
-  jq_filter='{ schema_version: 1, artifacts: {} }'
+  jq_filter="{ schema_version: ${MANIFEST_SCHEMA_VERSION}, artifacts: {} }"
   for target in "${targets[@]}"; do
     digest="$(metadata_digest "$METADATA_FILE" "$(target_key "$target")")"
     jq_filter+=" | .artifacts[\"eidola-${target}\"] = { type: \"oci\", platform: \"linux/amd64\", digest: \"${digest}\" }"
@@ -555,8 +560,8 @@ print_oci_manifest() {
   done
 
   METADATA_FILE="$saved_metadata_file"
-  printf '%s\n' "$partials_json" | jq '{
-    schema_version: 1,
+  printf '%s\n' "$partials_json" | jq --argjson schema "$MANIFEST_SCHEMA_VERSION" '{
+    schema_version: $schema,
     artifacts: (reduce .[] as $p ({}; . + ($p.artifacts // {})))
   }'
 }
@@ -576,11 +581,12 @@ manifest_arch() {
 
 # Build the Linux GUI via Nix (glibc dynamic binary; see flake.nix for why
 # the GUI can't be a static musl artifact like the server/cli). On a Linux
-# host this runs Nix natively (sets LINUX_GUI_PATH). On any other host (e.g.
-# Darwin) it reproduces CI's native x86_64-linux build inside a pinned
-# linux/amd64 Nix container (sets LINUX_GUI_NARHASH), so `just update-manifest`
-# can compose the *full* manifest from a Mac instead of carrying the Linux GUI
-# entry over stale.
+# host this runs Nix natively (sets LINUX_GUI_PATH + LINUX_GUI_ARCHIVE_PATH).
+# On any other host (e.g. Darwin) it reproduces CI's native x86_64-linux
+# build inside a pinned linux/amd64 Nix container (sets LINUX_GUI_NARHASH
+# and LINUX_GUI_ARCHIVE_SHA256), so `just update-manifest` can compose the
+# *full* manifest from a Mac instead of carrying the Linux GUI entry over
+# stale.
 build_linux_gui_artifact() {
   if [[ "$(uname -s)" == "Linux" ]]; then
     LINUX_GUI_PATH="$(
@@ -590,16 +596,24 @@ build_linux_gui_artifact() {
         --print-out-paths \
         --show-trace
     )"
+    LINUX_GUI_ARCHIVE_PATH="$(
+      nix build \
+        '.#eidola-gui-linux-archive' \
+        --no-link \
+        --print-out-paths \
+        --show-trace
+    )"
   else
     build_linux_gui_via_docker
   fi
 }
 
-# Cross-host Linux GUI build: run `nix build .#eidola-gui-linux` inside a
-# pinned linux/amd64 Nix container and capture the output's narHash into
-# LINUX_GUI_NARHASH. The store path only exists inside the container, so the
-# narHash is computed there via `nix hash path --sri` (byte-identical to
-# `nix path-info`'s narHash — verified against the same store path).
+# Cross-host Linux GUI build: run `nix build .#eidola-gui-linux` (and the
+# matching `-archive` derivation) inside a pinned linux/amd64 Nix container
+# and capture narHash + archiveSha256. The store paths only exist inside
+# the container, so hashes are computed there: `nix hash path --sri` for
+# the payload NAR (byte-identical to `nix path-info`'s narHash) and
+# `nix hash file --base16` for the flake-built `.tar.gz`.
 #
 # Correctness rests on the same determinism CI's linux-gui job trusts: a
 # pinned, sandboxed, reproducible derivation yields an identical narHash
@@ -623,7 +637,7 @@ build_linux_gui_artifact() {
 # emulated build. Bumping NIX_IMAGE keys a new volume so the store is never
 # stale relative to the pinned Nix.
 build_linux_gui_via_docker() {
-  local nix_store_volume digest
+  local nix_store_volume digest hashes
 
   if ! command -v docker >/dev/null 2>&1; then
     echo "error: building the Linux GUI on a non-Linux host requires docker" >&2
@@ -635,7 +649,7 @@ build_linux_gui_via_docker() {
 
   echo "Building Linux GUI in a linux/amd64 Nix container (first run is a cold, emulated build — this is slow)..." >&2
 
-  LINUX_GUI_NARHASH="$(
+  hashes="$(
     docker run --rm --platform linux/amd64 \
       --privileged \
       -v "$REPO_ROOT":/repo \
@@ -649,27 +663,35 @@ sandbox-fallback = false
 filter-syscalls = false"
         git config --global --add safe.directory /repo
         out="$(nix build .#eidola-gui-linux --no-link --print-out-paths --show-trace)"
-        nix hash path --sri "$out"
+        archive="$(nix build .#eidola-gui-linux-archive --no-link --print-out-paths --show-trace)"
+        printf "NARHASH=%s\n" "$(nix hash path --sri "$out")"
+        printf "ARCHIVESHA=%s\n" "$(nix hash file --base16 --type sha256 "$archive")"
       '
   )"
 
-  if [[ -z "$LINUX_GUI_NARHASH" ]]; then
-    echo "error: Linux GUI docker build produced no narHash" >&2
+  LINUX_GUI_NARHASH="$(printf '%s\n' "$hashes" | sed -n 's/^NARHASH=//p')"
+  LINUX_GUI_ARCHIVE_SHA256="$(printf '%s\n' "$hashes" | sed -n 's/^ARCHIVESHA=//p')"
+
+  if [[ -z "$LINUX_GUI_NARHASH" || -z "$LINUX_GUI_ARCHIVE_SHA256" ]]; then
+    echo "error: Linux GUI docker build produced no narHash/archiveSha256" >&2
+    echo "$hashes" >&2
     exit 1
   fi
 }
 
 print_linux_gui_manifest() {
-  local gui_hash arch
+  local gui_hash archive_sha arch
 
   if [[ -n "${LINUX_GUI_NARHASH:-}" ]]; then
     # Cross-host docker path: the container always builds linux/amd64
     # (matching CI), regardless of the host's own arch — so the key/platform
     # are fixed to amd64 rather than derived from `uname -m`.
     gui_hash="$LINUX_GUI_NARHASH"
+    archive_sha="sha256:${LINUX_GUI_ARCHIVE_SHA256}"
     arch="amd64"
-  elif [[ -n "${LINUX_GUI_PATH:-}" ]]; then
+  elif [[ -n "${LINUX_GUI_PATH:-}" && -n "${LINUX_GUI_ARCHIVE_PATH:-}" ]]; then
     gui_hash="$(nix_nar_hash "$LINUX_GUI_PATH")"
+    archive_sha="$(file_sha256 "$LINUX_GUI_ARCHIVE_PATH")"
     arch="$(manifest_arch)"
   else
     echo "error: print_linux_gui_manifest called before build_linux_gui_artifact" >&2
@@ -677,13 +699,20 @@ print_linux_gui_manifest() {
   fi
 
   jq -n \
+    --argjson schema "$MANIFEST_SCHEMA_VERSION" \
     --arg gui_hash "$gui_hash" \
+    --arg archive_sha "$archive_sha" \
     --arg key "eidola-gui-linux-${arch}" \
     --arg platform "linux/${arch}" \
     '{
-      schema_version: 1,
+      schema_version: $schema,
       artifacts: {
-        ($key): { type: "nix", platform: $platform, narHash: $gui_hash }
+        ($key): {
+          type: "nix",
+          platform: $platform,
+          narHash: $gui_hash,
+          archiveSha256: $archive_sha
+        }
       }
     }'
 }
@@ -695,12 +724,12 @@ print_linux_gui_manifest() {
 # and will flag a manifest that is missing a required artifact).
 carry_over_partial() {
   if [[ ! -f "$MANIFEST_FILE" ]]; then
-    jq -n '{ schema_version: 1, artifacts: {} }'
+    jq -n --argjson schema "$MANIFEST_SCHEMA_VERSION" '{ schema_version: $schema, artifacts: {} }'
     return
   fi
 
-  jq -S '{
-    schema_version: 1,
+  jq -S --argjson schema "$MANIFEST_SCHEMA_VERSION" '{
+    schema_version: $schema,
     artifacts: (.artifacts | with_entries(
       select(.key as $k | $ARGS.positional | any(. as $p | $k | startswith($p)))
     ))
@@ -720,10 +749,24 @@ build_macos_artifacts() {
       --print-out-paths \
       --show-trace
   )"
+  CLI_ARCHIVE_PATH="$(
+    nix build \
+      '.#eidola-cli-macos-universal-archive' \
+      --no-link \
+      --print-out-paths \
+      --show-trace
+  )"
 
   GUI_PATH="$(
     nix build \
       '.#eidola-gui-macos-universal' \
+      --no-link \
+      --print-out-paths \
+      --show-trace
+  )"
+  GUI_ARCHIVE_PATH="$(
+    nix build \
+      '.#eidola-gui-macos-universal-archive' \
       --no-link \
       --print-out-paths \
       --show-trace
@@ -737,25 +780,60 @@ nix_nar_hash() {
     | jq -er --arg path "$store_path" '.[$path].narHash | select(type == "string" and startswith("sha256-"))'
 }
 
-print_macos_manifest() {
-  local cli_hash gui_hash
+# SHA-256 of a file as `sha256:` + lowercase hex — comparable with
+# `sha256sum` / `shasum -a 256` without Nix. Prefer those tools; fall
+# back to `nix hash file` when neither is on PATH (the Nix container).
+file_sha256() {
+  local path="$1" hex
 
-  if [[ -z "${CLI_PATH:-}" || -z "${GUI_PATH:-}" ]]; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    hex="$(sha256sum "$path" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    hex="$(shasum -a 256 "$path" | awk '{print $1}')"
+  else
+    hex="$(nix hash file --base16 --type sha256 "$path")"
+  fi
+  if [[ ! "$hex" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "error: could not hash $path (got ${hex:-empty})" >&2
+    return 1
+  fi
+  printf 'sha256:%s\n' "$hex"
+}
+
+print_macos_manifest() {
+  local cli_hash gui_hash cli_archive gui_archive
+
+  if [[ -z "${CLI_PATH:-}" || -z "${GUI_PATH:-}" || -z "${CLI_ARCHIVE_PATH:-}" || -z "${GUI_ARCHIVE_PATH:-}" ]]; then
     echo "error: print_macos_manifest called before build_macos_artifacts" >&2
     return 1
   fi
 
   cli_hash="$(nix_nar_hash "$CLI_PATH")"
   gui_hash="$(nix_nar_hash "$GUI_PATH")"
+  cli_archive="$(file_sha256 "$CLI_ARCHIVE_PATH")"
+  gui_archive="$(file_sha256 "$GUI_ARCHIVE_PATH")"
 
   jq -n \
+    --argjson schema "$MANIFEST_SCHEMA_VERSION" \
     --arg cli_hash "$cli_hash" \
     --arg gui_hash "$gui_hash" \
+    --arg cli_archive "$cli_archive" \
+    --arg gui_archive "$gui_archive" \
     '{
-      schema_version: 1,
+      schema_version: $schema,
       artifacts: {
-        "eidola-cli-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $cli_hash },
-        "eidola-gui-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $gui_hash }
+        "eidola-cli-macos-universal": {
+          type: "nix",
+          platform: "darwin/universal",
+          narHash: $cli_hash,
+          archiveSha256: $cli_archive
+        },
+        "eidola-gui-macos-universal": {
+          type: "nix",
+          platform: "darwin/universal",
+          narHash: $gui_hash,
+          archiveSha256: $gui_archive
+        }
       }
     }'
 }
@@ -786,9 +864,9 @@ merge_partials() {
   fi
 
   local merged
-  merged="$(jq -s '
+  merged="$(jq -s --argjson schema "$MANIFEST_SCHEMA_VERSION" '
     {
-      schema_version: 1,
+      schema_version: $schema,
       artifacts: (reduce .[] as $partial ({}; . + ($partial.artifacts // {})))
     }
   ' "${PARTIAL_FILES[@]}")"
@@ -871,9 +949,9 @@ verify_oci_manifest() {
   PARTIAL_FILES=("$tmp_partial")
 
   actual_norm="$(merge_partials | jq -cS .)"
-  committed_subset="$(jq -cS '
+  committed_subset="$(jq -cS --argjson schema "$MANIFEST_SCHEMA_VERSION" '
     {
-      schema_version: 1,
+      schema_version: $schema,
       artifacts: {
         "eidola-server": .artifacts["eidola-server"],
         "eidola-cli": .artifacts["eidola-cli"],
@@ -970,7 +1048,7 @@ update_manifest() {
     build_linux_gui_artifact
     linux_gui_partial="$(print_linux_gui_manifest)"
     macos_partial="$(carry_over_partial "eidola-cli-macos-" "eidola-gui-macos-")"
-    echo "note: darwin narHashes carried over from committed manifest (not buildable on Linux); CI verifies them" >&2
+    echo "note: darwin narHash/archiveSha256 carried over from committed manifest (not buildable on Linux); CI verifies them" >&2
   fi
 
   # ── Phase 4: compose final artifact-manifest.json ───────────────────────

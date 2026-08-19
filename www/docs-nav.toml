@@ -29,6 +29,7 @@ pages = [
 title = "Release flow"
 pages = [
     ["releases.md", "Releases"],
+    ["verification.md", "Verification"],
     ["trust-root.md", "Trust root"],
     ["apple-distribution.md", "Apple distribution"],
 ]

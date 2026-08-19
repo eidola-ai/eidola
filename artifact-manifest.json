@@ -6,16 +6,19 @@
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
+      "archiveSha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "narHash": "sha256-jectUb9Xi7+gq1pkP7bTcMgpOAI5tKgjooWAxJJBEbw=",
       "platform": "darwin/universal",
       "type": "nix"
     },
     "eidola-gui-linux-amd64": {
+      "archiveSha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "narHash": "sha256-KKvJZlINCwBAemWFD/kQocSnfvAmgu+b5MvgQKenLp4=",
       "platform": "linux/amd64",
       "type": "nix"
     },
     "eidola-gui-macos-universal": {
+      "archiveSha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "narHash": "sha256-wdFGbkTPjHxGj7M9VzIJOh0tJ8W67k5pFux6zGevCSs=",
       "platform": "darwin/universal",
       "type": "nix"
@@ -39,5 +42,5 @@
       "rtmr2": "5f935649c7fbc57c9fa930def584520c1df54b646ae040caf0db46e24854575b182f40b8f88db4f70bc4a31f75d9d3cc"
     }
   },
-  "schema_version": 1
+  "schema_version": 2
 }

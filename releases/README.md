@@ -16,7 +16,7 @@ This file is for contributors who need to *modify* something here.
 | `trust/server-enclave.json` | The paired server enclave measurement (SEV-SNP launch digest, TDX RTMR1/RTMR2, kernel cmdline). Materialized as its own file so the cli build can COPY it without dragging the full manifest into its build context | `crates/eidola-app-core/build.rs` |
 | `trust/attestant-provenance/` | **Informational only** — optional hardware-attestation evidence (e.g. YubiKey-PIV certs) that a pinned attestant fingerprint is a real on-device, policy-constrained key. See its [`README.md`](trust/attestant-provenance/README.md) | nothing — auditor-facing |
 
-Most files here are **build inputs**. The corresponding **build output** — `artifact-manifest.json` at the repo root — is signed by CI and records the digests of what was actually produced. The two are kept separate to prevent build-context self-reference (see [`docs/trust-root.md`](../docs/trust-root.md#why-the-enclave-block-lives-in-its-own-file)).
+Most files here are **build inputs**. The corresponding **build output** — `artifact-manifest.json` at the repo root — is signed by CI and records the digests of what was actually produced (OCI `digest`, Nix `narHash` + `archiveSha256`). The two are kept separate to prevent build-context self-reference (see [`docs/trust-root.md`](../docs/trust-root.md#why-the-enclave-block-lives-in-its-own-file)). How to check a published download: [`docs/verification.md`](../docs/verification.md).
 
 ## Rotation procedures
 

@@ -62,12 +62,12 @@
 //!
 //! | Claim key | Expected value | Derivation |
 //! |---|---|---|
-//! | `manifest.schema_version` | `1` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shape this module's parser understands; a jump is a release-gated trust event (`docs/trust-root.md`) |
+//! | `manifest.schema_version` | `2` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shape this module's parser understands; a jump is a release-gated trust event (`docs/trust-root.md`) |
 //! | `enclave.snp_measurement` | `SEV-SNP launch measurement (48-byte hex)` | the embedded trust root pins a SEV-SNP measurement (`trust_root::SERVER_SNP_MEASUREMENT`), so the paired server's SEV-SNP platform must keep being attested |
 //! | `enclave.tdx_measurement.rtmr1` | `TDX runtime measurement (48-byte hex)` | ditto, `trust_root::SERVER_TDX_RTMR1` |
 //! | `enclave.tdx_measurement.rtmr2` | `TDX runtime measurement (48-byte hex)` | ditto, `trust_root::SERVER_TDX_RTMR2` |
-//! | `enclave.cmdline` | `kernel command line (non-empty)` | manifest schema 1 — the cmdline binds the tinfoil-config hash into the measurement |
-//! | `artifacts.eidola-cli` | `oci (linux/amd64)` | [`EXPECTED_ARTIFACTS`] — the artifact set schema-1 manifests record |
+//! | `enclave.cmdline` | `kernel command line (non-empty)` | manifest schema 2 — the cmdline binds the tinfoil-config hash into the measurement |
+//! | `artifacts.eidola-cli` | `oci (linux/amd64)` | [`EXPECTED_ARTIFACTS`] — the artifact set schema-2 manifests record |
 //! | `artifacts.eidola-cli-macos-universal` | `nix (darwin/universal)` | ditto |
 //! | `artifacts.eidola-gui-linux-amd64` | `nix (linux/amd64)` | ditto |
 //! | `artifacts.eidola-gui-macos-universal` | `nix (darwin/universal)` | ditto |
@@ -96,11 +96,11 @@ use crate::updater::ci_sigstore;
 /// manifest shape [`attested_claims`] walks. A version outside this set is a
 /// *claims change* (authentic but unintelligible to this build), not a
 /// verification failure.
-pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[1];
+pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2];
 
-/// The artifact entries a schema-1 `artifact-manifest.json` is expected to
-/// record, as `(name, type, platform)`. Structure only — digests/narHashes
-/// are values and legitimately change every release.
+/// The artifact entries a schema-2 `artifact-manifest.json` is expected to
+/// record, as `(name, type, platform)`. Structure only — digests / narHashes /
+/// archiveSha256 are values and legitimately change every release.
 pub const EXPECTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     ("eidola-cli", "oci", "linux/amd64"),
     ("eidola-cli-macos-universal", "nix", "darwin/universal"),
@@ -779,10 +779,24 @@ fn describe_artifact(entry: &serde_json::Value) -> String {
                 .get("narHash")
                 .and_then(|d| d.as_str())
                 .is_some_and(|d| d.starts_with("sha256-"));
-            if nar_ok {
+            // archiveSha256 is required on schema-2 rows we produce, but
+            // optional for older attested manifests (the captured v0.0.8
+            // fixture has none). Presence is shape; a present-but-malformed
+            // value is the claims-change signal.
+            let archive_ok = match obj.get("archiveSha256").and_then(|d| d.as_str()) {
+                None => true,
+                Some(s) => {
+                    s.starts_with("sha256:")
+                        && s.len() == "sha256:".len() + 64
+                        && s["sha256:".len()..].chars().all(|c| c.is_ascii_hexdigit())
+                }
+            };
+            if nar_ok && archive_ok {
                 format!("nix ({platform})")
-            } else {
+            } else if !nar_ok {
                 format!("nix ({platform}) — malformed: missing narHash")
+            } else {
+                format!("nix ({platform}) — malformed: expected sha256: hex archiveSha256")
             }
         }
         Some(other) => format!("unrecognized type `{other}` ({platform})"),
@@ -836,9 +850,24 @@ mod tests {
         serde_json::json!({
             "artifacts": {
                 "eidola-cli": {"digest": "sha256:aa", "platform": "linux/amd64", "type": "oci"},
-                "eidola-cli-macos-universal": {"narHash": "sha256-aa", "platform": "darwin/universal", "type": "nix"},
-                "eidola-gui-linux-amd64": {"narHash": "sha256-cc", "platform": "linux/amd64", "type": "nix"},
-                "eidola-gui-macos-universal": {"narHash": "sha256-bb", "platform": "darwin/universal", "type": "nix"},
+                "eidola-cli-macos-universal": {
+                    "archiveSha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "narHash": "sha256-aa",
+                    "platform": "darwin/universal",
+                    "type": "nix"
+                },
+                "eidola-gui-linux-amd64": {
+                    "archiveSha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "narHash": "sha256-cc",
+                    "platform": "linux/amd64",
+                    "type": "nix"
+                },
+                "eidola-gui-macos-universal": {
+                    "archiveSha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "narHash": "sha256-bb",
+                    "platform": "darwin/universal",
+                    "type": "nix"
+                },
                 "eidola-postgres": {"digest": "sha256:bb", "platform": "linux/amd64", "type": "oci"},
                 "eidola-server": {"digest": "sha256:cc", "platform": "linux/amd64", "type": "oci"}
             },
@@ -847,7 +876,7 @@ mod tests {
                 "snp_measurement": "a".repeat(96),
                 "tdx_measurement": {"rtmr1": "b".repeat(96), "rtmr2": "c".repeat(96)}
             },
-            "schema_version": 1
+            "schema_version": 2
         })
     }
 
@@ -894,12 +923,44 @@ mod tests {
     #[test]
     fn schema_version_jump_is_a_delta() {
         let mut manifest = current_manifest();
-        manifest["schema_version"] = serde_json::json!(2);
+        manifest["schema_version"] = serde_json::json!(99);
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].key, "manifest.schema_version");
-        assert_eq!(deltas[0].expected.as_deref(), Some("1"));
-        assert_eq!(deltas[0].attested.as_deref(), Some("2"));
+        assert_eq!(deltas[0].expected.as_deref(), Some("2"));
+        assert_eq!(deltas[0].attested.as_deref(), Some("99"));
+    }
+
+    #[test]
+    fn missing_archive_sha256_is_still_nix() {
+        // Schema-1 fixtures omit archiveSha256; describe_artifact must
+        // still report `nix (platform)` so a captured old release is not
+        // a claims change on that axis.
+        let mut manifest = current_manifest();
+        manifest["artifacts"]["eidola-gui-macos-universal"]
+            .as_object_mut()
+            .unwrap()
+            .remove("archiveSha256");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert!(deltas.is_empty(), "unexpected deltas: {deltas:#?}");
+    }
+
+    #[test]
+    fn malformed_archive_sha256_is_a_delta() {
+        let mut manifest = current_manifest();
+        manifest["artifacts"]["eidola-gui-macos-universal"]["archiveSha256"] =
+            serde_json::json!("not-a-digest");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].key, "artifacts.eidola-gui-macos-universal");
+        assert!(
+            deltas[0]
+                .attested
+                .as_deref()
+                .unwrap()
+                .contains("archiveSha256"),
+            "got: {deltas:?}"
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 The client is the user's entry point and the **arbiter of trust** for every interaction with Eidola. Where most products treat the client as a thin shell around server-side decisions, Eidola treats it as the locus of authority: the client decides what servers to talk to, what code to run, and what to refuse.
 
-This page explains how that authority is structured. For the mechanical detail of what is pinned and how, see [trust-root.md](trust-root.md).
+This page explains how that authority is structured. For the mechanical detail of what is pinned and how, see [trust-root.md](trust-root.md). For how a download is hashed, see [verification.md](verification.md).
 
 ## Fail-safe by design
 

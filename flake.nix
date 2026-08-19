@@ -1117,18 +1117,52 @@ with open(path, "wb") as f:
               };
             };
 
-        # The shippable Linux GUI: the binary above plus bundled Mesa Vulkan
-        # drivers. The host's own ICD manifests are useless to a Nix binary —
-        # distros reference drivers by bare soname (`libvulkan_radeon.so`),
-        # which the loader resolves through the dynamic linker's search path,
+        # Canonical byte-stream of a Nix payload for `archiveSha256`. GNU
+        # tar ustar + gzip -n, timestamps/owners pinned, so the file hash
+        # is a function of the payload tree rather than of the packer host.
+        # `$out` is the `.tar.gz` itself (not a directory). See
+        # docs/verification.md.
+        mkReproducibleArchive =
+          {
+            pname,
+            payload,
+          }:
+          pkgs.runCommand "${pname}.tar.gz"
+            {
+              nativeBuildInputs = [
+                pkgs.gnutar
+                pkgs.gzip
+              ];
+            }
+            ''
+              export LC_ALL=C
+              tar --format=ustar \
+                --sort=name \
+                --mtime=@0 \
+                --owner=0 --group=0 --numeric-owner \
+                --mode=u=rwX,go=rX \
+                -C ${payload} -cf - . \
+              | gzip -n -9 > "$out"
+            '';
+
+        # The shippable Linux GUI: the binary above plus a *copied*
+        # llama-server sidecar (bytes in this NAR — same measurement rule
+        # as macOS) and a *referenced* nixpkgs Mesa ICD set. The host's
+        # own ICD manifests are useless to a Nix binary — distros
+        # reference drivers by bare soname (`libvulkan_radeon.so`), which
+        # the loader resolves through the dynamic linker's search path,
         # i.e. our RUNPATH, never /usr/lib; and dlopening host Mesa into a
-        # Nix glibc invites symbol-version mismatches. Bundling Mesa (whose
-        # Nix ICD manifests carry absolute store paths) makes the artifact's
-        # host surface kernel + compositor socket + /dev/dri, at the cost of
-        # Mesa's closure (~1 GB, LLVM for the llvmpipe fallback included).
-        # VK_ADD_DRIVER_FILES is *additive* and set only as a default, so a
-        # NixOS host's /run/opengl-driver drivers coexist and a user can
-        # override outright.
+        # Nix glibc invites symbol-version mismatches. Bundling Mesa
+        # (whose Nix ICD manifests carry absolute store paths) makes the
+        # artifact's host surface kernel + compositor socket + /dev/dri,
+        # at the cost of Mesa's closure (~1 GB, LLVM for the llvmpipe
+        # fallback included). Those Mesa bytes are *not* copied into
+        # $out: VK_ADD_DRIVER_FILES points at the store, so they sit
+        # outside archiveSha256. A Flatpak against the Freedesktop GL
+        # runtime is how an Ubuntu-shaped installable leaves Mesa out of
+        # our payload entirely. VK_ADD_DRIVER_FILES is *additive* and set
+        # only as a default, so a NixOS host's /run/opengl-driver drivers
+        # coexist and a user can override outright.
         eidolaGuiLinuxWrapped =
           if eidolaGuiLinux == null then
             null
@@ -1139,10 +1173,12 @@ with open(path, "wb") as f:
               }
               ''
                 mkdir -p $out/bin $out/share/applications
+                cp ${llamaServer}/bin/llama-server "$out/bin/llama-server"
+                chmod u+w "$out/bin/llama-server"
                 icds=$(ls ${pkgs.mesa}/share/vulkan/icd.d/*.json | tr '\n' ':')
                 makeWrapper ${eidolaGuiLinux}/bin/eidola-gui $out/bin/eidola-gui \
                   --set-default VK_ADD_DRIVER_FILES "''${icds%:}" \
-                  --set-default EIDOLA_LLAMA_SERVER ${llamaServer}/bin/llama-server
+                  --set-default EIDOLA_LLAMA_SERVER "$out/bin/llama-server"
                 # Desktop entry — basename matches the Wayland app_id the
                 # binary sets (lib.rs APP_ID), which is what lets the shell
                 # resolve our windows to this entry. Strip the comment header
@@ -1179,13 +1215,25 @@ with open(path, "wb") as f:
         }
         // pkgs.lib.optionalAttrs (eidolaCliMacosUniversal != null) {
           eidola-cli-macos-universal = eidolaCliMacosUniversal;
+          eidola-cli-macos-universal-archive = mkReproducibleArchive {
+            pname = "eidola-cli-macos-universal";
+            payload = eidolaCliMacosUniversal;
+          };
         }
         // pkgs.lib.optionalAttrs (eidolaGuiMacosUniversal != null) {
           eidola-gui-macos-universal = eidolaGuiMacosUniversal;
+          eidola-gui-macos-universal-archive = mkReproducibleArchive {
+            pname = "eidola-gui-macos-universal";
+            payload = eidolaGuiMacosUniversal;
+          };
         }
         // pkgs.lib.optionalAttrs (eidolaGuiLinux != null) {
           eidola-gui-linux = eidolaGuiLinuxWrapped;
           eidola-gui-linux-unwrapped = eidolaGuiLinux;
+          eidola-gui-linux-archive = mkReproducibleArchive {
+            pname = "eidola-gui-linux";
+            payload = eidolaGuiLinuxWrapped;
+          };
         };
 
         # Development shell (lightweight — daily Rust dev uses rustup)

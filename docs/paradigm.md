@@ -55,5 +55,6 @@ A note on these docs themselves: they are a map, not the territory. They will be
 - [The server](server.md) — what runs in confidential compute, and what is deliberately kept apart from it.
 - [Inference upstream](upstream.md) — where models actually run.
 - [Releases](releases.md) — how a new binary becomes trustable.
+- [Verification](verification.md) — payload, archive, envelope, installable, and the hashes a user checks.
 - [Known gaps](gaps.md) — what we don't yet defend against.
 - [Trust root](trust-root.md) — the technical specification, for spot-checking rigor.
