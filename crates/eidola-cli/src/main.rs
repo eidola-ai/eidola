@@ -666,8 +666,11 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             Some(AccountCommand::Create { accept_terms }) => {
                 // Consent is captured here, not in app-core: creating an
-                // account records acceptance of the current terms/privacy
-                // versions, so the documents must be surfaced first.
+                // account records acceptance of the terms/privacy versions,
+                // so the documents must be surfaced first. This exact
+                // snapshot is then what `account_create` submits — printing
+                // one set and agreeing to another is the thing passing it
+                // through prevents.
                 let docs = core.current_terms().await?;
                 if !docs.is_empty() && !accept_terms {
                     eprintln!("creating an account means agreeing to:");
@@ -680,10 +683,18 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     eprintln!("re-run with --accept-terms to agree and create the account");
                     std::process::exit(2);
                 }
-                let result = core.account_create().await?;
+                let result = core.account_create(docs).await?;
                 println!("account created");
                 println!("id: {}", result.id);
                 println!("created_at: {}", result.created_at);
+                if !result.terms_recorded {
+                    eprintln!(
+                        "warning: the account exists but its terms acceptance was not \
+                         recorded (the published versions may have moved on) — run \
+                         `eidola account accept-terms` to review and accept the current \
+                         documents"
+                    );
+                }
                 Ok(())
             }
             Some(AccountCommand::AcceptTerms { yes }) => {
@@ -711,8 +722,13 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                         std::process::exit(2);
                     }
                 }
-                let accepted = core.accept_current_terms().await?;
-                println!("accepted {} document(s)", accepted.len());
+                // The displayed snapshot is what gets submitted. If a
+                // version advanced while the prompt was open, the server
+                // refuses the pair rather than recording agreement to text
+                // that was never printed.
+                let count = docs.len();
+                core.accept_terms(docs).await?;
+                println!("accepted {count} document(s)");
                 Ok(())
             }
             Some(AccountCommand::Reset) => {

@@ -293,11 +293,11 @@ fn a_refused_space_creation_says_so_instead_of_showing_a_blank_page(cx: &mut Tes
 
 #[gpui::test]
 fn account_op_error_surfaces_and_clears(cx: &mut TestAppContext) {
-    // `AccountStore::create_account` must store its `Err` (honest-states rule:
-    // the Settings button can't silently do nothing). The banner renders from
-    // the stored error; the next attempt clears it.
+    // An account-lifecycle write must store its `Err` (honest-states rule: the
+    // Settings button can't silently do nothing). The banner renders from the
+    // stored error; the next attempt clears it.
     let stores = stub_stores(cx, |s| {
-        // No account yet — the Account pane shows the "Create account" button.
+        // No account yet — the Account pane shows its account-setup door.
         s.config_state = Some(config_state(false));
         s.eidola_trust = Some(eidola_trust());
     });
@@ -334,8 +334,8 @@ fn account_op_error_surfaces_and_clears(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // A retry clears the error at the start of the attempt. On a stub there is
-    // no backend, so `create_account` clears the field and early-returns.
-    stores.account.update(cx, |s, cx| s.create_account(cx));
+    // no backend, so `reset_account` clears the field and early-returns.
+    stores.account.update(cx, |s, cx| s.reset_account(cx));
     cx.run_until_parked();
     stores.account.read_with(cx, |s, _| {
         assert!(
@@ -7157,6 +7157,47 @@ fn onboarding_checkout_will_not_fund_an_account_linked_over(cx: &mut TestAppCont
         assert!(
             v.checkout_error()
                 .is_some_and(|e| e.contains("account changed"))
+        );
+    });
+}
+
+#[gpui::test]
+fn onboarding_creates_only_against_the_snapshot_it_rendered(cx: &mut TestAppContext) {
+    // Creating an account records acceptance of the terms of service and
+    // privacy policy, and that acceptance is submitted for *the versions this
+    // slide linked to* — `AppCore::account_create` takes the snapshot rather
+    // than re-reading it. So with no snapshot on screen there is nothing the
+    // agreement could be agreement to, and the flow must not create.
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    view.update(cx, |v, cx| v.begin_create(cx));
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.creating_for_test(),
+            "with no documents loaded there is nothing to agree to, so nothing is created"
+        );
+    });
+
+    // The snapshot arrives; now the same click has something to submit.
+    stores.account.update(cx, |s, cx| {
+        s.set_terms_for_test(
+            eidola_gui::loadable::Loadable::loaded(vec![eidola_app_core::TermsDocument {
+                document: "terms_of_service".into(),
+                version: 3,
+                url: "https://example.invalid/terms/".into(),
+                sha256: "a".repeat(64),
+            }]),
+            cx,
+        );
+    });
+    view.update(cx, |v, cx| v.begin_create(cx));
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.creating_for_test(),
+            "with the presented snapshot in hand, creation proceeds"
         );
     });
 }

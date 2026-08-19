@@ -1,10 +1,12 @@
-//! `AccountStore` — balances, prices, and account lifecycle (create / reset /
-//! checkout). Per `crates/eidola-gui/STATE.md` the checkout *poll* is
+//! `AccountStore` — balances, prices, the required-terms snapshot, and
+//! account lifecycle (create / reset / checkout). Per
+//! `crates/eidola-gui/STATE.md` the checkout *poll* is
 //! view-owned (it dies with its window); its result lands here via the bus.
 //!
 //! Two method shapes, distinguished by who owns the task:
 //!
-//! - `refresh_balances` / `refresh_prices` — **fire-and-notify** supersede
+//! - `refresh_balances` / `refresh_prices` / `refresh_terms` —
+//!   **fire-and-notify** supersede
 //!   slots. The store owns the task; callers observe the `Loadable`.
 //! - `request_checkout` / `request_account_create` / `request_balances` —
 //!   **awaitable**. They return a `oneshot::Receiver`; the *caller* awaits it
@@ -15,7 +17,9 @@
 use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AccountCreateResult, AppCore, BalancesResult, PriceInfo, SubscriptionInfo};
+use eidola_app_core::{
+    AccountCreateResult, AppCore, BalancesResult, PriceInfo, SubscriptionInfo, TermsDocument,
+};
 use gpui::{Context, Task};
 use tokio::sync::oneshot;
 
@@ -31,15 +35,18 @@ pub struct AccountStore {
     /// it is refreshed when a surface that shows it opens, and by that
     /// surface's own retry.
     subscription: Loadable<SubscriptionInfo>,
+    /// The document versions the server currently requires acceptance of —
+    /// **the snapshot a consent surface renders and then hands back to
+    /// `request_account_create`**, so what is agreed to is what was shown.
+    /// Empty `Loaded` means the server runs no acceptance gate.
+    terms: Loadable<Vec<TermsDocument>>,
     /// Supersede slots — replacing cancels the predecessor. `Loading` on a
     /// cell implies its slot is `Some`.
     balances_task: Option<Task<()>>,
     prices_task: Option<Task<()>>,
     subscription_task: Option<Task<()>>,
-    /// Slot for the fire-and-notify `create_account` op (its own slot so it
-    /// never cancels a balances/prices refresh).
-    lifecycle_task: Option<Task<()>>,
-    /// The last account-lifecycle write error (create / reset), or `None`.
+    terms_task: Option<Task<()>>,
+    /// The last account-lifecycle write error (today: reset), or `None`.
     /// Honest-states rule: a failed Settings button must say so. Cleared at the
     /// start of the next attempt and on success; rendered by `AccountView`.
     account_op_error: Option<AppError>,
@@ -52,10 +59,11 @@ impl AccountStore {
             balances: Loadable::NotLoaded,
             prices: Loadable::NotLoaded,
             subscription: Loadable::NotLoaded,
+            terms: Loadable::NotLoaded,
             balances_task: None,
             prices_task: None,
             subscription_task: None,
-            lifecycle_task: None,
+            terms_task: None,
             account_op_error: None,
         }
     }
@@ -81,10 +89,11 @@ impl AccountStore {
                 Some(s) => Loadable::loaded(s),
                 None => Loadable::NotLoaded,
             },
+            terms: Loadable::NotLoaded,
             balances_task: None,
             prices_task: None,
             subscription_task: None,
-            lifecycle_task: None,
+            terms_task: None,
             account_op_error: None,
         }
     }
@@ -101,6 +110,12 @@ impl AccountStore {
 
     pub fn subscription(&self) -> &Loadable<SubscriptionInfo> {
         &self.subscription
+    }
+
+    /// The document versions a consent surface must show before an account is
+    /// created. See [`AccountStore::request_account_create`].
+    pub fn terms(&self) -> &Loadable<Vec<TermsDocument>> {
+        &self.terms
     }
 
     /// True while either cell is doing an initial load — the panes' "Loading…"
@@ -161,6 +176,40 @@ impl AccountStore {
                 cx.notify();
             });
         }));
+        cx.notify();
+    }
+
+    /// Re-read the document versions the server requires acceptance of.
+    ///
+    /// A consent surface calls this when it opens and renders the resulting
+    /// snapshot; the *same* snapshot is what
+    /// [`AccountStore::request_account_create`] then submits. Public data —
+    /// no account needed, and nothing here is account-scoped.
+    pub fn refresh_terms(&mut self, cx: &mut Context<Self>) {
+        let Some(core) = self.app_core.clone() else {
+            return;
+        };
+        self.terms = std::mem::take(&mut self.terms).to_loading();
+        self.terms_task = Some(cx.spawn(async move |this, cx| {
+            let result = bridge(core, |c| async move { c.current_terms().await }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.terms = std::mem::take(&mut this.terms).resolve(result);
+                this.terms_task = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Test-only: put the terms cell in an arbitrary state so a behavior test
+    /// can render a consent surface without a backend.
+    #[doc(hidden)]
+    pub fn set_terms_for_test(
+        &mut self,
+        cell: Loadable<Vec<TermsDocument>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.terms = cell;
         cx.notify();
     }
 
@@ -260,16 +309,24 @@ impl AccountStore {
         Some(rx)
     }
 
-    /// Create an anonymous account; the caller (onboarding flow) awaits the
+    /// Create an anonymous account, recording its acceptance of
+    /// `accepted_terms` — **the snapshot the caller rendered**, read from
+    /// [`AccountStore::terms`]. The caller (the consent flow) awaits the
     /// returned receiver inside its own task and refreshes config on success.
     /// `None` on a stub.
+    ///
+    /// The snapshot is a parameter rather than something app-core re-reads,
+    /// so a document version advancing while the consent screen was open is
+    /// refused by the server instead of silently recorded — see
+    /// `AppCore::account_create`.
     pub fn request_account_create(
         &self,
+        accepted_terms: Vec<TermsDocument>,
     ) -> Option<oneshot::Receiver<Result<AccountCreateResult, AppError>>> {
         let core = self.app_core.clone()?;
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {
-            let _ = tx.send(core.account_create().await);
+            let _ = tx.send(core.account_create(accepted_terms).await);
         });
         Some(rx)
     }
@@ -333,8 +390,8 @@ impl AccountStore {
 
     // -- Account lifecycle writes ------------------------------------------
 
-    /// The last account-lifecycle (create / reset) error, if the most recent
-    /// attempt failed. Cleared at the start of the next attempt and on success.
+    /// The last account-lifecycle error, if the most recent attempt failed.
+    /// Cleared at the start of the next attempt and on success.
     pub fn account_op_error(&self) -> Option<&AppError> {
         self.account_op_error.as_ref()
     }
@@ -351,46 +408,9 @@ impl AccountStore {
         cx.notify();
     }
 
-    /// Create an account as a fire-and-notify store op (the Account settings
-    /// pane's "Create account" button). Refreshes prices+balances on success;
-    /// on a real backend it also emits `Change::Config`/`Change::Account`.
-    /// On failure the error is **stored** (honest-states rule — the button must
-    /// not silently do nothing) and rendered by `AccountView`.
-    pub fn create_account(&mut self, cx: &mut Context<Self>) {
-        // Clear any prior error at the start of this attempt.
-        self.account_op_error = None;
-        cx.notify();
-        let Some(core) = self.app_core.clone() else {
-            return;
-        };
-        let task = cx.spawn(async move |this, cx| {
-            let result = bridge(core, |c| async move { c.account_create().await }).await;
-            let _ = this.update(cx, |this, cx| {
-                match result {
-                    Ok(_) => {
-                        this.account_op_error = None;
-                        this.refresh_prices(cx);
-                        this.refresh_balances(cx);
-                        this.refresh_subscription(cx);
-                    }
-                    Err(e) => {
-                        // Surface the failure instead of dropping it.
-                        this.account_op_error = Some(e);
-                        cx.notify();
-                    }
-                }
-            });
-        });
-        // Own the task in its own slot (not `.detach()`): it dies with the
-        // store, never cancels a balances/prices refresh, and the result drives
-        // those refreshes from inside its body.
-        self.lifecycle_task = Some(task);
-        cx.notify();
-    }
-
     /// Reset the account (forget local keys). Synchronous core write; refreshes
     /// the local cells to their now-empty state on the next bus tick. A failed
-    /// reset is stored (same honest-states treatment as create) and rendered.
+    /// reset is stored (the honest-states treatment) and rendered.
     pub fn reset_account(&mut self, cx: &mut Context<Self>) {
         self.account_op_error = None;
         let Some(core) = self.app_core.as_ref() else {

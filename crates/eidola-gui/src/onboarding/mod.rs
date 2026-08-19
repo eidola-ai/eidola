@@ -246,6 +246,14 @@ impl OnboardingView {
         self.slide_tops(window)
     }
 
+    /// Whether an account-create request is in flight — on a stub store the
+    /// request stops at the no-core guard, so this marker is what says the
+    /// view decided to create at all.
+    #[doc(hidden)]
+    pub fn creating_for_test(&self) -> bool {
+        self.creating
+    }
+
     /// The freshly-created account id + secret, if account creation succeeded.
     #[doc(hidden)]
     pub fn created_for_test(&self) -> Option<(String, String)> {
@@ -291,6 +299,13 @@ impl OnboardingView {
             self.stores
                 .account
                 .update(cx, |s, cx| s.refresh_subscription(cx));
+        }
+        // The consent slide must show the versions creation will submit, so
+        // the snapshot is fetched when the slide is revealed rather than held
+        // from launch — the fresher it is, the less chance the server refuses
+        // it as stale on the way back out.
+        if next == Slide::CreateAccount {
+            self.stores.account.update(cx, |s, cx| s.refresh_terms(cx));
         }
         self.pending_scroll = Some(target);
         cx.notify();
@@ -434,15 +449,28 @@ impl OnboardingView {
     /// Create an anonymous account (new-account branch). On success, store the
     /// id/secret, refresh config + balances, and reveal the "Your new account"
     /// slide; on failure, surface the error inline.
+    ///
+    /// Creation carries **the snapshot this slide rendered**, so what is
+    /// agreed to is what was shown. Without one there is nothing to agree to
+    /// and nothing is created (the CTA is disabled in that state; this is the
+    /// same rule stated where it is enforced).
     pub fn begin_create(&mut self, cx: &mut Context<Self>) {
         if self.creating {
             return;
         }
+        let Some(accepted_terms) = self.stores.account.read(cx).terms().value().cloned() else {
+            return;
+        };
         self.creating = true;
         self.create_error = None;
         cx.notify();
 
-        let Some(rx) = self.stores.account.read(cx).request_account_create() else {
+        let Some(rx) = self
+            .stores
+            .account
+            .read(cx)
+            .request_account_create(accepted_terms)
+        else {
             // Stub / no backend: the in-flight marker is the observable state.
             return;
         };
@@ -858,17 +886,26 @@ impl OnboardingView {
                 ),
             }
             .into_any_element(),
-            Slide::CreateAccount => slides::CreateAccount {
-                agreed: self.agreed,
-                creating: self.creating,
-                error: self.create_error.clone(),
-                on_toggle_agree: Box::new(cx.listener(|this, checked: &bool, _, cx| {
-                    this.agreed = *checked;
-                    cx.notify();
-                })),
-                on_create: Box::new(cx.listener(|this, _, _, cx| this.begin_create(cx))),
+            Slide::CreateAccount => {
+                let terms = self.stores.account.read(cx).terms();
+                slides::CreateAccount {
+                    documents: terms.value().cloned(),
+                    loading_documents: terms.is_loading(),
+                    documents_error: terms.error().map(|e| e.to_string()),
+                    agreed: self.agreed,
+                    creating: self.creating,
+                    error: self.create_error.clone(),
+                    on_toggle_agree: Box::new(cx.listener(|this, checked: &bool, _, cx| {
+                        this.agreed = *checked;
+                        cx.notify();
+                    })),
+                    on_create: Box::new(cx.listener(|this, _, _, cx| this.begin_create(cx))),
+                    on_retry_documents: Box::new(cx.listener(|this, _, _, cx| {
+                        this.stores.account.update(cx, |s, cx| s.refresh_terms(cx));
+                    })),
+                }
+                .into_any_element()
             }
-            .into_any_element(),
             Slide::NewAccount => {
                 let (id, secret) = self.created.clone().unwrap_or_default();
                 slides::NewAccount {

@@ -574,6 +574,18 @@ pub struct AccountCreateResult {
     /// is no other API to recover it (losing it means creating a new account).
     pub secret: String,
     pub created_at: i64,
+    /// Whether acceptance of the documents the caller presented was recorded
+    /// against the new account.
+    ///
+    /// `false` means the account exists but carries no acceptance: either the
+    /// round trip failed, or the server refused the pair because those
+    /// versions stopped being current between the caller presenting them and
+    /// the account existing. Both are safe — nothing is recorded for text the
+    /// user did not read, and the server's 428 gate re-prompts with the
+    /// current documents before the first purchase — so this is a notice, not
+    /// a failure. Trivially `true` when the caller presented nothing (a
+    /// server with no acceptance gate configured).
+    pub terms_recorded: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2158,7 +2170,10 @@ impl Inner {
         })
     }
 
-    async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
+    async fn account_create(
+        &self,
+        accepted_terms: Vec<TermsDocument>,
+    ) -> Result<AccountCreateResult, AppError> {
         let cfg = self.load_config();
 
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
@@ -2190,18 +2205,26 @@ impl Inner {
         cfg.save_to(&self.config_path)?;
         self.bus.emit(Change::Config);
 
-        // Record acceptance of the currently required terms/privacy versions
-        // against the new account. The caller is responsible for having
-        // presented the documents first (the GUI's consent checkbox, the
-        // CLI's --accept-terms flag). Best-effort: if this fails, the
-        // server's 428 gate re-prompts at the first purchase or conversion,
-        // so a network blip here must not fail the already-created account.
-        let _ = self.accept_current_terms().await;
+        // Record the user's acceptance of exactly the documents the caller
+        // presented — never a freshly fetched set, which would record consent
+        // for text nobody read if a version advanced between the two.
+        // Passing the pairs through makes that impossible: the server only
+        // records a `(document, sha256)` pair it still requires, and answers
+        // a stale one with a conflict.
+        //
+        // Best-effort by design. The account exists either way, and both ways
+        // this can fail — a network blip, or those versions having gone stale
+        // — leave the server holding no acceptance for it, which the 428 gate
+        // resolves by re-prompting with the current text before the first
+        // purchase. Failing the call would strand a created account instead.
+        // The outcome is reported rather than swallowed: see `terms_recorded`.
+        let terms_recorded = self.accept_terms(accepted_terms).await.is_ok();
 
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
             secret: created.secret,
             created_at: iso_to_ms(&created.created_at)?,
+            terms_recorded,
         })
     }
 
@@ -2239,15 +2262,20 @@ impl Inner {
             .collect())
     }
 
-    /// Record acceptance of every currently required document version
-    /// against the configured account, returning what was accepted.
+    /// Record the configured account's acceptance of exactly the documents
+    /// `presented` — the snapshot the caller obtained from `current_terms`
+    /// and showed the user.
     ///
-    /// Callers are responsible for having *presented* the documents to the
-    /// user first — this method transmits consent, it does not obtain it.
-    async fn accept_current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
-        let docs = self.current_terms().await?;
-        if docs.is_empty() {
-            return Ok(docs);
+    /// The snapshot is an *input*, deliberately: this method transmits
+    /// consent, it does not obtain it, and re-reading the current documents
+    /// here would transmit consent for whatever the server requires now
+    /// rather than for what the user read. The server accepts a
+    /// `(document, sha256)` pair only while it is still required, so a
+    /// version that advanced mid-flow surfaces as a conflict instead of a
+    /// silent acceptance.
+    async fn accept_terms(&self, presented: Vec<TermsDocument>) -> Result<(), AppError> {
+        if presented.is_empty() {
+            return Ok(());
         }
 
         let cfg = self.load_config();
@@ -2256,7 +2284,7 @@ impl Inner {
         let (id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&eidola, None).await?;
 
-        for d in &docs {
+        for d in &presented {
             let resp = client
                 .post(format!("{base_url}/v1/account/terms"))
                 .basic_auth(id, Some(secret))
@@ -2272,7 +2300,7 @@ impl Inner {
             check_status(status, &body)?;
         }
 
-        Ok(docs)
+        Ok(())
     }
 
     async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
@@ -8729,10 +8757,17 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    pub async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
+    /// Create an anonymous account and record its acceptance of
+    /// `accepted_terms` — the snapshot [`AppCore::current_terms`] returned
+    /// and the caller **presented to the user**. Pass an empty list only
+    /// when nothing was required to present.
+    pub async fn account_create(
+        &self,
+        accepted_terms: Vec<TermsDocument>,
+    ) -> Result<AccountCreateResult, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.account_create().await })
+            .spawn(async move { inner.account_create(accepted_terms).await })
             .await
             .map_err(join_err)?
     }
@@ -8748,14 +8783,18 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// Record the user's acceptance of every currently required document
-    /// version, returning what was accepted. Callers must have presented
-    /// the documents to the user first — this transmits consent, it does
-    /// not obtain it. Routes here after [`AppError::TermsAcceptanceRequired`].
-    pub async fn accept_current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+    /// Record the user's acceptance of `presented` — the snapshot
+    /// [`AppCore::current_terms`] returned and the caller showed the user.
+    ///
+    /// The snapshot travels as an argument so that consent is transmitted for
+    /// the text that was read: a document version advancing between the two
+    /// calls is answered by the server as a conflict, which the
+    /// [`AppError::TermsAcceptanceRequired`] gate then re-prompts for with
+    /// the new text. Routes here after that error.
+    pub async fn accept_terms(&self, presented: Vec<TermsDocument>) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.accept_current_terms().await })
+            .spawn(async move { inner.accept_terms(presented).await })
             .await
             .map_err(join_err)?
     }
