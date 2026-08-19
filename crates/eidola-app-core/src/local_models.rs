@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +70,15 @@ const ENGINE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 
 /// Minimum interval between download-progress bus emissions.
 const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How long a download may go without receiving anything before it is
+/// declared stalled. A read timeout, not a total one: multi-gigabyte models
+/// legitimately take hours on a slow link, but a connection that delivers
+/// nothing for this long is dead. The shared HTTP client sets no timeout of
+/// its own — it also carries loopback engine traffic, where a long silence
+/// while a model processes a prompt is normal — so the bound lives here,
+/// where it means only "this transfer".
+const DOWNLOAD_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // ============================================================================
 // Curated catalog — the official Google Gemma 4 QAT GGUF releases.
@@ -264,7 +273,13 @@ struct DownloadEntry {
     received: AtomicU64,
     /// 0 = unknown (no Content-Length yet).
     total: AtomicU64,
-    cancel: AtomicBool,
+    /// Set once when the user cancels — a watch channel rather than a flag
+    /// because the transfer must be *woken*, not polled. A flag can only be
+    /// noticed between chunks, so a server that stalls mid-response (or never
+    /// answers at all) left a cancelled download blocked in its read forever:
+    /// the partial file stayed, the map entry stayed, and every retry was
+    /// refused as already downloading.
+    cancel: tokio::sync::watch::Sender<bool>,
 }
 
 /// Identity of one engine **instance** — a single `llama-server` child and
@@ -883,8 +898,23 @@ pub(crate) fn engine_key_for_id(id: &str) -> EngineKey {
 /// collapse in app-core's own map.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelDownloadTarget {
-    /// The URL the bytes are fetched from (normalized).
+    /// The URL the bytes are actually fetched from: the caller's own URL,
+    /// query string included, with a Hugging Face `/blob/` page rewritten to
+    /// its `/resolve/` object.
+    ///
+    /// **The query is not decoration.** A direct link to a model on S3 or a
+    /// CDN commonly carries its authorization in the query
+    /// (`?token=…`, `?X-Amz-Signature=…`), so a request made without it is a
+    /// request that fails — while the *path* is all that identifies the file.
+    /// Hence the split: inspection and identity below read the path, and only
+    /// this field is handed to the HTTP client.
     pub url: String,
+    /// The same URL with query and fragment removed — what is recorded beside
+    /// the file and shown as its source. Provenance, never a request: a
+    /// signed URL's token is a short-lived credential that has no business
+    /// being written to disk, and it says nothing about where the model came
+    /// from that the path does not.
+    pub canonical_url: String,
     /// The file name they are written under.
     pub file_name: String,
     /// The `<slug>` of the resulting `<slug>@local` id — the transfer's identity.
@@ -902,10 +932,20 @@ pub fn resolve_model_download(input: &str) -> Result<ModelDownloadTarget, AppErr
     let (url, file_name) = normalize_model_url(input)?;
     let slug = slug_for_file(&file_name);
     Ok(ModelDownloadTarget {
+        canonical_url: strip_query(&url).to_string(),
         url,
         file_name,
         slug,
     })
+}
+
+/// A URL without its query or fragment — the part that names the file.
+fn strip_query(url: &str) -> &str {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment)
 }
 
 /// Normalize a pasted model URL into `(download_url, file_name)`.
@@ -915,6 +955,16 @@ pub fn resolve_model_download(input: &str) -> Result<ModelDownloadTarget, AppErr
 /// download instead of rendering HTML. Anything without a `.gguf` final
 /// path segment is rejected — better an honest error at paste time than a
 /// half-downloaded HTML page named like a model.
+///
+/// **The query is stripped for inspection, not from the download.** What the
+/// file is called, whether it is a `.gguf` at all, and which transfer it
+/// identifies are all decided on the path alone, so every equivalent spelling
+/// of one model still collapses onto one `file_name` (and one slug) —
+/// the identity `download_local_model` and its callers key on. But the URL
+/// returned here is the one that gets requested, and dropping its query would
+/// strip the authorization a signed S3/CDN link carries, turning a link that
+/// validates into a download that 403s. The fragment is dropped outright: it
+/// is never sent to a server.
 pub fn normalize_model_url(input: &str) -> Result<(String, String), AppError> {
     let raw = input.trim();
     if raw.is_empty() {
@@ -927,22 +977,24 @@ pub fn normalize_model_url(input: &str) -> Result<(String, String), AppError> {
             message: "model URL must start with https://".into(),
         });
     }
-    // Drop query/fragment (e.g. `?download=true`) before inspecting the path.
+    // Split off the query (e.g. `?download=true`, or a signed link's
+    // credentials) and drop the fragment. Everything below inspects the path;
+    // the query rides along to the request untouched.
     let without_fragment = raw.split('#').next().unwrap_or(raw);
-    let path_part = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
+    let (path_part, query) = match without_fragment.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (without_fragment, None),
+    };
 
     // Hugging Face file-page URLs use `/blob/<rev>/...`; the raw object
     // lives at `/resolve/<rev>/...`.
-    let url = if path_part.contains("huggingface.co/") {
+    let path = if path_part.contains("huggingface.co/") {
         path_part.replacen("/blob/", "/resolve/", 1)
     } else {
         path_part.to_string()
     };
 
-    let file_name = url.rsplit('/').next().unwrap_or_default().to_string();
+    let file_name = path.rsplit('/').next().unwrap_or_default().to_string();
     if !file_name.to_ascii_lowercase().ends_with(".gguf") {
         return Err(AppError::LocalModel {
             message: format!(
@@ -963,6 +1015,10 @@ pub fn normalize_model_url(input: &str) -> Result<(String, String), AppError> {
             message: format!("model file name contains unsupported characters: `{file_name}`"),
         });
     }
+    let url = match query {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
     Ok((url, file_name))
 }
 
@@ -1451,6 +1507,7 @@ impl Inner {
     pub(crate) async fn download_local_model(&self, url: &str) -> Result<String, AppError> {
         let ModelDownloadTarget {
             url: download_url,
+            canonical_url,
             file_name,
             slug,
         } = resolve_model_download(url)?;
@@ -1465,16 +1522,19 @@ impl Inner {
 
         let display_name = LOCAL_MODEL_CATALOG
             .iter()
-            .find(|c| c.file_name == file_name || c.url == download_url)
+            .find(|c| c.file_name == file_name || c.url == canonical_url)
             .map(|c| c.display_name.to_string())
             .unwrap_or_else(|| prettify_stem(&slug));
 
         let entry = Arc::new(DownloadEntry {
             display_name,
-            source_url: download_url.clone(),
+            // Provenance, not a request: the sidecar written beside the
+            // finished file records this, and a signed link's credentials
+            // must not be what is left on disk.
+            source_url: canonical_url,
             received: AtomicU64::new(0),
             total: AtomicU64::new(0),
-            cancel: AtomicBool::new(false),
+            cancel: tokio::sync::watch::Sender::new(false),
         });
         {
             let mut downloads = self.local.downloads.lock().expect("downloads lock");
@@ -1498,8 +1558,11 @@ impl Inner {
         let local = self.local.clone();
         let slug_task = slug.clone();
         // The normalized URL round-trips through `normalize_model_url` (a
-        // direct `.gguf` URL is its own normal form), so recording it is
-        // enough for a retry to re-enter this method unchanged.
+        // direct `.gguf` URL, query and all, is its own normal form), so
+        // recording it is enough for a retry to re-enter this method
+        // unchanged — including the authorization a signed link carries,
+        // without which the retry could only fail. This lives in the
+        // in-memory failure map and never reaches the disk.
         let retry_url = download_url.clone();
         // Core-owned transfer task: survives any window; cancellation is the
         // explicit flag, checked between chunks.
@@ -1532,7 +1595,7 @@ impl Inner {
         let downloads = self.local.downloads.lock().expect("downloads lock");
         match downloads.get(&slug) {
             Some(entry) => {
-                entry.cancel.store(true, Ordering::Relaxed);
+                entry.cancel.send_replace(true);
                 Ok(())
             }
             None => Err(AppError::LocalModel {
@@ -1988,9 +2051,13 @@ async fn remove_partial(path: &Path) {
 }
 
 /// Stream `url` to `<dir>/<file_name>.part`, then write the sidecar and
-/// rename into place. Cancellation is checked between chunks; any failure
-/// removes the partial file. Returns `Ok` for both completion and
-/// cancellation — only real failures are recorded.
+/// rename into place. Any failure removes the partial file. Returns `Ok` for
+/// both completion and cancellation — only real failures are recorded.
+///
+/// Cancellation and the stall timeout race **every** network wait, from the
+/// request itself through each chunk: a press of Cancel has to reach a
+/// transfer that is blocked on a server that stopped talking, which is
+/// exactly when a user reaches for it.
 async fn run_download(
     client: &reqwest::Client,
     url: &str,
@@ -2010,13 +2077,33 @@ async fn run_download(
     let part_path = dir.join(format!("{file_name}.part"));
     let final_path = dir.join(file_name);
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| AppError::LocalModel {
+    /// Why a network wait ended other than by producing bytes.
+    enum Interrupted {
+        Cancelled,
+        Stalled,
+    }
+    let stalled = || AppError::LocalModel {
+        message: format!(
+            "download stalled: nothing received for {}s",
+            DOWNLOAD_STALL_TIMEOUT.as_secs()
+        ),
+    };
+    let mut cancelled = entry.cancel.subscribe();
+
+    let sent = tokio::select! {
+        biased;
+        _ = cancelled.wait_for(|c| *c) => Err(Interrupted::Cancelled),
+        _ = tokio::time::sleep(DOWNLOAD_STALL_TIMEOUT) => Err(Interrupted::Stalled),
+        sent = client.get(url).send() => Ok(sent),
+    };
+    let response = match sent {
+        Ok(sent) => sent.map_err(|e| AppError::LocalModel {
             message: format!("download failed: {e}"),
-        })?;
+        })?,
+        // Nothing was created yet, so there is nothing to clean up.
+        Err(Interrupted::Cancelled) => return Ok(()),
+        Err(Interrupted::Stalled) => return Err(stalled()),
+    };
     if !response.status().is_success() {
         return Err(AppError::LocalModel {
             message: format!("download failed: HTTP {}", response.status().as_u16()),
@@ -2034,12 +2121,30 @@ async fn run_download(
 
     let mut stream = response.bytes_stream();
     let mut last_emit = std::time::Instant::now();
-    while let Some(chunk) = stream.next().await {
-        if entry.cancel.load(Ordering::Relaxed) {
-            drop(file);
-            remove_partial(&part_path).await;
-            return Ok(());
-        }
+    loop {
+        // A fresh timer per chunk: the bound is on silence, not on the
+        // transfer's length.
+        let read = tokio::select! {
+            biased;
+            _ = cancelled.wait_for(|c| *c) => Err(Interrupted::Cancelled),
+            _ = tokio::time::sleep(DOWNLOAD_STALL_TIMEOUT) => Err(Interrupted::Stalled),
+            chunk = stream.next() => Ok(chunk),
+        };
+        let chunk = match read {
+            Ok(Some(chunk)) => chunk,
+            // The response ended.
+            Ok(None) => break,
+            Err(Interrupted::Cancelled) => {
+                drop(file);
+                remove_partial(&part_path).await;
+                return Ok(());
+            }
+            Err(Interrupted::Stalled) => {
+                drop(file);
+                remove_partial(&part_path).await;
+                return Err(stalled());
+            }
+        };
         let bytes = match chunk {
             Ok(b) => b,
             Err(e) => {
@@ -2331,16 +2436,35 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rewrites_hf_blob_urls_and_strips_query() {
+    fn normalize_rewrites_hf_blob_urls_and_keeps_the_query() {
         let (url, name) = normalize_model_url(
-            "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/blob/main/gemma-4-12b-it-qat-q4_0.gguf?download=true",
+            "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/blob/main/gemma-4-12b-it-qat-q4_0.gguf?download=true#anchor",
         )
         .unwrap();
         assert_eq!(
             url,
-            "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf"
+            "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf?download=true",
+            "the page URL is rewritten to the object; the query rides along"
         );
         assert_eq!(name, "gemma-4-12b-it-qat-q4_0.gguf");
+    }
+
+    /// A direct link's query is its **authorization**, not decoration: signed
+    /// S3/CDN model links carry `?token=…`, and a request made without it is a
+    /// request that 403s. So the query is stripped for *inspection* — the file
+    /// name, the `.gguf` check, the transfer's identity — and kept on the URL
+    /// that is actually fetched.
+    #[test]
+    fn a_signed_urls_authorization_survives_to_the_fetch() {
+        let signed = "https://cdn.example.com/models/tiny.gguf?token=abc123&X-Amz-Expires=900";
+        let target = resolve_model_download(signed).expect("resolves");
+        assert_eq!(target.url, signed, "the fetch keeps every query parameter");
+        assert_eq!(target.file_name, "tiny.gguf");
+        assert_eq!(target.slug, "tiny");
+        assert_eq!(
+            target.canonical_url, "https://cdn.example.com/models/tiny.gguf",
+            "provenance carries no credential"
+        );
     }
 
     /// Equivalent spellings of one model resolve to one transfer identity.
@@ -2361,8 +2485,20 @@ mod tests {
         assert_eq!(first.slug, "gemma-4-12b-it-qat-q4_0");
         for spelling in &spellings[1..] {
             let target = resolve_model_download(spelling).expect("resolves");
-            assert_eq!(target, first, "`{spelling}` names the same transfer");
+            assert_eq!(
+                (&target.slug, &target.file_name, &target.canonical_url),
+                (&first.slug, &first.file_name, &first.canonical_url),
+                "`{spelling}` names the same transfer"
+            );
         }
+        // Identity is the path's alone, so two spellings that differ *only*
+        // in their query — one signed link and its refreshed twin — are still
+        // one transfer, and the second is refused rather than started again.
+        let base = format!("{base}/resolve/main/{file}");
+        let signed = resolve_model_download(&format!("{base}?token=one")).expect("resolves");
+        let refreshed = resolve_model_download(&format!("{base}?token=two")).expect("resolves");
+        assert_eq!(signed.slug, refreshed.slug);
+        assert_ne!(signed.url, refreshed.url, "each fetches with its own token");
     }
 
     #[test]

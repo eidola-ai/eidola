@@ -71,6 +71,142 @@ fn wait_for_state(
 // Downloads
 // ===========================================================================
 
+/// A direct model link's query is its authorization — signed S3/CDN links
+/// carry `?token=…` — so the request must go out with it. Only the *path*
+/// decides what the file is called and which transfer it identifies, which is
+/// why the query can be stripped for inspection and still ride along to the
+/// fetch.
+#[test]
+fn a_signed_download_url_is_fetched_with_its_authorization() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let mock = core.runtime().block_on(async {
+            let mock = wiremock::MockServer::start().await;
+            // The object is served *only* to a request that presents the
+            // token; anything else is the 403 a stripped signature earns.
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/models/signed-model.gguf"))
+                .and(wiremock::matchers::query_param("token", "s3cret"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0x47u8; 2048]),
+                )
+                .mount(&mock)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(403))
+                .mount(&mock)
+                .await;
+            mock
+        });
+
+        let url = format!("{}/models/signed-model.gguf?token=s3cret", mock.uri());
+        core.runtime()
+            .block_on(core.download_local_model(url))
+            .expect("download starts");
+
+        let state = wait_for_state(&core, |s| {
+            s.models
+                .iter()
+                .any(|m| m.slug == "signed-model" && m.status == LocalModelStatus::Available)
+        });
+        let model = state
+            .models
+            .iter()
+            .find(|m| m.slug == "signed-model")
+            .unwrap();
+        assert_eq!(model.last_error, None, "the signed URL downloads");
+        assert_eq!(model.size_bytes, Some(2048));
+        // What is recorded beside the file is provenance, not a credential:
+        // the token is short-lived, says nothing about where the model came
+        // from, and has no business on disk.
+        assert_eq!(
+            model.source_url.as_deref(),
+            Some(format!("{}/models/signed-model.gguf", mock.uri()).as_str()),
+            "the sidecar records the URL without its query"
+        );
+        let sidecar = dir.path().join("data/models/signed-model.gguf.meta.json");
+        let written = std::fs::read_to_string(&sidecar).expect("sidecar");
+        assert!(
+            !written.contains("s3cret"),
+            "no credential may be written beside the model: {written}"
+        );
+    });
+}
+
+/// A server that answers with a `Content-Length` it never satisfies: headers,
+/// a first chunk, then silence with the socket held open — the shape of a
+/// transfer that dies mid-response. Returns its port.
+fn stalling_download_server(rt: &tokio::runtime::Runtime) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    rt.spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n")
+                .await;
+            let _ = sock.write_all(&[0x47u8; 1024]).await;
+            let _ = sock.flush().await;
+            // Held, and silent from here.
+            held.push(sock);
+        }
+    });
+    port
+}
+
+/// Cancel must reach a transfer that is blocked on the network.
+///
+/// The shared HTTP client sets no request timeout, so a server that stops
+/// talking mid-response leaves the read pending indefinitely. A cancellation
+/// that is only *checked between chunks* never runs: the partial file stays,
+/// the entry stays in the download map, and every retry is refused as already
+/// downloading — the transfer becomes unstoppable and unrepeatable at once.
+#[test]
+fn cancelling_a_stalled_download_interrupts_the_blocked_read() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let port = stalling_download_server(core.runtime());
+        let url = format!("http://127.0.0.1:{port}/stalled.gguf");
+
+        core.runtime()
+            .block_on(core.download_local_model(url.clone()))
+            .expect("download starts");
+        // Bytes have arrived and the next read is blocked on a silent server.
+        wait_for_state(&core, |s| {
+            s.models.iter().any(|m| {
+                m.slug == "stalled"
+                    && matches!(m.status, LocalModelStatus::Downloading { received, .. }
+                        if received > 0)
+            })
+        });
+
+        core.runtime()
+            .block_on(core.cancel_local_model_download("stalled@local".into()))
+            .expect("cancel");
+
+        // The transfer actually ends: no row, no partial file, and no
+        // failure — a cancellation is not an error.
+        wait_for_state(&core, |s| !s.models.iter().any(|m| m.slug == "stalled"));
+        assert!(
+            !dir.path().join("data/models/stalled.gguf.part").exists(),
+            "the partial file is removed"
+        );
+
+        // And the slug is free again, so the user can try once more.
+        core.runtime()
+            .block_on(core.download_local_model(url))
+            .expect("a cancelled download can be retried");
+        core.runtime()
+            .block_on(core.cancel_local_model_download("stalled@local".into()))
+            .expect("cancel the retry too");
+    });
+}
+
 #[test]
 fn download_persists_model_and_emits() {
     run(|| {
