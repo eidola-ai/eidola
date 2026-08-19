@@ -39,6 +39,8 @@ struct Config {
     terms_feed_base_url: Option<String>,
     /// How often the terms feed re-polls.
     terms_refresh: std::time::Duration,
+    /// How often `src/upstream_trust` re-checks Tinfoil's latest release.
+    upstream_refresh: std::time::Duration,
 }
 
 impl Config {
@@ -154,17 +156,16 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches('/').to_string());
 
-        let terms_refresh = std::time::Duration::from_secs(
-            std::env::var("TERMS_REFRESH_SECS")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    s.parse::<u64>()
-                        .map_err(|_| "TERMS_REFRESH_SECS must be a positive integer".to_string())
-                })
-                .transpose()?
-                .unwrap_or(600),
-        );
+        // Both refresh periods go through the same guard: each drives a
+        // detached loop where zero is a live-process failure (a panicked
+        // ticker, or a poll with no sleep between passes), so it is refused
+        // here instead.
+        let terms_refresh =
+            eidola_server::helpers::refresh_secs_from_env("TERMS_REFRESH_SECS", 600)?;
+        let upstream_refresh = eidola_server::helpers::refresh_secs_from_env(
+            "TINFOIL_MEASUREMENT_REFRESH_SECS",
+            eidola_server::upstream_trust::DEFAULT_REFRESH_SECS,
+        )?;
 
         let mut terms_seed = Vec::new();
         for (document, hash_var, version_var, url_var, default_url) in [
@@ -228,6 +229,7 @@ impl Config {
             terms_seed,
             terms_feed_base_url,
             terms_refresh,
+            upstream_refresh,
         })
     }
 }
@@ -393,7 +395,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         e
     })?;
     let client_cell = upstream.client_cell();
-    std::sync::Arc::clone(&upstream).spawn_refresh();
+    std::sync::Arc::clone(&upstream).spawn_refresh(config.upstream_refresh);
 
     // Readiness: attest the enclave once through the current client, failing
     // fast at startup if the upstream is misconfigured or attestation fails.
