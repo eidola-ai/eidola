@@ -4,7 +4,7 @@ use std::io::{IsTerminal, Write};
 
 use clap::{Parser, Subcommand};
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ChatStreamEvent, config};
+use eidola_app_core::{AppCore, ChatStreamEvent, TermsDocument, config};
 
 #[derive(Parser)]
 #[command(name = "eidola", about = "Eidola CLI")]
@@ -156,9 +156,10 @@ enum UpdateCommand {
 enum AccountCommand {
     /// Create a new account on the server
     Create {
-        /// Agree to the current terms of service and privacy policy.
-        /// Required when the server has an acceptance gate configured;
-        /// run without it to see the documents first.
+        /// Agree to the terms of service and privacy policy printed by this
+        /// invocation. Required when the server has an acceptance gate
+        /// configured; the documents are printed either way, and only the
+        /// versions printed here are submitted.
         #[arg(long)]
         accept_terms: bool,
     },
@@ -668,18 +669,23 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 // Consent is captured here, not in app-core: creating an
                 // account records acceptance of the terms/privacy versions,
                 // so the documents must be surfaced first. This exact
-                // snapshot is then what `account_create` submits — printing
-                // one set and agreeing to another is the thing passing it
-                // through prevents.
+                // snapshot is then what `account_create` submits.
                 let docs = core.current_terms().await?;
-                if !docs.is_empty() && !accept_terms {
+                let consent = CreateConsent::decide(!docs.is_empty(), accept_terms);
+                if consent.displays() {
+                    // **Printed on every path that submits.** `--accept-terms`
+                    // skips the second invocation, never the display: the flag
+                    // claims agreement to these documents, and it could not
+                    // claim it about text this run never showed. Fetching once
+                    // and printing what is submitted also closes the rerun
+                    // race — read version 1, rerun with the flag after version
+                    // 2 is published, and version 2 is what gets printed.
                     eprintln!("creating an account means agreeing to:");
-                    for d in &docs {
-                        eprintln!(
-                            "  {} v{} — {} (sha256 {})",
-                            d.document, d.version, d.url, d.sha256
-                        );
+                    for line in terms_lines(&docs) {
+                        eprintln!("{line}");
                     }
+                }
+                if !consent.creates() {
                     eprintln!("re-run with --accept-terms to agree and create the account");
                     std::process::exit(2);
                 }
@@ -703,12 +709,11 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     println!("the server requires no terms acceptance");
                     return Ok(());
                 }
+                // Unconditional, above the `--yes` branch: that flag skips
+                // the *prompt*, never the display.
                 println!("the server requires acceptance of:");
-                for d in &docs {
-                    println!(
-                        "  {} v{} — {} (sha256 {})",
-                        d.document, d.version, d.url, d.sha256
-                    );
+                for line in terms_lines(&docs) {
+                    println!("{line}");
                 }
                 if !yes {
                     use std::io::Write;
@@ -1622,12 +1627,121 @@ fn print_indented(text: &str, indent: usize) {
     }
 }
 
+/// One line per document: what it is, which version, where to read it, and
+/// the hash of the exact text. **Every path that submits a snapshot renders it
+/// through this first** — see [`CreateConsent`].
+fn terms_lines(documents: &[TermsDocument]) -> impl Iterator<Item = String> + '_ {
+    documents.iter().map(|d| {
+        format!(
+            "  {} v{} — {} (sha256 {})",
+            d.document, d.version, d.url, d.sha256
+        )
+    })
+}
+
+/// What `account create` does about consent, decided from the fetched
+/// snapshot and `--accept-terms`.
+///
+/// It exists as a decision rather than a chain of conditions so the rule it
+/// enforces is checkable: **no outcome creates an account against documents
+/// this invocation did not print.** The flag governs whether a *second*
+/// invocation is needed, never whether the documents are shown — a claim of
+/// agreement cannot be made about text the reader was given no chance to see,
+/// and it was that coupling (`!docs.is_empty() && !accept_terms` gating the
+/// print) that let `--accept-terms` submit an unprinted version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateConsent {
+    /// The server runs no acceptance gate: nothing to show, nothing recorded.
+    Nothing,
+    /// Show the documents and stop — agreement has not been given yet.
+    ShowThenStop,
+    /// Show the documents and create the account against them.
+    ShowThenCreate,
+}
+
+impl CreateConsent {
+    fn decide(has_documents: bool, accept_terms: bool) -> Self {
+        match (has_documents, accept_terms) {
+            (false, _) => Self::Nothing,
+            (true, false) => Self::ShowThenStop,
+            (true, true) => Self::ShowThenCreate,
+        }
+    }
+
+    /// Whether the documents are put in front of the reader.
+    fn displays(self) -> bool {
+        matches!(self, Self::ShowThenStop | Self::ShowThenCreate)
+    }
+
+    /// Whether the account is created — and so whether the snapshot is
+    /// submitted as accepted.
+    fn creates(self) -> bool {
+        matches!(self, Self::Nothing | Self::ShowThenCreate)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use eidola_app_core::{
         ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState, RunningEngine,
     };
+
+    #[test]
+    fn account_create_never_submits_documents_it_did_not_print() {
+        // The whole rule, over every input: an invocation that records
+        // acceptance has shown what it is recording acceptance of. Written as
+        // an exhaustive sweep rather than a case list, because the defect was
+        // exactly one combination (`--accept-terms` with a gate configured)
+        // silently skipping the display.
+        for has_documents in [false, true] {
+            for accept_terms in [false, true] {
+                let consent = CreateConsent::decide(has_documents, accept_terms);
+                assert!(
+                    !(consent.creates() && has_documents && !consent.displays()),
+                    "has_documents={has_documents}, accept_terms={accept_terms}: \
+                     created against documents that were never printed ({consent:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_flag_decides_the_stop_not_the_display() {
+        // Both flag states show the documents; only the stop differs.
+        assert_eq!(
+            CreateConsent::decide(true, false),
+            CreateConsent::ShowThenStop
+        );
+        assert_eq!(
+            CreateConsent::decide(true, true),
+            CreateConsent::ShowThenCreate
+        );
+        assert!(CreateConsent::decide(true, true).displays());
+        assert!(CreateConsent::decide(true, false).displays());
+        // A server with no gate has nothing to show and nothing to record.
+        assert_eq!(CreateConsent::decide(false, true), CreateConsent::Nothing);
+        assert!(!CreateConsent::decide(false, false).displays());
+        assert!(CreateConsent::decide(false, false).creates());
+    }
+
+    #[test]
+    fn every_document_line_carries_the_hash_that_is_submitted() {
+        // The printed line is the reader's only view of what acceptance will
+        // be recorded for, so it names the exact bytes, not just a version.
+        let doc = TermsDocument {
+            document: "terms_of_service".into(),
+            version: 4,
+            url: "https://example.invalid/terms/".into(),
+            sha256: "c".repeat(64),
+        };
+        let lines: Vec<String> = terms_lines(std::slice::from_ref(&doc)).collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("terms_of_service"));
+        assert!(lines[0].contains("v4"));
+        assert!(lines[0].contains(&doc.url));
+        assert!(lines[0].contains(&doc.sha256));
+    }
 
     fn engine(id: &str, port: u16, ready: bool) -> RunningEngine {
         let (slug, backend_id) = id.split_once('@').expect("qualified id");
