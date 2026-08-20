@@ -10,10 +10,10 @@ A **release** publishes **artifacts**. Each artifact has a measured **payload**,
 | --- | --- |
 | **Release** | The unit of trust: everything published for one git ref — every artifact, `artifact-manifest.json`, human attestations, and the paired server enclave. See [releases.md](releases.md). |
 | **Artifact** | One named, measured output of a release. The keys in `artifact-manifest.json` (`eidola-gui-macos-universal`, `eidola-server`, …). An artifact is the tuple of payload + archive, and where applicable envelope + installable. |
-| **Payload** | The functional file tree: binaries, the `llama-server` sidecar, plist/icons, the embedded trust root. Not Developer ID signatures. Not Mesa on the current Nix Linux GUI (host GPU stack). *Trust object* is the threat-model synonym. |
-| **Archive** | A canonical byte-stream of the payload. For Nix artifacts, a gzip'd ustar produced inside the flake (`nix build .#…-archive`); its SHA-256 is `archiveSha256`. For OCI artifacts, the image; its digest is `digest`. This is the hash a user can `shasum` / `sha256sum` without Nix. |
+| **Payload** | The functional file tree: binaries, the `llama-server` sidecar, plist/icons, the embedded trust root. Every executable that ships is **copied in**, never referenced. Not Developer ID signatures. Not Mesa on the Nix Linux GUI (host GPU stack). *Trust object* is the threat-model synonym. |
+| **Archive** | A canonical byte-stream of the payload. For Nix artifacts, a gzip'd POSIX/pax tar produced inside the flake (`nix build .#…-archive`); its SHA-256 is `archiveSha256`. For OCI artifacts, the image; its digest is `digest`. This is the hash a user can `shasum` / `sha256sum` without Nix. |
 | **Envelope** | Host-required, non-reproducible material applied to an archive. Today: Apple Developer ID, notarization, staple. Never recorded in the CI-signed manifest. |
-| **Installable** | What a normal user actually fetches (Gatekeeper zip, `docker pull`, a future Flatpak). Archive composed with envelope. When the envelope is empty, installable = archive. |
+| **Installable** | What a normal user actually fetches and can run (Gatekeeper zip, `docker pull`, a future Flatpak). Archive composed with envelope. When the envelope is empty, installable = archive — **provided the archive is self-contained**; see [the Linux caveat](#the-linux-nix-archive-is-not-a-standalone-installable). |
 
 **Artifact** is not a stage; it is the name of one of those tuples in the manifest.
 
@@ -28,9 +28,15 @@ Attestations and `artifact-manifest.json` live **beside** the installable on the
 | `oci` | Layers of the image | `digest` (`sha256:` + hex) — this *is* the archive | Empty. `docker pull` is the installable. |
 | `nix` | `narHash` (Nix SRI of the store-path NAR) — rebuild/debug checkpoint | `archiveSha256` (`sha256:` + hex of the flake-built `.tar.gz`) | macOS: Apple material, hashes in the **human attestation** only. Current Linux Nix GUI: empty envelope. |
 
-`narHash` is kept because it is free and isolates "the packer changed" from "the payload changed." It is not the user-facing check. Two serializations of the same tree: if they disagree, the archive derivation is impure.
+`narHash` is kept because it is free and isolates "the packer changed" from "the payload changed." It is not the user-facing check. Two serializations of the same tree: if they disagree, the archive derivation is impure. That split is load-bearing in one routine case: the archive is gzip-compressed, so the pinned **gzip version** is an input to `archiveSha256`. A `flake.lock` bump can move the archive hash with a byte-identical payload — `narHash` holding steady while `archiveSha256` moves is that, not tampering.
 
-Anything **copied into** the payload is in both hashes. A store-path *reference* (today: Nix Mesa ICDs via `VK_ADD_DRIVER_FILES`) is not. Functional bytes that ship inside the installable must be in the payload; that is why the Linux Nix GUI **copies** `llama-server` next to the wrapper rather than pointing at another derivation.
+### Copied, not referenced
+
+Anything **copied into** the payload is in both hashes. A store-path *reference* is not.
+
+This is not a stylistic preference. Nix store paths are **input-addressed**: the path is a function of the derivation's inputs, not of its output bytes. A payload that names a binary by store path therefore binds the *build recipe* but not the *result* — a non-reproducible build, or a compromised builder, yields the same path and so the same `narHash` and `archiveSha256`, while the user's machine resolves whatever bytes its substituter holds for that path. Copying moves the bytes into the measured tree, where a substitution changes the hash.
+
+So every executable that ships is copied: the macOS `.app` copies `llama-server` into `Contents/MacOS/`, and the Linux Nix GUI copies **both** the GUI binary (to `bin/.eidola-gui-wrapped`, kept a sibling of the sidecar) and `llama-server` into `$out/bin`. The only deliberate references left are the ones we have decided *not* to measure — the nixpkgs Mesa ICDs reached via `VK_ADD_DRIVER_FILES`, because the device's GPU stack is pre-trusted.
 
 ## Checking a download
 
@@ -45,7 +51,7 @@ sha256sum eidola-gui-linux-amd64.tar.gz
 # macOS: shasum -a 256 eidola-gui-macos-universal.tar.gz
 ```
 
-Compare to that artifact’s `archiveSha256` in the verified manifest.
+Compare to that artifact’s `archiveSha256` in the verified manifest. On Linux this establishes what the artifact *is*; running it is a separate question — see below.
 
 **Rebuild.** `nix build .#eidola-gui-linux` (or the macOS universal attr) and compare `narHash`. `nix build .#eidola-gui-linux-archive` and compare `archiveSha256`.
 
@@ -58,8 +64,16 @@ Compare to that artifact’s `archiveSha256` in the verified manifest.
 
 Apple-specific disclosure, ticket stapling, and Team ID are in [apple-distribution.md](apple-distribution.md).
 
+## The Linux Nix archive is not a standalone installable
+
+`eidola-gui-linux-amd64` is a **Nix artifact**, and its archive is a serialization of a Nix store path. The payload now contains the real GUI binary and the real sidecar, so the hash means what it should — but the tree is still Nix-shaped: `bin/eidola-gui` is a wrapper script with a `/nix/store/…` interpreter, and the GUI binary's `RUNPATH` resolves Wayland, libxkbcommon, fontconfig, freetype, and the Vulkan loader out of the store. Extracted onto a machine with no Nix store, it will not start.
+
+That is the correct artifact for NixOS, for `nix profile install`, and for anyone reproducing the build. It is **not** the download to hand a Ubuntu or Fedora user, and this page does not pretend otherwise: for that artifact, `archiveSha256` is a verification identity and a Nix-ecosystem installable, not a browser download that runs.
+
+Closing that gap is packaging work, not hashing work — a second, Freedesktop-runtime installable whose payload is self-contained. It is tracked separately and does not change any rule on this page.
+
 ## Linux GPU stack
 
-The current Nix Linux GUI still *references* nixpkgs Mesa so a Nix glibc binary can load Vulkan ICDs on Ubuntu. Those driver bytes are not in the archive. A Flatpak (Freedesktop GL runtime) or a distro `.deb` (host `mesa-vulkan-drivers`) is how an Ubuntu-shaped installable leaves Mesa out of *our* payload entirely; that work is tracked separately.
+The Nix Linux GUI *references* nixpkgs Mesa so a Nix glibc binary can load Vulkan ICDs on a non-Nix host. Those driver bytes are not in the archive. A Flatpak (Freedesktop GL runtime) is how a distro-shaped installable leaves Mesa out of *our* payload entirely — and, unlike bundled Mesa, gives proprietary-driver users a matched GPU stack instead of a glibc mismatch.
 
 Server/CLI Linux images stay OCI: they run in an untrusted environment, so the image is the whole functional closure we can measure.

@@ -1,25 +1,25 @@
 {
   "artifacts": {
     "eidola-cli": {
-      "digest": "sha256:6074b1c88ef684b32120727f43edc9b49811efc47e83d3f492a12c07e7ee97cb",
+      "digest": "sha256:3a14d1c807ce1ffdf9f41e6f67ef590f89042017b1a3e3e2b03eec98bee499f4",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "archiveSha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "narHash": "sha256-jectUb9Xi7+gq1pkP7bTcMgpOAI5tKgjooWAxJJBEbw=",
+      "archiveSha256": "sha256:262947bfde2e1671128bda81a0653614b1bfc97a23416ccfc9b08bbc6908f722",
+      "narHash": "sha256-QXkCQVAN/3ziCou6PxniynlP+iMF7YdNwmLfSZJZhMM=",
       "platform": "darwin/universal",
       "type": "nix"
     },
     "eidola-gui-linux-amd64": {
-      "archiveSha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "narHash": "sha256-KKvJZlINCwBAemWFD/kQocSnfvAmgu+b5MvgQKenLp4=",
+      "archiveSha256": "sha256:228adedaecb4ab2a441d3493e8b3e426b88995d173169524ee71ad5ddd1dc1ce",
+      "narHash": "sha256-lAcbRQIhpEuMUpUgVl+qWoiJ7QT8svlagHwV+eDX9WE=",
       "platform": "linux/amd64",
       "type": "nix"
     },
     "eidola-gui-macos-universal": {
-      "archiveSha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "narHash": "sha256-wdFGbkTPjHxGj7M9VzIJOh0tJ8W67k5pFux6zGevCSs=",
+      "archiveSha256": "sha256:86fe1473b98373fb976159384d9a5d296691756ea20ecd52d72fd1eb5e736b2f",
+      "narHash": "sha256-QxqjmU0+KZ/65na8uAH9l/GgWjkRD5+06VZVIV/mPy4=",
       "platform": "darwin/universal",
       "type": "nix"
     },
