@@ -309,6 +309,26 @@ impl EngineInstance {
     }
 }
 
+/// A backend's **configuration epoch**: bumped every time that backend's
+/// engines are retired (its row removed, disabled, or repointed at another
+/// models directory).
+///
+/// [`EngineInstance`] gives an entry an identity a stale actor cannot forge;
+/// this is the same idea one level up, for a load that has no entry yet.
+/// `load_local_model` reads the backend row and then *awaits* — model-file
+/// lookup, engine resolution, port pick, `fs::metadata` — before it reserves,
+/// so a retirement landing in that window sweeps a map the load has not
+/// written to yet, and the load then registers an engine spawned from the
+/// configuration that was just retired. Sweeping an empty map is not the same
+/// as keeping it empty.
+///
+/// So a load carries the epoch it read its configuration under, and
+/// [`LocalRuntime::reserve_engine`] refuses if it has moved — the authority
+/// read at the *write* point, under the same lock the sweep takes, exactly as
+/// the quit-time shutdown latch is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackendEpoch(u64);
+
 /// A running (or warming-up) engine subprocess. The supervisor task owns
 /// the child process; this entry is the control handle.
 struct EngineEntry {
@@ -421,6 +441,17 @@ pub(crate) struct LocalRuntime {
     failures: StdMutex<HashMap<EngineKey, EngineFailure>>,
     /// Test override for the machine memory budget ([`memory_budget`]).
     budget_override: StdMutex<Option<u64>>,
+    /// Per-backend configuration epochs ([`BackendEpoch`]). **Only ever
+    /// touched while the `engines` lock is held** — that ordering is what
+    /// makes "bump on retirement" and "validate on reservation" atomic with
+    /// respect to each other; the separate mutex is here only because the
+    /// `engines` lock guards a bare `HashMap` rather than a state struct
+    /// (the same reason [`Self::shutting_down`] is an atomic).
+    backend_epochs: StdMutex<HashMap<String, u64>>,
+    /// Test-only pause inside `load_local_model`, between reading the backend
+    /// row and reserving ([`Self::pause_before_reserve`]).
+    #[cfg(feature = "test-support")]
+    reserve_pause: StdMutex<Option<std::time::Duration>>,
     /// Test override for the engine readiness budget
     /// ([`ENGINE_READY_TIMEOUT`]), so a test can watch the deadline fire
     /// without waiting out the real one.
@@ -475,6 +506,23 @@ impl LocalRuntime {
         ))
     }
 
+    /// This backend's current epoch. Caller must hold the `engines` lock.
+    fn epoch_locked(&self, backend_id: &str) -> u64 {
+        *self
+            .backend_epochs
+            .lock()
+            .expect("backend epochs lock")
+            .get(backend_id)
+            .unwrap_or(&0)
+    }
+
+    /// The epoch a load reads its backend configuration under, to hand back to
+    /// [`Self::reserve_engine`]. See [`BackendEpoch`].
+    pub(crate) fn backend_epoch(&self, backend_id: &str) -> BackendEpoch {
+        let _engines = self.engines.lock().expect("engines lock");
+        BackendEpoch(self.epoch_locked(backend_id))
+    }
+
     /// Whether an entry (ready or warming) exists for this key.
     fn engine_present(&self, key: &EngineKey) -> bool {
         self.engines.lock().expect("engines lock").contains_key(key)
@@ -495,6 +543,7 @@ impl LocalRuntime {
         port: u16,
         footprint: u64,
         shutdown: tokio::sync::oneshot::Sender<()>,
+        epoch: BackendEpoch,
     ) -> Result<Option<(EngineInstance, Vec<EngineKey>)>, String> {
         let mut engines = self.engines.lock().expect("engines lock");
         // The shutdown authority is checked *here*, inside the reservation's
@@ -503,6 +552,18 @@ impl LocalRuntime {
         // would let a mid-flight load spawn a subprocess after the drain.
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err("Eidola is shutting down".into());
+        }
+        // Same shape, different authority: this load resolved its directory
+        // and engine binary from a backend row that has since been removed,
+        // disabled, or repointed, and registering it now would hand later
+        // turns an engine serving the old configuration under the new one's
+        // name. Refused here, inside the critical section the retirement's
+        // own sweep takes.
+        if self.epoch_locked(&key.0) != epoch.0 {
+            return Err(format!(
+                "backend `{}` changed while the model was loading — try again",
+                key.0
+            ));
         }
         if engines.contains_key(key) {
             return Ok(None);
@@ -608,6 +669,17 @@ impl LocalRuntime {
     /// describes the new one. The caller owns the returned shutdown senders.
     fn take_backend_engines(&self, backend_id: &str) -> Vec<EngineEntry> {
         let mut engines = self.engines.lock().expect("engines lock");
+        // Bumped under the `engines` lock, so a reservation either happened
+        // before this sweep (and is in `engines`, and is taken below) or
+        // validates its epoch after it (and is refused). There is no third
+        // interleaving — which is the whole point, since a load can be
+        // mid-flight with nothing in the map to sweep.
+        *self
+            .backend_epochs
+            .lock()
+            .expect("backend epochs lock")
+            .entry(backend_id.to_string())
+            .or_insert(0) += 1;
         let keys: Vec<EngineKey> = engines
             .keys()
             .filter(|(b, _)| b == backend_id)
@@ -673,6 +745,25 @@ impl LocalRuntime {
             .lock()
             .expect("ready timeout lock"))
         .unwrap_or(ENGINE_READY_TIMEOUT)
+    }
+
+    /// Pause between reading a backend's configuration and reserving the
+    /// engine, when a test has asked for one — the window a retirement races
+    /// ([`BackendEpoch`]), widened so it can be hit on purpose instead of by
+    /// luck. Compiled only into test builds; production has no such call.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn pause_before_reserve(&self) {
+        let pause = *self.reserve_pause.lock().expect("reserve pause lock");
+        if let Some(pause) = pause {
+            tokio::time::sleep(pause).await;
+        }
+    }
+
+    /// Test seam: see [`Self::pause_before_reserve`].
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_reserve_pause_for_test(&self, pause: std::time::Duration) {
+        *self.reserve_pause.lock().expect("reserve pause lock") = Some(pause);
     }
 
     /// Test seam: shorten the engine readiness budget so a test can observe
@@ -1712,6 +1803,12 @@ impl Inner {
             return self.await_engine_ready(&key).await;
         }
 
+        // The epoch is read **before** the backend row, and handed to the
+        // reservation to validate — see [`BackendEpoch`]. Everything between
+        // here and the reservation is configuration this load is about to act
+        // on, and all of it can be retired while this future awaits.
+        let epoch = self.local.backend_epoch(&backend_id);
+
         // Resolve the model file's directory by backend, and note how the
         // engine binary resolves for it: the managed `local` store served by
         // the bundled engine, or a `llamacpp` backend's user-owned directory
@@ -1724,11 +1821,19 @@ impl Inner {
             /// A `llamacpp` backend's explicit path (`Some`) or discovery.
             External(Option<String>),
         }
+        // The backend row is required for **every** engine backend, the `local`
+        // singleton included: disabling a backend retires its engines, and a
+        // rule that only the chat path enforced would let the explicit verb
+        // (`eidola model load`, the Load button) start another `llama-server`
+        // the moment after the disable stopped one — a disabled backend still
+        // holding gigabytes, which is precisely what disabling it asked for.
+        // Managing *files* (download, delete) stays open: those are not
+        // processes, and a disabled backend's models are still the user's.
+        let db_conn = self.db_conn().await?;
+        let row = self.require_backend(&db_conn, &backend_id).await?;
         let (dir, engine_source) = if backend_id == crate::backends::LOCAL_BACKEND_ID {
             (models_dir(&self.data_dir), EngineSource::Bundled)
         } else {
-            let db_conn = self.db_conn().await?;
-            let row = self.require_backend(&db_conn, &backend_id).await?;
             if row.kind != crate::backends::BackendKind::LlamaCpp.as_str() {
                 return Err(AppError::LocalModel {
                     message: format!("backend `{backend_id}` does not serve local engines"),
@@ -1776,6 +1881,12 @@ impl Inner {
                 .unwrap_or(0),
         );
 
+        // Test seam only: widen the window between the configuration read
+        // above and the reservation below, so the race the epoch closes can be
+        // driven deliberately. Compiled out of production builds.
+        #[cfg(feature = "test-support")]
+        self.local.pause_before_reserve().await;
+
         // Make room: plan LRU evictions and insert this load's warming
         // entry in one critical section ([`LocalRuntime::reserve_engine`]),
         // so concurrent loads of different models can't double-book the
@@ -1783,7 +1894,7 @@ impl Inner {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let reserved = self
             .local
-            .reserve_engine(&key, port, footprint, shutdown_tx)
+            .reserve_engine(&key, port, footprint, shutdown_tx, epoch)
             .map_err(|message| AppError::LocalModel {
                 message: format!("cannot load `{model_id}`: {message}"),
             })?;
@@ -2635,7 +2746,7 @@ mod tests {
         let key_a = ("local".to_string(), "a".to_string());
         let (tx_a, _rx_a) = tokio::sync::oneshot::channel();
         let (_instance, victims) = runtime
-            .reserve_engine(&key_a, 4001, 6 * GIB, tx_a)
+            .reserve_engine(&key_a, 4001, 6 * GIB, tx_a, runtime.backend_epoch("local"))
             .unwrap()
             .expect("the first load fits with no evictions");
         assert_eq!(victims, Vec::<EngineKey>::new());
@@ -2643,7 +2754,7 @@ mod tests {
         let key_b = ("local".to_string(), "b".to_string());
         let (tx_b, _rx_b) = tokio::sync::oneshot::channel();
         let err = runtime
-            .reserve_engine(&key_b, 4002, 6 * GIB, tx_b)
+            .reserve_engine(&key_b, 4002, 6 * GIB, tx_b, runtime.backend_epoch("local"))
             .unwrap_err();
         assert!(err.contains("held"), "got {err}");
         assert!(
@@ -2655,7 +2766,7 @@ mod tests {
         let (tx_a2, _rx_a2) = tokio::sync::oneshot::channel();
         assert_eq!(
             runtime
-                .reserve_engine(&key_a, 4003, 6 * GIB, tx_a2)
+                .reserve_engine(&key_a, 4003, 6 * GIB, tx_a2, runtime.backend_epoch("local"))
                 .unwrap(),
             None
         );
@@ -2675,7 +2786,9 @@ mod tests {
 
         let key = ("local".to_string(), "late".to_string());
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        let err = runtime.reserve_engine(&key, 4004, GIB, tx).unwrap_err();
+        let err = runtime
+            .reserve_engine(&key, 4004, GIB, tx, runtime.backend_epoch("local"))
+            .unwrap_err();
         assert!(err.contains("shutting down"), "got {err}");
         assert!(
             !runtime.engine_present(&key),
@@ -2726,7 +2839,7 @@ mod tests {
 
         let (tx1, _rx1) = tokio::sync::oneshot::channel();
         let (first, _) = runtime
-            .reserve_engine(&key, 5001, GIB, tx1)
+            .reserve_engine(&key, 5001, GIB, tx1, runtime.backend_epoch("local"))
             .unwrap()
             .expect("reserved");
         // The user unloads (by key — that verb means "whatever is loaded
@@ -2734,7 +2847,7 @@ mod tests {
         assert!(runtime.take_engine(&key).is_some());
         let (tx2, _rx2) = tokio::sync::oneshot::channel();
         let (second, _) = runtime
-            .reserve_engine(&key, 5002, GIB, tx2)
+            .reserve_engine(&key, 5002, GIB, tx2, runtime.backend_epoch("local"))
             .unwrap()
             .expect("reserved again");
         assert_ne!(first, second, "instances are never reused");
@@ -2780,6 +2893,60 @@ mod tests {
                 .expect("failures lock")
                 .contains_key(&key),
             "the owning instance's failure is the one that gets reported"
+        );
+    }
+
+    /// Retiring a backend's engines also invalidates the reservations of
+    /// loads that read its configuration but have not registered yet.
+    ///
+    /// The sweep alone can only take what is already in the map; a load that
+    /// is mid-flight has written nothing to it, so without the epoch it walks
+    /// in afterwards and registers an engine spawned from the configuration
+    /// that was just retired.
+    #[test]
+    fn a_retirement_invalidates_a_reservation_made_under_the_old_configuration() {
+        let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+        let key = ("my-box".to_string(), "tiny".to_string());
+
+        // A load reads its configuration...
+        let epoch = runtime.backend_epoch("my-box");
+        // ...the backend is removed (or disabled, or repointed) while it is
+        // still resolving files and ports...
+        assert!(runtime.take_backend_engines("my-box").is_empty());
+        // ...and its reservation is refused when it finally arrives.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let err = runtime
+            .reserve_engine(&key, 6001, GIB, tx, epoch)
+            .unwrap_err();
+        assert!(err.contains("changed while"), "got {err}");
+        assert!(
+            !runtime.engine_present(&key),
+            "a refused reservation leaves nothing to spawn against"
+        );
+
+        // A load that reads its configuration *after* the retirement is
+        // ordinary work and proceeds.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(
+            runtime
+                .reserve_engine(&key, 6002, GIB, tx, runtime.backend_epoch("my-box"))
+                .unwrap()
+                .is_some()
+        );
+
+        // And the epoch is per backend: retiring one does not invalidate a
+        // load of another.
+        let other = ("local".to_string(), "tiny".to_string());
+        let other_epoch = runtime.backend_epoch("local");
+        runtime.take_backend_engines("my-box");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(
+            runtime
+                .reserve_engine(&other, 6003, GIB, tx, other_epoch)
+                .unwrap()
+                .is_some(),
+            "another backend's retirement is not this load's business"
         );
     }
 

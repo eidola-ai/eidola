@@ -9606,6 +9606,15 @@ impl AppCore {
         self.inner.local.set_memory_budget_for_test(budget);
     }
 
+    /// Test-only seam: pause every engine load between reading its backend's
+    /// configuration and reserving the engine, so a test can drive the race a
+    /// retirement has with an in-flight load.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_pause_before_engine_reserve(&self, pause: std::time::Duration) {
+        self.inner.local.set_reserve_pause_for_test(pause);
+    }
+
     /// Test-only seam: shorten the engine readiness budget (five minutes in
     /// production) so a test can watch the load deadline fire.
     #[doc(hidden)]

@@ -821,3 +821,50 @@ fn repointing_or_disabling_a_backend_retires_its_engines() {
         );
     });
 }
+
+/// A disabled backend serves nothing and **starts** nothing — the built-in
+/// `local` singleton included.
+///
+/// Disabling retires the backend's engines, and the chat path already refuses
+/// a disabled backend. The explicit verb has to hold the same line or the
+/// guarantee is decorative: `eidola model load tiny@local` (and the Load
+/// button behind it) would start another `llama-server` a moment after the
+/// disable stopped one, leaving a disabled backend holding gigabytes.
+/// Managing files is a different thing and stays open.
+#[test]
+fn a_disabled_backend_starts_no_engine_even_when_asked_explicitly() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let models_dir = dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("tiny.gguf"), b"gguf").unwrap();
+        // `/usr/bin/false` spawns and exits at once, so a load that got past
+        // the gate reports the engine's own failure — which is what
+        // distinguishes "refused" from "spawned and died".
+        core.set_llama_server_path(Some("/usr/bin/false".into()))
+            .unwrap();
+
+        core.runtime()
+            .block_on(core.set_backend_enabled("local".into(), false))
+            .expect("disable");
+
+        let err = core
+            .runtime()
+            .block_on(core.load_local_model("tiny@local".into()))
+            .expect_err("a disabled backend must not start an engine");
+        assert!(matches!(err, AppError::NotConfigured { .. }), "got {err:?}");
+        assert!(err.to_string().contains("disabled"), "got {err}");
+        assert!(core.running_engines().is_empty(), "nothing was spawned");
+
+        // Re-enabling restores the verb (the load now reaches the engine and
+        // fails on its own terms).
+        core.runtime()
+            .block_on(core.set_backend_enabled("local".into(), true))
+            .expect("enable");
+        let err = core
+            .runtime()
+            .block_on(core.load_local_model("tiny@local".into()))
+            .expect_err("/usr/bin/false exits immediately");
+        assert!(err.to_string().contains("exited during load"), "got {err}");
+    });
+}

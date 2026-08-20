@@ -1180,3 +1180,67 @@ fn a_hanging_health_probe_still_hits_the_readiness_deadline() {
         rt.shutdown_background();
     });
 }
+
+/// A retirement must bind a load that is already in flight.
+///
+/// `load_local_model` reads its backend's configuration and then awaits —
+/// model-file lookup, engine resolution, port pick, `fs::metadata` — before it
+/// reserves. A retirement landing in that window sweeps an engine map the load
+/// has not written to yet, so sweeping alone guarantees nothing: the load
+/// resumes, registers, and later turns lease an engine spawned from the
+/// configuration that was just retired. The load therefore carries the epoch
+/// it read its configuration under and the reservation validates it, under the
+/// same lock the sweep takes.
+///
+/// Driven here through disabling the `local` singleton; removal and repointing
+/// retire through the very same sweep.
+#[test]
+fn a_load_in_flight_when_its_backend_is_retired_registers_nothing() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let core = std::sync::Arc::new(core);
+        let models_dir = dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
+        // A fake engine that stays alive keeps a registration visible: an
+        // engine that exited would tidy itself away and hide the defect.
+        core.set_llama_server_path(Some(write_sleeping_engine(dir.path())))
+            .unwrap();
+        core.test_set_engine_ready_timeout(std::time::Duration::from_millis(1500));
+        // Widen the window the retirement has to race; the race itself is
+        // real, this only makes it reachable on purpose.
+        core.test_pause_before_engine_reserve(std::time::Duration::from_millis(800));
+
+        let handle = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.load_local_model("sleeper@local".into()).await }
+        });
+        // The load has read its configuration and is inside the pause.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        core.runtime()
+            .block_on(core.set_backend_enabled("local".into(), false))
+            .expect("disable");
+
+        // From the moment the retirement returns, no engine for that backend
+        // may ever appear — including one reserved by a load that read the
+        // old configuration.
+        for _ in 0..50 {
+            let running = core.running_engines();
+            assert!(
+                running.is_empty(),
+                "a retired backend must never acquire an engine: {running:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let outcome = core
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
+            })
+            .expect("the load must settle")
+            .expect("join");
+        let err = outcome.expect_err("the load must be refused, not silently registered");
+        assert!(err.to_string().contains("changed while"), "got {err}");
+    });
+}
