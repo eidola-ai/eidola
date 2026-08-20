@@ -220,7 +220,7 @@ pub enum AppError {
 impl AppError {
     /// Classify a `reqwest::Error`, surfacing attestation failures explicitly.
     pub(crate) fn from_request(e: reqwest::Error) -> Self {
-        let chain = format_error_chain(&e);
+        let chain = request_error_text(e);
         if chain.contains("measurement") && chain.contains("allowed") {
             return AppError::Attestation {
                 message: "the server's enclave measurement is not in your \
@@ -251,9 +251,28 @@ impl AppError {
     }
 }
 
-fn format_error_chain(e: &reqwest::Error) -> String {
+/// One `reqwest::Error` rendered as text a person can be shown — **with the
+/// request URL removed**.
+///
+/// reqwest attaches the request URL to every request-phase error and prints it
+/// in `Display` (`error sending request for url (https://host/x?token=…)`),
+/// and `Response::bytes`/`text`/`json` attach it to a body they collected. A
+/// model link's query is its *authorization* — a signed S3/CDN URL carries
+/// `?token=…` — so formatting one of these errors copies a live credential
+/// into whatever then holds the message: a standing failure a settings pane
+/// renders, a support paste, a terminal's scrollback. Nothing there needs the
+/// URL; the reader knows what they asked for, and the cause is what they are
+/// missing.
+///
+/// The source chain is appended, which is where the useful part lives (DNS,
+/// TLS, connect); it never repeats the URL — established by running each of
+/// those failures rather than by reading the docs. **Every path in this crate
+/// that turns a `reqwest::Error` into a message goes through here**, so no
+/// individual call site has to remember.
+pub(crate) fn request_error_text(e: reqwest::Error) -> String {
+    let e = e.without_url();
     let mut chain = format!("{e}");
-    let mut source = std::error::Error::source(e);
+    let mut source = std::error::Error::source(&e);
     while let Some(err) = source {
         use std::fmt::Write;
         let _ = write!(chain, ": {err}");

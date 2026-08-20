@@ -11689,7 +11689,10 @@ async fn recover_refund(
 
     let status = resp.status();
     let body_text = resp.text().await.map_err(|e| AppError::Network {
-        message: format!("failed to read recovery response: {e}"),
+        message: format!(
+            "failed to read recovery response: {}",
+            crate::error::request_error_text(e)
+        ),
     })?;
     let body: serde_json::Value =
         serde_json::from_str(&body_text).map_err(|e| AppError::Network {
@@ -14353,7 +14356,10 @@ fn params_from_domain_separator(ds: &str) -> Result<Params, AppError> {
 async fn read_response(resp: reqwest::Response) -> Result<(reqwest::StatusCode, String), AppError> {
     let status = resp.status();
     let body = resp.text().await.map_err(|e| AppError::Network {
-        message: format!("failed to read response body: {e}"),
+        message: format!(
+            "failed to read response body: {}",
+            crate::error::request_error_text(e)
+        ),
     })?;
     Ok((status, body))
 }

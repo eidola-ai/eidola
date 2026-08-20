@@ -612,7 +612,13 @@ impl Inner {
                 let resp = req.send().await.map_err(AppError::from_request)?;
                 let status = resp.status();
                 let text = resp.text().await.map_err(|e| AppError::Network {
-                    message: format!("failed to read model list: {e}"),
+                    // `Response::text` attaches the request URL to its error,
+                    // so this goes through the same stripping every other
+                    // reqwest error in this crate does.
+                    message: format!(
+                        "failed to read model list: {}",
+                        crate::error::request_error_text(e)
+                    ),
                 })?;
                 if !status.is_success() {
                     return Err(AppError::Server {

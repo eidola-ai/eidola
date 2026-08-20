@@ -133,6 +133,70 @@ fn a_signed_download_url_is_fetched_with_its_authorization() {
     });
 }
 
+/// A failure report may not carry the credential the URL carried.
+///
+/// `reqwest` attaches the request URL to every request-phase error and prints
+/// it in `Display` ("error sending request for url (…)"), so formatting one
+/// into a message copies whatever that URL holds — and a signed model link
+/// holds an authorization token. The message becomes `last_error`, which is
+/// rendered wherever a failed model row is shown; the URL kept for Retry is a
+/// different field, is never displayed, and never reaches disk.
+#[test]
+fn a_failed_signed_download_keeps_its_token_out_of_the_error() {
+    run(|| {
+        let (core, dir) = bare_core();
+        // A port with nothing listening: the send fails during connect, which
+        // is exactly when reqwest has a URL to attach.
+        let dead_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{dead_port}/models/secret-model.gguf?token=s3cret");
+
+        core.runtime()
+            .block_on(core.download_local_model(url))
+            .expect("download starts");
+
+        let state = wait_for_state(&core, |s| {
+            s.models
+                .iter()
+                .any(|m| m.slug == "secret-model" && m.last_error.is_some())
+        });
+        let model = state
+            .models
+            .iter()
+            .find(|m| m.slug == "secret-model")
+            .unwrap();
+        let error = model.last_error.as_deref().unwrap();
+        assert!(
+            !error.contains("s3cret"),
+            "a credential may not reach the error a person is shown: {error}"
+        );
+        assert!(
+            error.contains("download failed") && error.contains("Connection refused"),
+            "the cause a reader needs is still there: {error}"
+        );
+        // Retry still works: the URL the row remembers is the one that was
+        // asked for, credential included. It is an argument, not a display —
+        // no surface renders it, and nothing writes it down.
+        assert!(
+            model
+                .source_url
+                .as_deref()
+                .is_some_and(|u| u.contains("token=s3cret")),
+            "the retry URL keeps what a retry needs: {:?}",
+            model.source_url
+        );
+        assert!(
+            !dir.path()
+                .join("data/models")
+                .join("secret-model.gguf.meta.json")
+                .exists(),
+            "a failed download writes no sidecar"
+        );
+    });
+}
+
 /// A server that answers with a `Content-Length` it never satisfies: headers,
 /// a first chunk, then silence with the socket held open — the shape of a
 /// transfer that dies mid-response. Returns its port.

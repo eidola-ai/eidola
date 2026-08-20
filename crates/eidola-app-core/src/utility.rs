@@ -317,7 +317,11 @@ impl Inner {
                 self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
                     .await;
                 return Err(AppError::Network {
-                    message: format!("failed to read the {} response: {e}", target.chore),
+                    message: format!(
+                        "failed to read the {} response: {}",
+                        target.chore,
+                        crate::error::request_error_text(e)
+                    ),
                 });
             }
         };

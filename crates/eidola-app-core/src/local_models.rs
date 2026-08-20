@@ -2209,7 +2209,10 @@ async fn run_download(
     };
     let response = match sent {
         Ok(sent) => sent.map_err(|e| AppError::LocalModel {
-            message: format!("download failed: {e}"),
+            // Never `{e}`: a request-phase `reqwest::Error` prints the URL it
+            // was fetching, and this one carries the caller's authorization —
+            // see [`crate::error::request_error_text`].
+            message: format!("download failed: {}", crate::error::request_error_text(e)),
         })?,
         // Nothing was created yet, so there is nothing to clean up.
         Err(Interrupted::Cancelled) => return Ok(()),
@@ -2262,7 +2265,10 @@ async fn run_download(
                 drop(file);
                 remove_partial(&part_path).await;
                 return Err(AppError::LocalModel {
-                    message: format!("download interrupted: {e}"),
+                    message: format!(
+                        "download interrupted: {}",
+                        crate::error::request_error_text(e)
+                    ),
                 });
             }
         };
