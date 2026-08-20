@@ -269,7 +269,10 @@ pub(super) struct CreateAccount {
     pub loading_documents: bool,
     /// Why the snapshot could not be read, if it could not be.
     pub documents_error: Option<String>,
-    /// Whether the terms/privacy agreement checkbox is checked.
+    /// Whether the agreement box reads as checked — derived by the parent
+    /// from whether the reader's consent still covers `documents`, never a
+    /// stored flag. False therefore also covers "agreed to an earlier
+    /// snapshot", which is why it alone gates the CTA.
     pub agreed: bool,
     /// Whether an account-create request is in flight.
     pub creating: bool,
@@ -343,7 +346,11 @@ impl RenderOnce for CreateAccount {
         let extras = extras
             .child(
                 // Required consent — the "Create a new account." button
-                // stays disabled until this is checked.
+                // stays disabled until this is checked. **Inert until the
+                // documents are on screen**: consent binds to a particular
+                // snapshot (`OnboardingView::set_agreement`), so a click with
+                // nothing loaded would have no text to be agreement to, and a
+                // box that ticked anyway would be claiming one.
                 div()
                     .id("onboarding-agree")
                     .pt_10()
@@ -356,16 +363,21 @@ impl RenderOnce for CreateAccount {
                     // macOS adapter reads `accessibilityValue` off `toggled()`
                     // and consults `is_selected()` only for `Role::Tab`.
                     .aria_toggled(self.agreed.into())
-                    .on_click({
-                        let toggle = self.on_toggle_agree;
-                        let next = !self.agreed;
-                        move |_, window, cx| toggle(&next, window, cx)
+                    .map(|d| {
+                        if have_documents {
+                            let toggle = self.on_toggle_agree;
+                            let next = !self.agreed;
+                            d.on_click(move |_, window, cx| toggle(&next, window, cx))
+                        } else {
+                            d.tab_stop(false)
+                        }
                     })
                     .child(
                         Checkbox::new("onboarding-agree-box")
                             .role(None)
                             .label("I agree to the Terms of Service and Privacy Policy.")
                             .checked(self.agreed)
+                            .disabled(!have_documents)
                             .tab_stop(false)
                             .p_1(),
                     ),
@@ -379,9 +391,11 @@ impl RenderOnce for CreateAccount {
         } else {
             "Create a new account."
         };
-        // Consent is for a snapshot that exists: with none loaded there is
-        // nothing the checkbox could be agreement *to*.
-        let enabled = self.agreed && have_documents && !self.creating;
+        // `agreed` is derived from the consent binding, not a stored flag:
+        // it is true only while the reader's agreement covers the snapshot
+        // being rendered, so "no documents" and "documents the agreement no
+        // longer covers" are the same disabled state, not two conditions.
+        let enabled = self.agreed && !self.creating;
         let cta = div()
             .id("onboarding-cta-create")
             .probe("onboarding/cta/create", Role::Button, label)

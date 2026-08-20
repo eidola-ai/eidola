@@ -7181,23 +7181,142 @@ fn onboarding_creates_only_against_the_snapshot_it_rendered(cx: &mut TestAppCont
         );
     });
 
-    // The snapshot arrives; now the same click has something to submit.
-    stores.account.update(cx, |s, cx| {
-        s.set_terms_for_test(
-            eidola_gui::loadable::Loadable::loaded(vec![eidola_app_core::TermsDocument {
-                document: "terms_of_service".into(),
-                version: 3,
-                url: "https://example.invalid/terms/".into(),
-                sha256: "a".repeat(64),
-            }]),
-            cx,
-        );
-    });
+    // The snapshot arrives and is agreed to; now the same click has
+    // something to submit.
+    set_terms(&stores, cx, vec![terms_doc("terms_of_service", 3, 'a')]);
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
     view.update(cx, |v, cx| v.begin_create(cx));
     view.read_with(cx, |v, _| {
         assert!(
             v.creating_for_test(),
             "with the presented snapshot in hand, creation proceeds"
+        );
+    });
+}
+
+/// A required document, as `AccountStore::terms` would hold it.
+fn terms_doc(document: &str, version: i64, sha_seed: char) -> eidola_app_core::TermsDocument {
+    eidola_app_core::TermsDocument {
+        document: document.into(),
+        version,
+        url: format!("https://example.invalid/{document}/"),
+        sha256: sha_seed.to_string().repeat(64),
+    }
+}
+
+fn set_terms(stores: &Stores, cx: &mut TestAppContext, docs: Vec<eidola_app_core::TermsDocument>) {
+    stores.account.update(cx, |s, cx| {
+        s.set_terms_for_test(eidola_gui::loadable::Loadable::loaded(docs), cx);
+    });
+}
+
+#[gpui::test]
+fn onboarding_consent_does_not_survive_the_snapshot_it_was_given_for(cx: &mut TestAppContext) {
+    // Check the box, step back to "Get started", come back after a new
+    // version is published: the reveal re-fetches, and a stored `agreed` flag
+    // would leave the CTA live over documents the reader never saw — the
+    // defect the whole snapshot pass-through exists to prevent, re-entering
+    // through the UI's own state. Consent is bound to the documents it was
+    // given for, so a snapshot it does not cover reads as unchecked.
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    set_terms(&stores, cx, vec![terms_doc("terms_of_service", 1, 'a')]);
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.read_with(cx, |v, cx| {
+        assert!(v.agreed_for_test(cx), "the box is checked for version 1");
+    });
+
+    // Version 2 is published and the slide's refresh lands.
+    set_terms(&stores, cx, vec![terms_doc("terms_of_service", 2, 'b')]);
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.agreed_for_test(cx),
+            "agreement to version 1 is not agreement to version 2, so the box \
+             must not read as checked over the new documents"
+        );
+    });
+    view.update(cx, |v, cx| v.begin_create(cx));
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.creating_for_test(),
+            "and nothing may be created against a snapshot the reader never agreed to"
+        );
+    });
+
+    // Re-agreeing to what is now on screen releases it again.
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.update(cx, |v, cx| v.begin_create(cx));
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.creating_for_test(),
+            "consent given for the documents in hand does create"
+        );
+    });
+}
+
+#[gpui::test]
+fn onboarding_consent_is_not_recorded_before_there_is_anything_to_agree_to(
+    cx: &mut TestAppContext,
+) {
+    // Checking the box while the snapshot is still loading must record
+    // nothing — an empty consent would otherwise match the *next* empty
+    // snapshot and read as agreement to documents never shown.
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.agreed_for_test(cx),
+            "there is no text on screen to have agreed to"
+        );
+    });
+
+    // A gate-less server answers with an empty snapshot; the earlier click
+    // must not now count as agreement to it.
+    set_terms(&stores, cx, Vec::new());
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.agreed_for_test(cx),
+            "a click made before any answer arrived is not consent to the answer"
+        );
+    });
+}
+
+/// A reordered listing of the same texts is the same thing to agree to.
+#[gpui::test]
+fn onboarding_consent_survives_a_reordered_listing_of_the_same_documents(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    set_terms(
+        &stores,
+        cx,
+        vec![
+            terms_doc("terms_of_service", 1, 'a'),
+            terms_doc("privacy_policy", 1, 'b'),
+        ],
+    );
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    set_terms(
+        &stores,
+        cx,
+        vec![
+            terms_doc("privacy_policy", 1, 'b'),
+            terms_doc("terms_of_service", 1, 'a'),
+        ],
+    );
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.agreed_for_test(cx),
+            "same documents, same hashes — order is not consent"
         );
     });
 }
