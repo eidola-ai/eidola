@@ -114,12 +114,20 @@ pub struct MarkdownStyle {
     pub background: Hsla,
     pub caret_color: Hsla,
     pub selection_color: Hsla,
-    /// Wash painted behind host-supplied highlight ranges (see
-    /// [`crate::highlight`]) — a quiet warm underlay, deliberately fainter
-    /// than the selection so a selection over highlighted text still reads.
-    /// The default is a low-alpha amber derived from the theme's mode (the
-    /// same warm family in day and night); hosts can override per palette.
+    /// Wash painted behind host-supplied highlight ranges on
+    /// [`crate::highlight::HighlightLayer::Base`] (see [`crate::highlight`])
+    /// — a quiet warm underlay, deliberately fainter than the selection so a
+    /// selection over highlighted text still reads. The default is a
+    /// low-alpha amber derived from the theme's mode (the same warm family in
+    /// day and night); hosts can override per palette.
     pub highlight_color: Hsla,
+    /// Wash for [`crate::highlight::HighlightLayer::Overlay`] — the same warm
+    /// family, one step stronger, so a range on the layer above the base
+    /// reads as a distinct decoration rather than a deeper merge.
+    pub highlight_overlay_color: Hsla,
+    /// Wash for [`crate::highlight::HighlightLayer::Accent`] — the strongest
+    /// of the three, for the one range a host singles out among many.
+    pub highlight_accent_color: Hsla,
 
     /// Font family for *inline* code spans. Defaults to
     /// `mono_font_family`, but is exposed separately because inline
@@ -199,6 +207,16 @@ impl MarkdownStyle {
                 gpui::hsla(0.115, 0.55, 0.55, 0.18)
             } else {
                 gpui::hsla(0.115, 0.85, 0.55, 0.16)
+            },
+            highlight_overlay_color: if theme.mode.is_dark() {
+                gpui::hsla(0.115, 0.55, 0.55, 0.32)
+            } else {
+                gpui::hsla(0.115, 0.85, 0.55, 0.30)
+            },
+            highlight_accent_color: if theme.mode.is_dark() {
+                gpui::hsla(0.115, 0.70, 0.60, 0.55)
+            } else {
+                gpui::hsla(0.115, 0.90, 0.55, 0.52)
             },
 
             inline_code_font_family: theme.mono_font_family.clone(),
@@ -323,10 +341,35 @@ impl MarkdownStyle {
         self
     }
 
-    /// Override the highlight wash color (see `highlight_color`).
+    /// Override the base layer's highlight wash color (see
+    /// `highlight_color`).
     pub fn highlight_color(mut self, color: Hsla) -> Self {
         self.highlight_color = color;
         self
+    }
+
+    /// Override the overlay layer's wash color (see
+    /// `highlight_overlay_color`).
+    pub fn highlight_overlay_color(mut self, color: Hsla) -> Self {
+        self.highlight_overlay_color = color;
+        self
+    }
+
+    /// Override the accent layer's wash color (see `highlight_accent_color`).
+    pub fn highlight_accent_color(mut self, color: Hsla) -> Self {
+        self.highlight_accent_color = color;
+        self
+    }
+
+    /// The wash color for one highlight layer. Total by construction — every
+    /// [`crate::highlight::HighlightLayer`] has a color, so a host that paints
+    /// on a layer can never get an unstyled wash.
+    pub fn highlight_layer_color(&self, layer: crate::highlight::HighlightLayer) -> Hsla {
+        match layer {
+            crate::highlight::HighlightLayer::Base => self.highlight_color,
+            crate::highlight::HighlightLayer::Overlay => self.highlight_overlay_color,
+            crate::highlight::HighlightLayer::Accent => self.highlight_accent_color,
+        }
     }
 
     /// Final font size for `level` (1..=6). Uses the callback if set,

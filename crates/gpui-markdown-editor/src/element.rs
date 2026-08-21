@@ -1988,7 +1988,7 @@ impl Element for BlockElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let (selection, source, scroll_offset, caret_downstream, highlight_ranges) = {
+        let (selection, source, scroll_offset, caret_downstream, highlight_layers) = {
             let editor = self.editor.read(cx);
             let scroll = editor.code_block_scroll(self.block_index);
             (
@@ -1996,7 +1996,7 @@ impl Element for BlockElement {
                 editor.state.markdown.clone(),
                 scroll,
                 editor.caret_downstream(),
-                editor.highlights().merged_ranges(),
+                editor.highlight_layers().merged_by_layer(),
             )
         };
 
@@ -2322,10 +2322,17 @@ impl Element for BlockElement {
         );
 
         // Host-supplied highlight washes — the same per-line quad geometry as
-        // a selection, in the (fainter, warmer) highlight color. The ranges
-        // arrive pre-merged (see `HighlightSet::merged_ranges`), so
-        // overlapping highlights paint one wash, never a stacked darker band.
-        let highlight_quads = build_highlight_quads(&laid_out, &highlight_ranges, &style);
+        // a selection, in each layer's (fainter, warmer) highlight color. The
+        // ranges arrive pre-merged per layer (see
+        // `HighlightLayers::merged_by_layer`), so overlapping highlights on one
+        // layer paint one wash, never a stacked darker band; layers arrive
+        // bottom to top, so an upper layer's wash paints over a lower one.
+        let highlight_quads: Vec<TaggedQuad> = highlight_layers
+            .iter()
+            .flat_map(|(layer, ranges)| {
+                build_highlight_quads(&laid_out, ranges, style.highlight_layer_color(*layer))
+            })
+            .collect();
 
         if cursor_quad.is_none() && source.is_empty() && self.block_index == 0 {
             // Truly empty document — paint a cursor at the origin so the
@@ -4535,15 +4542,15 @@ fn build_caret_and_selection(
     (cursor.or(boundary_fallback), sel_quads)
 }
 
-/// Wash quads for host-supplied highlight ranges over one block: for each
+/// Wash quads for one highlight layer's ranges over one block: for each
 /// (pre-merged) range that intersects a laid-out line, the same quad geometry
-/// as a selection (via [`paint_selection_for_line`]) in
-/// `MarkdownStyle::highlight_color`. Inert with respect to the caret and
-/// selection — pure decoration under the text.
+/// as a selection (via [`paint_selection_for_line`]) in `color` — the layer's
+/// wash (`MarkdownStyle::highlight_layer_color`). Inert with respect to the
+/// caret and selection — pure decoration under the text.
 fn build_highlight_quads(
     block: &LaidOutBlock,
     ranges: &[std::ops::Range<usize>],
-    style: &MarkdownStyle,
+    color: gpui::Hsla,
 ) -> Vec<TaggedQuad> {
     if ranges.is_empty() {
         return Vec::new();
@@ -4556,14 +4563,7 @@ fn build_highlight_quads(
             let lo_clamped = range.start.max(lo);
             let hi_clamped = range.end.min(hi);
             if hi_clamped > lo_clamped {
-                paint_selection_for_line(
-                    line,
-                    lo_clamped,
-                    hi_clamped,
-                    hi,
-                    style.highlight_color,
-                    &mut quads,
-                );
+                paint_selection_for_line(line, lo_clamped, hi_clamped, hi, color, &mut quads);
             }
         }
     }

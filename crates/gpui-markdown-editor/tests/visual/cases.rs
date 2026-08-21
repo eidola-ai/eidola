@@ -4,7 +4,9 @@
 //! selection.
 
 use gpui::{AppContext, Entity, px, size};
-use gpui_markdown_editor::{EditorState, EmbedMap, MarkdownEditor, MarkdownEditorState, Selection};
+use gpui_markdown_editor::{
+    EditorState, EmbedMap, HighlightLayer, MarkdownEditor, MarkdownEditorState, Selection,
+};
 
 use super::harness::Snapshots;
 
@@ -726,6 +728,123 @@ pub fn register(s: &mut Snapshots) {
     );
 
     register_embed_audit(s);
+    register_highlight_wash(s);
+}
+
+/// The host-supplied highlight wash (`crate::highlight`) over read-only
+/// content — the surface the space view paints quoted-passage references on.
+/// The wash has no other coverage in this corpus, so these are the pixels
+/// that say whether a change to the highlight plugin moved anything.
+fn register_highlight_wash(s: &mut Snapshots) {
+    let win = size(px(720.), px(320.));
+
+    // A wash across inline styles, spanning delimiters the reader cannot see.
+    s.add("highlight_wash_paragraph", win, |window, cx| {
+        highlighted_readonly(
+            window,
+            cx,
+            "A paragraph with **bold** and *italic* words, plus a\n\
+             [link to somewhere](https://example.com) after them.\n\n\
+             A second paragraph that carries no wash at all.",
+            &["with **bold** and", "somewhere"],
+        )
+    });
+
+    // Two ranges that overlap: the wash merges rather than double-darkening.
+    s.add("highlight_wash_overlapping", win, |window, cx| {
+        highlighted_readonly(
+            window,
+            cx,
+            "One long sentence whose middle is covered by two overlapping ranges.",
+            &["sentence whose middle", "middle is covered by"],
+        )
+    });
+
+    // Inside a fenced code block — the wash follows the delimiter/content
+    // mask split rather than painting over the fence rows.
+    s.add("highlight_wash_code_block", win, |window, cx| {
+        highlighted_readonly(
+            window,
+            cx,
+            "Before the fence.\n\n\
+             ```rust\n\
+             fn main() {\n    println!(\"hello\");\n}\n\
+             ```\n\n\
+             After the fence.",
+            &["println!"],
+        )
+    });
+
+    // Two layers over the same words: the upper layer's wash paints on top of
+    // the base one instead of merging with it, and each takes its own color.
+    s.add("highlight_wash_layered", win, |window, cx| {
+        cx.new(|cx| {
+            let markdown = "One sentence whose middle carries a base wash, with a \
+                            shorter span inside it singled out on the layer above.";
+            let base = markdown.find("whose middle carries").expect("fixture");
+            let accent = markdown.find("middle").expect("fixture");
+            let state = EditorState {
+                markdown: markdown.into(),
+                selection: Selection::Cursor(0),
+                ..Default::default()
+            };
+            let state = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
+            state.update(cx, |e, cx| {
+                e.set_highlights(vec![(base..base + "whose middle carries".len(), 0)], cx);
+                e.set_highlights_in(
+                    HighlightLayer::Accent,
+                    vec![(accent..accent + "middle".len(), 1)],
+                    cx,
+                );
+            });
+            ReadonlyHarness { state }
+        })
+    });
+
+    // Inside a table cell — cells are ordinary laid-out lines, so the wash
+    // reaches them with no table-specific machinery.
+    s.add("highlight_wash_table_cell", win, |window, cx| {
+        highlighted_readonly(
+            window,
+            cx,
+            "| Feature | Status |\n\
+             | :-- | --: |\n\
+             | **Bold** cell | `code` |\n\
+             | plain | ~~cut~~ |\n",
+            &["Status", "plain"],
+        )
+    });
+}
+
+/// A read-only editor over `markdown` with a highlight range per needle.
+/// Panics if a needle is missing — keeps the cases honest, like
+/// `editor_with_cursor`.
+fn highlighted_readonly(
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+    markdown: &'static str,
+    needles: &'static [&'static str],
+) -> Entity<ReadonlyHarness> {
+    let entries: Vec<(std::ops::Range<usize>, u64)> = needles
+        .iter()
+        .enumerate()
+        .map(|(i, needle)| {
+            let start = markdown
+                .find(needle)
+                .unwrap_or_else(|| panic!("substring {needle:?} not found in test fixture"));
+            (start..start + needle.len(), i as u64)
+        })
+        .collect();
+    let state = EditorState {
+        markdown: markdown.into(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    cx.new(|cx| {
+        let state = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
+        state.update(cx, |e, cx| e.set_highlights(entries, cx));
+        ReadonlyHarness { state }
+    })
 }
 
 /// The embed-fidelity audit: every markdown construct the editor supports,

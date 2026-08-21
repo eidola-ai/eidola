@@ -339,11 +339,13 @@ pub struct MarkdownEditorState {
     /// from the element's `.on_embed_click(..)` prop each frame; the editor
     /// only reports the ordinal, never interprets it.
     pub(crate) on_embed_click: Option<EmbedClickHandler>,
-    /// Host-supplied highlight ranges (see [`crate::highlight`]) — inert
-    /// decorations painted as a quiet wash behind the covered text. Entity
-    /// state (not [`EditorState`]): the pure update/render pipeline never
-    /// consults them, only the element's paint (and the click hit-test) do.
-    pub(crate) highlights: crate::highlight::HighlightSet,
+    /// Host-supplied highlight ranges, one set per layer (see
+    /// [`crate::highlight`]) — inert decorations painted as a quiet wash
+    /// behind the covered text. Entity state (not [`EditorState`]): the pure
+    /// update/render pipeline never consults them, only the element's paint
+    /// (and the click hit-test, which reads
+    /// [`crate::highlight::HighlightLayer::Base`] alone) do.
+    pub(crate) highlights: crate::highlight::HighlightLayers,
     /// Host callback for a plain click on highlighted text. Synced from the
     /// element's `.on_highlight_click(..)` prop each frame.
     pub(crate) on_highlight_click: Option<HighlightClickHandler>,
@@ -444,7 +446,7 @@ impl MarkdownEditorState {
             focus_handle,
             disabled: false,
             on_embed_click: None,
-            highlights: crate::highlight::HighlightSet::default(),
+            highlights: crate::highlight::HighlightLayers::default(),
             on_highlight_click: None,
             on_context_menu: None,
             highlight_press: None,
@@ -674,23 +676,52 @@ impl MarkdownEditorState {
         &self.state.embeds
     }
 
-    /// Supply the highlight ranges — `(source-byte range, opaque key)` pairs
-    /// (see [`crate::highlight`] for the plugin contract). Render-time
-    /// decoration only: the buffer is untouched (no
-    /// [`MarkdownEditorEvent::Change`]), no caret position becomes forbidden,
-    /// and editing/selection are unaffected — the view just re-renders with
-    /// the wash. Overlapping ranges merge visually at paint time.
+    /// Supply the highlight ranges on [`crate::highlight::HighlightLayer::Base`]
+    /// — the layer whose ranges route clicks. Shorthand for
+    /// [`Self::set_highlights_in`].
     pub fn set_highlights(
         &mut self,
         entries: impl IntoIterator<Item = (std::ops::Range<usize>, u64)>,
         cx: &mut Context<Self>,
     ) {
-        self.highlights = crate::highlight::HighlightSet::new(entries);
+        self.set_highlights_in(crate::highlight::HighlightLayer::Base, entries, cx);
+    }
+
+    /// Supply the highlight ranges on one layer — `(source-byte range, opaque
+    /// key)` pairs (see [`crate::highlight`] for the plugin contract). Every
+    /// other layer is left as it was. Render-time decoration only: the buffer
+    /// is untouched (no [`MarkdownEditorEvent::Change`]), no caret position
+    /// becomes forbidden, and editing/selection are unaffected — the view just
+    /// re-renders with the wash. Overlapping ranges merge visually at paint
+    /// time, **within the layer**.
+    pub fn set_highlights_in(
+        &mut self,
+        layer: crate::highlight::HighlightLayer,
+        entries: impl IntoIterator<Item = (std::ops::Range<usize>, u64)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.highlights
+            .set(layer, crate::highlight::HighlightSet::new(entries));
         cx.notify();
     }
 
-    /// The current highlight set.
+    /// The current highlight set on [`crate::highlight::HighlightLayer::Base`].
     pub fn highlights(&self) -> &crate::highlight::HighlightSet {
+        self.highlights_in(crate::highlight::HighlightLayer::Base)
+    }
+
+    /// The current highlight set on one layer — the read half of the
+    /// compare-before-set guard a host that recomputes ranges every frame
+    /// needs (setting notifies unconditionally).
+    pub fn highlights_in(
+        &self,
+        layer: crate::highlight::HighlightLayer,
+    ) -> &crate::highlight::HighlightSet {
+        self.highlights.get(layer)
+    }
+
+    /// Every layer's highlight ranges — what the paint pass walks.
+    pub(crate) fn highlight_layers(&self) -> &crate::highlight::HighlightLayers {
         &self.highlights
     }
 
@@ -909,6 +940,29 @@ impl MarkdownEditorState {
     /// (the space composer) reads this on every [`MarkdownEditorEvent::Change`]
     /// and adjusts *its* scroll offset to keep the caret visible.
     ///
+    /// [`Self::content_y_for_offset`] at the caret, with the caret's
+    /// wrap-boundary affinity (see [`WrapAffinity`]) rather than the default.
+    pub fn caret_content_y(&self) -> Option<(Pixels, Pixels)> {
+        self.content_y_at(self.state.selection.head(), self.caret_downstream())
+    }
+
+    /// The vertical span of an arbitrary source `offset`, relative to the
+    /// editor's laid-out content top — [`Self::caret_content_y`] generalized
+    /// to any offset, for a host that scrolls something *other* than the caret
+    /// into view (a search match, a cited passage).
+    ///
+    /// An offset on a soft-wrap boundary resolves **downstream** (the start of
+    /// the lower row): unlike the caret, an arbitrary offset carries no
+    /// affinity, and a range's start is what a host reveals.
+    ///
+    /// **Coordinate frame.** See [`Self::caret_content_y`]. Paint-derived, so
+    /// `None` before the first paint — a host revealing a position inside
+    /// content that has not rendered yet (a virtualized transcript) must
+    /// estimate first and correct once this answers.
+    pub fn content_y_for_offset(&self, offset: usize) -> Option<(Pixels, Pixels)> {
+        self.content_y_at(offset, true)
+    }
+
     /// **Coordinate frame.** Derived from the previous frame's `last_blocks`
     /// exactly like [`Self::bounds_for_range`], but re-based to content-local
     /// coordinates: `last_blocks`/`last_bounds` are window-absolute, so
@@ -916,31 +970,29 @@ impl MarkdownEditorState {
     /// yields the y a scroll container measures from its own content top. The
     /// value is independent of any `min_height` runway (the laid-out text sits
     /// at the content top regardless). Returns `None` before the first paint
-    /// (no layout to consult) or when the caret's offset isn't covered by any
-    /// laid-out line.
-    pub fn caret_content_y(&self) -> Option<(Pixels, Pixels)> {
+    /// (no layout to consult) or when the offset isn't covered by any laid-out
+    /// line.
+    fn content_y_at(&self, offset: usize, downstream: bool) -> Option<(Pixels, Pixels)> {
         let content_top = self.last_bounds?.origin.y;
-        let cursor = self.state.selection.head();
-        // Sort keys so a caret sitting on a block boundary (claimed by two
+        // Sort keys so an offset sitting on a block boundary (claimed by two
         // adjacent lines) resolves deterministically to the earlier block,
         // rather than by `HashMap` iteration order.
         let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
         keys.sort_unstable();
-        // Fallback for a caret past every laid-out range — the document end
+        // Fallback for an offset past every laid-out range — the document end
         // after a trailing newline synthesizes an empty paragraph that isn't
         // always laid out as a line, the same edge `bounds_for_range` hits. Keep
-        // the latest line whose range ends at or before the caret and clamp the
-        // caret onto it (its last row) rather than returning `None`.
+        // the latest line whose range ends at or before the offset and clamp it
+        // onto it (its last row) rather than returning `None`.
         let mut fallback: Option<&crate::element::LaidOutLine> = None;
         for k in keys {
             for line in &self.last_blocks[&k].lines {
-                if line.contains_source_offset(cursor) {
-                    let local = line
-                        .local_position_for_source_offset_biased(cursor, self.caret_downstream());
+                if line.contains_source_offset(offset) {
+                    let local = line.local_position_for_source_offset_biased(offset, downstream);
                     let top = line.origin.y + local.y - content_top;
                     return Some((top, top + line.row_height));
                 }
-                if line.source_range.end <= cursor
+                if line.source_range.end <= offset
                     && fallback.is_none_or(|f| line.source_range.end >= f.source_range.end)
                 {
                     fallback = Some(line);
@@ -948,9 +1000,24 @@ impl MarkdownEditorState {
             }
         }
         let line = fallback?;
-        let local = line.local_position_for_source_offset_biased(cursor, self.caret_downstream());
+        let local = line.local_position_for_source_offset_biased(offset, downstream);
         let top = line.origin.y + local.y - content_top;
         Some((top, top + line.row_height))
+    }
+
+    /// Whether an IME composition (preedit) is in progress — the buffer holds
+    /// marked text the user has not committed.
+    ///
+    /// Unlike some input primitives, this editor emits
+    /// [`MarkdownEditorEvent::Change`] on **every** preedit keystroke, because
+    /// the marked text really is in the buffer and a host sizing itself to the
+    /// content must follow it. A host that acts on the text's *meaning*
+    /// instead — searching it, sending it, parsing it — should ask this first
+    /// and wait: the reader has not chosen those characters yet. (The
+    /// `EntityInputHandler::marked_text_range` half of the IME contract needs
+    /// a `Window` and is not a host-facing query.)
+    pub fn is_composing(&self) -> bool {
+        self.marked_range.is_some()
     }
 
     fn dispatch(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
@@ -1680,7 +1747,10 @@ impl MarkdownEditorState {
         self.highlight_press = (event.click_count == 1
             && !event.modifiers.shift
             && self.on_highlight_click.is_some()
-            && !self.highlights.keys_at(offset).is_empty())
+            && !self
+                .highlights_in(crate::highlight::HighlightLayer::Base)
+                .keys_at(offset)
+                .is_empty())
         .then_some(offset);
         self.begin_selection(offset, event.click_count, event.modifiers.shift, cx);
     }
@@ -1789,7 +1859,9 @@ impl MarkdownEditorState {
             && self.state.selection.is_collapsed()
             && let Some(cb) = self.on_highlight_click.clone()
         {
-            let keys = self.highlights.keys_at(offset);
+            let keys = self
+                .highlights_in(crate::highlight::HighlightLayer::Base)
+                .keys_at(offset);
             if !keys.is_empty() {
                 cb(&keys, window, cx);
             }

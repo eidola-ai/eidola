@@ -22,8 +22,8 @@ use gpui_markdown_editor::editor::{
     Undo, Up, WordLeft, WordRight,
 };
 use gpui_markdown_editor::{
-    BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, MarkdownEditorState,
-    RenderSpec, Selection,
+    BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, MarkdownEditorEvent,
+    MarkdownEditorState, RenderSpec, Selection,
 };
 
 /// Minimal host view for the editor under test: holds the state entity and
@@ -9906,4 +9906,165 @@ fn append_at_end_lands_after_the_text_with_the_caret_behind_it(cx: &mut TestAppC
         assert_eq!(e.value(), "already herex");
         assert_eq!(e.cursor_offset(), "already herex".len());
     });
+}
+
+// ---------------------------------------------------------------------------
+// Host seams: offset geometry (`content_y_for_offset`) and IME composition
+// (`is_composing`).
+//
+// The editor has no internal vertical scroll, so a host that wants to reveal
+// something reads its content-local y from here. `caret_content_y` answers for
+// the caret; `content_y_for_offset` answers for any offset — a match, a cited
+// passage — and resolves a wrap boundary downstream, since an arbitrary offset
+// carries no affinity.
+//
+// `is_composing` exists because this editor emits `Change` on every preedit
+// keystroke: a host that reads the buffer's *meaning* on Change must be able to
+// ask whether the reader has committed those characters.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn content_y_for_offset_answers_for_offsets_the_caret_is_not_at(cx: &mut TestAppContext) {
+    let markdown = "first paragraph\n\nsecond paragraph\n\nthird paragraph";
+    let initial = EditorState {
+        markdown: markdown.into(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    // Populate `last_blocks` with a paint pass — the geometry is paint-derived.
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+
+    editor.read_with(cx, |e, _| {
+        let at = |needle: &str| {
+            e.content_y_for_offset(markdown.find(needle).expect("fixture"))
+                .expect("laid out")
+        };
+        let (first_top, first_bottom) = at("first");
+        let (second_top, _) = at("second");
+        let (third_top, _) = at("third");
+
+        assert!(
+            first_bottom > first_top,
+            "the span is a row: {first_top:?}..{first_bottom:?}",
+        );
+        assert!(
+            second_top > first_top && third_top > second_top,
+            "later paragraphs sit lower: {first_top:?}, {second_top:?}, {third_top:?}",
+        );
+        // The caret is at offset 0 and untouched by any of that.
+        assert_eq!(e.cursor_offset(), 0);
+        assert_eq!(e.caret_content_y(), Some((first_top, first_bottom)));
+
+        // The document end is the same edge `caret_content_y` documents: it
+        // clamps onto the last laid-out line rather than answering `None`.
+        let (end_top, _) = e.content_y_for_offset(markdown.len()).expect("clamped");
+        assert_eq!(end_top, third_top);
+    });
+}
+
+#[gpui::test]
+fn content_y_for_offset_resolves_a_wrap_boundary_downstream(cx: &mut TestAppContext) {
+    // The same boundary offset the caret can render on either row of: End
+    // leaves Upstream affinity (upper row), while `content_y_for_offset` has no
+    // affinity to consult and always answers with the lower row — what a host
+    // revealing a range's start wants.
+    let para = "This is a fairly long paragraph that soft-wraps across several \
+                rows inside the narrow viewport configured by open_editor_narrow, \
+                giving us interior wrap boundaries to land a caret on."
+        .to_string();
+    let initial = EditorState {
+        markdown: para,
+        selection: Selection::Cursor(2),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+
+    set_cursor(cx, handle, &editor, 2);
+    dispatch(cx, handle, &editor, End);
+    editor.read_with(cx, |e, _| {
+        let boundary = e.cursor_offset();
+        let (caret_top, caret_bottom) = e.caret_content_y().expect("caret row");
+        let row_h = caret_bottom - caret_top;
+        let (offset_top, _) = e.content_y_for_offset(boundary).expect("boundary row");
+        assert!(
+            offset_top >= caret_top + row_h - gpui::px(1.0),
+            "the same offset resolves one row lower without the caret's upstream \
+             affinity (caret {caret_top:?}, offset {offset_top:?}, row {row_h:?})",
+        );
+    });
+}
+
+#[gpui::test]
+fn is_composing_holds_while_preedit_text_sits_in_the_buffer(cx: &mut TestAppContext) {
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(""));
+
+    let changes = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = changes.clone();
+    cx.update(|cx| {
+        cx.subscribe(&editor, move |_, event: &MarkdownEditorEvent, _| {
+            if matches!(event, MarkdownEditorEvent::Change) {
+                counter.set(counter.get() + 1);
+            }
+        })
+        .detach();
+    });
+
+    editor.read_with(cx, |e, _| assert!(!e.is_composing()));
+
+    // Preedit: the marked text is really in the buffer, and `Change` fires —
+    // which is exactly why a host needs to be able to ask.
+    ime_insert(cx, handle, &editor, "n");
+    editor.read_with(cx, |e, _| {
+        assert!(e.is_composing());
+        assert_eq!(e.value(), "n");
+    });
+    assert!(
+        changes.get() >= 1,
+        "the editor emits Change during preedit ({} events)",
+        changes.get(),
+    );
+
+    ime_insert(cx, handle, &editor, "ni");
+    editor.read_with(cx, |e, _| {
+        assert!(e.is_composing());
+        assert_eq!(e.value(), "ni");
+    });
+
+    // Committing the composition clears it.
+    ime_commit(cx, handle, &editor, "に");
+    editor.read_with(cx, |e, _| {
+        assert!(!e.is_composing());
+        assert_eq!(e.value(), "に");
+    });
+}
+
+#[gpui::test]
+fn ordinary_typing_never_reports_a_composition(cx: &mut TestAppContext) {
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(""));
+    type_text(cx, handle, &editor, "plain");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "plain");
+        assert!(!e.is_composing());
+    });
+}
+
+/// Commit an IME composition (`replace_text_in_range`) — the path that ends a
+/// preedit and leaves the chosen characters in the buffer.
+fn ime_commit(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    editor: &Entity<MarkdownEditorState>,
+    text: &str,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |e, cx| {
+            e.replace_text_in_range(None, text, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
 }

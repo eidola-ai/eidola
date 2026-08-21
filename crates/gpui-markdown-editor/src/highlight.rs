@@ -2,7 +2,7 @@
 //! (sibling of [`crate::embed`]).
 //!
 //! The host hands the editor a set of source-byte ranges, each paired with an
-//! opaque `u64` key, via `MarkdownEditorState::set_highlights`. The editor
+//! opaque `u64` key, via `MarkdownEditorState::set_highlights_in`. The editor
 //! paints a quiet wash behind the covered text (overlapping ranges merge
 //! visually — the wash never double-darkens) and reports a click on
 //! highlighted text through `MarkdownEditor::on_highlight_click` with the
@@ -10,6 +10,22 @@
 //! learns what a highlight *means* — in Eidola the key indexes the host's
 //! incoming-reference list ("this passage was quoted by …"), but this crate
 //! carries no such symbols.
+//!
+//! ## Layers
+//!
+//! A host with two unrelated kinds of decoration (a passage someone quoted;
+//! a phrase the reader is searching for) cannot put both in one set: the
+//! ranges would merge into a single wash, take a single color, and a click on
+//! either would report both. So the plugin holds **one [`HighlightSet`] per
+//! [`HighlightLayer`]** ([`HighlightLayers`]), and each layer is independent:
+//!
+//! - layers paint bottom to top in [`HighlightLayer::ALL`] order, each in its
+//!   own color ([`crate::style::MarkdownStyle::highlight_layer_color`]), so an
+//!   upper layer's wash sits *on top of* a lower one rather than merging with
+//!   it; merging stays within a layer;
+//! - **only [`HighlightLayer::Base`] routes clicks.** Every other layer is
+//!   inert paint: `keys_at` is never consulted for it, so a decoration a host
+//!   paints for its own reasons can never fire the host's click callback.
 //!
 //! Highlights are **inert decorations**: they are not document content
 //! (`value()` and copy never see them), they create no forbidden caret
@@ -24,6 +40,70 @@ use std::sync::Arc;
 /// One host-supplied highlight: the source-byte range it covers and the
 /// opaque key reported back on a click.
 pub type HighlightEntry = (Range<usize>, u64);
+
+/// One of the editor's highlight layers — an ordered, independent channel of
+/// host-supplied decoration (see the module docs).
+///
+/// Named by *stacking position and weight* rather than by meaning: the crate
+/// never learns what a host paints on a layer. An enum rather than an index
+/// so every layer has a color by construction and no out-of-range layer can
+/// be named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum HighlightLayer {
+    /// The bottom layer, and **the only one whose ranges route clicks**
+    /// through `MarkdownEditor::on_highlight_click`.
+    #[default]
+    Base,
+    /// A quiet layer above the base.
+    Overlay,
+    /// The top layer, painted most prominently — for the one range a host
+    /// wants to single out among many.
+    Accent,
+}
+
+impl HighlightLayer {
+    /// Every layer, bottom to top: the paint order.
+    pub const ALL: [Self; 3] = [Self::Base, Self::Overlay, Self::Accent];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The editor's highlight layers: one [`HighlightSet`] per
+/// [`HighlightLayer`]. Cheap to clone; the default is every layer empty,
+/// which disables the plugin.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HighlightLayers([HighlightSet; HighlightLayer::ALL.len()]);
+
+impl HighlightLayers {
+    /// The set on `layer`.
+    pub fn get(&self, layer: HighlightLayer) -> &HighlightSet {
+        &self.0[layer.index()]
+    }
+
+    /// Replace the set on `layer`, leaving every other layer alone.
+    pub fn set(&mut self, layer: HighlightLayer, entries: HighlightSet) {
+        self.0[layer.index()] = entries;
+    }
+
+    /// True when no layer carries a range.
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(HighlightSet::is_empty)
+    }
+
+    /// Each non-empty layer's merged ranges, bottom to top — what the paint
+    /// pass walks. Merging is per layer: an upper layer's wash overlays a
+    /// lower one instead of coalescing with it.
+    pub fn merged_by_layer(&self) -> Vec<(HighlightLayer, Vec<Range<usize>>)> {
+        HighlightLayer::ALL
+            .iter()
+            .copied()
+            .filter(|layer| !self.get(*layer).is_empty())
+            .map(|layer| (layer, self.get(layer).merged_ranges()))
+            .collect()
+    }
+}
 
 /// The host-supplied set of [`HighlightEntry`] pairs. Cheap to clone (shared
 /// `Arc`); an empty set (the default) disables the plugin.
@@ -115,6 +195,53 @@ mod tests {
         let set = HighlightSet::new(vec![(20..25, 1), (0..10, 2), (5..15, 3), (15..18, 4)]);
         // 0..10 ∪ 5..15 ∪ 15..18 coalesce (overlap + adjacency); 20..25 stands.
         assert_eq!(set.merged_ranges(), vec![0..18, 20..25]);
+    }
+
+    #[test]
+    fn layers_are_independent_and_merge_only_within_themselves() {
+        let mut layers = HighlightLayers::default();
+        assert!(layers.is_empty());
+        assert!(layers.merged_by_layer().is_empty());
+
+        layers.set(HighlightLayer::Base, HighlightSet::new(vec![(0..10, 1)]));
+        layers.set(HighlightLayer::Accent, HighlightSet::new(vec![(5..15, 2)]));
+
+        assert!(!layers.is_empty());
+        // Overlapping ranges on *different* layers stay separate ...
+        assert_eq!(
+            layers.merged_by_layer(),
+            vec![
+                (HighlightLayer::Base, vec![0..10]),
+                (HighlightLayer::Accent, vec![5..15]),
+            ]
+        );
+        // ... and only the base layer answers a click.
+        assert_eq!(layers.get(HighlightLayer::Base).keys_at(7), vec![1]);
+        assert_eq!(
+            layers.get(HighlightLayer::Overlay).keys_at(7),
+            Vec::<u64>::new()
+        );
+
+        // Replacing one layer leaves the others alone.
+        layers.set(HighlightLayer::Accent, HighlightSet::default());
+        assert_eq!(
+            layers.merged_by_layer(),
+            vec![(HighlightLayer::Base, vec![0..10])]
+        );
+    }
+
+    #[test]
+    fn layers_paint_bottom_to_top() {
+        let mut layers = HighlightLayers::default();
+        for layer in HighlightLayer::ALL {
+            layers.set(layer, HighlightSet::new(vec![(0..4, 0)]));
+        }
+        let order: Vec<HighlightLayer> = layers
+            .merged_by_layer()
+            .into_iter()
+            .map(|(layer, _)| layer)
+            .collect();
+        assert_eq!(order, HighlightLayer::ALL.to_vec());
     }
 
     #[test]

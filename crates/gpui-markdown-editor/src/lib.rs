@@ -43,7 +43,7 @@ pub use editor::{
 pub use embed::{EmbedMap, embed_marker, parse_embed_text};
 pub use event::{EditorEvent, MarkdownEditorEvent};
 pub use formatting::InlineFormat;
-pub use highlight::HighlightSet;
+pub use highlight::{HighlightLayer, HighlightLayers, HighlightSet};
 pub use parser::parse;
 pub use render::render;
 pub use render_spec::{
