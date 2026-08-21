@@ -181,10 +181,16 @@ apple-roundtrip *args:
 # directory, check every recorded byte/hash, and print structurally parsed
 # embedded claims. Apple trust is established by the authenticated release
 # attestation, not by this structural parser alone.
-verify-apple unsigned_zip signature_bundle:
-    ./scripts/verify-apple.sh "{{ unsigned_zip }}" "{{ signature_bundle }}"
+#
+# unsigned_archive is the flake's gzip'd POSIX tar
+# (nix build .#eidola-gui-macos-universal-archive) — the bytes
+# artifact-manifest.json binds through archiveSha256. Either argument may
+# also be a zip; the container is read from the file's magic bytes.
+verify-apple unsigned_archive signature_bundle:
+    ./scripts/verify-apple.sh "{{ unsigned_archive }}" "{{ signature_bundle }}"
 
-# Regression for Nix archives whose app directories extract read-only.
+# Regression over both containers verify-apple reads, including Nix archives
+# whose app directories extract read-only.
 test-verify-apple:
     ./scripts/test-verify-apple.sh
 
