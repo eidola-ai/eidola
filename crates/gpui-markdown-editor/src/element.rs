@@ -2573,11 +2573,16 @@ impl Element for BlockElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (focus_handle, should_register, disabled) = self.editor.update(cx, |editor, _| {
+        let (focus_handle, should_register, disabled) = self.editor.update(cx, |editor, cx| {
             // Skip IME registration entirely when read-only — a disabled
             // editor accepts no typed text or composition.
             let should = !editor.frame_input_handler_set && !editor.disabled;
             editor.frame_input_handler_set = true;
+            // The frame focus leaves is the frame an open composition ends:
+            // IME is routed to the focused handle, so nothing could end it
+            // afterwards.
+            let focused = editor.focus_handle.is_focused(window);
+            editor.sync_focused(focused, cx);
             (editor.focus_handle.clone(), should, editor.disabled)
         });
         if should_register {

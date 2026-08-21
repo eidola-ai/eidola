@@ -369,6 +369,14 @@ pub struct MarkdownEditorState {
     pub(crate) last_blocks: HashMap<usize, LaidOutBlock>,
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
     pub(crate) frame_input_handler_set: bool,
+    /// Whether the editor held focus at the last paint. Read only to notice
+    /// the focused → unfocused *transition*, which ends an open composition:
+    /// gpui routes IME to the focused handle, so once focus leaves, no
+    /// platform path can end it (Wayland's `text_input` `Leave`, for one,
+    /// tells the client nothing at all), and the marking would answer
+    /// [`MarkdownEditorState::is_composing`] forever — and mis-target the next
+    /// composition, which falls back to it as the range to replace.
+    pub(crate) was_focused: bool,
     /// The in-progress IME composition (preedit) — marked text that is in the
     /// buffer but that the reader has not chosen yet. **Cleared only through
     /// [`Self::end_composition`]**, which always reports the ending: a
@@ -460,6 +468,7 @@ impl MarkdownEditorState {
             last_blocks: HashMap::new(),
             last_bounds: None,
             frame_input_handler_set: false,
+            was_focused: false,
             marked_range: None,
             code_block_scrolls: HashMap::new(),
             intended_x: None,
@@ -1019,6 +1028,35 @@ impl MarkdownEditorState {
         let local = line.local_position_for_source_offset_biased(offset, downstream);
         let top = line.origin.y + local.y - content_top;
         Some((top, top + line.row_height))
+    }
+
+    /// Sync the element's `disabled` prop onto the state, ending any open
+    /// composition when the editor becomes read-only.
+    ///
+    /// A disabled editor registers no input handler
+    /// (`element.rs`: `!editor.frame_input_handler_set && !editor.disabled`),
+    /// so the platform loses the only route it had to end the composition. The
+    /// marking would then answer [`Self::is_composing`] for the rest of the
+    /// editor's life, and a host that skips composing editors would ignore
+    /// this one's content forever.
+    pub(crate) fn sync_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        if disabled && !self.disabled {
+            self.end_composition(cx);
+        }
+        self.disabled = disabled;
+    }
+
+    /// Note this frame's focus, ending an open composition when focus has just
+    /// left — the other half of [`Self::sync_disabled`], and the same rule: a
+    /// composition cannot outlive the editor's ability to receive IME.
+    ///
+    /// A *transition*, not a state test, so an editor that never had focus
+    /// (a headless test driving the IME methods directly) is left alone.
+    pub(crate) fn sync_focused(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if self.was_focused && !focused {
+            self.end_composition(cx);
+        }
+        self.was_focused = focused;
     }
 
     /// Whether an IME composition (preedit) is in progress — the buffer holds
@@ -2356,8 +2394,8 @@ impl RenderOnce for MarkdownEditor {
         let embed_cb = self.on_embed_click.clone();
         let highlight_cb = self.on_highlight_click.clone();
         let context_menu_cb = self.on_context_menu.clone();
-        self.state.update(cx, |st, _| {
-            st.disabled = self.disabled;
+        self.state.update(cx, |st, cx| {
+            st.sync_disabled(self.disabled, cx);
             st.on_embed_click = embed_cb;
             st.on_highlight_click = highlight_cb;
             st.on_context_menu = context_menu_cb;

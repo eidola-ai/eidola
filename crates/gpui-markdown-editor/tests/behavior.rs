@@ -10277,3 +10277,107 @@ fn every_way_a_composition_ends_reports_a_final_change(cx: &mut TestAppContext) 
         );
     }
 }
+
+/// Host view whose `disabled` prop the test can flip, so the editable →
+/// read-only transition runs through the real element render.
+struct ToggleableHarness {
+    state: Entity<MarkdownEditorState>,
+    disabled: bool,
+}
+
+impl gpui::Render for ToggleableHarness {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        MarkdownEditor::new(&self.state).disabled(self.disabled)
+    }
+}
+
+fn open_toggleable_editor(
+    cx: &mut TestAppContext,
+    state: EditorState,
+) -> (
+    AnyWindowHandle,
+    Entity<MarkdownEditorState>,
+    Entity<ToggleableHarness>,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        let mut inner: Option<Entity<MarkdownEditorState>> = None;
+        let mut host: Option<Entity<ToggleableHarness>> = None;
+        let window = cx
+            .open_window(WindowOptions::default(), |window, cx| {
+                let editor = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
+                inner = Some(editor.clone());
+                let harness = cx.new(|_| ToggleableHarness {
+                    state: editor.clone(),
+                    disabled: false,
+                });
+                host = Some(harness.clone());
+                cx.new(|cx| Root::new(harness, window, cx))
+            })
+            .expect("open window");
+        (
+            window.into(),
+            inner.expect("editor built"),
+            host.expect("harness built"),
+        )
+    })
+}
+
+#[gpui::test]
+fn a_composition_cannot_outlive_the_editor_becoming_read_only(cx: &mut TestAppContext) {
+    // A host that renders the editor disabled mid-composition (accepting an
+    // inline edit, say) takes away the very path that would end the
+    // composition: the input handler is not registered while disabled, so the
+    // platform can no longer unmark. Left alone, `is_composing()` would answer
+    // true forever and a host would treat committed text as provisional for
+    // the rest of the editor's life.
+    let (handle, editor, host) = open_toggleable_editor(cx, EditorState::with_markdown("body"));
+    set_cursor(cx, handle, &editor, 4);
+    ime_insert(cx, handle, &editor, "n");
+    editor.read_with(cx, |e, _| assert!(e.is_composing()));
+
+    let changes = change_counter(cx, &editor);
+    host.update(cx, |h, cx| {
+        h.disabled = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    editor.read_with(cx, |e, _| {
+        assert!(!e.is_composing(), "becoming read-only ends the composition");
+        assert_eq!(e.value(), "bodyn", "the composed bytes stay");
+    });
+    assert_eq!(changes.get(), 1, "and it is reported like any other ending");
+}
+
+#[gpui::test]
+fn a_composition_cannot_outlive_the_editor_losing_focus(cx: &mut TestAppContext) {
+    // The other lifecycle exit: gpui routes IME to the focused handle, so once
+    // focus leaves, no platform path can end the composition — Wayland's
+    // `text_input` `Leave` tells the client nothing at all. A marking that
+    // survived would also mis-target the *next* composition, which falls back
+    // to it as the range to replace.
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown("body"));
+    let focus = editor.read_with(cx, |e, _| e.focus_handle.clone());
+    cx.update_window(handle, |_, window, cx| focus.focus(window, cx))
+        .unwrap();
+    cx.run_until_parked();
+    set_cursor(cx, handle, &editor, 4);
+    ime_insert(cx, handle, &editor, "n");
+    editor.read_with(cx, |e, _| assert!(e.is_composing()));
+
+    let changes = change_counter(cx, &editor);
+    cx.update_window(handle, |_, window, _| window.blur())
+        .unwrap();
+    cx.run_until_parked();
+
+    editor.read_with(cx, |e, _| {
+        assert!(!e.is_composing(), "losing focus ends the composition");
+        assert_eq!(e.value(), "bodyn", "the composed bytes stay");
+    });
+    assert_eq!(changes.get(), 1, "and it is reported like any other ending");
+}
