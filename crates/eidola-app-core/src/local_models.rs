@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +70,15 @@ const ENGINE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 
 /// Minimum interval between download-progress bus emissions.
 const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How long a download may go without receiving anything before it is
+/// declared stalled. A read timeout, not a total one: multi-gigabyte models
+/// legitimately take hours on a slow link, but a connection that delivers
+/// nothing for this long is dead. The shared HTTP client sets no timeout of
+/// its own — it also carries loopback engine traffic, where a long silence
+/// while a model processes a prompt is normal — so the bound lives here,
+/// where it means only "this transfer".
+const DOWNLOAD_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // ============================================================================
 // Curated catalog — the official Google Gemma 4 QAT GGUF releases.
@@ -264,12 +273,99 @@ struct DownloadEntry {
     received: AtomicU64,
     /// 0 = unknown (no Content-Length yet).
     total: AtomicU64,
-    cancel: AtomicBool,
+    /// Set once when the user cancels — a watch channel rather than a flag
+    /// because the transfer must be *woken*, not polled. A flag can only be
+    /// noticed between chunks, so a server that stalls mid-response (or never
+    /// answers at all) left a cancelled download blocked in its read forever:
+    /// the partial file stayed, the map entry stayed, and every retry was
+    /// refused as already downloading.
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+/// Identity of one engine **instance** — a single `llama-server` child and
+/// the supervisor task that owns it.
+///
+/// The engines map is keyed by `(backend_id, slug)`, which is the *name* of
+/// a load, not the identity of a process: unload the model and load it again
+/// and the same key names a different child. A supervisor is therefore not
+/// allowed to reason about "the entry under my key" — its own entry may
+/// already have been removed by an unload and replaced by a newer load's,
+/// and mutating that one by name is how a stale actor marks a
+/// still-warming replacement ready, or deletes it outright on its way to
+/// reporting a failure that belongs to a process nobody is waiting for.
+///
+/// So every mutation a supervisor (or a reservation guard) makes names the
+/// instance it owns, and the runtime applies it only if that instance still
+/// holds the key. The counter is process-global and monotonic, so a value
+/// is never reused and a stale actor cannot forge a live one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct EngineInstance(u64);
+
+impl EngineInstance {
+    /// Allocate the next instance identity.
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// A backend's **configuration epoch**: bumped every time that backend's
+/// engines are retired (its row removed, disabled, or repointed at another
+/// models directory).
+///
+/// [`EngineInstance`] gives an entry an identity a stale actor cannot forge;
+/// this is the same idea one level up, for a load that has no entry yet.
+/// `load_local_model` reads the backend row and then *awaits* — model-file
+/// lookup, engine resolution, port pick, `fs::metadata` — before it reserves,
+/// so a retirement landing in that window sweeps a map the load has not
+/// written to yet, and the load then registers an engine spawned from the
+/// configuration that was just retired. Sweeping an empty map is not the same
+/// as keeping it empty.
+///
+/// So a load carries the epoch it read its configuration under, and
+/// [`LocalRuntime::reserve_engine`] refuses if it has moved — the authority
+/// read at the *write* point, under the same lock the sweep takes, exactly as
+/// the quit-time shutdown latch is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackendEpoch(u64);
+
+/// What retiring a backend actually did.
+///
+/// Retirement has **two** effects — it stops that backend's engines and it
+/// forgets what those engines had to say — and a caller deciding whether
+/// anything needs re-rendering has to hear about both. (It has a third: the
+/// backend's [`BackendEpoch`] moves, invalidating loads that are still
+/// in flight. That one is deliberately not summarised here, because it
+/// changes nothing anyone is rendering — a load far enough along to be
+/// visible has an entry, and entries are counted.) A count of engines was
+/// an honest summary while stopping them was the only effect; the moment
+/// forgetting reports joined it, that count started answering a different
+/// question than the one its caller was asking, and a backend whose engine had
+/// already failed (a standing report, nothing running) retired in silence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Retirement {
+    /// Engine supervisors signalled to stop.
+    pub(crate) engines: usize,
+    /// Standing engine reports forgotten.
+    pub(crate) reports: usize,
+}
+
+impl Retirement {
+    /// Whether anything a local-models snapshot renders actually changed.
+    /// `false` is a genuine no-op — nothing was running and nothing was being
+    /// reported — and its caller must stay silent, because an invalidation
+    /// nobody needs is its own defect.
+    pub(crate) fn changed(self) -> bool {
+        self.engines > 0 || self.reports > 0
+    }
 }
 
 /// A running (or warming-up) engine subprocess. The supervisor task owns
 /// the child process; this entry is the control handle.
 struct EngineEntry {
+    /// Which engine instance this entry *is* — see [`EngineInstance`]. Only
+    /// the owner of this identity may mark it ready or retire it.
+    instance: EngineInstance,
     port: u16,
     context_tokens: u32,
     ready: bool,
@@ -312,24 +408,24 @@ impl Drop for EngineLease {
 struct ReservationGuard {
     local: Arc<LocalRuntime>,
     bus: BroadcastSource,
-    key: Option<EngineKey>,
+    /// The reservation to roll back — **by instance**, so a rollback that
+    /// runs after an unload-then-reload cycle cannot take the replacement
+    /// down with it.
+    reservation: Option<(EngineKey, EngineInstance)>,
 }
 
 impl ReservationGuard {
     /// The supervisor now owns the entry; the guard stands down.
     fn defuse(mut self) {
-        self.key = None;
+        self.reservation = None;
     }
 }
 
 impl Drop for ReservationGuard {
     fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.local
-                .engines
-                .lock()
-                .expect("engines lock")
-                .remove(&key);
+        if let Some((key, instance)) = self.reservation.take()
+            && self.local.retire_instance(&key, instance)
+        {
             self.bus.emit(Change::LocalModels);
         }
     }
@@ -376,6 +472,30 @@ pub(crate) struct LocalRuntime {
     failures: StdMutex<HashMap<EngineKey, EngineFailure>>,
     /// Test override for the machine memory budget ([`memory_budget`]).
     budget_override: StdMutex<Option<u64>>,
+    /// Per-backend configuration epochs ([`BackendEpoch`]). **Only ever
+    /// touched while the `engines` lock is held** — that ordering is what
+    /// makes "bump on retirement" and "validate on reservation" atomic with
+    /// respect to each other; the separate mutex is here only because the
+    /// `engines` lock guards a bare `HashMap` rather than a state struct
+    /// (the same reason [`Self::shutting_down`] is an atomic).
+    backend_epochs: StdMutex<HashMap<String, u64>>,
+    /// Test-only pause at each of a load's hand-off points
+    /// ([`Self::pause_at_load_checkpoint`]).
+    #[cfg(feature = "test-support")]
+    load_pause: StdMutex<Option<std::time::Duration>>,
+    /// Test-only count of `llama-server` processes actually started.
+    ///
+    /// The witness a test needs for "nothing was executed": a child that is
+    /// killed microseconds after `fork` leaves no trace of its own — no
+    /// output, no file it had time to touch — so *whether a process was
+    /// started* cannot be observed from outside the parent. It is counted
+    /// where it happens instead.
+    #[cfg(feature = "test-support")]
+    engine_spawns: AtomicU64,
+    /// Test override for the engine readiness budget
+    /// ([`ENGINE_READY_TIMEOUT`]), so a test can watch the deadline fire
+    /// without waiting out the real one.
+    ready_timeout_override: StdMutex<Option<std::time::Duration>>,
     /// One-way shutdown latch. Set by [`Inner::shutdown_all_engines`] and
     /// checked by [`Self::reserve_engine`] — **both under the `engines`
     /// lock**, which is what makes it race-free; the atomic is only here
@@ -426,6 +546,23 @@ impl LocalRuntime {
         ))
     }
 
+    /// This backend's current epoch. Caller must hold the `engines` lock.
+    fn epoch_locked(&self, backend_id: &str) -> u64 {
+        *self
+            .backend_epochs
+            .lock()
+            .expect("backend epochs lock")
+            .get(backend_id)
+            .unwrap_or(&0)
+    }
+
+    /// The epoch a load reads its backend configuration under, to hand back to
+    /// [`Self::reserve_engine`]. See [`BackendEpoch`].
+    pub(crate) fn backend_epoch(&self, backend_id: &str) -> BackendEpoch {
+        let _engines = self.engines.lock().expect("engines lock");
+        BackendEpoch(self.epoch_locked(backend_id))
+    }
+
     /// Whether an entry (ready or warming) exists for this key.
     fn engine_present(&self, key: &EngineKey) -> bool {
         self.engines.lock().expect("engines lock").contains_key(key)
@@ -436,15 +573,18 @@ impl LocalRuntime {
     /// loads of different models can never both conclude that the same free
     /// memory covers them (each sees the other's reservation in its own
     /// plan). Returns `Ok(None)` when an entry for `key` already exists
-    /// (join that load) and `Ok(Some(victims))` when the reservation is in
-    /// place; `Err` refuses without reserving or unloading anything.
+    /// (join that load) and `Ok(Some((instance, victims)))` when the
+    /// reservation is in place — the instance identity being what the
+    /// spawned supervisor must present for every later mutation of the
+    /// entry. `Err` refuses without reserving or unloading anything.
     fn reserve_engine(
         &self,
         key: &EngineKey,
         port: u16,
         footprint: u64,
         shutdown: tokio::sync::oneshot::Sender<()>,
-    ) -> Result<Option<Vec<EngineKey>>, String> {
+        epoch: BackendEpoch,
+    ) -> Result<Option<(EngineInstance, Vec<EngineKey>)>, String> {
         let mut engines = self.engines.lock().expect("engines lock");
         // The shutdown authority is checked *here*, inside the reservation's
         // critical section and under the same lock the drain takes — not by
@@ -452,6 +592,18 @@ impl LocalRuntime {
         // would let a mid-flight load spawn a subprocess after the drain.
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err("Eidola is shutting down".into());
+        }
+        // Same shape, different authority: this load resolved its directory
+        // and engine binary from a backend row that has since been removed,
+        // disabled, or repointed, and registering it now would hand later
+        // turns an engine serving the old configuration under the new one's
+        // name. Refused here, inside the critical section the retirement's
+        // own sweep takes.
+        if self.epoch_locked(&key.0) != epoch.0 {
+            return Err(format!(
+                "backend `{}` changed while the model was loading — try again",
+                key.0
+            ));
         }
         if engines.contains_key(key) {
             return Ok(None);
@@ -468,9 +620,11 @@ impl LocalRuntime {
             })
             .collect();
         let victims = plan_evictions(footprint, self.memory_budget(), &snapshot)?;
+        let instance = EngineInstance::next();
         engines.insert(
             key.clone(),
             EngineEntry {
+                instance,
                 port,
                 context_tokens: LOCAL_CONTEXT_TOKENS,
                 ready: false,
@@ -481,31 +635,198 @@ impl LocalRuntime {
                 in_flight: Arc::new(AtomicU64::new(0)),
             },
         );
-        Ok(Some(victims))
+        Ok(Some((instance, victims)))
     }
 
-    /// Run `f` — the engine spawn — only if no quit-time shutdown has begun,
-    /// **atomically with respect to the drain**.
+    /// **The gate every instance-scoped effect passes through**: run `f` while
+    /// and only while `instance` still holds `key`, under the `engines` lock.
     ///
-    /// The latch on [`Self::reserve_engine`] closes the window between a load's
-    /// last `await` and its reservation; this closes the one *after* it. A
-    /// reservation accepted a moment before the latch flipped hands its
-    /// supervisor to `tokio::spawn`, and that task's first poll can land after
-    /// the drain has already walked an empty-of-it registry — at which point an
-    /// unconditional `command.spawn()` starts a subprocess into a process about
-    /// to `exit()`. Same class, same cure: the authority is read at the write
-    /// point, under the same lock the drain takes, so no interleaving can put a
-    /// spawn after the latch.
+    /// A supervisor outlives its own registration. Its entry can be taken by
+    /// an unload, an eviction, the quit drain, or its backend being removed,
+    /// disabled or repointed — and the key can be occupied again by a newer
+    /// load — all while this task sits between two `await`s. So a supervisor
+    /// may never name its effect by key alone, and *every* arm has to ask the
+    /// same question: is this still mine?
+    ///
+    /// Asking it in one place is the difference between an invariant and a
+    /// habit. Each arm that asked separately was one that could forget, and
+    /// one did: the failure-filing arm treated an *absent* key as licence to
+    /// record, so a deliberate unload could leave "exited unexpectedly" on a
+    /// row that is merely available. The closure receives the instance's own
+    /// [`OccupiedEntry`](std::collections::hash_map::OccupiedEntry) — the only
+    /// handle it gets — so it can promote or remove *that* entry and reach no
+    /// other, and an arm that skips the gate has nothing to act on at all.
+    /// `None` means the instance is gone; every caller's answer to that is to
+    /// do nothing.
+    fn if_still_registered<T>(
+        &self,
+        key: &EngineKey,
+        instance: EngineInstance,
+        f: impl FnOnce(std::collections::hash_map::OccupiedEntry<'_, EngineKey, EngineEntry>) -> T,
+    ) -> Option<T> {
+        use std::collections::hash_map::Entry;
+        let mut engines = self.engines.lock().expect("engines lock");
+        match engines.entry(key.clone()) {
+            Entry::Occupied(entry) if entry.get().instance == instance => Some(f(entry)),
+            _ => None,
+        }
+    }
+
+    /// Mark a warming entry ready. Returns whether it did; `false` means this
+    /// instance was unloaded (and possibly replaced) while it warmed up, and
+    /// its caller owes its child a kill rather than a promotion.
+    fn mark_engine_ready(&self, key: &EngineKey, instance: EngineInstance) -> bool {
+        self.if_still_registered(key, instance, |mut entry| entry.get_mut().ready = true)
+            .is_some()
+    }
+
+    /// Drop an entry. Returns whether it did. Used by every path that ends one
+    /// engine's life on the engine's own account (a rolled-back reservation, a
+    /// supervisor's failure); the user-driven verbs remove by key, because
+    /// "unload whatever is loaded under this id" is exactly what they mean.
+    fn retire_instance(&self, key: &EngineKey, instance: EngineInstance) -> bool {
+        self.if_still_registered(key, instance, |entry| {
+            entry.remove();
+        })
+        .is_some()
+    }
+
+    /// Retire one instance and file its failure — **both inside the gate**, so
+    /// a report can only ever be filed by the instance whose row it decorates.
+    ///
+    /// A standing failure exists to explain a model's state to whoever is
+    /// looking at it. An instance that no longer holds its key has no such
+    /// state to explain: something deliberate ended it, and the row now shows
+    /// what that something left behind. Filing anyway is how a plain unload
+    /// grows a spurious "exited unexpectedly", and how a newer load under the
+    /// same key inherits a dead process's complaint.
+    ///
+    /// Nothing is swallowed by the silence. The caller waiting on this load
+    /// gets the message over its own channel (`ready_tx`), and a second caller
+    /// that joined the load reads "the engine load was cancelled" from
+    /// [`Inner::await_engine_ready`] — which is what actually happened.
+    fn fail_instance(&self, key: &EngineKey, instance: EngineInstance, message: String) {
+        self.if_still_registered(key, instance, |entry| {
+            entry.remove();
+            self.failures
+                .lock()
+                .expect("failures lock")
+                .insert(key.clone(), EngineFailure::load(message));
+        });
+    }
+
+    /// Take the entry loaded under `key`, whatever instance it is — the
+    /// user-driven unload. The caller owns the returned shutdown sender.
+    fn take_engine(&self, key: &EngineKey) -> Option<EngineEntry> {
+        self.engines.lock().expect("engines lock").remove(key)
+    }
+
+    /// Take every entry belonging to `backend_id`.
+    ///
+    /// A backend row's models directory (and the engine binary that serves
+    /// it) is what gives `(backend_id, slug)` its meaning, so a row that is
+    /// removed, disabled, or repointed at another directory leaves every
+    /// engine registered under its id describing a configuration that no
+    /// longer exists. Left in place, the next load of the same slug joins the
+    /// old engine and turns run against the previous file while every surface
+    /// describes the new one. The caller owns the returned shutdown senders.
+    ///
+    /// The reports those engines filed go with them. A standing engine failure
+    /// says "this backend's engine could not start", and a row that is removed
+    /// is only soft-removed — re-adding the id revives it, and the old error
+    /// would come back with it, describing a directory and a binary the
+    /// backend no longer has. A **download** report is not an engine's: it
+    /// belongs to the file and carries the URL a retry needs (see
+    /// [`EngineFailure`]), so it survives — retiring engines is not a reason
+    /// to forget that a download failed.
+    /// Returns the entries (whose shutdown senders the caller owns) alongside
+    /// the number of reports forgotten, because the caller's question is
+    /// "did anything change?" and neither half answers it alone.
+    fn take_backend_engines(&self, backend_id: &str) -> (Vec<EngineEntry>, usize) {
+        let mut engines = self.engines.lock().expect("engines lock");
+        // Bumped under the `engines` lock, so a reservation either happened
+        // before this sweep (and is in `engines`, and is taken below) or
+        // validates its epoch after it (and is refused). There is no third
+        // interleaving — which is the whole point, since a load can be
+        // mid-flight with nothing in the map to sweep.
+        *self
+            .backend_epochs
+            .lock()
+            .expect("backend epochs lock")
+            .entry(backend_id.to_string())
+            .or_insert(0) += 1;
+        let mut reports = 0usize;
+        self.failures
+            .lock()
+            .expect("failures lock")
+            .retain(|(b, _), failure| {
+                let keep = b != backend_id || failure.source_url.is_some();
+                if !keep {
+                    reports += 1;
+                }
+                keep
+            });
+        let keys: Vec<EngineKey> = engines
+            .keys()
+            .filter(|(b, _)| b == backend_id)
+            .cloned()
+            .collect();
+        let entries = keys.iter().filter_map(|k| engines.remove(k)).collect();
+        (entries, reports)
+    }
+
+    /// Run `f` — the one place in this crate that starts a process — only
+    /// while the load that asked for it still holds its registration.
+    ///
+    /// **The registration is the licence to run a subprocess**, and this is
+    /// the single check that enforces it. A load reserves, then hands its
+    /// supervisor to `tokio::spawn`, and that task's first poll can land an
+    /// arbitrary time later — after a quit drained the registry, after an
+    /// unload or an eviction took the entry, after the backend was removed,
+    /// disabled or repointed. Every one of those removes the entry under the
+    /// `engines` lock, so asking *under the same lock* whether this instance
+    /// still holds its key answers all of them at once, and answers any future
+    /// path that ends an engine's life without anyone remembering to add a
+    /// check here.
+    ///
+    /// It is [`Self::if_still_registered`] with a message attached — the same
+    /// gate every other instance-scoped effect passes through.
+    ///
+    /// It subsumes the quit latch it replaced: the drain empties the map and
+    /// sets the latch in one critical section, and [`Self::reserve_engine`]
+    /// refuses to reserve afterwards — so an entry that is still present at
+    /// this moment is proof that no drain has run since it was made. The latch
+    /// is read below only to *word* the refusal, never as the authority.
     ///
     /// Holding the `engines` lock across the spawn is safe and deliberate:
-    /// `Command::spawn` is synchronous (no `await` under the guard) and touches
-    /// nothing in this map.
-    fn spawn_unless_shutting_down<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
-        let _engines = self.engines.lock().expect("engines lock");
-        if self.shutting_down.load(Ordering::SeqCst) {
-            return None;
-        }
-        Some(f())
+    /// `Command::spawn` is synchronous (no `await` under the guard) and
+    /// touches nothing in this map. Killing a child a moment after starting it
+    /// is not the same as never starting it — a model is mmapped and
+    /// gigabytes are touched on the way up, and on a repointed backend the
+    /// binary may be one the user has just replaced.
+    fn spawn_if_still_registered<T>(
+        &self,
+        key: &EngineKey,
+        instance: EngineInstance,
+        f: impl FnOnce() -> T,
+    ) -> Result<T, &'static str> {
+        self.if_still_registered(key, instance, |_entry| {
+            #[cfg(feature = "test-support")]
+            self.engine_spawns.fetch_add(1, Ordering::SeqCst);
+            f()
+        })
+        .ok_or(if self.shutting_down.load(Ordering::SeqCst) {
+            "Eidola is shutting down"
+        } else {
+            "the load was cancelled before the engine started"
+        })
+    }
+
+    /// Test seam: how many `llama-server` processes have been started.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub(crate) fn engine_spawn_count(&self) -> u64 {
+        self.engine_spawns.load(Ordering::SeqCst)
     }
 
     /// The total memory the engine pool may occupy: a fixed fraction of
@@ -529,6 +850,54 @@ impl LocalRuntime {
     #[cfg(feature = "test-support")]
     pub(crate) fn set_memory_budget_for_test(&self, budget: u64) {
         *self.budget_override.lock().expect("budget lock") = Some(budget);
+    }
+
+    /// How long a load may take to reach `/health` = 200
+    /// ([`ENGINE_READY_TIMEOUT`]), or the test override. One reading serves
+    /// the spawning supervisor and every caller joining its load, so the two
+    /// cannot disagree about when the budget is spent.
+    fn ready_timeout(&self) -> std::time::Duration {
+        (*self
+            .ready_timeout_override
+            .lock()
+            .expect("ready timeout lock"))
+        .unwrap_or(ENGINE_READY_TIMEOUT)
+    }
+
+    /// Pause at a load's hand-off points, when a test has asked for one.
+    ///
+    /// A load hands over twice, and a retirement (or an unload, or the quit
+    /// drain) can land in either gap: between reading the backend's
+    /// configuration and reserving ([`BackendEpoch`]), and between reserving
+    /// and its supervisor starting the child
+    /// ([`Self::spawn_if_still_registered`]). Both windows are real and
+    /// microseconds wide; this widens them so a test can hit one on purpose
+    /// rather than by luck. Compiled only into test builds — production has
+    /// no such call.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn pause_at_load_checkpoint(&self) {
+        let pause = *self.load_pause.lock().expect("load pause lock");
+        if let Some(pause) = pause {
+            tokio::time::sleep(pause).await;
+        }
+    }
+
+    /// Test seam: see [`Self::pause_at_load_checkpoint`].
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_load_pause_for_test(&self, pause: std::time::Duration) {
+        *self.load_pause.lock().expect("load pause lock") = Some(pause);
+    }
+
+    /// Test seam: shorten the engine readiness budget so a test can observe
+    /// the deadline without waiting out the real five minutes.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_ready_timeout_for_test(&self, timeout: std::time::Duration) {
+        *self
+            .ready_timeout_override
+            .lock()
+            .expect("ready timeout lock") = Some(timeout);
     }
 
     /// Test seam: register a fake "ready" engine at an arbitrary port so
@@ -557,6 +926,7 @@ impl LocalRuntime {
         self.engines.lock().expect("engines lock").insert(
             (backend_id.to_string(), slug.to_string()),
             EngineEntry {
+                instance: EngineInstance::next(),
                 port,
                 context_tokens: LOCAL_CONTEXT_TOKENS,
                 ready: true,
@@ -742,8 +1112,23 @@ pub(crate) fn engine_key_for_id(id: &str) -> EngineKey {
 /// collapse in app-core's own map.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelDownloadTarget {
-    /// The URL the bytes are fetched from (normalized).
+    /// The URL the bytes are actually fetched from: the caller's own URL,
+    /// query string included, with a Hugging Face `/blob/` page rewritten to
+    /// its `/resolve/` object.
+    ///
+    /// **The query is not decoration.** A direct link to a model on S3 or a
+    /// CDN commonly carries its authorization in the query
+    /// (`?token=…`, `?X-Amz-Signature=…`), so a request made without it is a
+    /// request that fails — while the *path* is all that identifies the file.
+    /// Hence the split: inspection and identity below read the path, and only
+    /// this field is handed to the HTTP client.
     pub url: String,
+    /// The same URL with query and fragment removed — what is recorded beside
+    /// the file and shown as its source. Provenance, never a request: a
+    /// signed URL's token is a short-lived credential that has no business
+    /// being written to disk, and it says nothing about where the model came
+    /// from that the path does not.
+    pub canonical_url: String,
     /// The file name they are written under.
     pub file_name: String,
     /// The `<slug>` of the resulting `<slug>@local` id — the transfer's identity.
@@ -761,10 +1146,20 @@ pub fn resolve_model_download(input: &str) -> Result<ModelDownloadTarget, AppErr
     let (url, file_name) = normalize_model_url(input)?;
     let slug = slug_for_file(&file_name);
     Ok(ModelDownloadTarget {
+        canonical_url: strip_query(&url).to_string(),
         url,
         file_name,
         slug,
     })
+}
+
+/// A URL without its query or fragment — the part that names the file.
+fn strip_query(url: &str) -> &str {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment)
 }
 
 /// Normalize a pasted model URL into `(download_url, file_name)`.
@@ -774,6 +1169,16 @@ pub fn resolve_model_download(input: &str) -> Result<ModelDownloadTarget, AppErr
 /// download instead of rendering HTML. Anything without a `.gguf` final
 /// path segment is rejected — better an honest error at paste time than a
 /// half-downloaded HTML page named like a model.
+///
+/// **The query is stripped for inspection, not from the download.** What the
+/// file is called, whether it is a `.gguf` at all, and which transfer it
+/// identifies are all decided on the path alone, so every equivalent spelling
+/// of one model still collapses onto one `file_name` (and one slug) —
+/// the identity `download_local_model` and its callers key on. But the URL
+/// returned here is the one that gets requested, and dropping its query would
+/// strip the authorization a signed S3/CDN link carries, turning a link that
+/// validates into a download that 403s. The fragment is dropped outright: it
+/// is never sent to a server.
 pub fn normalize_model_url(input: &str) -> Result<(String, String), AppError> {
     let raw = input.trim();
     if raw.is_empty() {
@@ -786,22 +1191,24 @@ pub fn normalize_model_url(input: &str) -> Result<(String, String), AppError> {
             message: "model URL must start with https://".into(),
         });
     }
-    // Drop query/fragment (e.g. `?download=true`) before inspecting the path.
+    // Split off the query (e.g. `?download=true`, or a signed link's
+    // credentials) and drop the fragment. Everything below inspects the path;
+    // the query rides along to the request untouched.
     let without_fragment = raw.split('#').next().unwrap_or(raw);
-    let path_part = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
+    let (path_part, query) = match without_fragment.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (without_fragment, None),
+    };
 
     // Hugging Face file-page URLs use `/blob/<rev>/...`; the raw object
     // lives at `/resolve/<rev>/...`.
-    let url = if path_part.contains("huggingface.co/") {
+    let path = if path_part.contains("huggingface.co/") {
         path_part.replacen("/blob/", "/resolve/", 1)
     } else {
         path_part.to_string()
     };
 
-    let file_name = url.rsplit('/').next().unwrap_or_default().to_string();
+    let file_name = path.rsplit('/').next().unwrap_or_default().to_string();
     if !file_name.to_ascii_lowercase().ends_with(".gguf") {
         return Err(AppError::LocalModel {
             message: format!(
@@ -822,6 +1229,10 @@ pub fn normalize_model_url(input: &str) -> Result<(String, String), AppError> {
             message: format!("model file name contains unsupported characters: `{file_name}`"),
         });
     }
+    let url = match query {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
     Ok((url, file_name))
 }
 
@@ -1311,6 +1722,7 @@ impl Inner {
     pub(crate) async fn download_local_model(&self, url: &str) -> Result<String, AppError> {
         let ModelDownloadTarget {
             url: download_url,
+            canonical_url,
             file_name,
             slug,
         } = resolve_model_download(url)?;
@@ -1325,16 +1737,19 @@ impl Inner {
 
         let display_name = LOCAL_MODEL_CATALOG
             .iter()
-            .find(|c| c.file_name == file_name || c.url == download_url)
+            .find(|c| c.file_name == file_name || c.url == canonical_url)
             .map(|c| c.display_name.to_string())
             .unwrap_or_else(|| prettify_stem(&slug));
 
         let entry = Arc::new(DownloadEntry {
             display_name,
-            source_url: download_url.clone(),
+            // Provenance, not a request: the sidecar written beside the
+            // finished file records this, and a signed link's credentials
+            // must not be what is left on disk.
+            source_url: canonical_url,
             received: AtomicU64::new(0),
             total: AtomicU64::new(0),
-            cancel: AtomicBool::new(false),
+            cancel: tokio::sync::watch::Sender::new(false),
         });
         {
             let mut downloads = self.local.downloads.lock().expect("downloads lock");
@@ -1358,18 +1773,28 @@ impl Inner {
         let local = self.local.clone();
         let slug_task = slug.clone();
         // The normalized URL round-trips through `normalize_model_url` (a
-        // direct `.gguf` URL is its own normal form), so recording it is
-        // enough for a retry to re-enter this method unchanged.
+        // direct `.gguf` URL, query and all, is its own normal form), so
+        // recording it is enough for a retry to re-enter this method
+        // unchanged — including the authorization a signed link carries,
+        // without which the retry could only fail. This lives in the
+        // in-memory failure map and never reaches the disk.
         let retry_url = download_url.clone();
         // Core-owned transfer task: survives any window; cancellation is the
-        // explicit flag, checked between chunks.
+        // wakeable signal on the entry.
         tokio::spawn(async move {
             let result = run_download(&client, &download_url, &dir, &file_name, &entry, &bus).await;
-            local
-                .downloads
-                .lock()
-                .expect("downloads lock")
-                .remove(&slug_task);
+            // Retiring this transfer and filing its report happen in **one**
+            // critical section, for the reason every other report in this
+            // module names an instance: the slot is what a second download of
+            // the same slug waits on. Removing first and filing after would
+            // leave a gap in which a retry starts (its own start clears this
+            // key's failures) and then inherits this transfer's error on its
+            // fresh row. Holding the downloads lock across the insert orders
+            // the two absolutely — a retry either sees the slot occupied and
+            // is refused, or starts after the report is already filed and
+            // clears it on the way in.
+            let mut downloads = local.downloads.lock().expect("downloads lock");
+            downloads.remove(&slug_task);
             if let Err(e) = result {
                 local.failures.lock().expect("failures lock").insert(
                     (crate::backends::LOCAL_BACKEND_ID.to_string(), slug_task),
@@ -1379,6 +1804,7 @@ impl Inner {
                     },
                 );
             }
+            drop(downloads);
             bus.emit(Change::LocalModels);
         });
 
@@ -1392,7 +1818,7 @@ impl Inner {
         let downloads = self.local.downloads.lock().expect("downloads lock");
         match downloads.get(&slug) {
             Some(entry) => {
-                entry.cancel.store(true, Ordering::Relaxed);
+                entry.cancel.send_replace(true);
                 Ok(())
             }
             None => Err(AppError::LocalModel {
@@ -1509,6 +1935,12 @@ impl Inner {
             return self.await_engine_ready(&key).await;
         }
 
+        // The epoch is read **before** the backend row, and handed to the
+        // reservation to validate — see [`BackendEpoch`]. Everything between
+        // here and the reservation is configuration this load is about to act
+        // on, and all of it can be retired while this future awaits.
+        let epoch = self.local.backend_epoch(&backend_id);
+
         // Resolve the model file's directory by backend, and note how the
         // engine binary resolves for it: the managed `local` store served by
         // the bundled engine, or a `llamacpp` backend's user-owned directory
@@ -1521,11 +1953,19 @@ impl Inner {
             /// A `llamacpp` backend's explicit path (`Some`) or discovery.
             External(Option<String>),
         }
+        // The backend row is required for **every** engine backend, the `local`
+        // singleton included: disabling a backend retires its engines, and a
+        // rule that only the chat path enforced would let the explicit verb
+        // (`eidola model load`, the Load button) start another `llama-server`
+        // the moment after the disable stopped one — a disabled backend still
+        // holding gigabytes, which is precisely what disabling it asked for.
+        // Managing *files* (download, delete) stays open: those are not
+        // processes, and a disabled backend's models are still the user's.
+        let db_conn = self.db_conn().await?;
+        let row = self.require_backend(&db_conn, &backend_id).await?;
         let (dir, engine_source) = if backend_id == crate::backends::LOCAL_BACKEND_ID {
             (models_dir(&self.data_dir), EngineSource::Bundled)
         } else {
-            let db_conn = self.db_conn().await?;
-            let row = self.require_backend(&db_conn, &backend_id).await?;
             if row.kind != crate::backends::BackendKind::LlamaCpp.as_str() {
                 return Err(AppError::LocalModel {
                     message: format!("backend `{backend_id}` does not serve local engines"),
@@ -1573,6 +2013,12 @@ impl Inner {
                 .unwrap_or(0),
         );
 
+        // Test seam only: widen the window between the configuration read
+        // above and the reservation below, so the race the epoch closes can be
+        // driven deliberately. Compiled out of production builds.
+        #[cfg(feature = "test-support")]
+        self.local.pause_at_load_checkpoint().await;
+
         // Make room: plan LRU evictions and insert this load's warming
         // entry in one critical section ([`LocalRuntime::reserve_engine`]),
         // so concurrent loads of different models can't double-book the
@@ -1580,21 +2026,23 @@ impl Inner {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let reserved = self
             .local
-            .reserve_engine(&key, port, footprint, shutdown_tx)
+            .reserve_engine(&key, port, footprint, shutdown_tx, epoch)
             .map_err(|message| AppError::LocalModel {
                 message: format!("cannot load `{model_id}`: {message}"),
             })?;
-        let Some(victims) = reserved else {
+        let Some((instance, victims)) = reserved else {
             // Raced another load between the presence check and here — join
             // that load instead of double-spawning.
             return self.await_engine_ready(&key).await;
         };
         // Until the supervisor takes ownership at spawn, an error return
-        // (or this future being dropped) must roll the reservation back.
+        // (or this future being dropped) must roll the reservation back —
+        // this reservation, named by instance, never whatever holds the key
+        // by then.
         let reservation = ReservationGuard {
             local: self.local.clone(),
             bus: self.bus.clone(),
-            key: Some(key.clone()),
+            reservation: Some((key.clone(), instance)),
         };
         self.local
             .failures
@@ -1635,7 +2083,18 @@ impl Inner {
         // authority is the shutdown channel (map removal → send) — and if
         // the whole runtime is torn down, `kill_on_drop` reaps the child.
         tokio::spawn(async move {
-            supervise_engine(command, port, http, shutdown_rx, ready_tx, bus, local, key).await;
+            supervise_engine(
+                command,
+                port,
+                http,
+                shutdown_rx,
+                ready_tx,
+                bus,
+                local,
+                key,
+                instance,
+            )
+            .await;
         });
 
         match ready_rx.await {
@@ -1651,7 +2110,8 @@ impl Inner {
     /// `Ok`, entry gone (load failed / unloaded) → the recorded failure, or
     /// a timeout mirroring the loader's own budget.
     async fn await_engine_ready(&self, key: &EngineKey) -> Result<(), AppError> {
-        let deadline = std::time::Instant::now() + ENGINE_READY_TIMEOUT;
+        let budget = self.local.ready_timeout();
+        let deadline = std::time::Instant::now() + budget;
         loop {
             if self.local.ready_engine(&key.0, &key.1).is_some() {
                 return Ok(());
@@ -1669,10 +2129,7 @@ impl Inner {
             }
             if std::time::Instant::now() >= deadline {
                 return Err(AppError::LocalModel {
-                    message: format!(
-                        "engine did not become ready within {}s",
-                        ENGINE_READY_TIMEOUT.as_secs()
-                    ),
+                    message: format!("engine did not become ready within {}s", budget.as_secs()),
                 });
             }
             tokio::time::sleep(ENGINE_POLL_INTERVAL).await;
@@ -1705,11 +2162,7 @@ impl Inner {
     /// Unload a model: signal its supervisor, which kills the subprocess.
     pub(crate) async fn unload_local_model(&self, id: &str) -> Result<(), AppError> {
         let key = engine_key_for_id(id);
-        let entry = {
-            let mut engines = self.local.engines.lock().expect("engines lock");
-            engines.remove(&key)
-        };
-        match entry {
+        match self.local.take_engine(&key) {
             Some(e) => {
                 // Supervisor may already be gone (crash path); either way the
                 // map entry is removed, which is the user-visible state.
@@ -1776,6 +2229,26 @@ impl Inner {
         count
     }
 
+    /// Stop every engine registered under `backend_id` and forget what those
+    /// engines had to say, returning what that came to ([`Retirement`]).
+    ///
+    /// Called when a backend row stops meaning what it meant — removed,
+    /// disabled, or repointed at another models directory (see
+    /// [`LocalRuntime::take_backend_engines`] for why an engine may not
+    /// outlive that). Like [`Self::unload_local_model`] this *signals*; the
+    /// supervisor task owns the child and does the kill. It does not emit —
+    /// the caller knows what else changed at the same moment.
+    pub(crate) fn retire_backend_engines(&self, backend_id: &str) -> Retirement {
+        let (entries, reports) = self.local.take_backend_engines(backend_id);
+        let engines = entries.len();
+        for entry in entries {
+            // The supervisor may already be gone (crash path); the map
+            // removal is the user-visible state either way.
+            let _ = entry.shutdown.send(());
+        }
+        Retirement { engines, reports }
+    }
+
     /// Every engine the registry is holding, right now.
     ///
     /// The read-only sibling of [`Self::shutdown_all_engines`], and it exists
@@ -1821,9 +2294,13 @@ async fn remove_partial(path: &Path) {
 }
 
 /// Stream `url` to `<dir>/<file_name>.part`, then write the sidecar and
-/// rename into place. Cancellation is checked between chunks; any failure
-/// removes the partial file. Returns `Ok` for both completion and
-/// cancellation — only real failures are recorded.
+/// rename into place. Any failure removes the partial file. Returns `Ok` for
+/// both completion and cancellation — only real failures are recorded.
+///
+/// Cancellation and the stall timeout race **every** network wait, from the
+/// request itself through each chunk: a press of Cancel has to reach a
+/// transfer that is blocked on a server that stopped talking, which is
+/// exactly when a user reaches for it.
 async fn run_download(
     client: &reqwest::Client,
     url: &str,
@@ -1843,13 +2320,36 @@ async fn run_download(
     let part_path = dir.join(format!("{file_name}.part"));
     let final_path = dir.join(file_name);
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| AppError::LocalModel {
-            message: format!("download failed: {e}"),
-        })?;
+    /// Why a network wait ended other than by producing bytes.
+    enum Interrupted {
+        Cancelled,
+        Stalled,
+    }
+    let stalled = || AppError::LocalModel {
+        message: format!(
+            "download stalled: nothing received for {}s",
+            DOWNLOAD_STALL_TIMEOUT.as_secs()
+        ),
+    };
+    let mut cancelled = entry.cancel.subscribe();
+
+    let sent = tokio::select! {
+        biased;
+        _ = cancelled.wait_for(|c| *c) => Err(Interrupted::Cancelled),
+        _ = tokio::time::sleep(DOWNLOAD_STALL_TIMEOUT) => Err(Interrupted::Stalled),
+        sent = client.get(url).send() => Ok(sent),
+    };
+    let response = match sent {
+        Ok(sent) => sent.map_err(|e| AppError::LocalModel {
+            // Never `{e}`: a request-phase `reqwest::Error` prints the URL it
+            // was fetching, and this one carries the caller's authorization —
+            // see [`crate::error::request_error_text`].
+            message: format!("download failed: {}", crate::error::request_error_text(e)),
+        })?,
+        // Nothing was created yet, so there is nothing to clean up.
+        Err(Interrupted::Cancelled) => return Ok(()),
+        Err(Interrupted::Stalled) => return Err(stalled()),
+    };
     if !response.status().is_success() {
         return Err(AppError::LocalModel {
             message: format!("download failed: HTTP {}", response.status().as_u16()),
@@ -1867,19 +2367,40 @@ async fn run_download(
 
     let mut stream = response.bytes_stream();
     let mut last_emit = std::time::Instant::now();
-    while let Some(chunk) = stream.next().await {
-        if entry.cancel.load(Ordering::Relaxed) {
-            drop(file);
-            remove_partial(&part_path).await;
-            return Ok(());
-        }
+    loop {
+        // A fresh timer per chunk: the bound is on silence, not on the
+        // transfer's length.
+        let read = tokio::select! {
+            biased;
+            _ = cancelled.wait_for(|c| *c) => Err(Interrupted::Cancelled),
+            _ = tokio::time::sleep(DOWNLOAD_STALL_TIMEOUT) => Err(Interrupted::Stalled),
+            chunk = stream.next() => Ok(chunk),
+        };
+        let chunk = match read {
+            Ok(Some(chunk)) => chunk,
+            // The response ended.
+            Ok(None) => break,
+            Err(Interrupted::Cancelled) => {
+                drop(file);
+                remove_partial(&part_path).await;
+                return Ok(());
+            }
+            Err(Interrupted::Stalled) => {
+                drop(file);
+                remove_partial(&part_path).await;
+                return Err(stalled());
+            }
+        };
         let bytes = match chunk {
             Ok(b) => b,
             Err(e) => {
                 drop(file);
                 remove_partial(&part_path).await;
                 return Err(AppError::LocalModel {
-                    message: format!("download interrupted: {e}"),
+                    message: format!(
+                        "download interrupted: {}",
+                        crate::error::request_error_text(e)
+                    ),
                 });
             }
         };
@@ -1941,14 +2462,15 @@ async fn supervise_engine(
     bus: BroadcastSource,
     local: Arc<LocalRuntime>,
     key: EngineKey,
+    instance: EngineInstance,
 ) {
+    // Every map mutation below names `instance`, never the bare key: this
+    // task can resume after its own entry was unloaded and a newer load
+    // registered its engine under the same `(backend, slug)`, and a stale
+    // supervisor must not mark that replacement ready or delete it while
+    // reporting its own child's death. See [`EngineInstance`].
     let fail = |message: &str| {
-        local.engines.lock().expect("engines lock").remove(&key);
-        local
-            .failures
-            .lock()
-            .expect("failures lock")
-            .insert(key.clone(), EngineFailure::load(message));
+        local.fail_instance(&key, instance, message.to_string());
     };
 
     // **Every** emission in this supervisor goes through here, and it is
@@ -1974,13 +2496,25 @@ async fn supervise_engine(
         }
     };
 
-    // A quit may have landed between our reservation and this task's first
-    // poll; starting a subprocess now would orphan it to the imminent
-    // `exit()`. Checked under the drain's own lock — see
-    // `LocalRuntime::spawn_unless_shutting_down`.
-    let Some(spawned) = local.spawn_unless_shutting_down(|| command.spawn()) else {
-        let _ = ready_tx.send(Err("Eidola is shutting down".into()));
-        return;
+    // Test seam only: widen the window between the reservation and this
+    // spawn, the second place a load hands over. Compiled out of production
+    // builds.
+    #[cfg(feature = "test-support")]
+    local.pause_at_load_checkpoint().await;
+
+    // Anything at all may have landed between our reservation and this task's
+    // first poll — a quit, an unload, an eviction, a backend removed or
+    // disabled or repointed — and each of them took our entry out of the
+    // registry. The registration is what licenses a subprocess, so it is
+    // re-read here, under the lock every one of those paths takes, at the one
+    // place a process is actually started. Nothing is mutated on refusal: the
+    // entry is already gone, and whatever holds the key now is not ours.
+    let spawned = match local.spawn_if_still_registered(&key, instance, || command.spawn()) {
+        Ok(spawned) => spawned,
+        Err(message) => {
+            let _ = ready_tx.send(Err(message.into()));
+            return;
+        }
     };
     let mut child = match spawned {
         Ok(c) => c,
@@ -2019,7 +2553,8 @@ async fn supervise_engine(
     };
 
     let health_url = format!("http://127.0.0.1:{port}/health");
-    let deadline = std::time::Instant::now() + ENGINE_READY_TIMEOUT;
+    let ready_timeout = local.ready_timeout();
+    let deadline = tokio::time::Instant::now() + ready_timeout;
 
     // Phase 1: wait for readiness. The child's exit is observed via
     // `try_wait` between polls so no `&mut child` borrow spans the select.
@@ -2040,7 +2575,7 @@ async fn supervise_engine(
         if let Ok(Some(status)) = child.try_wait() {
             break LoadEnd::Exited(status.code());
         }
-        if std::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             break LoadEnd::TimedOut;
         }
         // The probe must race the shutdown signal, not precede it.
@@ -2053,8 +2588,17 @@ async fn supervise_engine(
         // its signal into a receiver nobody was watching, the drain's brief
         // grace expired, `exit()` followed, and the child outlived the
         // process — the orphan the whole teardown exists to prevent.
+        //
+        // It must race the readiness deadline for the same reason. A hang
+        // *inside* one probe is indistinguishable from a hang between them,
+        // and the loop's own deadline check is above this await: an endpoint
+        // that accepts the request and never answers would otherwise leave
+        // this select waiting on shutdown alone, the documented load budget
+        // never enforced, and every caller joining the warming engine stuck
+        // for as long as the socket stays open.
         let ready = tokio::select! {
             _ = &mut shutdown_rx => break LoadEnd::Shutdown,
+            _ = tokio::time::sleep_until(deadline) => break LoadEnd::TimedOut,
             resp = http.get(&health_url).send() => {
                 matches!(resp, Ok(r) if r.status().is_success())
             }
@@ -2089,7 +2633,7 @@ async fn supervise_engine(
             let _ = child.wait().await;
             let message = format!(
                 "llama-server did not become ready within {}s. Last output:\n{}",
-                ENGINE_READY_TIMEOUT.as_secs(),
+                ready_timeout.as_secs(),
                 tail_text(),
             );
             fail(&message);
@@ -2099,19 +2643,12 @@ async fn supervise_engine(
         }
     }
 
-    // Ready — flip the map entry (it may have been removed by a concurrent
-    // unload, in which case we shut down instead of serving a ghost). The
-    // decision happens under the lock; the kill happens after it drops.
-    let still_wanted = {
-        let mut engines = local.engines.lock().expect("engines lock");
-        match engines.get_mut(&key) {
-            Some(e) => {
-                e.ready = true;
-                true
-            }
-            None => false,
-        }
-    };
+    // Ready — flip *our* map entry. It may have been removed by a concurrent
+    // unload (and the key may already carry a newer load's engine), in which
+    // case there is nothing of ours to promote and we shut down instead of
+    // serving a ghost — or, worse, advertising someone else's warming child
+    // as ready. The decision happens under the lock; the kill after it drops.
+    let still_wanted = local.mark_engine_ready(&key, instance);
     if !still_wanted {
         let _ = child.start_kill();
         let _ = child.wait().await;
@@ -2160,16 +2697,35 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rewrites_hf_blob_urls_and_strips_query() {
+    fn normalize_rewrites_hf_blob_urls_and_keeps_the_query() {
         let (url, name) = normalize_model_url(
-            "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/blob/main/gemma-4-12b-it-qat-q4_0.gguf?download=true",
+            "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/blob/main/gemma-4-12b-it-qat-q4_0.gguf?download=true#anchor",
         )
         .unwrap();
         assert_eq!(
             url,
-            "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf"
+            "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf?download=true",
+            "the page URL is rewritten to the object; the query rides along"
         );
         assert_eq!(name, "gemma-4-12b-it-qat-q4_0.gguf");
+    }
+
+    /// A direct link's query is its **authorization**, not decoration: signed
+    /// S3/CDN model links carry `?token=…`, and a request made without it is a
+    /// request that 403s. So the query is stripped for *inspection* — the file
+    /// name, the `.gguf` check, the transfer's identity — and kept on the URL
+    /// that is actually fetched.
+    #[test]
+    fn a_signed_urls_authorization_survives_to_the_fetch() {
+        let signed = "https://cdn.example.com/models/tiny.gguf?token=abc123&X-Amz-Expires=900";
+        let target = resolve_model_download(signed).expect("resolves");
+        assert_eq!(target.url, signed, "the fetch keeps every query parameter");
+        assert_eq!(target.file_name, "tiny.gguf");
+        assert_eq!(target.slug, "tiny");
+        assert_eq!(
+            target.canonical_url, "https://cdn.example.com/models/tiny.gguf",
+            "provenance carries no credential"
+        );
     }
 
     /// Equivalent spellings of one model resolve to one transfer identity.
@@ -2190,8 +2746,20 @@ mod tests {
         assert_eq!(first.slug, "gemma-4-12b-it-qat-q4_0");
         for spelling in &spellings[1..] {
             let target = resolve_model_download(spelling).expect("resolves");
-            assert_eq!(target, first, "`{spelling}` names the same transfer");
+            assert_eq!(
+                (&target.slug, &target.file_name, &target.canonical_url),
+                (&first.slug, &first.file_name, &first.canonical_url),
+                "`{spelling}` names the same transfer"
+            );
         }
+        // Identity is the path's alone, so two spellings that differ *only*
+        // in their query — one signed link and its refreshed twin — are still
+        // one transfer, and the second is refused rather than started again.
+        let base = format!("{base}/resolve/main/{file}");
+        let signed = resolve_model_download(&format!("{base}?token=one")).expect("resolves");
+        let refreshed = resolve_model_download(&format!("{base}?token=two")).expect("resolves");
+        assert_eq!(signed.slug, refreshed.slug);
+        assert_ne!(signed.url, refreshed.url, "each fetches with its own token");
     }
 
     #[test]
@@ -2327,16 +2895,16 @@ mod tests {
 
         let key_a = ("local".to_string(), "a".to_string());
         let (tx_a, _rx_a) = tokio::sync::oneshot::channel();
-        assert_eq!(
-            runtime.reserve_engine(&key_a, 4001, 6 * GIB, tx_a).unwrap(),
-            Some(Vec::new()),
-            "the first load fits with no evictions"
-        );
+        let (_instance, victims) = runtime
+            .reserve_engine(&key_a, 4001, 6 * GIB, tx_a, runtime.backend_epoch("local"))
+            .unwrap()
+            .expect("the first load fits with no evictions");
+        assert_eq!(victims, Vec::<EngineKey>::new());
 
         let key_b = ("local".to_string(), "b".to_string());
         let (tx_b, _rx_b) = tokio::sync::oneshot::channel();
         let err = runtime
-            .reserve_engine(&key_b, 4002, 6 * GIB, tx_b)
+            .reserve_engine(&key_b, 4002, 6 * GIB, tx_b, runtime.backend_epoch("local"))
             .unwrap_err();
         assert!(err.contains("held"), "got {err}");
         assert!(
@@ -2348,7 +2916,7 @@ mod tests {
         let (tx_a2, _rx_a2) = tokio::sync::oneshot::channel();
         assert_eq!(
             runtime
-                .reserve_engine(&key_a, 4003, 6 * GIB, tx_a2)
+                .reserve_engine(&key_a, 4003, 6 * GIB, tx_a2, runtime.backend_epoch("local"))
                 .unwrap(),
             None
         );
@@ -2368,7 +2936,9 @@ mod tests {
 
         let key = ("local".to_string(), "late".to_string());
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        let err = runtime.reserve_engine(&key, 4004, GIB, tx).unwrap_err();
+        let err = runtime
+            .reserve_engine(&key, 4004, GIB, tx, runtime.backend_epoch("local"))
+            .unwrap_err();
         assert!(err.contains("shutting down"), "got {err}");
         assert!(
             !runtime.engine_present(&key),
@@ -2376,26 +2946,316 @@ mod tests {
         );
     }
 
+    /// **A registration is the licence to run a subprocess**, and it is
+    /// checked once, where the process is actually started.
+    ///
+    /// The reservation and the spawn are separated by a `tokio::spawn` and an
+    /// unbounded scheduling delay, and everything that can end an engine's
+    /// life in that gap — the quit drain, an unload, an eviction, a backend
+    /// removed / disabled / repointed — does so by taking the entry out of
+    /// this map under this lock. So one question asked here answers all of
+    /// them, including whichever path is added next.
     #[test]
-    fn the_shutdown_latch_also_refuses_a_spawn_that_was_already_reserved() {
-        // The latch on `reserve_engine` closes the window before a
-        // reservation; this closes the one after it. A supervisor whose
-        // reservation was accepted a moment before the quit lands can have
-        // its first poll scheduled *after* the drain walked the registry —
-        // and an unconditional `command.spawn()` there starts a subprocess
-        // into a process about to `exit()`.
+    fn only_a_live_registration_may_start_a_process() {
         let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+        let key = ("my-box".to_string(), "tiny".to_string());
+
+        let reserve = |port| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let (instance, _) = runtime
+                .reserve_engine(&key, port, GIB, tx, runtime.backend_epoch("my-box"))
+                .unwrap()
+                .expect("reserved");
+            (instance, rx)
+        };
+
+        // The ordinary case: the load still holds its entry.
+        let (instance, _rx) = reserve(7001);
         assert_eq!(
-            runtime.spawn_unless_shutting_down(|| "spawned"),
-            Some("spawned"),
-            "an ordinary load spawns"
+            runtime.spawn_if_still_registered(&key, instance, || "spawned"),
+            Ok("spawned"),
+            "an ordinary load starts its engine"
         );
 
-        runtime.shutting_down.store(true, Ordering::SeqCst);
+        // Retired between reserving and spawning — the backend's row was
+        // removed, disabled, or repointed while this supervisor was queued.
+        runtime.take_backend_engines("my-box");
         assert_eq!(
-            runtime.spawn_unless_shutting_down(|| "spawned"),
-            None,
+            runtime.spawn_if_still_registered(&key, instance, || "spawned"),
+            Err("the load was cancelled before the engine started"),
+            "a retired configuration may not start a process"
+        );
+
+        // Unloaded and immediately reloaded: the key is occupied again, but
+        // not by us. The replacement's child is its own to start.
+        let (replacement, _rx2) = reserve(7002);
+        assert_eq!(
+            runtime.spawn_if_still_registered(&key, instance, || "spawned"),
+            Err("the load was cancelled before the engine started"),
+            "a stale supervisor may not start a child against a live entry"
+        );
+        assert_eq!(
+            runtime.spawn_if_still_registered(&key, replacement, || "spawned"),
+            Ok("spawned")
+        );
+
+        // And the quit drain needs no separate check: it empties the map (and
+        // `reserve_engine` refuses to refill it), so a present entry is itself
+        // proof that no drain has run since the reservation was made.
+        let entries: Vec<EngineEntry> = {
+            let mut engines = runtime.engines.lock().expect("engines lock");
+            runtime.shutting_down.store(true, Ordering::SeqCst);
+            engines.drain().map(|(_, e)| e).collect()
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            runtime.spawn_if_still_registered(&key, replacement, || "spawned"),
+            Err("Eidola is shutting down"),
             "once the drain has run, nothing may start a child"
+        );
+    }
+
+    /// An engine entry belongs to one **instance**, and a supervisor whose
+    /// instance is gone may not touch what took its place.
+    ///
+    /// Unload-then-reload puts a second engine under the same
+    /// `(backend, slug)` while the first supervisor is still alive: its
+    /// health probe may already have succeeded, or its child may have exited,
+    /// at the same moment the shutdown signal arrived — and `select!` is free
+    /// to take either arm. A mutation addressed by key alone would then mark a
+    /// replacement that is still loading as ready (routing turns at a port
+    /// nothing serves yet) or, on the failure paths, delete the replacement
+    /// outright, leaving its subprocess running with no entry through which
+    /// anyone could ever unload it.
+    #[test]
+    fn a_stale_supervisor_cannot_touch_the_engine_that_replaced_it() {
+        let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+        let key = ("local".to_string(), "tiny".to_string());
+
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (first, _) = runtime
+            .reserve_engine(&key, 5001, GIB, tx1, runtime.backend_epoch("local"))
+            .unwrap()
+            .expect("reserved");
+        // The user unloads (by key — that verb means "whatever is loaded
+        // here") and immediately loads again: a second instance, same key.
+        assert!(runtime.take_engine(&key).is_some());
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        let (second, _) = runtime
+            .reserve_engine(&key, 5002, GIB, tx2, runtime.backend_epoch("local"))
+            .unwrap()
+            .expect("reserved again");
+        assert_ne!(first, second, "instances are never reused");
+
+        // The first supervisor's health probe finally answers.
+        assert!(
+            !runtime.mark_engine_ready(&key, first),
+            "a stale instance may not promote anything"
+        );
+        assert!(
+            runtime.ready_engine(&key.0, &key.1).is_none(),
+            "the replacement is still warming and must not be advertised"
+        );
+
+        // ...and then its child's death is reported.
+        runtime.fail_instance(&key, first, "llama-server exited".into());
+        assert!(
+            runtime.engine_present(&key),
+            "a stale instance may not delete the engine that replaced it"
+        );
+        assert!(
+            !runtime
+                .failures
+                .lock()
+                .expect("failures lock")
+                .contains_key(&key),
+            "nor file its complaint against the engine that replaced it"
+        );
+        assert!(
+            runtime
+                .failures
+                .lock()
+                .expect("failures lock")
+                .get(&key)
+                .is_none(),
+            "nor pin its own failure on the live engine's row"
+        );
+
+        // The live instance still owns its entry, and its own mutations land.
+        assert!(runtime.mark_engine_ready(&key, second));
+        assert_eq!(
+            runtime.ready_engine(&key.0, &key.1),
+            Some(("http://127.0.0.1:5002".to_string(), LOCAL_CONTEXT_TOKENS))
+        );
+        runtime.fail_instance(&key, second, "llama-server exited".into());
+        assert!(!runtime.engine_present(&key));
+        assert!(
+            runtime
+                .failures
+                .lock()
+                .expect("failures lock")
+                .contains_key(&key),
+            "the owning instance's failure is the one that gets reported"
+        );
+    }
+
+    /// Retiring a backend's engines also invalidates the reservations of
+    /// loads that read its configuration but have not registered yet.
+    ///
+    /// The sweep alone can only take what is already in the map; a load that
+    /// is mid-flight has written nothing to it, so without the epoch it walks
+    /// in afterwards and registers an engine spawned from the configuration
+    /// that was just retired.
+    #[test]
+    fn a_retirement_invalidates_a_reservation_made_under_the_old_configuration() {
+        let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+        let key = ("my-box".to_string(), "tiny".to_string());
+
+        // A load reads its configuration...
+        let epoch = runtime.backend_epoch("my-box");
+        // ...the backend is removed (or disabled, or repointed) while it is
+        // still resolving files and ports...
+        assert!(runtime.take_backend_engines("my-box").0.is_empty());
+        // ...and its reservation is refused when it finally arrives.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let err = runtime
+            .reserve_engine(&key, 6001, GIB, tx, epoch)
+            .unwrap_err();
+        assert!(err.contains("changed while"), "got {err}");
+        assert!(
+            !runtime.engine_present(&key),
+            "a refused reservation leaves nothing to spawn against"
+        );
+
+        // A load that reads its configuration *after* the retirement is
+        // ordinary work and proceeds.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(
+            runtime
+                .reserve_engine(&key, 6002, GIB, tx, runtime.backend_epoch("my-box"))
+                .unwrap()
+                .is_some()
+        );
+
+        // And the epoch is per backend: retiring one does not invalidate a
+        // load of another.
+        let other = ("local".to_string(), "tiny".to_string());
+        let other_epoch = runtime.backend_epoch("local");
+        runtime.take_backend_engines("my-box");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(
+            runtime
+                .reserve_engine(&other, 6003, GIB, tx, other_epoch)
+                .unwrap()
+                .is_some(),
+            "another backend's retirement is not this load's business"
+        );
+    }
+
+    /// A retired instance files nothing — not even when the key it held is
+    /// empty.
+    ///
+    /// This is the arm the ownership rule was missing. An unload (or an
+    /// eviction, or a backend retirement) takes the entry and signals the
+    /// supervisor, but the supervisor's `select!` may see its child's exit
+    /// first and report it. Filing then puts "exited unexpectedly" on a model
+    /// the user has just deliberately unloaded, whose row now says nothing
+    /// worse than *available* — and leaves that error keyed under
+    /// `(backend, slug)` for the next thing to occupy it.
+    ///
+    /// The silence costs nothing: the caller waiting on the load is told over
+    /// its own channel, and a caller that joined it reads "the engine load was
+    /// cancelled", which is what happened.
+    #[test]
+    fn a_retired_instance_files_no_failure() {
+        let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+        let key = ("local".to_string(), "tiny".to_string());
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let (instance, _) = runtime
+            .reserve_engine(&key, 9001, GIB, tx, runtime.backend_epoch("local"))
+            .unwrap()
+            .expect("reserved");
+        // The user unloads: the entry goes, and nothing takes its place.
+        assert!(runtime.take_engine(&key).is_some());
+
+        runtime.fail_instance(&key, instance, "llama-server exited unexpectedly".into());
+        assert!(
+            !runtime
+                .failures
+                .lock()
+                .expect("failures lock")
+                .contains_key(&key),
+            "an instance that no longer holds its key has no row to explain"
+        );
+        assert!(!runtime.engine_present(&key), "and nothing was resurrected");
+    }
+
+    /// Retiring a backend retires what its engines had to say — and nothing
+    /// else. A download's report belongs to the file, not to the engine, and
+    /// carries the URL a retry needs.
+    #[test]
+    fn retiring_a_backend_forgets_its_engine_reports_but_not_its_downloads() {
+        let runtime = LocalRuntime::default();
+        let engine_failed = ("local".to_string(), "engine".to_string());
+        let download_failed = ("local".to_string(), "download".to_string());
+        let other_backend = ("my-box".to_string(), "engine".to_string());
+        {
+            let mut failures = runtime.failures.lock().expect("failures lock");
+            failures.insert(engine_failed.clone(), EngineFailure::load("exited"));
+            failures.insert(
+                download_failed.clone(),
+                EngineFailure {
+                    message: "download failed".into(),
+                    source_url: Some("https://example.com/x.gguf".into()),
+                },
+            );
+            failures.insert(other_backend.clone(), EngineFailure::load("exited"));
+        }
+
+        let (entries, reports) = runtime.take_backend_engines("local");
+        assert!(entries.is_empty(), "no engine was running");
+        assert_eq!(
+            reports, 1,
+            "the retirement reports what it forgot — the only thing that \
+             happened here, and what tells its caller to invalidate"
+        );
+
+        let failures = runtime.failures.lock().expect("failures lock");
+        assert!(
+            !failures.contains_key(&engine_failed),
+            "the engine's report goes"
+        );
+        assert!(
+            failures.contains_key(&download_failed),
+            "a failed download keeps its report — and the URL a retry needs"
+        );
+        assert!(
+            failures.contains_key(&other_backend),
+            "another backend's reports are not this retirement's business"
+        );
+    }
+
+    /// Every engine of one backend goes when that backend's row does — and
+    /// nothing else does. See `Inner::retire_backend_engines`.
+    #[test]
+    fn retiring_a_backend_takes_its_engines_and_only_its_engines() {
+        let runtime = LocalRuntime::default();
+        runtime.register_for_test("my-box", "tiny", 5101);
+        runtime.register_for_test("my-box", "other", 5102);
+        runtime.register_for_test("local", "tiny", 5103);
+
+        let (taken, _reports) = runtime.take_backend_engines("my-box");
+        assert_eq!(taken.len(), 2);
+        assert!(!runtime.engine_present(&("my-box".into(), "tiny".into())));
+        assert!(runtime.engine_present(&("local".into(), "tiny".into())));
+        assert!(
+            runtime.take_backend_engines("my-box").0.is_empty(),
+            "idempotent"
         );
     }
 
@@ -2502,10 +3362,10 @@ mod tests {
 
     #[test]
     fn the_bundled_engine_rule_is_a_sibling_and_nothing_else() {
-        // The sidecar moved from Contents/Resources/bin into Contents/MacOS
-        // (task 55: Apple expects a bundle's executables there, and it makes
-        // the resolver one rule on every platform). The old location must be
-        // gone, not merely deprioritized — a stale candidate would keep a
+        // The bundle's sidecar lives in Contents/MacOS, where Apple expects a
+        // bundle's executables — which is also what makes the resolver one
+        // rule on every platform. The Contents/Resources/bin location must be
+        // absent, not merely deprioritized — a stale candidate would keep a
         // half-migrated bundle silently working and let the two layouts drift.
         let exe = PathBuf::from("/app/Contents/MacOS/Eidola");
         assert_eq!(

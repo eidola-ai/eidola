@@ -71,6 +71,206 @@ fn wait_for_state(
 // Downloads
 // ===========================================================================
 
+/// A direct model link's query is its authorization — signed S3/CDN links
+/// carry `?token=…` — so the request must go out with it. Only the *path*
+/// decides what the file is called and which transfer it identifies, which is
+/// why the query can be stripped for inspection and still ride along to the
+/// fetch.
+#[test]
+fn a_signed_download_url_is_fetched_with_its_authorization() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let mock = core.runtime().block_on(async {
+            let mock = wiremock::MockServer::start().await;
+            // The object is served *only* to a request that presents the
+            // token; anything else is the 403 a stripped signature earns.
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/models/signed-model.gguf"))
+                .and(wiremock::matchers::query_param("token", "s3cret"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0x47u8; 2048]),
+                )
+                .mount(&mock)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(403))
+                .mount(&mock)
+                .await;
+            mock
+        });
+
+        let url = format!("{}/models/signed-model.gguf?token=s3cret", mock.uri());
+        core.runtime()
+            .block_on(core.download_local_model(url))
+            .expect("download starts");
+
+        let state = wait_for_state(&core, |s| {
+            s.models
+                .iter()
+                .any(|m| m.slug == "signed-model" && m.status == LocalModelStatus::Available)
+        });
+        let model = state
+            .models
+            .iter()
+            .find(|m| m.slug == "signed-model")
+            .unwrap();
+        assert_eq!(model.last_error, None, "the signed URL downloads");
+        assert_eq!(model.size_bytes, Some(2048));
+        // What is recorded beside the file is provenance, not a credential:
+        // the token is short-lived, says nothing about where the model came
+        // from, and has no business on disk.
+        assert_eq!(
+            model.source_url.as_deref(),
+            Some(format!("{}/models/signed-model.gguf", mock.uri()).as_str()),
+            "the sidecar records the URL without its query"
+        );
+        let sidecar = dir.path().join("data/models/signed-model.gguf.meta.json");
+        let written = std::fs::read_to_string(&sidecar).expect("sidecar");
+        assert!(
+            !written.contains("s3cret"),
+            "no credential may be written beside the model: {written}"
+        );
+    });
+}
+
+/// A failure report may not carry the credential the URL carried.
+///
+/// `reqwest` attaches the request URL to every request-phase error and prints
+/// it in `Display` ("error sending request for url (…)"), so formatting one
+/// into a message copies whatever that URL holds — and a signed model link
+/// holds an authorization token. The message becomes `last_error`, which is
+/// rendered wherever a failed model row is shown; the URL kept for Retry is a
+/// different field, is never displayed, and never reaches disk.
+#[test]
+fn a_failed_signed_download_keeps_its_token_out_of_the_error() {
+    run(|| {
+        let (core, dir) = bare_core();
+        // A port with nothing listening: the send fails during connect, which
+        // is exactly when reqwest has a URL to attach.
+        let dead_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{dead_port}/models/secret-model.gguf?token=s3cret");
+
+        core.runtime()
+            .block_on(core.download_local_model(url))
+            .expect("download starts");
+
+        let state = wait_for_state(&core, |s| {
+            s.models
+                .iter()
+                .any(|m| m.slug == "secret-model" && m.last_error.is_some())
+        });
+        let model = state
+            .models
+            .iter()
+            .find(|m| m.slug == "secret-model")
+            .unwrap();
+        let error = model.last_error.as_deref().unwrap();
+        assert!(
+            !error.contains("s3cret"),
+            "a credential may not reach the error a person is shown: {error}"
+        );
+        assert!(
+            error.contains("download failed") && error.contains("Connection refused"),
+            "the cause a reader needs is still there: {error}"
+        );
+        // Retry still works: the URL the row remembers is the one that was
+        // asked for, credential included. It is an argument, not a display —
+        // no surface renders it, and nothing writes it down.
+        assert!(
+            model
+                .source_url
+                .as_deref()
+                .is_some_and(|u| u.contains("token=s3cret")),
+            "the retry URL keeps what a retry needs: {:?}",
+            model.source_url
+        );
+        assert!(
+            !dir.path()
+                .join("data/models")
+                .join("secret-model.gguf.meta.json")
+                .exists(),
+            "a failed download writes no sidecar"
+        );
+    });
+}
+
+/// A server that answers with a `Content-Length` it never satisfies: headers,
+/// a first chunk, then silence with the socket held open — the shape of a
+/// transfer that dies mid-response. Returns its port.
+fn stalling_download_server(rt: &tokio::runtime::Runtime) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    rt.spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n")
+                .await;
+            let _ = sock.write_all(&[0x47u8; 1024]).await;
+            let _ = sock.flush().await;
+            // Held, and silent from here.
+            held.push(sock);
+        }
+    });
+    port
+}
+
+/// Cancel must reach a transfer that is blocked on the network.
+///
+/// The shared HTTP client sets no request timeout, so a server that stops
+/// talking mid-response leaves the read pending indefinitely. A cancellation
+/// that is only *checked between chunks* never runs: the partial file stays,
+/// the entry stays in the download map, and every retry is refused as already
+/// downloading — the transfer becomes unstoppable and unrepeatable at once.
+#[test]
+fn cancelling_a_stalled_download_interrupts_the_blocked_read() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let port = stalling_download_server(core.runtime());
+        let url = format!("http://127.0.0.1:{port}/stalled.gguf");
+
+        core.runtime()
+            .block_on(core.download_local_model(url.clone()))
+            .expect("download starts");
+        // Bytes have arrived and the next read is blocked on a silent server.
+        wait_for_state(&core, |s| {
+            s.models.iter().any(|m| {
+                m.slug == "stalled"
+                    && matches!(m.status, LocalModelStatus::Downloading { received, .. }
+                        if received > 0)
+            })
+        });
+
+        core.runtime()
+            .block_on(core.cancel_local_model_download("stalled@local".into()))
+            .expect("cancel");
+
+        // The transfer actually ends: no row, no partial file, and no
+        // failure — a cancellation is not an error.
+        wait_for_state(&core, |s| !s.models.iter().any(|m| m.slug == "stalled"));
+        assert!(
+            !dir.path().join("data/models/stalled.gguf.part").exists(),
+            "the partial file is removed"
+        );
+
+        // And the slug is free again, so the user can try once more.
+        core.runtime()
+            .block_on(core.download_local_model(url))
+            .expect("a cancelled download can be retried");
+        core.runtime()
+            .block_on(core.cancel_local_model_download("stalled@local".into()))
+            .expect("cancel the retry too");
+    });
+}
+
 #[test]
 fn download_persists_model_and_emits() {
     run(|| {
@@ -930,43 +1130,50 @@ fn the_supervisors_shutdown_arm_emits_nothing() {
 ///
 /// The hang is reproduced deterministically by pointing the injected HTTP
 /// client at a proxy that accepts connections and never answers.
+/// A core whose HTTP client is pointed at a proxy that accepts connections
+/// and never answers, with a sleeping fake engine already configured: every
+/// `/health` probe hangs for as long as the test cares to watch.
+///
+/// The returned runtime owns the proxy and must outlive the core.
+fn core_with_a_hanging_health_endpoint(
+    dir: &std::path::Path,
+) -> (std::sync::Arc<AppCore>, tokio::runtime::Runtime) {
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+
+    // A listener that accepts and never responds. Sockets are held so the
+    // connection stays open rather than being closed under the client.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    rt.spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{proxy_port}")).unwrap())
+        .build()
+        .expect("client");
+    let core =
+        AppCore::with_test_http_client(dir.to_path_buf(), dir.join("data"), client).expect("core");
+
+    let models_dir = dir.join("data").join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
+    core.set_llama_server_path(Some(write_sleeping_engine(dir)))
+        .unwrap();
+    (std::sync::Arc::new(core), rt)
+}
+
 #[test]
 fn a_hanging_health_probe_does_not_swallow_the_shutdown_signal() {
     run(|| {
-        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let dir = tempfile::tempdir().expect("tempdir");
-
-        // A listener that accepts and never responds. Sockets are held so the
-        // connection stays open rather than being closed under the client.
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let listener = rt
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let proxy_port = listener.local_addr().unwrap().port();
-        rt.spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((sock, _)) = listener.accept().await {
-                held.push(sock);
-            }
-        });
-
-        let client = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{proxy_port}")).unwrap())
-            .build()
-            .expect("client");
-        let core = AppCore::with_test_http_client(
-            dir.path().to_path_buf(),
-            dir.path().join("data"),
-            client,
-        )
-        .expect("open core");
-        let core = std::sync::Arc::new(core);
-
-        let models_dir = dir.path().join("data").join("models");
-        std::fs::create_dir_all(&models_dir).unwrap();
-        std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
-        core.set_llama_server_path(Some(write_sleeping_engine(dir.path())))
-            .unwrap();
+        let (core, rt) = core_with_a_hanging_health_endpoint(dir.path());
 
         let handle = core.runtime().spawn({
             let core = core.clone();
@@ -992,5 +1199,190 @@ fn a_hanging_health_probe_does_not_swallow_the_shutdown_signal() {
 
         drop(core);
         rt.shutdown_background();
+    });
+}
+
+/// The five-minute readiness budget must bind **each probe**, not merely the
+/// gaps between them.
+///
+/// A `/health` endpoint that accepts the request and never answers is exactly
+/// what a warming engine can look like (the socket is accepted while a
+/// multi-gigabyte model loads, and this client sets no request timeout). With
+/// the deadline checked only at the top of the loop, such a probe left the
+/// supervisor waiting on the shutdown signal alone: the documented budget
+/// never expired, the load never failed, and every caller joining the warming
+/// engine waited for a load that would never end.
+#[test]
+fn a_hanging_health_probe_still_hits_the_readiness_deadline() {
+    run(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (core, rt) = core_with_a_hanging_health_endpoint(dir.path());
+        core.test_set_engine_ready_timeout(std::time::Duration::from_millis(1500));
+
+        let handle = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.load_local_model("sleeper@local".into()).await }
+        });
+        let err = core
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(20), handle).await
+            })
+            .expect("the readiness deadline must fire even inside a probe")
+            .expect("join")
+            .expect_err("a load that never became ready must fail");
+        assert!(
+            err.to_string().contains("did not become ready within 1s"),
+            "got {err}"
+        );
+        assert!(
+            core.running_engines().is_empty(),
+            "the timed-out load leaves no entry behind"
+        );
+
+        drop(core);
+        rt.shutdown_background();
+    });
+}
+
+/// A retirement must bind a load that is already in flight.
+///
+/// `load_local_model` reads its backend's configuration and then awaits —
+/// model-file lookup, engine resolution, port pick, `fs::metadata` — before it
+/// reserves. A retirement landing in that window sweeps an engine map the load
+/// has not written to yet, so sweeping alone guarantees nothing: the load
+/// resumes, registers, and later turns lease an engine spawned from the
+/// configuration that was just retired. The load therefore carries the epoch
+/// it read its configuration under and the reservation validates it, under the
+/// same lock the sweep takes.
+///
+/// Driven here through disabling the `local` singleton; removal and repointing
+/// retire through the very same sweep.
+#[test]
+fn a_load_in_flight_when_its_backend_is_retired_registers_nothing() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let core = std::sync::Arc::new(core);
+        let models_dir = dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
+        // A fake engine that stays alive keeps a registration visible: an
+        // engine that exited would tidy itself away and hide the defect.
+        core.set_llama_server_path(Some(write_sleeping_engine(dir.path())))
+            .unwrap();
+        core.test_set_engine_ready_timeout(std::time::Duration::from_millis(1500));
+        // Widen the window the retirement has to race; the race itself is
+        // real, this only makes it reachable on purpose.
+        core.test_pause_at_load_checkpoints(std::time::Duration::from_millis(800));
+
+        let handle = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.load_local_model("sleeper@local".into()).await }
+        });
+        // The load has read its configuration and is inside the pause.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        core.runtime()
+            .block_on(core.set_backend_enabled("local".into(), false))
+            .expect("disable");
+
+        // From the moment the retirement returns, no engine for that backend
+        // may ever appear — including one reserved by a load that read the
+        // old configuration.
+        for _ in 0..50 {
+            let running = core.running_engines();
+            assert!(
+                running.is_empty(),
+                "a retired backend must never acquire an engine: {running:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let outcome = core
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
+            })
+            .expect("the load must settle")
+            .expect("join");
+        let err = outcome.expect_err("the load must be refused, not silently registered");
+        assert!(err.to_string().contains("changed while"), "got {err}");
+    });
+}
+
+/// A retired backend may not **start** a process.
+///
+/// The epoch closes the window before a load reserves; this is the window
+/// after it. A retirement that lands there removes the entry and signals the
+/// supervisor, but the supervisor had already been handed its command — so it
+/// spawned the child first and only noticed the signal on the next poll,
+/// which is a `llama-server` executed from a configuration that no longer
+/// exists. Killing it a moment later is not the same as never starting it: a
+/// model is mmapped and gigabytes are touched on the way up, and on a
+/// repointed backend the binary itself may be one the user just replaced.
+///
+/// The witness is a spawn count, because a child killed microseconds after
+/// `fork` leaves nothing outside the parent to observe — not even a file it
+/// had time to touch (measured: the kill wins that race nearly every time,
+/// which bounds the harm but does not remove it).
+#[test]
+fn a_retired_backend_never_starts_a_process() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let core = std::sync::Arc::new(core);
+        let models_dir = dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
+        core.set_llama_server_path(Some(write_sleeping_engine(dir.path())))
+            .unwrap();
+        core.test_set_engine_ready_timeout(std::time::Duration::from_millis(1500));
+        // Widen both hand-off points so the retirement can be aimed at the
+        // second one; the race is real, this only makes it reachable.
+        core.test_pause_at_load_checkpoints(std::time::Duration::from_millis(600));
+
+        let handle = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.load_local_model("sleeper@local".into()).await }
+        });
+
+        // Wait for the reservation itself to appear: past the epoch check,
+        // before the spawn. That is the window under test, and waiting for
+        // the entry is what puts the retirement inside it rather than before.
+        let mut reserved = false;
+        for _ in 0..100 {
+            if !core.running_engines().is_empty() {
+                reserved = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(reserved, "the load must reach its reservation");
+        assert_eq!(
+            core.test_engine_spawn_count(),
+            0,
+            "precondition: the reservation exists but no process has started"
+        );
+
+        core.runtime()
+            .block_on(core.set_backend_enabled("local".into(), false))
+            .expect("disable");
+
+        let outcome = core
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
+            })
+            .expect("the load must settle")
+            .expect("join");
+        let err = outcome.expect_err("a retired load cannot succeed");
+        assert!(
+            err.to_string().contains("before the engine started"),
+            "got {err}"
+        );
+        assert_eq!(
+            core.test_engine_spawn_count(),
+            0,
+            "a retired backend must never start a `llama-server`"
+        );
+        assert!(core.running_engines().is_empty());
     });
 }

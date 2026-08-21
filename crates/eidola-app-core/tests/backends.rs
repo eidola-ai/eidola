@@ -692,3 +692,373 @@ fn openai_backend_models_come_from_listing_when_not_pinned() {
         assert!(models[0].request_credits.is_none());
     });
 }
+
+/// An engine may not outlive the backend row that gave it its meaning.
+///
+/// Engines are keyed by `(backend_id, slug)` and removal is a *soft* remove —
+/// re-adding the same id revives the row. So an engine left registered under
+/// a removed backend is inherited by its revival: point the revived backend at
+/// a different models directory that happens to hold the same file name, and
+/// the next load of `<slug>@<id>` finds the old ready entry, returns
+/// immediately, and every turn runs against the previous file while Settings
+/// describes the new directory.
+#[test]
+fn removing_a_backend_retires_its_engines_so_a_revival_cannot_inherit_them() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let old_models = dir.path().join("old-models");
+        let new_models = dir.path().join("new-models");
+        std::fs::create_dir_all(&old_models).unwrap();
+        std::fs::create_dir_all(&new_models).unwrap();
+        // The same file name in both directories — the trap a revival springs.
+        std::fs::write(old_models.join("tiny.gguf"), b"old").unwrap();
+        std::fs::write(new_models.join("tiny.gguf"), b"new").unwrap();
+
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &old_models.display().to_string(),
+                Some("/usr/bin/false"),
+                true,
+            )))
+            .expect("add backend");
+        core.test_register_loaded_local_model("my-box", "tiny", 51234);
+        // A managed-store engine stands by to prove the sweep is scoped.
+        core.test_register_loaded_local_model("local", "keep", 51235);
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.remove_backend("my-box".into()))
+            .expect("remove");
+
+        let running: Vec<String> = core.running_engines().into_iter().map(|e| e.id).collect();
+        assert_eq!(
+            running,
+            vec!["keep@local".to_string()],
+            "the removed backend's engine must be gone, and only it"
+        );
+        let emitted = drain(&mut rx);
+        assert!(
+            emitted.contains(&Change::LocalModels),
+            "retiring an engine is a local-models change: {emitted:?}"
+        );
+
+        // Revive the id over a different directory. The engine that served
+        // the *old* directory's `tiny.gguf` must not answer for the new one:
+        // the load has to start a real engine, which `/usr/bin/false` makes
+        // fail honestly rather than silently succeeding against port 51234.
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &new_models.display().to_string(),
+                Some("/usr/bin/false"),
+                true,
+            )))
+            .expect("revive backend");
+        let err = core
+            .runtime()
+            .block_on(core.load_local_model("tiny@my-box".into()))
+            .expect_err("the revived backend must load its own file, not inherit an engine");
+        assert!(err.to_string().contains("exited during load"), "got {err}");
+    });
+}
+
+/// The same rule, for the two other ways a row stops meaning what it meant:
+/// repointing it at another models directory, and disabling it (a backend
+/// that may not serve a turn has no business holding gigabytes).
+#[test]
+fn repointing_or_disabling_a_backend_retires_its_engines() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &first.display().to_string(),
+                None,
+                true,
+            )))
+            .expect("add backend");
+        core.test_register_loaded_local_model("my-box", "tiny", 51236);
+
+        core.runtime()
+            .block_on(core.update_backend(
+                "my-box".into(),
+                BackendUpdate {
+                    models_dir: Some(Some(second.display().to_string())),
+                    ..Default::default()
+                },
+            ))
+            .expect("repoint");
+        assert!(
+            core.running_engines().is_empty(),
+            "an engine started from the old directory may not survive the repoint"
+        );
+
+        // An update that leaves the directory alone keeps the engine.
+        core.test_register_loaded_local_model("my-box", "tiny", 51237);
+        core.runtime()
+            .block_on(core.update_backend(
+                "my-box".into(),
+                BackendUpdate {
+                    display_name: Some("My Box".into()),
+                    ..Default::default()
+                },
+            ))
+            .expect("rename");
+        assert_eq!(core.running_engines().len(), 1, "a rename changes nothing");
+
+        core.runtime()
+            .block_on(core.set_backend_enabled("my-box".into(), false))
+            .expect("disable");
+        assert!(
+            core.running_engines().is_empty(),
+            "a disabled backend keeps no engines"
+        );
+    });
+}
+
+/// A disabled backend serves nothing and **starts** nothing — the built-in
+/// `local` singleton included.
+///
+/// Disabling retires the backend's engines, and the chat path already refuses
+/// a disabled backend. The explicit verb has to hold the same line or the
+/// guarantee is decorative: `eidola model load tiny@local` (and the Load
+/// button behind it) would start another `llama-server` a moment after the
+/// disable stopped one, leaving a disabled backend holding gigabytes.
+/// Managing files is a different thing and stays open.
+#[test]
+fn a_disabled_backend_starts_no_engine_even_when_asked_explicitly() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let models_dir = dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("tiny.gguf"), b"gguf").unwrap();
+        // `/usr/bin/false` spawns and exits at once, so a load that got past
+        // the gate reports the engine's own failure — which is what
+        // distinguishes "refused" from "spawned and died".
+        core.set_llama_server_path(Some("/usr/bin/false".into()))
+            .unwrap();
+
+        core.runtime()
+            .block_on(core.set_backend_enabled("local".into(), false))
+            .expect("disable");
+
+        let err = core
+            .runtime()
+            .block_on(core.load_local_model("tiny@local".into()))
+            .expect_err("a disabled backend must not start an engine");
+        assert!(matches!(err, AppError::NotConfigured { .. }), "got {err:?}");
+        assert!(err.to_string().contains("disabled"), "got {err}");
+        assert!(core.running_engines().is_empty(), "nothing was spawned");
+
+        // Re-enabling restores the verb (the load now reaches the engine and
+        // fails on its own terms).
+        core.runtime()
+            .block_on(core.set_backend_enabled("local".into(), true))
+            .expect("enable");
+        let err = core
+            .runtime()
+            .block_on(core.load_local_model("tiny@local".into()))
+            .expect_err("/usr/bin/false exits immediately");
+        assert!(err.to_string().contains("exited during load"), "got {err}");
+    });
+}
+
+/// A re-added backend starts clean: it does not inherit the error its
+/// predecessor's engine left behind.
+///
+/// Removal is a *soft* remove and re-adding the id revives the row, so a
+/// standing engine failure keyed on `(backend, slug)` outlives the backend
+/// that earned it and reappears on a configuration that may have nothing to do
+/// with it — a different directory, a different `llama-server`. Retiring a
+/// backend's engines therefore retires what those engines had to say.
+#[test]
+fn a_re_added_backend_does_not_inherit_its_predecessors_error() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let models = dir.path().join("box-models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("tiny.gguf"), b"gguf").unwrap();
+        let add = || {
+            core.runtime().block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &models.display().to_string(),
+                // Spawns and exits immediately: a real, honest load failure.
+                Some("/usr/bin/false"),
+                true,
+            )))
+        };
+        let last_error = || {
+            let state = core
+                .runtime()
+                .block_on(core.local_models_state())
+                .expect("state");
+            state
+                .external
+                .iter()
+                .find(|b| b.backend_id == "my-box")
+                .expect("backend section")
+                .models
+                .iter()
+                .find(|m| m.slug == "tiny")
+                .expect("model row")
+                .last_error
+                .clone()
+        };
+
+        add().expect("add");
+        core.runtime()
+            .block_on(core.load_local_model("tiny@my-box".into()))
+            .expect_err("/usr/bin/false exits during load");
+        assert!(
+            last_error().is_some_and(|e| e.contains("exited during load")),
+            "precondition: the failed load is reported"
+        );
+
+        core.runtime()
+            .block_on(core.remove_backend("my-box".into()))
+            .expect("remove");
+        add().expect("re-add");
+        assert_eq!(
+            last_error(),
+            None,
+            "a backend re-added under the same id starts with no standing error"
+        );
+    });
+}
+
+/// Retiring a backend that has no live engine but *does* have a standing
+/// failure still changes what the local-model snapshot shows — so it has to
+/// say so on the bus.
+///
+/// Retirement has two effects: it stops engines and it forgets those engines'
+/// reports. A subscriber that refreshes the snapshot on its documented
+/// invalidation would otherwise go on rendering an error that is gone.
+#[test]
+fn retiring_a_backend_that_only_has_a_failure_still_invalidates() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let models = dir.path().join("box-models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("tiny.gguf"), b"gguf").unwrap();
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &models.display().to_string(),
+                // Spawns and exits immediately: a standing load failure, and
+                // no engine left behind to be retired.
+                Some("/usr/bin/false"),
+                true,
+            )))
+            .expect("add");
+        core.runtime()
+            .block_on(core.load_local_model("tiny@my-box".into()))
+            .expect_err("/usr/bin/false exits during load");
+        assert!(
+            core.running_engines().is_empty(),
+            "precondition: the failed load left no engine — only its report"
+        );
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.remove_backend("my-box".into()))
+            .expect("remove");
+
+        let emitted = drain(&mut rx);
+        assert!(
+            emitted.contains(&Change::LocalModels),
+            "forgetting the report is a local-models change: {emitted:?}"
+        );
+    });
+}
+
+/// ...and a retirement that changes nothing stays silent. Widening the
+/// condition to "either effect happened" must not become "emit always": a
+/// spurious invalidation on every disable is its own regression.
+#[test]
+fn retiring_a_backend_with_nothing_to_retire_emits_nothing() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let models = dir.path().join("box-models");
+        std::fs::create_dir_all(&models).unwrap();
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &models.display().to_string(),
+                None,
+                true,
+            )))
+            .expect("add");
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.set_backend_enabled("my-box".into(), false))
+            .expect("disable");
+
+        let emitted = drain(&mut rx);
+        assert_eq!(
+            emitted,
+            vec![Change::Backends],
+            "no engine, no report: the registry change is the only news"
+        );
+    });
+}
+
+/// A configuration write and the cleanup that belongs to it are **one**
+/// operation, so a newer write cannot land between them.
+///
+/// Otherwise an older disable's cleanup outlives a newer enable: the disable
+/// commits, the enable commits over it, a load registers an engine the *final*
+/// configuration authorises — and then the disable's cleanup arrives and stops
+/// it. The load has already reported success, and the backend is enabled, so
+/// nothing about the end state explains the engine that vanished.
+#[test]
+fn an_older_disables_cleanup_cannot_retire_an_enabled_backends_engine() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let core = std::sync::Arc::new(core);
+        // Widen the gap between the write and its cleanup; the race is real,
+        // this only makes it reachable on purpose.
+        core.test_pause_before_backend_cleanup(std::time::Duration::from_millis(600));
+
+        let disable = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.set_backend_enabled("local".into(), false).await }
+        });
+        // The disable has committed and is on its way to its cleanup.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // A newer write says the backend is enabled after all...
+        core.runtime()
+            .block_on(core.set_backend_enabled("local".into(), true))
+            .expect("enable");
+        // ...and a load registers the engine that configuration authorises.
+        core.test_register_loaded_local_model("local", "tiny", 51999);
+
+        core.runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), disable).await
+            })
+            .expect("the disable must settle")
+            .expect("join")
+            .expect("disable");
+
+        let backends = core.runtime().block_on(core.list_backends()).expect("list");
+        let local = backends
+            .iter()
+            .find(|b| b.id == "local")
+            .expect("local row");
+        assert!(local.enabled, "the newer write is the one that stands");
+        assert_eq!(
+            core.running_engines().len(),
+            1,
+            "an engine the current configuration authorises may not be retired \
+             by an operation the configuration has already moved past"
+        );
+    });
+}
