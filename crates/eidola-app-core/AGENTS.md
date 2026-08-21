@@ -346,6 +346,18 @@ LLM-written précis lines under thread-map entries — a progressive enhancement
 
 **Scheduling never touches a turn:** `spawn_branch_summaries` is fire-and-forget after every branch-moving write commits *and emits*, with per-space trailing debounce + a one-pass-at-a-time gate (cache re-read inside); a pass with nothing stale makes no request. Each committed summary emits `Change::Space`; a pass generating nothing emits nothing. Tests: `tests/branch_summaries.rs` (driven via the `test_refresh_branch_summaries` seam — the production trigger is debounced).
 
+## Text search (`search.rs`)
+
+The pure matcher over user text — no database, no I/O, no view types, so every surface that searches (a window, the CLI, a future cross-space index) shares one semantics. Literal substring matching with **smart case**: a query in all lower case matches case-insensitively, a query containing an upper-case letter matches exactly. Matches are leftmost and non-overlapping. `Query::new` returns `None` for an empty query, so "what does the empty query match" is not a state any caller decides.
+
+**The structural commitment is the offset map, not the scan.** Every transformation of text is a `Projection` — the transformed text plus a run table recording each run's source range and its projected range **separately** — and a range in transformed text is only ever turned back into a source range through `Projection::source_range`. Nothing here returns an offset into transformed text as if it were an offset into the text it came from. This is load-bearing because such transformations are routinely length-changing: `fold_case` alone changes byte length (`ẞ` → `ß`) and changes it *within* a character (`ß` and `ss` share no boundary), and a caller projecting rendered markdown hides spans wholesale (a link's URL) and substitutes text for others (`&amp;` → `&`). A `ProjectionBuilder` has exactly two appenders, and the choice between them *is* the choice of how offsets map: `copy` (the source bytes appear verbatim; offsets map one to one, guaranteed by construction since only the builder can slice them) and `substitute` (different text stands for the span, which then maps as one atom). A span that is neither is simply not appended, so it can never be matched. Projections compose by applying their maps in sequence.
+
+Mapping is **covering**, not corresponding: a hit reaching into a substituted run takes that run's whole source span, and a hit spanning two runs takes the dropped span between them — the source range always contains everything the projected range showed the reader.
+
+Deliberately not here yet, each additive on the same structure (more substituted runs, no change to the map): diacritic folding, NFKC normalization (which is what would fold full-width `ＡＢＣ`), and whole-word matching. `fold_case` today folds case only, plus the two Greek sigmas together so `ΟΔΟΣ`, `οδος` and `οδοσ` are one word — per-character lower-casing cannot apply the contextual final-sigma rule that `str::to_lowercase` does, and folding both sigmas recovers it symmetrically.
+
+Tests are in-module. The load-bearing pair: a length-changing projection surviving the round trip (project → match → map back → the source range covers the intended text), and its companion pinning what the map prevents — the same hit read naively as a source offset lands mid-word in unrelated text.
+
 ## Agent memory (`memory.rs`, task 35)
 
 The second of three participant layers — charter (human-owned config), **memory** (agent-owned, self-revised, human-inspectable), experience (transcript + traces). Charter/memory separation is deliberate: the human's instructions stay authoritative, and each layer is more credible to a model than one blob.

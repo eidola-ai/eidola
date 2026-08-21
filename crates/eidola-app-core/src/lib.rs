@@ -8,6 +8,7 @@ pub mod error;
 pub mod local_models;
 pub mod memory;
 pub mod router;
+pub mod search;
 pub mod subspace_driver;
 pub mod subspaces;
 pub mod summaries;
