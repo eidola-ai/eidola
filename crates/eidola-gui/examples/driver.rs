@@ -609,6 +609,8 @@ mod driver {
                                         range_end: Some(r.range.1),
                                         annotation: None,
                                         created_at: 0,
+                                        author_label: "Ada".into(),
+                                        author_kind: "agent".into(),
                                     })
                                     .collect(),
                             );

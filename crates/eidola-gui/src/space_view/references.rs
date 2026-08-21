@@ -2195,7 +2195,7 @@ impl SpaceView {
                             (
                                 r.action_id.clone(),
                                 r.space_id.clone(),
-                                self.referencer_label(&r.action_id),
+                                self.referencer_label(r, cx),
                             )
                         })
                         .collect(),
@@ -2211,11 +2211,33 @@ impl SpaceView {
     /// The post's own quote blocks are elided first — a marker is rendered
     /// content, never chrome text, and a label reading "`{{ embed 1 }}`" would
     /// leak the wire format into the UI.
-    fn referencer_label(&self, action_id: &str) -> SharedString {
+    ///
+    /// **A referrer this window does not hold is still named**, through the
+    /// same order and the same rule [`SpaceView::reference_byline`] applies to
+    /// the footnote rail's outgoing direction: the post's own gutter byline
+    /// where this window has the post, otherwise the edge's carried author
+    /// identity — `(author_kind, author_label)`, the *referring* space's
+    /// effective naming of that participant — read through
+    /// [`crate::space::byline_for_participant`] and, for an agent, the second
+    /// pass through [`SpaceView::model_display`] the gutter takes. The picker
+    /// is the surface a **cross-space** backlink is most likely to appear on
+    /// (a same-space referrer is on the page), and "A post in another space"
+    /// for every one of them made two candidates indistinguishable — the one
+    /// thing a picker exists to prevent. That sentence survives only where the
+    /// identity names nobody: a blank effective label under a kind with no
+    /// fallback of its own, which the schema's "override to empty" makes a real
+    /// state. It still tells the reader the true thing left, and it says "in
+    /// another space" rather than the rail's bare "another space" because these
+    /// rows are choices between posts, not attributions.
+    fn referencer_label(
+        &self,
+        reference: &eidola_app_core::IncomingReference,
+        cx: &gpui::App,
+    ) -> SharedString {
         match self
             .posts
             .iter()
-            .find(|p| p.action_id.as_deref() == Some(action_id))
+            .find(|p| p.action_id.as_deref() == Some(reference.action_id.as_str()))
         {
             Some(p) => {
                 let head = footnote_snippet(&strip_embed_blocks(&p.content, &p.references));
@@ -2225,7 +2247,22 @@ impl SpaceView {
                     SharedString::from(format!("{}: {head}", p.byline))
                 }
             }
-            None => SharedString::from("A post in another space"),
+            None => {
+                match crate::space::byline_for_participant(
+                    &reference.author_kind,
+                    &reference.author_label,
+                ) {
+                    Some(byline) => {
+                        let byline = if reference.author_kind == "agent" {
+                            self.model_display(&byline, cx).0
+                        } else {
+                            SharedString::from(byline)
+                        };
+                        SharedString::from(format!("{byline}, in another space"))
+                    }
+                    None => SharedString::from("A post in another space"),
+                }
+            }
         }
     }
 

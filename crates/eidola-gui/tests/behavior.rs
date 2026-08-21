@@ -10451,6 +10451,8 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                         range_end: Some(9),
                         annotation: None,
                         created_at: 0,
+                        author_label: "Ada".into(),
+                        author_kind: "agent".into(),
                     },
                     // A range past the block's end no longer maps: dropped,
                     // never approximated.
@@ -10463,6 +10465,8 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                         range_end: Some(200),
                         annotation: None,
                         created_at: 0,
+                        author_label: "Ada".into(),
+                        author_kind: "agent".into(),
                     },
                 ],
             );
@@ -10524,6 +10528,8 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
         range_end: Some(hi),
         annotation: None,
         created_at: 0,
+        author_label: "Ada".into(),
+        author_kind: "agent".into(),
     };
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, _| {
@@ -12775,6 +12781,8 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
         range_end: Some(hi),
         annotation: None,
         created_at: 0,
+        author_label: "Ada".into(),
+        author_kind: "agent".into(),
     };
     vcx.update(|_, cx| {
         space.update(cx, |s, _| {

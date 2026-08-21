@@ -1127,6 +1127,21 @@ pub struct IncomingReference {
     pub range_end: Option<i64>,
     pub annotation: Option<String>,
     pub created_at: i64,
+    /// How the **referring** post's own space names its author.
+    ///
+    /// Carried rather than looked up for the reason the outgoing direction
+    /// carries [`PostReference::antecedent_author_label`]: a referrer in
+    /// another space cannot be attributed from anything the quoted space
+    /// knows, and a surface that lists backlinks is exactly the surface that
+    /// meets one. May be blank — a per-space override of `''` is "override to
+    /// empty" under the schema's NULL-inherits rule, which is why the pair is
+    /// only ever read through the presentation layer's shared byline rule.
+    pub author_label: String,
+    /// The referring post's author's participant **kind**, from the same join
+    /// — `human`, `agent`, `system`. The label is not renderable on its own
+    /// (an unnamed author's fallback depends entirely on the kind), so the two
+    /// travel together.
+    pub author_kind: String,
 }
 
 /// One turn's operational trace, as a space UI discloses it (task 34): the
@@ -3164,6 +3179,8 @@ impl Inner {
                 range_end: r.range_end,
                 annotation: r.annotation,
                 created_at: r.created_at,
+                author_label: r.author_label,
+                author_kind: r.author_kind,
             });
         }
         Ok(out)
@@ -3191,6 +3208,8 @@ impl Inner {
                 range_end: r.range_end,
                 annotation: r.annotation,
                 created_at: r.created_at,
+                author_label: r.author_label,
+                author_kind: r.author_kind,
             })
             .collect())
     }

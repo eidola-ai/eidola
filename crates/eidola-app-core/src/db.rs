@@ -5887,6 +5887,16 @@ pub struct IncomingReferenceRow {
     pub range_end: Option<i64>,
     pub annotation: Option<String>,
     pub created_at: i64,
+    /// The **referring** post's author, as that post's own space names it
+    /// (`COALESCE(space_participant.override_label, participant.label)` joined
+    /// on `ar.space_id`). Carried for the same reason the outgoing direction
+    /// carries [`AntecedentEdgeRow::antecedent_author_label`]: a referrer in
+    /// another space cannot be named from anything the quoted space knows.
+    pub author_label: String,
+    /// The referring post's author's participant **kind**, from the same join.
+    /// The label is not renderable on its own — see
+    /// [`crate::IncomingReference::author_kind`].
+    pub author_kind: String,
 }
 
 /// All current-generation posts referencing `antecedent_action_id` (relation
@@ -5899,9 +5909,13 @@ pub async fn references_to(
     let mut stmt = conn
         .prepare(&format!(
             "SELECT aa.action_id, ar.space_id, aa.ordinal, aa.content_block_id, \
-                    aa.range_start, aa.range_end, aa.annotation, ar.created_at \
+                    aa.range_start, aa.range_end, aa.annotation, ar.created_at, \
+                    COALESCE(rsp.override_label, rp.label), rp.kind \
              FROM action_antecedent aa \
              JOIN action_resolved ar ON ar.action_id = aa.action_id \
+             JOIN participant rp ON rp.id = ar.participant_id \
+             LEFT JOIN space_participant rsp \
+               ON rsp.space_id = ar.space_id AND rsp.participant_id = ar.participant_id \
              WHERE aa.antecedent_action_id = ?1 \
                AND aa.relation = 'reference' \
                AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
@@ -5926,6 +5940,8 @@ pub async fn references_to(
             range_end: row.get::<Option<i64>>(5).map_err(AppError::db)?,
             annotation: row.get::<Option<String>>(6).map_err(AppError::db)?,
             created_at: row.get::<i64>(7).map_err(AppError::db)?,
+            author_label: row.get::<String>(8).map_err(AppError::db)?,
+            author_kind: row.get::<String>(9).map_err(AppError::db)?,
         });
     }
     Ok(out)

@@ -4396,6 +4396,8 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
         range_end: Some(15),
         annotation: None,
         created_at: 0,
+        author_label: "Sofia".into(),
+        author_kind: "agent".into(),
     };
     cx.update(|cx| {
         space.update(cx, |s, _| {
@@ -7452,6 +7454,91 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
             && names.contains(&"space/band/add".to_string()),
         "a member's verbs survive a failed refresh of the roster that names them: {names:?}"
     );
+
+    probe::set_probes_enabled(false);
+}
+
+/// REGRESSION: the highlight picker said "A post in another space" for every
+/// **incoming** reference it did not hold, so two cross-space referrers were
+/// indistinguishable — the one thing a chooser must never be.
+///
+/// The picker is exactly where a cross-space backlink shows up (a same-space
+/// referrer is already on the page with its byline), and it names one the same
+/// way the footnote rail names an outgoing quote's author: this window's own
+/// gutter byline where it has the post, otherwise the edge's carried identity
+/// — `(author_kind, author_label)`, as the *referring* space names them — read
+/// through `space::byline_for_participant`. Every arm on one passage:
+///
+/// 1. a referrer this window holds: its gutter byline plus what it says, which
+///    is **not** the edge's raw label (a human labelled `user` reads "You");
+/// 2. a referrer from a conversation this window never loaded, by name;
+/// 3. the same where the label is blank (the schema's "override to empty") —
+///    the kind is what is left, and it is enough;
+/// 4. the original sentence, surviving only where nothing names anyone.
+#[gpui::test]
+fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let quoted = probe_post("a1", "the sentence everything else hangs off");
+    let mut here = probe_post("a2", "quoted right here");
+    here.parent_action_id = Some("a1".into());
+    here.relation = Some("reply".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![quoted, here], cx));
+    });
+
+    let incoming = |action: &str, kind: &str, label: &str| eidola_app_core::IncomingReference {
+        action_id: action.into(),
+        space_id: "elsewhere".into(),
+        ordinal: 1,
+        content_block_id: Some("b1".into()),
+        range_start: Some(4),
+        range_end: Some(15),
+        annotation: None,
+        created_at: 0,
+        author_label: label.into(),
+        author_kind: kind.into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![
+                    incoming("a2", "human", "user"),
+                    incoming("x1", "agent", "Sofia"),
+                    incoming("x2", "human", ""),
+                    incoming("x3", "tool", "  "),
+                ],
+            );
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0, 1, 2, 3], window, cx)
+        });
+    })
+    .unwrap();
+
+    let entries = fresh_entries(cx, window);
+    for (index, expected) in [
+        (0, "You: quoted right here"),
+        (1, "Sofia, in another space"),
+        (2, "You, in another space"),
+        (3, "A post in another space"),
+    ] {
+        assert_probe(
+            &entries,
+            &format!("space/highlight/picker/{index}"),
+            gpui::Role::Button,
+            expected,
+        );
+    }
 
     probe::set_probes_enabled(false);
 }
