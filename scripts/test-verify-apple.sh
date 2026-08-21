@@ -16,6 +16,12 @@ command -v tar >/dev/null 2>&1 || {
   echo "test-verify-apple requires tar" >&2
   exit 2
 }
+# Same directory-mode deferral verify-apple.sh probes for: this harness
+# extracts a read-only archive itself to prove the modes survived the pack.
+tar_delay=
+if tar --delay-directory-restore --version >/dev/null 2>&1; then
+  tar_delay=--delay-directory-restore
+fi
 
 fixture=scripts/fixtures/apple-roundtrip/synthetic-universal
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/eidola-apple-archive-test.XXXXXX")
@@ -403,7 +409,8 @@ write(
 ' "$test_root" "$fixture/settled" "$fixture/detached"
 
 mkdir "$test_root/tar-probe"
-tar -xzf "$test_root/unsigned-readonly.tar.gz" -C "$test_root/tar-probe"
+tar ${tar_delay:+"$tar_delay"} -xzf "$test_root/unsigned-readonly.tar.gz" \
+  -C "$test_root/tar-probe"
 if mkdir "$test_root/tar-probe/Fixture.app/Contents/write-probe" 2>/dev/null; then
   echo "unsigned tar archive did not preserve the read-only Contents directory" >&2
   exit 1

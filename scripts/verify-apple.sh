@@ -38,6 +38,19 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+# GNU tar applies a directory's archived mode the moment it creates the
+# directory, so a 0555 directory refuses the members that follow it in the
+# same archive; --delay-directory-restore holds those modes back until the
+# extraction finishes. libarchive/bsdtar already defers and rejects the
+# option, so this probes for it rather than matching on an implementation.
+# Extraction ordering is the one place the two genuinely differ here.
+tar_delay=
+detect_tar_delay() {
+  if tar --delay-directory-restore --version >/dev/null 2>&1; then
+    tar_delay=--delay-directory-restore
+  fi
+}
+
 # Container format from the leading magic bytes, never the file name. The
 # canonical unsigned macOS archive is the flake's gzip'd POSIX tar
 # (`.#eidola-gui-macos-universal-archive` — the bytes `archiveSha256`
@@ -52,6 +65,7 @@ detect_format() {
   1f8b)
     archive_format=tgz
     require_command tar
+    detect_tar_delay
     ;;
   *)
     echo "$2 archive is neither a zip nor a gzip'd tar" >&2
@@ -92,7 +106,7 @@ extract_archive() {
   # overwrite prompt. tar overwrites silently instead; both are equivalent
   # here because colliding members are refused before extraction.
   zip) unzip -nq "$1" -d "$3" ;;
-  tgz) tar -xzf "$1" -C "$3" ;;
+  tgz) tar ${tar_delay:+"$tar_delay"} -xzf "$1" -C "$3" ;;
   esac
 }
 
