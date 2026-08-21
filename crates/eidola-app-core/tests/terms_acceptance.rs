@@ -1,70 +1,113 @@
-//! Terms acceptance transmits *the snapshot that was presented*.
+//! Terms acceptance: what is *submitted*, and what is *reported*.
 //!
-//! Consent is obtained by a UI showing the user a set of documents; app-core
-//! only transmits it. The two must describe the same bytes, which is why
+//! Two contracts meet here, and they pull in opposite directions.
+//!
+//! **Submission takes the snapshot that was presented.** Consent is obtained
+//! by a UI showing the user a set of documents; app-core only transmits it. So
 //! `AppCore::accept_terms` and `AppCore::account_create` take the snapshot as
-//! an argument instead of re-reading `GET /v1/terms` on the way out: a
-//! document version that advances between the two would otherwise be recorded
-//! as accepted without anyone having read it.
+//! an argument instead of re-reading `GET /v1/terms` on the way out — a
+//! version that advanced between the two would otherwise be recorded as
+//! accepted without anyone having read it.
 //!
-//! The server side of the contract (`eidola-server`'s `POST /v1/account/terms`)
-//! records a `(document, sha256)` pair only while that pair is still required
-//! and answers a stale one with 409 Conflict. The mock here reproduces exactly
-//! that rule, so what these tests pin is the client half: which pair goes on
-//! the wire, and what the caller is told when the server refuses it.
+//! **The report comes from reading the server back.** Acceptance is recorded
+//! one document at a time and each submission is judged alone, so "every
+//! document I submitted was accepted" is silent about a document that became
+//! required *after* the snapshot was taken — most starkly when the snapshot
+//! was empty because the gate was not switched on yet. The purchase gate asks
+//! a different question, and `TermsAcceptance` is the answer to that one.
+//!
+//! The read that reports is not the read that was removed: it happens after
+//! the submission, and its answer is document **names**, which carry no hash
+//! and so can never be submitted.
+//!
+//! The mock reproduces the server's own rules — `POST /v1/account/terms`
+//! records a `(document, sha256)` pair only while it is still required and
+//! answers a stale one with 409 — so what these tests pin is the client half.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use eidola_app_core::{AppCore, TermsDocument};
+use eidola_app_core::{AppCore, TermsAcceptance, TermsDocument};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-/// The published hash of `terms_of_service` at a given version. Any stable
-/// version→hash function does; these tests only care that two versions carry
-/// two different hashes.
-fn sha_for_version(version: i64) -> String {
-    format!("{version:064x}")
+const ACCOUNT_ID: &str = "00000000-0000-0000-0000-000000000001";
+const TOS: &str = "terms_of_service";
+const PRIVACY: &str = "privacy_policy";
+
+/// The published hash of a document at a given version. Any stable
+/// `(document, version) -> hash` function does; the tests only need distinct
+/// documents and distinct versions to carry distinct hashes.
+fn sha_for(document: &str, version: i64) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in document.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:032x}{version:032x}")
 }
 
-/// `GET /v1/terms` — answers whatever version the test has advanced to, and
-/// counts how many times it was asked.
+/// The server's required-document table, as `(document, version)`.
+type Required = Arc<std::sync::Mutex<Vec<(String, i64)>>>;
+
+/// `GET /v1/terms` — answers the current required set, counts how many times
+/// it was asked, and can be made to fail on cue.
 struct CurrentTerms {
-    version: Arc<AtomicI64>,
+    required: Required,
     hits: Arc<AtomicU64>,
+    broken: Arc<AtomicBool>,
 }
 
 impl Respond for CurrentTerms {
     fn respond(&self, _: &Request) -> ResponseTemplate {
         self.hits.fetch_add(1, Ordering::SeqCst);
-        let version = self.version.load(Ordering::SeqCst);
-        ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "documents": [{
-                "document": "terms_of_service",
-                "version": version,
-                "url": "https://example.invalid/terms/",
-                "sha256": sha_for_version(version),
-            }]
-        }))
+        if self.broken.load(Ordering::SeqCst) {
+            return ResponseTemplate::new(500).set_body_string("terms feed unavailable");
+        }
+        let documents: Vec<serde_json::Value> = self
+            .required
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(document, version)| {
+                serde_json::json!({
+                    "document": document,
+                    "version": version,
+                    "url": format!("https://example.invalid/{document}/"),
+                    "sha256": sha_for(document, *version),
+                })
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({ "documents": documents }))
     }
 }
 
-/// `POST /v1/account/terms` — the server's rule: record the pair only while
-/// it is the currently required one, 409 otherwise. Every submitted hash is
-/// recorded either way, so a test can see what the client actually sent.
+/// `POST /v1/account/terms` — the server's rule: record the pair only while it
+/// is a currently required one, 409 otherwise. Every submitted pair is noted
+/// either way, so a test can see what the client actually sent.
 struct AcceptTerms {
-    version: Arc<AtomicI64>,
-    submitted: Arc<std::sync::Mutex<Vec<String>>>,
-    recorded: Arc<std::sync::Mutex<Vec<String>>>,
+    required: Required,
+    submitted: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    recorded: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl Respond for AcceptTerms {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
+        let document = body["document"].as_str().unwrap_or_default().to_string();
         let sha = body["sha256"].as_str().unwrap_or_default().to_string();
-        self.submitted.lock().unwrap().push(sha.clone());
-        if sha == sha_for_version(self.version.load(Ordering::SeqCst)) {
-            self.recorded.lock().unwrap().push(sha);
+        self.submitted
+            .lock()
+            .unwrap()
+            .push((document.clone(), sha.clone()));
+        let is_current = self
+            .required
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(d, v)| *d == document && sha_for(d, *v) == sha);
+        if is_current {
+            self.recorded.lock().unwrap().push((document, sha));
             ResponseTemplate::new(204)
         } else {
             ResponseTemplate::new(409).set_body_json(serde_json::json!({
@@ -82,18 +125,18 @@ struct Harness {
     core: AppCore,
     _server: MockServer,
     _dir: tempfile::TempDir,
-    /// The version `GET /v1/terms` currently answers with.
-    version: Arc<AtomicI64>,
+    required: Required,
     /// `GET /v1/terms` request count.
     terms_hits: Arc<AtomicU64>,
-    /// Hashes the client submitted to `POST /v1/account/terms`, in order.
-    submitted: Arc<std::sync::Mutex<Vec<String>>>,
-    /// Hashes the server actually recorded (the subset it still required).
-    recorded: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Makes `GET /v1/terms` fail, so the read-back has nothing to report.
+    terms_broken: Arc<AtomicBool>,
+    submitted: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    recorded: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl Harness {
-    fn start() -> Self {
+    /// A server whose gate requires exactly `required`.
+    fn start(required: &[(&str, i64)]) -> Self {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let dir = tempfile::tempdir().expect("tempdir");
         let client = reqwest::Client::builder().build().expect("plain client");
@@ -104,14 +147,21 @@ impl Harness {
         )
         .expect("open core");
 
-        let version = Arc::new(AtomicI64::new(1));
+        let required: Required = Arc::new(std::sync::Mutex::new(
+            required
+                .iter()
+                .map(|(d, v)| ((*d).to_string(), *v))
+                .collect(),
+        ));
         let terms_hits = Arc::new(AtomicU64::new(0));
+        let terms_broken = Arc::new(AtomicBool::new(false));
         let submitted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let server = core.runtime().block_on({
-            let version = version.clone();
+            let required = required.clone();
             let terms_hits = terms_hits.clone();
+            let terms_broken = terms_broken.clone();
             let submitted = submitted.clone();
             let recorded = recorded.clone();
             async move {
@@ -119,15 +169,16 @@ impl Harness {
                 Mock::given(method("GET"))
                     .and(path("/v1/terms"))
                     .respond_with(CurrentTerms {
-                        version: version.clone(),
+                        required: required.clone(),
                         hits: terms_hits,
+                        broken: terms_broken,
                     })
                     .mount(&server)
                     .await;
                 Mock::given(method("POST"))
                     .and(path("/v1/account/terms"))
                     .respond_with(AcceptTerms {
-                        version: version.clone(),
+                        required: required.clone(),
                         submitted,
                         recorded,
                     })
@@ -136,7 +187,7 @@ impl Harness {
                 Mock::given(method("POST"))
                     .and(path("/v1/account"))
                     .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                        "account_id": "00000000-0000-0000-0000-000000000001",
+                        "account_id": ACCOUNT_ID,
                         "secret": "mock-secret",
                         "created_at": "2025-01-01T00:00:00Z",
                     })))
@@ -153,17 +204,27 @@ impl Harness {
             core,
             _server: server,
             _dir: dir,
-            version,
+            required,
             terms_hits,
+            terms_broken,
             submitted,
             recorded,
         }
     }
 
-    /// Publish a new version of the document — the mid-flow advance the whole
-    /// contract exists to survive.
-    fn advance_to_version(&self, version: i64) {
-        self.version.store(version, Ordering::SeqCst);
+    fn with_credentials(self) -> Self {
+        self.core
+            .set_account_credentials(ACCOUNT_ID.into(), "mock-secret".into())
+            .expect("configure credentials");
+        self
+    }
+
+    /// Replace the server's required set — a publish, mid-flow.
+    fn now_requires(&self, required: &[(&str, i64)]) {
+        *self.required.lock().unwrap() = required
+            .iter()
+            .map(|(d, v)| ((*d).to_string(), *v))
+            .collect();
     }
 
     fn current_terms(&self) -> Vec<TermsDocument> {
@@ -173,85 +234,108 @@ impl Harness {
             .expect("fetch current terms")
     }
 
-    fn submitted(&self) -> Vec<String> {
+    fn accept(&self, presented: Vec<TermsDocument>) -> Result<TermsAcceptance, String> {
+        self.core
+            .runtime()
+            .block_on(self.core.accept_terms(presented))
+            .map_err(|e| e.to_string())
+    }
+
+    fn create_account(&self, presented: Vec<TermsDocument>) -> TermsAcceptance {
+        self.core
+            .runtime()
+            .block_on(self.core.account_create(presented))
+            .expect("the account is created regardless — acceptance is best-effort")
+            .terms
+    }
+
+    fn terms_hits(&self) -> u64 {
+        self.terms_hits.load(Ordering::SeqCst)
+    }
+
+    /// `(document, sha256)` pairs that went on the wire.
+    fn submitted(&self) -> Vec<(String, String)> {
         self.submitted.lock().unwrap().clone()
     }
 
-    fn recorded(&self) -> Vec<String> {
+    /// The subset the server actually recorded.
+    fn recorded(&self) -> Vec<(String, String)> {
         self.recorded.lock().unwrap().clone()
     }
 }
 
+fn outstanding(standing: &TermsAcceptance) -> Vec<String> {
+    match standing {
+        TermsAcceptance::Outstanding { documents } => documents.clone(),
+        other => panic!("expected Outstanding, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What is submitted: the presented snapshot, never a fresh read
+// ---------------------------------------------------------------------------
+
 #[test]
 fn acceptance_submits_the_presented_snapshot_not_a_fresh_read() {
-    let h = Harness::start();
-    h.core
-        .set_account_credentials(
-            "00000000-0000-0000-0000-000000000001".into(),
-            "mock-secret".into(),
-        )
-        .expect("configure credentials");
+    let h = Harness::start(&[(TOS, 1)]).with_credentials();
 
     // What a consent screen fetched and showed.
     let presented = h.current_terms();
     assert_eq!(presented.len(), 1);
-    assert_eq!(presented[0].sha256, sha_for_version(1));
-    let fetches_after_presenting = h.terms_hits.load(Ordering::SeqCst);
+    assert_eq!(presented[0].sha256, sha_for(TOS, 1));
+    let fetches_after_presenting = h.terms_hits();
 
     // A new version is published while the user is reading.
-    h.advance_to_version(2);
+    h.now_requires(&[(TOS, 2)]);
 
     // Accepting must speak about version 1 — the text that was on screen —
     // and must therefore be refused, because the server no longer requires it.
     let err = h
-        .core
-        .runtime()
-        .block_on(h.core.accept_terms(presented))
+        .accept(presented)
         .expect_err("a stale snapshot must be refused, not silently upgraded");
     assert!(
-        format!("{err}").contains("not a currently required version"),
+        err.contains("not a currently required version"),
         "the server's conflict must reach the caller: {err}"
     );
 
     assert_eq!(
         h.submitted(),
-        vec![sha_for_version(1)],
-        "the hash on the wire is the one that was presented"
+        vec![(TOS.to_string(), sha_for(TOS, 1))],
+        "the pair on the wire is the one that was presented"
     );
     assert!(
         h.recorded().is_empty(),
         "nothing may be recorded as accepted when the presented version went stale"
     );
     assert_eq!(
-        h.terms_hits.load(Ordering::SeqCst),
+        h.terms_hits(),
         fetches_after_presenting,
-        "accepting must not re-read the current documents — that read is what \
-         would substitute unseen text for the snapshot the user agreed to"
+        "nothing is read on the way to the submission — a read there would \
+         substitute unseen text for the snapshot the user agreed to. (The \
+         read-back that reports the standing runs only after a submission \
+         succeeds, and this one did not.)"
     );
 }
 
 #[test]
 fn account_creation_records_only_what_the_caller_presented() {
-    let h = Harness::start();
+    let h = Harness::start(&[(TOS, 1)]);
 
     // The consent screen's snapshot, then a publish while it was on screen.
     let presented = h.current_terms();
-    h.advance_to_version(2);
+    h.now_requires(&[(TOS, 2)]);
 
-    let created = h
-        .core
-        .runtime()
-        .block_on(h.core.account_create(presented))
-        .expect("the account is still created — acceptance is best-effort");
+    let standing = h.create_account(presented);
 
-    assert!(
-        !created.terms_recorded,
+    assert_eq!(
+        outstanding(&standing),
+        vec![TOS.to_string()],
         "the account exists, but its acceptance was refused as stale — and the \
-         caller is told so rather than left to assume it landed"
+         caller is told what is outstanding rather than left to assume it landed"
     );
     assert_eq!(
         h.submitted(),
-        vec![sha_for_version(1)],
+        vec![(TOS.to_string(), sha_for(TOS, 1))],
         "creation submits the presented snapshot, never a fresh read"
     );
     assert!(
@@ -262,39 +346,136 @@ fn account_creation_records_only_what_the_caller_presented() {
 
 #[test]
 fn account_creation_records_the_snapshot_when_it_is_still_current() {
-    let h = Harness::start();
+    let h = Harness::start(&[(TOS, 1)]);
 
     let presented = h.current_terms();
-    let created = h
-        .core
-        .runtime()
-        .block_on(h.core.account_create(presented))
-        .expect("create account");
+    let standing = h.create_account(presented);
 
-    assert!(created.terms_recorded, "the ordinary path still records");
-    assert_eq!(h.recorded(), vec![sha_for_version(1)]);
+    assert!(
+        standing.is_complete(),
+        "the ordinary path records and reads back clean: {standing:?}"
+    );
+    assert_eq!(h.recorded(), vec![(TOS.to_string(), sha_for(TOS, 1))]);
 }
 
 #[test]
-fn an_empty_snapshot_sends_nothing_and_counts_as_recorded() {
-    // A server with no acceptance gate configured: `current_terms` answers
-    // empty, so there is nothing to submit and nothing to be stale about.
-    let h = Harness::start();
-    h.core
-        .set_account_credentials(
-            "00000000-0000-0000-0000-000000000001".into(),
-            "mock-secret".into(),
-        )
-        .expect("configure credentials");
+fn an_empty_snapshot_submits_nothing() {
+    // A server with no acceptance gate: `current_terms` answers empty, so
+    // there is nothing to put on the wire.
+    let h = Harness::start(&[]).with_credentials();
 
-    h.core
-        .runtime()
-        .block_on(h.core.accept_terms(Vec::new()))
-        .expect("an empty snapshot is a no-op, not an error");
+    let standing = h.accept(Vec::new()).expect("an empty snapshot is a no-op");
+    assert!(standing.is_complete(), "nothing required, nothing missing");
+    assert!(h.submitted().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// What is reported: the standing, read back from the server
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_document_added_after_the_snapshot_is_reported_outstanding() {
+    // Every submission in the snapshot succeeds — so a report assembled from
+    // those per-document outcomes reads as complete while the account has
+    // never so much as been shown the new document, and the next purchase is
+    // the first anyone hears of it.
+    let h = Harness::start(&[(TOS, 1)]);
+    let presented = h.current_terms();
+    h.now_requires(&[(TOS, 1), (PRIVACY, 1)]);
+
+    let standing = h.create_account(presented);
+
+    assert_eq!(
+        h.recorded(),
+        vec![(TOS.to_string(), sha_for(TOS, 1))],
+        "the presented document really was accepted"
+    );
+    assert_eq!(
+        outstanding(&standing),
+        vec![PRIVACY.to_string()],
+        "and the one that appeared afterwards is named, not silently omitted"
+    );
+}
+
+#[test]
+fn a_gate_switched_on_after_an_empty_snapshot_is_reported_outstanding() {
+    // The starkest case: nothing was submitted at all, so there is no
+    // per-document outcome to be right about, and every submission
+    // "succeeded" vacuously.
+    let h = Harness::start(&[]).with_credentials();
+    let presented = h.current_terms();
+    assert!(presented.is_empty());
+
+    h.now_requires(&[(TOS, 1)]);
+
+    let standing = h
+        .accept(presented)
+        .expect("nothing to submit, nothing fails");
     assert!(h.submitted().is_empty());
     assert_eq!(
-        h.terms_hits.load(Ordering::SeqCst),
-        0,
-        "and it does not fetch anything to decide that"
+        outstanding(&standing),
+        vec![TOS.to_string()],
+        "an empty submission that succeeded says nothing about a gate that \
+         opened since"
+    );
+}
+
+#[test]
+fn accepting_everything_currently_required_reports_complete() {
+    let h = Harness::start(&[(TOS, 1), (PRIVACY, 2)]).with_credentials();
+    let presented = h.current_terms();
+    let before = h.terms_hits();
+
+    let standing = h.accept(presented).expect("accept");
+
+    assert!(standing.is_complete(), "{standing:?}");
+    assert_eq!(
+        h.terms_hits(),
+        before + 1,
+        "the standing is established by reading the server back, once, after \
+         the submission — not inferred from the submissions succeeding"
+    );
+    assert_eq!(h.recorded().len(), 2);
+}
+
+#[test]
+fn a_standing_that_cannot_be_read_is_unknown_not_complete() {
+    // "I could not check" is an answer. Reporting completeness here would be
+    // the same over-claim in a different costume.
+    let h = Harness::start(&[(TOS, 1)]).with_credentials();
+    let presented = h.current_terms();
+
+    h.terms_broken.store(true, Ordering::SeqCst);
+    let standing = h
+        .accept(presented)
+        .expect("the submission itself succeeded");
+
+    match &standing {
+        TermsAcceptance::Unknown { .. } => {}
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+    assert!(
+        !standing.is_complete(),
+        "an unestablished standing is not a complete one"
+    );
+    assert_eq!(h.recorded().len(), 1, "the acceptance itself did land");
+}
+
+#[test]
+fn a_failed_submission_leaves_everything_required_outstanding() {
+    // Nothing is known to have been recorded, so nothing is assumed: the
+    // standing is read with an empty recorded set. It may over-list — which
+    // is the safe direction, since re-accepting is a no-op and silence is a
+    // purchase that fails later.
+    let h = Harness::start(&[(TOS, 1)]);
+    let presented = h.current_terms();
+    h.now_requires(&[(TOS, 2), (PRIVACY, 1)]);
+
+    let standing = h.create_account(presented);
+
+    assert!(h.recorded().is_empty(), "the stale pair was refused");
+    assert_eq!(
+        outstanding(&standing),
+        vec![TOS.to_string(), PRIVACY.to_string()],
     );
 }

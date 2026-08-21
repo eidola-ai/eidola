@@ -7288,6 +7288,47 @@ fn onboarding_consent_is_not_recorded_before_there_is_anything_to_agree_to(
     });
 }
 
+#[gpui::test]
+fn onboarding_consent_does_not_carry_over_to_a_snapshot_that_gained_a_document(
+    cx: &mut TestAppContext,
+) {
+    // The sibling of the version-advance case, and the one a per-document
+    // check would miss: nothing the reader agreed to changed, a document was
+    // simply *added*. The consent binding compares whole sets, so the box
+    // unticks — agreement to one document is not agreement to two.
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    set_terms(&stores, cx, vec![terms_doc("terms_of_service", 1, 'a')]);
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.read_with(cx, |v, cx| assert!(v.agreed_for_test(cx)));
+
+    set_terms(
+        &stores,
+        cx,
+        vec![
+            terms_doc("terms_of_service", 1, 'a'),
+            terms_doc("privacy_policy", 1, 'b'),
+        ],
+    );
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.agreed_for_test(cx),
+            "a document the reader has not seen joined the set, so the earlier \
+             agreement no longer covers what is on screen"
+        );
+    });
+    view.update(cx, |v, cx| v.begin_create(cx));
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.creating_for_test(),
+            "and nothing is created against the enlarged set"
+        );
+    });
+}
+
 /// A reordered listing of the same texts is the same thing to agree to.
 #[gpui::test]
 fn onboarding_consent_survives_a_reordered_listing_of_the_same_documents(cx: &mut TestAppContext) {

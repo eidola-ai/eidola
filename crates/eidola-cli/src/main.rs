@@ -4,7 +4,7 @@ use std::io::{IsTerminal, Write};
 
 use clap::{Parser, Subcommand};
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ChatStreamEvent, TermsDocument, config};
+use eidola_app_core::{AppCore, ChatStreamEvent, TermsAcceptance, TermsDocument, config};
 
 #[derive(Parser)]
 #[command(name = "eidola", about = "Eidola CLI")]
@@ -693,14 +693,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 println!("account created");
                 println!("id: {}", result.id);
                 println!("created_at: {}", result.created_at);
-                if !result.terms_recorded {
-                    eprintln!(
-                        "warning: the account exists but its terms acceptance was not \
-                         recorded (the published versions may have moved on) — run \
-                         `eidola account accept-terms` to review and accept the current \
-                         documents"
-                    );
-                }
+                report_terms_standing(&result.terms);
                 Ok(())
             }
             Some(AccountCommand::AcceptTerms { yes }) => {
@@ -732,8 +725,14 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 // refuses the pair rather than recording agreement to text
                 // that was never printed.
                 let count = docs.len();
-                core.accept_terms(docs).await?;
+                let standing = core.accept_terms(docs).await?;
                 println!("accepted {count} document(s)");
+                // Accepting every printed document is not the same as having
+                // nothing left to accept — a document that became required
+                // while the prompt was open was in no snapshot and refused by
+                // no submission. Say so rather than let the next purchase be
+                // the first the reader hears of it.
+                report_terms_standing(&standing);
                 Ok(())
             }
             Some(AccountCommand::Reset) => {
@@ -1623,6 +1622,35 @@ fn print_indented(text: &str, indent: usize) {
         }
         if !line.is_empty() {
             println!("{pad}{line}");
+        }
+    }
+}
+
+/// Say where the account stands with the terms gate, when that is anything
+/// other than settled.
+///
+/// This is the **only** place the user is told, and today the CLI is the only
+/// surface that tells them at all, so the wording carries the whole remedy:
+/// name what is outstanding, and name the command that clears it. Silence is
+/// reserved for [`TermsAcceptance::Complete`] — "could not check" gets a
+/// sentence of its own, because a reader who is told nothing reasonably
+/// concludes there is nothing to do.
+fn report_terms_standing(standing: &TermsAcceptance) {
+    match standing {
+        TermsAcceptance::Complete => {}
+        TermsAcceptance::Outstanding { documents } => {
+            eprintln!(
+                "warning: this account still needs to accept {} — run \
+                 `eidola account accept-terms` to review and accept it; \
+                 purchases are refused until then",
+                documents.join(" and ")
+            );
+        }
+        TermsAcceptance::Unknown { error } => {
+            eprintln!(
+                "warning: could not confirm this account's terms acceptance ({error}) — \
+                 run `eidola account accept-terms` if a purchase is refused"
+            );
         }
     }
 }
