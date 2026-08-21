@@ -975,10 +975,17 @@ impl MarkdownEditorState {
     fn content_y_at(&self, offset: usize, downstream: bool) -> Option<(Pixels, Pixels)> {
         let content_top = self.last_bounds?.origin.y;
         // Sort keys so an offset sitting on a block boundary (claimed by two
-        // adjacent lines) resolves deterministically to the earlier block,
-        // rather than by `HashMap` iteration order.
+        // adjacent lines) resolves deterministically, rather than by `HashMap`
+        // iteration order.
         let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
         keys.sort_unstable();
+        // Line ranges are end-inclusive, so where one line's end is the next
+        // one's start — a code block's rows, a hard-broken paragraph, the row
+        // boundary between table cells — two lines claim the offset. Resolve
+        // that the way the caller asked: `downstream` takes the line that
+        // *starts* at the offset (the row a reader would say the offset is on),
+        // upstream keeps the earlier line (where an upstream caret renders).
+        let mut hit: Option<&crate::element::LaidOutLine> = None;
         // Fallback for an offset past every laid-out range — the document end
         // after a trailing newline synthesizes an empty paragraph that isn't
         // always laid out as a line, the same edge `bounds_for_range` hits. Keep
@@ -988,18 +995,23 @@ impl MarkdownEditorState {
         for k in keys {
             for line in &self.last_blocks[&k].lines {
                 if line.contains_source_offset(offset) {
-                    let local = line.local_position_for_source_offset_biased(offset, downstream);
-                    let top = line.origin.y + local.y - content_top;
-                    return Some((top, top + line.row_height));
-                }
-                if line.source_range.end <= offset
+                    let better = match hit {
+                        None => true,
+                        Some(prev) => {
+                            downstream && line.source_range.start > prev.source_range.start
+                        }
+                    };
+                    if better {
+                        hit = Some(line);
+                    }
+                } else if line.source_range.end <= offset
                     && fallback.is_none_or(|f| line.source_range.end >= f.source_range.end)
                 {
                     fallback = Some(line);
                 }
             }
         }
-        let line = fallback?;
+        let line = hit.or(fallback)?;
         let local = line.local_position_for_source_offset_biased(offset, downstream);
         let top = line.origin.y + local.y - content_top;
         Some((top, top + line.row_height))

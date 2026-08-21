@@ -10068,3 +10068,48 @@ fn ime_commit(
     .unwrap();
     cx.run_until_parked();
 }
+
+#[gpui::test]
+fn content_y_for_offset_at_a_shared_line_boundary_takes_the_later_line(cx: &mut TestAppContext) {
+    // Line ranges are end-inclusive, so where one line's end is the next one's
+    // start — a code block's rows here, and equally a hard-broken paragraph or
+    // a table's row boundary — one offset is claimed by two lines. A host
+    // revealing a match at that offset must land on the line the match is *on*,
+    // not the line above it.
+    let markdown = "```\nlet x = 1;\nlet y = 2;\n```\n\ntail";
+    let initial = EditorState {
+        markdown: markdown.into(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+
+    let (boundary, upper_y, lower_y) = editor.read_with(cx, |e, _| {
+        let mut geo = e.debug_line_source_geometry();
+        geo.sort_by_key(|(start, end, ..)| (*start, *end));
+        let shared = geo
+            .windows(2)
+            .find(|w| w[0].1 == w[1].0 && w[1].3 > w[0].3)
+            .expect("the fixture shares a boundary between two lines on different rows")
+            .to_vec();
+        (shared[0].1, shared[0].3, shared[1].3)
+    });
+
+    editor.read_with(cx, |e, _| {
+        let (top, _) = e.content_y_for_offset(boundary).expect("boundary offset");
+        assert_eq!(
+            top.as_f32(),
+            lower_y,
+            "offset {boundary} starts the lower line, so it reveals at {lower_y}, \
+             not at the line above it ({upper_y})",
+        );
+    });
+
+    // The caret path is untouched: the later-line rule is gated on
+    // `downstream`, so an upstream caret still resolves to the line it renders
+    // on. No caret can actually land on a *cross-line* shared boundary today
+    // (`End` stops at the end of the row's text, before the byte the next line
+    // claims), which is why the gate costs nothing and stays as the guarantee.
+}
