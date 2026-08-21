@@ -868,3 +868,66 @@ fn a_disabled_backend_starts_no_engine_even_when_asked_explicitly() {
         assert!(err.to_string().contains("exited during load"), "got {err}");
     });
 }
+
+/// A re-added backend starts clean: it does not inherit the error its
+/// predecessor's engine left behind.
+///
+/// Removal is a *soft* remove and re-adding the id revives the row, so a
+/// standing engine failure keyed on `(backend, slug)` outlives the backend
+/// that earned it and reappears on a configuration that may have nothing to do
+/// with it — a different directory, a different `llama-server`. Retiring a
+/// backend's engines therefore retires what those engines had to say.
+#[test]
+fn a_re_added_backend_does_not_inherit_its_predecessors_error() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let models = dir.path().join("box-models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("tiny.gguf"), b"gguf").unwrap();
+        let add = || {
+            core.runtime().block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &models.display().to_string(),
+                // Spawns and exits immediately: a real, honest load failure.
+                Some("/usr/bin/false"),
+                true,
+            )))
+        };
+        let last_error = || {
+            let state = core
+                .runtime()
+                .block_on(core.local_models_state())
+                .expect("state");
+            state
+                .external
+                .iter()
+                .find(|b| b.backend_id == "my-box")
+                .expect("backend section")
+                .models
+                .iter()
+                .find(|m| m.slug == "tiny")
+                .expect("model row")
+                .last_error
+                .clone()
+        };
+
+        add().expect("add");
+        core.runtime()
+            .block_on(core.load_local_model("tiny@my-box".into()))
+            .expect_err("/usr/bin/false exits during load");
+        assert!(
+            last_error().is_some_and(|e| e.contains("exited during load")),
+            "precondition: the failed load is reported"
+        );
+
+        core.runtime()
+            .block_on(core.remove_backend("my-box".into()))
+            .expect("remove");
+        add().expect("re-add");
+        assert_eq!(
+            last_error(),
+            None,
+            "a backend re-added under the same id starts with no standing error"
+        );
+    });
+}

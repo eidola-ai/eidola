@@ -607,58 +607,81 @@ impl LocalRuntime {
         Ok(Some((instance, victims)))
     }
 
-    /// Mark a warming entry ready — **only if `instance` still holds `key`**.
-    /// Returns whether it did; `false` means this instance was unloaded (and
-    /// possibly replaced) while it warmed up, and its caller owes its child a
-    /// kill rather than a promotion.
-    fn mark_engine_ready(&self, key: &EngineKey, instance: EngineInstance) -> bool {
-        let mut engines = self.engines.lock().expect("engines lock");
-        match engines.get_mut(key) {
-            Some(e) if e.instance == instance => {
-                e.ready = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Drop an entry — **only if `instance` still holds `key`**. Returns
-    /// whether it did. Used by every path that ends one engine's life on the
-    /// engine's own account (a rolled-back reservation, a supervisor's
-    /// failure); the user-driven verbs remove by key, because "unload
-    /// whatever is loaded under this id" is exactly what they mean.
-    fn retire_instance(&self, key: &EngineKey, instance: EngineInstance) -> bool {
-        let mut engines = self.engines.lock().expect("engines lock");
-        match engines.get(key) {
-            Some(e) if e.instance == instance => {
-                engines.remove(key);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Record one instance's failure and retire it.
+    /// **The gate every instance-scoped effect passes through**: run `f` while
+    /// and only while `instance` still holds `key`, under the `engines` lock.
     ///
-    /// The report is filed only when it can still be about the row a surface
-    /// would show: the failing instance still holds the key (and is removed
-    /// under the same lock), or the key holds nothing at all. A newer
-    /// instance under the key keeps its own state — a dead process's
-    /// complaint must not become the live one's error, and must certainly not
-    /// delete it.
-    fn fail_instance(&self, key: &EngineKey, instance: EngineInstance, message: String) {
+    /// A supervisor outlives its own registration. Its entry can be taken by
+    /// an unload, an eviction, the quit drain, or its backend being removed,
+    /// disabled or repointed — and the key can be occupied again by a newer
+    /// load — all while this task sits between two `await`s. So a supervisor
+    /// may never name its effect by key alone, and *every* arm has to ask the
+    /// same question: is this still mine?
+    ///
+    /// Asking it in one place is the difference between an invariant and a
+    /// habit. Each arm that asked separately was one that could forget, and
+    /// one did: the failure-filing arm treated an *absent* key as licence to
+    /// record, so a deliberate unload could leave "exited unexpectedly" on a
+    /// row that is merely available. The closure receives the instance's own
+    /// [`OccupiedEntry`](std::collections::hash_map::OccupiedEntry) — the only
+    /// handle it gets — so it can promote or remove *that* entry and reach no
+    /// other, and an arm that skips the gate has nothing to act on at all.
+    /// `None` means the instance is gone; every caller's answer to that is to
+    /// do nothing.
+    fn if_still_registered<T>(
+        &self,
+        key: &EngineKey,
+        instance: EngineInstance,
+        f: impl FnOnce(std::collections::hash_map::OccupiedEntry<'_, EngineKey, EngineEntry>) -> T,
+    ) -> Option<T> {
+        use std::collections::hash_map::Entry;
         let mut engines = self.engines.lock().expect("engines lock");
-        match engines.get(key) {
-            Some(e) if e.instance == instance => {
-                engines.remove(key);
-            }
-            Some(_) => return,
-            None => {}
+        match engines.entry(key.clone()) {
+            Entry::Occupied(entry) if entry.get().instance == instance => Some(f(entry)),
+            _ => None,
         }
-        self.failures
-            .lock()
-            .expect("failures lock")
-            .insert(key.clone(), EngineFailure::load(message));
+    }
+
+    /// Mark a warming entry ready. Returns whether it did; `false` means this
+    /// instance was unloaded (and possibly replaced) while it warmed up, and
+    /// its caller owes its child a kill rather than a promotion.
+    fn mark_engine_ready(&self, key: &EngineKey, instance: EngineInstance) -> bool {
+        self.if_still_registered(key, instance, |mut entry| entry.get_mut().ready = true)
+            .is_some()
+    }
+
+    /// Drop an entry. Returns whether it did. Used by every path that ends one
+    /// engine's life on the engine's own account (a rolled-back reservation, a
+    /// supervisor's failure); the user-driven verbs remove by key, because
+    /// "unload whatever is loaded under this id" is exactly what they mean.
+    fn retire_instance(&self, key: &EngineKey, instance: EngineInstance) -> bool {
+        self.if_still_registered(key, instance, |entry| {
+            entry.remove();
+        })
+        .is_some()
+    }
+
+    /// Retire one instance and file its failure — **both inside the gate**, so
+    /// a report can only ever be filed by the instance whose row it decorates.
+    ///
+    /// A standing failure exists to explain a model's state to whoever is
+    /// looking at it. An instance that no longer holds its key has no such
+    /// state to explain: something deliberate ended it, and the row now shows
+    /// what that something left behind. Filing anyway is how a plain unload
+    /// grows a spurious "exited unexpectedly", and how a newer load under the
+    /// same key inherits a dead process's complaint.
+    ///
+    /// Nothing is swallowed by the silence. The caller waiting on this load
+    /// gets the message over its own channel (`ready_tx`), and a second caller
+    /// that joined the load reads "the engine load was cancelled" from
+    /// [`Inner::await_engine_ready`] — which is what actually happened.
+    fn fail_instance(&self, key: &EngineKey, instance: EngineInstance, message: String) {
+        self.if_still_registered(key, instance, |entry| {
+            entry.remove();
+            self.failures
+                .lock()
+                .expect("failures lock")
+                .insert(key.clone(), EngineFailure::load(message));
+        });
     }
 
     /// Take the entry loaded under `key`, whatever instance it is — the
@@ -676,6 +699,15 @@ impl LocalRuntime {
     /// longer exists. Left in place, the next load of the same slug joins the
     /// old engine and turns run against the previous file while every surface
     /// describes the new one. The caller owns the returned shutdown senders.
+    ///
+    /// The reports those engines filed go with them. A standing engine failure
+    /// says "this backend's engine could not start", and a row that is removed
+    /// is only soft-removed — re-adding the id revives it, and the old error
+    /// would come back with it, describing a directory and a binary the
+    /// backend no longer has. A **download** report is not an engine's: it
+    /// belongs to the file and carries the URL a retry needs (see
+    /// [`EngineFailure`]), so it survives — retiring engines is not a reason
+    /// to forget that a download failed.
     fn take_backend_engines(&self, backend_id: &str) -> Vec<EngineEntry> {
         let mut engines = self.engines.lock().expect("engines lock");
         // Bumped under the `engines` lock, so a reservation either happened
@@ -689,6 +721,10 @@ impl LocalRuntime {
             .expect("backend epochs lock")
             .entry(backend_id.to_string())
             .or_insert(0) += 1;
+        self.failures
+            .lock()
+            .expect("failures lock")
+            .retain(|(b, _), failure| b != backend_id || failure.source_url.is_some());
         let keys: Vec<EngineKey> = engines
             .keys()
             .filter(|(b, _)| b == backend_id)
@@ -711,6 +747,9 @@ impl LocalRuntime {
     /// path that ends an engine's life without anyone remembering to add a
     /// check here.
     ///
+    /// It is [`Self::if_still_registered`] with a message attached — the same
+    /// gate every other instance-scoped effect passes through.
+    ///
     /// It subsumes the quit latch it replaced: the drain empties the map and
     /// sets the latch in one critical section, and [`Self::reserve_engine`]
     /// refuses to reserve afterwards — so an entry that is still present at
@@ -729,19 +768,16 @@ impl LocalRuntime {
         instance: EngineInstance,
         f: impl FnOnce() -> T,
     ) -> Result<T, &'static str> {
-        let engines = self.engines.lock().expect("engines lock");
-        match engines.get(key) {
-            Some(e) if e.instance == instance => {
-                #[cfg(feature = "test-support")]
-                self.engine_spawns.fetch_add(1, Ordering::SeqCst);
-                Ok(f())
-            }
-            _ => Err(if self.shutting_down.load(Ordering::SeqCst) {
-                "Eidola is shutting down"
-            } else {
-                "the load was cancelled before the engine started"
-            }),
-        }
+        self.if_still_registered(key, instance, |_entry| {
+            #[cfg(feature = "test-support")]
+            self.engine_spawns.fetch_add(1, Ordering::SeqCst);
+            f()
+        })
+        .ok_or(if self.shutting_down.load(Ordering::SeqCst) {
+            "Eidola is shutting down"
+        } else {
+            "the load was cancelled before the engine started"
+        })
     }
 
     /// Test seam: how many `llama-server` processes have been started.
@@ -1702,14 +1738,21 @@ impl Inner {
         // in-memory failure map and never reaches the disk.
         let retry_url = download_url.clone();
         // Core-owned transfer task: survives any window; cancellation is the
-        // explicit flag, checked between chunks.
+        // wakeable signal on the entry.
         tokio::spawn(async move {
             let result = run_download(&client, &download_url, &dir, &file_name, &entry, &bus).await;
-            local
-                .downloads
-                .lock()
-                .expect("downloads lock")
-                .remove(&slug_task);
+            // Retiring this transfer and filing its report happen in **one**
+            // critical section, for the reason every other report in this
+            // module names an instance: the slot is what a second download of
+            // the same slug waits on. Removing first and filing after would
+            // leave a gap in which a retry starts (its own start clears this
+            // key's failures) and then inherits this transfer's error on its
+            // fresh row. Holding the downloads lock across the insert orders
+            // the two absolutely — a retry either sees the slot occupied and
+            // is refused, or starts after the report is already filed and
+            // clears it on the way in.
+            let mut downloads = local.downloads.lock().expect("downloads lock");
+            downloads.remove(&slug_task);
             if let Err(e) = result {
                 local.failures.lock().expect("failures lock").insert(
                     (crate::backends::LOCAL_BACKEND_ID.to_string(), slug_task),
@@ -1719,6 +1762,7 @@ impl Inner {
                     },
                 );
             }
+            drop(downloads);
             bus.emit(Change::LocalModels);
         });
 
@@ -2980,6 +3024,14 @@ mod tests {
             "a stale instance may not delete the engine that replaced it"
         );
         assert!(
+            !runtime
+                .failures
+                .lock()
+                .expect("failures lock")
+                .contains_key(&key),
+            "nor file its complaint against the engine that replaced it"
+        );
+        assert!(
             runtime
                 .failures
                 .lock()
@@ -3058,6 +3110,85 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "another backend's retirement is not this load's business"
+        );
+    }
+
+    /// A retired instance files nothing — not even when the key it held is
+    /// empty.
+    ///
+    /// This is the arm the ownership rule was missing. An unload (or an
+    /// eviction, or a backend retirement) takes the entry and signals the
+    /// supervisor, but the supervisor's `select!` may see its child's exit
+    /// first and report it. Filing then puts "exited unexpectedly" on a model
+    /// the user has just deliberately unloaded, whose row now says nothing
+    /// worse than *available* — and leaves that error keyed under
+    /// `(backend, slug)` for the next thing to occupy it.
+    ///
+    /// The silence costs nothing: the caller waiting on the load is told over
+    /// its own channel, and a caller that joined it reads "the engine load was
+    /// cancelled", which is what happened.
+    #[test]
+    fn a_retired_instance_files_no_failure() {
+        let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+        let key = ("local".to_string(), "tiny".to_string());
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let (instance, _) = runtime
+            .reserve_engine(&key, 9001, GIB, tx, runtime.backend_epoch("local"))
+            .unwrap()
+            .expect("reserved");
+        // The user unloads: the entry goes, and nothing takes its place.
+        assert!(runtime.take_engine(&key).is_some());
+
+        runtime.fail_instance(&key, instance, "llama-server exited unexpectedly".into());
+        assert!(
+            !runtime
+                .failures
+                .lock()
+                .expect("failures lock")
+                .contains_key(&key),
+            "an instance that no longer holds its key has no row to explain"
+        );
+        assert!(!runtime.engine_present(&key), "and nothing was resurrected");
+    }
+
+    /// Retiring a backend retires what its engines had to say — and nothing
+    /// else. A download's report belongs to the file, not to the engine, and
+    /// carries the URL a retry needs.
+    #[test]
+    fn retiring_a_backend_forgets_its_engine_reports_but_not_its_downloads() {
+        let runtime = LocalRuntime::default();
+        let engine_failed = ("local".to_string(), "engine".to_string());
+        let download_failed = ("local".to_string(), "download".to_string());
+        let other_backend = ("my-box".to_string(), "engine".to_string());
+        {
+            let mut failures = runtime.failures.lock().expect("failures lock");
+            failures.insert(engine_failed.clone(), EngineFailure::load("exited"));
+            failures.insert(
+                download_failed.clone(),
+                EngineFailure {
+                    message: "download failed".into(),
+                    source_url: Some("https://example.com/x.gguf".into()),
+                },
+            );
+            failures.insert(other_backend.clone(), EngineFailure::load("exited"));
+        }
+
+        runtime.take_backend_engines("local");
+
+        let failures = runtime.failures.lock().expect("failures lock");
+        assert!(
+            !failures.contains_key(&engine_failed),
+            "the engine's report goes"
+        );
+        assert!(
+            failures.contains_key(&download_failed),
+            "a failed download keeps its report — and the URL a retry needs"
+        );
+        assert!(
+            failures.contains_key(&other_backend),
+            "another backend's reports are not this retirement's business"
         );
     }
 
