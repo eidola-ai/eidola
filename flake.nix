@@ -1166,6 +1166,57 @@ with open(path, "wb") as f:
               | gzip -n -9 > "$out"
             '';
 
+        # The macOS shipping container: a deterministic zip of the payload,
+        # in the shape a browser download and Gatekeeper expect. Distinct
+        # from mkReproducibleArchive's `.tar.gz` and not a replacement for
+        # it — `archiveSha256` stays the payload's canonical identity. What
+        # this adds is a *published recipe* for the container itself, which
+        # is what makes `apply(archive, envelope) = installable` checkable:
+        # reconstructing the signed bundle only reproduces a tree, and the
+        # shipped file is a zip, so re-zipping has to land on the same bytes
+        # CI produced or the comparison has nothing to compare.
+        #
+        # Info-ZIP from nixpkgs, never `ditto`: ditto's defaults embed
+        # wall-clock time and it exists only on macOS, which would put the
+        # final hash check behind a Mac. Nothing here is macOS-only, so a
+        # verifier can re-zip a reconstructed tree on Linux and land on the
+        # same bytes.
+        #
+        # Determinism comes from four things, all load-bearing:
+        #   * `-y` stores symlinks as symlinks. Without it zip silently
+        #     follows them, which both corrupts a bundle and makes the
+        #     output depend on the link targets.
+        #   * `-X` drops the extra fields that carry uid/gid and
+        #     second-resolution timestamps; the DOS fields that remain are
+        #     pinned by the mtime normalization.
+        #   * every mtime is set to SOURCE_DATE_EPOCH (`-h`, so symlinks
+        #     get their own, not their targets'), and TZ is fixed because
+        #     zip records DOS local time.
+        #   * entry order is `find | sort` under LC_ALL=C rather than
+        #     readdir order, which is filesystem state.
+        # The zip version pinned by flake.lock is an input to the result,
+        # the same way gzip's version is an input to archiveSha256.
+        mkShippingZip =
+          {
+            pname,
+            payload,
+          }:
+          pkgs.runCommand "${pname}.zip"
+            {
+              nativeBuildInputs = [ pkgs.zip ];
+            }
+            ''
+              export LC_ALL=C TZ=UTC
+              cp -R ${payload} tree
+              chmod -R u+w tree
+              find tree -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+              # Built beside the tree and moved into place: zip writes its
+              # temporary archive in the *output's* directory, and the store
+              # is not writable during a build.
+              ( cd tree && find . -mindepth 1 | LC_ALL=C sort | zip -q -X -y -@ ../shipping.zip )
+              mv shipping.zip "$out"
+            '';
+
         # The shippable Linux GUI: a *copied* GUI binary, a *copied*
         # llama-server sidecar (both sets of bytes in this NAR — same
         # measurement rule as macOS), and a *referenced* nixpkgs Mesa ICD
@@ -1269,6 +1320,13 @@ with open(path, "wb") as f:
         // pkgs.lib.optionalAttrs (eidolaGuiMacosUniversal != null) {
           eidola-gui-macos-universal = eidolaGuiMacosUniversal;
           eidola-gui-macos-universal-archive = mkReproducibleArchive {
+            pname = "eidola-gui-macos-universal";
+            payload = eidolaGuiMacosUniversal;
+          };
+          # The unsigned shipping container. Signing happens outside Nix
+          # (it needs a key), so this is the *unsigned* zip: the recipe a
+          # signed release's zip is produced by, exercised on every build.
+          eidola-gui-macos-universal-zip = mkShippingZip {
             pname = "eidola-gui-macos-universal";
             payload = eidolaGuiMacosUniversal;
           };

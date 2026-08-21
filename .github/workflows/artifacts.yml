@@ -406,6 +406,26 @@ jobs:
           cat /tmp/macos-artifact-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
+      - name: Build the unsigned macOS shipping zip
+        # The container a macOS download arrives in, built from the same
+        # `.app` the step above measured. Unsigned: signing needs a key, and
+        # no key reaches this job. Building it here means the recipe is
+        # exercised on every run rather than first attempted at release
+        # time, and the file is available for a release to sign and publish.
+        run: |
+          zip_path="$(nix build '.#eidola-gui-macos-universal-zip' \
+            --no-link --print-out-paths --show-trace)"
+          mkdir -p /tmp/eidola-shipping
+          cp "$zip_path" /tmp/eidola-shipping/eidola-gui-macos-universal.zip
+          shasum -a 256 /tmp/eidola-shipping/eidola-gui-macos-universal.zip
+
+      - name: Upload the unsigned macOS shipping zip
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: eidola-gui-macos-universal-zip
+          path: /tmp/eidola-shipping/eidola-gui-macos-universal.zip
+          if-no-files-found: error
+
       - name: Verify detached Apple signature contract
         run: ./scripts/apple-signature-differential.sh
 

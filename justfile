@@ -118,6 +118,7 @@ check:
     cargo fmt --check
     rumdl check .
     cargo-deny check licenses bans sources
+    ./scripts/check-manifest-determinism.sh
 
 # Apply auto-fixable markdown formatting via rumdl
 format:
@@ -195,6 +196,18 @@ test-verify-apple:
     ./scripts/test-verify-apple.sh
 
 # --- CI / Release ---
+
+# Assert no key-dependent value can reach artifact-manifest.json: the
+# per-type field allow-list, the signing-material key deny-list, and the
+# job-graph rule that keeps signing out of the manifest's inputs. Runs the
+# bad fixtures too, so the check is proven to still bite.
+check-manifest-determinism:
+    ./scripts/check-manifest-determinism.sh
+
+# Symlink and determinism regressions for flake.nix's macOS shipping-zip
+# recipe. Info-ZIP only — no Nix, no toolchain.
+test-shipping-zip:
+    ./scripts/test-shipping-zip.sh
 
 # Compute enclave measurements from tinfoil-config.yml and CVM artifacts
 measure:

@@ -1,0 +1,21 @@
+{
+  "artifacts": {
+    "eidola-gui-macos-universal": {
+      "appleSignatureBundleSha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "archiveSha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "platform": "darwin/universal",
+      "type": "nix"
+    },
+    "eidola-server": {
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "platform": "linux/amd64",
+      "type": "oci"
+    }
+  },
+  "schema_version": 2,
+  "signing": {
+    "notarization_ticket_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "team_id": "XXXXXXXXXX"
+  }
+}

@@ -118,6 +118,20 @@ jobs:
       - name: Test check scope classifier
         run: .github/scripts/test-rust-check-scope.sh
 
+      - name: Check artifact-manifest determinism
+        # Deliberately ungated: jq over two files, and the invariant it
+        # protects (no key-dependent value can reach artifact-manifest.json)
+        # is broken by exactly the kinds of PR the scope step classifies as
+        # irrelevant — a workflow edit, a manifest field, a scripts change.
+        # The run includes the check's own bad fixtures, so a check that
+        # stopped catching anything fails here too.
+        run: ./scripts/check-manifest-determinism.sh
+
+      - name: Test macOS shipping-zip recipe
+        # Info-ZIP flags only (no Nix, no toolchain): the symlink and
+        # determinism regressions behind flake.nix's mkShippingZip.
+        run: ./scripts/test-shipping-zip.sh
+
       - name: Check legal document versioning
         # The published legal documents (www/pages/terms.md, privacy.md)
         # are accepted by the SHA-256 of their exact bytes, ordered by a
