@@ -181,10 +181,16 @@ apple-roundtrip *args:
 # directory, check every recorded byte/hash, and print structurally parsed
 # embedded claims. Apple trust is established by the authenticated release
 # attestation, not by this structural parser alone.
-verify-apple unsigned_zip signature_bundle:
-    ./scripts/verify-apple.sh "{{ unsigned_zip }}" "{{ signature_bundle }}"
+#
+# unsigned_archive is the flake's gzip'd POSIX tar
+# (nix build .#eidola-gui-macos-universal-archive) — the bytes
+# artifact-manifest.json binds through archiveSha256. Either argument may
+# also be a zip; the container is read from the file's magic bytes.
+verify-apple unsigned_archive signature_bundle:
+    ./scripts/verify-apple.sh "{{ unsigned_archive }}" "{{ signature_bundle }}"
 
-# Regression for Nix archives whose app directories extract read-only.
+# Regression over both containers verify-apple reads, including Nix archives
+# whose app directories extract read-only.
 test-verify-apple:
     ./scripts/test-verify-apple.sh
 
@@ -195,12 +201,13 @@ measure:
     ./scripts/artifact-manifest.sh measure
 
 # Update artifact-manifest.json with current build digests and measurements.
-# Builds the OCI images plus the current host's Nix-built desktop artifacts
-# (macOS universal CLI + GUI .app on Darwin; the Linux GUI on Linux), then
-# records their digests/narHashes. Also stamps image digests into
-# tinfoil-config.yml and computes enclave measurements. The *other*
-# platform's desktop entries are carried over from the committed manifest —
-# no single host builds both; CI's apple + linux-gui jobs verify the full set.
+# Builds the OCI images plus the current host's Nix-built desktop payloads
+# and flake-built archives (macOS universal CLI + GUI .app on Darwin; the
+# Linux GUI on Linux), then records OCI digest / narHash / archiveSha256.
+# Also stamps image digests into tinfoil-config.yml and computes enclave
+# measurements. The *other* platform's desktop entries are carried over
+# from the committed manifest — no single host builds both; CI's apple +
+# linux-gui jobs verify the full set.
 update-manifest:
     ./scripts/artifact-manifest.sh update --ensure-builder
 

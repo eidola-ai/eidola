@@ -574,6 +574,16 @@ pub struct AccountCreateResult {
     /// is no other API to recover it (losing it means creating a new account).
     pub secret: String,
     pub created_at: i64,
+    /// Where the new account stands with the terms gate, read back from the
+    /// server rather than inferred from the recording having succeeded.
+    ///
+    /// Recording acceptance is best-effort here — the account exists either
+    /// way, and failing the call would strand it — so this is how the outcome
+    /// is reported instead of swallowed. Anything but
+    /// [`TermsAcceptance::Complete`] means the caller should say so: the
+    /// server's 428 gate will otherwise refuse the first purchase with no
+    /// warning having been given.
+    pub terms: TermsAcceptance,
 }
 
 #[derive(Clone, Debug)]
@@ -678,6 +688,78 @@ pub struct TermsDocument {
     pub url: String,
     /// Hex-encoded SHA-256 of the exact published document text.
     pub sha256: String,
+}
+
+/// Whether an account's terms acceptance is **complete** — as established by
+/// reading the server back after recording acceptance, never assumed from the
+/// recording having succeeded.
+///
+/// The distinction is the whole reason this is not a boolean. Acceptance is
+/// recorded one document at a time and each submission is judged on its own,
+/// so "every document I submitted was accepted" says nothing about a document
+/// that became required *after* the snapshot was taken — including the case
+/// where the snapshot was empty because the gate had not been switched on yet.
+/// The server's purchase gate asks a different question ("has this account
+/// accepted everything currently required?"), and that is the question a
+/// caller needs answered before it promises the user there is nothing to do.
+#[derive(Clone, Debug)]
+pub enum TermsAcceptance {
+    /// Every document the server requires is covered. Nothing to do.
+    ///
+    /// Also the answer when the server requires nothing at all: for the
+    /// caller those are the same standing, and the sentence to say about
+    /// them is the same one.
+    Complete,
+    /// These documents (by name) are **not established as accepted**, so the
+    /// server's gate will refuse a purchase until they are.
+    ///
+    /// Two situations reach here. One is a document that became required
+    /// between the snapshot being taken and acceptance being recorded — the
+    /// account is genuinely missing it. The other is a submission that
+    /// failed, where nothing is known to have been recorded and so
+    /// everything currently required is listed. Deliberately named
+    /// "outstanding" rather than "missing": the second case may over-list,
+    /// and re-accepting a document already accepted is a no-op, whereas
+    /// staying quiet about one is a purchase that fails later with no
+    /// warning.
+    Outstanding { documents: Vec<String> },
+    /// The standing could not be established — the server could not be read
+    /// back. Nothing is claimed either way.
+    Unknown { error: AppError },
+}
+
+impl TermsAcceptance {
+    /// Whether the caller can tell the user there is nothing outstanding.
+    /// False for [`TermsAcceptance::Unknown`], which is not a claim of
+    /// completeness.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, TermsAcceptance::Complete)
+    }
+}
+
+/// Which of `required` is **not** covered by `recorded`, by document name.
+///
+/// The rule mirrors the server's purchase gate exactly, and it is a *version*
+/// comparison rather than a hash one: accepting version N satisfies any
+/// requirement at or below N (see [`TermsDocument`]), so a snapshot recorded a
+/// moment before a version bump still covers the older requirement it was
+/// taken against. What it cannot cover is a document that is not in it at all
+/// — which is the case a per-document "every submission succeeded" can never
+/// notice, and the reason this comparison exists.
+///
+/// **Answers with names, never documents.** See [`Inner::terms_standing`]:
+/// the narrowing is what stops a verification read from turning back into a
+/// submission.
+fn documents_not_covered(required: &[TermsDocument], recorded: &[TermsDocument]) -> Vec<String> {
+    required
+        .iter()
+        .filter(|d| {
+            !recorded
+                .iter()
+                .any(|r| r.document == d.document && r.version >= d.version)
+        })
+        .map(|d| d.document.clone())
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -2158,7 +2240,10 @@ impl Inner {
         })
     }
 
-    async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
+    async fn account_create(
+        &self,
+        accepted_terms: Vec<TermsDocument>,
+    ) -> Result<AccountCreateResult, AppError> {
         let cfg = self.load_config();
 
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
@@ -2190,18 +2275,30 @@ impl Inner {
         cfg.save_to(&self.config_path)?;
         self.bus.emit(Change::Config);
 
-        // Record acceptance of the currently required terms/privacy versions
-        // against the new account. The caller is responsible for having
-        // presented the documents first (the GUI's consent checkbox, the
-        // CLI's --accept-terms flag). Best-effort: if this fails, the
-        // server's 428 gate re-prompts at the first purchase or conversion,
-        // so a network blip here must not fail the already-created account.
-        let _ = self.accept_current_terms().await;
+        // Record the user's acceptance of exactly the documents the caller
+        // presented — never a freshly fetched set, which would record consent
+        // for text nobody read if a version advanced between the two.
+        // Passing the pairs through makes that impossible: the server only
+        // records a `(document, sha256)` pair it still requires, and answers
+        // a stale one with a conflict.
+        //
+        // Best-effort by design: the account exists either way, and failing
+        // the call would strand a created account. So the outcome is
+        // *reported* rather than swallowed — and reported as the standing the
+        // server would gate on, not as "my submissions succeeded". When
+        // nothing is known to have been recorded, nothing is assumed: the
+        // standing is read with an empty recorded set, which lists everything
+        // currently required.
+        let terms = match self.submit_terms(&accepted_terms).await {
+            Ok(()) => self.terms_standing(&accepted_terms).await,
+            Err(_) => self.terms_standing(&[]).await,
+        };
 
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
             secret: created.secret,
             created_at: iso_to_ms(&created.created_at)?,
+            terms,
         })
     }
 
@@ -2239,15 +2336,36 @@ impl Inner {
             .collect())
     }
 
-    /// Record acceptance of every currently required document version
-    /// against the configured account, returning what was accepted.
+    /// Record acceptance of `presented`, then report where the account
+    /// stands with the gate.
     ///
-    /// Callers are responsible for having *presented* the documents to the
-    /// user first — this method transmits consent, it does not obtain it.
-    async fn accept_current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
-        let docs = self.current_terms().await?;
-        if docs.is_empty() {
-            return Ok(docs);
+    /// Two acts, deliberately kept apart (see [`Inner::submit_terms`] and
+    /// [`Inner::terms_standing`]): what gets *submitted* is only ever what
+    /// the caller presented, and the read that follows only ever *reports*.
+    /// An `Err` here is a failed submission; an `Ok` carries the standing,
+    /// which may still be [`TermsAcceptance::Outstanding`].
+    async fn accept_terms(
+        &self,
+        presented: Vec<TermsDocument>,
+    ) -> Result<TermsAcceptance, AppError> {
+        self.submit_terms(&presented).await?;
+        Ok(self.terms_standing(&presented).await)
+    }
+
+    /// **The only path that records anything.** Submits exactly the documents
+    /// `presented` — the snapshot the caller obtained from `current_terms`
+    /// and showed the user.
+    ///
+    /// The snapshot is an *input*, deliberately: this method transmits
+    /// consent, it does not obtain it, and re-reading the current documents
+    /// here would transmit consent for whatever the server requires now
+    /// rather than for what the user read. The server accepts a
+    /// `(document, sha256)` pair only while it is still required, so a
+    /// version that advanced mid-flow surfaces as a conflict instead of a
+    /// silent acceptance.
+    async fn submit_terms(&self, presented: &[TermsDocument]) -> Result<(), AppError> {
+        if presented.is_empty() {
+            return Ok(());
         }
 
         let cfg = self.load_config();
@@ -2256,7 +2374,7 @@ impl Inner {
         let (id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&eidola, None).await?;
 
-        for d in &docs {
+        for d in presented {
             let resp = client
                 .post(format!("{base_url}/v1/account/terms"))
                 .basic_auth(id, Some(secret))
@@ -2272,7 +2390,38 @@ impl Inner {
             check_status(status, &body)?;
         }
 
-        Ok(docs)
+        Ok(())
+    }
+
+    /// Where the account stands with the terms gate, given what is known to
+    /// have been `recorded`. **Read-only, and structurally so.**
+    ///
+    /// This re-reads `GET /v1/terms`, which is the read this contract removed
+    /// from the acceptance path — but for the opposite purpose, and the
+    /// difference is what keeps it safe. There it *decided what was
+    /// submitted*, which is how consent for unread text got recorded. Here it
+    /// only reports, and it cannot become the other thing: what it hands back
+    /// is [`documents_not_covered`]'s answer, which is document **names**,
+    /// and [`Inner::submit_terms`] takes `TermsDocument`s. A name carries no
+    /// hash, so there is nothing in this function's output that the
+    /// submitting path could accept. Keep it that way — widening the return
+    /// type to documents is what would re-open the hole.
+    ///
+    /// Never fails: an unreadable server is [`TermsAcceptance::Unknown`],
+    /// because "I could not check" is an answer and `Complete` would be a
+    /// lie.
+    async fn terms_standing(&self, recorded: &[TermsDocument]) -> TermsAcceptance {
+        match self.current_terms().await {
+            Ok(required) => {
+                let documents = documents_not_covered(&required, recorded);
+                if documents.is_empty() {
+                    TermsAcceptance::Complete
+                } else {
+                    TermsAcceptance::Outstanding { documents }
+                }
+            }
+            Err(error) => TermsAcceptance::Unknown { error },
+        }
     }
 
     async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
@@ -8729,10 +8878,17 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    pub async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
+    /// Create an anonymous account and record its acceptance of
+    /// `accepted_terms` — the snapshot [`AppCore::current_terms`] returned
+    /// and the caller **presented to the user**. Pass an empty list only
+    /// when nothing was required to present.
+    pub async fn account_create(
+        &self,
+        accepted_terms: Vec<TermsDocument>,
+    ) -> Result<AccountCreateResult, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.account_create().await })
+            .spawn(async move { inner.account_create(accepted_terms).await })
             .await
             .map_err(join_err)?
     }
@@ -8748,14 +8904,29 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// Record the user's acceptance of every currently required document
-    /// version, returning what was accepted. Callers must have presented
-    /// the documents to the user first — this transmits consent, it does
-    /// not obtain it. Routes here after [`AppError::TermsAcceptanceRequired`].
-    pub async fn accept_current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+    /// Record the user's acceptance of `presented` — the snapshot
+    /// [`AppCore::current_terms`] returned and the caller showed the user —
+    /// and report where the account then stands with the gate.
+    ///
+    /// The snapshot travels as an argument so that consent is transmitted for
+    /// the text that was read: a document version advancing between the two
+    /// calls is answered by the server as a conflict, which the
+    /// [`AppError::TermsAcceptanceRequired`] gate then re-prompts for with
+    /// the new text. Routes here after that error.
+    ///
+    /// **`Ok` is not "nothing left to do".** Acceptance is recorded one
+    /// document at a time, so a document that became required after the
+    /// snapshot was taken is accepted by nobody and refused by no submission.
+    /// The returned [`TermsAcceptance`] is read back from the server and is
+    /// the answer to the question the purchase gate actually asks; an `Err`
+    /// means the submission itself failed.
+    pub async fn accept_terms(
+        &self,
+        presented: Vec<TermsDocument>,
+    ) -> Result<TermsAcceptance, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.accept_current_terms().await })
+            .spawn(async move { inner.accept_terms(presented).await })
             .await
             .map_err(join_err)?
     }
@@ -14708,6 +14879,67 @@ mod tests {
     fn auto_allocation_exact_balance_allocates_it_all() {
         let amount = auto_allocation_amount(6_200, 6_200).unwrap();
         assert_eq!(amount, 6_200);
+    }
+
+    /// A required-document row as `current_terms` would hand it back. Only
+    /// `document` and `version` decide coverage; the hash rides along
+    /// because a real snapshot carries one.
+    fn doc(document: &str, version: i64) -> TermsDocument {
+        TermsDocument {
+            document: document.into(),
+            version,
+            url: format!("https://example.invalid/{document}/"),
+            sha256: "0".repeat(64),
+        }
+    }
+
+    #[test]
+    fn a_document_added_after_the_snapshot_is_outstanding() {
+        // The defect this comparison exists for: every submission in the
+        // snapshot succeeds, so a per-document "it all went through" reads as
+        // complete while the account has never seen the new document.
+        let recorded = [doc("terms_of_service", 1)];
+        let required = [doc("terms_of_service", 1), doc("privacy_policy", 1)];
+        assert_eq!(
+            documents_not_covered(&required, &recorded),
+            vec!["privacy_policy".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_empty_recorded_set_leaves_everything_outstanding() {
+        // Two live cases land here: a gate switched on after an empty
+        // snapshot was fetched, and a submission that failed, where nothing
+        // is known to have been recorded.
+        let required = [doc("terms_of_service", 2), doc("privacy_policy", 1)];
+        assert_eq!(
+            documents_not_covered(&required, &[]),
+            vec!["terms_of_service".to_string(), "privacy_policy".to_string()]
+        );
+        // And with nothing required, an empty recorded set is complete.
+        assert!(documents_not_covered(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn acceptance_covers_the_requirement_it_meets_or_exceeds() {
+        // The server's rule, mirrored: accepting version N satisfies any
+        // requirement at or below N. A snapshot recorded just before a bump
+        // therefore still covers what it was taken against, and only a
+        // *higher* requirement is outstanding.
+        let recorded = [doc("terms_of_service", 3)];
+        assert!(documents_not_covered(&[doc("terms_of_service", 3)], &recorded).is_empty());
+        assert!(documents_not_covered(&[doc("terms_of_service", 2)], &recorded).is_empty());
+        assert_eq!(
+            documents_not_covered(&[doc("terms_of_service", 4)], &recorded),
+            vec!["terms_of_service".to_string()]
+        );
+    }
+
+    #[test]
+    fn extra_recorded_documents_do_not_make_anything_outstanding() {
+        // A document the server has stopped requiring is not a problem.
+        let recorded = [doc("terms_of_service", 1), doc("retired_notice", 9)];
+        assert!(documents_not_covered(&[doc("terms_of_service", 1)], &recorded).is_empty());
     }
 
     #[test]

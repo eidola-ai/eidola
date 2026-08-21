@@ -1618,6 +1618,54 @@ fn onboarding_probes_record_ctas_and_inputs(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+fn onboarding_consent_slide_links_the_documents_it_will_submit(cx: &mut TestAppContext) {
+    // The consent slide's links are the *server's* current snapshot, not
+    // constants: creation submits exactly those `(document, sha256)` pairs, so
+    // a link that named a different document than the one being agreed to
+    // would be the whole defect. The probe name comes from the document key
+    // (stable), the label carries the version (which moves).
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_terms_for_test(
+            eidola_gui::loadable::Loadable::loaded(vec![eidola_app_core::TermsDocument {
+                document: "privacy_policy".into(),
+                version: 7,
+                url: "https://example.invalid/privacy/".into(),
+                sha256: "b".repeat(64),
+            }]),
+            cx,
+        );
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let link = entries
+        .iter()
+        .find(|(n, _)| n == "onboarding/link/privacy-policy")
+        .unwrap_or_else(|| {
+            let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+            panic!("the required document's link probe is missing; recorded: {names:?}")
+        });
+    assert!(
+        link.1.label.contains("Privacy Policy") && link.1.label.contains("version 7"),
+        "the link must name the exact version acceptance will be recorded for; got {:?}",
+        link.1.label
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Record window — the raw local trail. Listing rows, section tabs, refresh,
 // and the load-more affordance are all probed (indexed row names so a driver

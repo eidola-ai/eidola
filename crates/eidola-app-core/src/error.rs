@@ -124,8 +124,9 @@ pub enum AppError {
     /// The server requires acceptance of the current terms-of-service /
     /// privacy-policy versions before purchases or credential issuance can
     /// proceed (HTTP 428). UIs route to a review-and-accept step:
-    /// `AppCore::current_terms` lists the documents,
-    /// `AppCore::accept_current_terms` records acceptance.
+    /// `AppCore::current_terms` lists the documents and
+    /// `AppCore::accept_terms` records acceptance of that same snapshot —
+    /// the one the user was shown, never a re-read.
     #[error("terms acceptance required: {message}")]
     TermsAcceptanceRequired { message: String },
 

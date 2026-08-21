@@ -1220,7 +1220,8 @@ fn bundled_engine_candidates(exe: &Path) -> Vec<PathBuf> {
 
 /// Resolve the **`local`** (bundled) engine, in order: the config override
 /// (`llama_server_path`, the dev escape hatch + test seam), the
-/// `EIDOLA_LLAMA_SERVER` env var (set by the Linux GUI wrapper), then the
+/// `EIDOLA_LLAMA_SERVER` env var (set by the Linux GUI wrapper to the
+/// copied `$out/bin/llama-server`), then the
 /// exe-relative bundled sidecar. There is **no `$PATH` scan** — the managed
 /// engine is shipped with the app, never borrowed from the system. Pure over
 /// its injected inputs so the ordering is unit-testable.

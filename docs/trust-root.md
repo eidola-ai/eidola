@@ -1,6 +1,6 @@
 # Trust root
 
-This is the spec for spot-checking rigor. For the narrative version of how releases become trustable, see [releases.md](releases.md); for the day-to-day operational procedures (rotating keys, updating Sigstore roots, etc.) see [`releases/README.md`](../releases/README.md).
+This is the spec for spot-checking rigor: what is pinned at compile time, how schema versions work, and how the verifier walks the chain. For the narrative of how a release becomes trustable, see [releases.md](releases.md). For payload / archive / envelope / installable vocabulary and how to hash a download, see [verification.md](verification.md). For day-to-day operational procedures (rotating keys, updating Sigstore roots, etc.) see [`releases/README.md`](../releases/README.md).
 
 The trust root is the set of values compiled into the Eidola client at build time that determines every trust decision it will make at runtime. The client's verifier consults these values when checking a server attestation, when verifying a release, and when accepting or rejecting a self-update.
 
@@ -29,7 +29,7 @@ The `eidola` backend row's overrides (`base_url`, `trusted_measurements`, and th
 
 The enclave block (`snp_measurement`, `tdx_measurement.rtmr1`, `tdx_measurement.rtmr2`, `cmdline`) lives in `releases/trust/server-enclave.json`, separate from `artifact-manifest.json`. The reason is build reproducibility.
 
-`artifact-manifest.json` records the eidola-cli OCI digest and the eidola-cli-macos-universal narHash among other artifacts. If the cli build COPYed (Docker) or filtered-in (Nix) the manifest as a build input, every regeneration of the manifest would also be an input to the build it's describing — a self-reference that produces a different digest on every run instead of converging.
+`artifact-manifest.json` records the eidola-cli OCI digest and the Nix desktop artifacts' `narHash` / `archiveSha256` among other artifacts. If the cli build COPYed (Docker) or filtered-in (Nix) the manifest as a build input, every regeneration of the manifest would also be an input to the build it's describing — a self-reference that produces a different digest on every run instead of converging.
 
 `server-enclave.json` is the minimum slice of the manifest the cli build needs, so it can be COPYed without dragging the cli's own digest into the build context. CI re-asserts the consistency: `scripts/artifact-manifest.sh verify-full` recomputes the enclave block from `tinfoil-config.yml` and rejects the build if either `server-enclave.json` or `artifact-manifest.json`'s `enclave` field disagrees with it.
 
@@ -45,7 +45,7 @@ Each document's shape is owned by the Rust `serde` types shared between the rele
 
 | Document | Shape (source of truth) | Notes |
 | --- | --- | --- |
-| `artifact-manifest.json` | format owned by `scripts/artifact-manifest.sh` | `schema_version: 1`. Records OCI digests, the Nix desktop-build narHashes (macOS universal CLI/GUI, Linux GUI), and a denormalized copy of the enclave block. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). |
+| `artifact-manifest.json` | format owned by `scripts/artifact-manifest.sh` | `schema_version: 2`. Records OCI `digest`s (the archive identity of each image), Nix desktop `narHash` (store-path checkpoint) plus `archiveSha256` (flake-built `.tar.gz` of the payload), and a denormalized copy of the enclave block. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). Apple envelope / installable hashes never appear here — they live in the human attestation. Vocabulary: [verification.md](verification.md). |
 | `releases/trust/server-enclave.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs` | `schema_version: 1`. Holds just the enclave block (snp/tdx measurement + cmdline) so the cli build doesn't drag its own digest into its build context. |
 | `release.json` | `eidola_attestation::ReleaseIndex` — `crates/eidola-attestation/src/trust_shapes.rs` | Unsigned URL-only index; cross-checked via referenced documents (see caveat below) |
 | `attestation.json` | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via `cosign sign-blob` (local PEM, PKCS#11 URI, or any KMS URI cosign supports), logged to Rekor as a `hashedrekord` v0.0.1 entry with a PKIX SubjectPublicKeyInfo (ECDSA-P256/P384 or Ed25519) in `signature.publicKey.content` |
@@ -93,7 +93,7 @@ The protection that *doesn't* hold without a signed `release.json` is **first-in
 
 ## Where each piece lives
 
-Almost everything under `releases/` is a **build input** — pinned data the client and server compile against (the one exception is `trust/attestant-provenance/`, informational auditor-facing evidence that no build or client reads). `artifact-manifest.json` at the repo root is the **build output** — a record of what was actually produced, signed by CI. They live in different places on purpose: files under `releases/` are bulk-copied/filtered into builds as a unit, while `artifact-manifest.json` is deliberately kept out of every build context to prevent self-reference cycles (it records the eidola-cli OCI digest and desktop-build narHashes that the cli build would otherwise see in its own input).
+Almost everything under `releases/` is a **build input** — pinned data the client and server compile against (the one exception is `trust/attestant-provenance/`, informational auditor-facing evidence that no build or client reads). `artifact-manifest.json` at the repo root is the **build output** — a record of what was actually produced, signed by CI. They live in different places on purpose: files under `releases/` are bulk-copied/filtered into builds as a unit, while `artifact-manifest.json` is deliberately kept out of every build context to prevent self-reference cycles (it records the eidola-cli OCI digest and desktop `narHash` / `archiveSha256` that the cli build would otherwise see in its own input).
 
 ```text
 releases/

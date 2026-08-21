@@ -1,4 +1,5 @@
-//! Consolidated utility functions: calendar and epoch computation.
+//! Consolidated utility functions: calendar computation, epoch timing, and
+//! configuration parsing.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -131,12 +132,90 @@ impl EpochConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Configuration parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a background task's refresh period, in whole seconds, from a raw
+/// environment value; `default_secs` answers for unset or empty.
+///
+/// **Zero is refused, not accepted.** Every period parsed here drives a
+/// periodic loop, and zero breaks each of them in a way that only shows up
+/// long after startup: `tokio::time::interval` panics outright on a zero
+/// period (taking a detached refresh task with it), and a `sleep`-based loop
+/// turns into an unbounded retry storm against whatever it polls. Both leave
+/// the process alive and apparently healthy, so the value is rejected while
+/// the operator is still watching — at configuration time — rather than
+/// inside the task it would break.
+pub fn parse_refresh_secs(
+    var: &str,
+    raw: Option<&str>,
+    default_secs: u64,
+) -> Result<Duration, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Duration::from_secs(default_secs));
+    };
+    match raw.parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        _ => Err(format!(
+            "{var} must be a positive integer number of seconds"
+        )),
+    }
+}
+
+/// [`parse_refresh_secs`] over the process environment.
+pub fn refresh_secs_from_env(var: &str, default_secs: u64) -> Result<Duration, String> {
+    parse_refresh_secs(var, std::env::var(var).ok().as_deref(), default_secs)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_refresh_secs_defaults_when_unset_or_empty() {
+        assert_eq!(
+            parse_refresh_secs("X", None, 600).expect("unset falls back"),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            parse_refresh_secs("X", Some(""), 600).expect("empty falls back"),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            parse_refresh_secs("X", Some("  "), 600).expect("blank falls back"),
+            Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn parse_refresh_secs_rejects_zero_and_nonsense() {
+        // Zero is the one that reaches a running server: it parses as an
+        // integer, so every hand-rolled `parse::<u64>()` accepted it, and
+        // the damage (a panicked refresh task, or a busy poll loop) only
+        // appears once the task it configures starts ticking.
+        for raw in ["0", "-1", "abc", "1.5", "600s"] {
+            assert!(
+                parse_refresh_secs("REFRESH_SECS", Some(raw), 600).is_err(),
+                "{raw:?} should be refused"
+            );
+        }
+        assert_eq!(
+            parse_refresh_secs("REFRESH_SECS", Some("0"), 600).expect_err("zero is refused"),
+            "REFRESH_SECS must be a positive integer number of seconds"
+        );
+    }
+
+    #[test]
+    fn parse_refresh_secs_accepts_a_positive_period() {
+        assert_eq!(
+            parse_refresh_secs("X", Some("30"), 600).expect("positive parses"),
+            Duration::from_secs(30)
+        );
+    }
 
     #[test]
     fn unix_to_iso_handles_epoch_and_pre_epoch() {

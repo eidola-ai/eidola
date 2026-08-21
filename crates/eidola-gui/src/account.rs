@@ -563,6 +563,15 @@ impl Render for AccountView {
                 )))
                 .child(
                     h_flex().child(
+                        // This opens the Get Started flow rather than creating
+                        // an account here. Creating one records acceptance of
+                        // the current terms of service and privacy policy, and
+                        // that acceptance may only ever be submitted for
+                        // documents the user was actually shown — which is a
+                        // consent screen, not a button. Get Started is where
+                        // that screen lives; keeping it the only door means
+                        // there is no second path that could skip it.
+                        //
                         // Probed wrapper for the a11y role/label — shrink-wraps
                         // the button so its bounds are an honest click target.
                         div()
@@ -570,24 +579,24 @@ impl Render for AccountView {
                             .probe(
                                 "settings/account/create",
                                 gpui::Role::Button,
-                                "Create account",
+                                "Set up an account…",
                             )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.account.update(cx, |s, cx| s.create_account(cx));
-                            }))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::actions::GetStarted), cx);
+                            })
                             .child(
                                 Button::new("create-account")
                                     .role(None)
                                     .primary()
                                     .small()
-                                    .label("Create account")
+                                    .label("Set up an account…")
                                     .tab_stop(false),
                             ),
                     ),
                 );
         }
 
-        // Account create/reset failure — rendered right under the Account
+        // Account-lifecycle failure — rendered right under the Account
         // controls so a failed button click is never silent.
         if let Some(err) = account_op_error.as_deref() {
             col = col.child(

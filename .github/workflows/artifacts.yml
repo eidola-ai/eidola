@@ -413,7 +413,8 @@ jobs:
   # The GUI's Linux release artifact is Nix-built (glibc dynamic binary; see
   # flake.nix's eidola-gui-linux for why it can't be a static musl OCI
   # artifact like the server/cli). Mirrors the apple job: install the
-  # stamped trust root from the oci job, then record the narHash partial.
+  # stamped trust root from the oci job, then record the narHash +
+  # archiveSha256 partial.
   linux-gui:
     name: Linux GUI build
     needs: oci
