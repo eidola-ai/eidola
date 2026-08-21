@@ -456,6 +456,91 @@ mod tests {
     }
 
     #[test]
+    fn folding_is_lowercasing_and_not_unicode_case_folding() {
+        // The honest, uniform limitation: this folds *case*, by lower-casing.
+        // Unicode case folding is a different table, and every equivalence it
+        // adds is missing here — an expansion (`ß`/`ss`), a compatibility
+        // letter (`ſ`/`s`), a duplicated symbol (`µ`/`μ`), a ligature
+        // (`ﬁ`/`fi`). Each is a *missing equivalence*, never a wrong offset:
+        // the map is the same either way. Closing them is the deferred fold,
+        // which lands beside diacritic stripping and NFKC.
+        for (query, haystack) in [
+            ("strasse", "Straße"),
+            ("sun", "ſun"),
+            ("µm", "μm"),
+            ("finish", "ﬁnish"),
+        ] {
+            assert!(
+                Query::new(query)
+                    .expect("non-empty")
+                    .find_in(haystack)
+                    .is_empty(),
+                "{query} in {haystack} is a case-folding equivalence, not a \
+                 lower-casing one",
+            );
+        }
+    }
+
+    #[test]
+    fn the_per_character_walk_agrees_with_rusts_own_lowercasing() {
+        // Why the walk is per character at all: the map is built from the same
+        // pass. That is only safe if the result is the string `str::to_lowercase`
+        // would have produced — so check it against every scalar in Unicode,
+        // and against the one rule that makes whole-string lower-casing
+        // context-dependent.
+        let mut divergent = Vec::new();
+        for scalar in (0..=0x10FFFF).filter_map(char::from_u32) {
+            let one = scalar.to_string();
+            let folded = fold_case(&one);
+            // `fold_case` of a lower-cased string must equal `fold_case` of the
+            // original: folding is what makes the two spellings one.
+            if folded.text() != fold_case(&one.to_lowercase()).text() {
+                divergent.push(scalar);
+            }
+        }
+        assert!(
+            divergent.is_empty(),
+            "these scalars fold differently from their lower-cased form: {divergent:?}",
+        );
+
+        // The contextual rule: `str::to_lowercase` writes a *final* sigma as
+        // `ς` and a medial one as `σ`, which a per-character walk cannot see.
+        // Folding the two sigmas together is what keeps the walk equivalent to
+        // it — the whole reason that one rewrite exists, and the only place
+        // non-locale-specific lower-casing depends on context at all.
+        let word = "ΟΔΟΣ";
+        assert_eq!(word.to_lowercase(), "οδος");
+        assert_eq!(
+            fold_case(word).text(),
+            fold_case(&word.to_lowercase()).text(),
+            "the fold is invariant under Rust's own lower-casing",
+        );
+    }
+
+    #[test]
+    fn an_expanding_fold_maps_back_through_the_existing_machinery() {
+        // What the deferred fold needs from this module: one source character
+        // standing for several folded ones. `substitute` already carries that
+        // — the run records both lengths — so adding the table is a table
+        // swap, not a redesign. Modelled here with the `ß` → `ss` expansion.
+        let source = "Die Straße hier";
+        let mut builder = ProjectionBuilder::new(source);
+        let sharp_s = source.find('ß').expect("fixture");
+        builder.copy(0..sharp_s);
+        builder.substitute(sharp_s..sharp_s + 'ß'.len_utf8(), "ss");
+        builder.copy(sharp_s + 'ß'.len_utf8()..source.len());
+        let projection = builder.finish();
+        assert_eq!(projection.text(), "Die Strasse hier");
+
+        let hit = Query::new("strasse")
+            .expect("non-empty")
+            .find_in(projection.text())
+            .remove(0);
+        let mapped = projection.source_range(hit).expect("a hit maps back");
+        assert_eq!(&source[mapped], "Straße");
+    }
+
+    #[test]
     fn smart_case_is_insensitive_until_the_query_shifts() {
         let hay = "Turbulence and turbulence and TURBULENCE";
 
