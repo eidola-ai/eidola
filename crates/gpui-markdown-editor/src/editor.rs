@@ -23,7 +23,6 @@ use gpui::{
     FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Point, RenderOnce, Subscription, UTF16Selection, Window, actions, div, prelude::*, px,
 };
-use gpui_component::Theme;
 
 use crate::element::{BlockElement, LaidOutBlock};
 use crate::event::{EditorEvent, MarkdownEditorEvent};
@@ -2327,26 +2326,16 @@ impl RenderOnce for MarkdownEditor {
             st.last_bounds = None;
         });
 
-        // Final style = caller overrides (or the theme default) with the
-        // theme-derived color fields refreshed each frame, so a Circadian
-        // light/dark flip recolors live even if the caller built its style
-        // once. This is the old entity-render refresh, moved to the element.
+        // Final style = caller overrides (or the theme default) with every
+        // theme-derived color the caller did *not* override re-derived each
+        // frame, so a Circadian light/dark flip recolors live even if the
+        // caller built its style once. One registry drives both halves — see
+        // `style::theme_colors!`.
         let mut style = self
             .style
             .clone()
             .unwrap_or_else(|| MarkdownStyle::from_theme(cx));
-        let theme = Theme::global(cx);
-        style.text_color = theme.foreground;
-        style.delimiter_color = theme.muted_foreground;
-        style.background = theme.background;
-        style.caret_color = theme.caret;
-        style.selection_color = theme.selection;
-        style.link_color = theme.link;
-        style.blockquote_border_color = theme.border;
-        style.thematic_break_color = theme.border;
-        style.inline_code_background = theme.accent;
-        style.code_block_background = theme.muted;
-        style.code_block_content_background = crate::style::shift_lightness(theme.muted, -0.04);
+        style.refresh_theme_colors(cx);
 
         let spec = self.state.read(cx).render_spec();
         let state = self.state.clone();

@@ -23,7 +23,7 @@ use gpui_markdown_editor::editor::{
 };
 use gpui_markdown_editor::{
     BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, MarkdownEditorEvent,
-    MarkdownEditorState, RenderSpec, Selection,
+    MarkdownEditorState, MarkdownStyle, RenderSpec, Selection,
 };
 
 /// Minimal host view for the editor under test: holds the state entity and
@@ -10112,4 +10112,49 @@ fn content_y_for_offset_at_a_shared_line_boundary_takes_the_later_line(cx: &mut 
     // on. No caret can actually land on a *cross-line* shared boundary today
     // (`End` stops at the end of the row's text, before the byte the next line
     // claims), which is why the gate costs nothing and stays as the guarantee.
+}
+
+#[gpui::test]
+fn theme_colors_follow_a_live_mode_flip_and_an_override_survives_it(cx: &mut TestAppContext) {
+    // A host may build a style once and keep it; the element re-derives every
+    // theme color each frame so a Day/Night flip recolors live. A color the
+    // host set explicitly is its own decision and must not be re-derived.
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+
+        let mine = gpui::hsla(0.5, 0.5, 0.5, 0.5);
+        let mut style = MarkdownStyle::from_theme(cx).highlight_color(mine);
+        let day = (
+            style.text_color,
+            style.highlight_overlay_color,
+            style.highlight_accent_color,
+        );
+
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        style.refresh_theme_colors(cx);
+
+        assert_ne!(style.text_color, day.0, "ordinary theme colors follow");
+        assert_ne!(
+            style.highlight_overlay_color, day.1,
+            "the overlay wash follows the mode like every other theme color",
+        );
+        assert_ne!(
+            style.highlight_accent_color, day.2,
+            "the accent wash follows the mode like every other theme color",
+        );
+        assert_eq!(
+            style.highlight_color, mine,
+            "a color the host set is never re-derived",
+        );
+
+        // And a fresh style built under the same mode agrees with the
+        // refreshed one — one registry, so there is no second derivation to
+        // drift from.
+        let fresh = MarkdownStyle::from_theme(cx);
+        assert_eq!(style.text_color, fresh.text_color);
+        assert_eq!(style.highlight_overlay_color, fresh.highlight_overlay_color);
+        assert_eq!(style.highlight_accent_color, fresh.highlight_accent_color);
+        assert_eq!(style.table_rule_color, fresh.table_rule_color);
+    });
 }
