@@ -245,6 +245,14 @@ jobs:
 
       - name: Test Apple archive verifier (tar + zip, read-only directories)
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true'
+        # The harness runs its body under the host userland and again under GNU
+        # tar + mawk, because bsdtar and BSD awk on a developer's Mac hide
+        # differences that bite on the GNU/Linux userland most people verifying
+        # a download run. This runner is that userland, so the second pass needs
+        # no Nix here — but it may only ever be skipped on a developer machine,
+        # never in CI, which is what this variable enforces.
+        env:
+          EIDOLA_TEST_REQUIRE_GNU_USERLAND: "1"
         run: ./scripts/test-verify-apple.sh
 
       - name: Check OpenAPI spec freshness
