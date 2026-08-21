@@ -1273,7 +1273,7 @@ fn a_load_in_flight_when_its_backend_is_retired_registers_nothing() {
         core.test_set_engine_ready_timeout(std::time::Duration::from_millis(1500));
         // Widen the window the retirement has to race; the race itself is
         // real, this only makes it reachable on purpose.
-        core.test_pause_before_engine_reserve(std::time::Duration::from_millis(800));
+        core.test_pause_at_load_checkpoints(std::time::Duration::from_millis(800));
 
         let handle = core.runtime().spawn({
             let core = core.clone();
@@ -1306,5 +1306,83 @@ fn a_load_in_flight_when_its_backend_is_retired_registers_nothing() {
             .expect("join");
         let err = outcome.expect_err("the load must be refused, not silently registered");
         assert!(err.to_string().contains("changed while"), "got {err}");
+    });
+}
+
+/// A retired backend may not **start** a process.
+///
+/// The epoch closes the window before a load reserves; this is the window
+/// after it. A retirement that lands there removes the entry and signals the
+/// supervisor, but the supervisor had already been handed its command — so it
+/// spawned the child first and only noticed the signal on the next poll,
+/// which is a `llama-server` executed from a configuration that no longer
+/// exists. Killing it a moment later is not the same as never starting it: a
+/// model is mmapped and gigabytes are touched on the way up, and on a
+/// repointed backend the binary itself may be one the user just replaced.
+///
+/// The witness is a spawn count, because a child killed microseconds after
+/// `fork` leaves nothing outside the parent to observe — not even a file it
+/// had time to touch (measured: the kill wins that race nearly every time,
+/// which bounds the harm but does not remove it).
+#[test]
+fn a_retired_backend_never_starts_a_process() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let core = std::sync::Arc::new(core);
+        let models_dir = dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
+        core.set_llama_server_path(Some(write_sleeping_engine(dir.path())))
+            .unwrap();
+        core.test_set_engine_ready_timeout(std::time::Duration::from_millis(1500));
+        // Widen both hand-off points so the retirement can be aimed at the
+        // second one; the race is real, this only makes it reachable.
+        core.test_pause_at_load_checkpoints(std::time::Duration::from_millis(600));
+
+        let handle = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.load_local_model("sleeper@local".into()).await }
+        });
+
+        // Wait for the reservation itself to appear: past the epoch check,
+        // before the spawn. That is the window under test, and waiting for
+        // the entry is what puts the retirement inside it rather than before.
+        let mut reserved = false;
+        for _ in 0..100 {
+            if !core.running_engines().is_empty() {
+                reserved = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(reserved, "the load must reach its reservation");
+        assert_eq!(
+            core.test_engine_spawn_count(),
+            0,
+            "precondition: the reservation exists but no process has started"
+        );
+
+        core.runtime()
+            .block_on(core.set_backend_enabled("local".into(), false))
+            .expect("disable");
+
+        let outcome = core
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
+            })
+            .expect("the load must settle")
+            .expect("join");
+        let err = outcome.expect_err("a retired load cannot succeed");
+        assert!(
+            err.to_string().contains("before the engine started"),
+            "got {err}"
+        );
+        assert_eq!(
+            core.test_engine_spawn_count(),
+            0,
+            "a retired backend must never start a `llama-server`"
+        );
+        assert!(core.running_engines().is_empty());
     });
 }

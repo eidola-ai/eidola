@@ -9606,13 +9606,22 @@ impl AppCore {
         self.inner.local.set_memory_budget_for_test(budget);
     }
 
-    /// Test-only seam: pause every engine load between reading its backend's
-    /// configuration and reserving the engine, so a test can drive the race a
-    /// retirement has with an in-flight load.
+    /// Test-only seam: how many `llama-server` processes this core has
+    /// started — the witness for "nothing was executed", which a child killed
+    /// microseconds after `fork` cannot provide from outside.
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
-    pub fn test_pause_before_engine_reserve(&self, pause: std::time::Duration) {
-        self.inner.local.set_reserve_pause_for_test(pause);
+    pub fn test_engine_spawn_count(&self) -> u64 {
+        self.inner.local.engine_spawn_count()
+    }
+
+    /// Test-only seam: pause every engine load at each of its hand-off points
+    /// — before it reserves, and before its supervisor starts the child — so a
+    /// test can drive the races a retirement has with an in-flight load.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_pause_at_load_checkpoints(&self, pause: std::time::Duration) {
+        self.inner.local.set_load_pause_for_test(pause);
     }
 
     /// Test-only seam: shorten the engine readiness budget (five minutes in

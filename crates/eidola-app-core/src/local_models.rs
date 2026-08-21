@@ -448,10 +448,19 @@ pub(crate) struct LocalRuntime {
     /// `engines` lock guards a bare `HashMap` rather than a state struct
     /// (the same reason [`Self::shutting_down`] is an atomic).
     backend_epochs: StdMutex<HashMap<String, u64>>,
-    /// Test-only pause inside `load_local_model`, between reading the backend
-    /// row and reserving ([`Self::pause_before_reserve`]).
+    /// Test-only pause at each of a load's hand-off points
+    /// ([`Self::pause_at_load_checkpoint`]).
     #[cfg(feature = "test-support")]
-    reserve_pause: StdMutex<Option<std::time::Duration>>,
+    load_pause: StdMutex<Option<std::time::Duration>>,
+    /// Test-only count of `llama-server` processes actually started.
+    ///
+    /// The witness a test needs for "nothing was executed": a child that is
+    /// killed microseconds after `fork` leaves no trace of its own — no
+    /// output, no file it had time to touch — so *whether a process was
+    /// started* cannot be observed from outside the parent. It is counted
+    /// where it happens instead.
+    #[cfg(feature = "test-support")]
+    engine_spawns: AtomicU64,
     /// Test override for the engine readiness budget
     /// ([`ENGINE_READY_TIMEOUT`]), so a test can watch the deadline fire
     /// without waiting out the real one.
@@ -688,28 +697,58 @@ impl LocalRuntime {
         keys.iter().filter_map(|k| engines.remove(k)).collect()
     }
 
-    /// Run `f` — the engine spawn — only if no quit-time shutdown has begun,
-    /// **atomically with respect to the drain**.
+    /// Run `f` — the one place in this crate that starts a process — only
+    /// while the load that asked for it still holds its registration.
     ///
-    /// The latch on [`Self::reserve_engine`] closes the window between a load's
-    /// last `await` and its reservation; this closes the one *after* it. A
-    /// reservation accepted a moment before the latch flipped hands its
-    /// supervisor to `tokio::spawn`, and that task's first poll can land after
-    /// the drain has already walked an empty-of-it registry — at which point an
-    /// unconditional `command.spawn()` starts a subprocess into a process about
-    /// to `exit()`. Same class, same cure: the authority is read at the write
-    /// point, under the same lock the drain takes, so no interleaving can put a
-    /// spawn after the latch.
+    /// **The registration is the licence to run a subprocess**, and this is
+    /// the single check that enforces it. A load reserves, then hands its
+    /// supervisor to `tokio::spawn`, and that task's first poll can land an
+    /// arbitrary time later — after a quit drained the registry, after an
+    /// unload or an eviction took the entry, after the backend was removed,
+    /// disabled or repointed. Every one of those removes the entry under the
+    /// `engines` lock, so asking *under the same lock* whether this instance
+    /// still holds its key answers all of them at once, and answers any future
+    /// path that ends an engine's life without anyone remembering to add a
+    /// check here.
+    ///
+    /// It subsumes the quit latch it replaced: the drain empties the map and
+    /// sets the latch in one critical section, and [`Self::reserve_engine`]
+    /// refuses to reserve afterwards — so an entry that is still present at
+    /// this moment is proof that no drain has run since it was made. The latch
+    /// is read below only to *word* the refusal, never as the authority.
     ///
     /// Holding the `engines` lock across the spawn is safe and deliberate:
-    /// `Command::spawn` is synchronous (no `await` under the guard) and touches
-    /// nothing in this map.
-    fn spawn_unless_shutting_down<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
-        let _engines = self.engines.lock().expect("engines lock");
-        if self.shutting_down.load(Ordering::SeqCst) {
-            return None;
+    /// `Command::spawn` is synchronous (no `await` under the guard) and
+    /// touches nothing in this map. Killing a child a moment after starting it
+    /// is not the same as never starting it — a model is mmapped and
+    /// gigabytes are touched on the way up, and on a repointed backend the
+    /// binary may be one the user has just replaced.
+    fn spawn_if_still_registered<T>(
+        &self,
+        key: &EngineKey,
+        instance: EngineInstance,
+        f: impl FnOnce() -> T,
+    ) -> Result<T, &'static str> {
+        let engines = self.engines.lock().expect("engines lock");
+        match engines.get(key) {
+            Some(e) if e.instance == instance => {
+                #[cfg(feature = "test-support")]
+                self.engine_spawns.fetch_add(1, Ordering::SeqCst);
+                Ok(f())
+            }
+            _ => Err(if self.shutting_down.load(Ordering::SeqCst) {
+                "Eidola is shutting down"
+            } else {
+                "the load was cancelled before the engine started"
+            }),
         }
-        Some(f())
+    }
+
+    /// Test seam: how many `llama-server` processes have been started.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub(crate) fn engine_spawn_count(&self) -> u64 {
+        self.engine_spawns.load(Ordering::SeqCst)
     }
 
     /// The total memory the engine pool may occupy: a fixed fraction of
@@ -747,23 +786,29 @@ impl LocalRuntime {
         .unwrap_or(ENGINE_READY_TIMEOUT)
     }
 
-    /// Pause between reading a backend's configuration and reserving the
-    /// engine, when a test has asked for one — the window a retirement races
-    /// ([`BackendEpoch`]), widened so it can be hit on purpose instead of by
-    /// luck. Compiled only into test builds; production has no such call.
+    /// Pause at a load's hand-off points, when a test has asked for one.
+    ///
+    /// A load hands over twice, and a retirement (or an unload, or the quit
+    /// drain) can land in either gap: between reading the backend's
+    /// configuration and reserving ([`BackendEpoch`]), and between reserving
+    /// and its supervisor starting the child
+    /// ([`Self::spawn_if_still_registered`]). Both windows are real and
+    /// microseconds wide; this widens them so a test can hit one on purpose
+    /// rather than by luck. Compiled only into test builds — production has
+    /// no such call.
     #[cfg(feature = "test-support")]
-    pub(crate) async fn pause_before_reserve(&self) {
-        let pause = *self.reserve_pause.lock().expect("reserve pause lock");
+    pub(crate) async fn pause_at_load_checkpoint(&self) {
+        let pause = *self.load_pause.lock().expect("load pause lock");
         if let Some(pause) = pause {
             tokio::time::sleep(pause).await;
         }
     }
 
-    /// Test seam: see [`Self::pause_before_reserve`].
+    /// Test seam: see [`Self::pause_at_load_checkpoint`].
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
-    pub(crate) fn set_reserve_pause_for_test(&self, pause: std::time::Duration) {
-        *self.reserve_pause.lock().expect("reserve pause lock") = Some(pause);
+    pub(crate) fn set_load_pause_for_test(&self, pause: std::time::Duration) {
+        *self.load_pause.lock().expect("load pause lock") = Some(pause);
     }
 
     /// Test seam: shorten the engine readiness budget so a test can observe
@@ -1885,7 +1930,7 @@ impl Inner {
         // above and the reservation below, so the race the epoch closes can be
         // driven deliberately. Compiled out of production builds.
         #[cfg(feature = "test-support")]
-        self.local.pause_before_reserve().await;
+        self.local.pause_at_load_checkpoint().await;
 
         // Make room: plan LRU evictions and insert this load's warming
         // entry in one critical section ([`LocalRuntime::reserve_engine`]),
@@ -2364,13 +2409,25 @@ async fn supervise_engine(
         }
     };
 
-    // A quit may have landed between our reservation and this task's first
-    // poll; starting a subprocess now would orphan it to the imminent
-    // `exit()`. Checked under the drain's own lock — see
-    // `LocalRuntime::spawn_unless_shutting_down`.
-    let Some(spawned) = local.spawn_unless_shutting_down(|| command.spawn()) else {
-        let _ = ready_tx.send(Err("Eidola is shutting down".into()));
-        return;
+    // Test seam only: widen the window between the reservation and this
+    // spawn, the second place a load hands over. Compiled out of production
+    // builds.
+    #[cfg(feature = "test-support")]
+    local.pause_at_load_checkpoint().await;
+
+    // Anything at all may have landed between our reservation and this task's
+    // first poll — a quit, an unload, an eviction, a backend removed or
+    // disabled or repointed — and each of them took our entry out of the
+    // registry. The registration is what licenses a subprocess, so it is
+    // re-read here, under the lock every one of those paths takes, at the one
+    // place a process is actually started. Nothing is mutated on refusal: the
+    // entry is already gone, and whatever holds the key now is not ours.
+    let spawned = match local.spawn_if_still_registered(&key, instance, || command.spawn()) {
+        Ok(spawned) => spawned,
+        Err(message) => {
+            let _ = ready_tx.send(Err(message.into()));
+            return;
+        }
     };
     let mut child = match spawned {
         Ok(c) => c,
@@ -2802,25 +2859,72 @@ mod tests {
         );
     }
 
+    /// **A registration is the licence to run a subprocess**, and it is
+    /// checked once, where the process is actually started.
+    ///
+    /// The reservation and the spawn are separated by a `tokio::spawn` and an
+    /// unbounded scheduling delay, and everything that can end an engine's
+    /// life in that gap — the quit drain, an unload, an eviction, a backend
+    /// removed / disabled / repointed — does so by taking the entry out of
+    /// this map under this lock. So one question asked here answers all of
+    /// them, including whichever path is added next.
     #[test]
-    fn the_shutdown_latch_also_refuses_a_spawn_that_was_already_reserved() {
-        // The latch on `reserve_engine` closes the window before a
-        // reservation; this closes the one after it. A supervisor whose
-        // reservation was accepted a moment before the quit lands can have
-        // its first poll scheduled *after* the drain walked the registry —
-        // and an unconditional `command.spawn()` there starts a subprocess
-        // into a process about to `exit()`.
+    fn only_a_live_registration_may_start_a_process() {
         let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+        let key = ("my-box".to_string(), "tiny".to_string());
+
+        let reserve = |port| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let (instance, _) = runtime
+                .reserve_engine(&key, port, GIB, tx, runtime.backend_epoch("my-box"))
+                .unwrap()
+                .expect("reserved");
+            (instance, rx)
+        };
+
+        // The ordinary case: the load still holds its entry.
+        let (instance, _rx) = reserve(7001);
         assert_eq!(
-            runtime.spawn_unless_shutting_down(|| "spawned"),
-            Some("spawned"),
-            "an ordinary load spawns"
+            runtime.spawn_if_still_registered(&key, instance, || "spawned"),
+            Ok("spawned"),
+            "an ordinary load starts its engine"
         );
 
-        runtime.shutting_down.store(true, Ordering::SeqCst);
+        // Retired between reserving and spawning — the backend's row was
+        // removed, disabled, or repointed while this supervisor was queued.
+        runtime.take_backend_engines("my-box");
         assert_eq!(
-            runtime.spawn_unless_shutting_down(|| "spawned"),
-            None,
+            runtime.spawn_if_still_registered(&key, instance, || "spawned"),
+            Err("the load was cancelled before the engine started"),
+            "a retired configuration may not start a process"
+        );
+
+        // Unloaded and immediately reloaded: the key is occupied again, but
+        // not by us. The replacement's child is its own to start.
+        let (replacement, _rx2) = reserve(7002);
+        assert_eq!(
+            runtime.spawn_if_still_registered(&key, instance, || "spawned"),
+            Err("the load was cancelled before the engine started"),
+            "a stale supervisor may not start a child against a live entry"
+        );
+        assert_eq!(
+            runtime.spawn_if_still_registered(&key, replacement, || "spawned"),
+            Ok("spawned")
+        );
+
+        // And the quit drain needs no separate check: it empties the map (and
+        // `reserve_engine` refuses to refill it), so a present entry is itself
+        // proof that no drain has run since the reservation was made.
+        let entries: Vec<EngineEntry> = {
+            let mut engines = runtime.engines.lock().expect("engines lock");
+            runtime.shutting_down.store(true, Ordering::SeqCst);
+            engines.drain().map(|(_, e)| e).collect()
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            runtime.spawn_if_still_registered(&key, replacement, || "spawned"),
+            Err("Eidola is shutting down"),
             "once the drain has run, nothing may start a child"
         );
     }
