@@ -787,6 +787,16 @@ pub struct ChatResult {
     /// bow out, and **no post was written** — `content` is empty and
     /// `response_action_id` is `None`. `None` on every ordinary turn.
     pub declined: Option<DeclineOutcome>,
+    /// The upstream reported `finish_reason: "length"` — the answer stops
+    /// where the completion ceiling bound it, not where the model was done.
+    ///
+    /// The turn is otherwise ordinary: the partial answer is real text a reader
+    /// wants, so it is kept and persisted like any other. What must not happen
+    /// is calling it finished, which is why this rides the result rather than
+    /// being inferred by a surface counting tokens. A turn cut off *before any
+    /// answer text* never reaches here at all — that is
+    /// [`AppError::ResponseTruncated`], and it writes no generation.
+    pub truncated: bool,
 }
 
 /// A turn that ended at the agent-side decline checkpoint (see [`decline`]).
@@ -1663,6 +1673,17 @@ struct Inner {
     /// so these are exactly the rooms the sweep's licence is false about — see
     /// `Inner::note_room_spawned_here`.
     rooms_spawned_here: Mutex<Option<std::collections::HashSet<String>>>,
+    /// The **items** a regeneration is currently running against, process-wide
+    /// — the guard that keeps one post from being revised twice at once (see
+    /// [`RegenerationGuard`]).
+    ///
+    /// Process-wide rather than per-caller because a regeneration outlives the
+    /// surface that asked for it: the core-side future runs to completion even
+    /// if its consumer drops the receiving end, so a window closed and reopened
+    /// mid-regeneration meets a fresh view with no memory of the one still in
+    /// flight. `Arc` so the guard can release the key from its `Drop` without
+    /// borrowing `Inner`.
+    regenerating_items: Arc<Mutex<std::collections::HashSet<String>>>,
     /// How many delegated rooms may be walked at once, process-wide — see
     /// `subspace_driver::MAX_CONCURRENT_WALKS`.
     walk_permits: Arc<tokio::sync::Semaphore>,
@@ -6440,6 +6461,7 @@ impl Inner {
             // No post was written: the decision travels in `declined` so no
             // caller can mistake it for one and cascade off it.
             response_action_id: None,
+            truncated: false,
             declined: Some(DeclineOutcome {
                 reason,
                 action_id: decision_id,
@@ -6750,6 +6772,46 @@ impl Inner {
     ///
     /// Emissions stay here, at the transport's exit points — extracting the
     /// round from `run_turn` moved the code, not the contract.
+    /// End a round that reached the completion ceiling **before writing any
+    /// answer** — shared by both transports so they cannot disagree about what
+    /// a truncation costs.
+    ///
+    /// Nothing is persisted as an action. That is the point: an `inference`
+    /// written here would be a current generation with no readable content —
+    /// a reply could attach beneath it, a regeneration would have replaced a
+    /// real answer with it, and every surface would call it complete. The raw
+    /// exchange still lands in the Record attached to no action (the same shape
+    /// a structurally unusable tool call takes), so the forensic trail keeps
+    /// the reasoning the model did produce and the `finish_reason` that
+    /// explains it.
+    ///
+    /// The credential is already settled by the caller — the tokens were spent
+    /// whether or not they became an answer — so the emissions here are the
+    /// unattached-request pair, and the error carries the ceiling it hit.
+    #[allow(clippy::too_many_arguments)]
+    async fn end_round_truncated(
+        &self,
+        prep: &TurnPrep,
+        output_tokens: Option<i64>,
+        request_body_json: &serde_json::Value,
+        request_at: i64,
+        response_at: i64,
+        http_status: u16,
+        response_body: Vec<u8>,
+    ) -> Result<RoundOutcome, AppError> {
+        prep.insert_unattached_request(
+            request_body_json,
+            request_at,
+            response_at,
+            http_status,
+            response_body,
+        )
+        .await?;
+        self.bus.emit(Change::Space(prep.space_id.clone()));
+        self.bus.emit(Change::Record);
+        Err(AppError::ResponseTruncated { output_tokens })
+    }
+
     async fn run_turn_round(
         &self,
         prep: &mut TurnPrep,
@@ -6869,6 +6931,10 @@ impl Inner {
             .and_then(|c| c.as_array())
             .and_then(|arr| arr.first())
             .and_then(|c| c.get("message"));
+
+        // Why the turn ended, as the upstream reported it — the one signal that
+        // separates "the model finished" from "the ceiling bound it".
+        let finish_reason = choice_finish_reason(&body).map(str::to_string);
 
         // Strip-on-receipt: a model that mimicked the per-message header
         // scaffolding gets that line removed before it is persisted or
@@ -7002,6 +7068,22 @@ impl Inner {
             }
         }
 
+        if status.is_success()
+            && truncated_before_any_answer(finish_reason.as_deref(), &response_content)
+        {
+            return self
+                .end_round_truncated(
+                    prep,
+                    output_tokens,
+                    &request_body_json,
+                    request_at,
+                    response_at,
+                    status.as_u16(),
+                    response_text.as_bytes().to_vec(),
+                )
+                .await;
+        }
+
         #[cfg(feature = "test-support")]
         if prep.mechanical {
             self.pause_in_report_persist_window().await;
@@ -7038,6 +7120,7 @@ impl Inner {
                 credits_charged: prep.total_credits as i64,
                 response_action_id: None,
                 declined: None,
+                truncated: stopped_at_ceiling(finish_reason.as_deref()),
             }));
         }
 
@@ -7080,6 +7163,7 @@ impl Inner {
             credits_charged: prep.total_credits as i64,
             response_action_id,
             declined: None,
+            truncated: stopped_at_ceiling(finish_reason.as_deref()),
         }))
     }
 
@@ -7142,11 +7226,20 @@ impl Inner {
         .await
     }
 
-    /// Regenerate an inference: append a new generation of its item (agent
-    /// revise). `action_id` is any generation of the target item. Uses the
-    /// model-picker compat path (`TurnSelector::Model`), so the same agent
-    /// participant (matched by model) authors the new generation.
-    async fn regenerate(&self, action_id: &str, model: &str) -> Result<ChatResult, AppError> {
+    /// The shared front half of a regeneration, whichever transport runs it:
+    /// resolve the target item and its current tip, apply the two gates
+    /// (**the human's verb, on an agent's inferred answer**), and claim the
+    /// item so a second regeneration of the same post cannot start.
+    ///
+    /// It exists so the blocking and streaming doors cannot drift: the target
+    /// resolution, the gates and the `Revise` context rule are the regeneration
+    /// contract, and a transport is only a choice of how the bytes arrive.
+    /// Returns the space, the tip to revise, and the claim — which the caller
+    /// must hold for the whole turn.
+    async fn begin_regeneration(
+        &self,
+        action_id: &str,
+    ) -> Result<(String, String, RegenerationGuard), AppError> {
         let db_conn = self.db_conn().await?;
         let (item_id, space_id) = db::action_item_and_space(&db_conn, action_id)
             .await?
@@ -7182,6 +7275,20 @@ impl Inner {
         )
         .await?;
         drop(db_conn);
+
+        // Claimed last, after every refusal that costs nothing: the claim is
+        // about **spending twice**, so it covers exactly the stretch from here
+        // to the turn's end.
+        let guard = RegenerationGuard::claim(&self.regenerating_items, &item_id)?;
+        Ok((space_id, tip, guard))
+    }
+
+    /// Regenerate an inference: append a new generation of its item (agent
+    /// revise). `action_id` is any generation of the target item. Uses the
+    /// model-picker compat path (`TurnSelector::Model`), so the same agent
+    /// participant (matched by model) authors the new generation.
+    async fn regenerate(&self, action_id: &str, model: &str) -> Result<ChatResult, AppError> {
+        let (space_id, tip, _guard) = self.begin_regeneration(action_id).await?;
         self.run_turn(
             &space_id,
             TurnSelector::Model(model.to_string()),
@@ -7189,6 +7296,35 @@ impl Inner {
             ResponseMode::Revise,
             None,
             &TurnDirective::default(),
+        )
+        .await
+    }
+
+    /// Streaming twin of [`Self::regenerate`] — the same target resolution, the
+    /// same gates, the same claim and the same `Revise` context rule, sending
+    /// `stream: true` and forwarding each delta to `sender`.
+    ///
+    /// It exists because a regeneration is a *model request*, and a model
+    /// request that shows nothing until it lands is indistinguishable from a
+    /// button that does nothing — a reasoning model can spend twenty minutes
+    /// there. Every visible affordance a surface can offer while a turn runs
+    /// (the thinking disclosure, the arriving answer) needs the deltas, and
+    /// only this door has them.
+    async fn regenerate_stream(
+        &self,
+        action_id: &str,
+        model: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let (space_id, tip, _guard) = self.begin_regeneration(action_id).await?;
+        self.run_turn_stream(
+            &space_id,
+            TurnSelector::Model(model.to_string()),
+            &tip,
+            ResponseMode::Revise,
+            None,
+            &TurnDirective::default(),
+            sender,
         )
         .await
     }
@@ -7385,6 +7521,11 @@ impl Inner {
         let mut tool_call_shape_error: Option<AppError> = None;
         let mut input_tokens: Option<i64> = None;
         let mut output_tokens: Option<i64> = None;
+        // Why the stream ended, as the upstream reported it. It rides a chunk
+        // rather than a body, and providers put it on the last content-bearing
+        // chunk or on a trailing one with an empty delta — so it is read off
+        // every chunk, before the delta gate, and the last one named wins.
+        let mut finish_reason: Option<String> = None;
         let mut response_buf: Vec<u8> = Vec::new();
         let mut finished = false;
 
@@ -7435,6 +7576,10 @@ impl Inner {
                         if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
                             output_tokens = Some(v);
                         }
+                    }
+
+                    if let Some(reason) = choice_finish_reason(&json) {
+                        finish_reason = Some(reason.to_string());
                     }
 
                     let Some(delta) = json
@@ -7584,6 +7729,20 @@ impl Inner {
         }
 
         // --- the final round ---------------------------------------------
+        if truncated_before_any_answer(finish_reason.as_deref(), &full_content) {
+            return self
+                .end_round_truncated(
+                    prep,
+                    output_tokens,
+                    &request_body_json,
+                    request_at,
+                    response_at,
+                    status.as_u16(),
+                    response_buf,
+                )
+                .await;
+        }
+
         #[cfg(feature = "test-support")]
         if prep.mechanical {
             self.pause_in_report_persist_window().await;
@@ -7613,6 +7772,7 @@ impl Inner {
                 credits_charged: prep.total_credits as i64,
                 response_action_id: None,
                 declined: None,
+                truncated: stopped_at_ceiling(finish_reason.as_deref()),
             }));
         }
 
@@ -7634,6 +7794,7 @@ impl Inner {
             credits_charged: prep.total_credits as i64,
             response_action_id,
             declined: None,
+            truncated: stopped_at_ceiling(finish_reason.as_deref()),
         }))
     }
 
@@ -8372,6 +8533,7 @@ impl AppCore {
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
                 subspace_walks: Mutex::new(std::collections::HashMap::new()),
                 rooms_spawned_here: Mutex::new(Some(std::collections::HashSet::new())),
+                regenerating_items: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 walk_permits: Arc::new(tokio::sync::Semaphore::new(
                     subspace_driver::MAX_CONCURRENT_WALKS,
                 )),
@@ -10240,6 +10402,29 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.regenerate(&action_id, &model).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **Streaming** regeneration — the same door as [`Self::regenerate`],
+    /// pushing incremental [`ChatStreamEvent`]s through `sender` as they
+    /// arrive. This is the one a surface with a reader in front of it should
+    /// use: it is what lets a regeneration show reasoning and answer text while
+    /// it runs, instead of a still frame until it lands.
+    ///
+    /// A second regeneration of the same post is refused
+    /// ([`AppError::RegenerationInFlight`]) **before it spends** — the claim is
+    /// process-wide and outlives any one window, so closing and reopening a
+    /// conversation mid-regeneration cannot start a paid duplicate.
+    pub async fn regenerate_stream(
+        &self,
+        action_id: String,
+        model: String,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.regenerate_stream(&action_id, &model, sender).await })
             .await
             .map_err(join_err)?
     }
@@ -13074,6 +13259,87 @@ fn with_header(item_id: &str, label: &str, created_at_ms: i64, text: &str) -> St
     } else {
         format!("{header}\n\n{text}")
     }
+}
+
+/// One live regeneration's claim on the **item** it revises, released on drop
+/// — which is what makes it correct rather than merely present: an early `?`,
+/// a cancelled consumer and a panic all release it, and nothing has to remember
+/// to.
+///
+/// Keyed by item rather than by generation because that is what a regeneration
+/// replaces: two callers naming different generations of one post are still two
+/// regenerations of the same thing, and the second would spend a second
+/// credential to lose the durable single-successor race.
+struct RegenerationGuard {
+    items: Arc<Mutex<std::collections::HashSet<String>>>,
+    item_id: String,
+}
+
+impl RegenerationGuard {
+    fn claim(
+        items: &Arc<Mutex<std::collections::HashSet<String>>>,
+        item_id: &str,
+    ) -> Result<Self, AppError> {
+        let claimed = items
+            .lock()
+            .expect("regeneration registry lock poisoned")
+            .insert(item_id.to_string());
+        if !claimed {
+            return Err(AppError::RegenerationInFlight {
+                item_id: item_id.to_string(),
+            });
+        }
+        Ok(Self {
+            items: items.clone(),
+            item_id: item_id.to_string(),
+        })
+    }
+}
+
+impl Drop for RegenerationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut items) = self.items.lock() {
+            items.remove(&self.item_id);
+        }
+    }
+}
+
+/// The upstream's terminal `finish_reason` for the first choice, if it named
+/// one. `value` is a whole chunk (SSE) or a whole completion body (blocking) —
+/// the two spellings differ only in where the choice's payload sits, never in
+/// where the reason does.
+fn choice_finish_reason(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str())
+}
+
+/// The upstream stopped at the completion ceiling (`finish_reason: "length"`).
+/// Both transports read the same key, so this is the one place the spelling is
+/// written down.
+fn stopped_at_ceiling(finish_reason: Option<&str>) -> bool {
+    finish_reason == Some("length")
+}
+
+/// Whether a finished round is a **truncation with nothing to read**: the
+/// upstream stopped at the completion ceiling and the round produced no answer
+/// text at all.
+///
+/// This is the reasoning model's failure mode — it can spend the entire budget
+/// thinking and never start the answer — and the reason it needs its own rule
+/// is that every other signal reads like success: the HTTP status is 200, the
+/// body parses, the usage is honest, and a `thinking` block is genuinely there
+/// to persist. Only the pair (ceiling reached, nothing readable) says the turn
+/// has no answer in it.
+///
+/// Callers apply it **after** tool calls are assembled: a round that requested
+/// tools has content the loop can act on even with an empty message, and
+/// stopping there would abandon a tool round mid-turn.
+fn truncated_before_any_answer(finish_reason: Option<&str>, content: &str) -> bool {
+    stopped_at_ceiling(finish_reason) && content.trim().is_empty()
 }
 
 /// Strip-on-receipt: models mimic visible per-message scaffolding, so a leading

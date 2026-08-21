@@ -354,7 +354,12 @@ impl DelegationFailure {
             | AppError::NotJoined { .. }
             | AppError::DrivenConversation { .. }
             | AppError::SpaceArchived { .. } => Self::Configuration,
-            AppError::ToolLoop { .. }
+            // A truncation is the sharpest case of "ran, produced no answer",
+            // and a regeneration collision cannot reach a driven room at all
+            // (the driver never revises) — both land in the honest catch-all.
+            AppError::ResponseTruncated { .. }
+            | AppError::RegenerationInFlight { .. }
+            | AppError::ToolLoop { .. }
             | AppError::Internal { .. }
             | AppError::Database { .. }
             | AppError::DatabaseInUse { .. }

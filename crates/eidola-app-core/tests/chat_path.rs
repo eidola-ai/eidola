@@ -5360,3 +5360,457 @@ fn post_headers_carry_a_stable_absolute_stamp() {
         }
     });
 }
+
+// ===========================================================================
+// The completion ceiling — a turn that stopped because it ran out of budget
+// ===========================================================================
+
+/// A post's readable text — its `text` blocks joined, which is what a reader
+/// would have lost had a truncated regeneration superseded it.
+fn block_text(node: &eidola_app_core::PostNode) -> String {
+    node.blocks
+        .iter()
+        .filter(|b| b.block_type == "text")
+        .filter_map(|b| b.text.clone())
+        .collect()
+}
+
+/// Drain a turn's stream events while it runs, returning `(content, reasoning)`.
+/// The collector must run *concurrently* with the turn: the sender is dropped
+/// only when the turn returns.
+async fn collect_deltas(
+    mut events_rx: tokio::sync::mpsc::UnboundedReceiver<ChatStreamEvent>,
+) -> (String, String) {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            ChatStreamEvent::ContentDelta(t) => content.push_str(&t),
+            ChatStreamEvent::ReasoningDelta(t) => reasoning.push_str(&t),
+        }
+    }
+    (content, reasoning)
+}
+
+/// The reported defect, in the blocking transport: a reasoning model spends the
+/// whole completion budget thinking and never starts the answer. Everything
+/// about the response reads like success — 200, parseable, honest usage, a real
+/// `thinking` block — and recording it as an ordinary completed inference is
+/// exactly the lie. No generation is written; the raw exchange is kept.
+#[test]
+fn a_ceiling_exit_with_no_answer_writes_no_generation_blocking() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ReasoningOnlyLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("think about it".into(), MODEL.into(), None))
+            .expect_err("a turn with no answer in it must not succeed");
+        let space_id = only_space(&core);
+        assert!(
+            matches!(
+                err,
+                AppError::ResponseTruncated {
+                    output_tokens: Some(4096)
+                }
+            ),
+            "expected a typed truncation carrying the ceiling it hit, got {err:?}"
+        );
+        assert_eq!(mock.chat_hits(), 1);
+
+        // The post survives; nothing was written as an answer.
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space_id.clone()))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(kinds, vec!["user_input"], "no inference generation");
+
+        // The reasoning the model did produce is not lost — it is in the
+        // Record, attached to no action.
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        let chat_rows: Vec<_> = requests
+            .iter()
+            .filter(|r| r.path == "/v1/chat/completions")
+            .collect();
+        assert_eq!(chat_rows.len(), 1, "the exchange is recorded");
+        let detail = core
+            .runtime()
+            .block_on(core.request_detail(chat_rows[0].id.clone()))
+            .expect("request detail")
+            .expect("the row is there");
+        assert!(detail.action_id.is_none(), "attached to no action");
+        let body = String::from_utf8(detail.response_body.expect("a recorded response body"))
+            .expect("utf-8");
+        assert!(
+            body.contains("\"finish_reason\":\"length\""),
+            "the reason the turn ended is in the trail: {body}"
+        );
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space_id)),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+    });
+}
+
+/// The streaming twin: same upstream, same verdict. The deltas the reader
+/// already watched arrive are still delivered — the reasoning was real — but
+/// the turn still fails, because there is no answer under it.
+#[test]
+fn a_ceiling_exit_with_no_answer_writes_no_generation_streaming() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ReasoningOnlyLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content, reasoning) = core.runtime().block_on(async {
+            let chat = core.chat_stream("think about it".into(), MODEL.into(), None, tx);
+            let (res, (content, reasoning)) = tokio::join!(chat, collect_deltas(events_rx));
+            (res, content, reasoning)
+        });
+
+        let err = res.expect_err("a stream with no answer in it must not succeed");
+        assert!(
+            matches!(
+                err,
+                AppError::ResponseTruncated {
+                    output_tokens: Some(4096)
+                }
+            ),
+            "blocking and streaming must classify a ceiling exit alike, got {err:?}"
+        );
+        assert!(content.is_empty(), "there was no answer to stream");
+        assert_eq!(reasoning, "still working through it…");
+
+        let space_id = only_space(&core);
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space_id))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(kinds, vec!["user_input"], "no inference generation");
+
+        // The hold is settled exactly as a turn that produced text settles it:
+        // the tokens were spent whether or not they became an answer.
+        assert!(mock.refund_hits() >= 1);
+    });
+}
+
+/// The case the defect was reported from: regenerating an answer, and the new
+/// generation never arrives. The **old generation must survive** — a
+/// regeneration supersedes, so writing the truncated turn would have replaced a
+/// readable answer with an empty one.
+#[test]
+fn a_regeneration_cut_off_at_the_ceiling_keeps_the_answer_it_would_replace() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkThenReasoningOnlyLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        assert_eq!(tree[1].action_type, "inference");
+        let original = block_text(&tree[1]);
+        assert!(!original.is_empty(), "the answer has readable text");
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let res = core.runtime().block_on(async {
+            let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+            let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+            res
+        });
+        assert!(
+            matches!(res, Err(AppError::ResponseTruncated { .. })),
+            "got {res:?}"
+        );
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "no successor post; got {tree:#?}");
+        assert_eq!(tree[1].action_id, answer, "the tip did not move");
+        assert_eq!(block_text(&tree[1]), original, "the answer is intact");
+        assert_eq!(
+            tree[1].generation_count, 1,
+            "the refused turn is not a generation"
+        );
+    });
+}
+
+/// A ceiling exit that **did** produce text is a different thing: the partial
+/// answer is real and worth keeping, so the turn is ordinary — but it is not
+/// finished, and the result says so rather than leaving a surface to guess.
+/// Asserted through both transports against one upstream.
+#[test]
+fn a_partial_answer_at_the_ceiling_is_kept_and_reported_as_truncated() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::PartialAnswerLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let blocking = core
+            .runtime()
+            .block_on(core.chat("go on".into(), MODEL.into(), None))
+            .expect("a partial answer is still a turn");
+        assert_eq!(blocking.content, "Hello from the stream.");
+        assert!(
+            blocking.truncated,
+            "the ceiling bound it, and it must say so"
+        );
+        assert!(blocking.response_action_id.is_some(), "the text is kept");
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let streaming = core.runtime().block_on(async {
+            let chat = core.chat_stream(
+                "go on".into(),
+                MODEL.into(),
+                Some(blocking.space_id.clone()),
+                tx,
+            );
+            let (res, _) = tokio::join!(chat, collect_deltas(events_rx));
+            res
+        });
+        let streaming = streaming.expect("a partial answer is still a turn");
+        assert_eq!(streaming.content, "Hello from the stream.");
+        assert!(
+            streaming.truncated,
+            "the transports must agree about the ceiling"
+        );
+
+        // Both answers are in the transcript.
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(blocking.space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 4, "two questions, two partial answers");
+    });
+}
+
+/// An ordinary turn is not truncated, so nothing downstream has to distinguish
+/// "the flag is false" from "nobody set it".
+#[test]
+fn an_ordinary_turn_is_not_reported_as_truncated() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        let res = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat");
+        assert!(!res.truncated);
+    });
+}
+
+// ===========================================================================
+// Streaming regeneration
+// ===========================================================================
+
+/// The streaming regeneration door is the blocking one's twin, not a second
+/// implementation: `stream: true` on the wire, `Revise` context (the generation
+/// being replaced is withheld), and exactly one successor generation.
+#[test]
+fn streaming_regeneration_revises_in_place_and_streams_its_deltas() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let u1_item = tree[0].item_id.clone();
+        let answer = tree[1].action_id.clone();
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content, reasoning) = core.runtime().block_on(async {
+            let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+            let (res, (content, reasoning)) = tokio::join!(regen, collect_deltas(events_rx));
+            (res, content, reasoning)
+        });
+        let res = res.expect("streaming regenerate");
+
+        // The deltas arrived — the whole point of the door.
+        assert_eq!(content, "Hello from the stream.");
+        assert_eq!(reasoning, "thinking…");
+        assert_eq!(res.content, "Hello from the stream.");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2, "one chat + one regenerate");
+        assert_eq!(
+            bodies[1].get("stream").and_then(|s| s.as_bool()),
+            Some(true),
+            "the streaming door must ask for a stream"
+        );
+
+        // `Revise` context: the upstream question only. The generation being
+        // replaced is withheld, so the model does not read its own last try.
+        let stamps = Stamps::of(&core, &first.space_id);
+        assert_eq!(
+            flat_messages(&bodies[1]),
+            vec![
+                (
+                    "system".to_string(),
+                    system_message(Some(SEEDED_SYSTEM_PROMPT), DEFAULT_AGENT_LABEL)
+                ),
+                (
+                    "user".to_string(),
+                    stamps.headed(&u1_item, HUMAN_LABEL, "How do tides work?")
+                )
+            ],
+        );
+
+        // Exactly one successor generation of the same item — a new version of
+        // the answer, never a reply branch.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "still one question and one answer");
+        assert_eq!(tree[1].item_id, tree[1].item_id, "same item");
+        assert_eq!(tree[1].generation_count, 2, "the answer has two versions");
+        assert_eq!(
+            tree[1].action_id,
+            res.response_action_id.expect("a successor generation"),
+        );
+    });
+}
+
+/// Two regenerations of one post cannot both spend. The claim is process-wide
+/// and lives with the running turn, not with whoever asked for it — so a second
+/// ask is refused **before** the credential, which is the only place refusing
+/// costs nothing (the durable single-successor index rejects the loser only
+/// after both have paid).
+#[test]
+fn a_second_regeneration_of_one_post_is_refused_before_it_spends() {
+    run(|| {
+        // The mock holds each answer, so the first regeneration is provably
+        // still running when the second asks — the state the guard is about.
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            chat_delay_ms: 2_000,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let before = mock.chat_hits();
+
+        // The first regeneration's consumer drops its receiver immediately —
+        // the window closed — while the turn itself runs on. The second ask
+        // must still meet the claim.
+        let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (first_res, second_res) = core.runtime().block_on(async {
+            let a = core.regenerate_stream(answer.clone(), MODEL.into(), tx1);
+            let b = async {
+                // Let the first claim its item before the second asks. The
+                // held response keeps it claimed until well after this.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                core.regenerate_stream(answer.clone(), MODEL.into(), tx2)
+                    .await
+            };
+            let (a, b, _, _) = tokio::join!(a, b, collect_deltas(rx1), collect_deltas(rx2));
+            (a, b)
+        });
+
+        first_res.expect("the first regeneration runs");
+        let err = second_res.expect_err("the second must be refused");
+        assert!(
+            matches!(err, AppError::RegenerationInFlight { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            mock.chat_hits() - before,
+            1,
+            "the refused ask sent no model request"
+        );
+
+        // One successor, one spend — not two of either.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree[1].generation_count, 2);
+    });
+}
+
+/// The claim is released when the turn ends, whichever way it ended — so a
+/// refused-then-retried regeneration is an ordinary regeneration.
+#[test]
+fn a_finished_regeneration_releases_its_claim() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+
+        for _ in 0..2 {
+            let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            core.runtime()
+                .block_on(async {
+                    let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+                    let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+                    res
+                })
+                .expect("a released claim lets the next regeneration through");
+        }
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree[1].generation_count, 3, "two regenerations landed");
+    });
+}

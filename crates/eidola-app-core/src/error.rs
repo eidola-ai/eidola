@@ -212,6 +212,43 @@ pub enum AppError {
     /// this is returned.
     #[error("tool loop error: {message}")]
     ToolLoop { message: String },
+
+    /// The model spent its whole completion budget without writing any answer
+    /// text — a reasoning model that thought until the ceiling bound, and a
+    /// turn that has nothing a reader could read.
+    ///
+    /// The upstream says so itself (`finish_reason: "length"`); what makes this
+    /// a typed refusal rather than a short answer is that there is no answer at
+    /// all and no tool call either. Recording such a turn as an ordinary
+    /// completed inference is the lie this variant exists to make
+    /// unrepresentable: **no generation is written**, so a regeneration cannot
+    /// supersede a readable answer with an empty one, and a reply cannot attach
+    /// under a post with no content.
+    ///
+    /// Everything that did happen is kept: the raw request/response pair lands
+    /// in the Record attached to no action, and the credential settles exactly
+    /// as it does for a turn that produced text — the tokens were spent.
+    ///
+    /// **Data, not prose.** `output_tokens` is the ceiling the model reached
+    /// (as the upstream reported it, `None` when it reported no usage); the
+    /// sentence a reader sees is chosen in their own locale by the
+    /// presentation layer.
+    #[error("the model used its whole completion budget without writing an answer")]
+    ResponseTruncated { output_tokens: Option<i64> },
+
+    /// A second regeneration of the same post was asked for while one is still
+    /// running in this process.
+    ///
+    /// Regeneration spends before it writes: the credential is provisioned and
+    /// the request is in flight long before any row lands, so the durable
+    /// single-successor index (`idx_one_successor_per_action`) rejects the
+    /// loser only after both have paid. The in-process guard refuses the second
+    /// ask before either — which is what makes closing and reopening a window
+    /// mid-regeneration cost nothing, since the guard outlives any one view.
+    ///
+    /// **Data, not prose**: the item whose generation is being replaced.
+    #[error("this response is already being regenerated")]
+    RegenerationInFlight { item_id: String },
 }
 
 // ---------------------------------------------------------------------------
