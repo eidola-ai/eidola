@@ -371,8 +371,8 @@ pub struct MarkdownEditorState {
     pub(crate) frame_input_handler_set: bool,
     /// The in-progress IME composition (preedit) — marked text that is in the
     /// buffer but that the reader has not chosen yet. **Cleared only through
-    /// [`Self::end_composition`] or [`Self::end_composition_before_own_change`]**:
-    /// a composition that ends with no `Change` strands a host that skips
+    /// [`Self::end_composition`]**, which always reports the ending: a
+    /// composition that ends with no `Change` strands a host that skips
     /// `Change` while [`Self::is_composing`] is true.
     marked_range: Option<Range<usize>>,
     /// Per-block horizontal scroll offset (positive = content scrolled
@@ -623,7 +623,7 @@ impl MarkdownEditorState {
         let embeds = std::mem::take(&mut self.state.embeds);
         self.state = EditorState::with_markdown(markdown);
         self.state.embeds = embeds;
-        self.end_composition_before_own_change();
+        self.end_composition(cx);
         self.intended_x = None;
         self.wrap_affinity = WrapAffinity::Downstream;
         self.undo_stack.clear();
@@ -1040,21 +1040,24 @@ impl MarkdownEditorState {
     /// that tells a host the provisional text is now ordinary committed text.
     ///
     /// This is the other half of [`Self::is_composing`]: a host that skips the
-    /// preedit `Change`s needs exactly one `Change` once the composition ends,
-    /// however it ends — the platform unmarking it, or a caret move that
-    /// commits it. Without it the host stays stale until some unrelated edit
+    /// preedit `Change`s needs one once the composition ends, however it ends —
+    /// the platform unmarking it, a caret move that leaves it behind, or a
+    /// commit. Without it the host stays stale until some unrelated edit
     /// happens to nudge it.
+    ///
+    /// **This is the only place `marked_range` is cleared**, and it always
+    /// emits, so "the marking went away and nobody was told" is not a state
+    /// this editor can be in. The price is that an ending which *also* changes
+    /// the buffer reports twice — the end, then the edit — which is why the
+    /// contract is *at least* one `Change`, not exactly one. A caller that
+    /// tried to suppress its own duplicate would be promising, at the moment
+    /// it clears the marking, something it can only know afterwards: whether
+    /// its edit produced a buffer delta at all. A commit of the same bytes
+    /// produces none, and that promise is what silently failed.
     fn end_composition(&mut self, cx: &mut Context<Self>) {
         if self.marked_range.take().is_some() {
             cx.emit(MarkdownEditorEvent::Change);
         }
-    }
-
-    /// End an in-progress composition where the caller emits its own `Change`
-    /// for the same step — an edit that consumed the marked text. That
-    /// `Change` is the report; a second one would double every IME commit.
-    fn end_composition_before_own_change(&mut self) {
-        self.marked_range = None;
     }
 
     fn dispatch(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
@@ -1072,16 +1075,12 @@ impl MarkdownEditorState {
         // canonicalization passes belong to editing. Routing through the
         // readonly update keeps the buffer byte-identical to what the host
         // seeded (see `update::update_readonly`).
-        // A live composition ends here: whatever this event is, the marked
-        // text stops being provisional. Remember it, because a selection-only
-        // event emits no `Change` of its own and the host needs one.
-        let was_composing = self.is_composing();
         self.state = if self.disabled {
             update::update_readonly(before.clone(), event)
         } else {
             update::update_guarded(before.clone(), event, &mut self.table_guard)
         };
-        self.end_composition_before_own_change();
+        self.end_composition(cx);
         // Compare the buffer across the update so selection-only events
         // (Move*/Extend*/SetSelection) don't push an undo step or count
         // as a content change. The composer buffer is small, so the
@@ -1089,18 +1088,13 @@ impl MarkdownEditorState {
         if self.state.markdown != before.markdown {
             self.record_history(before);
             cx.emit(MarkdownEditorEvent::Change);
-        } else {
-            if was_composing {
-                // The edit didn't touch the buffer, but the composition it
-                // ended did: those bytes are committed text now.
-                cx.emit(MarkdownEditorEvent::Change);
-            }
-            if self.state.selection != before.selection {
-                // A pure caret/selection move (Left/Right/word/Move*/Extend*):
-                // no buffer change, so no `Change` — but a host that scrolls
-                // the caret into view still needs to know it moved.
-                cx.emit(MarkdownEditorEvent::SelectionChanged);
-            }
+        } else if self.state.selection != before.selection {
+            // A pure caret/selection move (Left/Right/word/Move*/Extend*): no
+            // buffer change, so no `Change` of its own — but a host that
+            // scrolls the caret into view still needs to know it moved. (If
+            // the move also ended a composition, `end_composition` above
+            // already reported that.)
+            cx.emit(MarkdownEditorEvent::SelectionChanged);
         }
         cx.notify();
     }
@@ -1151,7 +1145,7 @@ impl MarkdownEditorState {
         };
         let current = std::mem::replace(&mut self.state, prev);
         self.redo_stack.push(current);
-        self.end_composition_before_own_change();
+        self.end_composition(cx);
         self.intended_x = None;
         // An undo is a hard boundary: the next typed character starts a
         // fresh coalescing run rather than folding into the step we just
@@ -1167,7 +1161,7 @@ impl MarkdownEditorState {
         };
         let current = std::mem::replace(&mut self.state, next);
         self.undo_stack.push(current);
-        self.end_composition_before_own_change();
+        self.end_composition(cx);
         self.intended_x = None;
         self.coalesce_anchor = None;
         cx.emit(MarkdownEditorEvent::Change);
@@ -2147,10 +2141,11 @@ impl EntityInputHandler for MarkdownEditorState {
             .as_ref()
             .map(|r| self.range_from_utf16(r))
             .or_else(|| self.marked_range.clone());
-        // The commit path: end the composition *before* dispatching, so the
-        // selection dispatch below doesn't report a composition end of its own
-        // — the `InsertText` dispatch is this step's single `Change`.
-        self.end_composition_before_own_change();
+        // End the composition *before* dispatching, so its `Change` is
+        // reported once here rather than by whichever dispatch below happens
+        // to still see the marking. The edit itself may report nothing — a
+        // commit of the same bytes has no buffer delta.
+        self.end_composition(cx);
         if let Some(range) = target {
             self.dispatch(
                 EditorEvent::SetSelection(Selection::range(range.start, range.end)),
@@ -2193,7 +2188,7 @@ impl EntityInputHandler for MarkdownEditorState {
         if !new_text.is_empty() {
             self.marked_range = Some(range.start..range.start + new_text.len());
         } else {
-            self.end_composition_before_own_change();
+            self.end_composition(cx);
         }
 
         let cursor = if let Some(sel_utf16) = new_selected_range_utf16 {

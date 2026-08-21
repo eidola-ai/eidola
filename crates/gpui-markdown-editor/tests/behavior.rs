@@ -10206,28 +10206,56 @@ fn ime_unmark(
 type CompositionEnder = fn(&mut TestAppContext, AnyWindowHandle, &Entity<MarkdownEditorState>);
 
 #[gpui::test]
-fn every_way_a_composition_ends_reports_one_change(cx: &mut TestAppContext) {
+fn every_way_a_composition_ends_reports_a_final_change(cx: &mut TestAppContext) {
     // The other half of `is_composing`: a host skips `Change` while a
-    // composition is live, so the end of one owes it exactly one `Change` —
-    // whatever ended it. A composition that ends silently leaves that host
-    // holding text it was told to ignore.
-    let ends: [(&str, CompositionEnder); 5] = [
-        ("the platform unmarking it", ime_unmark),
-        ("a caret move", |cx, handle, editor| {
-            dispatch(cx, handle, editor, Right)
-        }),
-        ("a vertical move", |cx, handle, editor| {
-            dispatch(cx, handle, editor, Down)
-        }),
-        ("Home", |cx, handle, editor| {
-            dispatch(cx, handle, editor, Home)
-        }),
-        ("End", |cx, handle, editor| {
-            dispatch(cx, handle, editor, End)
-        }),
+    // composition is live, so the end of one owes it a `Change` — whatever
+    // ended it. A composition that ends silently leaves that host holding text
+    // it was told to ignore.
+    //
+    // *At least* one, not exactly one: an ending that also changes the buffer
+    // reports the ending and then the edit. Two is the ceiling, and asserting
+    // it keeps the redundancy from growing.
+    //
+    // The fixture composes `n` at offset 6 of "before\n\nafter"; each ending
+    // says what the buffer should read afterwards.
+    let ends: [(&str, CompositionEnder, &str); 7] = [
+        ("the platform unmarking it", ime_unmark, "beforen\n\nafter"),
+        (
+            "a caret move",
+            |cx, handle, editor| dispatch(cx, handle, editor, Right),
+            "beforen\n\nafter",
+        ),
+        (
+            "a vertical move",
+            |cx, handle, editor| dispatch(cx, handle, editor, Down),
+            "beforen\n\nafter",
+        ),
+        (
+            "Home",
+            |cx, handle, editor| dispatch(cx, handle, editor, Home),
+            "beforen\n\nafter",
+        ),
+        (
+            "End",
+            |cx, handle, editor| dispatch(cx, handle, editor, End),
+            "beforen\n\nafter",
+        ),
+        (
+            "a commit that changes the text",
+            |cx, handle, editor| ime_commit(cx, handle, editor, "に"),
+            "beforeに\n\nafter",
+        ),
+        (
+            // The input method accepting what is already there — committing
+            // romaji or ASCII unchanged. No buffer delta, so the edit itself
+            // has nothing to report.
+            "a commit of the same bytes",
+            |cx, handle, editor| ime_commit(cx, handle, editor, "n"),
+            "beforen\n\nafter",
+        ),
     ];
 
-    for (what, end_it) in ends {
+    for (what, end_it, expected) in ends {
         let (handle, editor) = open_editor(cx, EditorState::with_markdown("before\n\nafter"));
         set_cursor(cx, handle, &editor, 6);
         ime_insert(cx, handle, &editor, "n");
@@ -10238,29 +10266,14 @@ fn every_way_a_composition_ends_reports_one_change(cx: &mut TestAppContext) {
 
         editor.read_with(cx, |e, _| {
             assert!(!e.is_composing(), "{what}: composition ended");
-            // The marked bytes stay — they are ordinary text now.
-            assert!(e.value().starts_with("beforen"), "{what}: text kept");
+            // The composed bytes stay — they are ordinary text now.
+            assert_eq!(e.value(), expected, "{what}: text kept");
         });
-        assert_eq!(
+        assert!(
+            (1..=2).contains(&changes.get()),
+            "{what}: ends the composition with one Change, or two when the \
+             edit itself also has something to report — got {}",
             changes.get(),
-            1,
-            "{what}: ends the composition with exactly one Change",
         );
     }
-}
-
-#[gpui::test]
-fn committing_a_composition_reports_one_change_not_two(cx: &mut TestAppContext) {
-    // The commit path replaces the marked text through two internal dispatches;
-    // only one of them is this step, so a host re-deriving on `Change` does the
-    // work once.
-    let (handle, editor) = open_editor(cx, EditorState::with_markdown(""));
-    ime_insert(cx, handle, &editor, "ni");
-    let changes = change_counter(cx, &editor);
-    ime_commit(cx, handle, &editor, "に");
-    editor.read_with(cx, |e, _| {
-        assert_eq!(e.value(), "に");
-        assert!(!e.is_composing());
-    });
-    assert_eq!(changes.get(), 1);
 }
