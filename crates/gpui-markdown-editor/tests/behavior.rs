@@ -10202,36 +10202,29 @@ fn ime_unmark(
     cx.run_until_parked();
 }
 
+/// One way a composition can end, driven through the editor's real paths.
+type CompositionEnder = fn(&mut TestAppContext, AnyWindowHandle, &Entity<MarkdownEditorState>);
+
 #[gpui::test]
 fn every_way_a_composition_ends_reports_one_change(cx: &mut TestAppContext) {
     // The other half of `is_composing`: a host skips `Change` while a
     // composition is live, so the end of one owes it exactly one `Change` —
     // whatever ended it. A composition that ends silently leaves that host
     // holding text it was told to ignore.
-    let ends: Vec<(
-        &str,
-        Box<dyn Fn(&mut TestAppContext, AnyWindowHandle, &Entity<MarkdownEditorState>)>,
-    )> = vec![
-        (
-            "the platform unmarking it",
-            Box::new(|cx, handle, editor| ime_unmark(cx, handle, editor)),
-        ),
-        (
-            "a caret move",
-            Box::new(|cx, handle, editor| dispatch(cx, handle, editor, Right)),
-        ),
-        (
-            "a vertical move",
-            Box::new(|cx, handle, editor| dispatch(cx, handle, editor, Down)),
-        ),
-        (
-            "Home",
-            Box::new(|cx, handle, editor| dispatch(cx, handle, editor, Home)),
-        ),
-        (
-            "End",
-            Box::new(|cx, handle, editor| dispatch(cx, handle, editor, End)),
-        ),
+    let ends: [(&str, CompositionEnder); 5] = [
+        ("the platform unmarking it", ime_unmark),
+        ("a caret move", |cx, handle, editor| {
+            dispatch(cx, handle, editor, Right)
+        }),
+        ("a vertical move", |cx, handle, editor| {
+            dispatch(cx, handle, editor, Down)
+        }),
+        ("Home", |cx, handle, editor| {
+            dispatch(cx, handle, editor, Home)
+        }),
+        ("End", |cx, handle, editor| {
+            dispatch(cx, handle, editor, End)
+        }),
     ];
 
     for (what, end_it) in ends {
