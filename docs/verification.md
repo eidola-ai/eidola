@@ -44,16 +44,23 @@ Start from a **verified** release (manifest signature + human attestations, [rel
 
 **OCI.** `crane digest` / registry digest against `digest`.
 
-**Nix archive, empty envelope (Linux GUI today, unsigned macOS tree).** Hash the published `.tar.gz`:
+**Nix archive, empty envelope (Linux GUI, unsigned macOS tree).** `archiveSha256` is designed to be the check a user can run with nothing but `sha256sum`:
 
 ```bash
 sha256sum eidola-gui-linux-amd64.tar.gz
 # macOS: shasum -a 256 eidola-gui-macos-universal.tar.gz
 ```
 
-Compare to that artifact’s `archiveSha256` in the verified manifest. On Linux this establishes what the artifact *is*; running it is a separate question — see below.
+**Not yet available.** The release pipeline builds each archive to record its `archiveSha256` and does not currently publish the file: the archives are produced by the artifact workflow, while release assets are attached by the tagged release workflow, and nothing carries them across. Until that is wired up, the manifest's `archiveSha256` is verifiable only by rebuilding — which is the next check, and the stronger one. Publishing the archives as release assets is tracked as part of the Linux packaging work.
 
-**Rebuild.** `nix build .#eidola-gui-linux` (or the macOS universal attr) and compare `narHash`. `nix build .#eidola-gui-linux-archive` and compare `archiveSha256`.
+**Rebuild — the check that works today.** Build the artifact and its archive from the release's git ref and compare both hashes to the verified manifest:
+
+```bash
+nix build .#eidola-gui-linux          # compare narHash
+nix build .#eidola-gui-linux-archive  # compare archiveSha256
+```
+
+The macOS universal attrs (`.#eidola-cli-macos-universal`, `.#eidola-gui-macos-universal`, and their `-archive` variants) work the same way, on a Mac.
 
 **macOS installable (Developer ID zip), once published.** The browser file is not the archive. `codesign` rewrites Mach-Os; the unmodified archive is not a subset of the zip. The first-line check is `shasum` of that zip against the **attested shipped-installable** hash. Binding it to the git ref is one of:
 
