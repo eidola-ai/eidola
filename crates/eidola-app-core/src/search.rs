@@ -211,16 +211,29 @@ impl<'a> ProjectionBuilder<'a> {
 /// runs, so a fold that changes byte length maps back correctly.
 pub fn fold_case(text: &str) -> Projection {
     let mut builder = ProjectionBuilder::new(text);
+    // One reused stack buffer for the folded form of the character in hand.
+    // `char::to_lowercase` yields at most three scalars, so twelve bytes is the
+    // widest UTF-8 a fold can produce and `encode_utf8` can never run out of
+    // room. The buffer is what keeps the walk allocation-free: the matcher
+    // folds a whole haystack on every case-insensitive search, so a `String`
+    // per character would put one heap round trip per character in the hot
+    // path.
+    let mut folded = [0u8; 4 * 3];
     for (offset, ch) in text.char_indices() {
         let range = offset..offset + ch.len_utf8();
-        let mut folded = String::new();
+        let mut len = 0;
         for lowered in ch.to_lowercase() {
-            folded.push(if lowered == 'ς' { 'σ' } else { lowered });
+            let lowered = if lowered == 'ς' { 'σ' } else { lowered };
+            len += lowered.encode_utf8(&mut folded[len..]).len();
         }
-        if folded.len() == ch.len_utf8() && folded.as_str() == &text[range.clone()] {
+        // SAFETY-free by construction: `encode_utf8` wrote whole scalars, so
+        // the prefix is valid UTF-8 — but say it with the checked conversion,
+        // which optimizes to the same thing and cannot be wrong.
+        let folded = std::str::from_utf8(&folded[..len]).expect("encoded scalars");
+        if folded == &text[range.clone()] {
             builder.copy(range);
         } else {
-            builder.substitute(range, &folded);
+            builder.substitute(range, folded);
         }
     }
     builder.finish()
