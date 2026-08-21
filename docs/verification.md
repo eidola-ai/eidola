@@ -64,7 +64,7 @@ The macOS universal attrs (`.#eidola-cli-macos-universal`, `.#eidola-gui-macos-u
 
 **macOS installable (Developer ID zip), once published.** The browser file is not the archive. `codesign` rewrites Mach-Os; the unmodified archive is not a subset of the zip. The first-line check is `shasum` of that zip against the **attested shipped-installable** hash. Binding it to the git ref is one of:
 
-1. **Forward (the designed path).** `apply(archive, envelope) = installable`, then hash the archive against the manifest. `just verify-apple` is this direction.
+1. **Forward (the designed path).** `apply(archive, envelope) = installable`, then hash the archive against the manifest. `just verify-apple` is this direction: it takes the flake's gzip'd POSIX tar (`nix build .#eidola-gui-macos-universal-archive`) — the exact bytes `archiveSha256` covers — plus the detached signature material, and reconstructs the installable in a temporary directory.
 2. **Reverse.** Invert the Mach-O edits and drop the envelope until the unmodified archive reappears, then hash it. That is not "skip `_CodeSignature`." Load commands and `__LINKEDIT` already changed.
 
 "Unsigned" means not Developer ID-signed. Nix ad-hoc signatures on the payload are part of the archive, not of the envelope.
