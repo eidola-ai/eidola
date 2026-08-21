@@ -92,7 +92,14 @@ impl Projection {
 
     /// The source range covering `projected`: the union of the source spans of
     /// every run the projected range touches. `None` when the range is empty,
-    /// inverted, or lies outside the projected text.
+    /// inverted, or is not a range the projected text could have produced —
+    /// an endpoint past its end or inside a character.
+    ///
+    /// [`Self::find`] is the ordinary path and never hands a projected range
+    /// to a caller at all; this is for a caller scanning the projected text
+    /// itself, and it **refuses** rather than clips, because a clipped
+    /// out-of-range hit would map to a plausible but wrong source span — the
+    /// one failure this whole type exists to prevent.
     ///
     /// The result **covers** the projected range rather than corresponding to
     /// it byte for byte: a range that reaches into a substituted run takes
@@ -101,7 +108,15 @@ impl Projection {
     /// them. Covering is the honest direction — the source range always
     /// contains everything the projected range showed the reader.
     pub fn source_range(&self, projected: Range<usize>) -> Option<Range<usize>> {
-        if projected.start >= projected.end {
+        // Both endpoints must be positions the projected text actually has.
+        // `is_char_boundary` is false past the end as well as mid-character,
+        // so this one test refuses every range that cannot be a hit over
+        // `text`. Everything after it clips only *between runs*, which is
+        // coverage, not repair.
+        if projected.start >= projected.end
+            || !self.text.is_char_boundary(projected.start)
+            || !self.text.is_char_boundary(projected.end)
+        {
             return None;
         }
         // Runs are appended in projected order, so a binary search finds the
@@ -130,6 +145,23 @@ impl Projection {
             });
         }
         source
+    }
+
+    /// Every match for `query` in this projection's text, **as source
+    /// ranges** — the scan and the map back in one step.
+    ///
+    /// This is what a caller that projected some text wants, and it is the
+    /// reason a projected offset need never leave this module: there is no
+    /// step at which a caller holds one and could hand back a stale or
+    /// invented range. A caller that scans the text itself can still map its
+    /// own hits with [`Self::source_range`], which refuses anything this text
+    /// could not have produced.
+    pub fn find(&self, query: &Query) -> Vec<Range<usize>> {
+        query
+            .find_in(self.text())
+            .into_iter()
+            .filter_map(|hit| self.source_range(hit))
+            .collect()
     }
 }
 
@@ -607,11 +639,60 @@ mod tests {
     }
 
     #[test]
-    fn mapping_rejects_empty_and_out_of_range_projected_ranges() {
-        let projection = rendered("plain text");
-        assert_eq!(projection.source_range(0..0), None);
-        assert_eq!(projection.source_range(Range { start: 5, end: 2 }), None);
-        assert_eq!(projection.source_range(50..60), None);
+    fn find_returns_source_ranges_so_a_caller_never_holds_a_projected_offset() {
+        let source = "See [the report](https://reports.example/perf) &amp; the notes.";
+        let projection = rendered(source);
+        let query = Query::new("the notes").expect("non-empty");
+
+        let hits = projection.find(&query);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(&source[hits[0].clone()], "the notes");
+
+        // Identical to scanning the projected text and mapping each hit back —
+        // the same two steps, with no moment where a projected offset is in a
+        // caller's hands.
+        let by_hand: Vec<Range<usize>> = query
+            .find_in(projection.text())
+            .into_iter()
+            .filter_map(|hit| projection.source_range(hit))
+            .collect();
+        assert_eq!(hits, by_hand);
+    }
+
+    #[test]
+    fn mapping_refuses_a_range_the_projected_text_could_not_produce() {
+        // The map's whole job is that a hit never becomes a *wrong* source
+        // range. A range the projected text could not have produced is not a
+        // hit, and clipping it into something plausible would be the exact
+        // failure this type exists to prevent — so every one of these refuses.
+        let plain = rendered("abc");
+        assert_eq!(plain.text(), "abc");
+        let refused: [(&str, Range<usize>); 6] = [
+            ("an end past the projected text", 1..4),
+            ("both ends past it", 5..6),
+            ("a start at the very end", 3..4),
+            ("an empty range", 2..2),
+            ("an inverted range", Range { start: 2, end: 1 }),
+            ("an end exactly one past", 0..4),
+        ];
+        for (what, range) in refused {
+            assert_eq!(plain.source_range(range.clone()), None, "{what}: {range:?}");
+        }
+
+        // The valid neighbours of those, which must still map.
+        assert_eq!(plain.source_range(0..3), Some(0..3));
+        assert_eq!(plain.source_range(1..3), Some(1..3));
+
+        // A range that splits a character is equally impossible to have come
+        // from a match over this text.
+        let greek = {
+            let mut builder = ProjectionBuilder::new("αβ");
+            builder.copy(0.."αβ".len());
+            builder.finish()
+        };
+        assert_eq!(greek.text().len(), 4);
+        assert_eq!(greek.source_range(1..3), None);
+        assert_eq!(greek.source_range(0..2), Some(0..2));
     }
 
     #[test]
