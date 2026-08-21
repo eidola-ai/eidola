@@ -190,7 +190,9 @@ verify-apple unsigned_archive signature_bundle:
     ./scripts/verify-apple.sh "{{ unsigned_archive }}" "{{ signature_bundle }}"
 
 # Regression over both containers verify-apple reads, including Nix archives
-# whose app directories extract read-only.
+# whose app directories extract read-only. Runs its body twice: once under the
+# host's userland, once under GNU tar + mawk (native on a GNU host, otherwise
+# via nix shell). Without either it says so and skips that second pass.
 test-verify-apple:
     ./scripts/test-verify-apple.sh
 
