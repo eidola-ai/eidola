@@ -8,10 +8,20 @@
 //! matches case-insensitively, a query containing an upper-case letter matches
 //! exactly. Matches are leftmost and non-overlapping.
 //!
-//! Case-insensitive matching folds both sides with [`fold_case`] — Rust's
-//! Unicode-aware per-character lower-casing, plus Greek final sigma (`ς`) and
-//! medial sigma (`σ`) folded together so `ΟΔΟΣ`, `οδος` and `οδοσ` are one
-//! word to a reader searching for any of them.
+//! Case-insensitive matching folds both sides with [`fold_case`], which is
+//! **Unicode-aware lower-casing, not Unicode case folding**. Those are
+//! different tables, and the difference is a list of equivalences this module
+//! does not have: `ß`/`ss`, `ſ`/`s`, `µ`/`μ`, `ﬁ`/`fi`. Each is a *missing
+//! equivalence*, never a wrong offset — closing them adds substituted runs to
+//! the same map, which is why they wait for the same later pass as diacritic
+//! stripping and NFKC rather than needing anything here to change.
+//!
+//! Within lower-casing, the walk is faithful: it is per character because the
+//! offset map is built from the same pass, and folding the two Greek sigmas
+//! together is what keeps that per-character walk equivalent to
+//! `str::to_lowercase` — final sigma is the one place non-locale-specific
+//! lower-casing depends on surrounding text, which a per-character walk cannot
+//! see. Pinned by a scan of every scalar in Unicode.
 //!
 //! ## The one structural commitment: offsets travel through a map
 //!
@@ -202,10 +212,12 @@ impl<'a> ProjectionBuilder<'a> {
 ///
 /// Per-character lower-casing (`char::to_lowercase`, so the multi-character
 /// mappings of SpecialCasing apply), with the two Greek sigmas folded
-/// together. Per-character rather than `str::to_lowercase` because the map is
-/// built from the same walk; the sigma fold is what recovers — symmetrically,
-/// in both directions — the contextual final-sigma rule that whole-string
-/// lower-casing applies and a per-character walk cannot.
+/// together. Per-character because the map is built from the same walk; the
+/// sigma fold is what recovers — symmetrically, in both directions — the
+/// contextual final-sigma rule that whole-string lower-casing applies and a
+/// per-character walk cannot. It is the *only* such rule, so the walk is
+/// equivalent to `str::to_lowercase` and not a partial case-fold table; see
+/// the module docs for what case folding proper would add.
 ///
 /// Unchanged characters extend a copied run; changed ones become substituted
 /// runs, so a fold that changes byte length maps back correctly.
