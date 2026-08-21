@@ -197,6 +197,13 @@ mod tests {
         assert_eq!(set.merged_ranges(), vec![0..18, 20..25]);
     }
 
+    /// One merged range as the paint pass reports it. Written through an
+    /// iterator because `vec![a..b]` reads to clippy as a botched range
+    /// literal.
+    fn ranges(range: Range<usize>) -> Vec<Range<usize>> {
+        std::iter::once(range).collect()
+    }
+
     #[test]
     fn layers_are_independent_and_merge_only_within_themselves() {
         let mut layers = HighlightLayers::default();
@@ -211,8 +218,8 @@ mod tests {
         assert_eq!(
             layers.merged_by_layer(),
             vec![
-                (HighlightLayer::Base, vec![0..10]),
-                (HighlightLayer::Accent, vec![5..15]),
+                (HighlightLayer::Base, ranges(0..10)),
+                (HighlightLayer::Accent, ranges(5..15)),
             ]
         );
         // ... and only the base layer answers a click.
@@ -226,7 +233,7 @@ mod tests {
         layers.set(HighlightLayer::Accent, HighlightSet::default());
         assert_eq!(
             layers.merged_by_layer(),
-            vec![(HighlightLayer::Base, vec![0..10])]
+            vec![(HighlightLayer::Base, ranges(0..10))]
         );
     }
 

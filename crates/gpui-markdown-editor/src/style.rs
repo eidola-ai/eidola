@@ -260,7 +260,7 @@ impl MarkdownStyle {
     /// derivation [`Self::refresh_theme_colors`] applies each frame.
     pub fn from_theme(cx: &App) -> Self {
         let theme = Theme::global(cx);
-        let color = |c: ThemeColor| c.derive(&theme);
+        let color = |c: ThemeColor| c.derive(theme);
         Self {
             font_family: theme.font_family.clone(),
             mono_font_family: theme.mono_font_family.clone(),
@@ -320,7 +320,7 @@ impl MarkdownStyle {
         let theme = Theme::global(cx);
         for &color in ThemeColor::ALL {
             if self.color_overrides & color.bit() == 0 {
-                *color.slot(self) = color.derive(&theme);
+                *color.slot(self) = color.derive(theme);
             }
         }
     }
