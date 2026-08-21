@@ -2469,6 +2469,19 @@ fn retiring_an_owner_stops_the_helpers_mid_cascade() {
 /// hole. Reads stay `pub` — they answer questions, they do not perform acts.
 /// It is the sibling of `the_raw_space_insert_has_no_production_caller` in
 /// `reap_pristine.rs`, which holds the raw space insert to the same rule.
+///
+/// **The rule is the shape, not the vintage.** The whole `_tx` family has it —
+/// each is a transaction whose refusals or side effects are the reason its
+/// door exists — so `promote_participant_tx` (the one-way promotion, with the
+/// persona that must travel inside it), `discard_space_if_pristine` (the
+/// disposal that decides *inside* the delete whether anything here was worth
+/// keeping) and `instantiate_template` (the only path that mints a space with
+/// participants from birth) are held here too. **A guard duplicated into the
+/// primitive would be the same rule in two places**, so the doors stay the only
+/// way in and the primitives stay unreachable. The consequence for tests: a
+/// transaction-level regression belongs beside the writer, in `db.rs`'s own
+/// test module (`db::tests::tx_contention`), because an integration test under
+/// `tests/` is an external consumer like any dependent.
 #[test]
 fn the_raw_db_writers_are_not_exported() {
     let source = include_str!("../src/db.rs");
@@ -2490,6 +2503,16 @@ fn the_raw_db_writers_are_not_exported() {
         // make unmintable, and `test-support` is enable-able by a downstream
         // crate's dev-dependencies.
         "test_insert_space_capability",
+        // The `_tx` family: each is a transaction whose refusals (or whose
+        // side effects) are the whole reason its door exists.
+        "remove_space_participant_tx",
+        "join_space_participant_tx",
+        "grant_space_membership_tx",
+        "retire_participant_tx",
+        "promote_participant_tx",
+        // Two more of the same shape that carry no `_tx` in their names.
+        "discard_space_if_pristine",
+        "instantiate_template",
     ] {
         assert!(
             production.contains(&format!("async fn {raw}(")),
@@ -2499,7 +2522,9 @@ fn the_raw_db_writers_are_not_exported() {
             !production.contains(&format!("pub async fn {raw}(")),
             "{raw} is a raw write and must not be exported from db: reachable from outside, it \
              is a way to end a sub-space owner's membership, mint a second owner, retire an \
-             agent without archiving the rooms it owned, open a room on an empty brief, or hand \
+             agent without archiving the rooms it owned, promote one without the persona that \
+             must travel inside that transaction, delete a space without asking whether it was \
+             pristine, mint a space with no participants, open a room on an empty brief, or hand \
              a space a capability no parent held — each of which its caller exists to refuse"
         );
     }
