@@ -982,17 +982,15 @@ const EMBED_AUDIT_CORPORA: &[(&str, &str, f32)] = &[
         260.,
     ),
     // Tall inline math on a *non-final* visual row of a soft-wrapped
-    // paragraph. KNOWN DEFECT — this case currently renders wrong, in the
-    // live editor and the embed alike: `compute_math_row_extra` is a
-    // per-*logical*-line overshoot, but the row layout multiplies it into
-    // the height (`(line_height + extra) * wrap_count`) while the shaped
-    // line is still painted with `row_height: line_height`, so gpui strides
-    // its visual rows by the bare `line_height` (`line.rs`'s
-    // `glyph_origin.y += line_height` at each wrap boundary). Two visible
-    // consequences: the construct overlaps the glyphs of the row beneath
-    // it, and `(wrap_count - 1) * extra` of reserved space piles up as dead
-    // air after the whole logical line. Kept as the reproduction for the
-    // fix; see the audit note for the measured numbers.
+    // paragraph — the pixel record of `LaidOutLine::row_stride`, in the
+    // live editor and the embed alike. The reservation
+    // `compute_math_row_extra` returns lands in the per-row stride, so
+    // every visual row of the line is that much further apart: the
+    // construct's ink stays off the glyphs of the row beneath it and no
+    // reserved space piles up after the logical line (the embedded twin's
+    // quote bar ends at the text). The uniform extra leading on the rows
+    // that carry no math is the cost of gpui striding a whole
+    // `WrappedLine` by one line height.
     (
         "wrapped_math",
         "A paragraph whose tall $\\frac{\\frac{\\frac{a}{b}}{\\frac{c}{d}}}{\\frac{e}{f}}$ \

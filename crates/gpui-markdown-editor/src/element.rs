@@ -88,8 +88,29 @@ impl IntoElement for BlockElement {
 /// One shaped, possibly soft-wrapped, logical line.
 pub struct LaidOutLine {
     pub line: Arc<WrappedLine>,
+    /// Top-left of the line's **first** visual row's text box. Caret and
+    /// selection geometry are expressed against this point; the y gpui is
+    /// painted at is [`Self::paint_origin`], which differs whenever
+    /// `row_stride > row_height`.
     pub origin: Point<Pixels>,
+    /// Height of one visual row's text box — the caret's height, the
+    /// selection quad's height, and the box whose vertical centering
+    /// puts the body baseline where every other line in the block has it.
     pub row_height: Pixels,
+    /// Distance between the tops of consecutive visual rows of this
+    /// soft-wrapped line. Equals `row_height` unless a tall inline
+    /// construct (math, an image) on this logical line reserves extra
+    /// vertical space.
+    ///
+    /// The reservation has to live in the *stride*, not merely in
+    /// `wrapped_height`: `gpui::WrappedLine::paint` advances every wrap
+    /// row by the single line height it is handed, so a reservation that
+    /// only inflated the total would leave the construct overlapping the
+    /// row beneath it and pile the reserved space up as dead air after
+    /// the whole logical line. Every row-index computation over this
+    /// line — `position_for_index`, `closest_index_for_position`, the
+    /// per-row selection quads — must use this, not `row_height`.
+    pub row_stride: Pixels,
     pub wrapped_height: Pixels,
     /// Source byte range covered by this line (including trailing `\n` if
     /// any, so the cursor at end-of-line resolves to the next paragraph).
@@ -117,6 +138,25 @@ impl LaidOutLine {
         offset >= self.source_range.start && offset <= self.source_range.end
     }
 
+    /// Where `gpui` is asked to draw this line — `paint` and
+    /// `paint_background` take this origin and `row_stride` as the line
+    /// height. (The local points `position_for_index` returns stay
+    /// relative to [`Self::origin`]: they are whole multiples of the
+    /// stride in y and independent of the origin in x.)
+    ///
+    /// gpui centers the shaped text inside the height it is given, so
+    /// painting the stride at [`Self::origin`] would push the text down by
+    /// half the reservation. Lifting the origin by that half puts the text
+    /// box back on `origin`, which splits the reservation above and below
+    /// exactly as the row extra asked for and keeps the body baseline
+    /// identical to a reservation-free row.
+    pub fn paint_origin(&self) -> Point<Pixels> {
+        point(
+            self.origin.x,
+            self.origin.y - (self.row_stride - self.row_height) / 2.0,
+        )
+    }
+
     fn display_offset_for_source(&self, source_offset: usize) -> usize {
         if source_offset <= self.source_range.start {
             return 0;
@@ -134,7 +174,7 @@ impl LaidOutLine {
 
     pub fn local_position_for_source_offset(&self, source_offset: usize) -> Point<Pixels> {
         let display = self.display_offset_for_source(source_offset);
-        if let Some(p) = self.line.position_for_index(display, self.row_height) {
+        if let Some(p) = self.line.position_for_index(display, self.row_stride) {
             return p;
         }
         // Fallback for end-of-line cursors when the shaped text
@@ -148,7 +188,7 @@ impl LaidOutLine {
         // `(0, 0)` and visually disappears against the leftmost
         // glyph of the line.
         let last_row = self.line.wrap_boundaries().len();
-        let y = self.row_height * (last_row as f32);
+        let y = self.row_stride * (last_row as f32);
         point(self.line.width(), y)
     }
 
@@ -169,7 +209,7 @@ impl LaidOutLine {
         if !downstream {
             return upper;
         }
-        let row_h = self.row_height;
+        let row_h = self.row_stride;
         if row_h <= px(0.) {
             return upper;
         }
@@ -206,7 +246,7 @@ impl LaidOutLine {
         if p.y < px(0.0) {
             p.y = px(0.0);
         }
-        let display_idx = match self.line.closest_index_for_position(p, self.row_height) {
+        let display_idx = match self.line.closest_index_for_position(p, self.row_stride) {
             Ok(i) => i,
             Err(i) => i,
         };
@@ -1192,8 +1232,13 @@ fn layout_table(
 /// coordinates.
 struct EmbedPiece {
     line: Arc<WrappedLine>,
+    /// The origin to *paint* at, already lifted by half of any row
+    /// reservation — see `LaidOutLine::paint_origin`.
     rel_origin: Point<Pixels>,
-    row_height: Pixels,
+    /// Distance between the tops of consecutive visual rows, which is
+    /// also what gpui is handed as the line height — see
+    /// `LaidOutLine::row_stride`.
+    row_stride: Pixels,
 }
 
 /// One typeset display-math sub-block of an embed.
@@ -1364,7 +1409,7 @@ fn emit_embed_marker_overlays(
         pieces.push(EmbedPiece {
             rel_origin: point((strip_right - glyph.width()).max(px(0.0)), row_y),
             line: glyph,
-            row_height: line_height,
+            row_stride: line_height,
         });
     }
 }
@@ -1421,7 +1466,7 @@ fn layout_embed(
                                 indent + piece.rel_origin.x,
                                 block_top + piece.rel_origin.y,
                             ),
-                            row_height: line_height,
+                            row_stride: line_height,
                         });
                     }
                     for (i, ry) in t.rule_ys.iter().enumerate() {
@@ -1521,17 +1566,24 @@ fn layout_embed(
                             body_descent,
                             line_height,
                         );
+                        let row_stride = line_height + extra.total();
                         let wrap_count = (sl.line.wrap_boundaries().len() as f32) + 1.0;
-                        let h = (line_height + extra.total()) * wrap_count;
+                        let h = row_stride * wrap_count;
                         let row_y = y + extra.top;
+                        // The reservation belongs to the stride (see
+                        // `LaidOutLine::row_stride`), and gpui centers the
+                        // text in whatever height it is handed, so the paint
+                        // origin lifts by half of it to leave the baseline
+                        // where a reservation-free row puts it.
+                        let paint_y = row_y - (row_stride - line_height) / 2.0;
                         if text_left + sl.line.width() > max_w {
                             max_w = text_left + sl.line.width();
                         }
                         place_embed_inline_math(
                             &mut math_specs,
                             &sl,
-                            point(text_left, row_y),
-                            line_height,
+                            point(text_left, paint_y),
+                            row_stride,
                             body_ascent,
                             body_descent,
                             &mut out.math,
@@ -1539,8 +1591,8 @@ fn layout_embed(
                         shaped_rows.push((sl.source_range.clone(), row_y));
                         out.pieces.push(EmbedPiece {
                             line: sl.line,
-                            rel_origin: point(text_left, row_y),
-                            row_height: line_height,
+                            rel_origin: point(text_left, paint_y),
+                            row_stride,
                         });
                         y += h;
                         advanced = true;
@@ -2146,15 +2198,16 @@ impl Element for BlockElement {
             // A line carrying math overlays taller than what the
             // body's natural half-leading already covers reserves
             // extra vertical space — `top` above the row's natural
-            // top, `bottom` past its natural bottom. The row_height
-            // passed to gpui stays at `line_height` so its
-            // internal text-vertical-centering keeps the body
-            // baseline in the same place across math and non-math
-            // rows; we shift `origin.y` down by `extra.top` so the
-            // *visible* row top floats up by that amount. Math
-            // overlays paint relative to `line.origin.y + ...`,
-            // and the formula in `paint_inline_math_overlays`
-            // accounts for gpui's centering using `line.row_height`.
+            // top, `bottom` past its natural bottom. The reservation
+            // goes into the row *stride*, so every visual row of a
+            // soft-wrapped line keeps it (gpui advances wrap rows by
+            // one line height, so a stride that ignored the extra
+            // would let the construct overlap the row below and pile
+            // the reservation up after the logical line). `origin.y`
+            // still shifts down by `extra.top`, keeping the body
+            // baseline at the same place it sits on reservation-free
+            // rows — `LaidOutLine::paint_origin` undoes gpui's
+            // centering of the taller row.
             let math_extra = compute_math_row_extra(
                 &sl.source_range,
                 &inline_math_specs,
@@ -2165,8 +2218,9 @@ impl Element for BlockElement {
             let image_extra =
                 compute_image_row_extra(&sl.source_range, &inline_image_specs, line_height);
             let extra = combined_row_extra(math_extra, image_extra);
+            let row_stride = line_height + extra.total();
             let wrap_count = (sl.line.wrap_boundaries().len() as f32) + 1.0;
-            let wrapped_h = (line_height + extra.total()) * wrap_count;
+            let wrapped_h = row_stride * wrap_count;
             let origin = point(content_left, content_cursor_y + extra.top);
             if !sl.is_delimiter && sl.line.width() > max_content_line_width {
                 max_content_line_width = sl.line.width();
@@ -2175,6 +2229,7 @@ impl Element for BlockElement {
                 line: sl.line,
                 origin,
                 row_height: line_height,
+                row_stride,
                 wrapped_height: wrapped_h,
                 source_range: sl.source_range,
                 display_to_source: sl.display_to_source,
@@ -2197,6 +2252,7 @@ impl Element for BlockElement {
                         content_top + piece.rel_origin.y,
                     ),
                     row_height: line_height,
+                    row_stride: line_height,
                     wrapped_height: piece.wrapped_height,
                     source_range: piece.source_range,
                     display_to_source: piece.display_to_source,
@@ -2224,6 +2280,7 @@ impl Element for BlockElement {
                     line,
                     origin: point(content_left, content_cursor_y),
                     row_height: line_height,
+                    row_stride: line_height,
                     wrapped_height: line_height,
                     source_range: self.block.source_range.clone(),
                     display_to_source: vec![self.block.source_range.start],
@@ -2808,7 +2865,7 @@ impl Element for BlockElement {
                 for piece in &ep.pieces {
                     let _ = piece.line.paint_background(
                         piece.rel_origin,
-                        piece.row_height,
+                        piece.row_stride,
                         gpui::TextAlign::Left,
                         None,
                         window,
@@ -2818,7 +2875,7 @@ impl Element for BlockElement {
                 for piece in &ep.pieces {
                     let _ = piece.line.paint(
                         piece.rel_origin,
-                        piece.row_height,
+                        piece.row_stride,
                         gpui::TextAlign::Left,
                         None,
                         window,
@@ -2883,8 +2940,8 @@ impl Element for BlockElement {
             for laid in &prepaint.laid_out.lines {
                 if laid.is_delimiter {
                     let _ = laid.line.paint(
-                        laid.origin,
-                        laid.row_height,
+                        laid.paint_origin(),
+                        laid.row_stride,
                         gpui::TextAlign::Left,
                         None,
                         window,
@@ -2914,8 +2971,8 @@ impl Element for BlockElement {
                 for laid in &prepaint.laid_out.lines {
                     if !laid.is_delimiter {
                         let _ = laid.line.paint(
-                            laid.origin,
-                            laid.row_height,
+                            laid.paint_origin(),
+                            laid.row_stride,
                             gpui::TextAlign::Left,
                             None,
                             window,
@@ -2967,8 +3024,8 @@ impl Element for BlockElement {
                 // `paint_background` pass or the chip never shows.
                 for laid in &prepaint.laid_out.lines {
                     let _ = laid.line.paint_background(
-                        laid.origin,
-                        laid.row_height,
+                        laid.paint_origin(),
+                        laid.row_stride,
                         gpui::TextAlign::Left,
                         None,
                         window,
@@ -2983,8 +3040,8 @@ impl Element for BlockElement {
                 }
                 for laid in &prepaint.laid_out.lines {
                     let _ = laid.line.paint(
-                        laid.origin,
-                        laid.row_height,
+                        laid.paint_origin(),
+                        laid.row_stride,
                         gpui::TextAlign::Left,
                         None,
                         window,
@@ -3419,7 +3476,7 @@ fn paint_inline_math_overlays(
         };
         let local = match line
             .line
-            .position_for_index(display_offset, line.row_height)
+            .position_for_index(display_offset, line.row_stride)
         {
             Some(p) => p,
             None => continue,
@@ -3483,7 +3540,7 @@ fn paint_inline_image_overlays(
         };
         let local = match line
             .line
-            .position_for_index(display_offset, line.row_height)
+            .position_for_index(display_offset, line.row_stride)
         {
             Some(p) => p,
             None => continue,
@@ -4591,7 +4648,11 @@ fn paint_selection_for_line(
     };
     let start = line.local_position_for_source_offset(lo);
     let end = line.local_position_for_source_offset(hi);
+    // A wash covers one visual row's *text* box (`row_height`) but steps
+    // between rows by the line's stride, which a tall inline construct
+    // makes larger — see `LaidOutLine::row_stride`.
     let row_height = line.row_height;
+    let row_stride = line.row_stride;
     let eol_pad = if hi == line_hi { px(6.0) } else { px(0.0) };
 
     if start.y == end.y {
@@ -4610,8 +4671,8 @@ fn paint_selection_for_line(
 
     let row_count = line.row_count();
     let line_width = line.line.width();
-    let start_row = (f32::from(start.y) / f32::from(row_height)).round() as usize;
-    let end_row = (f32::from(end.y) / f32::from(row_height)).round() as usize;
+    let start_row = (f32::from(start.y) / f32::from(row_stride)).round() as usize;
+    let end_row = (f32::from(end.y) / f32::from(row_stride)).round() as usize;
 
     let y_start = line.origin.y + start.y;
     push(
@@ -4626,7 +4687,7 @@ fn paint_selection_for_line(
     );
 
     for row in (start_row + 1)..end_row.min(row_count) {
-        let y = line.origin.y + row_height * (row as f32);
+        let y = line.origin.y + row_stride * (row as f32);
         push(
             fill(
                 Bounds::from_corners(
@@ -4829,6 +4890,7 @@ mod tests {
                             line: sl.line,
                             origin: point(px(0.0), px(0.0)),
                             row_height: line_height,
+                            row_stride: line_height,
                             wrapped_height: line_height,
                             source_range: sl.source_range,
                             display_to_source: sl.display_to_source,
@@ -4910,6 +4972,7 @@ mod tests {
                     line: piece.line.clone(),
                     origin: point(piece.rel_origin.x, piece.rel_origin.y),
                     row_height: line_height,
+                    row_stride: line_height,
                     wrapped_height: piece.wrapped_height,
                     source_range: piece.source_range.clone(),
                     display_to_source: piece.display_to_source.clone(),
