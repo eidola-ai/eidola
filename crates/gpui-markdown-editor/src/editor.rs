@@ -23,7 +23,6 @@ use gpui::{
     FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Point, RenderOnce, Subscription, UTF16Selection, Window, actions, div, prelude::*, px,
 };
-use gpui_component::Theme;
 
 use crate::element::{BlockElement, LaidOutBlock};
 use crate::event::{EditorEvent, MarkdownEditorEvent};
@@ -339,11 +338,13 @@ pub struct MarkdownEditorState {
     /// from the element's `.on_embed_click(..)` prop each frame; the editor
     /// only reports the ordinal, never interprets it.
     pub(crate) on_embed_click: Option<EmbedClickHandler>,
-    /// Host-supplied highlight ranges (see [`crate::highlight`]) — inert
-    /// decorations painted as a quiet wash behind the covered text. Entity
-    /// state (not [`EditorState`]): the pure update/render pipeline never
-    /// consults them, only the element's paint (and the click hit-test) do.
-    pub(crate) highlights: crate::highlight::HighlightSet,
+    /// Host-supplied highlight ranges, one set per layer (see
+    /// [`crate::highlight`]) — inert decorations painted as a quiet wash
+    /// behind the covered text. Entity state (not [`EditorState`]): the pure
+    /// update/render pipeline never consults them, only the element's paint
+    /// (and the click hit-test, which reads
+    /// [`crate::highlight::HighlightLayer::Base`] alone) do.
+    pub(crate) highlights: crate::highlight::HighlightLayers,
     /// Host callback for a plain click on highlighted text. Synced from the
     /// element's `.on_highlight_click(..)` prop each frame.
     pub(crate) on_highlight_click: Option<HighlightClickHandler>,
@@ -368,6 +369,19 @@ pub struct MarkdownEditorState {
     pub(crate) last_blocks: HashMap<usize, LaidOutBlock>,
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
     pub(crate) frame_input_handler_set: bool,
+    /// Whether the editor held focus at the last paint. Read only to notice
+    /// the focused → unfocused *transition*, which ends an open composition:
+    /// gpui routes IME to the focused handle, so once focus leaves, no
+    /// platform path can end it (Wayland's `text_input` `Leave`, for one,
+    /// tells the client nothing at all), and the marking would answer
+    /// [`MarkdownEditorState::is_composing`] forever — and mis-target the next
+    /// composition, which falls back to it as the range to replace.
+    pub(crate) was_focused: bool,
+    /// The in-progress IME composition (preedit) — marked text that is in the
+    /// buffer but that the reader has not chosen yet. **Cleared only through
+    /// [`Self::end_composition`]**, which always reports the ending: a
+    /// composition that ends with no `Change` strands a host that skips
+    /// `Change` while [`Self::is_composing`] is true.
     marked_range: Option<Range<usize>>,
     /// Per-block horizontal scroll offset (positive = content scrolled
     /// left under the visible band). Keyed by block index; entries
@@ -444,7 +458,7 @@ impl MarkdownEditorState {
             focus_handle,
             disabled: false,
             on_embed_click: None,
-            highlights: crate::highlight::HighlightSet::default(),
+            highlights: crate::highlight::HighlightLayers::default(),
             on_highlight_click: None,
             on_context_menu: None,
             highlight_press: None,
@@ -454,6 +468,7 @@ impl MarkdownEditorState {
             last_blocks: HashMap::new(),
             last_bounds: None,
             frame_input_handler_set: false,
+            was_focused: false,
             marked_range: None,
             code_block_scrolls: HashMap::new(),
             intended_x: None,
@@ -617,7 +632,7 @@ impl MarkdownEditorState {
         let embeds = std::mem::take(&mut self.state.embeds);
         self.state = EditorState::with_markdown(markdown);
         self.state.embeds = embeds;
-        self.marked_range = None;
+        self.end_composition(cx);
         self.intended_x = None;
         self.wrap_affinity = WrapAffinity::Downstream;
         self.undo_stack.clear();
@@ -674,23 +689,52 @@ impl MarkdownEditorState {
         &self.state.embeds
     }
 
-    /// Supply the highlight ranges — `(source-byte range, opaque key)` pairs
-    /// (see [`crate::highlight`] for the plugin contract). Render-time
-    /// decoration only: the buffer is untouched (no
-    /// [`MarkdownEditorEvent::Change`]), no caret position becomes forbidden,
-    /// and editing/selection are unaffected — the view just re-renders with
-    /// the wash. Overlapping ranges merge visually at paint time.
+    /// Supply the highlight ranges on [`crate::highlight::HighlightLayer::Base`]
+    /// — the layer whose ranges route clicks. Shorthand for
+    /// [`Self::set_highlights_in`].
     pub fn set_highlights(
         &mut self,
         entries: impl IntoIterator<Item = (std::ops::Range<usize>, u64)>,
         cx: &mut Context<Self>,
     ) {
-        self.highlights = crate::highlight::HighlightSet::new(entries);
+        self.set_highlights_in(crate::highlight::HighlightLayer::Base, entries, cx);
+    }
+
+    /// Supply the highlight ranges on one layer — `(source-byte range, opaque
+    /// key)` pairs (see [`crate::highlight`] for the plugin contract). Every
+    /// other layer is left as it was. Render-time decoration only: the buffer
+    /// is untouched (no [`MarkdownEditorEvent::Change`]), no caret position
+    /// becomes forbidden, and editing/selection are unaffected — the view just
+    /// re-renders with the wash. Overlapping ranges merge visually at paint
+    /// time, **within the layer**.
+    pub fn set_highlights_in(
+        &mut self,
+        layer: crate::highlight::HighlightLayer,
+        entries: impl IntoIterator<Item = (std::ops::Range<usize>, u64)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.highlights
+            .set(layer, crate::highlight::HighlightSet::new(entries));
         cx.notify();
     }
 
-    /// The current highlight set.
+    /// The current highlight set on [`crate::highlight::HighlightLayer::Base`].
     pub fn highlights(&self) -> &crate::highlight::HighlightSet {
+        self.highlights_in(crate::highlight::HighlightLayer::Base)
+    }
+
+    /// The current highlight set on one layer — the read half of the
+    /// compare-before-set guard a host that recomputes ranges every frame
+    /// needs (setting notifies unconditionally).
+    pub fn highlights_in(
+        &self,
+        layer: crate::highlight::HighlightLayer,
+    ) -> &crate::highlight::HighlightSet {
+        self.highlights.get(layer)
+    }
+
+    /// Every layer's highlight ranges — what the paint pass walks.
+    pub(crate) fn highlight_layers(&self) -> &crate::highlight::HighlightLayers {
         &self.highlights
     }
 
@@ -909,6 +953,29 @@ impl MarkdownEditorState {
     /// (the space composer) reads this on every [`MarkdownEditorEvent::Change`]
     /// and adjusts *its* scroll offset to keep the caret visible.
     ///
+    /// [`Self::content_y_for_offset`] at the caret, with the caret's
+    /// wrap-boundary affinity (see [`WrapAffinity`]) rather than the default.
+    pub fn caret_content_y(&self) -> Option<(Pixels, Pixels)> {
+        self.content_y_at(self.state.selection.head(), self.caret_downstream())
+    }
+
+    /// The vertical span of an arbitrary source `offset`, relative to the
+    /// editor's laid-out content top — [`Self::caret_content_y`] generalized
+    /// to any offset, for a host that scrolls something *other* than the caret
+    /// into view (a search match, a cited passage).
+    ///
+    /// An offset on a soft-wrap boundary resolves **downstream** (the start of
+    /// the lower row): unlike the caret, an arbitrary offset carries no
+    /// affinity, and a range's start is what a host reveals.
+    ///
+    /// **Coordinate frame.** See [`Self::caret_content_y`]. Paint-derived, so
+    /// `None` before the first paint — a host revealing a position inside
+    /// content that has not rendered yet (a virtualized transcript) must
+    /// estimate first and correct once this answers.
+    pub fn content_y_for_offset(&self, offset: usize) -> Option<(Pixels, Pixels)> {
+        self.content_y_at(offset, true)
+    }
+
     /// **Coordinate frame.** Derived from the previous frame's `last_blocks`
     /// exactly like [`Self::bounds_for_range`], but re-based to content-local
     /// coordinates: `last_blocks`/`last_bounds` are window-absolute, so
@@ -916,41 +983,126 @@ impl MarkdownEditorState {
     /// yields the y a scroll container measures from its own content top. The
     /// value is independent of any `min_height` runway (the laid-out text sits
     /// at the content top regardless). Returns `None` before the first paint
-    /// (no layout to consult) or when the caret's offset isn't covered by any
-    /// laid-out line.
-    pub fn caret_content_y(&self) -> Option<(Pixels, Pixels)> {
+    /// (no layout to consult) or when the offset isn't covered by any laid-out
+    /// line.
+    fn content_y_at(&self, offset: usize, downstream: bool) -> Option<(Pixels, Pixels)> {
         let content_top = self.last_bounds?.origin.y;
-        let cursor = self.state.selection.head();
-        // Sort keys so a caret sitting on a block boundary (claimed by two
-        // adjacent lines) resolves deterministically to the earlier block,
-        // rather than by `HashMap` iteration order.
+        // Sort keys so an offset sitting on a block boundary (claimed by two
+        // adjacent lines) resolves deterministically, rather than by `HashMap`
+        // iteration order.
         let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
         keys.sort_unstable();
-        // Fallback for a caret past every laid-out range — the document end
+        // Line ranges are end-inclusive, so where one line's end is the next
+        // one's start — a code block's rows, a hard-broken paragraph, the row
+        // boundary between table cells — two lines claim the offset. Resolve
+        // that the way the caller asked: `downstream` takes the line that
+        // *starts* at the offset (the row a reader would say the offset is on),
+        // upstream keeps the earlier line (where an upstream caret renders).
+        let mut hit: Option<&crate::element::LaidOutLine> = None;
+        // Fallback for an offset past every laid-out range — the document end
         // after a trailing newline synthesizes an empty paragraph that isn't
         // always laid out as a line, the same edge `bounds_for_range` hits. Keep
-        // the latest line whose range ends at or before the caret and clamp the
-        // caret onto it (its last row) rather than returning `None`.
+        // the latest line whose range ends at or before the offset and clamp it
+        // onto it (its last row) rather than returning `None`.
         let mut fallback: Option<&crate::element::LaidOutLine> = None;
         for k in keys {
             for line in &self.last_blocks[&k].lines {
-                if line.contains_source_offset(cursor) {
-                    let local = line
-                        .local_position_for_source_offset_biased(cursor, self.caret_downstream());
-                    let top = line.origin.y + local.y - content_top;
-                    return Some((top, top + line.row_height));
-                }
-                if line.source_range.end <= cursor
+                if line.contains_source_offset(offset) {
+                    let better = match hit {
+                        None => true,
+                        Some(prev) => {
+                            downstream && line.source_range.start > prev.source_range.start
+                        }
+                    };
+                    if better {
+                        hit = Some(line);
+                    }
+                } else if line.source_range.end <= offset
                     && fallback.is_none_or(|f| line.source_range.end >= f.source_range.end)
                 {
                     fallback = Some(line);
                 }
             }
         }
-        let line = fallback?;
-        let local = line.local_position_for_source_offset_biased(cursor, self.caret_downstream());
+        let line = hit.or(fallback)?;
+        let local = line.local_position_for_source_offset_biased(offset, downstream);
         let top = line.origin.y + local.y - content_top;
         Some((top, top + line.row_height))
+    }
+
+    /// Sync the element's `disabled` prop onto the state, ending any open
+    /// composition when the editor becomes read-only.
+    ///
+    /// A disabled editor registers no input handler
+    /// (`element.rs`: `!editor.frame_input_handler_set && !editor.disabled`),
+    /// so the platform loses the only route it had to end the composition. The
+    /// marking would then answer [`Self::is_composing`] for the rest of the
+    /// editor's life, and a host that skips composing editors would ignore
+    /// this one's content forever.
+    pub(crate) fn sync_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        if disabled && !self.disabled {
+            self.end_composition(cx);
+        }
+        self.disabled = disabled;
+    }
+
+    /// Note this frame's focus, ending an open composition when focus has just
+    /// left — the other half of [`Self::sync_disabled`], and the same rule: a
+    /// composition cannot outlive the editor's ability to receive IME.
+    ///
+    /// A *transition*, not a state test, so an editor that never had focus
+    /// (a headless test driving the IME methods directly) is left alone.
+    pub(crate) fn sync_focused(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if self.was_focused && !focused {
+            self.end_composition(cx);
+        }
+        self.was_focused = focused;
+    }
+
+    /// Whether an IME composition (preedit) is in progress — the buffer holds
+    /// marked text the user has not committed.
+    ///
+    /// Unlike some input primitives, this editor emits
+    /// [`MarkdownEditorEvent::Change`] on **every** preedit keystroke, because
+    /// the marked text really is in the buffer and a host sizing itself to the
+    /// content must follow it. A host that acts on the text's *meaning*
+    /// instead — searching it, sending it, parsing it — should ask this first
+    /// and wait: the reader has not chosen those characters yet. (The
+    /// `EntityInputHandler::marked_text_range` half of the IME contract needs
+    /// a `Window` and is not a host-facing query.)
+    pub fn is_composing(&self) -> bool {
+        self.marked_range.is_some()
+    }
+
+    /// End an in-progress composition, emitting the [`MarkdownEditorEvent::Change`]
+    /// that tells a host the provisional text is now ordinary committed text.
+    ///
+    /// This is the other half of [`Self::is_composing`]: a host that skips the
+    /// preedit `Change`s needs one once the composition ends, however it ends —
+    /// the platform unmarking it, a caret move that leaves it behind, or a
+    /// commit. Without it the host stays stale until some unrelated edit
+    /// happens to nudge it.
+    ///
+    /// **This is the only place `marked_range` is cleared**, and it always
+    /// emits, so "the marking went away and nobody was told" is not a state
+    /// this editor can be in. The price is that an ending which *also* changes
+    /// the buffer reports twice — the end, then the edit — which is why the
+    /// contract is *at least* one `Change`, not exactly one. A caller that
+    /// tried to suppress its own duplicate would be promising, at the moment
+    /// it clears the marking, something it can only know afterwards: whether
+    /// its edit produced a buffer delta at all. A commit of the same bytes
+    /// produces none, and that promise is what silently failed.
+    ///
+    /// **Public because it is also the host's escape hatch.** The editor
+    /// notices its own lifecycle transitions only on frames where it renders
+    /// (see [`Self::sync_disabled`] and [`Self::sync_focused`]); a host that
+    /// stops rendering an editor that might be composing — dropping it from a
+    /// virtualized list, say — should call this, or that editor's
+    /// [`Self::is_composing`] stays true with no frame left to clear it.
+    pub fn end_composition(&mut self, cx: &mut Context<Self>) {
+        if self.marked_range.take().is_some() {
+            cx.emit(MarkdownEditorEvent::Change);
+        }
     }
 
     fn dispatch(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
@@ -973,7 +1125,7 @@ impl MarkdownEditorState {
         } else {
             update::update_guarded(before.clone(), event, &mut self.table_guard)
         };
-        self.marked_range = None;
+        self.end_composition(cx);
         // Compare the buffer across the update so selection-only events
         // (Move*/Extend*/SetSelection) don't push an undo step or count
         // as a content change. The composer buffer is small, so the
@@ -982,9 +1134,11 @@ impl MarkdownEditorState {
             self.record_history(before);
             cx.emit(MarkdownEditorEvent::Change);
         } else if self.state.selection != before.selection {
-            // A pure caret/selection move (Left/Right/word/Move*/Extend*):
-            // no buffer change, so no `Change` — but a host that scrolls the
-            // caret into view still needs to know it moved.
+            // A pure caret/selection move (Left/Right/word/Move*/Extend*): no
+            // buffer change, so no `Change` of its own — but a host that
+            // scrolls the caret into view still needs to know it moved. (If
+            // the move also ended a composition, `end_composition` above
+            // already reported that.)
             cx.emit(MarkdownEditorEvent::SelectionChanged);
         }
         cx.notify();
@@ -1036,7 +1190,7 @@ impl MarkdownEditorState {
         };
         let current = std::mem::replace(&mut self.state, prev);
         self.redo_stack.push(current);
-        self.marked_range = None;
+        self.end_composition(cx);
         self.intended_x = None;
         // An undo is a hard boundary: the next typed character starts a
         // fresh coalescing run rather than folding into the step we just
@@ -1052,7 +1206,7 @@ impl MarkdownEditorState {
         };
         let current = std::mem::replace(&mut self.state, next);
         self.undo_stack.push(current);
-        self.marked_range = None;
+        self.end_composition(cx);
         self.intended_x = None;
         self.coalesce_anchor = None;
         cx.emit(MarkdownEditorEvent::Change);
@@ -1242,7 +1396,7 @@ impl MarkdownEditorState {
                 self.wrap_affinity = WrapAffinity::Downstream;
                 let next = std::mem::take(&mut self.state);
                 self.state = update::update_guarded(next, fallback, &mut self.table_guard);
-                self.marked_range = None;
+                self.end_composition(cx);
                 cx.notify();
                 return;
             }
@@ -1271,7 +1425,7 @@ impl MarkdownEditorState {
             EditorEvent::SetSelection(new_sel),
             &mut self.table_guard,
         );
-        self.marked_range = None;
+        self.end_composition(cx);
         // A vertical move changes the caret without touching the buffer — tell
         // a host that scrolls the caret into view (no `Change` is emitted).
         if self.state.selection != before_sel {
@@ -1386,7 +1540,7 @@ impl MarkdownEditorState {
             None => {
                 let next = std::mem::take(&mut self.state);
                 self.state = update::update_guarded(next, fallback, &mut self.table_guard);
-                self.marked_range = None;
+                self.end_composition(cx);
                 cx.notify();
                 return;
             }
@@ -1411,7 +1565,7 @@ impl MarkdownEditorState {
             EditorEvent::SetSelection(new_sel),
             &mut self.table_guard,
         );
-        self.marked_range = None;
+        self.end_composition(cx);
         // Home/End move the caret without a buffer change — notify a
         // caret-into-view host (no `Change` is emitted).
         if self.state.selection != before_sel {
@@ -1680,7 +1834,10 @@ impl MarkdownEditorState {
         self.highlight_press = (event.click_count == 1
             && !event.modifiers.shift
             && self.on_highlight_click.is_some()
-            && !self.highlights.keys_at(offset).is_empty())
+            && !self
+                .highlights_in(crate::highlight::HighlightLayer::Base)
+                .keys_at(offset)
+                .is_empty())
         .then_some(offset);
         self.begin_selection(offset, event.click_count, event.modifiers.shift, cx);
     }
@@ -1789,7 +1946,9 @@ impl MarkdownEditorState {
             && self.state.selection.is_collapsed()
             && let Some(cb) = self.on_highlight_click.clone()
         {
-            let keys = self.highlights.keys_at(offset);
+            let keys = self
+                .highlights_in(crate::highlight::HighlightLayer::Base)
+                .keys_at(offset);
             if !keys.is_empty() {
                 cb(&keys, window, cx);
             }
@@ -2004,8 +2163,13 @@ impl EntityInputHandler for MarkdownEditorState {
         self.marked_range.as_ref().map(|r| self.range_to_utf16(r))
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.marked_range = None;
+    /// The platform dropped the marking without sending replacement text —
+    /// a click elsewhere while composing, an input-source switch, a discarded
+    /// composition. The marked bytes stay in the buffer as ordinary text
+    /// ("accept the marked text as if it had been inserted normally"), so this
+    /// is a composition end like any other and owes the host a `Change`.
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.end_composition(cx);
     }
 
     fn replace_text_in_range(
@@ -2022,6 +2186,11 @@ impl EntityInputHandler for MarkdownEditorState {
             .as_ref()
             .map(|r| self.range_from_utf16(r))
             .or_else(|| self.marked_range.clone());
+        // End the composition *before* dispatching, so its `Change` is
+        // reported once here rather than by whichever dispatch below happens
+        // to still see the marking. The edit itself may report nothing — a
+        // commit of the same bytes has no buffer delta.
+        self.end_composition(cx);
         if let Some(range) = target {
             self.dispatch(
                 EditorEvent::SetSelection(Selection::range(range.start, range.end)),
@@ -2029,7 +2198,6 @@ impl EntityInputHandler for MarkdownEditorState {
             );
         }
         self.dispatch(EditorEvent::InsertText(new_text.to_string()), cx);
-        self.marked_range = None;
     }
 
     fn replace_and_mark_text_in_range(
@@ -2065,7 +2233,7 @@ impl EntityInputHandler for MarkdownEditorState {
         if !new_text.is_empty() {
             self.marked_range = Some(range.start..range.start + new_text.len());
         } else {
-            self.marked_range = None;
+            self.end_composition(cx);
         }
 
         let cursor = if let Some(sel_utf16) = new_selected_range_utf16 {
@@ -2233,8 +2401,8 @@ impl RenderOnce for MarkdownEditor {
         let embed_cb = self.on_embed_click.clone();
         let highlight_cb = self.on_highlight_click.clone();
         let context_menu_cb = self.on_context_menu.clone();
-        self.state.update(cx, |st, _| {
-            st.disabled = self.disabled;
+        self.state.update(cx, |st, cx| {
+            st.sync_disabled(self.disabled, cx);
             st.on_embed_click = embed_cb;
             st.on_highlight_click = highlight_cb;
             st.on_context_menu = context_menu_cb;
@@ -2243,26 +2411,16 @@ impl RenderOnce for MarkdownEditor {
             st.last_bounds = None;
         });
 
-        // Final style = caller overrides (or the theme default) with the
-        // theme-derived color fields refreshed each frame, so a Circadian
-        // light/dark flip recolors live even if the caller built its style
-        // once. This is the old entity-render refresh, moved to the element.
+        // Final style = caller overrides (or the theme default) with every
+        // theme-derived color the caller did *not* override re-derived each
+        // frame, so a Circadian light/dark flip recolors live even if the
+        // caller built its style once. One registry drives both halves — see
+        // `style::theme_colors!`.
         let mut style = self
             .style
             .clone()
             .unwrap_or_else(|| MarkdownStyle::from_theme(cx));
-        let theme = Theme::global(cx);
-        style.text_color = theme.foreground;
-        style.delimiter_color = theme.muted_foreground;
-        style.background = theme.background;
-        style.caret_color = theme.caret;
-        style.selection_color = theme.selection;
-        style.link_color = theme.link;
-        style.blockquote_border_color = theme.border;
-        style.thematic_break_color = theme.border;
-        style.inline_code_background = theme.accent;
-        style.code_block_background = theme.muted;
-        style.code_block_content_background = crate::style::shift_lightness(theme.muted, -0.04);
+        style.refresh_theme_colors(cx);
 
         let spec = self.state.read(cx).render_spec();
         let state = self.state.clone();

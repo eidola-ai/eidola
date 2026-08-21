@@ -18,6 +18,99 @@ pub type HeadingFontSize = Arc<dyn Fn(u8, Pixels) -> Pixels + Send + Sync + 'sta
 /// bold-h1/h2, semibold-h3+ ramp when set.
 pub type HeadingWeight = Arc<dyn Fn(u8) -> FontWeight + Send + Sync + 'static>;
 
+/// Every color a `MarkdownStyle` derives from the theme, declared once: the
+/// name, the field it lives in, and the expression that derives it.
+///
+/// The list is consumed three times — building a style ([`MarkdownStyle::from_theme`]),
+/// re-deriving one each frame ([`MarkdownStyle::refresh_theme_colors`]), and
+/// recording that a caller overrode one — so a color cannot be derived in one
+/// place and forgotten in another. The hand-maintained refresh list this
+/// replaces had drifted twice: the three highlight washes were never refreshed
+/// (stale across a live Day/Night flip), and the four colors a caller *can*
+/// override were re-derived unconditionally, silently discarding the override.
+macro_rules! theme_colors {
+    ($($variant:ident => $field:ident, $derive:expr;)+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ThemeColor {
+            $($variant,)+
+        }
+
+        impl ThemeColor {
+            /// Every theme-derived color, in declaration order.
+            const ALL: &'static [ThemeColor] = &[$(ThemeColor::$variant,)+];
+
+            /// This color's value under `theme`.
+            fn derive(self, theme: &Theme) -> Hsla {
+                match self {
+                    $(ThemeColor::$variant => ($derive)(theme),)+
+                }
+            }
+
+            /// The field this color lives in.
+            fn slot(self, style: &mut MarkdownStyle) -> &mut Hsla {
+                match self {
+                    $(ThemeColor::$variant => &mut style.$field,)+
+                }
+            }
+        }
+
+        impl MarkdownStyle {
+            $(
+                #[doc = concat!("Override `", stringify!($field), "` (see the field).")]
+                ///
+                /// Recorded as the caller's own decision, so the per-frame
+                /// theme refresh leaves it alone. Every registered color gets
+                /// one of these, generated from the same list — a color cannot
+                /// be theme-refreshed and un-overridable at the same time.
+                pub fn $field(self, color: Hsla) -> Self {
+                    self.override_color(ThemeColor::$variant, color)
+                }
+            )+
+        }
+    };
+}
+
+theme_colors! {
+    Text => text_color, |theme: &Theme| theme.foreground;
+    Delimiter => delimiter_color, |theme: &Theme| theme.muted_foreground;
+    Background => background, |theme: &Theme| theme.background;
+    Caret => caret_color, |theme: &Theme| theme.caret;
+    Selection => selection_color, |theme: &Theme| theme.selection;
+    HighlightBase => highlight_color, |theme: &Theme| if theme.mode.is_dark() {
+        gpui::hsla(0.115, 0.55, 0.55, 0.18)
+    } else {
+        gpui::hsla(0.115, 0.85, 0.55, 0.16)
+    };
+    HighlightOverlay => highlight_overlay_color, |theme: &Theme| if theme.mode.is_dark() {
+        gpui::hsla(0.115, 0.55, 0.55, 0.32)
+    } else {
+        gpui::hsla(0.115, 0.85, 0.55, 0.30)
+    };
+    HighlightAccent => highlight_accent_color, |theme: &Theme| if theme.mode.is_dark() {
+        gpui::hsla(0.115, 0.70, 0.60, 0.55)
+    } else {
+        gpui::hsla(0.115, 0.90, 0.55, 0.52)
+    };
+    CodeBlockBackground => code_block_background, |theme: &Theme| theme.muted;
+    CodeBlockContentBackground => code_block_content_background,
+        |theme: &Theme| shift_lightness(theme.muted, -0.04);
+    BlockquoteBorder => blockquote_border_color, |theme: &Theme| theme.border;
+    InlineCodeBackground => inline_code_background, |theme: &Theme| theme.accent;
+    Link => link_color, |theme: &Theme| theme.link;
+    ThematicBreak => thematic_break_color, |theme: &Theme| theme.border;
+    TableRule => table_rule_color, |theme: &Theme| theme.border;
+}
+
+/// One bit per color in the override mask, so the mask cannot run out of room
+/// unnoticed.
+const _: () = assert!(ThemeColor::ALL.len() <= 32);
+
+impl ThemeColor {
+    const fn bit(self) -> u32 {
+        1 << (self as u32)
+    }
+}
+
 #[derive(Clone)]
 pub struct MarkdownStyle {
     pub font_family: SharedString,
@@ -114,12 +207,20 @@ pub struct MarkdownStyle {
     pub background: Hsla,
     pub caret_color: Hsla,
     pub selection_color: Hsla,
-    /// Wash painted behind host-supplied highlight ranges (see
-    /// [`crate::highlight`]) — a quiet warm underlay, deliberately fainter
-    /// than the selection so a selection over highlighted text still reads.
-    /// The default is a low-alpha amber derived from the theme's mode (the
-    /// same warm family in day and night); hosts can override per palette.
+    /// Wash painted behind host-supplied highlight ranges on
+    /// [`crate::highlight::HighlightLayer::Base`] (see [`crate::highlight`])
+    /// — a quiet warm underlay, deliberately fainter than the selection so a
+    /// selection over highlighted text still reads. The default is a
+    /// low-alpha amber derived from the theme's mode (the same warm family in
+    /// day and night); hosts can override per palette.
     pub highlight_color: Hsla,
+    /// Wash for [`crate::highlight::HighlightLayer::Overlay`] — the same warm
+    /// family, one step stronger, so a range on the layer above the base
+    /// reads as a distinct decoration rather than a deeper merge.
+    pub highlight_overlay_color: Hsla,
+    /// Wash for [`crate::highlight::HighlightLayer::Accent`] — the strongest
+    /// of the three, for the one range a host singles out among many.
+    pub highlight_accent_color: Hsla,
 
     /// Font family for *inline* code spans. Defaults to
     /// `mono_font_family`, but is exposed separately because inline
@@ -157,12 +258,23 @@ pub struct MarkdownStyle {
     /// between body rows). Defaults to the theme's `border`, like
     /// the thematic break — table rules are chrome, not content.
     pub table_rule_color: Hsla,
+
+    /// Which theme-derived colors the caller set explicitly, one bit per
+    /// [`ThemeColor`]. [`MarkdownStyle::refresh_theme_colors`] re-derives the
+    /// rest every frame, so an override survives a Day/Night flip and
+    /// everything else follows it. Only the builder methods record a bit — a
+    /// direct write to a public color field is not an override and *is*
+    /// re-derived.
+    color_overrides: u32,
 }
 
 impl MarkdownStyle {
-    /// Build a style anchored to the active `gpui_component::Theme`.
+    /// Build a style anchored to the active `gpui_component::Theme`. Every
+    /// color comes from the [`theme_colors!`] registry, so it is the same
+    /// derivation [`Self::refresh_theme_colors`] applies each frame.
     pub fn from_theme(cx: &App) -> Self {
         let theme = Theme::global(cx);
+        let color = |c: ThemeColor| c.derive(theme);
         Self {
             font_family: theme.font_family.clone(),
             mono_font_family: theme.mono_font_family.clone(),
@@ -176,8 +288,8 @@ impl MarkdownStyle {
             heading_weight: None,
 
             mono_font_size: theme.mono_font_size,
-            code_block_background: theme.muted,
-            code_block_content_background: shift_lightness(theme.muted, -0.04),
+            code_block_background: color(ThemeColor::CodeBlockBackground),
+            code_block_content_background: color(ThemeColor::CodeBlockContentBackground),
             code_block_padding: px(12.0),
             code_block_content_padding_y: px(12.0),
             code_block_radius: theme.radius,
@@ -185,30 +297,53 @@ impl MarkdownStyle {
             blockquote_indent: px(20.0),
             blockquote_border_width: px(3.0),
             blockquote_border_inset: px(6.0),
-            blockquote_border_color: theme.border,
+            blockquote_border_color: color(ThemeColor::BlockquoteBorder),
 
             list_item_gap_factor: 0.35,
             list_indent: px(8.0),
 
-            text_color: theme.foreground,
-            delimiter_color: theme.muted_foreground,
-            background: theme.background,
-            caret_color: theme.caret,
-            selection_color: theme.selection,
-            highlight_color: if theme.mode.is_dark() {
-                gpui::hsla(0.115, 0.55, 0.55, 0.18)
-            } else {
-                gpui::hsla(0.115, 0.85, 0.55, 0.16)
-            },
+            text_color: color(ThemeColor::Text),
+            delimiter_color: color(ThemeColor::Delimiter),
+            background: color(ThemeColor::Background),
+            caret_color: color(ThemeColor::Caret),
+            selection_color: color(ThemeColor::Selection),
+            highlight_color: color(ThemeColor::HighlightBase),
+            highlight_overlay_color: color(ThemeColor::HighlightOverlay),
+            highlight_accent_color: color(ThemeColor::HighlightAccent),
 
             inline_code_font_family: theme.mono_font_family.clone(),
-            inline_code_background: theme.accent,
-            link_color: theme.link,
-            thematic_break_color: theme.border,
+            inline_code_background: color(ThemeColor::InlineCodeBackground),
+            link_color: color(ThemeColor::Link),
+            thematic_break_color: color(ThemeColor::ThematicBreak),
             thematic_break_thickness: px(1.0),
             table_header_weight: FontWeight::MEDIUM,
-            table_rule_color: theme.border,
+            table_rule_color: color(ThemeColor::TableRule),
+
+            color_overrides: 0,
         }
+    }
+
+    /// Re-derive every theme color the caller has **not** overridden.
+    ///
+    /// The element calls this each frame, so a style a host built once still
+    /// follows a live Day/Night flip; a color the host set through a builder
+    /// method is left alone. Registered colors are the [`theme_colors!`] list,
+    /// which is also what `from_theme` builds from — there is no second list
+    /// to keep in step.
+    pub fn refresh_theme_colors(&mut self, cx: &App) {
+        let theme = Theme::global(cx);
+        for &color in ThemeColor::ALL {
+            if self.color_overrides & color.bit() == 0 {
+                *color.slot(self) = color.derive(theme);
+            }
+        }
+    }
+
+    /// Record a caller's explicit color, so the per-frame refresh keeps it.
+    fn override_color(mut self, color: ThemeColor, value: Hsla) -> Self {
+        *color.slot(&mut self) = value;
+        self.color_overrides |= color.bit();
+        self
     }
 
     pub fn font_size(mut self, size: Pixels) -> Self {
@@ -268,16 +403,6 @@ impl MarkdownStyle {
         self
     }
 
-    pub fn code_block_background(mut self, bg: Hsla) -> Self {
-        self.code_block_background = bg;
-        self
-    }
-
-    pub fn code_block_content_background(mut self, bg: Hsla) -> Self {
-        self.code_block_content_background = bg;
-        self
-    }
-
     pub fn code_block_radius(mut self, radius: Pixels) -> Self {
         self.code_block_radius = radius;
         self
@@ -298,11 +423,6 @@ impl MarkdownStyle {
         self
     }
 
-    pub fn blockquote_border_color(mut self, color: Hsla) -> Self {
-        self.blockquote_border_color = color;
-        self
-    }
-
     pub fn list_indent(mut self, indent: Pixels) -> Self {
         self.list_indent = indent;
         self
@@ -318,15 +438,15 @@ impl MarkdownStyle {
         self
     }
 
-    pub fn inline_code_background(mut self, bg: Hsla) -> Self {
-        self.inline_code_background = bg;
-        self
-    }
-
-    /// Override the highlight wash color (see `highlight_color`).
-    pub fn highlight_color(mut self, color: Hsla) -> Self {
-        self.highlight_color = color;
-        self
+    /// The wash color for one highlight layer. Total by construction — every
+    /// [`crate::highlight::HighlightLayer`] has a color, so a host that paints
+    /// on a layer can never get an unstyled wash.
+    pub fn highlight_layer_color(&self, layer: crate::highlight::HighlightLayer) -> Hsla {
+        match layer {
+            crate::highlight::HighlightLayer::Base => self.highlight_color,
+            crate::highlight::HighlightLayer::Overlay => self.highlight_overlay_color,
+            crate::highlight::HighlightLayer::Accent => self.highlight_accent_color,
+        }
     }
 
     /// Final font size for `level` (1..=6). Uses the callback if set,

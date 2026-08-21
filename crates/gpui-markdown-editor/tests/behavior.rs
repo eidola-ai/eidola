@@ -22,8 +22,8 @@ use gpui_markdown_editor::editor::{
     Undo, Up, WordLeft, WordRight,
 };
 use gpui_markdown_editor::{
-    BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, MarkdownEditorState,
-    RenderSpec, Selection,
+    BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, MarkdownEditorEvent,
+    MarkdownEditorState, MarkdownStyle, RenderSpec, Selection,
 };
 
 /// Minimal host view for the editor under test: holds the state entity and
@@ -9906,4 +9906,478 @@ fn append_at_end_lands_after_the_text_with_the_caret_behind_it(cx: &mut TestAppC
         assert_eq!(e.value(), "already herex");
         assert_eq!(e.cursor_offset(), "already herex".len());
     });
+}
+
+// ---------------------------------------------------------------------------
+// Host seams: offset geometry (`content_y_for_offset`) and IME composition
+// (`is_composing`).
+//
+// The editor has no internal vertical scroll, so a host that wants to reveal
+// something reads its content-local y from here. `caret_content_y` answers for
+// the caret; `content_y_for_offset` answers for any offset — a match, a cited
+// passage — and resolves a wrap boundary downstream, since an arbitrary offset
+// carries no affinity.
+//
+// `is_composing` exists because this editor emits `Change` on every preedit
+// keystroke: a host that reads the buffer's *meaning* on Change must be able to
+// ask whether the reader has committed those characters.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn content_y_for_offset_answers_for_offsets_the_caret_is_not_at(cx: &mut TestAppContext) {
+    let markdown = "first paragraph\n\nsecond paragraph\n\nthird paragraph";
+    let initial = EditorState {
+        markdown: markdown.into(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    // Populate `last_blocks` with a paint pass — the geometry is paint-derived.
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+
+    editor.read_with(cx, |e, _| {
+        let at = |needle: &str| {
+            e.content_y_for_offset(markdown.find(needle).expect("fixture"))
+                .expect("laid out")
+        };
+        let (first_top, first_bottom) = at("first");
+        let (second_top, _) = at("second");
+        let (third_top, _) = at("third");
+
+        assert!(
+            first_bottom > first_top,
+            "the span is a row: {first_top:?}..{first_bottom:?}",
+        );
+        assert!(
+            second_top > first_top && third_top > second_top,
+            "later paragraphs sit lower: {first_top:?}, {second_top:?}, {third_top:?}",
+        );
+        // The caret is at offset 0 and untouched by any of that.
+        assert_eq!(e.cursor_offset(), 0);
+        assert_eq!(e.caret_content_y(), Some((first_top, first_bottom)));
+
+        // The document end is the same edge `caret_content_y` documents: it
+        // clamps onto the last laid-out line rather than answering `None`.
+        let (end_top, _) = e.content_y_for_offset(markdown.len()).expect("clamped");
+        assert_eq!(end_top, third_top);
+    });
+}
+
+#[gpui::test]
+fn content_y_for_offset_resolves_a_wrap_boundary_downstream(cx: &mut TestAppContext) {
+    // The same boundary offset the caret can render on either row of: End
+    // leaves Upstream affinity (upper row), while `content_y_for_offset` has no
+    // affinity to consult and always answers with the lower row — what a host
+    // revealing a range's start wants.
+    let para = "This is a fairly long paragraph that soft-wraps across several \
+                rows inside the narrow viewport configured by open_editor_narrow, \
+                giving us interior wrap boundaries to land a caret on."
+        .to_string();
+    let initial = EditorState {
+        markdown: para,
+        selection: Selection::Cursor(2),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+
+    set_cursor(cx, handle, &editor, 2);
+    dispatch(cx, handle, &editor, End);
+    editor.read_with(cx, |e, _| {
+        let boundary = e.cursor_offset();
+        let (caret_top, caret_bottom) = e.caret_content_y().expect("caret row");
+        let row_h = caret_bottom - caret_top;
+        let (offset_top, _) = e.content_y_for_offset(boundary).expect("boundary row");
+        assert!(
+            offset_top >= caret_top + row_h - gpui::px(1.0),
+            "the same offset resolves one row lower without the caret's upstream \
+             affinity (caret {caret_top:?}, offset {offset_top:?}, row {row_h:?})",
+        );
+    });
+}
+
+#[gpui::test]
+fn is_composing_holds_while_preedit_text_sits_in_the_buffer(cx: &mut TestAppContext) {
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(""));
+
+    let changes = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = changes.clone();
+    cx.update(|cx| {
+        cx.subscribe(&editor, move |_, event: &MarkdownEditorEvent, _| {
+            if matches!(event, MarkdownEditorEvent::Change) {
+                counter.set(counter.get() + 1);
+            }
+        })
+        .detach();
+    });
+
+    editor.read_with(cx, |e, _| assert!(!e.is_composing()));
+
+    // Preedit: the marked text is really in the buffer, and `Change` fires —
+    // which is exactly why a host needs to be able to ask.
+    ime_insert(cx, handle, &editor, "n");
+    editor.read_with(cx, |e, _| {
+        assert!(e.is_composing());
+        assert_eq!(e.value(), "n");
+    });
+    assert!(
+        changes.get() >= 1,
+        "the editor emits Change during preedit ({} events)",
+        changes.get(),
+    );
+
+    ime_insert(cx, handle, &editor, "ni");
+    editor.read_with(cx, |e, _| {
+        assert!(e.is_composing());
+        assert_eq!(e.value(), "ni");
+    });
+
+    // Committing the composition clears it.
+    ime_commit(cx, handle, &editor, "に");
+    editor.read_with(cx, |e, _| {
+        assert!(!e.is_composing());
+        assert_eq!(e.value(), "に");
+    });
+}
+
+#[gpui::test]
+fn ordinary_typing_never_reports_a_composition(cx: &mut TestAppContext) {
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(""));
+    type_text(cx, handle, &editor, "plain");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "plain");
+        assert!(!e.is_composing());
+    });
+}
+
+/// Commit an IME composition (`replace_text_in_range`) — the path that ends a
+/// preedit and leaves the chosen characters in the buffer.
+fn ime_commit(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    editor: &Entity<MarkdownEditorState>,
+    text: &str,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |e, cx| {
+            e.replace_text_in_range(None, text, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn content_y_for_offset_at_a_shared_line_boundary_takes_the_later_line(cx: &mut TestAppContext) {
+    // Line ranges are end-inclusive, so where one line's end is the next one's
+    // start — a code block's rows here, and equally a hard-broken paragraph or
+    // a table's row boundary — one offset is claimed by two lines. A host
+    // revealing a match at that offset must land on the line the match is *on*,
+    // not the line above it.
+    let markdown = "```\nlet x = 1;\nlet y = 2;\n```\n\ntail";
+    let initial = EditorState {
+        markdown: markdown.into(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+
+    let (boundary, upper_y, lower_y) = editor.read_with(cx, |e, _| {
+        let mut geo = e.debug_line_source_geometry();
+        geo.sort_by_key(|(start, end, ..)| (*start, *end));
+        let shared = geo
+            .windows(2)
+            .find(|w| w[0].1 == w[1].0 && w[1].3 > w[0].3)
+            .expect("the fixture shares a boundary between two lines on different rows")
+            .to_vec();
+        (shared[0].1, shared[0].3, shared[1].3)
+    });
+
+    editor.read_with(cx, |e, _| {
+        let (top, _) = e.content_y_for_offset(boundary).expect("boundary offset");
+        assert_eq!(
+            top.as_f32(),
+            lower_y,
+            "offset {boundary} starts the lower line, so it reveals at {lower_y}, \
+             not at the line above it ({upper_y})",
+        );
+    });
+
+    // The caret path is untouched: the later-line rule is gated on
+    // `downstream`, so an upstream caret still resolves to the line it renders
+    // on. No caret can actually land on a *cross-line* shared boundary today
+    // (`End` stops at the end of the row's text, before the byte the next line
+    // claims), which is why the gate costs nothing and stays as the guarantee.
+}
+
+#[gpui::test]
+fn theme_colors_follow_a_live_mode_flip_and_an_override_survives_it(cx: &mut TestAppContext) {
+    // A host may build a style once and keep it; the element re-derives every
+    // theme color each frame so a Day/Night flip recolors live. A color the
+    // host set explicitly is its own decision and must not be re-derived.
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+
+        let mine = gpui::hsla(0.5, 0.5, 0.5, 0.5);
+        let also_mine = gpui::hsla(0.25, 0.5, 0.5, 1.0);
+        // Every theme color has a builder — they are generated from the same
+        // registry the refresh walks — so any of them can be a host's own
+        // decision, not just the handful that happened to have one written.
+        let mut style = MarkdownStyle::from_theme(cx)
+            .highlight_color(mine)
+            .table_rule_color(also_mine);
+        let day = (
+            style.text_color,
+            style.highlight_overlay_color,
+            style.highlight_accent_color,
+        );
+
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        style.refresh_theme_colors(cx);
+
+        assert_ne!(style.text_color, day.0, "ordinary theme colors follow");
+        assert_ne!(
+            style.highlight_overlay_color, day.1,
+            "the overlay wash follows the mode like every other theme color",
+        );
+        assert_ne!(
+            style.highlight_accent_color, day.2,
+            "the accent wash follows the mode like every other theme color",
+        );
+        assert_eq!(
+            style.highlight_color, mine,
+            "a color the host set is never re-derived",
+        );
+        assert_eq!(
+            style.table_rule_color, also_mine,
+            "table chrome is overridable like every other registered color",
+        );
+
+        // And a fresh style built under the same mode agrees with the
+        // refreshed one — one registry, so there is no second derivation to
+        // drift from.
+        let fresh = MarkdownStyle::from_theme(cx);
+        assert_eq!(style.text_color, fresh.text_color);
+        assert_eq!(style.highlight_overlay_color, fresh.highlight_overlay_color);
+        assert_eq!(style.highlight_accent_color, fresh.highlight_accent_color);
+        assert_eq!(style.thematic_break_color, fresh.thematic_break_color);
+    });
+}
+
+/// Count `Change` events from now on.
+fn change_counter(
+    cx: &mut TestAppContext,
+    editor: &Entity<MarkdownEditorState>,
+) -> std::rc::Rc<std::cell::Cell<usize>> {
+    let changes = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = changes.clone();
+    cx.update(|cx| {
+        cx.subscribe(editor, move |_, event: &MarkdownEditorEvent, _| {
+            if matches!(event, MarkdownEditorEvent::Change) {
+                counter.set(counter.get() + 1);
+            }
+        })
+        .detach();
+    });
+    changes
+}
+
+/// The platform dropping the marking without replacement text
+/// (`EntityInputHandler::unmark_text`) — a click elsewhere while composing, an
+/// input-source switch.
+fn ime_unmark(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    editor: &Entity<MarkdownEditorState>,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |e, cx| e.unmark_text(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// One way a composition can end, driven through the editor's real paths.
+type CompositionEnder = fn(&mut TestAppContext, AnyWindowHandle, &Entity<MarkdownEditorState>);
+
+#[gpui::test]
+fn every_way_a_composition_ends_reports_a_final_change(cx: &mut TestAppContext) {
+    // The other half of `is_composing`: a host skips `Change` while a
+    // composition is live, so the end of one owes it a `Change` — whatever
+    // ended it. A composition that ends silently leaves that host holding text
+    // it was told to ignore.
+    //
+    // *At least* one, not exactly one: an ending that also changes the buffer
+    // reports the ending and then the edit. Two is the ceiling, and asserting
+    // it keeps the redundancy from growing.
+    //
+    // The fixture composes `n` at offset 6 of "before\n\nafter"; each ending
+    // says what the buffer should read afterwards.
+    let ends: [(&str, CompositionEnder, &str); 7] = [
+        ("the platform unmarking it", ime_unmark, "beforen\n\nafter"),
+        (
+            "a caret move",
+            |cx, handle, editor| dispatch(cx, handle, editor, Right),
+            "beforen\n\nafter",
+        ),
+        (
+            "a vertical move",
+            |cx, handle, editor| dispatch(cx, handle, editor, Down),
+            "beforen\n\nafter",
+        ),
+        (
+            "Home",
+            |cx, handle, editor| dispatch(cx, handle, editor, Home),
+            "beforen\n\nafter",
+        ),
+        (
+            "End",
+            |cx, handle, editor| dispatch(cx, handle, editor, End),
+            "beforen\n\nafter",
+        ),
+        (
+            "a commit that changes the text",
+            |cx, handle, editor| ime_commit(cx, handle, editor, "に"),
+            "beforeに\n\nafter",
+        ),
+        (
+            // The input method accepting what is already there — committing
+            // romaji or ASCII unchanged. No buffer delta, so the edit itself
+            // has nothing to report.
+            "a commit of the same bytes",
+            |cx, handle, editor| ime_commit(cx, handle, editor, "n"),
+            "beforen\n\nafter",
+        ),
+    ];
+
+    for (what, end_it, expected) in ends {
+        let (handle, editor) = open_editor(cx, EditorState::with_markdown("before\n\nafter"));
+        set_cursor(cx, handle, &editor, 6);
+        ime_insert(cx, handle, &editor, "n");
+        editor.read_with(cx, |e, _| assert!(e.is_composing(), "{what}: composing"));
+
+        let changes = change_counter(cx, &editor);
+        end_it(cx, handle, &editor);
+
+        editor.read_with(cx, |e, _| {
+            assert!(!e.is_composing(), "{what}: composition ended");
+            // The composed bytes stay — they are ordinary text now.
+            assert_eq!(e.value(), expected, "{what}: text kept");
+        });
+        assert!(
+            (1..=2).contains(&changes.get()),
+            "{what}: ends the composition with one Change, or two when the \
+             edit itself also has something to report — got {}",
+            changes.get(),
+        );
+    }
+}
+
+/// Host view whose `disabled` prop the test can flip, so the editable →
+/// read-only transition runs through the real element render.
+struct ToggleableHarness {
+    state: Entity<MarkdownEditorState>,
+    disabled: bool,
+}
+
+impl gpui::Render for ToggleableHarness {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        MarkdownEditor::new(&self.state).disabled(self.disabled)
+    }
+}
+
+fn open_toggleable_editor(
+    cx: &mut TestAppContext,
+    state: EditorState,
+) -> (
+    AnyWindowHandle,
+    Entity<MarkdownEditorState>,
+    Entity<ToggleableHarness>,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        let mut inner: Option<Entity<MarkdownEditorState>> = None;
+        let mut host: Option<Entity<ToggleableHarness>> = None;
+        let window = cx
+            .open_window(WindowOptions::default(), |window, cx| {
+                let editor = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
+                inner = Some(editor.clone());
+                let harness = cx.new(|_| ToggleableHarness {
+                    state: editor.clone(),
+                    disabled: false,
+                });
+                host = Some(harness.clone());
+                cx.new(|cx| Root::new(harness, window, cx))
+            })
+            .expect("open window");
+        (
+            window.into(),
+            inner.expect("editor built"),
+            host.expect("harness built"),
+        )
+    })
+}
+
+#[gpui::test]
+fn a_composition_cannot_outlive_the_editor_becoming_read_only(cx: &mut TestAppContext) {
+    // A host that renders the editor disabled mid-composition (accepting an
+    // inline edit, say) takes away the very path that would end the
+    // composition: the input handler is not registered while disabled, so the
+    // platform can no longer unmark. Left alone, `is_composing()` would answer
+    // true forever and a host would treat committed text as provisional for
+    // the rest of the editor's life.
+    let (handle, editor, host) = open_toggleable_editor(cx, EditorState::with_markdown("body"));
+    set_cursor(cx, handle, &editor, 4);
+    ime_insert(cx, handle, &editor, "n");
+    editor.read_with(cx, |e, _| assert!(e.is_composing()));
+
+    let changes = change_counter(cx, &editor);
+    host.update(cx, |h, cx| {
+        h.disabled = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    editor.read_with(cx, |e, _| {
+        assert!(!e.is_composing(), "becoming read-only ends the composition");
+        assert_eq!(e.value(), "bodyn", "the composed bytes stay");
+    });
+    assert_eq!(changes.get(), 1, "and it is reported like any other ending");
+}
+
+#[gpui::test]
+fn a_composition_cannot_outlive_the_editor_losing_focus(cx: &mut TestAppContext) {
+    // The other lifecycle exit: gpui routes IME to the focused handle, so once
+    // focus leaves, no platform path can end the composition — Wayland's
+    // `text_input` `Leave` tells the client nothing at all. A marking that
+    // survived would also mis-target the *next* composition, which falls back
+    // to it as the range to replace.
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown("body"));
+    let focus = editor.read_with(cx, |e, _| e.focus_handle.clone());
+    cx.update_window(handle, |_, window, cx| focus.focus(window, cx))
+        .unwrap();
+    cx.run_until_parked();
+    set_cursor(cx, handle, &editor, 4);
+    ime_insert(cx, handle, &editor, "n");
+    editor.read_with(cx, |e, _| assert!(e.is_composing()));
+
+    let changes = change_counter(cx, &editor);
+    cx.update_window(handle, |_, window, _| window.blur())
+        .unwrap();
+    cx.run_until_parked();
+
+    editor.read_with(cx, |e, _| {
+        assert!(!e.is_composing(), "losing focus ends the composition");
+        assert_eq!(e.value(), "bodyn", "the composed bytes stay");
+    });
+    assert_eq!(changes.get(), 1, "and it is reported like any other ending");
 }
