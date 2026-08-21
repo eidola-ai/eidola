@@ -10158,3 +10158,106 @@ fn theme_colors_follow_a_live_mode_flip_and_an_override_survives_it(cx: &mut Tes
         assert_eq!(style.table_rule_color, fresh.table_rule_color);
     });
 }
+
+/// Count `Change` events from now on.
+fn change_counter(
+    cx: &mut TestAppContext,
+    editor: &Entity<MarkdownEditorState>,
+) -> std::rc::Rc<std::cell::Cell<usize>> {
+    let changes = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = changes.clone();
+    cx.update(|cx| {
+        cx.subscribe(editor, move |_, event: &MarkdownEditorEvent, _| {
+            if matches!(event, MarkdownEditorEvent::Change) {
+                counter.set(counter.get() + 1);
+            }
+        })
+        .detach();
+    });
+    changes
+}
+
+/// The platform dropping the marking without replacement text
+/// (`EntityInputHandler::unmark_text`) — a click elsewhere while composing, an
+/// input-source switch.
+fn ime_unmark(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    editor: &Entity<MarkdownEditorState>,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |e, cx| e.unmark_text(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn every_way_a_composition_ends_reports_one_change(cx: &mut TestAppContext) {
+    // The other half of `is_composing`: a host skips `Change` while a
+    // composition is live, so the end of one owes it exactly one `Change` —
+    // whatever ended it. A composition that ends silently leaves that host
+    // holding text it was told to ignore.
+    let ends: Vec<(
+        &str,
+        Box<dyn Fn(&mut TestAppContext, AnyWindowHandle, &Entity<MarkdownEditorState>)>,
+    )> = vec![
+        (
+            "the platform unmarking it",
+            Box::new(|cx, handle, editor| ime_unmark(cx, handle, editor)),
+        ),
+        (
+            "a caret move",
+            Box::new(|cx, handle, editor| dispatch(cx, handle, editor, Right)),
+        ),
+        (
+            "a vertical move",
+            Box::new(|cx, handle, editor| dispatch(cx, handle, editor, Down)),
+        ),
+        (
+            "Home",
+            Box::new(|cx, handle, editor| dispatch(cx, handle, editor, Home)),
+        ),
+        (
+            "End",
+            Box::new(|cx, handle, editor| dispatch(cx, handle, editor, End)),
+        ),
+    ];
+
+    for (what, end_it) in ends {
+        let (handle, editor) = open_editor(cx, EditorState::with_markdown("before\n\nafter"));
+        set_cursor(cx, handle, &editor, 6);
+        ime_insert(cx, handle, &editor, "n");
+        editor.read_with(cx, |e, _| assert!(e.is_composing(), "{what}: composing"));
+
+        let changes = change_counter(cx, &editor);
+        end_it(cx, handle, &editor);
+
+        editor.read_with(cx, |e, _| {
+            assert!(!e.is_composing(), "{what}: composition ended");
+            // The marked bytes stay — they are ordinary text now.
+            assert!(e.value().starts_with("beforen"), "{what}: text kept");
+        });
+        assert_eq!(
+            changes.get(),
+            1,
+            "{what}: ends the composition with exactly one Change",
+        );
+    }
+}
+
+#[gpui::test]
+fn committing_a_composition_reports_one_change_not_two(cx: &mut TestAppContext) {
+    // The commit path replaces the marked text through two internal dispatches;
+    // only one of them is this step, so a host re-deriving on `Change` does the
+    // work once.
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(""));
+    ime_insert(cx, handle, &editor, "ni");
+    let changes = change_counter(cx, &editor);
+    ime_commit(cx, handle, &editor, "に");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "に");
+        assert!(!e.is_composing());
+    });
+    assert_eq!(changes.get(), 1);
+}
