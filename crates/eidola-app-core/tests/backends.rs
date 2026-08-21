@@ -931,3 +931,80 @@ fn a_re_added_backend_does_not_inherit_its_predecessors_error() {
         );
     });
 }
+
+/// Retiring a backend that has no live engine but *does* have a standing
+/// failure still changes what the local-model snapshot shows — so it has to
+/// say so on the bus.
+///
+/// Retirement has two effects: it stops engines and it forgets those engines'
+/// reports. A subscriber that refreshes the snapshot on its documented
+/// invalidation would otherwise go on rendering an error that is gone.
+#[test]
+fn retiring_a_backend_that_only_has_a_failure_still_invalidates() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let models = dir.path().join("box-models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("tiny.gguf"), b"gguf").unwrap();
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &models.display().to_string(),
+                // Spawns and exits immediately: a standing load failure, and
+                // no engine left behind to be retired.
+                Some("/usr/bin/false"),
+                true,
+            )))
+            .expect("add");
+        core.runtime()
+            .block_on(core.load_local_model("tiny@my-box".into()))
+            .expect_err("/usr/bin/false exits during load");
+        assert!(
+            core.running_engines().is_empty(),
+            "precondition: the failed load left no engine — only its report"
+        );
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.remove_backend("my-box".into()))
+            .expect("remove");
+
+        let emitted = drain(&mut rx);
+        assert!(
+            emitted.contains(&Change::LocalModels),
+            "forgetting the report is a local-models change: {emitted:?}"
+        );
+    });
+}
+
+/// ...and a retirement that changes nothing stays silent. Widening the
+/// condition to "either effect happened" must not become "emit always": a
+/// spurious invalidation on every disable is its own regression.
+#[test]
+fn retiring_a_backend_with_nothing_to_retire_emits_nothing() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let models = dir.path().join("box-models");
+        std::fs::create_dir_all(&models).unwrap();
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &models.display().to_string(),
+                None,
+                true,
+            )))
+            .expect("add");
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.set_backend_enabled("my-box".into(), false))
+            .expect("disable");
+
+        let emitted = drain(&mut rx);
+        assert_eq!(
+            emitted,
+            vec![Change::Backends],
+            "no engine, no report: the registry change is the only news"
+        );
+    });
+}

@@ -329,6 +329,37 @@ impl EngineInstance {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BackendEpoch(u64);
 
+/// What retiring a backend actually did.
+///
+/// Retirement has **two** effects — it stops that backend's engines and it
+/// forgets what those engines had to say — and a caller deciding whether
+/// anything needs re-rendering has to hear about both. (It has a third: the
+/// backend's [`BackendEpoch`] moves, invalidating loads that are still
+/// in flight. That one is deliberately not summarised here, because it
+/// changes nothing anyone is rendering — a load far enough along to be
+/// visible has an entry, and entries are counted.) A count of engines was
+/// an honest summary while stopping them was the only effect; the moment
+/// forgetting reports joined it, that count started answering a different
+/// question than the one its caller was asking, and a backend whose engine had
+/// already failed (a standing report, nothing running) retired in silence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Retirement {
+    /// Engine supervisors signalled to stop.
+    pub(crate) engines: usize,
+    /// Standing engine reports forgotten.
+    pub(crate) reports: usize,
+}
+
+impl Retirement {
+    /// Whether anything a local-models snapshot renders actually changed.
+    /// `false` is a genuine no-op — nothing was running and nothing was being
+    /// reported — and its caller must stay silent, because an invalidation
+    /// nobody needs is its own defect.
+    pub(crate) fn changed(self) -> bool {
+        self.engines > 0 || self.reports > 0
+    }
+}
+
 /// A running (or warming-up) engine subprocess. The supervisor task owns
 /// the child process; this entry is the control handle.
 struct EngineEntry {
@@ -708,7 +739,10 @@ impl LocalRuntime {
     /// belongs to the file and carries the URL a retry needs (see
     /// [`EngineFailure`]), so it survives — retiring engines is not a reason
     /// to forget that a download failed.
-    fn take_backend_engines(&self, backend_id: &str) -> Vec<EngineEntry> {
+    /// Returns the entries (whose shutdown senders the caller owns) alongside
+    /// the number of reports forgotten, because the caller's question is
+    /// "did anything change?" and neither half answers it alone.
+    fn take_backend_engines(&self, backend_id: &str) -> (Vec<EngineEntry>, usize) {
         let mut engines = self.engines.lock().expect("engines lock");
         // Bumped under the `engines` lock, so a reservation either happened
         // before this sweep (and is in `engines`, and is taken below) or
@@ -721,16 +755,24 @@ impl LocalRuntime {
             .expect("backend epochs lock")
             .entry(backend_id.to_string())
             .or_insert(0) += 1;
+        let mut reports = 0usize;
         self.failures
             .lock()
             .expect("failures lock")
-            .retain(|(b, _), failure| b != backend_id || failure.source_url.is_some());
+            .retain(|(b, _), failure| {
+                let keep = b != backend_id || failure.source_url.is_some();
+                if !keep {
+                    reports += 1;
+                }
+                keep
+            });
         let keys: Vec<EngineKey> = engines
             .keys()
             .filter(|(b, _)| b == backend_id)
             .cloned()
             .collect();
-        keys.iter().filter_map(|k| engines.remove(k)).collect()
+        let entries = keys.iter().filter_map(|k| engines.remove(k)).collect();
+        (entries, reports)
     }
 
     /// Run `f` — the one place in this crate that starts a process — only
@@ -2187,8 +2229,8 @@ impl Inner {
         count
     }
 
-    /// Stop every engine registered under `backend_id`, returning how many
-    /// were signalled.
+    /// Stop every engine registered under `backend_id` and forget what those
+    /// engines had to say, returning what that came to ([`Retirement`]).
     ///
     /// Called when a backend row stops meaning what it meant — removed,
     /// disabled, or repointed at another models directory (see
@@ -2196,15 +2238,15 @@ impl Inner {
     /// outlive that). Like [`Self::unload_local_model`] this *signals*; the
     /// supervisor task owns the child and does the kill. It does not emit —
     /// the caller knows what else changed at the same moment.
-    pub(crate) fn retire_backend_engines(&self, backend_id: &str) -> usize {
-        let entries = self.local.take_backend_engines(backend_id);
-        let count = entries.len();
+    pub(crate) fn retire_backend_engines(&self, backend_id: &str) -> Retirement {
+        let (entries, reports) = self.local.take_backend_engines(backend_id);
+        let engines = entries.len();
         for entry in entries {
             // The supervisor may already be gone (crash path); the map
             // removal is the user-visible state either way.
             let _ = entry.shutdown.send(());
         }
-        count
+        Retirement { engines, reports }
     }
 
     /// Every engine the registry is holding, right now.
@@ -3076,7 +3118,7 @@ mod tests {
         let epoch = runtime.backend_epoch("my-box");
         // ...the backend is removed (or disabled, or repointed) while it is
         // still resolving files and ports...
-        assert!(runtime.take_backend_engines("my-box").is_empty());
+        assert!(runtime.take_backend_engines("my-box").0.is_empty());
         // ...and its reservation is refused when it finally arrives.
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let err = runtime
@@ -3175,7 +3217,13 @@ mod tests {
             failures.insert(other_backend.clone(), EngineFailure::load("exited"));
         }
 
-        runtime.take_backend_engines("local");
+        let (entries, reports) = runtime.take_backend_engines("local");
+        assert!(entries.is_empty(), "no engine was running");
+        assert_eq!(
+            reports, 1,
+            "the retirement reports what it forgot — the only thing that \
+             happened here, and what tells its caller to invalidate"
+        );
 
         let failures = runtime.failures.lock().expect("failures lock");
         assert!(
@@ -3201,12 +3249,12 @@ mod tests {
         runtime.register_for_test("my-box", "other", 5102);
         runtime.register_for_test("local", "tiny", 5103);
 
-        let taken = runtime.take_backend_engines("my-box");
+        let (taken, _reports) = runtime.take_backend_engines("my-box");
         assert_eq!(taken.len(), 2);
         assert!(!runtime.engine_present(&("my-box".into(), "tiny".into())));
         assert!(runtime.engine_present(&("local".into(), "tiny".into())));
         assert!(
-            runtime.take_backend_engines("my-box").is_empty(),
+            runtime.take_backend_engines("my-box").0.is_empty(),
             "idempotent"
         );
     }

@@ -561,12 +561,19 @@ impl Inner {
         Ok(())
     }
 
-    /// Stop every engine registered under `backend_id` — the row that gave
-    /// those engines their meaning has gone or changed, and an engine may not
-    /// outlive its configuration (`Inner::retire_backend_engines`). Emits
-    /// [`Change::LocalModels`] only when something was actually retired.
+    /// Stop every engine registered under `backend_id` and forget its engines'
+    /// standing reports — the row that gave both their meaning has gone or
+    /// changed, and neither may outlive its configuration
+    /// (`Inner::retire_backend_engines`).
+    ///
+    /// Emits [`Change::LocalModels`] when *either* of those happened, since
+    /// either changes what the snapshot renders — a backend whose engine had
+    /// already failed has no engine to stop and a report to forget, and that
+    /// is precisely the case a count of engines could not see. A retirement
+    /// that finds nothing stays silent: an invalidation nobody needs would
+    /// redraw every subscriber on every disable.
     fn retire_engines_for(&self, backend_id: &str) {
-        if self.retire_backend_engines(backend_id) > 0 {
+        if self.retire_backend_engines(backend_id).changed() {
             self.bus.emit(Change::LocalModels);
         }
     }
