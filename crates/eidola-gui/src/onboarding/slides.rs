@@ -29,7 +29,7 @@ use gpui_component::{
 };
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorState};
 
-use eidola_app_core::PriceInfo;
+use eidola_app_core::{PriceInfo, TermsDocument};
 
 use crate::plans::{self, format_credits};
 use crate::probe::Probe as _;
@@ -130,7 +130,15 @@ impl RenderOnce for Control {
         slide_frame(
             "control",
             Self::MARKDOWN,
-            Some(link_row("The Eidola code repository", REPO_URL, cx).into_any_element()),
+            Some(
+                link_row(
+                    "the-eidola-code-repository",
+                    "The Eidola code repository",
+                    REPO_URL,
+                    cx,
+                )
+                .into_any_element(),
+            ),
             cta_button("control", "I understand.", self.on_advance).into_any_element(),
             window,
             cx,
@@ -244,15 +252,34 @@ impl RenderOnce for GetStarted {
 /// New-account branch: agree to terms, create an anonymous account. The
 /// create button stays disabled until the agreement checkbox is checked — an
 /// explicit, required consent step separate from the action.
+///
+/// **What this slide links to is what account creation submits.** The
+/// documents come from `AccountStore::terms` (the server's current snapshot)
+/// and travel back into `AppCore::account_create` unchanged, so agreement is
+/// recorded for the versions named here or not at all. Until that snapshot
+/// has arrived there is nothing to agree to, and the CTA stays disabled.
 #[derive(IntoElement)]
 pub(super) struct CreateAccount {
-    /// Whether the terms/privacy agreement checkbox is checked.
+    /// The documents whose acceptance creating an account will record, or
+    /// `None` while the snapshot has not arrived. An empty list is a loaded
+    /// answer — a server running no acceptance gate — and the published
+    /// policies are linked instead.
+    pub documents: Option<Vec<TermsDocument>>,
+    /// Set while the snapshot is being fetched (the initial load only).
+    pub loading_documents: bool,
+    /// Why the snapshot could not be read, if it could not be.
+    pub documents_error: Option<String>,
+    /// Whether the agreement box reads as checked — derived by the parent
+    /// from whether the reader's consent still covers `documents`, never a
+    /// stored flag. False therefore also covers "agreed to an earlier
+    /// snapshot", which is why it alone gates the CTA.
     pub agreed: bool,
     /// Whether an account-create request is in flight.
     pub creating: bool,
     pub error: Option<String>,
     pub on_toggle_agree: OnToggle,
     pub on_create: OnClick,
+    pub on_retry_documents: OnClick,
 }
 
 impl CreateAccount {
@@ -262,13 +289,68 @@ impl CreateAccount {
 
 impl RenderOnce for CreateAccount {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let extras = v_flex()
-            .gap_3()
-            .child(link_row("Terms of Service", TERMS_URL, cx))
-            .child(link_row("Privacy Policy", PRIVACY_URL, cx))
+        let theme = cx.theme();
+        let have_documents = self.documents.is_some();
+        let mut extras = v_flex().gap_3();
+        match self.documents.as_deref() {
+            // A server with no acceptance gate: nothing to record, but the
+            // published policies still govern, so they are still linked.
+            Some([]) => {
+                extras = extras
+                    .child(link_row(
+                        "terms-of-service",
+                        "Terms of Service",
+                        TERMS_URL,
+                        cx,
+                    ))
+                    .child(link_row(
+                        "privacy-policy",
+                        "Privacy Policy",
+                        PRIVACY_URL,
+                        cx,
+                    ));
+            }
+            Some(docs) => {
+                for doc in docs {
+                    let (slug, label) = document_link(doc);
+                    extras = extras.child(link_row(&slug, label, doc.url.clone(), cx));
+                }
+            }
+            None if self.loading_documents => {
+                extras = extras.child(
+                    div()
+                        .id("onboarding-terms-loading")
+                        .probe(
+                            "onboarding/terms/loading",
+                            Role::Label,
+                            "Checking the current documents…",
+                        )
+                        .text_color(theme.muted_foreground)
+                        .child("Checking the current documents…"),
+                );
+            }
+            None => {}
+        }
+        if let Some(err) = self.documents_error {
+            extras = extras.child(error_line("terms", err, cx)).child(
+                div()
+                    .id("onboarding-terms-retry")
+                    .probe("onboarding/terms/retry", Role::Button, "Try again")
+                    .cursor_pointer()
+                    .text_color(theme.link)
+                    .hover(|s| s.underline())
+                    .child("Try again")
+                    .on_click(self.on_retry_documents),
+            );
+        }
+        let extras = extras
             .child(
                 // Required consent — the "Create a new account." button
-                // stays disabled until this is checked.
+                // stays disabled until this is checked. **Inert until the
+                // documents are on screen**: consent binds to a particular
+                // snapshot (`OnboardingView::set_agreement`), so a click with
+                // nothing loaded would have no text to be agreement to, and a
+                // box that ticked anyway would be claiming one.
                 div()
                     .id("onboarding-agree")
                     .pt_10()
@@ -281,16 +363,21 @@ impl RenderOnce for CreateAccount {
                     // macOS adapter reads `accessibilityValue` off `toggled()`
                     // and consults `is_selected()` only for `Role::Tab`.
                     .aria_toggled(self.agreed.into())
-                    .on_click({
-                        let toggle = self.on_toggle_agree;
-                        let next = !self.agreed;
-                        move |_, window, cx| toggle(&next, window, cx)
+                    .map(|d| {
+                        if have_documents {
+                            let toggle = self.on_toggle_agree;
+                            let next = !self.agreed;
+                            d.on_click(move |_, window, cx| toggle(&next, window, cx))
+                        } else {
+                            d.tab_stop(false)
+                        }
                     })
                     .child(
                         Checkbox::new("onboarding-agree-box")
                             .role(None)
                             .label("I agree to the Terms of Service and Privacy Policy.")
                             .checked(self.agreed)
+                            .disabled(!have_documents)
                             .tab_stop(false)
                             .p_1(),
                     ),
@@ -304,6 +391,10 @@ impl RenderOnce for CreateAccount {
         } else {
             "Create a new account."
         };
+        // `agreed` is derived from the consent binding, not a stored flag:
+        // it is true only while the reader's agreement covers the snapshot
+        // being rendered, so "no documents" and "documents the agreement no
+        // longer covers" are the same disabled state, not two conditions.
         let enabled = self.agreed && !self.creating;
         let cta = div()
             .id("onboarding-cta-create")
@@ -725,27 +816,48 @@ pub(super) fn back_button(
         )
 }
 
-/// A standalone clickable external link line ("Label ↗").
-fn link_row(label: &'static str, url: &'static str, cx: &App) -> impl IntoElement {
+/// A standalone clickable external link line ("Label ↗"). `slug` names the
+/// probe and is **stable by contract** — it never carries anything that moves
+/// (a document version, a fetched title), because a probe name is a selector.
+fn link_row(
+    slug: &str,
+    label: impl Into<SharedString>,
+    url: impl Into<SharedString>,
+    cx: &App,
+) -> impl IntoElement {
     let theme = cx.theme();
-    let slug: String = label
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect();
+    let label: SharedString = label.into();
+    let url: SharedString = url.into();
     div()
-        .id(SharedString::from(format!("onboarding-link-{label}")))
+        .id(SharedString::from(format!("onboarding-link-{slug}")))
         .probe(
             SharedString::from(format!("onboarding/link/{slug}")),
             Role::Link,
-            label,
+            label.clone(),
         )
         .w_full()
         .cursor_pointer()
         .text_color(theme.link)
         .hover(|s| s.underline())
         .child(SharedString::from(format!("{label} ↗")))
-        .on_click(move |_, _, cx| cx.open_url(url))
+        .on_click(move |_, _, cx| cx.open_url(url.as_ref()))
+}
+
+/// Slug and display label for a required document. The **slug is derived from
+/// the document key**, which is the wire identifier and does not move; the
+/// label carries the version, which does.
+fn document_link(doc: &TermsDocument) -> (String, String) {
+    let slug: String = doc
+        .document
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let name = match doc.document.as_str() {
+        "terms_of_service" => "Terms of Service".to_string(),
+        "privacy_policy" => "Privacy Policy".to_string(),
+        other => other.replace('_', " "),
+    };
+    (slug, format!("{name} (version {})", doc.version))
 }
 
 /// A labeled single-line credential value in mono, with a Copy affordance.

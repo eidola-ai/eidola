@@ -2468,7 +2468,7 @@ fn a_refused_account_operation_leaves_the_subscription_alone(cx: &mut TestAppCon
     // is an identity change.
     let _create = stores
         .account
-        .read_with(cx, |s, _| s.request_account_create());
+        .read_with(cx, |s, _| s.request_account_create(Vec::new()));
     let _verify = stores.account.read_with(cx, |s, _| {
         s.request_verify_account("acct".into(), "secret".into())
     });

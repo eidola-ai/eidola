@@ -51,8 +51,8 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use eidola_app_core::SubscriptionState;
 use eidola_app_core::error::AppError;
+use eidola_app_core::{SubscriptionState, TermsDocument};
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, IsZero, ParentElement, Pixels, Render, ScrollHandle, SharedString,
@@ -72,6 +72,22 @@ use crate::stores::Stores;
 use crate::titlebar;
 
 mod slides;
+
+/// The identity of a terms snapshot **for consent purposes**: every document
+/// paired with the SHA-256 of the exact text linked for it, sorted so a
+/// reordered listing of the same texts stays the same thing to agree to.
+///
+/// Version numbers are deliberately not part of it — the hash *is* the text,
+/// and it is also the half the server matches on when acceptance is
+/// submitted, so agreeing and recording are keyed to the same value.
+fn consent_fingerprint(documents: &[TermsDocument]) -> Vec<(String, String)> {
+    let mut fingerprint: Vec<(String, String)> = documents
+        .iter()
+        .map(|d| (d.document.clone(), d.sha256.clone()))
+        .collect();
+    fingerprint.sort();
+    fingerprint
+}
 
 /// Fraction of the window's content height within which a *released* scroll
 /// gesture counts as "near" a slide boundary and snaps onto it (proximity
@@ -126,9 +142,21 @@ pub struct OnboardingView {
     revealed: Vec<Slide>,
 
     // -- Account creation (new-account branch) ----------------------------
-    /// Whether the terms/privacy agreement checkbox is checked (gates the
-    /// "Create a new account." button on [`Slide::CreateAccount`]).
-    agreed: bool,
+    /// The documents this reader affirmatively agreed to, as the
+    /// `(document, sha256)` pairs that were on screen when the agreement box
+    /// was checked. `None` = not checked.
+    ///
+    /// **Deliberately not a `bool`.** "The box is checked" is a claim about
+    /// *particular text*, and a bare flag outlives the snapshot it was
+    /// checked for: step back to "Get started", return to this slide while a
+    /// new version has been published, and the refreshed snapshot would be
+    /// created against consent given for the previous one. Holding what was
+    /// agreed to makes that state unrepresentable rather than something each
+    /// future refresh site has to remember to clear — the box reads as
+    /// checked exactly while this still matches the snapshot in hand, and
+    /// [`OnboardingView::consented_terms`] is the only way to obtain the
+    /// value creation submits.
+    agreed_to: Option<Vec<(String, String)>>,
     creating: bool,
     /// The freshly created (id, secret) to present on [`Slide::NewAccount`].
     created: Option<(SharedString, SharedString)>,
@@ -191,7 +219,7 @@ impl OnboardingView {
             focus_handle,
             _subs,
             revealed: vec![Slide::Pause],
-            agreed: false,
+            agreed_to: None,
             creating: false,
             created: None,
             create_error: None,
@@ -246,6 +274,21 @@ impl OnboardingView {
         self.slide_tops(window)
     }
 
+    /// Whether an account-create request is in flight — on a stub store the
+    /// request stops at the no-core guard, so this marker is what says the
+    /// view decided to create at all.
+    #[doc(hidden)]
+    pub fn creating_for_test(&self) -> bool {
+        self.creating
+    }
+
+    /// Whether the agreement box reads as checked — i.e. whether this
+    /// reader's consent still covers the snapshot in hand.
+    #[doc(hidden)]
+    pub fn agreed_for_test(&self, cx: &App) -> bool {
+        self.consented_terms(cx).is_some()
+    }
+
     /// The freshly-created account id + secret, if account creation succeeded.
     #[doc(hidden)]
     pub fn created_for_test(&self) -> Option<(String, String)> {
@@ -291,6 +334,13 @@ impl OnboardingView {
             self.stores
                 .account
                 .update(cx, |s, cx| s.refresh_subscription(cx));
+        }
+        // The consent slide must show the versions creation will submit, so
+        // the snapshot is fetched when the slide is revealed rather than held
+        // from launch — the fresher it is, the less chance the server refuses
+        // it as stale on the way back out.
+        if next == Slide::CreateAccount {
+            self.stores.account.update(cx, |s, cx| s.refresh_terms(cx));
         }
         self.pending_scroll = Some(target);
         cx.notify();
@@ -431,18 +481,68 @@ impl OnboardingView {
         self.leave(window, cx);
     }
 
+    /// Record or withdraw agreement to the documents **currently on screen**.
+    ///
+    /// Checking the box binds consent to that snapshot; any later snapshot it
+    /// does not match leaves the box unchecked, because agreement to one text
+    /// is not agreement to another. Checking with nothing loaded records
+    /// nothing — there is no text to have agreed to, which is why the
+    /// checkbox is inert in that state rather than storing an empty consent.
+    pub fn set_agreement(&mut self, checked: bool, cx: &mut Context<Self>) {
+        let fingerprint = if checked {
+            self.stores
+                .account
+                .read(cx)
+                .terms()
+                .value()
+                .map(|docs| consent_fingerprint(docs))
+        } else {
+            None
+        };
+        self.agreed_to = fingerprint;
+        cx.notify();
+    }
+
+    /// The documents this reader agreed to **and that are still the ones in
+    /// hand** — `None` when no snapshot is loaded, the box is unchecked, or
+    /// the snapshot moved since it was checked.
+    ///
+    /// One predicate, two readers: the CTA's enabled state and
+    /// [`OnboardingView::begin_create`] both go through it, so "the button
+    /// is live" and "there is something to submit" cannot disagree, and
+    /// stale consent lands in the same disabled state as no consent at all.
+    /// It is re-evaluated at the click, not cached from the render, so a
+    /// refresh landing between the two is caught too.
+    fn consented_terms(&self, cx: &App) -> Option<Vec<TermsDocument>> {
+        let documents = self.stores.account.read(cx).terms().value()?.clone();
+        let agreed_to = self.agreed_to.as_ref()?;
+        (*agreed_to == consent_fingerprint(&documents)).then_some(documents)
+    }
+
     /// Create an anonymous account (new-account branch). On success, store the
     /// id/secret, refresh config + balances, and reveal the "Your new account"
     /// slide; on failure, surface the error inline.
+    ///
+    /// Creation carries **the snapshot this reader agreed to**, and gets it
+    /// from `consented_terms` — the same predicate that lit the button — so
+    /// there is no path that submits documents the agreement did not cover.
     pub fn begin_create(&mut self, cx: &mut Context<Self>) {
         if self.creating {
             return;
         }
+        let Some(accepted_terms) = self.consented_terms(cx) else {
+            return;
+        };
         self.creating = true;
         self.create_error = None;
         cx.notify();
 
-        let Some(rx) = self.stores.account.read(cx).request_account_create() else {
+        let Some(rx) = self
+            .stores
+            .account
+            .read(cx)
+            .request_account_create(accepted_terms)
+        else {
             // Stub / no backend: the in-flight marker is the observable state.
             return;
         };
@@ -858,17 +958,34 @@ impl OnboardingView {
                 ),
             }
             .into_any_element(),
-            Slide::CreateAccount => slides::CreateAccount {
-                agreed: self.agreed,
-                creating: self.creating,
-                error: self.create_error.clone(),
-                on_toggle_agree: Box::new(cx.listener(|this, checked: &bool, _, cx| {
-                    this.agreed = *checked;
-                    cx.notify();
-                })),
-                on_create: Box::new(cx.listener(|this, _, _, cx| this.begin_create(cx))),
+            Slide::CreateAccount => {
+                let (documents, loading_documents, documents_error) = {
+                    let terms = self.stores.account.read(cx).terms();
+                    (
+                        terms.value().cloned(),
+                        terms.is_loading(),
+                        terms.error().map(|e| e.to_string()),
+                    )
+                };
+                slides::CreateAccount {
+                    documents,
+                    loading_documents,
+                    documents_error,
+                    // Derived, never stored: the box reads as checked only
+                    // while the consent still covers the snapshot on screen.
+                    agreed: self.consented_terms(cx).is_some(),
+                    creating: self.creating,
+                    error: self.create_error.clone(),
+                    on_toggle_agree: Box::new(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_agreement(*checked, cx);
+                    })),
+                    on_create: Box::new(cx.listener(|this, _, _, cx| this.begin_create(cx))),
+                    on_retry_documents: Box::new(cx.listener(|this, _, _, cx| {
+                        this.stores.account.update(cx, |s, cx| s.refresh_terms(cx));
+                    })),
+                }
+                .into_any_element()
             }
-            .into_any_element(),
             Slide::NewAccount => {
                 let (id, secret) = self.created.clone().unwrap_or_default();
                 slides::NewAccount {

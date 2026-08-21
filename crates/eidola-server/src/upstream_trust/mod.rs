@@ -70,7 +70,7 @@ pub type AttestingClientFactory = Arc<
 /// before we've picked up its measurement, requests fail closed until the
 /// next tick. 10 minutes keeps that window small while staying well within
 /// GitHub's unauthenticated rate limit (~3 calls/refresh).
-const DEFAULT_REFRESH_SECS: u64 = 600;
+pub const DEFAULT_REFRESH_SECS: u64 = 600;
 
 /// Holds the current attesting client and the state needed to refresh it.
 /// Shared as `Arc<UpstreamTrust>`; the backend holds a clone of the inner
@@ -178,14 +178,15 @@ impl UpstreamTrust {
         self.client.clone()
     }
 
-    /// Spawn the periodic refresh task. Interval comes from
-    /// `TINFOIL_MEASUREMENT_REFRESH_SECS` (default hourly).
-    pub fn spawn_refresh(self: Arc<Self>) {
-        let interval = std::env::var("TINFOIL_MEASUREMENT_REFRESH_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(DEFAULT_REFRESH_SECS));
+    /// Spawn the periodic refresh task, ticking every `interval`.
+    ///
+    /// The period is a *configuration* input (`TINFOIL_MEASUREMENT_REFRESH_SECS`,
+    /// parsed and validated at startup) rather than something read here: this
+    /// task is detached, so a zero period would panic it — leaving the server
+    /// serving on its bootstrap allowlist alone, and every upstream attestation
+    /// failing from the next router deploy until someone restarts the process.
+    pub fn spawn_refresh(self: Arc<Self>, interval: Duration) {
+        debug_assert!(!interval.is_zero(), "refresh interval must be non-zero");
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
