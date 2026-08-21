@@ -13,10 +13,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Edges, Element, ElementId, ElementInputHandler, Entity,
-    FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels,
-    Point, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, Style, TextRun,
-    Window, WrappedLine, fill, point, px, quad, relative, size,
+    App, BorderStyle, Bounds, ContentMask, Corners, Edges, Element, ElementId, ElementInputHandler,
+    Entity, FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, Style,
+    TextRun, Window, WrappedLine, fill, point, px, quad, relative, size,
 };
 use smallvec::SmallVec;
 
@@ -725,6 +725,69 @@ fn compute_image_row_extra(
     }
 }
 
+/// Bounds of the 着重号 emphasis dots for one shaped line — one square
+/// per emphasized CJK character, centered under its glyph.
+///
+/// `WrappedLine::paint` draws glyphs only, so the dots are their own
+/// pass, exactly like the inline-code chip background. Everything the
+/// geometry needs is already solved: `position_for_index` gives each
+/// glyph's leading and trailing edge on its wrap row, and the row-local
+/// baseline is the one the math overlays sit on.
+///
+/// The dot sits in the descender space below the baseline, so it never
+/// reaches the row beneath — even at the tightest line height, where a
+/// mark that overflowed would read as belonging to the wrong line.
+#[allow(clippy::too_many_arguments)]
+fn emphasis_dot_bounds(
+    line: &WrappedLine,
+    display_to_source: &[usize],
+    origin: Point<Pixels>,
+    row_stride: Pixels,
+    row_height: Pixels,
+    block: &RenderBlock,
+    style: &MarkdownStyle,
+    font_size: Pixels,
+    body_ascent: Pixels,
+    body_descent: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    let mut out = Vec::new();
+    if block.inlines.iter().all(|run| !run.style.emphasis_dots) {
+        return out;
+    }
+    let diameter = (font_size * style.emphasis_dot_size_factor).max(px(1.5));
+    let radius = diameter / 2.0;
+    let half_leading = ((row_height - body_ascent - body_descent) / 2.0).max(px(0.0));
+    let drop = font_size * style.emphasis_dot_baseline_offset_factor;
+    for (i, ch) in line.text.char_indices() {
+        if !crate::cjk::takes_emphasis_dot(ch) {
+            continue;
+        }
+        let Some(&src) = display_to_source.get(i) else {
+            continue;
+        };
+        if !effective_inline_style(src, block).emphasis_dots {
+            continue;
+        }
+        let Some(lead) = line.position_for_index(i, row_stride) else {
+            continue;
+        };
+        // A character that ends its wrap row has no trailing edge on
+        // the same row; a CJK glyph is an em square, so its own font
+        // size is the honest width to center within.
+        let advance = match line.position_for_index(i + ch.len_utf8(), row_stride) {
+            Some(trail) if trail.y == lead.y => trail.x - lead.x,
+            _ => font_size,
+        };
+        let center_x = origin.x + lead.x + advance / 2.0;
+        let baseline = origin.y + lead.y + half_leading + body_ascent;
+        out.push(Bounds::new(
+            point(center_x - radius, baseline + drop - radius),
+            size(diameter, diameter),
+        ));
+    }
+    out
+}
+
 /// Combine math and image row extras for one shaped line. Both
 /// kinds of overlay can contribute to the same row (a mixed-content
 /// paragraph might have inline math next to inline icons); take the
@@ -1264,6 +1327,10 @@ struct EmbedLayoutOut {
     /// strip, because an embed collapses the fence rows that frame would
     /// need — the panel *is* the content area.
     code_panels: Vec<Bounds<Pixels>>,
+    /// 着重号 emphasis dots under emphasized CJK characters, relative
+    /// bounds — the same pass the editor's own lines get, re-emitted here
+    /// because only the *shaping* path is shared.
+    emphasis_dots: Vec<Bounds<Pixels>>,
     size: Size<Pixels>,
 }
 
@@ -1435,6 +1502,7 @@ fn layout_embed(
         rules: Vec::new(),
         bars: Vec::new(),
         code_panels: Vec::new(),
+        emphasis_dots: Vec::new(),
         size: Size::default(),
     };
     let mut y = px(0.0);
@@ -1589,6 +1657,18 @@ fn layout_embed(
                             &mut out.math,
                         );
                         shaped_rows.push((sl.source_range.clone(), row_y));
+                        out.emphasis_dots.extend(emphasis_dot_bounds(
+                            &sl.line,
+                            &sl.display_to_source,
+                            point(text_left, row_y),
+                            row_stride,
+                            line_height,
+                            &b,
+                            style,
+                            font_size,
+                            body_ascent,
+                            body_descent,
+                        ));
                         out.pieces.push(EmbedPiece {
                             line: sl.line,
                             rel_origin: point(text_left, paint_y),
@@ -1653,6 +1733,7 @@ struct EmbedPaint {
     rules: Vec<(Bounds<Pixels>, bool)>,
     bars: Vec<Bounds<Pixels>>,
     code_panels: Vec<Bounds<Pixels>>,
+    emphasis_dots: Vec<Bounds<Pixels>>,
     /// The embed's own quote bar (the container chrome).
     bar: Bounds<Pixels>,
     /// Full content bounds — the clip mask and the selection-wash rect.
@@ -2532,6 +2613,10 @@ impl Element for BlockElement {
                     panel.origin.x += origin.x;
                     panel.origin.y += origin.y;
                 }
+                for dot in &mut layout.emphasis_dots {
+                    dot.origin.x += origin.x;
+                    dot.origin.y += origin.y;
+                }
                 let content_bounds = Bounds::new(
                     point(block_left, block_top),
                     size(block_width, (block_bottom - block_top).max(px(0.0))),
@@ -2545,6 +2630,7 @@ impl Element for BlockElement {
                     rules: layout.rules,
                     bars: layout.bars,
                     code_panels: layout.code_panels,
+                    emphasis_dots: layout.emphasis_dots,
                     bar: Bounds::new(
                         point(block_left + style.blockquote_border_inset, block_top),
                         size(
@@ -2889,6 +2975,13 @@ impl Element for BlockElement {
                     m.layout
                         .paint(m.rel_origin, m.em_px, self.style.text_color, window, cx);
                 }
+                for dot in &ep.emphasis_dots {
+                    let radius = dot.size.width / 2.0;
+                    window.paint_quad(
+                        fill(*dot, self.style.emphasis_dot_color)
+                            .corner_radii(Corners::all(radius)),
+                    );
+                }
             });
             // Record what was painted (moving, not cloning — `ep` is dropped
             // here regardless). See `LaidOutBlock::embed_content`.
@@ -3048,6 +3141,10 @@ impl Element for BlockElement {
                         cx,
                     );
                 }
+                // Emphasis dots under emphasized CJK characters, in
+                // the same over-the-text / under-the-cursor band as
+                // the overlays below.
+                paint_emphasis_dots(&prepaint.laid_out.lines, &self.block, &self.style, window);
                 // Inline math overlays paint *after* the line text (so
                 // they sit on top of the NBSP placeholders that
                 // reserved the space) but *before* the cursor (so the
@@ -3555,6 +3652,39 @@ fn paint_inline_image_overlays(
             line.origin.y + local.y + (line.row_height - spec.display_size.height) / 2.0;
         let bounds = Bounds::new(point(image_left, image_top), spec.display_size);
         crate::image::paint(spec.image.clone(), bounds, window);
+    }
+}
+
+/// Paint the 着重号 emphasis dots for every laid-out line of a block.
+fn paint_emphasis_dots(
+    lines: &[LaidOutLine],
+    block: &RenderBlock,
+    style: &MarkdownStyle,
+    window: &mut Window,
+) {
+    if !block.inlines.iter().any(|run| run.style.emphasis_dots) {
+        return;
+    }
+    let font_size = font_size_for_block(&block.kind, style);
+    let (body_ascent, body_descent) = body_metrics_for_block(&block.kind, style, font_size, window);
+    for line in lines {
+        for bounds in emphasis_dot_bounds(
+            &line.line,
+            &line.display_to_source,
+            line.origin,
+            line.row_stride,
+            line.row_height,
+            block,
+            style,
+            font_size,
+            body_ascent,
+            body_descent,
+        ) {
+            let radius = bounds.size.width / 2.0;
+            window.paint_quad(
+                fill(bounds, style.emphasis_dot_color).corner_radii(Corners::all(radius)),
+            );
+        }
     }
 }
 
@@ -4425,7 +4555,12 @@ fn build_runs_for_line(
         } else if base_weight != FontWeight::NORMAL {
             run_font.weight = base_weight;
         }
-        if merged.italic {
+        // Emphasized CJK takes 着重号 dots instead of an italic face —
+        // no CJK face has one, and `FontStyle::Italic` there is worse
+        // than a no-op (see `crate::cjk`). `italic` still covers the
+        // whole emphasized span, so the Latin parts of a mixed span
+        // shape italic and only the marked sub-runs opt out.
+        if merged.italic && !merged.emphasis_dots {
             run_font.style = FontStyle::Italic;
         }
 
@@ -4903,6 +5038,221 @@ mod tests {
             px(0.0)
         })
         .expect("update window")
+    }
+
+    /// Shape a document's first paragraph and return the emphasis-dot
+    /// bounds the paint pass would draw, in layout order.
+    fn emphasis_dots_for(cx: &mut TestAppContext, src: &str) -> Vec<Bounds<Pixels>> {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph block");
+            let font_size = font_size_for_block(&block.kind, &style);
+            let line_height = font_size * style.line_height.0;
+            let (body_ascent, body_descent) =
+                body_metrics_for_block(&block.kind, &style, font_size, window);
+            let shaped = shape_block_lines(
+                &src_owned,
+                block,
+                &style,
+                font_size,
+                Some(px(720.0)),
+                window,
+            );
+            let mut out = Vec::new();
+            for sl in shaped {
+                out.extend(emphasis_dot_bounds(
+                    &sl.line,
+                    &sl.display_to_source,
+                    point(px(0.0), px(0.0)),
+                    line_height,
+                    line_height,
+                    block,
+                    &style,
+                    font_size,
+                    body_ascent,
+                    body_descent,
+                ));
+            }
+            out
+        })
+        .expect("update window")
+    }
+
+    /// The `(text, is_italic)` of every shaped run of a document's first
+    /// paragraph — what `WrappedLine` is actually asked to draw.
+    fn run_italics(cx: &mut TestAppContext, src: &str) -> Vec<(String, bool)> {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph block");
+            let font_size = font_size_for_block(&block.kind, &style);
+            let shaped = shape_block_lines(
+                &src_owned,
+                block,
+                &style,
+                font_size,
+                Some(px(720.0)),
+                window,
+            );
+            let sl = shaped.into_iter().next().expect("a shaped line");
+            let runs = build_runs_for_line(&sl.line.text, &sl.display_to_source, block, &style);
+            let mut out = Vec::new();
+            let mut at = 0usize;
+            for run in runs {
+                let text = sl.line.text[at..at + run.len].to_string();
+                out.push((text, run.font.style == FontStyle::Italic));
+                at += run.len;
+            }
+            out
+        })
+        .expect("update window")
+    }
+
+    #[gpui::test]
+    fn emphasized_cjk_shapes_upright_while_latin_beside_it_shapes_italic(cx: &mut TestAppContext) {
+        // The whole span is emphasized, and the shaped runs carry both
+        // renderings: `FontStyle::Italic` matches no CJK face, so the
+        // dots stand in for it there and only there.
+        let runs = run_italics(cx, "*中文 latin 测试*");
+        let han: Vec<&(String, bool)> = runs
+            .iter()
+            .filter(|(t, _)| t.chars().any(crate::cjk::takes_emphasis_dot))
+            .collect();
+        assert!(!han.is_empty(), "the Han sub-runs must be present");
+        assert!(
+            han.iter().all(|(_, italic)| !*italic),
+            "no CJK run may ask for an italic face ({runs:?})"
+        );
+        assert!(
+            runs.iter()
+                .any(|(t, italic)| t.contains("latin") && *italic),
+            "the Latin sub-run keeps true italic ({runs:?})"
+        );
+    }
+
+    #[gpui::test]
+    fn emphasized_cjk_gets_one_dot_per_character(cx: &mut TestAppContext) {
+        // Four emphasized Han characters, four dots — and nothing under
+        // the unemphasized text on either side.
+        let dots = emphasis_dots_for(cx, "前面 *强调的字* 后面");
+        assert_eq!(dots.len(), 4, "one dot per emphasized character");
+        let xs: Vec<f32> = dots.iter().map(|b| b.origin.x.into()).collect();
+        assert!(
+            xs.windows(2).all(|w| w[1] > w[0]),
+            "dots march left to right with the glyphs ({xs:?})"
+        );
+    }
+
+    #[gpui::test]
+    fn a_mixed_emphasis_run_dots_only_its_cjk(cx: &mut TestAppContext) {
+        // `中文` + `测试` take dots; `latin` shapes italic and the two
+        // fullwidth commas are punctuation, so six characters carry four
+        // dots.
+        let dots = emphasis_dots_for(cx, "*中文，latin，测试*");
+        assert_eq!(dots.len(), 4);
+    }
+
+    #[gpui::test]
+    fn latin_emphasis_paints_no_dots(cx: &mut TestAppContext) {
+        assert!(emphasis_dots_for(cx, "before *italic* after").is_empty());
+    }
+
+    #[gpui::test]
+    fn an_emphasis_dot_clears_the_baseline_and_centers_under_its_glyph(cx: &mut TestAppContext) {
+        // The mark belongs under the character it emphasizes: below the
+        // baseline so it never touches the glyph, and centered on the
+        // glyph's own advance so a row of dots tracks the characters.
+        let src = "*强调*";
+        let dots = emphasis_dots_for(cx, src);
+        assert_eq!(dots.len(), 2);
+
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+        let (baseline, glyph_edges) = cx
+            .update_window(handle.into(), |_, window, cx| {
+                let style = MarkdownStyle::from_theme(cx);
+                let block = blocks
+                    .iter()
+                    .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                    .expect("paragraph block");
+                let font_size = font_size_for_block(&block.kind, &style);
+                let line_height = font_size * style.line_height.0;
+                let (ascent, descent) =
+                    body_metrics_for_block(&block.kind, &style, font_size, window);
+                let half_leading = ((line_height - ascent - descent) / 2.0).max(px(0.0));
+                let shaped = shape_block_lines(
+                    &src_owned,
+                    block,
+                    &style,
+                    font_size,
+                    Some(px(720.0)),
+                    window,
+                );
+                let line = &shaped.first().expect("a shaped line").line;
+                // Leading / trailing edge of the first emphasized glyph.
+                let lead = line.position_for_index(0, line_height).expect("lead edge");
+                let trail = line.position_for_index(3, line_height).expect("trail edge");
+                (half_leading + ascent, (lead.x, trail.x))
+            })
+            .expect("update window");
+
+        let dot = dots[0];
+        assert!(
+            dot.origin.y > baseline,
+            "the dot clears the baseline (dot {:?}, baseline {baseline:?})",
+            dot.origin.y
+        );
+        let center_x = dot.origin.x + dot.size.width / 2.0;
+        assert!(
+            center_x > glyph_edges.0 && center_x < glyph_edges.1,
+            "the dot centers under its glyph (center {center_x:?} in {glyph_edges:?})"
+        );
     }
 
     #[gpui::test]

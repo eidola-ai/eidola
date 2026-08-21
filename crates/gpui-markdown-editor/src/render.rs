@@ -96,7 +96,12 @@ use crate::syntax::{ListKind, NodeKind, SyntaxNode};
 ///    bytes line-by-line against the canonical prefix; matching
 ///    spans are added to `hidden_ranges`.
 ///
-/// 5. merge_hidden_ranges (per-block) — multiple hide passes (own
+/// 5. mark_cjk_emphasis (per-block) — emphasis asks for an italic no
+///    CJK face has, so the CJK sub-ranges of every italic run are
+///    marked for 着重号 dots instead. Additive: the Latin parts of a
+///    mixed span keep their italic.
+///
+/// 6. merge_hidden_ranges (per-block) — multiple hide passes (own
 ///    container, alternating chain, code-block fence, …) can produce
 ///    overlapping or duplicate entries. Normalize each block's
 ///    `hidden_ranges` into a sorted, non-overlapping list so the
@@ -133,9 +138,53 @@ fn render_with_cursor(state: &EditorState, tree: &[SyntaxNode], cursor: CursorRa
     for block in &mut blocks {
         hide_chain_continuation_prefix(block, bytes);
         apply_escapes_and_entities(block, &state.markdown, &verbatim, cursor);
+        mark_cjk_emphasis(block, &state.markdown);
         merge_hidden_ranges(&mut block.hidden_ranges);
     }
     RenderSpec { blocks }
+}
+
+/// Mark the CJK sub-ranges of every emphasized run for 着重号 dots.
+///
+/// Markdown emphasis asks for italic, and no CJK face has one (see
+/// [`crate::cjk`]) — the delimiters would vanish and the glyphs would
+/// render unchanged, telling the reader *less* than the raw asterisks
+/// did. So an emphasized span is split by script: Latin sub-runs keep
+/// true italic, CJK sub-runs take dots under their characters. One span
+/// may carry both renderings, which is correct rather than a
+/// compromise.
+///
+/// The marks are **added** over the existing italic runs rather than
+/// carving them up: styles merge per source byte in the element layer
+/// (`effective_inline_style`), so a CJK sub-range ends up with both
+/// flags and the element suppresses the italic face exactly there. That
+/// keeps every other consumer of `inlines` — nesting, dimming,
+/// strikethrough, the delimiter reveal — untouched.
+///
+/// Runs the element renders verbatim take no dots: inline code shapes in
+/// the mono face as literal source, and a dimmed run *is* the raw
+/// markdown revealed at the cursor.
+fn mark_cjk_emphasis(block: &mut RenderBlock, source: &str) {
+    let mut marks: Vec<InlineRun> = Vec::new();
+    for run in &block.inlines {
+        if !run.style.italic || run.style.code || run.style.dimmed {
+            continue;
+        }
+        let Some(text) = source.get(run.source_range.clone()) else {
+            continue;
+        };
+        let base = run.source_range.start;
+        for seg in crate::cjk::cjk_segments(text) {
+            marks.push(InlineRun {
+                source_range: (base + seg.start)..(base + seg.end),
+                style: InlineStyle {
+                    emphasis_dots: true,
+                    ..InlineStyle::default()
+                },
+            });
+        }
+    }
+    block.inlines.append(&mut marks);
 }
 
 /// Promote each **top-level** `Paragraph` block whose entire source is a
@@ -4308,5 +4357,118 @@ mod tests {
         assert!(block.has_hidden_range(3..5));
         assert!(block.has_hidden_range(9..11));
         assert_eq!(first_substitution_for(block, 6..8), Some("*"));
+    }
+
+    /// Effective style at `offset` — every overlapping run merged, the
+    /// same way the element layer resolves a byte's style.
+    fn style_at(block: &RenderBlock, offset: usize) -> InlineStyle {
+        block
+            .inlines
+            .iter()
+            .filter(|r| r.source_range.contains(&offset))
+            .fold(InlineStyle::default(), |acc, r| acc.merge(r.style.clone()))
+    }
+
+    #[test]
+    fn cjk_emphasis_takes_dots_and_drops_the_italic_face() {
+        let src = "*中文*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let style = style_at(block, src.find('中').expect("han present"));
+        assert!(style.emphasis_dots, "emphasized CJK is marked for dots");
+        assert!(
+            style.italic,
+            "the emphasis run still covers it — the element suppresses the face"
+        );
+    }
+
+    #[test]
+    fn latin_emphasis_takes_no_dots() {
+        let src = "*latin*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let style = style_at(block, src.find('l').expect("latin present"));
+        assert!(style.italic);
+        assert!(!style.emphasis_dots);
+    }
+
+    #[test]
+    fn a_mixed_emphasis_run_splits_by_script() {
+        // One emphasized span carrying both renderings: the Latin word
+        // keeps true italic, the Han characters take dots.
+        let src = "*中文 latin 测试*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        for needle in ['中', '试'] {
+            let style = style_at(block, src.find(needle).expect("han present"));
+            assert!(style.emphasis_dots, "{needle} takes dots");
+        }
+        let latin = style_at(block, src.find('l').expect("latin present"));
+        assert!(
+            latin.italic && !latin.emphasis_dots,
+            "the Latin sub-run stays italic"
+        );
+    }
+
+    #[test]
+    fn cjk_punctuation_stays_inside_the_marked_sub_run() {
+        // The comma has no italic face either, so it belongs to the CJK
+        // sub-run; the element's per-character rule is what withholds a
+        // dot from it.
+        let src = "*中，文*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let comma = style_at(block, src.find('，').expect("comma present"));
+        assert!(comma.emphasis_dots);
+        assert!(!crate::cjk::takes_emphasis_dot('，'));
+    }
+
+    #[test]
+    fn strong_cjk_takes_no_dots() {
+        // `**strong**` works on CJK today — the fallback ships a bold
+        // face. Dots are the emphasis answer only.
+        let src = "**中文**\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let style = style_at(block, src.find('中').expect("han present"));
+        assert!(style.bold);
+        assert!(!style.emphasis_dots);
+    }
+
+    #[test]
+    fn strong_emphasis_cjk_is_bold_plus_dots() {
+        let src = "***中文***\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let style = style_at(block, src.find('中').expect("han present"));
+        assert!(style.bold && style.emphasis_dots);
+    }
+
+    #[test]
+    fn cjk_inline_code_takes_no_dots() {
+        // Code shapes as literal source in the mono face; a dot under it
+        // would claim an emphasis the span does not carry.
+        let src = "*`中文`*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let style = style_at(block, src.find('中').expect("han present"));
+        assert!(style.code);
+        assert!(!style.emphasis_dots);
+    }
+
+    #[test]
+    fn cjk_emphasis_keeps_its_dots_with_the_cursor_inside() {
+        // Entering a construct reveals its delimiters; it never restyles
+        // the content. The dots are the content's emphasis, so they stay
+        // exactly as the italic face would on Latin.
+        let src = "*\u{4e2d}\u{6587}*";
+        let spec = render_with_cursor(src, 2);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(
+            block.has_dimmed_range(0..1),
+            "the opening delimiter reveals"
+        );
+        let style = style_at(block, src.find('\u{4e2d}').expect("han present"));
+        assert!(style.emphasis_dots);
     }
 }

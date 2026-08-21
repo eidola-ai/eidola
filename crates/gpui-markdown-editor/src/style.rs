@@ -99,6 +99,11 @@ theme_colors! {
     Link => link_color, |theme: &Theme| theme.link;
     ThematicBreak => thematic_break_color, |theme: &Theme| theme.border;
     TableRule => table_rule_color, |theme: &Theme| theme.border;
+    EmphasisDot => emphasis_dot_color, |theme: &Theme| {
+        let mut c = theme.foreground;
+        c.a *= 0.8;
+        c
+    };
 }
 
 /// One bit per color in the override mask, so the mask cannot run out of room
@@ -258,6 +263,17 @@ pub struct MarkdownStyle {
     /// between body rows). Defaults to the theme's `border`, like
     /// the thematic break — table rules are chrome, not content.
     pub table_rule_color: Hsla,
+    /// Color of the 着重号 emphasis dots painted under emphasized CJK
+    /// characters (see [`crate::cjk`]). The text color at slightly
+    /// reduced alpha in both modes: the dots are emphasis, so they read
+    /// as part of the text, but they sit in the quiet-UI register — a
+    /// mark under the line, never a second voice competing with it.
+    pub emphasis_dot_color: Hsla,
+    /// Diameter of one emphasis dot, as a fraction of the run's font
+    /// size, and how far below the baseline its center sits. Kept in
+    /// the descender space so a dot never reaches the row below.
+    pub emphasis_dot_size_factor: f32,
+    pub emphasis_dot_baseline_offset_factor: f32,
 
     /// Which theme-derived colors the caller set explicitly, one bit per
     /// [`ThemeColor`]. [`MarkdownStyle::refresh_theme_colors`] re-derives the
@@ -318,6 +334,9 @@ impl MarkdownStyle {
             thematic_break_thickness: px(1.0),
             table_header_weight: FontWeight::MEDIUM,
             table_rule_color: color(ThemeColor::TableRule),
+            emphasis_dot_color: color(ThemeColor::EmphasisDot),
+            emphasis_dot_size_factor: 0.13,
+            emphasis_dot_baseline_offset_factor: 0.17,
 
             color_overrides: 0,
         }

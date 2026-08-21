@@ -122,6 +122,31 @@ pub fn register(s: &mut Snapshots) {
         editor_with_cursor(window, cx, "leading *italic* trailing", "talic")
     });
 
+    // CJK emphasis — 着重号 dots stand in for the italic no CJK face
+    // has. Cursor outside: delimiters gone, dots under each character.
+    s.add("cjk_emphasis_cursor_outside", win, |window, cx| {
+        editor_with_cursor(window, cx, "前面 *强调的文字* 后面", "后面")
+    });
+
+    // CJK emphasis — cursor inside. Entering reveals the delimiters and
+    // leaves the content's emphasis exactly as it was.
+    s.add("cjk_emphasis_cursor_inside", win, |window, cx| {
+        editor_with_cursor(window, cx, "前面 *强调的文字* 后面", "调的文")
+    });
+
+    // One emphasized span carrying both renderings: the Latin word
+    // shapes italic, the Han characters take dots, and the CJK comma
+    // between them takes none.
+    s.add("cjk_emphasis_mixed_run", win, |window, cx| {
+        editor_with_cursor(window, cx, "混排 *中文，with latin，测试* 收尾", "收尾")
+    });
+
+    // Bold and bold+emphasis on CJK: strong stays a bold face (the CJK
+    // fallback ships one), strong+emphasis is bold *and* dotted.
+    s.add("cjk_strong_and_strong_emphasis", win, |window, cx| {
+        editor_with_cursor(window, cx, "**粗体文字** 与 ***粗体强调*** 收尾", "收尾")
+    });
+
     // Strikethrough outside.
     s.add("strike_cursor_outside", win, |window, cx| {
         editor_with_cursor(window, cx, "keep ~~drop~~ keep", "keep")
@@ -1004,6 +1029,16 @@ const EMBED_AUDIT_CORPORA: &[(&str, &str, f32)] = &[
         "list_with_code",
         "- item with a fence:\n\n  ```\n  let x = 1;\n  ```\n\n- plain item\n",
         260.,
+    ),
+    // 着重号 emphasis dots are painted in their own pass, so the embed —
+    // which shares only the *shaping* path — has to re-emit them. This
+    // pair is what keeps the two surfaces from drifting.
+    (
+        "cjk_emphasis",
+        "前面 *强调的文字* 后面\n\n\
+         混排 *中文，with latin，测试* 收尾\n\n\
+         **粗体文字** 与 ***粗体强调*** 收尾\n",
+        220.,
     ),
     (
         "quote_with_list",
