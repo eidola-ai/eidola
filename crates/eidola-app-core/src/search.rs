@@ -178,6 +178,15 @@ impl Projection {
 /// A source span that is neither copied nor substituted is simply **not
 /// appended**: it contributes no projected bytes, so it can never be matched
 /// (a hidden link URL, an embed marker, math source).
+///
+/// **Both appenders answer to one rule about their source range**, checked at
+/// the door for each of them: it must be a range the source actually has —
+/// within its length and on character boundaries. A stale span (from a parse
+/// of different text) or one that splits a character is refused loudly rather
+/// than recorded, because a recorded one would come back out of
+/// [`Projection::find`] as a "source range" that panics the moment the caller
+/// slices with it. `copy` used to enforce this incidentally, by slicing, while
+/// `substitute` never looked at the source at all.
 pub struct ProjectionBuilder<'a> {
     source: &'a str,
     projection: Projection,
@@ -191,12 +200,27 @@ impl<'a> ProjectionBuilder<'a> {
         }
     }
 
+    /// The one door both appenders pass through: a run's source range must be
+    /// a range the source has. `is_char_boundary` is false past the end as
+    /// well as mid-character, so this single test covers both ways a span can
+    /// fail to be one.
+    fn check(&self, range: &Range<usize>) {
+        assert!(
+            self.source.is_char_boundary(range.start) && self.source.is_char_boundary(range.end),
+            "projection run {range:?} is not a range of the source it projects \
+             ({} bytes): recording it would hand back a source range that \
+             panics when sliced",
+            self.source.len(),
+        );
+    }
+
     /// Append `source[range]` verbatim. Panics if `range` is not a character
     /// boundary range of the source — the same contract as slicing it.
     pub fn copy(&mut self, range: Range<usize>) {
         if range.start >= range.end {
             return;
         }
+        self.check(&range);
         let slice = &self.source[range.clone()];
         let start = self.projection.text.len();
         self.projection.text.push_str(slice);
@@ -225,6 +249,7 @@ impl<'a> ProjectionBuilder<'a> {
         if text.is_empty() || range.start >= range.end {
             return;
         }
+        self.check(&range);
         let start = self.projection.text.len();
         self.projection.text.push_str(text);
         self.projection.runs.push(Run {
@@ -636,6 +661,49 @@ mod tests {
     fn a_query_longer_than_the_text_matches_nothing() {
         let query = Query::new("a longer phrase").expect("non-empty");
         assert!(query.find_in("short").is_empty());
+    }
+
+    #[test]
+    fn both_appenders_refuse_a_range_the_source_does_not_have() {
+        // The builder's door, from both sides. `copy` used to enforce this
+        // incidentally by slicing and `substitute` not at all — the asymmetry
+        // is why a stale span could be recorded and come back out of `find` as
+        // a source range that panics when sliced.
+        let source = "Grüße hier"; // `ü` and `ß` are two bytes each
+        let bad: [(&str, Range<usize>); 4] = [
+            ("past the end", 0..source.len() + 1),
+            ("wholly past the end", 40..44),
+            ("splitting a character at the start", 3..6),
+            ("splitting a character at the end", 0..3),
+        ];
+        for (what, range) in bad {
+            for (appender, run) in [("copy", 0), ("substitute", 1)] {
+                let range = range.clone();
+                let outcome = std::panic::catch_unwind(|| {
+                    let mut builder = ProjectionBuilder::new(source);
+                    if run == 0 {
+                        builder.copy(range);
+                    } else {
+                        builder.substitute(range, "x");
+                    }
+                    builder.finish()
+                });
+                assert!(outcome.is_err(), "{appender} accepted a range {what}",);
+            }
+        }
+
+        // The valid neighbours still record, through both appenders.
+        let mut builder = ProjectionBuilder::new(source);
+        builder.copy(0..source.len());
+        assert_eq!(builder.finish().text(), source);
+        let mut builder = ProjectionBuilder::new(source);
+        builder.substitute(0.."Grüße".len(), "Grusse");
+        let projection = builder.finish();
+        assert_eq!(projection.text(), "Grusse");
+        assert_eq!(
+            projection.source_range(0.."Grusse".len()),
+            Some(0.."Grüße".len()),
+        );
     }
 
     #[test]
