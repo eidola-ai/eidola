@@ -95,16 +95,23 @@ async fn mount_release(server: &MockServer, tag: &str, manifest: &[u8], bundle: 
 
 /// Expected claims as of the captured v0.0.8 fixture release, which predates
 /// the Linux GUI artifact (`eidola-gui-linux-amd64`, added with the Nix Linux
-/// release pipeline). The matrix tests exercise the check *mechanics* against
-/// the real captured release, so the context pins the fixture-era expected
-/// set — otherwise every row would collapse into `ClaimsChanged`. (A real
-/// pre-linux-gui client checking a post-linux-gui release seeing
-/// `ClaimsChanged` is by design: a new artifact class is a threat-model
-/// change the user reviews once.)
+/// release pipeline) and still carries `artifact-manifest.json` schema 1
+/// (no `archiveSha256`). The matrix tests exercise the check *mechanics*
+/// against the real captured release, so the context pins the fixture-era
+/// expected set — otherwise every row would collapse into `ClaimsChanged`.
+/// (A real pre-linux-gui / schema-1 client checking a post-linux-gui /
+/// schema-2 release seeing `ClaimsChanged` is by design: a new artifact
+/// class or manifest shape is a threat-model change the user reviews once.)
 fn fixture_expected_claims() -> Vec<Claim> {
     expected_claims()
         .into_iter()
         .filter(|c| !c.key.starts_with("artifacts.eidola-gui-linux"))
+        .map(|mut c| {
+            if c.key == "manifest.schema_version" {
+                c.value = "1".into();
+            }
+            c
+        })
         .collect()
 }
 

@@ -1,15 +1,17 @@
 # Releases
 
-A release is the *unit of trust*. When a user is running Eidola release N, what they are trusting is the entire bundle that comprises release N — client, server, build inputs, measurements, and the signatures attesting to them. This page explains how a new release becomes trustable. For the technical specification, see [trust-root.md](trust-root.md).
+A **release** is the *unit of trust*. When a user is running Eidola release N, what they are trusting is the entire collection that comprises release N — every artifact, the paired server, build inputs, measurements, and the signatures attesting to them. This page explains how a new release becomes trustable.
+
+How those artifacts are hashed, what a user `shasum`s, and the payload / archive / envelope / installable split live in [verification.md](verification.md). The compile-time pin set is [trust-root.md](trust-root.md).
 
 ## What a release contains
 
 A single release ships:
 
-- A **client binary** for each supported platform (macOS and Linux GUI apps, CLI, etc.) with a trust root embedded at compile time.
-- A **server image** built reproducibly from the same source commit, whose confidential-compute measurement matches the value embedded in the client.
-- A signed **artifact manifest** (`artifact-manifest.json`) recording the digests of every artifact and the enclave measurement.
-- One or more **human attestations**, each signed under a pinned engineer's hardware-bound key, with their Sigstore Rekor inclusion proof.
+- A **client artifact** for each supported platform (macOS and Linux GUI, CLI) whose **payload** embeds the trust root at compile time.
+- A **server image** (OCI **archive**) built reproducibly from the same source commit, whose confidential-compute measurement matches the value embedded in the client.
+- A signed **artifact manifest** (`artifact-manifest.json`) recording each artifact’s archive identity (`digest` or `archiveSha256`), Nix `narHash` where applicable, and the enclave measurement.
+- One or more **human attestations**, each signed under a pinned engineer's hardware-bound key, with their Sigstore Rekor inclusion proof. The attestation also binds Apple **envelope** / **installable** hashes, which must not appear in the CI-signed manifest.
 
 The client carries enough information to verify all of this locally before installing an update.
 
@@ -22,7 +24,7 @@ Eidola uses two signing systems in coordination. Both ride the same Sigstore Rek
 | CI signs the manifest | Sigstore bundle | Fulcio keyless cert tied to the GitHub OIDC workflow identity |
 | Engineer signs a release attestation | `cosign sign-blob` against a hardware-held key (YubiKey-PIV, KMS, etc.) | sha256(PKIX SubjectPublicKeyInfo) matches a fingerprint pinned in the client |
 
-The CI side gives us "this artifact came from the release workflow on this tag." The engineer side gives us "a named human, signing under their legal identity, attests to the properties this release claims." Neither alone is sufficient; both are required.
+The CI side gives us "this archive came from the release workflow on this tag." The engineer side gives us "a named human, signing under their legal identity, attests to the properties this release claims." Neither alone is sufficient; both are required.
 
 ## What the engineer attests to
 
@@ -79,6 +81,6 @@ The first-install case (no prior installed commit) is the residual gap; see [gap
 
 ## For the technical specification
 
-For exact pinning, signing-system formats, schema document shapes, and the build-input vs. build-output story (why `artifact-manifest.json` and `server-enclave.json` are separate files), see [trust-root.md](trust-root.md).
+For exact pinning, signing-system formats, schema document shapes, and the build-input vs. build-output story (why `artifact-manifest.json` and `server-enclave.json` are separate files), see [trust-root.md](trust-root.md). For archive hashes and how to check a download, see [verification.md](verification.md).
 
 For the operational side — how to actually cut a release, rotate an attestant key, or update the Sigstore trusted root — see [`releases/README.md`](../releases/README.md).

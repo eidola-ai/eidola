@@ -16,16 +16,18 @@ These docs describe how Eidola works, what it commits to, and what it doesn't ye
 
 ## Release flow
 
-7. **[Releases](releases.md)** — How a new client+server bundle becomes trustable. CI signature plus human attestation, both on the same transparency log.
-8. **[Trust root](trust-root.md)** — The technical specification: what's pinned at compile time, how schema versions work, how the verifier walks the chain.
+7. **[Releases](releases.md)** — How a new release becomes trustable. CI signature plus human attestation, both on the same transparency log.
+8. **[Verification](verification.md)** — Payload, archive, envelope, installable: the hashes a user checks, and what the CI-signed manifest records.
+9. **[Trust root](trust-root.md)** — The technical specification: what's pinned at compile time, how schema versions work, how the verifier walks the chain.
+10. **[Apple distribution](apple-distribution.md)** — The macOS envelope: Developer ID, notarization, and why those bytes never enter the manifest.
 
 ## What's missing
 
-9. **[Known gaps](gaps.md)** — Every piece of the trust chain that is intentionally deferred, with what it would catch and what constrains it today.
+11. **[Known gaps](gaps.md)** — Every piece of the trust chain that is intentionally deferred, with what it would catch and what constrains it today.
 
 ## Operations
 
-10. **[Infrastructure and vendors](vendors.md)** — The complete list of third parties that process data for Eidola, and exactly what each can see. Referenced by the [privacy policy](https://www.eidola.ai/privacy/).
+12. **[Infrastructure and vendors](vendors.md)** — The complete list of third parties that process data for Eidola, and exactly what each can see. Referenced by the [privacy policy](https://www.eidola.ai/privacy/).
 
 ## For contributors
 

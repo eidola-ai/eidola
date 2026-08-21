@@ -1117,18 +1117,96 @@ with open(path, "wb") as f:
               };
             };
 
-        # The shippable Linux GUI: the binary above plus bundled Mesa Vulkan
-        # drivers. The host's own ICD manifests are useless to a Nix binary —
-        # distros reference drivers by bare soname (`libvulkan_radeon.so`),
-        # which the loader resolves through the dynamic linker's search path,
+        # Canonical byte-stream of a Nix payload for `archiveSha256`. GNU
+        # tar POSIX/pax + gzip -n, timestamps/owners pinned, so the file
+        # hash is a function of the payload tree rather than of the packer
+        # host. `$out` is the `.tar.gz` itself (not a directory). See
+        # docs/verification.md.
+        #
+        # pax, not ustar: ustar caps member names at 100 bytes (155-byte
+        # prefix, splittable only at `/`) and — with no extension mechanism
+        # — symlink targets at 100 bytes flat. A payload symlink pointing
+        # into /nix/store blows that on its own. pax has no such limit.
+        # The two pax options are what make it deterministic: the default
+        # extended-header member name embeds tar's PID (`PaxHeaders.%p`),
+        # and atime/ctime are packer-run state rather than payload content.
+        # mtime is not deleted — --mtime=@0 already pins it, in both the
+        # ustar-compatible header and the pax header.
+        #
+        # `--mode=u=rwX,go=rX` normalizes permissions to exactly the
+        # information a NAR records (the executable bit and nothing else),
+        # so the archive and narHash cannot disagree about modes.
+        #
+        # gzip's DEFLATE output is stable for a given implementation, so
+        # the *gzip version* pinned by flake.lock is an input to
+        # archiveSha256: a nixpkgs bump can move the archive hash with an
+        # unchanged payload. That is exactly the divergence narHash exists
+        # to isolate (see docs/verification.md).
+        mkReproducibleArchive =
+          {
+            pname,
+            payload,
+          }:
+          pkgs.runCommand "${pname}.tar.gz"
+            {
+              nativeBuildInputs = [
+                pkgs.gnutar
+                pkgs.gzip
+              ];
+            }
+            ''
+              export LC_ALL=C
+              tar --format=posix \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+                --sort=name \
+                --mtime=@0 \
+                --owner=0 --group=0 --numeric-owner \
+                --mode=u=rwX,go=rX \
+                -C ${payload} -cf - . \
+              | gzip -n -9 > "$out"
+            '';
+
+        # The shippable Linux GUI: a *copied* GUI binary, a *copied*
+        # llama-server sidecar (both sets of bytes in this NAR — same
+        # measurement rule as macOS), and a *referenced* nixpkgs Mesa ICD
+        # set.
+        #
+        # Both executables are copied rather than symlinked/wrapped-by-
+        # reference on purpose. A makeWrapper over `${eidolaGuiLinux}/bin/
+        # eidola-gui` would leave the application itself outside $out: the
+        # payload would measure a wrapper script whose only claim on the
+        # binary is a store *path*. Store paths here are input-addressed,
+        # so that binds the build's inputs but not its output bytes — a
+        # non-reproducible build or a compromised builder yields the same
+        # path, therefore the same narHash/archiveSha256, while the user
+        # resolves different bytes from their own substituter. Copying puts
+        # the ELF in the measured tree, which is the rule docs/verification.md
+        # states: functional bytes that ship inside the installable are in
+        # the payload.
+        #
+        # The copy lands at `.eidola-gui-wrapped` (the nixpkgs wrapper
+        # convention) so it stays a *sibling* of llama-server in $out/bin.
+        # app-core resolves the engine from the running executable, which
+        # after exec is the copy, so the sibling rule holds on its own;
+        # EIDOLA_LLAMA_SERVER is set anyway as an explicit pin.
+        #
+        # Mesa stays a reference — the one deliberate exception, because
+        # the device's GPU stack is pre-trusted. The host's own ICD
+        # manifests are useless to a Nix binary — distros
+        # reference drivers by bare soname (`libvulkan_radeon.so`), which
+        # the loader resolves through the dynamic linker's search path,
         # i.e. our RUNPATH, never /usr/lib; and dlopening host Mesa into a
-        # Nix glibc invites symbol-version mismatches. Bundling Mesa (whose
-        # Nix ICD manifests carry absolute store paths) makes the artifact's
-        # host surface kernel + compositor socket + /dev/dri, at the cost of
-        # Mesa's closure (~1 GB, LLVM for the llvmpipe fallback included).
-        # VK_ADD_DRIVER_FILES is *additive* and set only as a default, so a
-        # NixOS host's /run/opengl-driver drivers coexist and a user can
-        # override outright.
+        # Nix glibc invites symbol-version mismatches. Bundling Mesa
+        # (whose Nix ICD manifests carry absolute store paths) makes the
+        # artifact's host surface kernel + compositor socket + /dev/dri,
+        # at the cost of Mesa's closure (~1 GB, LLVM for the llvmpipe
+        # fallback included). Those Mesa bytes are *not* copied into
+        # $out: VK_ADD_DRIVER_FILES points at the store, so they sit
+        # outside archiveSha256. A Flatpak against the Freedesktop GL
+        # runtime is how an Ubuntu-shaped installable leaves Mesa out of
+        # our payload entirely. VK_ADD_DRIVER_FILES is *additive* and set
+        # only as a default, so a NixOS host's /run/opengl-driver drivers
+        # coexist and a user can override outright.
         eidolaGuiLinuxWrapped =
           if eidolaGuiLinux == null then
             null
@@ -1139,10 +1217,14 @@ with open(path, "wb") as f:
               }
               ''
                 mkdir -p $out/bin $out/share/applications
+                cp ${eidolaGuiLinux}/bin/eidola-gui "$out/bin/.eidola-gui-wrapped"
+                chmod u+w "$out/bin/.eidola-gui-wrapped"
+                cp ${llamaServer}/bin/llama-server "$out/bin/llama-server"
+                chmod u+w "$out/bin/llama-server"
                 icds=$(ls ${pkgs.mesa}/share/vulkan/icd.d/*.json | tr '\n' ':')
-                makeWrapper ${eidolaGuiLinux}/bin/eidola-gui $out/bin/eidola-gui \
+                makeWrapper "$out/bin/.eidola-gui-wrapped" $out/bin/eidola-gui \
                   --set-default VK_ADD_DRIVER_FILES "''${icds%:}" \
-                  --set-default EIDOLA_LLAMA_SERVER ${llamaServer}/bin/llama-server
+                  --set-default EIDOLA_LLAMA_SERVER "$out/bin/llama-server"
                 # Desktop entry — basename matches the Wayland app_id the
                 # binary sets (lib.rs APP_ID), which is what lets the shell
                 # resolve our windows to this entry. Strip the comment header
@@ -1179,13 +1261,25 @@ with open(path, "wb") as f:
         }
         // pkgs.lib.optionalAttrs (eidolaCliMacosUniversal != null) {
           eidola-cli-macos-universal = eidolaCliMacosUniversal;
+          eidola-cli-macos-universal-archive = mkReproducibleArchive {
+            pname = "eidola-cli-macos-universal";
+            payload = eidolaCliMacosUniversal;
+          };
         }
         // pkgs.lib.optionalAttrs (eidolaGuiMacosUniversal != null) {
           eidola-gui-macos-universal = eidolaGuiMacosUniversal;
+          eidola-gui-macos-universal-archive = mkReproducibleArchive {
+            pname = "eidola-gui-macos-universal";
+            payload = eidolaGuiMacosUniversal;
+          };
         }
         // pkgs.lib.optionalAttrs (eidolaGuiLinux != null) {
           eidola-gui-linux = eidolaGuiLinuxWrapped;
           eidola-gui-linux-unwrapped = eidolaGuiLinux;
+          eidola-gui-linux-archive = mkReproducibleArchive {
+            pname = "eidola-gui-linux";
+            payload = eidolaGuiLinuxWrapped;
+          };
         };
 
         # Development shell (lightweight — daily Rust dev uses rustup)

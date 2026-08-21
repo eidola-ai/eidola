@@ -243,7 +243,7 @@ jobs:
         if: steps.scope.outputs.rust != 'true' && steps.scope.outputs.apple == 'true'
         run: cargo test -p eidola-apple
 
-      - name: Test Apple archive verifier with read-only directories
+      - name: Test Apple archive verifier (tar + zip, read-only directories)
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true'
         run: ./scripts/test-verify-apple.sh
 
