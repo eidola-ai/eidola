@@ -1632,6 +1632,15 @@ struct Inner {
     /// pool), or waits bounded for an in-flight refund. Held only around the
     /// provisioning step in `prepare_turn`; the HTTP request runs outside it.
     spend_gate: tokio::sync::Mutex<()>,
+    /// Serializes each backend's configuration writes with the cleanup that
+    /// belongs to them (`backends::Inner::lock_backend_config`). Keyed by
+    /// backend id, so unrelated backends never wait on each other.
+    backend_config_gates: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Test-only pause between a backend configuration write and the cleanup
+    /// that belongs to it (see `backends::Inner::retire_engines_for`), so a
+    /// test can drive a second configuration write into that window.
+    #[cfg(feature = "test-support")]
+    backend_config_pause: Mutex<Option<std::time::Duration>>,
     /// Serializes background branch-summary passes (see [`summaries`]). One
     /// pass at a time, and each re-reads the cache inside the gate, so a burst
     /// of posts collapses into one generation per branch.
@@ -8355,6 +8364,9 @@ impl AppCore {
                 bus,
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
+                backend_config_gates: Mutex::new(std::collections::HashMap::new()),
+                #[cfg(feature = "test-support")]
+                backend_config_pause: Mutex::new(None),
                 subspace_driver_started: std::sync::atomic::AtomicBool::new(false),
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
                 subspace_walks: Mutex::new(std::collections::HashMap::new()),
@@ -9775,6 +9787,19 @@ impl AppCore {
     #[cfg(feature = "test-support")]
     pub fn test_set_memory_budget(&self, budget: u64) {
         self.inner.local.set_memory_budget_for_test(budget);
+    }
+
+    /// Test-only seam: pause between a backend configuration write and the
+    /// cleanup that belongs to it, so a test can drive a second configuration
+    /// write into that window.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_pause_before_backend_cleanup(&self, pause: std::time::Duration) {
+        *self
+            .inner
+            .backend_config_pause
+            .lock()
+            .expect("backend config pause") = Some(pause);
     }
 
     /// Test-only seam: how many `llama-server` processes this core has

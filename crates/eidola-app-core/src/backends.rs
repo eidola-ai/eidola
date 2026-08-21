@@ -267,6 +267,46 @@ pub struct BackendUpdate {
 // ============================================================================
 
 impl Inner {
+    /// Hold this backend's configuration gate for the whole of one
+    /// configuration operation — **its database write and the cleanup that
+    /// belongs to it**.
+    ///
+    /// Those two steps are one operation, and nothing but a critical section
+    /// makes that true. Each of these methods commits and then acts on
+    /// in-memory state (retiring engines and their reports), so without the
+    /// gate an older operation's cleanup can arrive after a newer write has
+    /// already settled the row: disable commits, enable commits over it, a
+    /// load registers the engine the *final* configuration authorises, and the
+    /// disable's cleanup then stops it — a load that reported success, an
+    /// enabled backend, and no engine.
+    ///
+    /// **An in-memory generation cannot replace this.** The cleanup that
+    /// should run is the one belonging to the write the database kept, and a
+    /// counter bumped either side of the commit orders itself, not the
+    /// commits: two operations can bump in one order and commit in the other.
+    /// Ordering a generation against the commit means writing it *in* the
+    /// transaction — a persisted column, which is a schema change — or
+    /// serializing, which is this.
+    ///
+    /// Holding a lock across a load's work was refused for good reason (an
+    /// engine load walks the filesystem, picks a port and spawns a child, and
+    /// a configuration edit must not wait on any of that). The reasoning does
+    /// not carry here: a configuration operation is one short database
+    /// statement plus a synchronous sweep of two in-memory maps, it touches no
+    /// filesystem and no subprocess, and the gate is per backend. Loads do not
+    /// take it at all — a load that read a stale row is a different axis,
+    /// closed by [`crate::local_models::BackendEpoch`].
+    async fn lock_backend_config(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self
+                .backend_config_gates
+                .lock()
+                .expect("backend config gates");
+            gates.entry(id.to_string()).or_default().clone()
+        };
+        gate.lock_owned().await
+    }
+
     pub(crate) async fn list_backends(&self) -> Result<Vec<BackendInfo>, AppError> {
         let conn = self.db_conn().await?;
         let rows = db::list_backends(&conn).await?;
@@ -302,6 +342,10 @@ impl Inner {
     /// soft-removed row with the same id. Emits [`Change::Backends`].
     pub(crate) async fn add_backend(&self, new: NewBackend) -> Result<BackendInfo, AppError> {
         validate_backend_id(&new.id)?;
+        // Taken after validation, so a rejected id allocates no gate. A revive
+        // is a configuration write like any other: it must not commit inside
+        // another operation's write-and-cleanup.
+        let _config = self.lock_backend_config(&new.id).await;
         match new.kind {
             BackendKind::Eidola | BackendKind::Local => {
                 return Err(AppError::Config {
@@ -392,6 +436,7 @@ impl Inner {
         id: &str,
         enabled: bool,
     ) -> Result<(), AppError> {
+        let _config = self.lock_backend_config(id).await;
         let conn = self.db_conn().await?;
         if !db::set_backend_enabled(&conn, id, enabled, now_ms()).await? {
             return Err(AppError::NotConfigured {
@@ -401,7 +446,7 @@ impl Inner {
         if !enabled {
             // A disabled backend cannot serve a turn, so nothing may keep
             // running under its id.
-            self.retire_engines_for(id);
+            self.retire_engines_for(id).await;
         }
         self.bus.emit(Change::Backends);
         Ok(())
@@ -418,6 +463,9 @@ impl Inner {
         id: &str,
         update: BackendUpdate,
     ) -> Result<(), AppError> {
+        // Held from the read: the validation below is against this row, and a
+        // write landing between the two would be validated against neither.
+        let _config = self.lock_backend_config(id).await;
         let conn = self.db_conn().await?;
         let row = db::get_backend(&conn, id)
             .await?
@@ -537,7 +585,7 @@ impl Inner {
             });
         }
         if repointed {
-            self.retire_engines_for(id);
+            self.retire_engines_for(id).await;
         }
         self.bus.emit(Change::Backends);
         Ok(())
@@ -545,6 +593,7 @@ impl Inner {
 
     /// Soft-remove an external backend (forensic rows keep their target).
     pub(crate) async fn remove_backend(&self, id: &str) -> Result<(), AppError> {
+        let _config = self.lock_backend_config(id).await;
         if id == EIDOLA_BACKEND_ID || id == LOCAL_BACKEND_ID {
             return Err(AppError::Config {
                 message: format!("backend `{id}` is built in — disable it instead"),
@@ -556,7 +605,7 @@ impl Inner {
                 message: format!("no backend named `{id}` is configured"),
             });
         }
-        self.retire_engines_for(id);
+        self.retire_engines_for(id).await;
         self.bus.emit(Change::Backends);
         Ok(())
     }
@@ -572,7 +621,19 @@ impl Inner {
     /// is precisely the case a count of engines could not see. A retirement
     /// that finds nothing stays silent: an invalidation nobody needs would
     /// redraw every subscriber on every disable.
-    fn retire_engines_for(&self, backend_id: &str) {
+    async fn retire_engines_for(&self, backend_id: &str) {
+        // Test seam only: widen the window between the configuration write
+        // above and this cleanup. Compiled out of production builds.
+        #[cfg(feature = "test-support")]
+        {
+            let pause = *self
+                .backend_config_pause
+                .lock()
+                .expect("backend config pause");
+            if let Some(pause) = pause {
+                tokio::time::sleep(pause).await;
+            }
+        }
         if self.retire_backend_engines(backend_id).changed() {
             self.bus.emit(Change::LocalModels);
         }

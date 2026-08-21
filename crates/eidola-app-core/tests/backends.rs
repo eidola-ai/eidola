@@ -1008,3 +1008,57 @@ fn retiring_a_backend_with_nothing_to_retire_emits_nothing() {
         );
     });
 }
+
+/// A configuration write and the cleanup that belongs to it are **one**
+/// operation, so a newer write cannot land between them.
+///
+/// Otherwise an older disable's cleanup outlives a newer enable: the disable
+/// commits, the enable commits over it, a load registers an engine the *final*
+/// configuration authorises — and then the disable's cleanup arrives and stops
+/// it. The load has already reported success, and the backend is enabled, so
+/// nothing about the end state explains the engine that vanished.
+#[test]
+fn an_older_disables_cleanup_cannot_retire_an_enabled_backends_engine() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let core = std::sync::Arc::new(core);
+        // Widen the gap between the write and its cleanup; the race is real,
+        // this only makes it reachable on purpose.
+        core.test_pause_before_backend_cleanup(std::time::Duration::from_millis(600));
+
+        let disable = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.set_backend_enabled("local".into(), false).await }
+        });
+        // The disable has committed and is on its way to its cleanup.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // A newer write says the backend is enabled after all...
+        core.runtime()
+            .block_on(core.set_backend_enabled("local".into(), true))
+            .expect("enable");
+        // ...and a load registers the engine that configuration authorises.
+        core.test_register_loaded_local_model("local", "tiny", 51999);
+
+        core.runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), disable).await
+            })
+            .expect("the disable must settle")
+            .expect("join")
+            .expect("disable");
+
+        let backends = core.runtime().block_on(core.list_backends()).expect("list");
+        let local = backends
+            .iter()
+            .find(|b| b.id == "local")
+            .expect("local row");
+        assert!(local.enabled, "the newer write is the one that stands");
+        assert_eq!(
+            core.running_engines().len(),
+            1,
+            "an engine the current configuration authorises may not be retired \
+             by an operation the configuration has already moved past"
+        );
+    });
+}
