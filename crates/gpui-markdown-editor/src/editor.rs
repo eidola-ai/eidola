@@ -1092,7 +1092,14 @@ impl MarkdownEditorState {
     /// it clears the marking, something it can only know afterwards: whether
     /// its edit produced a buffer delta at all. A commit of the same bytes
     /// produces none, and that promise is what silently failed.
-    fn end_composition(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// **Public because it is also the host's escape hatch.** The editor
+    /// notices its own lifecycle transitions only on frames where it renders
+    /// (see [`Self::sync_disabled`] and [`Self::sync_focused`]); a host that
+    /// stops rendering an editor that might be composing — dropping it from a
+    /// virtualized list, say — should call this, or that editor's
+    /// [`Self::is_composing`] stays true with no frame left to clear it.
+    pub fn end_composition(&mut self, cx: &mut Context<Self>) {
         if self.marked_range.take().is_some() {
             cx.emit(MarkdownEditorEvent::Change);
         }
