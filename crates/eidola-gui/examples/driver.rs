@@ -271,6 +271,62 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_regenerating",
+                description: "Space view: a regeneration in flight, pending in place on the answer it is replacing (no verbs offered while it runs)",
+                default_size: size(px(900.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx);
+                        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+                        if let Some(seq) = s.revising_seq("a2") {
+                            s.push_reasoning_delta_for_test(
+                                seq,
+                                "Re-reading 343b before I answer. The shepherd is a rebuttal, \
+                                 not the definition — so the order has to be \
+                                 definition, craft-analogy, then the shepherd.",
+                                cx,
+                            );
+                        }
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_answer_cut_off",
+                description: "Space view: an answer that stopped at its length allowance — scroll the first reply to its end to see the mark beneath the text it is about",
+                default_size: size(px(900.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    view.update(cx, |v, cx| {
+                        v.space().update(cx, |s, cx| {
+                            s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                        });
+                        v.note_truncated_turn_for_test("a2", cx);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_docked_composer",
                 description: "Space view: a populated conversation settled at the document floor with its active composer fully docked",
                 default_size: size(px(900.), px(720.)),

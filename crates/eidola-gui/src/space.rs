@@ -78,6 +78,16 @@ pub struct StreamingTurn {
     pub target_action_id: Option<String>,
     /// The live buffers.
     pub response: StreamingResponse,
+    /// Whether this turn **replaces** `target_action_id`'s post rather than
+    /// replying to it — a regeneration in flight.
+    ///
+    /// It changes where the turn renders, and that is the whole reason it is
+    /// carried: a reply grows a new leaf under its target, while a
+    /// regeneration is a new version of the target itself. Drawn as a leaf it
+    /// would read as an answer to the post it is about to become — a branch
+    /// that never existed — and the reader would watch a conversation gain a
+    /// turn it is not gaining.
+    pub revising: bool,
 }
 
 /// Whether a failure is worth offering **Retry** for — i.e. whether re-asking
@@ -416,6 +426,17 @@ pub enum SpaceEvent {
     TurnEnded {
         seq: u64,
         response_action_id: Option<String>,
+        /// The upstream stopped this turn at its **length allowance** rather
+        /// than because the model was finished, and it had already written
+        /// answer text (a turn cut off before writing any fails instead — see
+        /// `AppError::ResponseTruncated`).
+        ///
+        /// It rides the ending event because there is nowhere durable to keep
+        /// it: the post carries its text and no reason for where the text
+        /// stops. So the reader is told while they are watching it happen, and
+        /// a reopened window shows the answer without the marker — an honest
+        /// gap, not a claim that the answer is whole.
+        truncated: bool,
     },
     /// A mutation or turn failed with a typed error. The view routes
     /// onboarding-degraded states (`InsufficientBalance`) off this; a failed
@@ -1239,6 +1260,28 @@ impl Space {
         self.post_runner.is_some() || !self.streams.is_empty() || !self.turn_runners.is_empty()
     }
 
+    /// Whether the space will accept a **post-level mutation** right now — the
+    /// honest answer behind every Edit / Regenerate affordance.
+    ///
+    /// It is [`Self::is_busy`], not [`Self::is_streaming`], and the difference
+    /// is the whole point: the exclusive slot and the keyed turn runners refuse
+    /// a mutation just as firmly as a live stream does, so a surface that asked
+    /// only about streams would keep drawing verbs whose handler is already
+    /// certain to say no. A button that cannot act must not look like one that
+    /// can.
+    pub fn accepts_mutation(&self) -> bool {
+        !self.is_busy()
+    }
+
+    /// The in-flight **regeneration** of `action_id`'s post, if one is running
+    /// — the seq whose live buffers render in that post's place.
+    pub fn revising_seq(&self, action_id: &str) -> Option<u64> {
+        self.streams
+            .iter()
+            .find(|s| s.revising && s.target_action_id.as_deref() == Some(action_id))
+            .map(|s| s.seq)
+    }
+
     /// The model id handed to the most recent regenerate (see field docs).
     pub fn last_submitted_model(&self) -> Option<&str> {
         self.last_submitted_model.as_deref()
@@ -1617,6 +1660,7 @@ impl Space {
         cx.emit(SpaceEvent::TurnEnded {
             seq,
             response_action_id: result.response_action_id.clone(),
+            truncated: result.truncated,
         });
         cx.notify();
     }
@@ -1808,6 +1852,7 @@ impl Space {
                 participant_id: None,
                 target_action_id: None,
                 response: StreamingResponse::default(),
+                revising: false,
             });
             return true;
         };
@@ -1988,10 +2033,21 @@ impl Space {
     }
 
     /// Regenerate an inference — append a new agent generation of `action_id`'s
-    /// item via `AppCore::regenerate` (spends credits), then reload the tree.
-    /// `model` is resolved by the caller from the post's own recorded model
-    /// (regenerating re-asks the model that answered), falling back to the
-    /// configured default.
+    /// item via `AppCore::regenerate_stream` (spends credits), rendering the
+    /// arriving reasoning and answer **in place on the post being replaced**
+    /// and reloading the tree when it commits. `model` is resolved by the
+    /// caller from the post's own recorded model (regenerating re-asks the
+    /// model that answered), falling back to the configured default.
+    ///
+    /// It runs as a keyed turn rather than in the exclusive mutation slot,
+    /// because that is what it is: one streaming model request, with buffers to
+    /// show while it runs. The exclusivity is unchanged — [`Self::is_busy`]
+    /// counts streams, so nothing else starts while it does.
+    ///
+    /// Returns whether the regeneration was **accepted**. A refusal is not a
+    /// quiet no-op the caller may ignore: the verb it came from has to stop
+    /// looking live, or the reader presses a button that is already busy and
+    /// nothing at all happens.
     pub fn regenerate_post(
         &mut self,
         action_id: String,
@@ -2003,25 +2059,101 @@ impl Space {
         }
         self.last_submitted_model = Some(model.clone());
         self.supersede_load_for_mutation();
-        let Some(app_core) = self.app_core.clone() else {
-            return true; // stub: no backend
-        };
-        let wait = self.row_wait();
-        self.post_runner = Some(cx.spawn(async move |this, cx| {
-            if let Err(e) = Self::await_row(wait).await {
-                let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
-                return;
-            }
-            let outcome = bridge::regenerate(app_core.clone(), action_id, model)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(AppError::Internal {
-                        message: "regenerate task cancelled".into(),
-                    })
-                });
-            Self::finish_reload(this, cx, app_core, outcome.map(|r| r.space_id)).await;
-        }));
+        let seq = self.mint_turn_seq();
+        self.streams.push(StreamingTurn {
+            seq,
+            participant_id: None,
+            target_action_id: Some(action_id.clone()),
+            response: StreamingResponse::default(),
+            revising: true,
+        });
+        // Pushed **before** the backend is consulted, so the pending state is
+        // on screen in the frame that accepted the click — including in stub
+        // stores, where it is the whole observable effect.
+        if let Some(app_core) = self.app_core.clone() {
+            let (event_rx, done_rx) = bridge::regenerate_stream(app_core, action_id, model);
+            let runner = self.spawn_revision_runner(seq, event_rx, done_rx, cx);
+            self.turn_runners.insert(seq, runner);
+        }
+        cx.emit(SpaceEvent::MessagesChanged);
+        cx.notify();
         true
+    }
+
+    /// The revision runner: pump the regeneration's deltas onto its in-place
+    /// pending state, then finalize.
+    ///
+    /// Success reloads the tree through [`Self::apply_turn_success`] — the same
+    /// arm an ordinary turn takes, so the captured reasoning lands on the new
+    /// generation and the branch a view was following still gets its
+    /// `TurnEnded`. Failure goes through [`Self::fail_turn`] with **no**
+    /// recorded [`FailedTurn`]: nothing was written, so the generation being
+    /// replaced is still there to read, and Retry re-*asks* a participant,
+    /// which is not what a regeneration does. The notice explains itself from
+    /// the error either way.
+    ///
+    /// A regeneration deliberately does **not** re-plan the cascade its reply
+    /// twin does: re-wording an existing answer is not a new post for the room
+    /// to respond to, and treating it as one would bill a round of replies for
+    /// every press.
+    fn spawn_revision_runner(
+        &mut self,
+        seq: u64,
+        mut event_rx: mpsc::UnboundedReceiver<ChatStreamEvent>,
+        done_rx: oneshot::Receiver<Result<ChatResult, AppError>>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let app_core = self.app_core.clone();
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = event_rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(s) = this.streams.iter_mut().find(|s| s.seq == seq) {
+                        match event {
+                            ChatStreamEvent::ReasoningDelta(d) => s.response.reasoning.push_str(&d),
+                            ChatStreamEvent::ContentDelta(d) => s.response.content.push_str(&d),
+                        }
+                        cx.emit(SpaceEvent::StreamDelta);
+                        cx.notify();
+                    }
+                });
+            }
+
+            let outcome = done_rx.await.unwrap_or_else(|_| {
+                Err(AppError::Internal {
+                    message: "regenerate task cancelled".into(),
+                })
+            });
+
+            match (outcome, app_core) {
+                (Ok(result), Some(app_core)) => {
+                    let msgs = bridge::get_space_tree(app_core, result.space_id.clone())
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(AppError::Internal {
+                                message: "fetch space tree task cancelled".into(),
+                            })
+                        })
+                        .map(|(nodes, covers)| (views_from_nodes(nodes), covers));
+                    let _ = this.update(cx, |this, cx| {
+                        this.apply_turn_success(seq, &result, msgs, cx);
+                        this.turn_runners.remove(&seq);
+                        this.settle_transcript_debt(cx);
+                        cx.notify();
+                    });
+                }
+                (Ok(_), None) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.streams.retain(|s| s.seq != seq);
+                        this.turn_runners.remove(&seq);
+                        this.settle_transcript_debt(cx);
+                        cx.notify();
+                    });
+                }
+                (Err(e), _) => {
+                    let _ = this.update(cx, |this, cx| this.fail_turn(seq, None, None, e, cx));
+                }
+            }
+        })
     }
 
     /// Shared completion for post-only/edit/regenerate: on success reload the
@@ -2120,6 +2252,7 @@ impl Space {
                 participant_id: Some(participant_id),
                 target_action_id: Some(target_action_id),
                 response: StreamingResponse::default(),
+                revising: false,
             });
             cx.emit(SpaceEvent::MessagesChanged);
             cx.notify();
@@ -2157,6 +2290,7 @@ impl Space {
             participant_id: Some(participant_id.clone()),
             target_action_id: Some(target_action_id.clone()),
             response: StreamingResponse::default(),
+            revising: false,
         });
 
         let (event_rx, done_rx) = bridge::respond_stream_as(
@@ -2399,9 +2533,19 @@ impl Space {
                 participant_id: None,
                 target_action_id: None,
                 response,
+                revising: false,
             });
         }
         cx.notify();
+    }
+
+    /// Test-only: fail an in-flight **regeneration** exactly as its runner's
+    /// error arm does — the pending state goes, the transcript load restarts,
+    /// and `Failed` carries the reason. No [`FailedTurn`] is recorded: nothing
+    /// was written, and Retry re-asks a participant rather than regenerating.
+    #[doc(hidden)]
+    pub fn fail_revision_for_test(&mut self, seq: u64, error: AppError, cx: &mut Context<Self>) {
+        self.fail_turn(seq, None, None, error, cx);
     }
 
     /// Test-only: push one synthetic in-flight turn (multi-stream scenes).
@@ -2419,6 +2563,7 @@ impl Space {
             participant_id,
             target_action_id,
             response,
+            revising: false,
         });
         cx.notify();
         seq
@@ -2432,6 +2577,20 @@ impl Space {
     pub fn push_content_delta_for_test(&mut self, seq: u64, delta: &str, cx: &mut Context<Self>) {
         if let Some(s) = self.streams.iter_mut().find(|s| s.seq == seq) {
             s.response.content.push_str(delta);
+            cx.emit(SpaceEvent::StreamDelta);
+            cx.notify();
+        }
+    }
+
+    /// Test-only: push a reasoning delta into turn `seq`'s live buffer, the
+    /// twin of [`Self::push_content_delta_for_test`]. A regeneration's first
+    /// minutes are often reasoning and nothing else, which is exactly the
+    /// frame a pending state has to be legible in.
+    #[doc(hidden)]
+    pub fn push_reasoning_delta_for_test(&mut self, seq: u64, delta: &str, cx: &mut Context<Self>) {
+        if let Some(s) = self.streams.iter_mut().find(|s| s.seq == seq) {
+            s.response.reasoning.push_str(delta);
+            s.response.expanded = true;
             cx.emit(SpaceEvent::StreamDelta);
             cx.notify();
         }
@@ -2541,6 +2700,7 @@ impl Space {
                 reason: "nothing to add".into(),
                 action_id: "decision-1".into(),
             }),
+            truncated: false,
         };
         // The synthetic read covers everything announced so far, which is
         // what a real exit reload's watermark says (`bridge::get_space_tree`

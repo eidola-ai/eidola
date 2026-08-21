@@ -17294,3 +17294,244 @@ fn space_a_transcript_retry_hands_the_keyboard_back(cx: &mut TestAppContext) {
 
     drain_runtime(&core);
 }
+
+// ---------------------------------------------------------------------------
+// Regeneration: an accepted press is visible, a refused one is not a press
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn space_regenerate_shows_its_pending_state_in_the_same_frame(cx: &mut TestAppContext) {
+    // The reported defect: an accepted Regenerate could be silent for minutes,
+    // so nothing on screen distinguished it from a dead button. The pending
+    // state is pushed before the backend is consulted, and it renders **in
+    // place of the post being replaced** — never as a child leaf, which would
+    // draw as a reply to the post it is about to become.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        let seq = s
+            .revising_seq("a2")
+            .expect("the accepted press is pending on the post it replaces");
+        assert!(
+            s.streams().iter().any(|t| t.seq == seq && t.revising),
+            "the turn knows it is a revision, not a reply"
+        );
+        assert!(!s.accepts_mutation(), "and the space is busy while it runs");
+    });
+
+    use eidola_gui::probe;
+    probe::set_probes_enabled(true);
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    probe::set_probes_enabled(false);
+    assert!(
+        names.iter().any(|n| n.ends_with("/regenerating")),
+        "the reader is told, in the frame that accepted the press: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("/regenerate")),
+        "and the verb it came from is gone, not left looking live: {names:?}"
+    );
+}
+
+#[gpui::test]
+fn space_regenerate_while_busy_is_refused_not_silently_dropped(cx: &mut TestAppContext) {
+    // A second press must not look accepted. The entity refuses it, and the
+    // affordance is already withheld — the two answers agree.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    space.update(cx, |s, cx| {
+        assert!(
+            s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the first press is accepted"
+        );
+        assert!(
+            !s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the second is refused while the first runs"
+        );
+        assert_eq!(
+            s.streams().iter().filter(|t| t.revising).count(),
+            1,
+            "and no second pending state was created"
+        );
+    });
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            0,
+            "no verb is offered while the space would refuse one"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_withholds_post_verbs_while_a_save_is_in_flight(cx: &mut TestAppContext) {
+    // The exclusive mutation slot makes the space busy **without** anything
+    // streaming. Asking only "is something streaming?" left Edit and
+    // Regenerate on screen through that whole window, where the handler was
+    // already certain to refuse them — a press that does nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+    space.read_with(cx, |s, _| {
+        assert!(!s.is_streaming(), "nothing is streaming…");
+        assert!(!s.accepts_mutation(), "…and yet no mutation is accepted");
+    });
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.post_verb_count_for_test("a2", cx), 0);
+        assert_eq!(v.post_verb_count_for_test("a1", cx), 0);
+    });
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.set_post_hover_for_test("a2", true, cx);
+        });
+    })
+    .unwrap();
+    use eidola_gui::probe;
+    probe::set_probes_enabled(true);
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    probe::set_probes_enabled(false);
+    assert!(
+        !names.iter().any(|n| n.contains("/regenerate")),
+        "even hovered, a post offers no verb the space would refuse: {names:?}"
+    );
+
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            1,
+            "and they come back when the space is free"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_regeneration_deltas_render_on_the_post_being_replaced(cx: &mut TestAppContext) {
+    // Reasoning and answer arrive on the pending revision, in the post's own
+    // place. The transcript gains no node: a regeneration is a new version of
+    // an existing post, not a new post.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.push_content_delta_for_test(seq, "a better answer", cx)
+        });
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        let turn = s.streams().iter().find(|t| t.seq == seq).expect("the turn");
+        assert_eq!(turn.response.content, "a better answer");
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.stream_overlays_for_test(cx).is_empty(),
+            "a revision claims no leaf of its own"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_regeneration_failure_keeps_the_generation_it_would_replace(cx: &mut TestAppContext) {
+    // Nothing was written, so the answer already on screen is the answer.
+    // Retry is deliberately not armed: it re-*asks* a participant, which is a
+    // different verb from regenerating.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.fail_revision_for_test(
+                seq,
+                AppError::ResponseTruncated {
+                    output_tokens: Some(4096),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(s.revising_seq("a2").is_none(), "the pending state is gone");
+        assert!(s.accepts_mutation(), "and the space is free again");
+        assert!(
+            s.failed_turn().is_none(),
+            "a regeneration leaves no re-ask behind it"
+        );
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx)
+                .is_some_and(|t| t.contains("length allowance")),
+            "the reader is told what happened, in their own language"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_marks_an_answer_that_stopped_at_its_length_limit(cx: &mut TestAppContext) {
+    // A partial answer is kept — it is real text — but it must not read as a
+    // finished one. The mark sits beneath the answer it is about.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.note_truncated_turn_for_test("a2", cx));
+    })
+    .unwrap();
+
+    use eidola_gui::probe;
+    probe::set_probes_enabled(true);
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    probe::set_probes_enabled(false);
+    assert!(
+        names.iter().any(|n| n.ends_with("/cut-off")),
+        "the answer says where it stopped: {names:?}"
+    );
+}

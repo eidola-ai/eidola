@@ -768,6 +768,9 @@ pub struct SpaceView {
     /// failure — nothing broke, there is nothing to retry, and the band it
     /// renders in is the muted one.
     pub(crate) reference_notice: Option<SharedString>,
+    /// The posts this window watched stop at their **length allowance** — the
+    /// marker's whole state (see `SpaceEvent::TurnEnded`).
+    pub(crate) truncated_posts: HashSet<SharedString>,
 
     /// Whether this window's **inspector** (the per-space settings panel) is
     /// open. Per-window by design — two windows on one space are two vantage
@@ -1030,6 +1033,7 @@ impl SpaceView {
             minimap_drag: None,
             error: None,
             reference_notice: None,
+            truncated_posts: HashSet::new(),
             inspector_open: false,
             inspector_scroll: ScrollHandle::new(),
             inspector_title: None,
@@ -1485,6 +1489,31 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn error_for_test(&self, cx: &gpui::App) -> Option<String> {
         self.error.as_ref().map(|e| error_copy(e, cx))
+    }
+
+    /// Test-only: how many affordance-row verbs a post currently offers — the
+    /// same answer the render and the keyboard model both read, so a test can
+    /// ask whether a verb is *there* rather than infer it from a paint.
+    #[doc(hidden)]
+    pub fn post_verb_count_for_test(&self, node_id: &str, cx: &gpui::App) -> usize {
+        self.post_verb_count(node_id, cx)
+    }
+
+    /// Test-only: the streaming leaves the tree will grow this frame. A
+    /// regeneration is deliberately absent — it renders in place.
+    #[doc(hidden)]
+    pub fn stream_overlays_for_test(&self, cx: &gpui::App) -> Vec<(u64, Option<SharedString>)> {
+        self.stream_overlays(cx)
+    }
+
+    /// Test-only: record that this window watched `action_id`'s answer stop at
+    /// its length allowance — what `SpaceEvent::TurnEnded { truncated: true }`
+    /// does, without a backend to produce one.
+    #[doc(hidden)]
+    pub fn note_truncated_turn_for_test(&mut self, action_id: &str, cx: &mut Context<Self>) {
+        self.truncated_posts
+            .insert(SharedString::from(action_id.to_string()));
+        cx.notify();
     }
 
     /// The node id whose separator band menu is open, if any.
@@ -1975,7 +2004,16 @@ impl SpaceView {
             SpaceEvent::TurnEnded {
                 seq,
                 response_action_id,
+                truncated,
             } => {
+                // An answer that stopped at its length allowance is marked
+                // where it is read, beneath the post itself — the only place
+                // the mark means anything. Session-scoped by necessity: the
+                // reason an answer stops is not part of what is stored.
+                if let (true, Some(id)) = (*truncated, response_action_id.as_deref()) {
+                    self.truncated_posts
+                        .insert(SharedString::from(id.to_string()));
+                }
                 // A selection aimed at this turn's streaming leaf — pending, or
                 // the branch the reader is parked on — has to follow the turn
                 // onto the post it wrote; the leaf is already gone (see
@@ -2104,6 +2142,10 @@ impl SpaceView {
             .read(cx)
             .streams()
             .iter()
+            // A regeneration has no leaf of its own: it renders **in place of**
+            // the post it replaces (see `render_post`). Attached as a child it
+            // would draw as a reply to the post it is about to become.
+            .filter(|t| !t.revising)
             .map(|t| (t.seq, t.target_action_id.clone().map(SharedString::from)))
             .collect()
     }
@@ -2241,6 +2283,12 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
         }
         AppError::SpaceArchived { .. } => crate::i18n::msg::space_error_archived(cx).to_string(),
         AppError::NotJoined { .. } => crate::i18n::msg::space_error_not_joined(cx).to_string(),
+        AppError::ResponseTruncated { .. } => {
+            crate::i18n::msg::space_error_response_truncated(cx).to_string()
+        }
+        AppError::RegenerationInFlight { .. } => {
+            crate::i18n::msg::space_error_regeneration_in_flight(cx).to_string()
+        }
         other => other.to_string(),
     }
 }

@@ -87,20 +87,39 @@ impl SpaceView {
         ) = match node.src {
             NodeSrc::Msg(i) => {
                 let post = &self.posts[i];
-                article = Some((
-                    i,
-                    article_label(&post.byline, post.byline_backend.as_deref(), &post.time),
-                    SharedString::from(super::minimap::spoken_text(
-                        &post.content,
-                        &post.references,
-                    )),
-                ));
-                (
-                    post.byline.clone(),
-                    post.byline_backend.clone(),
-                    post.time.clone(),
-                    self.render_post_body(i, node, bw, editing_this, cx),
-                )
+                // A regeneration in flight draws **here**, over the generation
+                // it is replacing: same post, same byline, new version
+                // arriving. The old text stays until the new one commits, so a
+                // turn that fails or is cut off leaves the answer that is
+                // already there — and the reader can see, from the frame the
+                // click was accepted in, that something is happening.
+                let revising = post
+                    .action_id
+                    .as_deref()
+                    .and_then(|id| self.space.read(cx).revising_seq(id));
+                if let Some(seq) = revising {
+                    (
+                        post.byline.clone(),
+                        post.byline_backend.clone(),
+                        post.time.clone(),
+                        self.render_revision_body(seq, bw, cx),
+                    )
+                } else {
+                    article = Some((
+                        i,
+                        article_label(&post.byline, post.byline_backend.as_deref(), &post.time),
+                        SharedString::from(super::minimap::spoken_text(
+                            &post.content,
+                            &post.references,
+                        )),
+                    ));
+                    (
+                        post.byline.clone(),
+                        post.byline_backend.clone(),
+                        post.time.clone(),
+                        self.render_post_body(i, node, bw, editing_this, cx),
+                    )
+                }
             }
             NodeSrc::Streaming(seq) => {
                 // The in-flight turn's byline resolves live (the snapshot only
@@ -341,6 +360,28 @@ impl SpaceView {
                     )),
             );
         }
+        // The answer stopped where its length allowance ran out, not where the
+        // model was done — said beneath the text it is about, in the quiet
+        // register, because the alternative is a reader who reads a
+        // mid-sentence stop as the model's own choice.
+        if post
+            .action_id
+            .as_ref()
+            .is_some_and(|id| self.truncated_posts.contains(id))
+        {
+            col = col.child(
+                div()
+                    .id(SharedString::from(format!("space-cut-off-{}", node.id)))
+                    .probe(
+                        format!("space/post/{i}/cut-off"),
+                        gpui::Role::Label,
+                        "Answer reached its length limit",
+                    )
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(crate::i18n::msg::space_answer_cut_off(cx)),
+            );
+        }
         // The footnote rail — the post's references, rendered *outside* the
         // markdown (the editor never learns what a reference is).
         if let Some(rail) = self.render_post_footnotes(i, node, editing, cx) {
@@ -360,8 +401,8 @@ impl SpaceView {
     /// of the post's editor, committed as a new generation) and **Regenerate**
     /// (the assistant's; a new agent generation via the current model). While
     /// this post is being edited it shows the session's Save/Cancel verbs
-    /// instead. Hidden entirely while streaming (the entity refuses mutations
-    /// mid-stream, so dead verbs would lie).
+    /// instead. Hidden entirely while the space refuses mutations (a stream, a
+    /// regeneration, a save in flight — dead verbs would lie).
     fn render_post_actions(
         &self,
         node: &TreeNode,
@@ -379,10 +420,13 @@ impl SpaceView {
         if !matches!(post.role.as_ref(), "user" | "assistant") {
             return empty();
         }
-        if self.space.read(cx).is_streaming() {
-            // This settled row remains actionable once the turn finishes, so
+        if !self.space.read(cx).accepts_mutation() {
+            // This settled row remains actionable once the space is free, so
             // compact layout keeps its latent action line stable while the
-            // temporarily disabled verbs stay hidden.
+            // temporarily disabled verbs stay hidden. The question is whether a
+            // mutation would be *accepted*, not merely whether something is
+            // streaming: a regeneration or a save in flight refuses one just as
+            // firmly, and a verb offered there is a press that does nothing.
             return action_gutter(page_layout, true).gap_0p5();
         }
 
@@ -631,7 +675,7 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.space.read(cx).is_streaming() {
+        if !self.space.read(cx).accepts_mutation() {
             return;
         }
         let Some(post) = self
@@ -743,9 +787,14 @@ impl SpaceView {
             .map(|m| m.to_string())
             .unwrap_or_else(|| self.stores.config.read(cx).default_model());
         let id = action_id.to_string();
-        self.space.update(cx, |s, cx| {
-            s.regenerate_post(id, model, cx);
-        });
+        let accepted = self
+            .space
+            .update(cx, |s, cx| s.regenerate_post(id, model, cx));
+        if !accepted {
+            // A refusal is observed rather than dropped: nothing started, so
+            // nothing should repaint as though it had.
+            return;
+        }
         cx.notify();
     }
 
@@ -887,6 +936,43 @@ impl SpaceView {
     /// the same quiet line in the same slot as "Thinking…", because it answers
     /// the same question (what is this silence?) with the honest reason. It is
     /// a readout, not a control: no click, `Role::Label`.
+    /// The **pending revision** rendered in a post's own place: an immediate
+    /// "Regenerating…" line until anything arrives, then the ordinary streaming
+    /// treatment (thinking disclosure, then the answer as it comes).
+    ///
+    /// The label is not decoration. A reasoning model can spend its whole
+    /// budget before the first content token, so for minutes at a stretch the
+    /// only honest thing to draw is that the request is out.
+    fn render_revision_body(&self, seq: u64, bw: gpui::Pixels, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let started = self
+            .space
+            .read(cx)
+            .streams()
+            .iter()
+            .find(|t| t.seq == seq)
+            .is_some_and(|t| !t.response.reasoning.is_empty() || !t.response.content.is_empty());
+        v_flex()
+            .w(bw)
+            .gap_2()
+            .child(
+                div()
+                    .id(SharedString::from(format!("space-regenerating-{seq}")))
+                    .probe(
+                        format!("space/streaming/{seq}/regenerating"),
+                        gpui::Role::Label,
+                        "Regenerating",
+                    )
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(crate::i18n::msg::space_regenerating(cx)),
+            )
+            .when(started, |d| {
+                d.child(self.render_streaming_body(seq, bw, cx))
+            })
+            .into_any_element()
+    }
+
     fn render_streaming_body(&self, seq: u64, bw: gpui::Pixels, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let turn = self

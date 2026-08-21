@@ -735,11 +735,11 @@ impl SpaceView {
     /// the affordance level's cycle length. Mirrors
     /// [`SpaceView::render_post_actions`]'s own gating so the two cannot
     /// disagree about what is there to focus.
-    pub(crate) fn post_verb_count(&self, node_id: &str, cx: &Context<Self>) -> usize {
+    pub(crate) fn post_verb_count(&self, node_id: &str, cx: &gpui::App) -> usize {
         if self.editing.as_ref().map(|e| &e.node_id) == Some(&SharedString::from(node_id)) {
             return 2; // Save, Cancel
         }
-        if self.space.read(cx).is_streaming() || self.editing.is_some() {
+        if !self.space.read(cx).accepts_mutation() || self.editing.is_some() {
             return 0;
         }
         let Some(idx) = self.post_index(node_id) else {
