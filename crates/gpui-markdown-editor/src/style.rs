@@ -53,6 +53,20 @@ macro_rules! theme_colors {
                 }
             }
         }
+
+        impl MarkdownStyle {
+            $(
+                #[doc = concat!("Override `", stringify!($field), "` (see the field).")]
+                ///
+                /// Recorded as the caller's own decision, so the per-frame
+                /// theme refresh leaves it alone. Every registered color gets
+                /// one of these, generated from the same list — a color cannot
+                /// be theme-refreshed and un-overridable at the same time.
+                pub fn $field(self, color: Hsla) -> Self {
+                    self.override_color(ThemeColor::$variant, color)
+                }
+            )+
+        }
     };
 }
 
@@ -389,14 +403,6 @@ impl MarkdownStyle {
         self
     }
 
-    pub fn code_block_background(self, bg: Hsla) -> Self {
-        self.override_color(ThemeColor::CodeBlockBackground, bg)
-    }
-
-    pub fn code_block_content_background(self, bg: Hsla) -> Self {
-        self.override_color(ThemeColor::CodeBlockContentBackground, bg)
-    }
-
     pub fn code_block_radius(mut self, radius: Pixels) -> Self {
         self.code_block_radius = radius;
         self
@@ -417,10 +423,6 @@ impl MarkdownStyle {
         self
     }
 
-    pub fn blockquote_border_color(self, color: Hsla) -> Self {
-        self.override_color(ThemeColor::BlockquoteBorder, color)
-    }
-
     pub fn list_indent(mut self, indent: Pixels) -> Self {
         self.list_indent = indent;
         self
@@ -434,27 +436,6 @@ impl MarkdownStyle {
     pub fn inline_code_font_family(mut self, family: impl Into<SharedString>) -> Self {
         self.inline_code_font_family = family.into();
         self
-    }
-
-    pub fn inline_code_background(self, bg: Hsla) -> Self {
-        self.override_color(ThemeColor::InlineCodeBackground, bg)
-    }
-
-    /// Override the base layer's highlight wash color (see
-    /// `highlight_color`).
-    pub fn highlight_color(self, color: Hsla) -> Self {
-        self.override_color(ThemeColor::HighlightBase, color)
-    }
-
-    /// Override the overlay layer's wash color (see
-    /// `highlight_overlay_color`).
-    pub fn highlight_overlay_color(self, color: Hsla) -> Self {
-        self.override_color(ThemeColor::HighlightOverlay, color)
-    }
-
-    /// Override the accent layer's wash color (see `highlight_accent_color`).
-    pub fn highlight_accent_color(self, color: Hsla) -> Self {
-        self.override_color(ThemeColor::HighlightAccent, color)
     }
 
     /// The wash color for one highlight layer. Total by construction — every

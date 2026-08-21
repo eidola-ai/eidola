@@ -10124,7 +10124,13 @@ fn theme_colors_follow_a_live_mode_flip_and_an_override_survives_it(cx: &mut Tes
         gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
 
         let mine = gpui::hsla(0.5, 0.5, 0.5, 0.5);
-        let mut style = MarkdownStyle::from_theme(cx).highlight_color(mine);
+        let also_mine = gpui::hsla(0.25, 0.5, 0.5, 1.0);
+        // Every theme color has a builder — they are generated from the same
+        // registry the refresh walks — so any of them can be a host's own
+        // decision, not just the handful that happened to have one written.
+        let mut style = MarkdownStyle::from_theme(cx)
+            .highlight_color(mine)
+            .table_rule_color(also_mine);
         let day = (
             style.text_color,
             style.highlight_overlay_color,
@@ -10147,6 +10153,10 @@ fn theme_colors_follow_a_live_mode_flip_and_an_override_survives_it(cx: &mut Tes
             style.highlight_color, mine,
             "a color the host set is never re-derived",
         );
+        assert_eq!(
+            style.table_rule_color, also_mine,
+            "table chrome is overridable like every other registered color",
+        );
 
         // And a fresh style built under the same mode agrees with the
         // refreshed one — one registry, so there is no second derivation to
@@ -10155,7 +10165,7 @@ fn theme_colors_follow_a_live_mode_flip_and_an_override_survives_it(cx: &mut Tes
         assert_eq!(style.text_color, fresh.text_color);
         assert_eq!(style.highlight_overlay_color, fresh.highlight_overlay_color);
         assert_eq!(style.highlight_accent_color, fresh.highlight_accent_color);
-        assert_eq!(style.table_rule_color, fresh.table_rule_color);
+        assert_eq!(style.thematic_break_color, fresh.thematic_break_color);
     });
 }
 
