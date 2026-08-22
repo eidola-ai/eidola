@@ -62,30 +62,43 @@
 //!
 //! | Claim key | Expected value | Derivation |
 //! |---|---|---|
-//! | `manifest.schema_version` | `2` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shape this module's parser understands; a jump is a release-gated trust event (`docs/trust-root.md`) |
+//! | `manifest.schema_version` | `2 or 3` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shapes this module's parser understands; a jump outside the set is a release-gated trust event (`docs/trust-root.md`) |
 //! | `enclave.snp_measurement` | `SEV-SNP launch measurement (48-byte hex)` | the embedded trust root pins a SEV-SNP measurement (`trust_root::SERVER_SNP_MEASUREMENT`), so the paired server's SEV-SNP platform must keep being attested |
 //! | `enclave.tdx_measurement.rtmr1` | `TDX runtime measurement (48-byte hex)` | ditto, `trust_root::SERVER_TDX_RTMR1` |
 //! | `enclave.tdx_measurement.rtmr2` | `TDX runtime measurement (48-byte hex)` | ditto, `trust_root::SERVER_TDX_RTMR2` |
 //! | `enclave.cmdline` | `kernel command line (non-empty)` | manifest schema 2 — the cmdline binds the tinfoil-config hash into the measurement |
-//! | `artifacts.eidola-cli` | `oci (linux/amd64)` | [`EXPECTED_ARTIFACTS`] — the artifact set schema-2 manifests record |
+//! | `artifacts.eidola-cli` | `oci (linux/amd64)` | [`EXPECTED_ARTIFACTS`] — the artifact set every accepted schema records |
 //! | `artifacts.eidola-cli-macos-universal` | `nix (darwin/universal)` | ditto |
 //! | `artifacts.eidola-gui-linux-amd64` | `nix (linux/amd64)` | ditto |
 //! | `artifacts.eidola-gui-macos-universal` | `nix (darwin/universal)` | ditto |
 //! | `artifacts.eidola-postgres` | `oci (linux/amd64)` | ditto |
 //! | `artifacts.eidola-server` | `oci (linux/amd64)` | ditto |
+//! | `artifacts.eidola-gui-macos-universal-zip` | `file (darwin/universal) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] — the macOS unsigned shipping zip. Absent from the schema-2 manifests this build also accepts; required of any manifest declaring schema 3 |
 //!
 //! An attested manifest produces its own claim list via
 //! [`attested_claims`]: a claim disappears when the field is absent, gains
 //! a `present but malformed …` value when its shape is wrong, and
-//! unrecognized manifest fields / artifact entries / artifact types
-//! surface as extra claims. Any delta between the two lists — missing,
+//! unrecognized manifest fields / artifact entries / artifact types /
+//! artifact-row fields surface as extra claims. Row fields are an exact
+//! set per type, never a minimum — an added per-row field is a claim
+//! nobody reviewed. Any delta between the two lists — missing,
 //! extra, or changed — is `ClaimsChanged`.
 //!
-//! Whether a field is *required* can depend on the schema the manifest
-//! declares. `archiveSha256` arrived with schema 2 and is mandatory from
-//! there on — it is the only artifact hash a user can check without Nix,
-//! so a schema-2 manifest that drops it has weakened the claim and reads
-//! as `ClaimsChanged`. Schema-1 rows legitimately have none.
+//! Whether a field or a whole row is *required* can depend on the schema
+//! the manifest declares. `archiveSha256` arrived with schema 2 and is
+//! mandatory from there on — it is the only artifact hash a user can check
+//! without Nix, so a schema-2 manifest that drops it has weakened the claim
+//! and reads as `ClaimsChanged`. Schema-1 rows legitimately have none. The
+//! macOS unsigned shipping zip's row arrives the same way with schema 3.
+//!
+//! That two-sided tolerance is the shape of every manifest schema rotation:
+//! a build **accepts** the new schema one release before any release
+//! **emits** it (`releases/README.md`), so between those releases this
+//! module must read the old and the new shape as equally authentic — while
+//! still refusing a manifest that declares the new schema and omits what
+//! that schema promises, *or* records a row the schema it declares does
+//! not have yet. Tolerance runs in one direction only: the shape a
+//! manifest announces is the shape it is held to.
 
 use std::path::{Path, PathBuf};
 
@@ -102,10 +115,14 @@ use crate::updater::ci_sigstore;
 /// manifest shape [`attested_claims`] walks. A version outside this set is a
 /// *claims change* (authentic but unintelligible to this build), not a
 /// verification failure.
-pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2];
+pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2, 3];
 
-/// The artifact entries a schema-2 `artifact-manifest.json` is expected to
-/// record, as `(name, type, platform)`. Structure only — digests / narHashes /
+/// The schema at which [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] rows become
+/// required. Named once so the tolerance and the requirement cannot drift.
+const SCHEMA_WITH_MACOS_SHIPPING_ZIP: u64 = 3;
+
+/// The artifact entries every accepted `artifact-manifest.json` records, as
+/// `(name, type, platform)`. Structure only — digests / narHashes /
 /// archiveSha256 are values and legitimately change every release.
 pub const EXPECTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     ("eidola-cli", "oci", "linux/amd64"),
@@ -115,6 +132,18 @@ pub const EXPECTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     ("eidola-postgres", "oci", "linux/amd64"),
     ("eidola-server", "oci", "linux/amd64"),
 ];
+
+/// Artifact entries schema 3 adds: the macOS unsigned shipping zip, whose
+/// `sha256` is the identity of the container a signed release is built from
+/// (`type: "file"` — one published file, one hash, no Nix).
+///
+/// Kept separate from [`EXPECTED_ARTIFACTS`] because this build accepts both
+/// schemas: a schema-2 manifest legitimately has no such row, and only a
+/// manifest declaring schema 3 or later is required to carry it. When 2
+/// leaves [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] the row becomes
+/// unconditionally required, with no further edit here.
+pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_3: &[(&str, &str, &str)] =
+    &[("eidola-gui-macos-universal-zip", "file", "darwin/universal")];
 
 /// How often the background poll re-checks while the app is running.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
@@ -586,6 +615,11 @@ fn hex(bytes: &[u8]) -> String {
 // Claims — expected set, attested extraction, comparison
 // ---------------------------------------------------------------------------
 
+/// Rendered as an alternative in an expected claim's value when a row is
+/// legitimately missing from an older manifest schema this build still
+/// accepts. [`compare_claims`] reads it on the attested side's absence.
+const ABSENT_CLAIM: &str = "absent";
+
 const SNP_CLAIM_VALUE: &str = "SEV-SNP launch measurement (48-byte hex)";
 const TDX_CLAIM_VALUE: &str = "TDX runtime measurement (48-byte hex)";
 const CMDLINE_CLAIM_VALUE: &str = "kernel command line (non-empty)";
@@ -634,6 +668,24 @@ pub fn expected_claims() -> Vec<Claim> {
         claims.push(Claim {
             key: format!("artifacts.{name}"),
             value: format!("{ty} ({platform})"),
+        });
+    }
+    // Rows a later schema introduced, while an earlier schema this build
+    // still accepts legitimately lacks them. `" or absent"` is what makes
+    // the acceptance real: without it every release still emitting the
+    // older schema would read as a claims change on this row.
+    let tolerate_absence = SUPPORTED_MANIFEST_SCHEMA_VERSIONS
+        .iter()
+        .any(|v| u64::from(*v) < SCHEMA_WITH_MACOS_SHIPPING_ZIP);
+    for (name, ty, platform) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3 {
+        let value = format!("{ty} ({platform})");
+        claims.push(Claim {
+            key: format!("artifacts.{name}"),
+            value: if tolerate_absence {
+                format!("{value} or {ABSENT_CLAIM}")
+            } else {
+                value
+            },
         });
     }
     claims
@@ -731,11 +783,47 @@ pub fn attested_claims(manifest: &serde_json::Value) -> Vec<Claim> {
 
     if let Some(artifacts) = obj.get("artifacts") {
         if let Some(artifacts_obj) = artifacts.as_object() {
+            let records_since_3 =
+                schema_version.is_none_or(|v| v >= SCHEMA_WITH_MACOS_SHIPPING_ZIP);
             for (name, entry) in artifacts_obj {
+                let since_3 = EXPECTED_ARTIFACTS_SINCE_SCHEMA_3
+                    .iter()
+                    .any(|(n, _, _)| n == name);
                 claims.push(Claim {
                     key: format!("artifacts.{name}"),
-                    value: describe_artifact(entry, schema_version),
+                    // A row the declared schema does not record yet is a
+                    // claim made outside the shape it was announced under.
+                    // Tolerating it would make the rotation one-sided: a
+                    // release could start emitting the row without bumping
+                    // the version, and neither the gate on the committed
+                    // manifest nor this verifier would say a word.
+                    value: if since_3 && !records_since_3 {
+                        format!(
+                            "present, but schema {} records it only from \
+                             schema {SCHEMA_WITH_MACOS_SHIPPING_ZIP} on",
+                            schema_version.map_or_else(|| "«missing»".into(), |v| v.to_string())
+                        )
+                    } else {
+                        describe_artifact(entry, schema_version)
+                    },
                 });
+            }
+            // A row a manifest's own declared schema requires but does not
+            // carry is a claim it *stopped* making — so it has to appear in
+            // the attested list, or the expected side's "or absent"
+            // tolerance would silently excuse it.
+            if records_since_3 {
+                for (name, _, _) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3 {
+                    if !artifacts_obj.contains_key(*name) {
+                        claims.push(Claim {
+                            key: format!("artifacts.{name}"),
+                            value: format!(
+                                "missing (recorded from schema \
+                                 {SCHEMA_WITH_MACOS_SHIPPING_ZIP} on)"
+                            ),
+                        });
+                    }
+                }
             }
         } else {
             claims.push(Claim {
@@ -768,6 +856,14 @@ fn describe_hex96(v: &serde_json::Value, ok: &str) -> String {
 /// Describe one artifact entry's *shape*. `schema_version` is the version
 /// the enclosing manifest declares, which decides whether a field that only
 /// exists from a given schema on is required or merely absent.
+///
+/// A row's fields are an exact set, not a minimum. An unrecognized field is
+/// a structural change to what the release is claiming — the same reading
+/// this module already gives an unrecognized top-level or enclave field,
+/// and the same rule `scripts/check-manifest-determinism.sh` enforces on
+/// the committed manifest. A verifier that accepted extras would let an
+/// authentic release grow a per-row claim (an Apple hash, a Team ID) that
+/// no user ever reviewed.
 fn describe_artifact(entry: &serde_json::Value, schema_version: Option<u64>) -> String {
     let Some(obj) = entry.as_object() else {
         return "present but not an object".into();
@@ -776,6 +872,35 @@ fn describe_artifact(entry: &serde_json::Value, schema_version: Option<u64>) -> 
         .get("platform")
         .and_then(|p| p.as_str())
         .unwrap_or("missing platform");
+    let described = describe_artifact_fields(obj, platform, schema_version);
+    // `archiveSha256` is the one field whose presence is legitimate in some
+    // accepted schemas and absent in others, so it is allowed on any `nix`
+    // row; requiredness is judged above, by schema.
+    let allowed: &[&str] = match obj.get("type").and_then(|t| t.as_str()) {
+        Some("oci") => &["type", "platform", "digest"],
+        Some("nix") => &["type", "platform", "narHash", "archiveSha256"],
+        Some("file") => &["type", "platform", "sha256"],
+        _ => return described,
+    };
+    let extra: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !allowed.contains(k))
+        .collect();
+    if extra.is_empty() {
+        described
+    } else {
+        format!("{described} — unrecognized field(s): {}", extra.join(", "))
+    }
+}
+
+/// The per-type field checks: what each artifact type must carry, and in
+/// what shape. Split from the key-set check above so each reads on its own.
+fn describe_artifact_fields(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    platform: &str,
+    schema_version: Option<u64>,
+) -> String {
     match obj.get("type").and_then(|t| t.as_str()) {
         Some("oci") => {
             let digest_ok = obj
@@ -800,13 +925,10 @@ fn describe_artifact(entry: &serde_json::Value, schema_version: Option<u64>) -> 
             // (the captured v0.0.8 fixture) legitimately have none, so
             // absence is only a defect from schema 2 on.
             let archive_required = schema_version.is_none_or(|v| v >= 2);
-            let archive_ok = match obj.get("archiveSha256").and_then(|d| d.as_str()) {
-                None => !archive_required,
-                Some(s) => {
-                    s.starts_with("sha256:")
-                        && s.len() == "sha256:".len() + 64
-                        && s["sha256:".len()..].chars().all(|c| c.is_ascii_hexdigit())
-                }
+            let archive_ok = if obj.contains_key("archiveSha256") {
+                is_sha256_hex(obj.get("archiveSha256"))
+            } else {
+                !archive_required
             };
             if nar_ok && archive_ok {
                 format!("nix ({platform})")
@@ -816,9 +938,29 @@ fn describe_artifact(entry: &serde_json::Value, schema_version: Option<u64>) -> 
                 format!("nix ({platform}) — malformed: expected sha256: hex archiveSha256")
             }
         }
+        // One published file, identified by the hash of its bytes — no Nix
+        // and no unpacking between the download and the check. The macOS
+        // unsigned shipping zip is the first.
+        Some("file") => {
+            if is_sha256_hex(obj.get("sha256")) {
+                format!("file ({platform})")
+            } else {
+                format!("file ({platform}) — malformed: expected sha256: hex sha256")
+            }
+        }
         Some(other) => format!("unrecognized type `{other}` ({platform})"),
         None => "missing type".into(),
     }
+}
+
+/// `sha256:` + 64 lowercase hex, the form every file hash in the manifest
+/// takes.
+fn is_sha256_hex(v: Option<&serde_json::Value>) -> bool {
+    v.and_then(|d| d.as_str()).is_some_and(|s| {
+        s.starts_with("sha256:")
+            && s.len() == "sha256:".len() + 64
+            && s["sha256:".len()..].chars().all(|c| c.is_ascii_hexdigit())
+    })
 }
 
 /// Does an attested claim value satisfy an expected one?
@@ -848,6 +990,11 @@ pub fn compare_claims(expected: &[Claim], attested: &[Claim]) -> Vec<ClaimDelta>
                 expected: Some(exp.value.clone()),
                 attested: Some(a.value.clone()),
             }),
+            // An expected value may list `absent` as an alternative — a row
+            // a newer manifest schema introduced, which an older schema this
+            // build still accepts does not carry. Nothing else may go
+            // missing silently.
+            None if claim_matches(&exp.value, ABSENT_CLAIM) => {}
             None => deltas.push(ClaimDelta {
                 key: exp.key.clone(),
                 expected: Some(exp.value.clone()),
@@ -929,7 +1076,123 @@ mod tests {
                 "artifacts.eidola-gui-macos-universal",
                 "artifacts.eidola-postgres",
                 "artifacts.eidola-server",
+                "artifacts.eidola-gui-macos-universal-zip",
             ]
+        );
+    }
+
+    /// A schema-3 manifest — the shape a later release will emit. It adds
+    /// the macOS unsigned shipping zip and nothing else, and must read as a
+    /// clean update, not a claims change.
+    fn schema_3_manifest() -> serde_json::Value {
+        let mut manifest = current_manifest();
+        manifest["schema_version"] = serde_json::json!(3);
+        manifest["artifacts"]["eidola-gui-macos-universal-zip"] = serde_json::json!({
+            "platform": "darwin/universal",
+            "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "type": "file"
+        });
+        manifest
+    }
+
+    #[test]
+    fn schema_3_manifest_with_the_zip_row_is_not_a_claims_change() {
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&schema_3_manifest()));
+        assert!(deltas.is_empty(), "unexpected deltas: {deltas:#?}");
+    }
+
+    #[test]
+    fn schema_2_manifest_without_the_zip_row_is_not_a_claims_change() {
+        // Accept-before-emit: this build accepts schema 3, while releases
+        // keep emitting schema 2 until the release after. If the new row
+        // were required unconditionally, every release in that window would
+        // read as ClaimsChanged — the failure mode the rotation exists to
+        // avoid.
+        let manifest = current_manifest();
+        assert_eq!(manifest["schema_version"], serde_json::json!(2));
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert!(deltas.is_empty(), "unexpected deltas: {deltas:#?}");
+    }
+
+    #[test]
+    fn schema_3_manifest_missing_the_zip_row_is_a_delta() {
+        // The other half of the tolerance: a manifest that declares schema 3
+        // has promised the row, so dropping it is a weakened claim rather
+        // than an older shape.
+        let mut manifest = schema_3_manifest();
+        manifest["artifacts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("eidola-gui-macos-universal-zip");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-gui-macos-universal-zip");
+        assert!(
+            deltas[0].attested.as_deref().unwrap().contains("missing"),
+            "got: {deltas:?}"
+        );
+    }
+
+    #[test]
+    fn zip_row_present_before_schema_3_is_a_delta() {
+        // The other side of the rotation. Accept-before-emit means a
+        // release must not start recording the row until the version says
+        // so — emission without the bump has to be as loud as the bump
+        // without emission, or "accepted but not yet emitted" is a claim
+        // nothing enforces.
+        let mut manifest = schema_3_manifest();
+        manifest["schema_version"] = serde_json::json!(2);
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-gui-macos-universal-zip");
+        assert_eq!(
+            deltas[0].attested.as_deref(),
+            Some("present, but schema 2 records it only from schema 3 on")
+        );
+    }
+
+    #[test]
+    fn unrecognized_field_on_any_artifact_row_is_a_delta() {
+        // Rows are exact key sets on this side too, for every type — the
+        // rule the determinism gate applies to the committed manifest. An
+        // extra per-row field is how an unreviewed claim would arrive.
+        for (row, field, expected) in [
+            (
+                "eidola-gui-macos-universal-zip",
+                "appleTeamId",
+                "file (darwin/universal) — unrecognized field(s): appleTeamId",
+            ),
+            (
+                "eidola-gui-macos-universal",
+                "appleSignatureSha256",
+                "nix (darwin/universal) — unrecognized field(s): appleSignatureSha256",
+            ),
+            (
+                "eidola-server",
+                "notarizationTicket",
+                "oci (linux/amd64) — unrecognized field(s): notarizationTicket",
+            ),
+        ] {
+            let mut manifest = schema_3_manifest();
+            manifest["artifacts"][row][field] = serde_json::json!("x");
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "{row}: unexpected deltas: {deltas:#?}");
+            assert_eq!(deltas[0].key, format!("artifacts.{row}"));
+            assert_eq!(deltas[0].attested.as_deref(), Some(expected), "{row}");
+        }
+    }
+
+    #[test]
+    fn malformed_zip_sha256_is_a_delta() {
+        let mut manifest = schema_3_manifest();
+        manifest["artifacts"]["eidola-gui-macos-universal-zip"]["sha256"] =
+            serde_json::json!("sha256:nope");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-gui-macos-universal-zip");
+        assert!(
+            deltas[0].attested.as_deref().unwrap().contains("malformed"),
+            "got: {deltas:?}"
         );
     }
 
@@ -953,12 +1216,14 @@ mod tests {
 
     #[test]
     fn schema_version_jump_is_a_delta() {
-        let mut manifest = current_manifest();
+        // Built on the newest shape this build knows, so the schema row is
+        // the only thing that can differ.
+        let mut manifest = schema_3_manifest();
         manifest["schema_version"] = serde_json::json!(99);
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].key, "manifest.schema_version");
-        assert_eq!(deltas[0].expected.as_deref(), Some("2"));
+        assert_eq!(deltas[0].expected.as_deref(), Some("2 or 3"));
         assert_eq!(deltas[0].attested.as_deref(), Some("99"));
     }
 
@@ -1101,8 +1366,14 @@ mod tests {
         assert_eq!(attested.len(), 1);
         assert_eq!(attested[0].key, "manifest");
         let deltas = compare_claims(&expected_claims(), &attested);
-        // Every expected claim missing + the one "not a JSON object" extra.
-        assert_eq!(deltas.len(), expected_claims().len() + 1);
+        // Every expected claim missing — except the rows whose absence an
+        // older accepted schema makes legitimate — plus the one "not a JSON
+        // object" extra.
+        let tolerated = expected_claims()
+            .iter()
+            .filter(|c| c.value.ends_with(ABSENT_CLAIM))
+            .count();
+        assert_eq!(deltas.len(), expected_claims().len() - tolerated + 1);
     }
 
     #[test]
