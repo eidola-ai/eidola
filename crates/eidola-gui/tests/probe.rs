@@ -7564,6 +7564,22 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
                     // inside the truncating text tells nobody anything.
                     incoming("z1", "agent", "Wren", Some(LONG_TITLE)),
                     incoming("z2", "agent", "Wren", Some(LONG_TITLE)),
+                    // And the round-5 shape: two conversations whose names
+                    // are *different strings* that part company only past the
+                    // row's cutoff. Numbering keyed on the full label finds
+                    // nothing to number and paints two identical rows.
+                    incoming(
+                        "w1",
+                        "agent",
+                        "Bede",
+                        Some(&format!("{LONG_TITLE}, part one")),
+                    ),
+                    incoming(
+                        "w2",
+                        "agent",
+                        "Bede",
+                        Some(&format!("{LONG_TITLE}, part two")),
+                    ),
                 ],
             );
         });
@@ -7572,7 +7588,7 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
         view.update(cx, |v, cx| {
             v.click_highlight_for_test(
                 "a1",
-                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
                 window,
                 cx,
             )
@@ -7611,8 +7627,11 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
 
     // The property the rows are for, asserted as a property: whatever the
     // fixture happens to contain, no two buttons in this picker read alike.
-    let rows = view
-        .read_with(cx, |v, cx| v.highlight_picker_for_test(cx))
+    let rows = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).highlight_picker_for_test(window, cx)
+        })
+        .unwrap()
         .expect("the picker is open");
     let labels: Vec<&String> = rows.iter().map(|(_, label, _)| label).collect();
     let unique: std::collections::BTreeSet<&&String> = labels.iter().collect();
@@ -7629,6 +7648,29 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
     // no help at all to the reader looking at them (Codex review, PR #327).
     // The ordinal is reported separately because it is *painted* separately,
     // outside the truncating text, so this is the property that fixes it.
+    // **Distinct strings that paint the same row.** These two conversation
+    // names part company only past the cutoff, so the labels differ and the
+    // rows do not — numbering keyed on the full string found nothing to number
+    // and left the reader two identical buttons (Codex review, PR #327).
+    let past_the_cutoff: Vec<&(String, String, Option<i64>)> = rows
+        .iter()
+        .filter(|(_, label, _)| label.starts_with("Bede, in "))
+        .collect();
+    assert_eq!(past_the_cutoff.len(), 2, "the pair: {past_the_cutoff:?}");
+    assert_ne!(
+        past_the_cutoff[0].1, past_the_cutoff[1].1,
+        "their full sentences really are different — which is why the full string cannot be \
+         what a collision is decided on"
+    );
+    assert_eq!(
+        past_the_cutoff
+            .iter()
+            .map(|(_, _, n)| *n)
+            .collect::<Vec<_>>(),
+        vec![Some(1), Some(2)],
+        "and they are numbered anyway, because what they *paint* is the same: {past_the_cutoff:?}"
+    );
+
     let long_indices: Vec<(usize, &String)> = rows
         .iter()
         .enumerate()
@@ -7655,7 +7697,7 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
         .collect();
     assert_eq!(
         ordinals.len(),
-        8,
+        10,
         "one painted ordinal per numbered row — the four collision groups, and \
          notably *not* row 12, whose \"(1)\" is its conversation's real name: {ordinals:?}"
     );

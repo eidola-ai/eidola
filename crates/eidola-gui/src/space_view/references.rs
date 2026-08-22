@@ -35,7 +35,7 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, Context, Focusable as _, InteractiveElement, IntoElement, ParentElement,
+    AnyElement, Context, Focusable as _, InteractiveElement, IntoElement, ParentElement, Pixels,
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
@@ -234,6 +234,62 @@ fn delegation_note(end: DelegationEnd, cx: &gpui::App) -> SharedString {
     }
 }
 
+/// The source-highlight picker's fixed width — see `render_highlight_picker`,
+/// which is the only place it may be spelled.
+const PICKER_WIDTH: Pixels = px(280.);
+
+/// The picker row's type size, as `text_xs` resolves it: `rems(0.75)` off the
+/// window's own `rem_size`, which carries the reader's type-scale setting. Kept
+/// here so the measurement below and the row's styling are one number.
+const PICKER_TEXT_REMS: f32 = 0.75;
+
+/// What a row's chrome takes out of [`PICKER_WIDTH`] before a glyph is drawn:
+/// the popover's padding, the row's own, the gap, the ellipsis, and room for a
+/// collision number.
+///
+/// **A deliberate over-estimate.** It decides how much of a label is treated
+/// as visible, and the two errors are not equals: crediting *less* room than
+/// the row really has can only group two rows that would have looked different
+/// (a number nobody needed), while crediting more would let two rows that
+/// paint alike go unnumbered — which is the defect itself.
+const PICKER_ROW_CHROME: Pixels = px(64.);
+
+/// **The prefix of `label` that will actually be painted in a picker row.**
+///
+/// Collisions are decided on this rather than on the whole string, because
+/// what a reader can tell apart is what reaches the screen: two titles
+/// differing only past the cutoff are distinct as strings and identical as
+/// rows, so numbering keyed on the full text left them indistinguishable —
+/// the round-4 marker never fired, having nothing to fire on (Codex review,
+/// PR #327).
+///
+/// The glyphs are measured for real (`shape_line`), because a character budget
+/// cannot be right for a proportional font at a scale the reader chooses. Two
+/// approximations remain and both are stated rather than hidden: the width is
+/// under-credited by [`PICKER_ROW_CHROME`], and gpui's own ellipsis placement
+/// is its business, not ours — so this is a *lower bound* on what is shown,
+/// which is the safe direction (over-numbering, never under-).
+fn painted_prefix(label: &SharedString, window: &Window, _cx: &gpui::App) -> SharedString {
+    let width = PICKER_WIDTH - PICKER_ROW_CHROME;
+    let font_size = window.rem_size() * PICKER_TEXT_REMS;
+    let run = gpui::TextRun {
+        len: label.len(),
+        font: window.text_style().font(),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(label.clone(), font_size, &[run], None);
+    match shaped.index_for_x(width) {
+        // The whole label fits: what is painted is what it says.
+        None => label.clone(),
+        Some(cut) => SharedString::from(label[..cut].to_string()),
+    }
+}
+
 /// One row of the source-highlight picker, **kept in three pieces because the
 /// row is laid out in two and read aloud as one.**
 ///
@@ -282,36 +338,49 @@ pub(crate) struct PickerRow {
 /// no free candidate can exist for a well-formed message — and gives up into a
 /// duplicate rather than a hang. The `debug_assert` below is what says so out
 /// loud in a test build.
-fn disambiguate(rows: &mut [PickerRow], nth: impl Fn(&SharedString, i64) -> SharedString) {
+fn disambiguate(
+    rows: &mut [PickerRow],
+    painted: impl Fn(&SharedString) -> SharedString,
+    nth: impl Fn(&SharedString, i64) -> SharedString,
+) {
+    // **What a row collides with is decided on what it paints**, not on what
+    // it says: a label cut short at the row's measure is the string a reader
+    // actually compares against its neighbour — and for the same reason the
+    // *numbers* are allocated in that space too. Allocating them against the
+    // full sentences hands two rows that differ only past the cutoff the same
+    // "(1)", which is two identical rows again with extra ceremony.
+    let keys: Vec<SharedString> = rows.iter().map(|row| painted(&row.label)).collect();
     let mut counts: std::collections::HashMap<&SharedString, usize> =
         std::collections::HashMap::new();
-    for row in rows.iter() {
-        *counts.entry(&row.label).or_insert(0) += 1;
+    for key in keys.iter() {
+        *counts.entry(key).or_insert(0) += 1;
     }
-    // Every row that keeps its base speaks for that text first: a numbered row
-    // may not land on one of them.
-    let mut taken: std::collections::HashSet<SharedString> = rows
+    // Every row that keeps its base speaks for that painted text first: a
+    // numbered row may not land on one of them.
+    let mut taken: std::collections::HashSet<SharedString> = keys
         .iter()
-        .filter(|row| counts.get(&row.label).copied().unwrap_or(0) == 1)
-        .map(|row| row.label.clone())
+        .filter(|key| counts.get(*key).copied().unwrap_or(0) == 1)
+        .cloned()
         .collect();
     let duplicated: std::collections::HashSet<SharedString> = counts
         .into_iter()
         .filter(|(_, n)| *n > 1)
-        .map(|(label, _)| label.clone())
+        .map(|(key, _)| key.clone())
         .collect();
 
     let limit = rows.len() as i64 + 1;
-    for row in rows.iter_mut() {
-        if !duplicated.contains(&row.label) {
+    for (row, key) in rows.iter_mut().zip(keys.iter()) {
+        if !duplicated.contains(key) {
             continue;
         }
         let mut n = 1;
         loop {
-            let candidate = nth(&row.label, n);
-            if taken.insert(candidate.clone()) || n >= limit {
+            if taken.insert(nth(key, n)) || n >= limit {
                 row.ordinal = Some(n);
-                row.accessible = candidate;
+                // The accessible name is built from the **whole** label: a
+                // screen reader is never handed a truncated sentence, so the
+                // part a sighted reader lost is the part it keeps.
+                row.accessible = nth(&row.label, n);
                 break;
             }
             n += 1;
@@ -320,12 +389,18 @@ fn disambiguate(rows: &mut [PickerRow], nth: impl Fn(&SharedString, i64) -> Shar
 
     debug_assert!(
         {
-            let unique: std::collections::HashSet<&SharedString> =
-                rows.iter().map(|row| &row.accessible).collect();
-            unique.len() == rows.len()
+            let painted_rows: std::collections::HashSet<(&SharedString, Option<i64>)> = rows
+                .iter()
+                .zip(keys.iter())
+                .map(|(r, k)| (k, r.ordinal))
+                .collect();
+            painted_rows.len() == rows.len()
         },
-        "a chooser whose rows read alike cannot say which button goes where: {:?}",
-        rows.iter().map(|row| &row.accessible).collect::<Vec<_>>()
+        "a chooser whose rows paint alike cannot say which button goes where: {:?}",
+        rows.iter()
+            .zip(keys.iter())
+            .map(|(r, k)| (k, r.ordinal))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2287,7 +2362,7 @@ impl SpaceView {
                     anchor_action_id: action_id.to_string(),
                     choices: many
                         .iter()
-                        .map(|r| (r.action_id.clone(), r.ordinal))
+                        .map(|r| (r.item_id.clone(), r.ordinal))
                         .collect(),
                 });
                 cx.notify();
@@ -2393,7 +2468,7 @@ impl SpaceView {
     /// different, and this is the first" — where a snippet of the referring
     /// post would have to lift prose out of a conversation to label a chooser
     /// with, which is what the place-not-content rule above refuses.
-    pub(crate) fn picker_rows(&self, cx: &gpui::App) -> Vec<PickerRow> {
+    pub(crate) fn picker_rows(&self, window: &Window, cx: &gpui::App) -> Vec<PickerRow> {
         let Some(picker) = self.highlight_picker.as_ref() else {
             return Vec::new();
         };
@@ -2405,13 +2480,17 @@ impl SpaceView {
         let mut rows: Vec<PickerRow> = picker
             .choices
             .iter()
-            .filter_map(|(action_id, ordinal)| {
+            .filter_map(|(item_id, ordinal)| {
                 let reference = index
                     .iter()
-                    .find(|r| &r.action_id == action_id && r.ordinal == *ordinal)?;
+                    .find(|r| &r.item_id == item_id && r.ordinal == *ordinal)?;
                 let label = self.reference_label(reference, cx);
                 Some(PickerRow {
-                    action_id: action_id.clone(),
+                    // The **current** generation of that item, which is what
+                    // the click should open — an edit moves it, and opening
+                    // the generation the reader clicked past would land them
+                    // on superseded text.
+                    action_id: reference.action_id.clone(),
                     accessible: label.clone(),
                     label,
                     ordinal: None,
@@ -2419,9 +2498,11 @@ impl SpaceView {
             })
             .collect();
 
-        disambiguate(&mut rows, |label, n| {
-            msg::space_highlight_picker_nth(cx, label.to_string(), n)
-        });
+        disambiguate(
+            &mut rows,
+            |label| painted_prefix(label, window, cx),
+            |label, n| msg::space_highlight_picker_nth(cx, label.to_string(), n),
+        );
         rows
     }
 
@@ -2472,21 +2553,46 @@ impl SpaceView {
         if self.space.read(cx).incoming_references_pending(&anchor) {
             return;
         }
-        if self.picker_rows(cx).is_empty() {
+        if !self.any_choice_resolves(cx) {
             self.highlight_picker = None;
             cx.notify();
         }
     }
 
+    /// Whether any of the open picker's chosen edges is still in the index.
+    ///
+    /// The question the close path actually has, asked without composing a
+    /// single word: wording needs the reader's locale *and* the row's measure,
+    /// and the space observer this runs from has no window to measure in.
+    /// Whether a row exists at all is a fact about the index alone.
+    fn any_choice_resolves(&self, cx: &gpui::App) -> bool {
+        let Some(picker) = self.highlight_picker.as_ref() else {
+            return false;
+        };
+        let index = self
+            .space
+            .read(cx)
+            .incoming_references(&picker.anchor_action_id);
+        picker.choices.iter().any(|(item_id, ordinal)| {
+            index
+                .iter()
+                .any(|r| &r.item_id == item_id && r.ordinal == *ordinal)
+        })
+    }
+
     /// The picker: a small popover of the posts that quoted the clicked
     /// passage. Dismissed by click-out or a choice — the band-menu pattern.
-    pub(crate) fn render_highlight_picker(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_highlight_picker(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
         self.highlight_picker.as_ref()?;
         // Rows come from the live index. An empty resolution is *closed* by
         // `close_highlight_picker_if_empty` before a frame that would show it;
         // this stays as the guard that no interleaving paints an empty
         // popover.
-        let rows = self.picker_rows(cx);
+        let rows = self.picker_rows(window, cx);
         if rows.is_empty() {
             return None;
         }
@@ -2504,7 +2610,7 @@ impl SpaceView {
             .absolute()
             .right(GUTTER_GAP)
             .bottom(px(96.))
-            .w(px(280.))
+            .w(PICKER_WIDTH)
             .p_1()
             .gap_0p5()
             .rounded_md()

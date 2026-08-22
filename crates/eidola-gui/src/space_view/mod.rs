@@ -376,10 +376,18 @@ pub(crate) enum PendingSettle {
 pub(crate) struct HighlightPicker {
     /// The post whose passage was clicked — the index these choices name.
     pub(crate) anchor_action_id: String,
-    /// The chosen edges, as `(referring action id, ordinal)`. **The pair, not
-    /// the action alone**: one post can quote the same passage twice, and it
-    /// is then two rows leading to two places within it. Deliberately not an
-    /// index into the cached vector, which an invalidation invalidates.
+    /// The chosen edges, as `(referring **item** id, ordinal)`.
+    ///
+    /// **The pair, not one of them alone**: one post can quote the same
+    /// passage twice, and it is then two rows leading to two places within it.
+    /// Deliberately not an index into the cached vector, which an invalidation
+    /// invalidates — and deliberately the *item* rather than the action,
+    /// because an action id is a generation. Editing a referring post without
+    /// touching its quote replicates the edge onto a fresh action, so the
+    /// backlink is the same backlink under a name this window had never seen;
+    /// keyed by action the row vanished from the picker, which could then
+    /// close itself over an edit that changed nothing about it (Codex review,
+    /// PR #327). The item is the half that does not move.
     pub(crate) choices: Vec<(String, i64)>,
 }
 
@@ -1704,11 +1712,12 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn highlight_picker_for_test(
         &self,
+        window: &Window,
         cx: &gpui::App,
     ) -> Option<Vec<(String, String, Option<i64>)>> {
         self.highlight_picker.as_ref()?;
         Some(
-            self.picker_rows(cx)
+            self.picker_rows(window, cx)
                 .into_iter()
                 .map(|row| (row.action_id, row.accessible.to_string(), row.ordinal))
                 .collect(),
@@ -2632,7 +2641,7 @@ impl Render for SpaceView {
             // The source-highlight picker: which of several posts that quoted
             // the clicked passage to visit. Above the composer, below the
             // notices — it's a choice, not a state.
-            .children(self.render_highlight_picker(cx))
+            .children(self.render_highlight_picker(window, cx))
             // The quote destination picker + its visibility statement: the
             // same layer as the highlight picker — a choice, not a state.
             .children(self.render_quote_destination(cx))
