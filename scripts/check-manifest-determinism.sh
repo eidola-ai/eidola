@@ -12,17 +12,41 @@
 # in the human attestation, which is signed and already non-deterministic
 # (docs/verification.md, docs/trust-root.md).
 #
-# Three assertions:
+# Four assertions:
 #
-#   1. Every artifact entry declares a known `type` and carries exactly the
-#      fields that type allows. A new field cannot appear unnoticed.
+#   0. The file is one document: no repeated members. Parsers keep the last
+#      of a duplicate and drop the rest, so a file with two `artifacts`
+#      members would be *checked* as one reading and *signed* as the whole
+#      bytes. Nothing below means anything until this holds.
+#   1. The document's envelope and every artifact entry carry exactly the
+#      fields they are allowed. A new field cannot appear unnoticed — and
+#      determinism dies to any unvalidated field, not only to key-shaped
+#      ones.
 #   2. No key anywhere in the document names signing material.
-#   3. Over `.github/workflows/artifacts.yml`: the job that assembles the
-#      manifest does not depend on a signing job, and no job that produces
-#      a manifest partial is granted the signing environment. This is the
-#      one that makes the invariant structural instead of lexical — a
-#      manifest field cannot depend on a key that never reaches the job
-#      computing it.
+#   3. Over `.github/workflows/artifacts.yml`: no ancestor of the job that
+#      assembles the manifest is a signing job, and no job producing a
+#      manifest partial is granted the signing environment. This is the one
+#      that makes the invariant structural instead of lexical — a manifest
+#      field cannot depend on a key that never reaches the job computing
+#      it.
+#
+# What this is not: assertion 3 reads the workflow with a scanner, not a
+# YAML parser, because a real one is not available here without adding a
+# dependency to a check whose whole value is being cheap. It reads job
+# keys, `needs:` and `environment:` in the forms GitHub accepts for them —
+# bare or quoted scalars, flow sequences on one line or several, block
+# lists, block scalars, trailing comments, any letter case for an
+# environment name — and normalizes them before comparing. It assumes the
+# two-space job indentation this repo's workflows use; a workflow indented
+# otherwise reports "no artifact-manifest job" and fails loudly rather than
+# passing quietly, which is the behavior every unparsed shape should have.
+#
+# Two backstops hold past its edges. A dependency whose *name* says signing
+# counts as a signing job even when this parse never saw its definition. And
+# this check is defense in depth, not the authority: the expensive
+# `Build & Verify Artifacts` chain regenerates the manifest on a machine
+# with no key and requires byte equality with the committed one, which no
+# amount of clever YAML can talk its way past.
 #
 # With no arguments the committed manifest and workflow are checked and the
 # bad fixtures beside this script are then required to FAIL — the check's
@@ -55,7 +79,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h | --help)
-      sed -n '2,30p' "${BASH_SOURCE[0]}"
+      sed -n '2,58p' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
@@ -84,13 +108,57 @@ report_lines() {
   done <<< "$out"
 }
 
-# ── 1 + 2: the manifest document ─────────────────────────────────────────
+# ── 0 + 1 + 2: the manifest document ─────────────────────────────────────
 check_manifest() {
   local file="$1" out
 
   if [[ ! -f "$file" ]]; then
     echo "error: no such manifest: $file" >&2
     exit 2
+  fi
+
+  # Before anything reads the document: is there one document to read?
+  # JSON permits repeated members, and `jq` — like most parsers — keeps the
+  # last. A file with two `artifacts` members would therefore be *checked*
+  # as the second while CI *signs* the bytes containing both, and every
+  # assertion below would be answering a question about a document nobody
+  # published. Python's `json` with `object_pairs_hook` sees the repetition;
+  # jq structurally cannot, since duplicates are gone before any filter
+  # runs. Python is admissible here for the same reason it is elsewhere in
+  # `scripts/`: this reads and reports, and writes no byte anyone ships.
+  if ! command -v python3 > /dev/null 2>&1; then
+    echo "error: python3 is required (duplicate-member detection)" >&2
+    exit 2
+  fi
+  out="$(
+    python3 -c '
+import json
+import sys
+
+def duplicates(pairs):
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            print(
+                f"duplicate member \"{key}\" — parsers keep one and drop the "
+                "other, so the document checked here is not the document "
+                "whose bytes get signed"
+            )
+        seen.add(key)
+    return dict(pairs)
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        json.load(handle, object_pairs_hook=duplicates)
+except ValueError as exc:
+    print(f"not parseable as JSON: {exc}")
+' "$file"
+  )"
+  report_lines "$out"
+  # A document that does not parse has no shape to check; stop here rather
+  # than let every later filter repeat the same complaint in jq's voice.
+  if [[ "$out" == *"not parseable as JSON"* ]]; then
+    return
   fi
 
   # The envelope first: the document's own shape. Checked before the
@@ -202,11 +270,24 @@ check_workflow() {
 
   out="$(
     awk '
-      # YAML scalars may be quoted anywhere a name appears — `"apple-sign":`
-      # as a job key, `- "apple-sign"` in a needs list. Names are compared
-      # against each other to build the graph, so they are unquoted once,
-      # here, rather than at each comparison.
+      # ── the scanner ─────────────────────────────────────────────────
+      # Not a YAML parser. It reads the constructs the assertions need —
+      # job keys, `needs:`, `environment:` — in the forms GitHub Actions
+      # accepts for them: quoted or bare scalars, flow sequences (on one
+      # line or several), block lists, block scalars, trailing comments,
+      # and any letter case for an environment name. Values are collected
+      # by indentation and normalized once, here, so a new spelling of the
+      # same thing is a normalization change rather than a new rule.
       BEGIN { SQ = sprintf("%c", 39) }
+
+      # A `#` opens a comment at line start or after whitespace — and only
+      # there, so `a#b` stays the name `a#b`.
+      function decomment(s) {
+        sub(/^[ \t]*#.*$/, "", s)
+        sub(/[ \t]+#.*$/, "", s)
+        return s
+      }
+
       function unquote(s,   first, last) {
         gsub(/^[ \t]+/, "", s)
         gsub(/[ \t]+$/, "", s)
@@ -217,11 +298,27 @@ check_workflow() {
         return s
       }
 
+      # Collected `needs:` text -> the job names in it. Flow punctuation is
+      # whitespace; a `-` is a list bullet; `>`/`|` with their chomping and
+      # indentation indicators are block-scalar markers, never job names.
+      function job_names(s,   n, i, t, out) {
+        gsub(/[][,]/, " ", s)
+        n = split(s, parts, /[ \t]+/)
+        out = ""
+        for (i = 1; i <= n; i++) {
+          t = unquote(parts[i])
+          if (t == "" || t == "-") continue
+          if (t ~ /^[>|][-+0-9]*$/) continue
+          out = out " " t
+        }
+        return out
+      }
+
       # ── collect: job name -> needs, environment, produces-partial ──
       /^[^ #]/ { in_jobs = ($0 ~ /^jobs:/); next }
 
-      in_jobs && /^  [^ \t#-][^:]*:[ \t]*$/ {
-        job = $0
+      in_jobs && /^  [^ \t#-][^:]*:[ \t]*(#.*)?$/ {
+        job = decomment($0)
         sub(/^  /, "", job)
         sub(/:[ \t]*$/, "", job)
         job = unquote(job)
@@ -236,45 +333,30 @@ check_workflow() {
       # Any new key at job level closes whatever block was being collected.
       /^    [A-Za-z0-9_-]+:/ { collecting_needs = 0; collecting_env = 0 }
 
-      # `needs:` is either inline (`needs: oci`, `needs: [a, b]`) or a
-      # block list of `- name` lines that follow it.
+      # `needs:` and `environment:` are both collected as *text*: the value
+      # on the key line plus every line indented under it. What form that
+      # text took — inline, list, flow sequence, block scalar — is the
+      # normalizer'"'"'s problem, not the scanner'"'"'s.
       /^    needs:/ {
-        rest = $0
-        sub(/^    needs:[ \t]*/, "", rest)
-        gsub(/[][,]/, " ", rest)
-        if (rest ~ /[^ \t]/) {
-          n = split(rest, parts, /[ \t]+/)
-          for (i = 1; i <= n; i++)
-            if (parts[i] != "") needs[job] = needs[job] " " unquote(parts[i])
-          collecting_needs = 0
-        } else {
-          collecting_needs = 1
-        }
+        value = decomment($0)
+        sub(/^    needs:[ \t]*/, "", value)
+        needs_raw[job] = needs_raw[job] " " value
+        collecting_needs = 1
         next
       }
-      collecting_needs && /^      - / {
-        dep = $0
-        sub(/^      -[ \t]*/, "", dep)
-        needs[job] = needs[job] " " unquote(dep)
+      collecting_needs && /^      / {
+        needs_raw[job] = needs_raw[job] " " decomment($0)
         next
       }
-      # `environment:` is either a scalar (a name, or an expression that
-      # resolves to one) or a mapping whose `name:` carries it — both are
-      # valid GitHub Actions, so the nested block is collected too. The
-      # whole block is kept rather than just `name`, which errs toward
-      # flagging.
       /^    environment:/ {
-        env = $0
+        env = decomment($0)
         sub(/^    environment:[ \t]*/, "", env)
-        if (env ~ /[^ \t]/) {
-          environment[job] = environment[job] " " env
-        } else {
-          collecting_env = 1
-        }
+        environment[job] = environment[job] " " env
+        collecting_env = 1
         next
       }
       collecting_env && /^      / {
-        environment[job] = environment[job] " " $0
+        environment[job] = environment[job] " " decomment($0)
         next
       }
 
@@ -286,9 +368,13 @@ check_workflow() {
         # A signing job is one granted the Apple signing environment. The
         # name is checked too, so a signing job that has not yet been given
         # its environment (or was renamed) is still caught.
+        # Environment names are case-insensitive to GitHub, so they are
+        # matched that way here; `Apple-Signing` is the same protected
+        # environment as `apple-signing`.
         for (i = 1; i <= njobs; i++) {
           j = jobs[i]
-          if (environment[j] ~ /apple-signing/ || j ~ /sign/) signer[j] = 1
+          needs[j] = job_names(needs_raw[j])
+          if (tolower(environment[j]) ~ /apple-signing/ || tolower(j) ~ /sign/) signer[j] = 1
         }
 
         found = 0
@@ -317,14 +403,14 @@ check_workflow() {
             # `signer[d]` covers jobs this file defines; the name test
             # also covers a dependency on a job this parse never saw — a
             # reusable workflow, or a job whose key it could not read.
-            if (signer[d] || d ~ /sign/)
+            if (signer[d] || tolower(d) ~ /sign/)
               print "the `artifact-manifest` job depends on signing job `" d "` (" chain[d] ") — a key-dependent value could then reach the manifest"
           }
         }
 
         for (i = 1; i <= njobs; i++) {
           j = jobs[i]
-          if (partial[j] && environment[j] ~ /apple-signing/)
+          if (partial[j] && tolower(environment[j]) ~ /apple-signing/)
             print "job `" j "` produces a manifest partial and is granted the apple-signing environment"
         }
       }

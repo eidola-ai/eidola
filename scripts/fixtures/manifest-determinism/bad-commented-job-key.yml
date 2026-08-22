@@ -1,0 +1,30 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# A comment after the job key. YAML ends the mapping key at the `#`, so
+# this is the job `release-assets`; a header pattern anchored to
+# end-of-line never registers it, and the environment it holds is
+# attributed to whatever was parsed before it — here, nothing.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-assets: # publishes what the release serves
+    name: Publish release assets
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Publish
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - release-assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full
