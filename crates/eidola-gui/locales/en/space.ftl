@@ -44,7 +44,7 @@ space-regenerating = Regenerating…
 # Shown in the conversation's recovery notice when a response used its whole
 # length allowance on its own reasoning and never began an answer. Nothing was
 # recorded and nothing was replaced, so the answer already there is untouched.
-space-error-response-truncated = The model used its whole length allowance thinking and never started an answer. Nothing was changed — try again, or ask a shorter question.
+space-error-response-truncated = The model used its whole length allowance thinking and never started an answer. No answer was added or replaced — try again, or ask a shorter question.
 # A quiet marker beneath a response a regeneration was asked for while one was
 # already running against it somewhere this window cannot see. Not a failure:
 # the first one is still going, and its result will arrive here.

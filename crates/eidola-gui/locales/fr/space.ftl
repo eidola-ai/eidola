@@ -14,6 +14,6 @@ space-footnote-delegation-failed = s’est arrêtée : { $reason ->
     }
 
 space-regenerating = Régénération…
-space-error-response-truncated = Le modèle a consacré toute sa longueur autorisée à réfléchir sans jamais commencer de réponse. Rien n’a été modifié : réessayez, ou posez une question plus courte.
+space-error-response-truncated = Le modèle a consacré toute sa longueur autorisée à réfléchir sans jamais commencer de réponse. Aucune réponse n’a été ajoutée ni remplacée : réessayez, ou posez une question plus courte.
 space-regenerating-elsewhere = Cette réponse est déjà en cours de régénération.
 space-answer-cut-off = Cette réponse a atteint sa limite de longueur et s’interrompt en pleine pensée.
