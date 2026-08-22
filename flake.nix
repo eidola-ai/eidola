@@ -1194,6 +1194,13 @@ with open(path, "wb") as f:
         #     zip records DOS local time.
         #   * entry order is `find | sort` under LC_ALL=C rather than
         #     readdir order, which is filesystem state.
+        #   * modes are normalized to the same exact set the tar archive
+        #     uses, since zip records them and a umask would otherwise be
+        #     an input. (Symlink modes are the one thing chmod cannot
+        #     portably set, and they differ by platform — 0755 on macOS,
+        #     0777 on Linux. The payload contains none; if one ever
+        #     appears, the tar archive remains the cross-platform
+        #     identity and this container is macOS-produced.)
         # The zip version pinned by flake.lock is an input to the result,
         # the same way gzip's version is an input to archiveSha256.
         mkShippingZip =
@@ -1217,7 +1224,17 @@ with open(path, "wb") as f:
             ''
               export LC_ALL=C
               cp -R ${payload} tree
-              chmod -R u+w tree
+              # Exactly the modes mkReproducibleArchive's --mode gives the
+              # tar, and for the same reason: zip records Unix modes in the
+              # central directory (`-X` drops uid/gid and the extra
+              # timestamps, not these), so without this the hash is a
+              # function of the producing shell's umask. A verifier
+              # re-zipping a reconstructed tree under umask 077 would get
+              # 0700/0600 and a different file from identical contents.
+              # `X` keys off the executable bit, which is the only mode
+              # information a NAR carries, so the result is a function of
+              # the payload.
+              chmod -R u=rwX,go=rX tree
               find tree -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
               # Built beside the tree and moved into place: zip writes its
               # temporary archive in the *output's* directory, and the store

@@ -4,8 +4,8 @@
 #
 # The recipe's whole job is to be a *function of the payload*: the same
 # tree must produce the same bytes on any machine, and the bytes must still
-# describe the tree it was given. Two properties carry that, and both fail
-# silently:
+# describe the tree it was given. Three properties carry that, and each
+# fails silently:
 #
 #   * `-y` stores symlinks as symlinks. Without it Info-ZIP follows them
 #     and writes copies — a bundle containing a framework comes back with
@@ -13,12 +13,16 @@
 #     different (and invalid) bundle. Nothing errors.
 #   * mtimes, entry order and the extra fields carrying uid/gid have to be
 #     pinned, or the same tree hashes differently on the next run.
+#   * modes have to be normalized. zip records them, so without that the
+#     hash is a function of whoever's umask made the tree — and re-zipping
+#     a reconstructed bundle is exactly what an external verifier does.
 #
-# So this asserts the flake's invocation still carries the flags, then
-# exercises the recipe on a fixture bundle shaped like the thing that
-# breaks: a framework's `Current`/`Foo` symlink pair. The final negative
-# case runs the same recipe *without* `-y` and requires it to lose the
-# symlink — the reason the flag is not optional.
+# So this asserts the flake's recipe still declares what it must, then
+# exercises the same recipe on a fixture bundle shaped like the thing that
+# breaks: a framework's `Current`/`Foo` symlink pair, zipped twice and then
+# again under a restrictive umask. The final negative case runs the recipe
+# *without* `-y` and requires it to lose the symlink — the reason the flag
+# is not optional.
 #
 # Runs on macOS or Linux with Info-ZIP `zip`/`unzip`.
 
@@ -61,15 +65,16 @@ for flag in -X -y; do
 done
 echo "ok: mkShippingZip passes -X and -y"
 
-# The stamp and the zone are hash inputs, so the derivation must state
-# them rather than inherit whatever stdenv happens to default to.
-for pinned in 'SOURCE_DATE_EPOCH = "315532800"' 'TZ = "UTC"'; do
+# The stamp, the zone and the mode set are hash inputs, so the derivation
+# must state them rather than inherit whatever stdenv or the caller's umask
+# happens to give it.
+for pinned in 'SOURCE_DATE_EPOCH = "315532800"' 'TZ = "UTC"' 'chmod -R u=rwX,go=rX'; do
   if [[ "$recipe" != *"$pinned"* ]]; then
     echo "FAIL: mkShippingZip no longer declares $pinned" >&2
     exit 1
   fi
 done
-echo "ok: mkShippingZip declares SOURCE_DATE_EPOCH = 315532800 and TZ = UTC"
+echo "ok: mkShippingZip declares SOURCE_DATE_EPOCH, TZ, and the exact mode set"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -94,6 +99,10 @@ export TZ=UTC LC_ALL=C
 normalize_and_zip() {
   local tree="$1" out="$2"
   shift 2
+  # The same two normalizations the derivation performs, in the same order:
+  # modes to an exact set (zip records them; a umask would otherwise reach
+  # the hash) and every mtime to the pinned stamp.
+  chmod -R u=rwX,go=rX "$tree"
   find "$tree" -exec touch -h -t 198001010000.00 {} +
   (cd "$tree" && find . -mindepth 1 | LC_ALL=C sort | zip -q "$@" -@ "$out")
 }
@@ -107,6 +116,22 @@ if ! cmp -s "$WORK/one.zip" "$WORK/two.zip"; then
   exit 1
 fi
 echo "ok: the recipe is byte-identical across runs ($(wc -c < "$WORK/one.zip" | tr -d ' ') bytes)"
+
+# ── the verifier's umask must not reach the hash ─────────────────────────
+# The documented check re-zips a reconstructed tree and compares the file
+# against a published hash. That comparison is only meaningful if the
+# recipe is a function of the payload, and zip records Unix modes — so a
+# stricter umask on the verifier's machine must produce the same bytes.
+(
+  umask 077
+  cp -R "$WORK/payload" "$WORK/payload-strict"
+)
+normalize_and_zip "$WORK/payload-strict" "$WORK/strict.zip" -X -y
+if ! cmp -s "$WORK/one.zip" "$WORK/strict.zip"; then
+  echo "FAIL: the same payload zipped under umask 077 differs — a mode is reaching the hash" >&2
+  exit 1
+fi
+echo "ok: the same payload under umask 077 produces the same bytes"
 
 # ── round trip: the bundle that comes back is the bundle that went in ────
 mkdir -p "$WORK/out"

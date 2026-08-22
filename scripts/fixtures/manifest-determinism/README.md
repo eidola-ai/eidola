@@ -11,6 +11,7 @@ None of these is a real manifest or a real workflow. The `.yml` files deliberate
 | `bad-empty-artifacts.json` | `artifacts: {}`. A manifest that records nothing would otherwise satisfy every per-entry rule vacuously. |
 | `bad-signing-feeds-manifest.yml` | A signing job is a direct `needs:` of the manifest job, which also holds the signing environment. |
 | `bad-transitive-signing.yml` | The same, one hop further away: the manifest job needs `apple`, and `apple` needs the signing job. Ancestors are walked, not just direct edges. |
+| `bad-out-of-range-schema.json` | `schema_version: 1e100` — integral, positive, and unreadable as the u64 the client parses that field into. A double-based reader sees nothing wrong with it. |
 | `bad-duplicate-members.json` | Two `artifacts` members in one file. Every JSON parser keeps one and drops the other, so the first — carrying a forbidden row — disappears before any check runs, and the document validated stops being the document signed. Caught by a duplicate-aware parse before anything else reads the file. |
 | `bad-environment-case.yml` | `environment: Apple-Signing`. Environment names are case-insensitive to GitHub: same environment, same secrets, different string. |
 | `bad-block-scalar-needs.yml` | `needs: >-` with the job name on the next line. |

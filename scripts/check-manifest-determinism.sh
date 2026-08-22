@@ -30,6 +30,13 @@
 #      field cannot depend on a key that never reaches the job computing
 #      it.
 #
+# The manifest half is read by python3 (stdlib only, read-only) rather than
+# jq: `schema_version` is a u64 to the client, jq numbers are doubles, and
+# repeated members are resolved before any filter runs — both are checks a
+# filter language cannot express. It is also the interpreter every platform
+# here already ships, so this gate adds nothing to a fresh checkout's
+# prerequisites.
+#
 # What this is not: assertion 3 reads the workflow with a scanner, not a
 # YAML parser, because a real one is not available here without adding a
 # dependency to a check whose whole value is being cheap. It reads job
@@ -117,142 +124,166 @@ check_manifest() {
     exit 2
   fi
 
-  # Before anything reads the document: is there one document to read?
-  # JSON permits repeated members, and `jq` — like most parsers — keeps the
-  # last. A file with two `artifacts` members would therefore be *checked*
-  # as the second while CI *signs* the bytes containing both, and every
-  # assertion below would be answering a question about a document nobody
-  # published. Python's `json` with `object_pairs_hook` sees the repetition;
-  # jq structurally cannot, since duplicates are gone before any filter
-  # runs. Python is admissible here for the same reason it is elsewhere in
-  # `scripts/`: this reads and reports, and writes no byte anyone ships.
+  # One grader, one language. The document is read by Python rather than
+  # jq for a reason the checks below depend on: `schema_version` is a u64
+  # to the client (`as_u64()`), and jq numbers are IEEE-754 doubles, so
+  # `1e100` and `2^64` are integral there and out of range here — the gate
+  # would pass a manifest every client reads as malformed. Python integers
+  # are arbitrary precision, so the range check is exact. It also sees
+  # repeated members, which no filter language can: duplicates are resolved
+  # before a filter ever runs. Python is admissible for the same reason it
+  # is elsewhere in `scripts/`: this reads and reports, and writes no byte
+  # anyone ships. (It is also the interpreter every platform here already
+  # has, which keeps `just check` from needing anything extra.)
   if ! command -v python3 > /dev/null 2>&1; then
-    echo "error: python3 is required (duplicate-member detection)" >&2
+    echo "error: python3 is required (manifest validation)" >&2
     exit 2
   fi
   out="$(
     python3 -c '
 import json
+import re
 import sys
 
-def duplicates(pairs):
+U64_MAX = 2 ** 64 - 1
+SIGNING = re.compile("sign|notar|ticket|team|cert|staple|apple", re.IGNORECASE)
+ALLOWED = {
+    "oci": ["digest", "platform", "type"],
+    "nix": ["archiveSha256", "narHash", "platform", "type"],
+    "file": ["platform", "sha256", "type"],
+}
+
+violations = []
+duplicates = []
+
+
+def note_duplicates(pairs):
     seen = set()
     for key, _ in pairs:
         if key in seen:
-            print(
-                f"duplicate member \"{key}\" — parsers keep one and drop the "
-                "other, so the document checked here is not the document "
-                "whose bytes get signed"
-            )
+            duplicates.append(key)
         seen.add(key)
     return dict(pairs)
 
+
+def keyset(who, obj, want):
+    if sorted(obj) != sorted(want):
+        violations.append(
+            "{}: allows exactly {} — found {}".format(
+                who, ", ".join(sorted(want)), ", ".join(sorted(obj)) or "nothing"
+            )
+        )
+
+
+def walk_keys(node, out):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            out.add(key)
+            walk_keys(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            walk_keys(item, out)
+
+
 try:
     with open(sys.argv[1], "rb") as handle:
-        json.load(handle, object_pairs_hook=duplicates)
+        manifest = json.load(handle, object_pairs_hook=note_duplicates)
 except ValueError as exc:
-    print(f"not parseable as JSON: {exc}")
+    print("not parseable as JSON: {}".format(exc))
+    sys.exit(0)
+
+for key in duplicates:
+    print(
+        "duplicate member \"{}\" — parsers keep one and drop the other, so "
+        "the document checked here is not the document whose bytes get "
+        "signed".format(key)
+    )
+
+if not isinstance(manifest, dict):
+    print("manifest: not a JSON object")
+    sys.exit(0)
+
+# The envelope: a nonce, a run ID or a build timestamp does not have to look
+# like signing material to break determinism — it only has to be a field
+# nobody validated. Key sets are equalities at every level, so an added
+# field and a dropped one are both violations.
+keyset("manifest", manifest, ["artifacts", "enclave", "schema_version"])
+
+version = manifest.get("schema_version")
+if isinstance(version, bool) or not isinstance(version, int):
+    violations.append(
+        "manifest.schema_version: {} is not an integer".format(json.dumps(version))
+    )
+elif version < 1:
+    violations.append(
+        "manifest.schema_version: {} is not a positive integer".format(version)
+    )
+elif version > U64_MAX:
+    violations.append(
+        "manifest.schema_version: {} exceeds the u64 the client parses it "
+        "as".format(version)
+    )
+
+artifacts = manifest.get("artifacts")
+if not isinstance(artifacts, dict):
+    violations.append("manifest.artifacts: not an object")
+    artifacts = {}
+elif not artifacts:
+    violations.append(
+        "manifest.artifacts: empty — a manifest that records nothing proves nothing"
+    )
+
+enclave = manifest.get("enclave")
+if not isinstance(enclave, dict):
+    violations.append("manifest.enclave: not an object")
+else:
+    keyset("enclave", enclave, ["cmdline", "snp_measurement", "tdx_measurement"])
+    tdx = enclave.get("tdx_measurement")
+    if not isinstance(tdx, dict):
+        violations.append("enclave.tdx_measurement: not an object")
+    else:
+        keyset("enclave.tdx_measurement", tdx, ["rtmr1", "rtmr2"])
+
+# Field allow-list per artifact type. `oci` records the image digest; `nix`
+# records the store-path checkpoint plus the archive hash a user can check
+# without Nix; `file` records the sha256 of one published file.
+for name, entry in artifacts.items():
+    if not isinstance(entry, dict):
+        violations.append("artifacts.{}: not an object".format(name))
+        continue
+    kind = entry.get("type")
+    if kind not in ALLOWED:
+        violations.append(
+            "artifacts.{}: unknown type {} (allowed: oci, nix, file)".format(
+                name, json.dumps(kind)
+            )
+        )
+        continue
+    if sorted(entry) != sorted(ALLOWED[kind]):
+        violations.append(
+            "artifacts.{}: type \"{}\" allows exactly {} — found {}".format(
+                name, kind, ", ".join(sorted(ALLOWED[kind])), ", ".join(sorted(entry))
+            )
+        )
+
+# No key anywhere may name signing material, at any depth. Artifact names
+# are keys too, so `eidola-gui-macos-signed-zip` trips this as readily as a
+# `team_id` field would.
+keys = set()
+walk_keys(manifest, keys)
+for key in sorted(keys):
+    if SIGNING.search(key):
+        violations.append(
+            "key \"{}\" names signing material — Apple envelope hashes and "
+            "identities belong in the human attestation, not the "
+            "manifest".format(key)
+        )
+
+for line in violations:
+    print(line)
 ' "$file"
   )"
   report_lines "$out"
-  # A document that does not parse has no shape to check; stop here rather
-  # than let every later filter repeat the same complaint in jq's voice.
-  if [[ "$out" == *"not parseable as JSON"* ]]; then
-    return
-  fi
-
-  # The envelope first: the document's own shape. Checked before the
-  # entries because a nonce, a run ID or a build timestamp does not have to
-  # look like signing material to break determinism — it only has to be a
-  # field nobody validated. Key sets are compared for equality at every
-  # level, so an added field and a dropped one are both violations, and an
-  # empty `artifacts` object is not a vacuous pass.
-  out="$(
-    jq -r '
-      def keyset($who; $want):
-        if (keys != ($want | sort)) then
-          "\($who): allows exactly \($want | sort | join(", ")) — found \(keys | join(", "))"
-        else empty end;
-      if type != "object" then
-        "manifest: not a JSON object"
-      else
-        keyset("manifest"; ["artifacts", "enclave", "schema_version"]),
-        # A positive integer, per docs/trust-root.md — and specifically what
-        # the client parses it as. The verifier reads it with `as_u64()`, so
-        # 2.5 or -3 is malformed *there* and reads as a claims change; this
-        # gate has to reject what that parser would reject, or a release
-        # passes here and alarms every client.
-        (if (.schema_version | type) != "number" then
-           "manifest.schema_version: not a number"
-         elif (.schema_version | floor) != .schema_version then
-           "manifest.schema_version: \(.schema_version) is not an integer"
-         elif .schema_version < 1 then
-           "manifest.schema_version: \(.schema_version) is not a positive integer"
-         else empty end),
-        (if (.artifacts | type) != "object" then
-           "manifest.artifacts: not an object"
-         elif (.artifacts | length) == 0 then
-           "manifest.artifacts: empty — a manifest that records nothing proves nothing"
-         else empty end),
-        (if (.enclave | type) != "object" then
-           "manifest.enclave: not an object"
-         else
-           (.enclave | keyset("enclave"; ["cmdline", "snp_measurement", "tdx_measurement"])),
-           (if (.enclave.tdx_measurement | type) != "object" then
-              "enclave.tdx_measurement: not an object"
-            else
-              (.enclave.tdx_measurement | keyset("enclave.tdx_measurement"; ["rtmr1", "rtmr2"]))
-            end)
-         end)
-      end
-    ' "$file"
-  )"
-  report_lines "$out"
-
-  # Field allow-list per artifact type. `oci` records the image digest;
-  # `nix` records the store-path checkpoint plus the archive hash a user
-  # can check without Nix; `file` records the sha256 of a single published
-  # file. Key sets are compared for equality, so both an unknown field and
-  # a dropped one are violations.
-  out="$(
-    jq -r '
-      def allowed:
-        {
-          "oci":  ["digest", "platform", "type"],
-          "nix":  ["archiveSha256", "narHash", "platform", "type"],
-          "file": ["platform", "sha256", "type"]
-        };
-      (if type == "object" then (.artifacts // {}) else {} end)
-      | objects
-      | to_entries[]
-      | .key as $name
-      | .value as $entry
-      | (($entry | objects | .type) // "«missing»") as $type
-      | if ($entry | type) != "object" then
-          "artifacts.\($name): not an object"
-        elif (allowed | has($type) | not) then
-          "artifacts.\($name): unknown type \"\($type)\" (allowed: oci, nix, file)"
-        elif (($entry | keys) != (allowed[$type] | sort)) then
-          "artifacts.\($name): type \"\($type)\" allows exactly \(allowed[$type] | sort | join(", ")) — found \($entry | keys | join(", "))"
-        else
-          empty
-        end
-    ' "$file"
-  )"
-  report_lines "$out"
-
-  # No key anywhere may name signing material, at any depth. Artifact names
-  # are keys too, so `eidola-gui-macos-signed-zip` trips this as readily as
-  # a `team_id` field would.
-  out="$(
-    jq -r '
-      [paths | .[] | select(type == "string")]
-      | unique[]
-      | select(test("sign|notar|ticket|team|cert|staple|apple"; "i"))
-    ' "$file"
-  )"
-  report_lines "$out" \
-    'key "%s" names signing material — Apple envelope hashes and identities belong in the human attestation, not the manifest'
 }
 
 # ── 3: the job graph ─────────────────────────────────────────────────────
