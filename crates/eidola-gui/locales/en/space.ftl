@@ -45,9 +45,10 @@ space-regenerating = Regenerating…
 # length allowance on its own reasoning and never began an answer. Nothing was
 # recorded and nothing was replaced, so the answer already there is untouched.
 space-error-response-truncated = The model used its whole length allowance thinking and never started an answer. Nothing was changed — try again, or ask a shorter question.
-# Shown when a second regeneration of the same response is asked for while one
-# is still running. Not a failure: the first one is still going.
-space-error-regeneration-in-flight = This response is already being regenerated.
+# A quiet marker beneath a response a regeneration was asked for while one was
+# already running against it somewhere this window cannot see. Not a failure:
+# the first one is still going, and its result will arrive here.
+space-regenerating-elsewhere = This response is already being regenerated.
 # A quiet marker beneath an answer that stopped because it reached its length
 # allowance rather than because the model was finished.
 space-answer-cut-off = This answer reached its length limit and stops mid-thought.

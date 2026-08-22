@@ -369,17 +369,49 @@ impl SpaceView {
             .as_ref()
             .is_some_and(|id| self.truncated_posts.contains(id))
         {
+            // The label a screen reader hears **is** the message a sighted
+            // reader sees — the probe name is the stable selector, the label is
+            // never a second English copy of the sentence.
+            let cut_off = crate::i18n::msg::space_answer_cut_off(cx);
             col = col.child(
                 div()
                     .id(SharedString::from(format!("space-cut-off-{}", node.id)))
                     .probe(
                         format!("space/post/{i}/cut-off"),
                         gpui::Role::Label,
-                        "Answer reached its length limit",
+                        cut_off.clone(),
                     )
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(crate::i18n::msg::space_answer_cut_off(cx)),
+                    .child(cut_off),
+            );
+        }
+        // A regeneration of this generation is already running somewhere this
+        // window cannot see. Said in the same quiet register, on the post it is
+        // about, because that is what the sentence is about — and because a
+        // notice in the recovery band would have nothing to end it: the other
+        // regeneration lands as a transcript refresh, which supersedes this
+        // generation and takes the mark with it (`prune_post_marks`).
+        if post
+            .action_id
+            .as_ref()
+            .is_some_and(|id| self.regenerating_elsewhere.contains(id))
+        {
+            let elsewhere = crate::i18n::msg::space_regenerating_elsewhere(cx);
+            col = col.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "space-regenerating-elsewhere-{}",
+                        node.id
+                    )))
+                    .probe(
+                        format!("space/post/{i}/regenerating-elsewhere"),
+                        gpui::Role::Label,
+                        elsewhere.clone(),
+                    )
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(elsewhere),
             );
         }
         // The footnote rail — the post's references, rendered *outside* the
@@ -952,6 +984,7 @@ impl SpaceView {
             .iter()
             .find(|t| t.seq == seq)
             .is_some_and(|t| !t.response.reasoning.is_empty() || !t.response.content.is_empty());
+        let regenerating = crate::i18n::msg::space_regenerating(cx);
         v_flex()
             .w(bw)
             .gap_2()
@@ -961,11 +994,11 @@ impl SpaceView {
                     .probe(
                         format!("space/streaming/{seq}/regenerating"),
                         gpui::Role::Label,
-                        "Regenerating",
+                        regenerating.clone(),
                     )
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(crate::i18n::msg::space_regenerating(cx)),
+                    .child(regenerating),
             )
             .when(started, |d| {
                 d.child(self.render_streaming_body(seq, bw, cx))

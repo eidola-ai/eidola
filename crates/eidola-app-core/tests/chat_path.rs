@@ -5814,3 +5814,96 @@ fn a_finished_regeneration_releases_its_claim() {
         assert_eq!(tree[1].generation_count, 3, "two regenerations landed");
     });
 }
+
+/// The claim is only worth what it covers, and **the tip is inside it**.
+///
+/// A regeneration that resolved the post's current generation *before* claiming
+/// can be overtaken between the two: the winner commits its successor and
+/// releases the item, and the loser then claims a free item and carries a tip
+/// that has already been superseded — acquiring and spending a credential on a
+/// turn whose successor `idx_one_successor_per_action` is certain to refuse.
+/// Reading the tip under the claim makes that unrepresentable: the caller that
+/// waited revises whatever is there when its turn comes.
+///
+/// Staged rather than raced — `test_open_regeneration_claim_window` stops the
+/// first regeneration in exactly the window the ordering is about.
+#[test]
+fn a_regeneration_that_waited_for_the_claim_revises_the_generation_it_finds() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let before = mock.chat_hits();
+
+        let mut window = core.test_open_regeneration_claim_window();
+        let (waited, overtaker_tip) = std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                core.runtime().block_on(async {
+                    let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+                    let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+                    res
+                })
+            });
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the first regeneration reaches the claim window");
+            // Closing the window lets every later regeneration run straight
+            // through it — only the first one is being staged.
+            drop(window);
+
+            // The overtaker claims the free item, commits a new generation and
+            // releases it, all while the first is still holding here.
+            let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            let overtaker = core
+                .runtime()
+                .block_on(async {
+                    let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+                    let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+                    res
+                })
+                .expect("the overtaking regeneration lands");
+            let overtaker_tip = overtaker
+                .response_action_id
+                .expect("the overtaker wrote a successor");
+
+            resume.send(()).expect("the waiting regeneration resumes");
+            (waiting.join().expect("the waiting thread"), overtaker_tip)
+        });
+
+        let waited = waited.expect("the regeneration that waited revises what it finds");
+        let tip = waited
+            .response_action_id
+            .expect("it wrote a successor of its own");
+        assert_ne!(tip, overtaker_tip, "two generations, not one");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "still one question and one answer");
+        assert_eq!(
+            tree[1].generation_count, 3,
+            "both regenerations landed as generations of the one item"
+        );
+        assert_eq!(tree[1].action_id, tip, "the last to finish is the tip");
+        assert_eq!(
+            mock.chat_hits() - before,
+            2,
+            "two regenerations, two model requests — neither paid for nothing"
+        );
+    });
+}

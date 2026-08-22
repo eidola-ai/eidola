@@ -17535,3 +17535,78 @@ fn space_marks_an_answer_that_stopped_at_its_length_limit(cx: &mut TestAppContex
         "the answer says where it stopped: {names:?}"
     );
 }
+
+#[gpui::test]
+fn space_a_regeneration_running_elsewhere_is_marked_until_it_lands(cx: &mut TestAppContext) {
+    // The collision is transient by construction — the claim refuses precisely
+    // because the work is finishing somewhere this window cannot see (the
+    // regeneration it started before it was closed and reopened). So it is not
+    // a failure and does not stand in the recovery band, which has nothing to
+    // end it: the other regeneration arrives as a transcript refresh, never as
+    // a `StreamEnded`. It is held on the generation it collided with, and that
+    // refresh is exactly what takes that generation — and the mark — away.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(s.revising_seq("a2").is_none(), "the pending state is gone");
+        assert!(s.accepts_mutation(), "and the space is free again");
+        assert!(s.failed_turn().is_none(), "there is nothing to re-ask");
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx).is_none(),
+            "nothing failed, so nothing stands in the recovery band"
+        );
+    });
+
+    use eidola_gui::probe;
+    let names = |cx: &mut TestAppContext| -> Vec<String> {
+        probe::set_probes_enabled(true);
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        probe::set_probes_enabled(false);
+        names
+    };
+
+    let before = names(cx);
+    assert!(
+        before
+            .iter()
+            .any(|n| n.ends_with("/regenerating-elsewhere")),
+        "the reader is told which answer is already being regenerated: {before:?}"
+    );
+
+    // The other regeneration commits: the item's tip is a new generation, so
+    // the generation the mark was about is no longer in the transcript.
+    let mut a3 = fixture_assistant_post("a3", "the regenerated reply");
+    a3.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "original text"), a3], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let after = names(cx);
+    assert!(
+        !after.iter().any(|n| n.ends_with("/regenerating-elsewhere")),
+        "and the completion that superseded that generation took the mark with it: {after:?}"
+    );
+}

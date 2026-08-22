@@ -443,6 +443,19 @@ pub enum SpaceEvent {
     /// *turn* additionally records [`Space::failed_turn`] so the notice's
     /// Retry can re-ask the same participant.
     Failed(AppError),
+    /// A regeneration was refused because one is **already running against that
+    /// generation** somewhere this window cannot see (the process-wide claim —
+    /// `AppError::RegenerationInFlight`). Nothing failed and nothing is lost:
+    /// the work is finishing elsewhere and its result arrives here on the bus.
+    ///
+    /// It is deliberately not a [`Self::Failed`]: the recovery notice has no
+    /// end to this state to key on — the completion arrives as a transcript
+    /// refresh, never as a `StreamEnded` — so a notice would stand saying the
+    /// answer is being regenerated long after the regenerated answer had
+    /// arrived. Naming the **generation** instead lets the surface hold it in
+    /// state the completion itself removes: the regeneration supersedes that
+    /// action id, and the mark goes with the post it was about.
+    RegenerationCollided { action_id: String },
     /// A submit's (or a driven turn's) notification plan hit the space's
     /// cascade limit at `target_action_id` — the resumable paused state. The
     /// view renders a quiet, dismissible "cascade limit reached — ask to
@@ -2149,11 +2162,40 @@ impl Space {
                         cx.notify();
                     });
                 }
+                (Err(AppError::RegenerationInFlight { .. }), _) => {
+                    let _ = this.update(cx, |this, cx| this.collide_revision(seq, cx));
+                }
                 (Err(e), _) => {
                     let _ = this.update(cx, |this, cx| this.fail_turn(seq, None, None, e, cx));
                 }
             }
         })
+    }
+
+    /// End a revision that was refused because one is already running against
+    /// the same generation — the process-wide claim, from a regeneration this
+    /// window cannot see (the one it started before it was closed and
+    /// reopened, or a CLI's).
+    ///
+    /// Deliberately **not** [`Self::fail_turn`]: nothing failed, and the state
+    /// is transient by construction — the claim refuses precisely because the
+    /// work is finishing elsewhere. The transcript load restarts (the debt
+    /// every removed operation owes), and the collision travels as
+    /// [`SpaceEvent::RegenerationCollided`] naming the generation it collided
+    /// on, so the surface can hold it in something that completion removes.
+    fn collide_revision(&mut self, seq: u64, cx: &mut Context<Self>) {
+        let target = self
+            .streams
+            .iter()
+            .find(|s| s.seq == seq)
+            .and_then(|s| s.target_action_id.clone());
+        self.streams.retain(|s| s.seq != seq);
+        self.turn_runners.remove(&seq);
+        self.load_transcript(cx);
+        if let Some(action_id) = target {
+            cx.emit(SpaceEvent::RegenerationCollided { action_id });
+        }
+        cx.notify();
     }
 
     /// Shared completion for post-only/edit/regenerate: on success reload the
@@ -2546,6 +2588,14 @@ impl Space {
     #[doc(hidden)]
     pub fn fail_revision_for_test(&mut self, seq: u64, error: AppError, cx: &mut Context<Self>) {
         self.fail_turn(seq, None, None, error, cx);
+    }
+
+    /// Test-only: end an in-flight regeneration the way the claim's refusal
+    /// ends it — the pending state goes and the collision names the generation
+    /// it collided on. No `Failed`, no [`FailedTurn`]: nothing broke.
+    #[doc(hidden)]
+    pub fn collide_revision_for_test(&mut self, seq: u64, cx: &mut Context<Self>) {
+        self.collide_revision(seq, cx);
     }
 
     /// Test-only: push one synthetic in-flight turn (multi-stream scenes).

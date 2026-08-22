@@ -771,6 +771,16 @@ pub struct SpaceView {
     /// The posts this window watched stop at their **length allowance** — the
     /// marker's whole state (see `SpaceEvent::TurnEnded`).
     pub(crate) truncated_posts: HashSet<SharedString>,
+    /// The generations this window asked to regenerate and was told were
+    /// already being regenerated elsewhere (see
+    /// `SpaceEvent::RegenerationCollided`).
+    ///
+    /// Keyed by **generation**, which is what makes the state end on its own:
+    /// the regeneration it collided with supersedes that action id, the
+    /// reloaded transcript carries only the item's new tip, and
+    /// [`SpaceView::prune_post_marks`] drops the key with the post it was
+    /// about. Nothing has to notice the completion and clear it.
+    pub(crate) regenerating_elsewhere: HashSet<SharedString>,
 
     /// Whether this window's **inspector** (the per-space settings panel) is
     /// open. Per-window by design — two windows on one space are two vantage
@@ -1034,6 +1044,7 @@ impl SpaceView {
             error: None,
             reference_notice: None,
             truncated_posts: HashSet::new(),
+            regenerating_elsewhere: HashSet::new(),
             inspector_open: false,
             inspector_scroll: ScrollHandle::new(),
             inspector_title: None,
@@ -1758,7 +1769,34 @@ impl SpaceView {
         self.ensure_viewer_gate(cx);
         self.rethread_drafts(&posts);
         self.retarget_tree_focus(&posts);
+        self.prune_post_marks(&posts);
         self.posts = posts;
+    }
+
+    /// Drop every session-scoped mark whose **generation** has left the
+    /// transcript, beside the two references that forward across one.
+    ///
+    /// Both marks say something about one version of a post — that it stopped
+    /// at its length allowance, that a regeneration of it was already running —
+    /// and an edit or a regeneration answers both by producing a different
+    /// version. So this is not housekeeping: it is how the collision mark ends
+    /// when the regeneration it collided with lands, and it is why nothing has
+    /// to watch for that completion. Unlike a draft's antecedent or the tree
+    /// focus, neither mark forwards — what they assert is untrue of the new
+    /// generation.
+    ///
+    /// A transcript with nothing in it is a read that has not answered, not an
+    /// empty conversation, and nothing can be pruned against it.
+    fn prune_post_marks(&mut self, next: &[PostData]) {
+        if next.is_empty() {
+            return;
+        }
+        let live: HashSet<SharedString> = next
+            .iter()
+            .filter_map(|p| p.action_id.clone())
+            .collect::<HashSet<_>>();
+        self.truncated_posts.retain(|id| live.contains(id));
+        self.regenerating_elsewhere.retain(|id| live.contains(id));
     }
 
     /// Carry every draft's reply antecedent across a generation change of the
@@ -2024,6 +2062,16 @@ impl SpaceView {
                 self.error = Some(e.clone());
                 self.rebuild(cx);
             }
+            SpaceEvent::RegenerationCollided { action_id } => {
+                // Marked on the generation it collided on, never in the
+                // recovery band: the band has nothing to end this state on
+                // (the other regeneration lands as a transcript refresh), while
+                // the generation itself is exactly what that refresh takes
+                // away — see `prune_post_marks`.
+                self.regenerating_elsewhere
+                    .insert(SharedString::from(action_id.clone()));
+                self.rebuild(cx);
+            }
             SpaceEvent::CascadePaused {
                 depth,
                 limit,
@@ -2285,9 +2333,6 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
         AppError::NotJoined { .. } => crate::i18n::msg::space_error_not_joined(cx).to_string(),
         AppError::ResponseTruncated { .. } => {
             crate::i18n::msg::space_error_response_truncated(cx).to_string()
-        }
-        AppError::RegenerationInFlight { .. } => {
-            crate::i18n::msg::space_error_regeneration_in_flight(cx).to_string()
         }
         other => other.to_string(),
     }

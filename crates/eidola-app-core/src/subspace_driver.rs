@@ -1817,6 +1817,13 @@ impl Inner {
         pause_in_window(&self.persist_window).await;
     }
 
+    /// The same, for the window immediately before a regeneration claims its
+    /// item (see `Inner::claim_window`).
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn pause_in_regeneration_claim_window(&self) {
+        pause_in_window(&self.claim_window).await;
+    }
+
     /// **What every door that closes a room owes it**: announce the room, and
     /// end any wait it was holding.
     ///

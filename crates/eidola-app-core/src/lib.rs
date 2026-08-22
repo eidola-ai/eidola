@@ -1739,6 +1739,16 @@ struct Inner {
     #[cfg(feature = "test-support")]
     persist_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **immediately before a regeneration claims its
+    /// item**, after the target has been resolved and the space's gate has
+    /// passed. Whether the claim actually prevents a paid duplicate turns on
+    /// what is read on each side of it, and that is not observable from
+    /// outside: this lets one stop a regeneration in the window, run another
+    /// one of the same post to completion, and let the first go. Same shape and
+    /// same reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    claim_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
@@ -7227,15 +7237,25 @@ impl Inner {
     }
 
     /// The shared front half of a regeneration, whichever transport runs it:
-    /// resolve the target item and its current tip, apply the two gates
-    /// (**the human's verb, on an agent's inferred answer**), and claim the
-    /// item so a second regeneration of the same post cannot start.
+    /// resolve the target item, apply the two gates (**the human's verb, on an
+    /// agent's inferred answer**), and claim the item so a second regeneration
+    /// of the same post cannot start.
     ///
     /// It exists so the blocking and streaming doors cannot drift: the target
     /// resolution, the gates and the `Revise` context rule are the regeneration
     /// contract, and a transport is only a choice of how the bytes arrive.
     /// Returns the space, the tip to revise, and the claim — which the caller
     /// must hold for the whole turn.
+    ///
+    /// **The tip is read under the claim, and that ordering is the whole point
+    /// of the claim.** The claim is what makes one regeneration of an item run
+    /// at a time; the tip is the thing a regeneration of that item moves. Read
+    /// before the claim, it can be superseded by the regeneration the claim is
+    /// waiting behind — and this door would then go on to acquire a credential
+    /// and spend it on a turn whose successor the durable single-successor
+    /// index (`idx_one_successor_per_action`) is already certain to reject.
+    /// That is exactly the paid loser the guard was introduced to eliminate, so
+    /// nothing that names the item's current generation may be read outside it.
     async fn begin_regeneration(
         &self,
         action_id: &str,
@@ -7246,16 +7266,25 @@ impl Inner {
             .ok_or_else(|| AppError::NotConfigured {
                 message: format!("action not found: {action_id}"),
             })?;
-        let tip = db::current_tip_of_item(&db_conn, &space_id, &item_id)
-            .await?
-            .ok_or_else(|| AppError::Internal {
-                message: format!("item has no current generation: {item_id}"),
-            })?;
         // A regeneration is the human's verb — their picker chooses the model —
         // and it *spends*, so it takes the same gate as `post`, before any of
         // that. Reading a delegated conversation must not come with a button
         // that drives one.
         self.require_human_joined(&db_conn, &space_id).await?;
+
+        // Claimed as soon as the item is known and the space's own gate has
+        // passed. Everything below reads the item's *current* state, so it
+        // belongs on this side of the claim; both refusals below still cost
+        // nothing, and the guard's `Drop` releases the item on either.
+        #[cfg(feature = "test-support")]
+        self.pause_in_regeneration_claim_window().await;
+        let guard = RegenerationGuard::claim(&self.regenerating_items, &item_id)?;
+
+        let tip = db::current_tip_of_item(&db_conn, &space_id, &item_id)
+            .await?
+            .ok_or_else(|| AppError::Internal {
+                message: format!("item has no current generation: {item_id}"),
+            })?;
 
         // **Regeneration is "that agent, again", and it is destructive**: it
         // supersedes the tip with a fresh `inference`, and `Revise` withholds
@@ -7276,10 +7305,6 @@ impl Inner {
         .await?;
         drop(db_conn);
 
-        // Claimed last, after every refusal that costs nothing: the claim is
-        // about **spending twice**, so it covers exactly the stretch from here
-        // to the turn's end.
-        let guard = RegenerationGuard::claim(&self.regenerating_items, &item_id)?;
         Ok((space_id, tip, guard))
     }
 
@@ -8548,6 +8573,8 @@ impl AppCore {
                 entry_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 persist_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                claim_window: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 plan_faults: std::sync::atomic::AtomicU32::new(0),
@@ -9897,6 +9924,22 @@ impl AppCore {
             .persist_window
             .lock()
             .expect("persist window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: stop the next regeneration immediately before it claims
+    /// its item (see `Inner::claim_window`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_regeneration_claim_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .claim_window
+            .lock()
+            .expect("claim window lock poisoned") = Some(tx);
         rx
     }
 
