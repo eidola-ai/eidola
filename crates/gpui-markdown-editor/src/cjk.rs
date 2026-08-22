@@ -114,28 +114,67 @@ pub fn is_variation_selector(c: char) -> bool {
     matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
 }
 
+/// The Zhuyin tone mark Mandarin writes *before* its syllable rather
+/// than after it — the neutral tone (輕聲).
+const NEUTRAL_TONE_DOT: char = '\u{02D9}';
+
+/// True for a Zhuyin (Bopomofo) tone mark: `ˊ` `ˇ` `ˋ` and the neutral
+/// tone's `˙`. The first tone is unmarked.
+///
+/// **Deliberately not a [`CJK_BLOCKS`] entry** — the same reasoning as
+/// [`is_variation_selector`], and here the omission is load-bearing
+/// twice over. These live in Spacing Modifier Letters with
+/// `Script=Common`; a script classifier cannot claim them. And three of
+/// the four are `Lm`, hence Unicode-alphanumeric, so a table entry
+/// would have put a 着重号 under the tone mark itself — a mark on a
+/// mark. Riding the segment (see [`cjk_segments`]) gives the syllable
+/// one upright shaped run without touching [`takes_emphasis_dot`].
+pub fn is_zhuyin_tone_mark(c: char) -> bool {
+    matches!(c, '\u{02C7}' | '\u{02CA}' | '\u{02CB}' | NEUTRAL_TONE_DOT)
+}
+
 /// The maximal CJK-script sub-ranges of `text`, as byte ranges relative
 /// to its start.
 ///
 /// This is what splits one emphasized span into its two renderings: the
 /// ranges returned take dots, everything between them stays italic.
 ///
-/// **A segment runs through the variation selectors attached to it.** An
-/// ideographic variation sequence (`葛` + `U+E0100`) is one shaped
-/// cluster, and gpui shapes each `TextRun` separately: leaving the
-/// selector to the italic run beside the base split the cluster across
-/// two runs, where the selector can no longer select the base's glyph
-/// variant — the ideograph the reader sees changes, silently, which is
-/// the same class of failure the dots exist to prevent. A selector with
-/// no CJK character immediately before it belongs to whatever *is*
-/// before it, so it stays out.
+/// **A segment runs through the context characters attached to it** —
+/// the marks that modify a CJK character without being CJK script
+/// themselves. gpui shapes each `TextRun` separately, so leaving one to
+/// the italic run beside its base breaks the pair apart:
+///
+/// - A **variation selector** and its base are one shaped cluster. An
+///   ideographic variation sequence (`葛` + `U+E0100`) split across two
+///   runs is a selector that can no longer select its base's glyph
+///   variant — the ideograph the reader sees changes, silently, which
+///   is the same class of failure the dots exist to prevent.
+/// - A **Zhuyin tone mark** belongs to the syllable it marks. `ㄓㄨˋ`
+///   with the `ˋ` in the italic run is mixed typography inside one
+///   syllable: two upright letters and a slanted tone.
+///
+/// Attachment is to the character **immediately before** the mark, and
+/// only when that character is already inside a segment — a caron after
+/// a Latin letter, or one standing alone in Latin prose, stays italic
+/// where it belongs. The single exception is the neutral-tone dot,
+/// which Zhuyin writes *before* its syllable (`˙ㄉㄜ`), so that one may
+/// also look one character ahead.
 pub fn cjk_segments(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut out: Vec<std::ops::Range<usize>> = Vec::new();
-    for (offset, c) in text.char_indices() {
-        let attached = is_variation_selector(c)
-            && out
-                .last()
-                .is_some_and(|last: &std::ops::Range<usize>| last.end == offset);
+    let mut chars = text.char_indices().peekable();
+    while let Some((offset, c)) = chars.next() {
+        let rides_the_base = out
+            .last()
+            .is_some_and(|last: &std::ops::Range<usize>| last.end == offset);
+        let attached = if is_variation_selector(c) {
+            rides_the_base
+        } else if is_zhuyin_tone_mark(c) {
+            rides_the_base
+                || (c == NEUTRAL_TONE_DOT
+                    && chars.peek().is_some_and(|&(_, next)| is_cjk_script(next)))
+        } else {
+            false
+        };
         if !is_cjk_script(c) && !attached {
             continue;
         }
@@ -408,6 +447,63 @@ mod tests {
             !is_variation_selector('\u{FE10}'),
             "Vertical Forms starts here"
         );
+    }
+
+    #[test]
+    fn segments_carry_a_zhuyin_tone_mark_with_its_syllable() {
+        // ㄓㄨˋ — the letters are Bopomofo, the tone mark is Spacing
+        // Modifier Letters, and they are one syllable.
+        let text = "\u{3113}\u{3128}\u{02CB}";
+        let segs = cjk_segments(text);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(&text[segs[0].clone()], text);
+
+        // ˙ㄉㄜ — the neutral tone is the one Zhuyin writes first, so
+        // the dot looks ahead instead of back.
+        let text = "\u{02D9}\u{3109}\u{311C}";
+        let segs = cjk_segments(text);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(&text[segs[0].clone()], text);
+    }
+
+    #[test]
+    fn a_tone_mark_with_no_zhuyin_base_stays_where_it_is() {
+        // A caron after a Latin letter, and one standing alone.
+        assert!(cjk_segments("latin s\u{02C7} tail").is_empty());
+        assert!(cjk_segments("\u{02C7}").is_empty());
+
+        // Only the neutral-tone dot may look ahead: a caron *before* a
+        // CJK character marks nothing there and must not be dragged in.
+        let text = "s\u{02C7}\u{4E2D}";
+        let segs = cjk_segments(text);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(&text[segs[0].clone()], "\u{4E2D}");
+
+        // A Latin letter breaks the chain, so the caron riding it is
+        // not riding the CJK run that preceded it.
+        let text = "\u{4E2D}a\u{02C7}";
+        let segs = cjk_segments(text);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(&text[segs[0].clone()], "\u{4E2D}");
+    }
+
+    #[test]
+    fn a_tone_mark_takes_no_dot_of_its_own() {
+        // The trap: three of the four are `Lm`, so they *are* Unicode
+        // alphanumerics. Listing them as a CJK block would have marked
+        // the tone mark itself; riding the segment does not.
+        assert!('\u{02C7}'.is_alphanumeric(), "CARON is `Lm`");
+        for c in ['\u{02C7}', '\u{02CA}', '\u{02CB}', '\u{02D9}'] {
+            assert!(is_zhuyin_tone_mark(c));
+            assert!(
+                !takes_emphasis_dot(c),
+                "U+{:04X} marks a syllable, it is not one",
+                c as u32
+            );
+        }
+        // Its Spacing Modifier Letters neighbours are untouched.
+        assert!(!is_zhuyin_tone_mark('\u{02C6}'), "circumflex is not a tone");
+        assert!(!is_zhuyin_tone_mark('\u{02D8}'), "breve is not a tone");
     }
 
     #[test]

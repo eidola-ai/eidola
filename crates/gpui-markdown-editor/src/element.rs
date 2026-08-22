@@ -5430,6 +5430,64 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_zhuyin_tone_mark_shapes_with_its_syllable(cx: &mut TestAppContext) {
+        // ㄓㄨˋ with the tone in the italic run is mixed typography
+        // inside one syllable — two upright letters and a slanted tone.
+        let runs = run_italics(cx, "*\u{3113}\u{3128}\u{02CB} and latin*");
+        let holder = runs
+            .iter()
+            .find(|(t, _)| t.contains('\u{02CB}'))
+            .unwrap_or_else(|| panic!("the tone mark must survive shaping ({runs:?})"));
+        assert!(
+            holder.0.contains('\u{3128}'),
+            "the tone must shape with its syllable ({runs:?})"
+        );
+        assert!(
+            !holder.1,
+            "the syllable is CJK and must not ask for an italic face ({runs:?})"
+        );
+        assert!(
+            runs.iter()
+                .any(|(t, italic)| t.contains("latin") && *italic),
+            "the Latin sub-run keeps true italic ({runs:?})"
+        );
+
+        // The neutral tone is written before its syllable.
+        let runs = run_italics(cx, "*\u{02D9}\u{3109}\u{311C}*");
+        let holder = runs
+            .iter()
+            .find(|(t, _)| t.contains('\u{02D9}'))
+            .unwrap_or_else(|| panic!("the dot must survive shaping ({runs:?})"));
+        assert!(
+            holder.0.contains('\u{3109}') && !holder.1,
+            "the neutral-tone dot joins the syllable that follows it ({runs:?})"
+        );
+    }
+
+    #[gpui::test]
+    fn a_caron_in_latin_text_keeps_its_italic_face(cx: &mut TestAppContext) {
+        // The control for the case above: attachment is to the
+        // character immediately before the mark, and only when that
+        // character is already CJK. A caron riding a Latin letter is
+        // Latin typography and stays italic — even with a CJK run in
+        // the same emphasized span.
+        let runs = run_italics(cx, "*\u{4E2D}\u{6587} s\u{02C7} latin*");
+        let holder = runs
+            .iter()
+            .find(|(t, _)| t.contains('\u{02C7}'))
+            .unwrap_or_else(|| panic!("the caron must survive shaping ({runs:?})"));
+        assert!(
+            holder.1,
+            "a Latin caron must not be dragged upright ({runs:?})"
+        );
+        assert_eq!(
+            emphasis_dots_for(cx, "*\u{4E2D}\u{6587} s\u{02C7} latin*").len(),
+            2,
+            "only the two Han characters are marked"
+        );
+    }
+
+    #[gpui::test]
     fn a_variation_selector_takes_no_dot_and_leaves_its_base_alone(cx: &mut TestAppContext) {
         // The selector marks nothing of its own, and the base measures
         // its own advance regardless (see `emphasis_dot_bounds`). Only
