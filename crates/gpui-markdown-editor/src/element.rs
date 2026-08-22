@@ -5343,6 +5343,211 @@ mod tests {
         );
     }
 
+    /// Open a window and run `f` with a theme-derived style.
+    fn with_style<R>(
+        cx: &mut TestAppContext,
+        f: impl FnOnce(&mut Window, &MarkdownStyle) -> R,
+    ) -> R {
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            f(window, &style)
+        })
+        .expect("update window")
+    }
+
+    #[gpui::test]
+    fn an_embedded_table_cell_gets_its_emphasis_dots(cx: &mut TestAppContext) {
+        // Only the *shaping* path is shared with an embed, so every
+        // non-text decoration has to be re-emitted there. The editor's
+        // own table pieces become `LaidOutLine`s and ride the regular
+        // per-line pass; the embed's do not, and shaping has already
+        // dropped the italic face — so without this the cell showed
+        // upright unmarked text.
+        let content = "| head | col |\n| --- | --- |\n| *中文* | plain |\n";
+        let dots = with_style(cx, |window, style| {
+            layout_embed(content, style, px(600.0), window)
+                .emphasis_dots
+                .len()
+        });
+        assert_eq!(dots, 2, "one dot per emphasized character in the cell");
+    }
+
+    #[gpui::test]
+    fn a_table_cell_gets_its_emphasis_dots_outside_an_embed_too(cx: &mut TestAppContext) {
+        // The control for the case above — the editor's own table path.
+        let src = "| head | col |\n| --- | --- |\n| *中文* | plain |\n";
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let dots = with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+                .expect("table block");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let (a, d) = body_metrics_for_block(&block.kind, style, font_size, window);
+            let layout = layout_table(block, src, font_size, style, px(600.0), window)
+                .expect("table layout");
+            layout
+                .pieces
+                .iter()
+                .map(|piece| {
+                    emphasis_dot_bounds(
+                        &piece.line,
+                        &piece.display_to_source,
+                        point(px(0.0), px(0.0)),
+                        line_height,
+                        line_height,
+                        block,
+                        style,
+                        font_size,
+                        a,
+                        d,
+                    )
+                    .len()
+                })
+                .sum::<usize>()
+        });
+        assert_eq!(dots, 2);
+    }
+
+    #[gpui::test]
+    fn a_dot_under_the_first_glyph_of_a_wrap_row_lands_on_that_row(cx: &mut TestAppContext) {
+        // A boundary index resolves to the *upper* row in gpui, so the
+        // dot for the character that opens a wrap row was painted at the
+        // previous row's right edge — past the wrap width, on the wrong
+        // line.
+        let src = "*中文测试强调的文字还有更多内容*";
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let wrap_w = px(90.0);
+        let (dots, rows) = with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let (a, d) = body_metrics_for_block(&block.kind, style, font_size, window);
+            let shaped = shape_block_lines(src, block, style, font_size, Some(wrap_w), window);
+            let sl = shaped.first().expect("a shaped line");
+            let rows = sl.line.wrap_boundaries().len() + 1;
+            let dots = emphasis_dot_bounds(
+                &sl.line,
+                &sl.display_to_source,
+                point(px(0.0), px(0.0)),
+                line_height,
+                line_height,
+                block,
+                style,
+                font_size,
+                a,
+                d,
+            );
+            (dots, rows)
+        });
+        assert!(
+            rows > 1,
+            "the line must soft-wrap for this to mean anything"
+        );
+        assert!(!dots.is_empty());
+        for dot in &dots {
+            assert!(
+                dot.origin.x + dot.size.width <= wrap_w,
+                "no dot may sit past the wrap width (dot at {:?})",
+                dot.origin
+            );
+        }
+        // Dots march left to right *within* a row and reset each row, so
+        // an x that goes backwards must be paired with a new y.
+        for pair in dots.windows(2) {
+            if pair[1].origin.x <= pair[0].origin.x {
+                assert!(
+                    pair[1].origin.y > pair[0].origin.y,
+                    "an x that resets belongs to a new row ({:?} then {:?})",
+                    pair[0].origin,
+                    pair[1].origin
+                );
+            } else {
+                assert_eq!(
+                    pair[1].origin.y, pair[0].origin.y,
+                    "dots advancing rightwards stay on one row"
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn a_row_reservation_does_not_stretch_the_inline_code_chip(cx: &mut TestAppContext) {
+        // Tall math and an inline-code span on one logical line: the row
+        // stride grows to hold the math's overshoot, but the chip must
+        // still fill only the text row. gpui's own background pass takes
+        // one number for both, which is why the editor draws the chip.
+        let src = r"see $\frac{\frac{a}{b}}{\frac{c}{d}}$ and `code` here";
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let (chips, line_height, stride) = with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let (augmented, math_specs) =
+                augment_block_with_math(block, src, font_size, style, window);
+            let (a, d) = body_metrics_for_block(&block.kind, style, font_size, window);
+            let shaped =
+                shape_block_lines(src, &augmented, style, font_size, Some(px(720.0)), window);
+            let sl = shaped.first().expect("a shaped line");
+            let extra = compute_math_row_extra(&sl.source_range, &math_specs, a, d, line_height);
+            let stride = line_height + extra.total();
+            let chips = run_background_bounds(
+                &sl.line,
+                &sl.display_to_source,
+                point(px(0.0), px(0.0)),
+                stride,
+                line_height,
+                &augmented,
+                style,
+            );
+            (chips, line_height, stride)
+        });
+        assert!(
+            stride > line_height,
+            "the math must actually reserve a row extra (stride {stride:?})"
+        );
+        assert!(
+            !chips.is_empty(),
+            "the inline-code span must produce a chip"
+        );
+        for chip in &chips {
+            assert_eq!(
+                chip.size.height, line_height,
+                "the chip fills the text row, not the stride"
+            );
+        }
+    }
+
     #[gpui::test]
     fn emphasized_cjk_gets_one_dot_per_character(cx: &mut TestAppContext) {
         // Four emphasized Han characters, four dots — and nothing under

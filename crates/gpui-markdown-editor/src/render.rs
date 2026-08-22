@@ -4511,4 +4511,54 @@ mod tests {
         let style = style_at(block, src.find('\u{4e2d}').expect("han present"));
         assert!(style.emphasis_dots);
     }
+
+    #[test]
+    fn an_entity_that_decodes_to_cjk_takes_a_dot() {
+        // `&#x4E2D;` is ASCII in the buffer and a Han character on
+        // screen. Classifying the source bytes found no CJK, so the
+        // published view hid the delimiters and then showed neither an
+        // italic nor a dot — strictly less than the asterisks carried.
+        let src = "*&#x4E2D;*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert_eq!(first_substitution_for(block, 1..9), Some("中"));
+        assert!(
+            style_at(block, 1).emphasis_dots,
+            "the substituted range is marked ({:?})",
+            block.inlines
+        );
+    }
+
+    #[test]
+    fn an_escape_that_resolves_to_latin_still_takes_no_dot() {
+        // The mirror case: classification follows the display text, so a
+        // substitution that resolves to Latin must not be marked.
+        let src = r"*\*a\**".to_string() + "\n\nafter";
+        let spec = render_with_cursor(&src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(
+            block.inlines.iter().all(|r| !r.style.emphasis_dots),
+            "no CJK anywhere ({:?})",
+            block.inlines
+        );
+    }
+
+    #[test]
+    fn cjk_around_an_entity_is_marked_on_both_sides() {
+        // Literal source and substituted display text in one emphasized
+        // span: every Han character is marked, whichever form it took.
+        let src = "*中&#x6587;测*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let han = src.find('中').expect("han");
+        let entity = src.find("&#x6587;").expect("entity");
+        let tail = src.find('测').expect("han");
+        for offset in [han, entity, tail] {
+            assert!(
+                style_at(block, offset).emphasis_dots,
+                "offset {offset} is marked ({:?})",
+                block.inlines
+            );
+        }
+    }
 }

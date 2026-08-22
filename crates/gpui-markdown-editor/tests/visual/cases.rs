@@ -147,6 +147,35 @@ pub fn register(s: &mut Snapshots) {
         editor_with_cursor(window, cx, "**粗体文字** 与 ***粗体强调*** 收尾", "收尾")
     });
 
+    // A tall inline construct grows the row stride; the inline-code chip
+    // beside it must still fill only the text row (the editor draws the
+    // chip itself — gpui's background pass takes one number for both the
+    // fill height and the row step).
+    s.add("inline_code_chip_beside_tall_math", win, |window, cx| {
+        editor_with_cursor(
+            window,
+            cx,
+            "lead paragraph\n\nsee $\\frac{\\frac{a}{b}}{\\frac{c}{d}}$ and `code` here\n\ntail paragraph",
+            "tail",
+        )
+    });
+
+    // An emphasized CJK run soft-wrapped at a narrow measure: the dot for
+    // the character that *opens* a wrap row belongs on that row, not at
+    // the previous row's right edge.
+    s.add(
+        "cjk_emphasis_wrapped",
+        size(px(200.), px(240.)),
+        |window, cx| {
+            editor_with_cursor(
+                window,
+                cx,
+                "*中文测试强调的文字还有更多内容需要换行* 收尾",
+                "收尾",
+            )
+        },
+    );
+
     // Strikethrough outside.
     s.add("strike_cursor_outside", win, |window, cx| {
         editor_with_cursor(window, cx, "keep ~~drop~~ keep", "keep")
@@ -1037,8 +1066,11 @@ const EMBED_AUDIT_CORPORA: &[(&str, &str, f32)] = &[
         "cjk_emphasis",
         "前面 *强调的文字* 后面\n\n\
          混排 *中文，with latin，测试* 收尾\n\n\
-         **粗体文字** 与 ***粗体强调*** 收尾\n",
-        220.,
+         **粗体文字** 与 ***粗体强调*** 收尾\n\n\
+         | 表头 | 说明 |\n\
+         | --- | --- |\n\
+         | *中文* | `code` |\n",
+        300.,
     ),
     (
         "quote_with_list",
