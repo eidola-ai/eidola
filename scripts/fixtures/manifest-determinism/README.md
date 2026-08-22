@@ -20,4 +20,7 @@ None of these is a real manifest or a real workflow. The `.yml` files deliberate
 | `bad-quoted-needs.yml` | The dependency on the key-holding job written as a quoted scalar (`- "apple-envelope"`), with a job name that says nothing about signing. Names are unquoted before the graph is built. |
 | `bad-quoted-job-name.yml` | The same graph with the quotes on the job key (`"apple-envelope":`), which an unquoted-only header pattern never registers as a job at all. |
 | `bad-fractional-schema.json` | `schema_version: 2.5`. The client reads that field with `as_u64()`, so a non-integer is malformed *there*; the gate has to reject what the verifier would. |
+| `bad-anchored-environment.yml` | The protected environment reached through a YAML alias (`environment: *signing_env`). GitHub has resolved aliases since September 2025; this scanner does not resolve YAML, so an alias in a parsed field is refused rather than guessed at. |
+| `bad-aliased-needs.yml` | The same refusal in the other parsed position — the whole dependency list is an alias. |
+| `bad-merge-key-job.yml` | A merge key splicing an `environment:` into the job, in the form that needs no anchor at all. GitHub rejects `<<:` today, but actions that expand it before GitHub parses exist. |
 | `bad-mapping-environment.yml` | `environment:` in mapping form (`name: apple-signing`) on the job that computes a manifest partial — valid GitHub Actions that a scalar-only parser reads as "no environment". |

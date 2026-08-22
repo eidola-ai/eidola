@@ -1,0 +1,31 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The same refusal in the other parsed position: the dependency list itself
+# is an alias, so the graph this check walks would be empty while GitHub
+# walks a real edge to a key-holding job.
+name: Build & Verify Artifacts (rejected fixture)
+
+x-manifest-deps: &manifest_deps
+  - release-assets
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-assets:
+    name: Publish release assets
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Sign
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs: *manifest_deps
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

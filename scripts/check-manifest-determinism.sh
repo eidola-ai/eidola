@@ -48,6 +48,12 @@
 # otherwise reports "no artifact-manifest job" and fails loudly rather than
 # passing quietly, which is the behavior every unparsed shape should have.
 #
+# What it will not do is guess. A YAML alias or anchor in one of those
+# fields, or a merge key in a job body, is a violation rather than a
+# resolution attempt: GitHub resolves aliases (since September 2025), this
+# does not, and a scanner that guessed would be asserting something it
+# cannot know.
+#
 # Two backstops hold past its edges. A dependency whose *name* says signing
 # counts as a signing job even when this parse never saw its definition. And
 # this check is defense in depth, not the authority: the expensive
@@ -348,10 +354,10 @@ check_workflow() {
       # ── collect: job name -> needs, environment, produces-partial ──
       /^[^ #]/ { in_jobs = ($0 ~ /^jobs:/); next }
 
-      in_jobs && /^  [^ \t#-][^:]*:[ \t]*(#.*)?$/ {
+      in_jobs && /^  [^ \t#-][^:]*:[ \t]*(&[A-Za-z0-9_.-]+)?[ \t]*(#.*)?$/ {
         job = decomment($0)
         sub(/^  /, "", job)
-        sub(/:[ \t]*$/, "", job)
+        sub(/:[ \t]*(&[A-Za-z0-9_.-]+)?[ \t]*$/, "", job)
         job = unquote(job)
         jobs[++njobs] = job
         collecting_needs = 0
@@ -391,6 +397,11 @@ check_workflow() {
         next
       }
 
+      # A merge key splices another mapping into this job, which can carry
+      # an `environment:` that never appears here as a key. Recorded, not
+      # resolved.
+      /^    <<[ \t]*:/ { merge_key[job] = 1; next }
+
       # A job "produces a manifest partial" if it runs the manifest script
       # or exports the partial as a job output.
       /artifact-manifest\.sh/ || /artifact_manifest:/ { partial[job] = 1 }
@@ -402,6 +413,24 @@ check_workflow() {
         # Environment names are case-insensitive to GitHub, so they are
         # matched that way here; `Apple-Signing` is the same protected
         # environment as `apple-signing`.
+        # Aliases are refused, not resolved. GitHub has resolved `*alias`
+        # in workflows since September 2025, so `environment: *signing_env`
+        # grants the protected environment while this scanner sees a
+        # literal `*signing_env` — and a scanner that does not parse YAML
+        # has no business guessing what an alias meant. Merge keys are
+        # refused for the same reason and one more: GitHub rejects `<<:`
+        # itself, but pre-processing actions that expand it before GitHub
+        # sees the file exist, so the shape must not sit here unremarked.
+        for (i = 1; i <= njobs; i++) {
+          j = jobs[i]
+          if (needs_raw[j] ~ /(^|[ \t[,])[*&][A-Za-z0-9_.-]+/)
+            print "job `" j "` uses a YAML alias or anchor in `needs:` — this scanner does not resolve them, so the dependency must be written literally"
+          if (environment[j] ~ /(^|[ \t{,])[*&][A-Za-z0-9_.-]+/)
+            print "job `" j "` uses a YAML alias or anchor in `environment:` — this scanner does not resolve them, so the environment must be named literally"
+          if (merge_key[j])
+            print "job `" j "` uses a merge key (`<<:`) — it can splice in an `environment:` this scanner never sees, so it is refused rather than merged"
+        }
+
         for (i = 1; i <= njobs; i++) {
           j = jobs[i]
           needs[j] = job_names(needs_raw[j])
