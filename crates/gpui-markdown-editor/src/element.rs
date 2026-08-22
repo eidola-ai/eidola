@@ -185,11 +185,13 @@ impl LaidOutLine {
         offset >= self.source_range.start && offset <= self.source_range.end
     }
 
-    /// Where `gpui` is asked to draw this line — `paint` and
-    /// `paint_background` take this origin and `row_stride` as the line
-    /// height. (The local points `position_for_index` returns stay
-    /// relative to [`Self::origin`]: they are whole multiples of the
-    /// stride in y and independent of the origin in x.)
+    /// Where `gpui` is asked to draw this line's glyphs — `paint` takes
+    /// this origin and `row_stride` as the line height. (The local points
+    /// `position_for_index` returns stay relative to [`Self::origin`]:
+    /// they are whole multiples of the stride in y and independent of the
+    /// origin in x. Decorations that fill the *text row* — the
+    /// inline-code chip, the selection wash — measure from `origin`, not
+    /// from here.)
     ///
     /// gpui centers the shaped text inside the height it is given, so
     /// painting the stride at [`Self::origin`] would push the text down by
