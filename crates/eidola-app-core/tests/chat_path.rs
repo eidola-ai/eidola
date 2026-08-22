@@ -5907,3 +5907,129 @@ fn a_regeneration_that_waited_for_the_claim_revises_the_generation_it_finds() {
         );
     });
 }
+
+/// **A regeneration that fails announces its end too.**
+///
+/// Supersession is only half an ending: a regeneration that succeeds leaves a
+/// new generation for a surface to notice, but one that fails leaves nothing a
+/// transcript read can see — no action row, and for a ceiling truncation only a
+/// Record entry attached to nothing. A surface refused by the claim would
+/// therefore go on saying "already being regenerated" for the life of the
+/// window. The claim's release is the fact that ends it, and it is published
+/// rather than inferred.
+#[test]
+fn a_failed_regeneration_still_settles_its_claim() {
+    run(|| {
+        // The regeneration answers with reasoning up to the ceiling and no
+        // answer at all — a failure that writes no successor, which is exactly
+        // the ending supersession cannot provide.
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkThenReasoningOnlyLength,
+            chat_delay_ms: 2_000,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let item = tree[1].item_id.clone();
+
+        // Nothing is running, so the wait is already over — a caller that asks
+        // after the release is not left waiting for an event that is past.
+        let idle = core.runtime().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                core.regeneration_settled(item.clone()),
+            )
+            .await
+        });
+        assert!(idle.is_ok(), "an unclaimed item settles immediately");
+
+        let (regen, (second, early)) = core.runtime().block_on(async {
+            let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            let running = async {
+                let r = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+                let (r, _) = tokio::join!(r, collect_deltas(events_rx));
+                r
+            };
+            let probe = async {
+                // Let the claim be taken; the held response keeps it claimed
+                // well past everything below.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                let second = {
+                    let s = core.regenerate_stream(answer.clone(), MODEL.into(), tx2);
+                    let (s, _) = tokio::join!(s, collect_deltas(rx2));
+                    s
+                };
+                // A refused second ask proves the claim is held *right now*, so
+                // a wait resolving here would be answering about nothing.
+                let early = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    core.regeneration_settled(item.clone()),
+                )
+                .await;
+                // Now park a waiter **while the claim is still held** and let
+                // it run to the release. This is the arm that matters: the
+                // immediate arm answers a caller that asks too late, and only
+                // this one proves the release *wakes* what is waiting on it.
+                let parked = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    core.regeneration_settled(item.clone()),
+                )
+                .await;
+                (second, (early, parked))
+            };
+            tokio::join!(running, probe)
+        });
+        let (early, parked) = early;
+
+        assert!(
+            matches!(regen, Err(AppError::ResponseTruncated { .. })),
+            "the regeneration failed without writing anything; got {regen:?}"
+        );
+        assert!(
+            matches!(second, Err(AppError::RegenerationInFlight { .. })),
+            "the claim was held while it ran; got {second:?}"
+        );
+        assert!(
+            early.is_err(),
+            "and the wait held with it — a claim in flight has not settled"
+        );
+        assert!(
+            parked.is_ok(),
+            "a waiter parked while the claim was held is woken by its release"
+        );
+
+        // The transcript is exactly what it was: nothing superseded the answer,
+        // so nothing a refresh could read had changed.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "no successor post; got {tree:#?}");
+        assert_eq!(tree[1].action_id, answer, "the tip did not move");
+        assert_eq!(tree[1].generation_count, 1, "still one generation");
+
+        // And yet the wait is over — the release announced itself.
+        let settled = core.runtime().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                core.regeneration_settled(item.clone()),
+            )
+            .await
+        });
+        assert!(
+            settled.is_ok(),
+            "a failed regeneration releases its claim and says so, though it \
+             leaves no successor to notice"
+        );
+    });
+}

@@ -1683,7 +1683,7 @@ struct Inner {
     /// mid-regeneration meets a fresh view with no memory of the one still in
     /// flight. `Arc` so the guard can release the key from its `Drop` without
     /// borrowing `Inner`.
-    regenerating_items: Arc<Mutex<std::collections::HashSet<String>>>,
+    regenerating_items: RegenerationRegistry,
     /// How many delegated rooms may be walked at once, process-wide — see
     /// `subspace_driver::MAX_CONCURRENT_WALKS`.
     walk_permits: Arc<tokio::sync::Semaphore>,
@@ -7325,6 +7325,30 @@ impl Inner {
         .await
     }
 
+    /// Wait until no regeneration is running against `item_id` — the other half
+    /// of the claim, read from outside.
+    ///
+    /// Resolves immediately when the item is not claimed, so a caller that asks
+    /// after the release has already happened is not left waiting for an event
+    /// that is over. Otherwise it holds until the guard drops, **however the
+    /// turn ended**: the sender's liveness is the claim, so a success, a
+    /// network error, a `ResponseTruncated` and a panicked task all release and
+    /// announce in the same act.
+    async fn regeneration_settled(&self, item_id: &str) {
+        let subscription = {
+            let registry = self
+                .regenerating_items
+                .lock()
+                .expect("regeneration registry lock poisoned");
+            registry.get(item_id).map(|tx| tx.subscribe())
+        };
+        if let Some(mut rx) = subscription {
+            // `Ok` cannot happen — nothing ever sends on this channel — so the
+            // wait ends exactly when the sender is dropped.
+            let _ = rx.changed().await;
+        }
+    }
+
     /// Streaming twin of [`Self::regenerate`] — the same target resolution, the
     /// same gates, the same claim and the same `Revise` context rule, sending
     /// `stream: true` and forwarding each delta to `sender`.
@@ -8558,7 +8582,7 @@ impl AppCore {
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
                 subspace_walks: Mutex::new(std::collections::HashMap::new()),
                 rooms_spawned_here: Mutex::new(Some(std::collections::HashSet::new())),
-                regenerating_items: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                regenerating_items: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 walk_permits: Arc::new(tokio::sync::Semaphore::new(
                     subspace_driver::MAX_CONCURRENT_WALKS,
                 )),
@@ -10470,6 +10494,29 @@ impl AppCore {
             .spawn(async move { inner.regenerate_stream(&action_id, &model, sender).await })
             .await
             .map_err(join_err)?
+    }
+
+    /// **When the regeneration of `item_id` ends** — the other half of the fact
+    /// [`AppError::RegenerationInFlight`] reports. Resolves immediately if
+    /// nothing is running against that item.
+    ///
+    /// A surface refused by the claim has to be able to stop saying so, and
+    /// nothing durable can tell it when: a regeneration that *succeeds* leaves
+    /// a new generation to notice, but one that fails leaves no trace a
+    /// transcript read can see — no action row, and (for a truncation) only a
+    /// Record entry attached to nothing. So the end is published rather than
+    /// inferred, from the one place that knows it. It is a wait, not a poll:
+    /// the claim's own `Drop` wakes it.
+    ///
+    /// The window this cannot close is a *later* regeneration of the same item
+    /// claiming between the release and the ask — the answer is then honestly
+    /// "one is running", which is what the caller wanted to know.
+    pub async fn regeneration_settled(&self, item_id: String) {
+        let inner = self.inner.clone();
+        let _ = self
+            .runtime
+            .spawn(async move { inner.regeneration_settled(&item_id).await })
+            .await;
     }
 
     // -----------------------------------------------------------------------
@@ -13313,25 +13360,40 @@ fn with_header(item_id: &str, label: &str, created_at_ms: i64, text: &str) -> St
 /// replaces: two callers naming different generations of one post are still two
 /// regenerations of the same thing, and the second would spend a second
 /// credential to lose the durable single-successor race.
+///
+/// **The claim is announced on both sides.** A refused caller learns the item
+/// is claimed from [`AppError::RegenerationInFlight`]; it learns the claim has
+/// ended by awaiting [`AppCore::regeneration_settled`], which is the same fact
+/// read the other way round rather than a second source of truth. That is why
+/// the registry holds a `watch::Sender` per claimed item and not a bare set:
+/// dropping the sender *is* the release, so every waiter is woken by the same
+/// `Drop` that frees the item, and a turn that ends by `?`, by cancellation or
+/// by panic announces itself exactly as one that ends by succeeding.
 struct RegenerationGuard {
-    items: Arc<Mutex<std::collections::HashSet<String>>>,
+    items: RegenerationRegistry,
     item_id: String,
 }
 
+/// The claimed items, process-wide: item id → a sender whose *liveness* is the
+/// claim. See [`RegenerationGuard`].
+type RegenerationRegistry =
+    Arc<Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<()>>>>;
+
 impl RegenerationGuard {
-    fn claim(
-        items: &Arc<Mutex<std::collections::HashSet<String>>>,
-        item_id: &str,
-    ) -> Result<Self, AppError> {
-        let claimed = items
-            .lock()
-            .expect("regeneration registry lock poisoned")
-            .insert(item_id.to_string());
-        if !claimed {
+    fn claim(items: &RegenerationRegistry, item_id: &str) -> Result<Self, AppError> {
+        let mut registry = items.lock().expect("regeneration registry lock poisoned");
+        if registry.contains_key(item_id) {
             return Err(AppError::RegenerationInFlight {
                 item_id: item_id.to_string(),
             });
         }
+        // The receiver is deliberately dropped: nobody is waiting *yet*, and a
+        // `watch` channel keeps working when its last receiver goes (senders
+        // hand out new ones on demand). What matters is that this sender lives
+        // exactly as long as the claim.
+        let (tx, _rx) = tokio::sync::watch::channel(());
+        registry.insert(item_id.to_string(), tx);
+        drop(registry);
         Ok(Self {
             items: items.clone(),
             item_id: item_id.to_string(),
@@ -13342,6 +13404,9 @@ impl RegenerationGuard {
 impl Drop for RegenerationGuard {
     fn drop(&mut self) {
         if let Ok(mut items) = self.items.lock() {
+            // Removing the sender drops it, which resolves every waiter's
+            // `changed()` with the closed-channel error — the release and its
+            // announcement are one act, so there is no ordering to get wrong.
             items.remove(&self.item_id);
         }
     }

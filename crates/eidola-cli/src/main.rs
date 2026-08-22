@@ -921,14 +921,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
 
             let (result, ()) = tokio::join!(chat_fut, printer);
             let result = result?;
-            eprintln!(
-                "---\nspace: {}  model: {}  tokens: {}/{}  credits: {}",
-                result.space_id,
-                result.model,
-                result.input_tokens.unwrap_or(0),
-                result.output_tokens.unwrap_or(0),
-                result.credits_charged,
-            );
+            eprintln!("{}", chat_summary(&result));
             Ok(())
         }
         Some(Command::Spaces { command }) => match command {
@@ -1635,6 +1628,43 @@ fn print_indented(text: &str, indent: usize) {
 /// reserved for [`TermsAcceptance::Complete`] — "could not check" gets a
 /// sentence of its own, because a reader who is told nothing reasonably
 /// concludes there is nothing to do.
+/// What a finished `eidola chat` says on **stderr**, once the answer itself has
+/// gone to stdout: the run's metadata, and — ahead of it — the one thing about
+/// the answer the answer cannot say for itself.
+///
+/// **A turn stopped at the model's length allowance is a successful turn with
+/// an unfinished answer in it**, and every other signal reads like an ordinary
+/// success: the exit code is 0, the usage is honest, the text ends on a line
+/// like any other. Only `ChatResult::truncated` separates a model that was
+/// finished from a ceiling that bound it, so without this a reader — or a
+/// script keeping stdout — takes a mid-sentence answer for a whole one. It
+/// leads because it is about the text just printed, not about the run, and it
+/// is a `warning:` rather than an error because nothing failed and the partial
+/// answer is real.
+///
+/// Pure, so what a finished turn says is assertable without taking one. It
+/// writes nothing itself for the same reason the streaming printer splits the
+/// streams: **stdout is the answer and nothing else.**
+fn chat_summary(result: &eidola_app_core::ChatResult) -> String {
+    let mut out = String::new();
+    if result.truncated {
+        out.push_str(
+            "warning: this answer stopped at the model's length limit, not because the model \
+             was done — ask for a shorter answer, or ask it to carry on from where this one \
+             stops\n",
+        );
+    }
+    out.push_str(&format!(
+        "---\nspace: {}  model: {}  tokens: {}/{}  credits: {}",
+        result.space_id,
+        result.model,
+        result.input_tokens.unwrap_or(0),
+        result.output_tokens.unwrap_or(0),
+        result.credits_charged,
+    ));
+    out
+}
+
 fn report_terms_standing(standing: &TermsAcceptance) {
     match standing {
         TermsAcceptance::Complete => {}
@@ -1714,6 +1744,48 @@ mod tests {
     use eidola_app_core::{
         ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState, RunningEngine,
     };
+
+    fn finished_turn(truncated: bool) -> eidola_app_core::ChatResult {
+        eidola_app_core::ChatResult {
+            space_id: "s1".into(),
+            content: "Tides are the ocean answering the moon, and".into(),
+            model: "kimi-k2".into(),
+            input_tokens: Some(11),
+            output_tokens: Some(4096),
+            credits_charged: 320,
+            response_action_id: Some("a2".into()),
+            declined: None,
+            truncated,
+        }
+    }
+
+    #[test]
+    fn an_answer_cut_off_at_the_length_limit_says_so() {
+        // The reported defect: the CLI printed a mid-sentence answer and an
+        // ordinary usage footer, with nothing anywhere saying the model had not
+        // finished. Everything else about the turn succeeded, so the flag is
+        // the only thing that could have said it.
+        let cut_off = chat_summary(&finished_turn(true));
+        assert!(
+            cut_off.starts_with("warning: this answer stopped at the model's length limit"),
+            "the warning leads — it is about the text just printed: {cut_off:?}"
+        );
+        assert!(
+            cut_off.contains("---\nspace: s1  model: kimi-k2  tokens: 11/4096  credits: 320"),
+            "and the footer is unchanged beneath it: {cut_off:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_answer_says_nothing_extra() {
+        // The other half: a turn the model finished must print byte-identically
+        // to what it always printed, or every scripted reader of the footer
+        // breaks for the common case.
+        assert_eq!(
+            chat_summary(&finished_turn(false)),
+            "---\nspace: s1  model: kimi-k2  tokens: 11/4096  credits: 320"
+        );
+    }
 
     #[test]
     fn account_create_never_submits_documents_it_did_not_print() {
