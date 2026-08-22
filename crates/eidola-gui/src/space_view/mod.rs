@@ -1691,19 +1691,26 @@ impl SpaceView {
         self.highlight_ranges(i, cx)
     }
 
-    /// The open source-highlight picker's rows, as `(action id, label)` —
-    /// exactly what it paints.
+    /// The open source-highlight picker's rows, as
+    /// `(action id, accessible name, collision ordinal)` — exactly what it
+    /// paints. The ordinal is reported separately because it is painted
+    /// separately: it sits outside the row's truncatable text, so a test can
+    /// tell a discriminator that survives the 280px row from one that does
+    /// not.
     ///
     /// Takes `cx` because a row is resolved against the live reverse index and
     /// worded in the reader's locale at render, never stored — see
     /// [`HighlightPicker`].
     #[doc(hidden)]
-    pub fn highlight_picker_for_test(&self, cx: &gpui::App) -> Option<Vec<(String, String)>> {
+    pub fn highlight_picker_for_test(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<Vec<(String, String, Option<i64>)>> {
         self.highlight_picker.as_ref()?;
         Some(
             self.picker_rows(cx)
                 .into_iter()
-                .map(|(action_id, label)| (action_id, label.to_string()))
+                .map(|row| (row.action_id, row.accessible.to_string(), row.ordinal))
                 .collect(),
         )
     }

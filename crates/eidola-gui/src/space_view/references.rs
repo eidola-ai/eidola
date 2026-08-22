@@ -234,6 +234,29 @@ fn delegation_note(end: DelegationEnd, cx: &gpui::App) -> SharedString {
     }
 }
 
+/// One row of the source-highlight picker, **kept in three pieces because the
+/// row is laid out in two and read aloud as one.**
+///
+/// A picker row is 280px wide and its sentence truncates, so a discriminator
+/// living at the end of that sentence is the first thing thrown away: two long
+/// rows differing only in their collision number both ellipsized to the same
+/// prefix, and the number that made them distinct survived nowhere a sighted
+/// reader could see it (Codex review, PR #327). So `label` is the part that may
+/// truncate and `ordinal` is painted beside it, outside the truncation, while
+/// `accessible` is the whole thing as one localized sentence for the row's
+/// accessible name.
+pub(crate) struct PickerRow {
+    /// The referencing post — the click target.
+    pub(crate) action_id: String,
+    /// The sentence, minus any collision number. Truncates.
+    pub(crate) label: SharedString,
+    /// The collision number, for the rows that needed one. Never truncates.
+    pub(crate) ordinal: Option<i64>,
+    /// Label and ordinal as one localized sentence — what a screen reader is
+    /// given, where nothing is ever cut off.
+    pub(crate) accessible: SharedString,
+}
+
 /// **Make every row read differently, and make that an outcome rather than an
 /// intention.**
 ///
@@ -259,21 +282,18 @@ fn delegation_note(end: DelegationEnd, cx: &gpui::App) -> SharedString {
 /// no free candidate can exist for a well-formed message — and gives up into a
 /// duplicate rather than a hang. The `debug_assert` below is what says so out
 /// loud in a test build.
-fn disambiguate(
-    rows: &mut [(String, SharedString)],
-    nth: impl Fn(&SharedString, i64) -> SharedString,
-) {
+fn disambiguate(rows: &mut [PickerRow], nth: impl Fn(&SharedString, i64) -> SharedString) {
     let mut counts: std::collections::HashMap<&SharedString, usize> =
         std::collections::HashMap::new();
-    for (_, label) in rows.iter() {
-        *counts.entry(label).or_insert(0) += 1;
+    for row in rows.iter() {
+        *counts.entry(&row.label).or_insert(0) += 1;
     }
     // Every row that keeps its base speaks for that text first: a numbered row
     // may not land on one of them.
     let mut taken: std::collections::HashSet<SharedString> = rows
         .iter()
-        .filter(|(_, label)| counts.get(label).copied().unwrap_or(0) == 1)
-        .map(|(_, label)| label.clone())
+        .filter(|row| counts.get(&row.label).copied().unwrap_or(0) == 1)
+        .map(|row| row.label.clone())
         .collect();
     let duplicated: std::collections::HashSet<SharedString> = counts
         .into_iter()
@@ -282,15 +302,16 @@ fn disambiguate(
         .collect();
 
     let limit = rows.len() as i64 + 1;
-    for (_, label) in rows.iter_mut() {
-        if !duplicated.contains(label) {
+    for row in rows.iter_mut() {
+        if !duplicated.contains(&row.label) {
             continue;
         }
         let mut n = 1;
         loop {
-            let candidate = nth(label, n);
+            let candidate = nth(&row.label, n);
             if taken.insert(candidate.clone()) || n >= limit {
-                *label = candidate;
+                row.ordinal = Some(n);
+                row.accessible = candidate;
                 break;
             }
             n += 1;
@@ -300,11 +321,11 @@ fn disambiguate(
     debug_assert!(
         {
             let unique: std::collections::HashSet<&SharedString> =
-                rows.iter().map(|(_, label)| label).collect();
+                rows.iter().map(|row| &row.accessible).collect();
             unique.len() == rows.len()
         },
         "a chooser whose rows read alike cannot say which button goes where: {:?}",
-        rows.iter().map(|(_, l)| l).collect::<Vec<_>>()
+        rows.iter().map(|row| &row.accessible).collect::<Vec<_>>()
     );
 }
 
@@ -2372,7 +2393,7 @@ impl SpaceView {
     /// different, and this is the first" — where a snippet of the referring
     /// post would have to lift prose out of a conversation to label a chooser
     /// with, which is what the place-not-content rule above refuses.
-    pub(crate) fn picker_rows(&self, cx: &gpui::App) -> Vec<(String, SharedString)> {
+    pub(crate) fn picker_rows(&self, cx: &gpui::App) -> Vec<PickerRow> {
         let Some(picker) = self.highlight_picker.as_ref() else {
             return Vec::new();
         };
@@ -2381,14 +2402,20 @@ impl SpaceView {
             .read(cx)
             .incoming_references(&picker.anchor_action_id);
 
-        let mut rows: Vec<(String, SharedString)> = picker
+        let mut rows: Vec<PickerRow> = picker
             .choices
             .iter()
             .filter_map(|(action_id, ordinal)| {
                 let reference = index
                     .iter()
                     .find(|r| &r.action_id == action_id && r.ordinal == *ordinal)?;
-                Some((action_id.clone(), self.reference_label(reference, cx)))
+                let label = self.reference_label(reference, cx);
+                Some(PickerRow {
+                    action_id: action_id.clone(),
+                    accessible: label.clone(),
+                    label,
+                    ordinal: None,
+                })
             })
             .collect();
 
@@ -2496,25 +2523,47 @@ impl SpaceView {
                     .text_color(theme.muted_foreground)
                     .child(msg::space_highlight_picker_heading(cx)),
             );
-        for (idx, (action_id, label)) in rows.into_iter().enumerate() {
-            let target = action_id;
+        for (idx, row) in rows.into_iter().enumerate() {
+            let target = row.action_id;
             col = col.child(
-                div()
+                h_flex()
                     .id(SharedString::from(format!("space-highlight-pick-{idx}")))
                     .probe(
                         format!("space/highlight/picker/{idx}"),
                         gpui::Role::Button,
-                        label.clone(),
+                        row.accessible,
                     )
                     .w_full()
                     .px_1()
                     .py_0p5()
+                    .gap_0p5()
                     .rounded_sm()
                     .text_xs()
-                    .truncate()
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.muted))
-                    .child(label.clone())
+                    // The sentence gives way first…
+                    .child(div().flex_1().min_w_0().truncate().child(row.label))
+                    // …and the number that makes this row distinct from its
+                    // twin never does, or it would not be a discriminator.
+                    .children(row.ordinal.map(|n| {
+                        // Registry-only (`probe_bounds`): the number is
+                        // already spoken as part of the row's own accessible
+                        // name above, so a node here would say it twice — but
+                        // it is a separately painted element, and that is the
+                        // whole fix, so it is one a test can see.
+                        div()
+                            .id(SharedString::from(format!(
+                                "space-highlight-pick-{idx}-ordinal"
+                            )))
+                            .probe_bounds(
+                                format!("space/highlight/picker/{idx}/ordinal"),
+                                gpui::Role::Label,
+                                msg::space_highlight_picker_ordinal(cx, n),
+                            )
+                            .flex_none()
+                            .text_color(theme.muted_foreground)
+                            .child(msg::space_highlight_picker_ordinal(cx, n))
+                    }))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.navigate_to_action(target.clone(), window, cx);
                     })),

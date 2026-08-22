@@ -62,3 +62,8 @@ space-highlight-picker-unnamed-untitled = A post in another space
 # number no other row has taken — so a wording that drops it leaves rows the
 # reader cannot choose between.
 space-highlight-picker-nth = { $label } ({ $n })
+# The same number, painted on its own beside the row rather than inside the
+# sentence — the row's text truncates at 280px and a discriminator that
+# truncates discriminates nothing. Keep it in step with
+# `space-highlight-picker-nth`, whose tail it is.
+space-highlight-picker-ordinal = ({ $n })

@@ -7509,6 +7509,8 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
         space.update(cx, |s, cx| s.set_post_tree_for_test(vec![quoted, here], cx));
     });
 
+    const LONG_TITLE: &str = "Everything we worked out about spring tides, the moon's declination, and \
+         why the harbour empties twice";
     let incoming = |action: &str, kind: &str, label: &str, title: Option<&str>| {
         eidola_app_core::IncomingReference {
             action_id: action.into(),
@@ -7555,6 +7557,11 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
                     incoming("y1", "agent", "Iris", Some("Ebb")),
                     incoming("y2", "agent", "Iris", Some("Ebb")),
                     incoming("y3", "agent", "Iris", Some("Ebb (1)")),
+                    // And a collision whose shared prefix is longer than the
+                    // row: the number is what tells these apart, and a number
+                    // inside the truncating text tells nobody anything.
+                    incoming("z1", "agent", "Wren", Some(LONG_TITLE)),
+                    incoming("z2", "agent", "Wren", Some(LONG_TITLE)),
                 ],
             );
         });
@@ -7563,7 +7570,7 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
         view.update(cx, |v, cx| {
             v.click_highlight_for_test(
                 "a1",
-                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
                 window,
                 cx,
             )
@@ -7602,18 +7609,65 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
 
     // The property the rows are for, asserted as a property: whatever the
     // fixture happens to contain, no two buttons in this picker read alike.
-    let labels: Vec<String> = view
+    let rows = view
         .read_with(cx, |v, cx| v.highlight_picker_for_test(cx))
-        .expect("the picker is open")
-        .into_iter()
-        .map(|(_, label)| label)
-        .collect();
-    let unique: std::collections::BTreeSet<&String> = labels.iter().collect();
+        .expect("the picker is open");
+    let labels: Vec<&String> = rows.iter().map(|(_, label, _)| label).collect();
+    let unique: std::collections::BTreeSet<&&String> = labels.iter().collect();
     assert_eq!(
         unique.len(),
         labels.len(),
         "a chooser whose rows read alike cannot say which button goes where: {labels:?}"
     );
+
+    // **And the discriminator has to survive the row.** A picker row is 280px
+    // and its sentence truncates, so a number living at the end of that
+    // sentence is the first thing thrown away — two long rows would ellipsize
+    // to the same prefix with only their accessible names differing, which is
+    // no help at all to the reader looking at them (Codex review, PR #327).
+    // The ordinal is reported separately because it is *painted* separately,
+    // outside the truncating text, so this is the property that fixes it.
+    let long_indices: Vec<(usize, &String)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, label, _))| label.starts_with("Wren, in "))
+        .map(|(i, (_, label, _))| (i, label))
+        .collect();
+    let long = rows
+        .iter()
+        .filter(|(_, label, _)| label.starts_with("Wren, in "))
+        .collect::<Vec<_>>();
+    assert_eq!(long.len(), 2, "the long-title collision pair: {long:?}");
+    assert_eq!(
+        long.iter().map(|(_, _, n)| *n).collect::<Vec<_>>(),
+        vec![Some(1), Some(2)],
+        "each is numbered: {long:?}"
+    );
+    // And the numbers are *painted* outside it — their own elements, which is
+    // what surviving the truncation means. `entries` is the frame that was
+    // just drawn, so an entry here is a thing on the screen.
+    let ordinals: Vec<&String> = entries
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| name.ends_with("/ordinal"))
+        .collect();
+    assert_eq!(
+        ordinals.len(),
+        8,
+        "one painted ordinal per numbered row — the four collision groups, and \
+         notably *not* row 12, whose \"(1)\" is its conversation's real name: {ordinals:?}"
+    );
+    for (index, _) in &long_indices {
+        let name = format!("space/highlight/picker/{index}/ordinal");
+        let entry = entries
+            .iter()
+            .find(|(n, _)| n == &name)
+            .unwrap_or_else(|| panic!("the long row's number is painted on its own: {name}"));
+        assert!(
+            entry.1.bounds.size.width > gpui::px(0.),
+            "and it takes real room beside the text that gives way: {entry:?}"
+        );
+    }
 
     probe::set_probes_enabled(false);
 }
