@@ -2414,8 +2414,38 @@ impl SpaceView {
     /// So an empty resolution ends the picker the way a dismissal does — the
     /// same assignment, releasing the same ownership. Called from the space
     /// observer, which is where an invalidation lands.
+    ///
+    /// **But only an answer closes it.** That observer is also where the
+    /// invalidation itself lands, and an invalidation clears *every* live
+    /// space's index on any change to any space — so reading the resulting
+    /// empty slice as "my referrers were deleted" dismissed the picker in the
+    /// exact moment the reload was about to repair its labels, which is the
+    /// repair this window's whole cache-invalidation path exists for (Codex
+    /// review, PR #327). `Space::incoming_references_pending` is the
+    /// distinction `incoming_references` flattens: a cleared cache is a
+    /// question still out, a loaded index is an answer.
+    ///
+    /// **And the question is put back**, because nothing else guarantees it
+    /// will be: the lazy re-fetch is driven by *rendering* the anchor post, and
+    /// an anchor scrolled out of view would leave the index unrequested for
+    /// good — the picker then pending forever, invisible, still owning the
+    /// keyboard. Asking here is idempotent and makes "pending" true only while
+    /// something is actually going to answer.
     pub(crate) fn close_highlight_picker_if_empty(&mut self, cx: &mut Context<Self>) {
-        if self.highlight_picker.is_some() && self.picker_rows(cx).is_empty() {
+        let Some(anchor) = self
+            .highlight_picker
+            .as_ref()
+            .map(|p| p.anchor_action_id.clone())
+        else {
+            return;
+        };
+        self.space.update(cx, |space, cx| {
+            space.ensure_incoming_references(&anchor, cx)
+        });
+        if self.space.read(cx).incoming_references_pending(&anchor) {
+            return;
+        }
+        if self.picker_rows(cx).is_empty() {
             self.highlight_picker = None;
             cx.notify();
         }
