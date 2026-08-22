@@ -910,9 +910,14 @@ impl SpaceView {
         }
 
         let _subs = vec![
-            // Any space change re-derives the render snapshot and re-renders.
+            // Any space change re-derives the render snapshot and re-renders
+            // — and ends an open highlight picker whose chosen edges the
+            // reverse index no longer carries, which is where an invalidation
+            // of that index lands (see
+            // `SpaceView::close_highlight_picker_if_empty`).
             cx.observe(&space, |this: &mut Self, _, cx| {
                 this.rebuild(cx);
+                this.close_highlight_picker_if_empty(cx);
                 cx.notify();
             }),
             cx.subscribe_in(&space, window, Self::on_space_event),

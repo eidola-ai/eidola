@@ -12828,6 +12828,100 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
     });
 }
 
+/// REGRESSION (Codex review, PR #327): **a picker whose edges vanish is
+/// closed, not merely unpainted.**
+///
+/// Its rows resolve against the live reverse index, so an invalidation — or
+/// referrers edited until none of the chosen edges is current — can leave it
+/// naming nothing. Rendering nothing is not being closed: `highlight_picker`
+/// staying `Some` keeps `transient_overlay_open` true, and that predicate is
+/// the one definition of who owns the keyboard, so every arrow, Escape and
+/// printable went on being yielded to a popover the reader could not see. Nor
+/// was there a way out — Escape never reached `leave_focus_level`, and the
+/// click-out that clears the picker lives on the element no longer rendered.
+///
+/// The keyboard is the honest assertion here: ownership is not a field a
+/// reader can look at, it is whether typing reaches the conversation again.
+#[gpui::test]
+fn space_a_picker_whose_referrers_vanish_gives_the_keyboard_back(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let a1 = fixture_post_with_block("a1", "b1", "the quick brown fox jumps");
+    let mut a2 = fixture_assistant_post("a2", "first responder");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", "second responder");
+    a3.parent_action_id = Some("a1".into());
+    seed_quotable_space(&view, window, cx, vec![a1, a2, a3]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    let incoming = |action: &str, lo: i64, hi: i64| eidola_app_core::IncomingReference {
+        action_id: action.into(),
+        space_id: "s".into(),
+        ordinal: 1,
+        content_block_id: Some("b1".into()),
+        range_start: Some(lo),
+        range_end: Some(hi),
+        annotation: None,
+        created_at: 0,
+        author_label: "Ada".into(),
+        author_kind: "agent".into(),
+        space_title: None,
+    };
+    vcx.update(|_, cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![incoming("a2", 4, 15), incoming("a3", 10, 19)],
+            );
+        });
+    });
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0, 1], window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        assert!(
+            v.highlight_picker_for_test(cx).is_some(),
+            "the picker is open"
+        );
+    });
+
+    // Both referrers are edited until neither quote is current — the index
+    // re-reads and carries none of the chosen edges any more.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_for_test("a1", Vec::new());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        assert!(
+            v.highlight_picker_for_test(cx).is_none(),
+            "a picker naming nothing is closed, not left owning the window"
+        );
+    });
+
+    // And the keyboard is the conversation's again: a printable starts the
+    // trailing draft, which is exactly what an open overlay suppresses.
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.has_active_draft_for_test(),
+            "typing reaches the conversation once no invisible overlay owns it"
+        );
+    });
+}
+
 #[gpui::test]
 fn space_affordance_index_follows_the_verb_tab_moved_to(cx: &mut TestAppContext) {
     // The level's index is bookkeeping; which verb has focus is the truth. Tab

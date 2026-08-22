@@ -2398,12 +2398,37 @@ impl SpaceView {
         rows
     }
 
+    /// **Close the picker when the edges it names are gone.**
+    ///
+    /// Its rows are resolved against the live reverse index, so an
+    /// invalidation — or referrers edited until none of the chosen edges is
+    /// current — can leave it naming nothing. Painting nothing is not the same
+    /// as being closed: `highlight_picker` staying `Some` keeps
+    /// [`SpaceView::transient_overlay_open`] true, which is *the one
+    /// definition* of who owns the keyboard, so every arrow, Escape and
+    /// printable goes on being yielded to a popover the reader cannot see —
+    /// and Escape never reaches `leave_focus_level`, so there is no keyboard
+    /// way out of it either. The click-out that would clear it lives on the
+    /// element that is no longer rendered (Codex review, PR #327).
+    ///
+    /// So an empty resolution ends the picker the way a dismissal does — the
+    /// same assignment, releasing the same ownership. Called from the space
+    /// observer, which is where an invalidation lands.
+    pub(crate) fn close_highlight_picker_if_empty(&mut self, cx: &mut Context<Self>) {
+        if self.highlight_picker.is_some() && self.picker_rows(cx).is_empty() {
+            self.highlight_picker = None;
+            cx.notify();
+        }
+    }
+
     /// The picker: a small popover of the posts that quoted the clicked
     /// passage. Dismissed by click-out or a choice — the band-menu pattern.
     pub(crate) fn render_highlight_picker(&self, cx: &Context<Self>) -> Option<AnyElement> {
         self.highlight_picker.as_ref()?;
-        // Rows come from the live index, so an invalidation empties the
-        // popover rather than leaving it painting names nobody holds any more.
+        // Rows come from the live index. An empty resolution is *closed* by
+        // `close_highlight_picker_if_empty` before a frame that would show it;
+        // this stays as the guard that no interleaving paints an empty
+        // popover.
         let rows = self.picker_rows(cx);
         if rows.is_empty() {
             return None;
