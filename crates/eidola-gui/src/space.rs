@@ -1114,6 +1114,39 @@ impl Space {
             .unwrap_or(&[])
     }
 
+    /// Whether an **answer** about `action_id`'s reverse index is still
+    /// outstanding: never requested, or requested and in flight.
+    ///
+    /// [`Self::incoming_references`] flattens this away — a cleared cache and
+    /// a post nothing quotes both read as an empty slice, which is right for
+    /// painting highlights (there is nothing to paint either way) and wrong
+    /// for any decision that turns on *why* it is empty. The highlight picker
+    /// is such a decision: an invalidation clears every live space's index on
+    /// any change to any space, and a picker that read that transient miss as
+    /// "my referrers were deleted" would dismiss itself in the moment the
+    /// reload was about to repair it (Codex review, PR #327).
+    ///
+    /// `Failed` is **not** pending: no further answer is coming (a failed
+    /// decoration deliberately does not re-request), so a caller waiting on
+    /// one would wait forever.
+    pub fn incoming_references_pending(&self, action_id: &str) -> bool {
+        matches!(
+            self.incoming_refs.get(action_id),
+            None | Some(Loadable::NotLoaded) | Some(Loadable::Loading)
+        )
+    }
+
+    /// Test seam: put a post's reverse index into the in-flight state, which
+    /// is what an invalidation followed by a re-request leaves behind. Stub
+    /// mode answers `ensure_incoming_references` immediately with an empty
+    /// index, so it is the one real state a backend-less test cannot otherwise
+    /// reach.
+    #[doc(hidden)]
+    pub fn seed_incoming_references_loading_for_test(&mut self, action_id: impl Into<String>) {
+        self.incoming_refs
+            .insert(action_id.into(), Loadable::Loading);
+    }
+
     /// Load `action_id`'s reverse index if it hasn't been requested yet — the
     /// lazy, per-post fetch the view calls for each post it actually renders.
     /// Idempotent: a cell that is loading, loaded, or failed is left alone (a

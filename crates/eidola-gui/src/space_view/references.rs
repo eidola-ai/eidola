@@ -35,7 +35,7 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, Context, Focusable as _, InteractiveElement, IntoElement, ParentElement,
+    AnyElement, Context, Focusable as _, InteractiveElement, IntoElement, ParentElement, Pixels,
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
@@ -232,6 +232,176 @@ fn delegation_note(end: DelegationEnd, cx: &gpui::App) -> SharedString {
             },
         ),
     }
+}
+
+/// The source-highlight picker's fixed width — see `render_highlight_picker`,
+/// which is the only place it may be spelled.
+const PICKER_WIDTH: Pixels = px(280.);
+
+/// The picker row's type size, as `text_xs` resolves it: `rems(0.75)` off the
+/// window's own `rem_size`, which carries the reader's type-scale setting. Kept
+/// here so the measurement below and the row's styling are one number.
+const PICKER_TEXT_REMS: f32 = 0.75;
+
+/// What a row's chrome takes out of [`PICKER_WIDTH`] before a glyph is drawn:
+/// the popover's padding, the row's own, the gap, the ellipsis, and room for a
+/// collision number.
+///
+/// **A deliberate over-estimate.** It decides how much of a label is treated
+/// as visible, and the two errors are not equals: crediting *less* room than
+/// the row really has can only group two rows that would have looked different
+/// (a number nobody needed), while crediting more would let two rows that
+/// paint alike go unnumbered — which is the defect itself.
+const PICKER_ROW_CHROME: Pixels = px(64.);
+
+/// **The prefix of `label` that will actually be painted in a picker row.**
+///
+/// Collisions are decided on this rather than on the whole string, because
+/// what a reader can tell apart is what reaches the screen: two titles
+/// differing only past the cutoff are distinct as strings and identical as
+/// rows, so numbering keyed on the full text left them indistinguishable —
+/// the round-4 marker never fired, having nothing to fire on (Codex review,
+/// PR #327).
+///
+/// The glyphs are measured for real (`shape_line`), because a character budget
+/// cannot be right for a proportional font at a scale the reader chooses. Two
+/// approximations remain and both are stated rather than hidden: the width is
+/// under-credited by [`PICKER_ROW_CHROME`], and gpui's own ellipsis placement
+/// is its business, not ours — so this is a *lower bound* on what is shown,
+/// which is the safe direction (over-numbering, never under-).
+fn painted_prefix(label: &SharedString, window: &Window, _cx: &gpui::App) -> SharedString {
+    let width = PICKER_WIDTH - PICKER_ROW_CHROME;
+    let font_size = window.rem_size() * PICKER_TEXT_REMS;
+    let run = gpui::TextRun {
+        len: label.len(),
+        font: window.text_style().font(),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(label.clone(), font_size, &[run], None);
+    match shaped.index_for_x(width) {
+        // The whole label fits: what is painted is what it says.
+        None => label.clone(),
+        Some(cut) => SharedString::from(label[..cut].to_string()),
+    }
+}
+
+/// One row of the source-highlight picker, **kept in three pieces because the
+/// row is laid out in two and read aloud as one.**
+///
+/// A picker row is 280px wide and its sentence truncates, so a discriminator
+/// living at the end of that sentence is the first thing thrown away: two long
+/// rows differing only in their collision number both ellipsized to the same
+/// prefix, and the number that made them distinct survived nowhere a sighted
+/// reader could see it (Codex review, PR #327). So `label` is the part that may
+/// truncate and `ordinal` is painted beside it, outside the truncation, while
+/// `accessible` is the whole thing as one localized sentence for the row's
+/// accessible name.
+pub(crate) struct PickerRow {
+    /// The referencing post — the click target.
+    pub(crate) action_id: String,
+    /// The sentence, minus any collision number. Truncates.
+    pub(crate) label: SharedString,
+    /// The collision number, for the rows that needed one. Never truncates.
+    pub(crate) ordinal: Option<i64>,
+    /// Label and ordinal as one localized sentence — what a screen reader is
+    /// given, where nothing is ever cut off.
+    pub(crate) accessible: SharedString,
+}
+
+/// **Make every row read differently, and make that an outcome rather than an
+/// intention.**
+///
+/// Rows that composed to the same sentence are numbered; a row nothing
+/// collides with is left exactly as it was. The subtlety is that the number is
+/// *also* text, so a naive pass can manufacture the collision it was sent to
+/// remove: three rows reading `Foo`, `Foo`, `Foo (1)` have one duplicated base,
+/// and numbering that base alone turns the first row into `Foo (1)` — now a
+/// duplicate of a row the pre-count had already cleared as unique (Codex
+/// review, PR #327).
+///
+/// So the suffix is chosen against **what the picker will actually show**: the
+/// labels that keep their base are reserved first, and each numbered row takes
+/// the lowest number not already spoken for. `Foo`, `Foo`, `Foo (1)` therefore
+/// renders as `Foo (2)`, `Foo (3)`, `Foo (1)` — the numbers are not the
+/// group's own 1..k, because a row that is already unique must not be renamed
+/// to make its neighbours tidier.
+///
+/// `nth` is a formatting *function* rather than a format string because the
+/// wording is localized. The one thing it must do is vary with `n`; a
+/// translation that dropped the variable would leave this searching for a free
+/// candidate forever, so the search is bounded by the row count — beyond which
+/// no free candidate can exist for a well-formed message — and gives up into a
+/// duplicate rather than a hang. The `debug_assert` below is what says so out
+/// loud in a test build.
+fn disambiguate(
+    rows: &mut [PickerRow],
+    painted: impl Fn(&SharedString) -> SharedString,
+    nth: impl Fn(&SharedString, i64) -> SharedString,
+) {
+    // **What a row collides with is decided on what it paints**, not on what
+    // it says: a label cut short at the row's measure is the string a reader
+    // actually compares against its neighbour — and for the same reason the
+    // *numbers* are allocated in that space too. Allocating them against the
+    // full sentences hands two rows that differ only past the cutoff the same
+    // "(1)", which is two identical rows again with extra ceremony.
+    let keys: Vec<SharedString> = rows.iter().map(|row| painted(&row.label)).collect();
+    let mut counts: std::collections::HashMap<&SharedString, usize> =
+        std::collections::HashMap::new();
+    for key in keys.iter() {
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    // Every row that keeps its base speaks for that painted text first: a
+    // numbered row may not land on one of them.
+    let mut taken: std::collections::HashSet<SharedString> = keys
+        .iter()
+        .filter(|key| counts.get(*key).copied().unwrap_or(0) == 1)
+        .cloned()
+        .collect();
+    let duplicated: std::collections::HashSet<SharedString> = counts
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(key, _)| key.clone())
+        .collect();
+
+    let limit = rows.len() as i64 + 1;
+    for (row, key) in rows.iter_mut().zip(keys.iter()) {
+        if !duplicated.contains(key) {
+            continue;
+        }
+        let mut n = 1;
+        loop {
+            if taken.insert(nth(key, n)) || n >= limit {
+                row.ordinal = Some(n);
+                // The accessible name is built from the **whole** label: a
+                // screen reader is never handed a truncated sentence, so the
+                // part a sighted reader lost is the part it keeps.
+                row.accessible = nth(&row.label, n);
+                break;
+            }
+            n += 1;
+        }
+    }
+
+    debug_assert!(
+        {
+            let painted_rows: std::collections::HashSet<(&SharedString, Option<i64>)> = rows
+                .iter()
+                .zip(keys.iter())
+                .map(|(r, k)| (k, r.ordinal))
+                .collect();
+            painted_rows.len() == rows.len()
+        },
+        "a chooser whose rows paint alike cannot say which button goes where: {:?}",
+        rows.iter()
+            .zip(keys.iter())
+            .map(|(r, k)| (k, r.ordinal))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// What a footnote row can honestly say. The three cases are genuinely
@@ -2189,15 +2359,10 @@ impl SpaceView {
             }
             many => {
                 self.highlight_picker = Some(super::HighlightPicker {
+                    anchor_action_id: action_id.to_string(),
                     choices: many
                         .iter()
-                        .map(|r| {
-                            (
-                                r.action_id.clone(),
-                                r.space_id.clone(),
-                                self.referencer_label(&r.action_id),
-                            )
-                        })
+                        .map(|r| (r.item_id.clone(), r.ordinal))
                         .collect(),
                 });
                 cx.notify();
@@ -2211,35 +2376,233 @@ impl SpaceView {
     /// The post's own quote blocks are elided first — a marker is rendered
     /// content, never chrome text, and a label reading "`{{ embed 1 }}`" would
     /// leak the wire format into the UI.
-    fn referencer_label(&self, action_id: &str) -> SharedString {
-        match self
+    ///
+    /// **A referrer this window does not hold is still named**, through the
+    /// same order and the same rule [`SpaceView::reference_byline`] applies to
+    /// the footnote rail's outgoing direction: the post's own gutter byline
+    /// where this window has the post, otherwise the edge's carried author
+    /// identity — `(author_kind, author_label)`, the *referring* space's
+    /// effective naming of that participant — read through
+    /// [`crate::space::byline_for_participant`] and, for an agent, the second
+    /// pass through [`SpaceView::model_display`] the gutter takes. The picker
+    /// is the surface a **cross-space** backlink is most likely to appear on
+    /// (a same-space referrer is on the page), and "A post in another space"
+    /// for every one of them made two candidates indistinguishable — the one
+    /// thing a picker exists to prevent.
+    ///
+    /// **But an author does not identify a post, so the place is named too.**
+    /// One participant can quote the same passage from two conversations, and
+    /// two rows reading "You, in another space" put the reader back where they
+    /// started — the same defect one step along. The row therefore names the
+    /// conversation the click would open, which is exactly what distinguishes
+    /// the two targets. It is the *place*, not a snippet of the referring
+    /// post: a title says where the button goes, while lifting prose out of a
+    /// conversation to label a chooser would make this surface a disclosure
+    /// channel. The untitled arms keep "another space", which stays true of a
+    /// conversation nobody has named.
+    ///
+    /// **The words are composed at render, from Fluent**, never stored — see
+    /// [`super::HighlightPicker`].
+    fn reference_label(
+        &self,
+        reference: &eidola_app_core::IncomingReference,
+        cx: &gpui::App,
+    ) -> SharedString {
+        if let Some(p) = self
             .posts
             .iter()
-            .find(|p| p.action_id.as_deref() == Some(action_id))
+            .find(|p| p.action_id.as_deref() == Some(reference.action_id.as_str()))
         {
-            Some(p) => {
-                let head = footnote_snippet(&strip_embed_blocks(&p.content, &p.references));
-                if head.is_empty() {
-                    p.byline.clone()
+            let head = footnote_snippet(&strip_embed_blocks(&p.content, &p.references));
+            return if head.is_empty() {
+                p.byline.clone()
+            } else {
+                msg::space_highlight_picker_here(cx, p.byline.to_string(), head)
+            };
+        }
+
+        let space = reference
+            .space_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        match crate::space::byline_for_participant(&reference.author_kind, &reference.author_label)
+        {
+            Some(byline) => {
+                let byline = if reference.author_kind == "agent" {
+                    self.model_display(&byline, cx).0
                 } else {
-                    SharedString::from(format!("{}: {head}", p.byline))
+                    SharedString::from(byline)
+                };
+                match space {
+                    Some(space) => {
+                        msg::space_highlight_picker_elsewhere(cx, byline.to_string(), space)
+                    }
+                    None => msg::space_highlight_picker_elsewhere_untitled(cx, byline.to_string()),
                 }
             }
-            None => SharedString::from("A post in another space"),
+            None => match space {
+                Some(space) => msg::space_highlight_picker_unnamed(cx, space),
+                None => msg::space_highlight_picker_unnamed_untitled(cx),
+            },
         }
+    }
+
+    /// The picker's rows as it paints them: `(referring action id, label)`,
+    /// resolved against the **live** reverse index and worded for the reader.
+    ///
+    /// **Nothing is carried from the click but identity** — see
+    /// [`super::HighlightPicker`]. A chosen edge the index no longer holds is
+    /// simply not a row: an invalidation empties this until the lazy re-fetch
+    /// lands, and a referrer that was edited away never comes back.
+    ///
+    /// **And no two rows may read alike.** Naming the conversation tells one
+    /// author's two backlinks apart, but a title is neither unique nor
+    /// required — two conversations can share one, and two can have none at
+    /// all, which puts the reader back in front of a chooser that cannot say
+    /// which button goes where (Codex review, PR #327). So a group of rows
+    /// that composed to the same sentence is numbered, in the index's own
+    /// order (oldest first, `references_to`'s `ORDER BY`), and a row nothing
+    /// collides with is left exactly as it was. Deliberately a *counter* and
+    /// not more context: the honest thing an ordinal claims is "these are
+    /// different, and this is the first" — where a snippet of the referring
+    /// post would have to lift prose out of a conversation to label a chooser
+    /// with, which is what the place-not-content rule above refuses.
+    pub(crate) fn picker_rows(&self, window: &Window, cx: &gpui::App) -> Vec<PickerRow> {
+        let Some(picker) = self.highlight_picker.as_ref() else {
+            return Vec::new();
+        };
+        let index = self
+            .space
+            .read(cx)
+            .incoming_references(&picker.anchor_action_id);
+
+        let mut rows: Vec<PickerRow> = picker
+            .choices
+            .iter()
+            .filter_map(|(item_id, ordinal)| {
+                let reference = index
+                    .iter()
+                    .find(|r| &r.item_id == item_id && r.ordinal == *ordinal)?;
+                let label = self.reference_label(reference, cx);
+                Some(PickerRow {
+                    // The **current** generation of that item, which is what
+                    // the click should open — an edit moves it, and opening
+                    // the generation the reader clicked past would land them
+                    // on superseded text.
+                    action_id: reference.action_id.clone(),
+                    accessible: label.clone(),
+                    label,
+                    ordinal: None,
+                })
+            })
+            .collect();
+
+        disambiguate(
+            &mut rows,
+            |label| painted_prefix(label, window, cx),
+            |label, n| msg::space_highlight_picker_nth(cx, label.to_string(), n),
+        );
+        rows
+    }
+
+    /// **Close the picker when the edges it names are gone.**
+    ///
+    /// Its rows are resolved against the live reverse index, so an
+    /// invalidation — or referrers edited until none of the chosen edges is
+    /// current — can leave it naming nothing. Painting nothing is not the same
+    /// as being closed: `highlight_picker` staying `Some` keeps
+    /// [`SpaceView::transient_overlay_open`] true, which is *the one
+    /// definition* of who owns the keyboard, so every arrow, Escape and
+    /// printable goes on being yielded to a popover the reader cannot see —
+    /// and Escape never reaches `leave_focus_level`, so there is no keyboard
+    /// way out of it either. The click-out that would clear it lives on the
+    /// element that is no longer rendered (Codex review, PR #327).
+    ///
+    /// So an empty resolution ends the picker the way a dismissal does — the
+    /// same assignment, releasing the same ownership. Called from the space
+    /// observer, which is where an invalidation lands.
+    ///
+    /// **But only an answer closes it.** That observer is also where the
+    /// invalidation itself lands, and an invalidation clears *every* live
+    /// space's index on any change to any space — so reading the resulting
+    /// empty slice as "my referrers were deleted" dismissed the picker in the
+    /// exact moment the reload was about to repair its labels, which is the
+    /// repair this window's whole cache-invalidation path exists for (Codex
+    /// review, PR #327). `Space::incoming_references_pending` is the
+    /// distinction `incoming_references` flattens: a cleared cache is a
+    /// question still out, a loaded index is an answer.
+    ///
+    /// **And the question is put back**, because nothing else guarantees it
+    /// will be: the lazy re-fetch is driven by *rendering* the anchor post, and
+    /// an anchor scrolled out of view would leave the index unrequested for
+    /// good — the picker then pending forever, invisible, still owning the
+    /// keyboard. Asking here is idempotent and makes "pending" true only while
+    /// something is actually going to answer.
+    pub(crate) fn close_highlight_picker_if_empty(&mut self, cx: &mut Context<Self>) {
+        let Some(anchor) = self
+            .highlight_picker
+            .as_ref()
+            .map(|p| p.anchor_action_id.clone())
+        else {
+            return;
+        };
+        self.space.update(cx, |space, cx| {
+            space.ensure_incoming_references(&anchor, cx)
+        });
+        if self.space.read(cx).incoming_references_pending(&anchor) {
+            return;
+        }
+        if !self.any_choice_resolves(cx) {
+            self.highlight_picker = None;
+            cx.notify();
+        }
+    }
+
+    /// Whether any of the open picker's chosen edges is still in the index.
+    ///
+    /// The question the close path actually has, asked without composing a
+    /// single word: wording needs the reader's locale *and* the row's measure,
+    /// and the space observer this runs from has no window to measure in.
+    /// Whether a row exists at all is a fact about the index alone.
+    fn any_choice_resolves(&self, cx: &gpui::App) -> bool {
+        let Some(picker) = self.highlight_picker.as_ref() else {
+            return false;
+        };
+        let index = self
+            .space
+            .read(cx)
+            .incoming_references(&picker.anchor_action_id);
+        picker.choices.iter().any(|(item_id, ordinal)| {
+            index
+                .iter()
+                .any(|r| &r.item_id == item_id && r.ordinal == *ordinal)
+        })
     }
 
     /// The picker: a small popover of the posts that quoted the clicked
     /// passage. Dismissed by click-out or a choice — the band-menu pattern.
-    pub(crate) fn render_highlight_picker(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let picker = self.highlight_picker.as_ref()?;
+    pub(crate) fn render_highlight_picker(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        self.highlight_picker.as_ref()?;
+        // Rows come from the live index. An empty resolution is *closed* by
+        // `close_highlight_picker_if_empty` before a frame that would show it;
+        // this stays as the guard that no interleaving paints an empty
+        // popover.
+        let rows = self.picker_rows(window, cx);
+        if rows.is_empty() {
+            return None;
+        }
         let theme = cx.theme();
         let mut col = v_flex()
             .id("space-highlight-picker")
             .probe(
                 "space/highlight/picker",
                 gpui::Role::Group,
-                "Posts quoting this passage",
+                msg::space_highlight_picker_group(cx),
             )
             // An opaque popover over the page (see `crate::overlay`): a click
             // on a row must not also land in the post beneath it.
@@ -2247,7 +2610,7 @@ impl SpaceView {
             .absolute()
             .right(GUTTER_GAP)
             .bottom(px(96.))
-            .w(px(280.))
+            .w(PICKER_WIDTH)
             .p_1()
             .gap_0p5()
             .rounded_md()
@@ -2264,27 +2627,49 @@ impl SpaceView {
                     .pb_0p5()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("Quoted by"),
+                    .child(msg::space_highlight_picker_heading(cx)),
             );
-        for (idx, (action_id, _space_id, label)) in picker.choices.iter().enumerate() {
-            let target = action_id.clone();
+        for (idx, row) in rows.into_iter().enumerate() {
+            let target = row.action_id;
             col = col.child(
-                div()
+                h_flex()
                     .id(SharedString::from(format!("space-highlight-pick-{idx}")))
                     .probe(
                         format!("space/highlight/picker/{idx}"),
                         gpui::Role::Button,
-                        label.clone(),
+                        row.accessible,
                     )
                     .w_full()
                     .px_1()
                     .py_0p5()
+                    .gap_0p5()
                     .rounded_sm()
                     .text_xs()
-                    .truncate()
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.muted))
-                    .child(label.clone())
+                    // The sentence gives way first…
+                    .child(div().flex_1().min_w_0().truncate().child(row.label))
+                    // …and the number that makes this row distinct from its
+                    // twin never does, or it would not be a discriminator.
+                    .children(row.ordinal.map(|n| {
+                        // Registry-only (`probe_bounds`): the number is
+                        // already spoken as part of the row's own accessible
+                        // name above, so a node here would say it twice — but
+                        // it is a separately painted element, and that is the
+                        // whole fix, so it is one a test can see.
+                        div()
+                            .id(SharedString::from(format!(
+                                "space-highlight-pick-{idx}-ordinal"
+                            )))
+                            .probe_bounds(
+                                format!("space/highlight/picker/{idx}/ordinal"),
+                                gpui::Role::Label,
+                                msg::space_highlight_picker_ordinal(cx, n),
+                            )
+                            .flex_none()
+                            .text_color(theme.muted_foreground)
+                            .child(msg::space_highlight_picker_ordinal(cx, n))
+                    }))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.navigate_to_action(target.clone(), window, cx);
                     })),

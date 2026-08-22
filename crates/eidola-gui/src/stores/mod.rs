@@ -477,8 +477,15 @@ fn dispatch_change(stores: &Stores, change: Change, origin: ChangeOrigin, seq: u
         Change::Wallet => {
             stores.wallet.update(cx, |s, cx| s.refresh(cx));
         }
+        // The listing, and — because a rename emits this and nothing else —
+        // every live space's cached reverse index, whose rows carry the
+        // referring conversation's title (see
+        // `SpacesStore::notify_space_index_changed`).
         Change::SpaceIndex => {
-            stores.spaces.update(cx, |s, cx| s.refresh(cx));
+            stores.spaces.update(cx, |s, cx| {
+                s.refresh(cx);
+                s.notify_space_index_changed(cx);
+            });
         }
         // A per-space message change (e.g. a CLI write to the same space, in
         // process) is routed to the live registered `Space` entity, which

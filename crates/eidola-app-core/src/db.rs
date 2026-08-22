@@ -1551,7 +1551,7 @@ pub async fn space_footprint_counts(
 /// enforcement is on for every connection, so anything this reasoning missed
 /// aborts the transaction and the space is kept — which is the direction the
 /// whole feature errs in.
-pub async fn discard_space_if_pristine(
+pub(crate) async fn discard_space_if_pristine(
     conn: &Connection,
     space_id: &str,
 ) -> Result<bool, AppError> {
@@ -3023,7 +3023,7 @@ pub struct Promotion<'a> {
 /// The caller has already validated *what* may be promoted (kind, scope, the
 /// shared "User", removal) and what the persona may say; this is the mechanics —
 /// **plus the one check that cannot be done ahead of the transaction**, below.
-pub async fn promote_participant_tx(
+pub(crate) async fn promote_participant_tx(
     conn: &Connection,
     promotion: &Promotion<'_>,
 ) -> Result<(), AppError> {
@@ -3260,7 +3260,7 @@ pub enum GrantDecision {
 /// not an agent, the shared human, a template-scoped row) still belong to the
 /// caller: they are typed errors a reader can act on, and finding them out in
 /// here would be a rollback where a message belongs.
-pub async fn grant_space_membership_tx(
+pub(crate) async fn grant_space_membership_tx(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
@@ -3300,7 +3300,7 @@ pub async fn grant_space_membership_tx(
 /// reported a failure for a join that had committed (Codex review, PR #280).
 /// `None` means the join struck nothing — the liveness premise expired — with
 /// nothing written and nothing to announce.
-pub async fn join_space_participant_tx(
+pub(crate) async fn join_space_participant_tx(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
@@ -3599,7 +3599,7 @@ pub struct Retirement {
 /// The participant row itself always survives (soft-remove), so every
 /// `action.participant_id` in the trail stays resolvable; retirement is about
 /// the *library*, never the history.
-pub async fn retire_participant_tx(
+pub(crate) async fn retire_participant_tx(
     conn: &Connection,
     participant_id: &str,
     now: i64,
@@ -4342,7 +4342,7 @@ pub struct SpaceDeparture {
     pub archived_spaces: Vec<String>,
 }
 
-pub async fn remove_space_participant_tx(
+pub(crate) async fn remove_space_participant_tx(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
@@ -4961,7 +4961,7 @@ pub type TemplateParticipantInput = (String, Option<String>, Option<String>, Str
 /// `Change::Templates` only after this returns `Ok` (the changes.rs
 /// emit-after-commit rule). `participants = None` leaves the participant set
 /// untouched; `Some(&[])` clears it.
-pub async fn update_template_tx(
+pub(crate) async fn update_template_tx(
     conn: &Connection,
     id: &str,
     title: Option<&str>,
@@ -5055,7 +5055,7 @@ pub async fn soft_remove_space_template(
 /// inside it too**, decided at the write like every other guard in this module,
 /// so a template removed a moment ago cannot be instantiated by a check taken
 /// before the writer was reserved.
-pub async fn instantiate_template(
+pub(crate) async fn instantiate_template(
     conn: &Connection,
     template_id: &str,
     new_space_id: &str,
@@ -5879,6 +5879,14 @@ pub async fn visible_tip_of_action(
 pub struct IncomingReferenceRow {
     /// The referring post's action id (a current generation).
     pub action_id: String,
+    /// The referring post's **item** — its identity across generations.
+    ///
+    /// The action id is the generation, and an edit mints a new one: editing a
+    /// referring post without touching its quote replicates the edge onto a
+    /// fresh action, so the backlink is the same backlink while
+    /// [`Self::action_id`] is not the same string. Anything holding on to a
+    /// row across a reload wants this.
+    pub item_id: String,
     /// The referring post's space (references may cross spaces).
     pub space_id: String,
     pub ordinal: i64,
@@ -5887,6 +5895,26 @@ pub struct IncomingReferenceRow {
     pub range_end: Option<i64>,
     pub annotation: Option<String>,
     pub created_at: i64,
+    /// The **referring** post's author, as that post's own space names it
+    /// (`COALESCE(space_participant.override_label, participant.label)` joined
+    /// on `ar.space_id`). Carried for the same reason the outgoing direction
+    /// carries [`AntecedentEdgeRow::antecedent_author_label`]: a referrer in
+    /// another space cannot be named from anything the quoted space knows.
+    pub author_label: String,
+    /// The referring post's author's participant **kind**, from the same join.
+    /// The label is not renderable on its own — see
+    /// [`crate::IncomingReference::author_kind`].
+    pub author_kind: String,
+    /// The referring space's title, `NULL` for one never named.
+    ///
+    /// An author does not identify a post: the same participant can quote one
+    /// passage from two conversations, and a surface listing backlinks would
+    /// then offer two rows that read alike and open different windows. The
+    /// title is what tells them apart, and it travels with the row that already
+    /// names that space by id. A surface that shows it wants
+    /// [`crate::AppCore::references_to_visible_to`], which reports only spaces
+    /// the viewer may read.
+    pub space_title: Option<String>,
 }
 
 /// All current-generation posts referencing `antecedent_action_id` (relation
@@ -5899,9 +5927,15 @@ pub async fn references_to(
     let mut stmt = conn
         .prepare(&format!(
             "SELECT aa.action_id, ar.space_id, aa.ordinal, aa.content_block_id, \
-                    aa.range_start, aa.range_end, aa.annotation, ar.created_at \
+                    aa.range_start, aa.range_end, aa.annotation, ar.created_at, \
+                    COALESCE(rsp.override_label, rp.label), rp.kind, rs.title, \
+                    ar.item_id \
              FROM action_antecedent aa \
              JOIN action_resolved ar ON ar.action_id = aa.action_id \
+             JOIN participant rp ON rp.id = ar.participant_id \
+             JOIN space rs ON rs.id = ar.space_id \
+             LEFT JOIN space_participant rsp \
+               ON rsp.space_id = ar.space_id AND rsp.participant_id = ar.participant_id \
              WHERE aa.antecedent_action_id = ?1 \
                AND aa.relation = 'reference' \
                AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
@@ -5926,6 +5960,10 @@ pub async fn references_to(
             range_end: row.get::<Option<i64>>(5).map_err(AppError::db)?,
             annotation: row.get::<Option<String>>(6).map_err(AppError::db)?,
             created_at: row.get::<i64>(7).map_err(AppError::db)?,
+            author_label: row.get::<String>(8).map_err(AppError::db)?,
+            author_kind: row.get::<String>(9).map_err(AppError::db)?,
+            space_title: row.get::<Option<String>>(10).map_err(AppError::db)?,
+            item_id: row.get::<String>(11).map_err(AppError::db)?,
         });
     }
     Ok(out)
@@ -7859,7 +7897,7 @@ pub async fn space_action_ids(conn: &Connection, space_id: &str) -> Result<Vec<S
 /// thing that decides this. Doing it in the archival's own transaction is what
 /// makes "a live room under a closed one" unrepresentable rather than a state
 /// somebody has to notice.
-pub async fn archive_space_tx(
+pub(crate) async fn archive_space_tx(
     conn: &Connection,
     space_id: &str,
     archived_at: i64,
@@ -11238,5 +11276,235 @@ mod tests {
             kept.label, "Scribe",
             "nor were the overrides it was inserted with"
         );
+    }
+
+    /// **Deciding at the write means reserving the writer.**
+    ///
+    /// Several of app-core's transactions read before they write: they check a
+    /// scope, a membership, a `left_at`, and choose what to write from what they
+    /// found (task 36's promotion guard, task 37's promote-or-join grant, the
+    /// notebook-owner removal guard). That shape is only worth anything if the read
+    /// and the write are one act against one snapshot — and a *deferred* `BEGIN`
+    /// (what plain `BEGIN` means here as in SQLite) reserves nothing.
+    ///
+    /// Measured on turso at our pin, two live connections on one `Database`
+    /// (`AppCore::db_conn` mints a fresh connection per call, so this is an
+    /// in-process race, not merely a cross-process one):
+    ///
+    /// * `BEGIN` — A reads, B writes and commits without blocking A, and A's
+    ///   write comes back `BusySnapshot("database snapshot is stale, rollback
+    ///   and retry the transaction")`. `busy_timeout` cannot rescue it: a stale
+    ///   snapshot is not something you can wait out.
+    /// * `BEGIN IMMEDIATE` — A reserves the writer; B waits on its own `BEGIN
+    ///   IMMEDIATE` for exactly A's hold, then acquires and reads A's committed
+    ///   state, deciding against *that*.
+    ///
+    /// So every transaction goes through `db::begin_write`. These tests pin the
+    /// consequence at the layer the finding is about (Codex review, PR #280).
+    ///
+    /// **They live beside the writers rather than in `tests/`** because the
+    /// transactions they drive are crate-private — an exported one is the write
+    /// reachable without its guards (see
+    /// `the_raw_db_writers_are_not_exported`), and an integration test is an
+    /// external consumer like any other.
+    mod tx_contention {
+        use crate::db;
+
+        /// **A result that describes the commit point cannot be overtaken.** The grant
+        /// answers with the membership it wrote, read inside its own transaction — so a
+        /// removal or retirement landing immediately afterwards changes what the roster
+        /// says next, but not what the grant reported. Answering from a read *after*
+        /// the commit put a failure message beside committed work, including (for a
+        /// space-owned candidate) an irreversible promotion — the very state deciding
+        /// at the write exists to prevent (Codex review, PR #280).
+        #[test]
+        fn a_grants_answer_describes_its_commit_not_the_roster_afterwards() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+            runtime.block_on(async move {
+                let database = db::open(dir.path()).await.expect("open");
+                let conn = db::connect(&database).await.expect("connect");
+                db::insert_space(&conn, "home", Some("Home"), "unlinked", 1)
+                    .await
+                    .expect("home");
+                db::insert_space(&conn, "here", Some("Here"), "unlinked", 1)
+                    .await
+                    .expect("destination");
+                db::insert_participant(
+                    &conn,
+                    "agent",
+                    "space",
+                    Some("home"),
+                    None,
+                    "agent",
+                    "Mara",
+                    None,
+                    None,
+                    "explicit",
+                    "member",
+                    None,
+                    1,
+                )
+                .await
+                .expect("a space-owned agent");
+
+                let outcome =
+                    db::grant_space_membership_tx(&conn, "here", "agent", "observer", "notebook-id", 2)
+                        .await
+                        .expect("the grant");
+                assert!(matches!(
+                    outcome.decision,
+                    db::GrantDecision::Promoted { .. }
+                ));
+                assert_eq!(outcome.member.role, "observer");
+                assert_eq!(outcome.member.label, "Mara");
+
+                // Another window ends the membership the instant the grant commits —
+                // the window a post-commit read would have raced.
+                db::remove_space_participant_tx(&conn, "here", "agent", 3)
+                    .await
+                    .expect("the other window's removal");
+
+                // The roster a caller would have re-read now says nothing about it…
+                assert!(
+                    db::space_participants(&conn, "here")
+                        .await
+                        .expect("roster")
+                        .iter()
+                        .all(|m| m.participant_id != "agent"),
+                    "the hazard is real: a read taken now finds no member"
+                );
+                // …while the grant's own answer still describes what it committed, and
+                // the promotion it made is still there to be seen.
+                assert_eq!(outcome.member.role, "observer");
+                let promoted = db::get_participant(&conn, "agent")
+                    .await
+                    .expect("read")
+                    .expect("the row");
+                assert_eq!(
+                    promoted.scope, "global",
+                    "the irreversible half committed — which is why its call must not have reported failure"
+                );
+            });
+        }
+
+        /// The concurrent-window case the grant's transaction exists for: a promotion
+        /// holds the writer while a grant starts. The grant must **wait** and then take
+        /// the join branch against the promoted row — never fail with a stale-snapshot
+        /// error, and never write a second promotion.
+        #[test]
+        fn a_grant_that_meets_a_writer_waits_and_decides_against_what_it_finds() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("runtime");
+
+            runtime.block_on(async move {
+                let database = db::open(dir.path()).await.expect("open");
+                let setup = db::connect(&database).await.expect("connect");
+
+                db::insert_space(&setup, "home", Some("Home"), "unlinked", 1)
+                    .await
+                    .expect("home space");
+                db::insert_space(&setup, "here", Some("Here"), "unlinked", 1)
+                    .await
+                    .expect("destination space");
+                db::insert_participant(
+                    &setup,
+                    "agent",
+                    "space",
+                    Some("home"),
+                    None,
+                    "agent",
+                    "Mara",
+                    None,
+                    None,
+                    "explicit",
+                    "member",
+                    None,
+                    1,
+                )
+                .await
+                .expect("a space-owned agent");
+
+                // A competing writer — another window's promotion — holds the writer
+                // for a beat, exactly as a real transaction does between its first
+                // statement and its commit.
+                let holder = db::connect(&database).await.expect("connect");
+                holder
+                    .execute("BEGIN IMMEDIATE", ())
+                    .await
+                    .expect("the competing writer reserves");
+                holder
+                    .execute(
+                        "UPDATE participant SET scope = 'global', owner_space_id = NULL WHERE id = 'agent'",
+                        (),
+                    )
+                    .await
+                    .expect("the promotion's own write");
+
+                let granting = db::connect(&database).await.expect("connect");
+                let grant = tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    let decision = db::grant_space_membership_tx(
+                        &granting,
+                        "here",
+                        "agent",
+                        "observer",
+                        "notebook-id",
+                        2,
+                    )
+                    .await;
+                    (decision, started.elapsed())
+                });
+
+                // Let the grant reach its `BEGIN IMMEDIATE` and block there, then let
+                // the promotion land.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                holder
+                    .execute("COMMIT", ())
+                    .await
+                    .expect("the promotion commits");
+
+                let (decision, waited) = grant.await.expect("the grant task");
+                let decision = decision.expect(
+                    "the grant waited for the writer rather than failing on a stale snapshot — \
+                     a deferred BEGIN answers BusySnapshot here",
+                );
+                assert_eq!(
+                    decision.decision,
+                    db::GrantDecision::Joined,
+                    "it decided against the row it found: already global, so plain membership"
+                );
+                assert_eq!(
+                    decision.member.role, "observer",
+                    "and it answered with the membership as of its own commit"
+                );
+                assert!(
+                    waited >= std::time::Duration::from_millis(150),
+                    "it really did wait for the other writer (waited {waited:?})"
+                );
+
+                // One promotion, one membership — the join did not promote again, and
+                // the notebook the promoting branch would have minted does not exist.
+                let member = db::space_participants(&setup, "here")
+                    .await
+                    .expect("roster")
+                    .into_iter()
+                    .find(|m| m.participant_id == "agent")
+                    .expect("a member of the destination");
+                assert_eq!(member.role, "observer");
+                assert!(
+                    db::get_space(&setup, "notebook-id")
+                        .await
+                        .expect("read")
+                        .is_none(),
+                    "the join branch mints no notebook"
+                );
+            });
+        }
     }
 }

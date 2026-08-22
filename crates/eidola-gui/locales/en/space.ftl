@@ -52,3 +52,34 @@ space-regenerating-elsewhere = This response is already being regenerated.
 # A quiet marker beneath an answer that stopped because it reached its length
 # allowance rather than because the model was finished.
 space-answer-cut-off = This answer reached its length limit and stops mid-thought.
+# The source-highlight picker (src/space_view/references.rs): the popover that
+# opens when a clicked passage was quoted by more than one post, listing each
+# so the reader chooses the target rather than the app guessing.
+space-highlight-picker-group = Posts quoting this passage
+space-highlight-picker-heading = Quoted by
+# A referrer this window holds: the byline the page already shows for that post,
+# plus the opening of what it says.
+space-highlight-picker-here = { $byline }: { $snippet }
+# A referrer from a conversation this window never loaded. The author alone does
+# not identify a post — one participant can quote the same passage from two
+# conversations — so the row names the conversation the click would open. The
+# untitled variants are for a conversation nobody has named, where its existence
+# elsewhere is the only true thing left to say.
+space-highlight-picker-elsewhere = { $byline }, in { $space }
+space-highlight-picker-elsewhere-untitled = { $byline }, in another space
+space-highlight-picker-unnamed = A post in { $space }
+space-highlight-picker-unnamed-untitled = A post in another space
+# Two rows that composed to the same sentence — one author quoting the same
+# passage from two conversations that share a title, or from two nobody named.
+# A counter, not context: it claims only that these are different rows and this
+# is the first of them, in the order the backlinks were written.
+# TRANSLATORS: $n is load-bearing, not decoration. It is what makes two
+# otherwise identical rows tell apart, and the picker searches upward for a
+# number no other row has taken — so a wording that drops it leaves rows the
+# reader cannot choose between.
+space-highlight-picker-nth = { $label } ({ $n })
+# The same number, painted on its own beside the row rather than inside the
+# sentence — the row's text truncates at 280px and a discriminator that
+# truncates discriminates nothing. Keep it in step with
+# `space-highlight-picker-nth`, whose tail it is.
+space-highlight-picker-ordinal = ({ $n })
