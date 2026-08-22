@@ -4961,7 +4961,7 @@ pub type TemplateParticipantInput = (String, Option<String>, Option<String>, Str
 /// `Change::Templates` only after this returns `Ok` (the changes.rs
 /// emit-after-commit rule). `participants = None` leaves the participant set
 /// untouched; `Some(&[])` clears it.
-pub async fn update_template_tx(
+pub(crate) async fn update_template_tx(
     conn: &Connection,
     id: &str,
     title: Option<&str>,
@@ -7875,7 +7875,7 @@ pub async fn space_action_ids(conn: &Connection, space_id: &str) -> Result<Vec<S
 /// thing that decides this. Doing it in the archival's own transaction is what
 /// makes "a live room under a closed one" unrepresentable rather than a state
 /// somebody has to notice.
-pub async fn archive_space_tx(
+pub(crate) async fn archive_space_tx(
     conn: &Connection,
     space_id: &str,
     archived_at: i64,
