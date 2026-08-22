@@ -2191,12 +2191,11 @@ impl SpaceView {
                 self.highlight_picker = Some(super::HighlightPicker {
                     choices: many
                         .iter()
-                        .map(|r| {
-                            (
-                                r.action_id.clone(),
-                                r.space_id.clone(),
-                                self.referencer_label(r, cx),
-                            )
+                        .map(|r| super::PickerChoice {
+                            action_id: r.action_id.clone(),
+                            space_title: r.space_title.clone(),
+                            author_kind: r.author_kind.clone(),
+                            author_label: r.author_label.clone(),
                         })
                         .collect(),
                 });
@@ -2223,46 +2222,62 @@ impl SpaceView {
     /// is the surface a **cross-space** backlink is most likely to appear on
     /// (a same-space referrer is on the page), and "A post in another space"
     /// for every one of them made two candidates indistinguishable — the one
-    /// thing a picker exists to prevent. That sentence survives only where the
-    /// identity names nobody: a blank effective label under a kind with no
-    /// fallback of its own, which the schema's "override to empty" makes a real
-    /// state. It still tells the reader the true thing left, and it says "in
-    /// another space" rather than the rail's bare "another space" because these
-    /// rows are choices between posts, not attributions.
-    fn referencer_label(
+    /// thing a picker exists to prevent.
+    ///
+    /// **But an author does not identify a post, so the place is named too.**
+    /// One participant can quote the same passage from two conversations, and
+    /// two rows reading "You, in another space" put the reader back where they
+    /// started — the same defect one step along. The row therefore names the
+    /// conversation the click would open, which is exactly what distinguishes
+    /// the two targets. It is the *place*, not a snippet of the referring
+    /// post: a title says where the button goes, while lifting prose out of a
+    /// conversation to label a chooser would make this surface a disclosure
+    /// channel. The untitled arms keep "another space", which stays true of a
+    /// conversation nobody has named.
+    ///
+    /// **The words are composed at render, from Fluent**, never stored — see
+    /// [`super::PickerChoice`].
+    pub(crate) fn choice_label(
         &self,
-        reference: &eidola_app_core::IncomingReference,
+        choice: &super::PickerChoice,
         cx: &gpui::App,
     ) -> SharedString {
-        match self
+        if let Some(p) = self
             .posts
             .iter()
-            .find(|p| p.action_id.as_deref() == Some(reference.action_id.as_str()))
+            .find(|p| p.action_id.as_deref() == Some(choice.action_id.as_str()))
         {
-            Some(p) => {
-                let head = footnote_snippet(&strip_embed_blocks(&p.content, &p.references));
-                if head.is_empty() {
-                    p.byline.clone()
+            let head = footnote_snippet(&strip_embed_blocks(&p.content, &p.references));
+            return if head.is_empty() {
+                p.byline.clone()
+            } else {
+                msg::space_highlight_picker_here(cx, p.byline.to_string(), head)
+            };
+        }
+
+        let space = choice
+            .space_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        match crate::space::byline_for_participant(&choice.author_kind, &choice.author_label) {
+            Some(byline) => {
+                let byline = if choice.author_kind == "agent" {
+                    self.model_display(&byline, cx).0
                 } else {
-                    SharedString::from(format!("{}: {head}", p.byline))
-                }
-            }
-            None => {
-                match crate::space::byline_for_participant(
-                    &reference.author_kind,
-                    &reference.author_label,
-                ) {
-                    Some(byline) => {
-                        let byline = if reference.author_kind == "agent" {
-                            self.model_display(&byline, cx).0
-                        } else {
-                            SharedString::from(byline)
-                        };
-                        SharedString::from(format!("{byline}, in another space"))
+                    SharedString::from(byline)
+                };
+                match space {
+                    Some(space) => {
+                        msg::space_highlight_picker_elsewhere(cx, byline.to_string(), space)
                     }
-                    None => SharedString::from("A post in another space"),
+                    None => msg::space_highlight_picker_elsewhere_untitled(cx, byline.to_string()),
                 }
             }
+            None => match space {
+                Some(space) => msg::space_highlight_picker_unnamed(cx, space),
+                None => msg::space_highlight_picker_unnamed_untitled(cx),
+            },
         }
     }
 
@@ -2276,7 +2291,7 @@ impl SpaceView {
             .probe(
                 "space/highlight/picker",
                 gpui::Role::Group,
-                "Posts quoting this passage",
+                msg::space_highlight_picker_group(cx),
             )
             // An opaque popover over the page (see `crate::overlay`): a click
             // on a row must not also land in the post beneath it.
@@ -2301,10 +2316,11 @@ impl SpaceView {
                     .pb_0p5()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("Quoted by"),
+                    .child(msg::space_highlight_picker_heading(cx)),
             );
-        for (idx, (action_id, _space_id, label)) in picker.choices.iter().enumerate() {
-            let target = action_id.clone();
+        for (idx, choice) in picker.choices.iter().enumerate() {
+            let target = choice.action_id.clone();
+            let label = self.choice_label(choice, cx);
             col = col.child(
                 div()
                     .id(SharedString::from(format!("space-highlight-pick-{idx}")))

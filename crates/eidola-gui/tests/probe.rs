@@ -4398,6 +4398,7 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
         created_at: 0,
         author_label: "Sofia".into(),
         author_kind: "agent".into(),
+        space_title: None,
     };
     cx.update(|cx| {
         space.update(cx, |s, _| {
@@ -7471,10 +7472,15 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
 ///
 /// 1. a referrer this window holds: its gutter byline plus what it says, which
 ///    is **not** the edge's raw label (a human labelled `user` reads "You");
-/// 2. a referrer from a conversation this window never loaded, by name;
+/// 2. a referrer from a conversation this window never loaded, by name **and
+///    by conversation** — an author does not identify a post, so two rows from
+///    one participant (rows 1 and 2 here) are told apart by where they lead,
+///    which is the whole job of a chooser (Codex review, PR #327);
 /// 3. the same where the label is blank (the schema's "override to empty") —
 ///    the kind is what is left, and it is enough;
-/// 4. the original sentence, surviving only where nothing names anyone.
+/// 4. "another space" where the conversation was never named;
+/// 5. the original sentence, surviving only where nothing names anyone **and**
+///    nothing names the place.
 #[gpui::test]
 fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext) {
     let _guard = probes_on();
@@ -7493,34 +7499,44 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
         space.update(cx, |s, cx| s.set_post_tree_for_test(vec![quoted, here], cx));
     });
 
-    let incoming = |action: &str, kind: &str, label: &str| eidola_app_core::IncomingReference {
-        action_id: action.into(),
-        space_id: "elsewhere".into(),
-        ordinal: 1,
-        content_block_id: Some("b1".into()),
-        range_start: Some(4),
-        range_end: Some(15),
-        annotation: None,
-        created_at: 0,
-        author_label: label.into(),
-        author_kind: kind.into(),
+    let incoming = |action: &str, kind: &str, label: &str, title: Option<&str>| {
+        eidola_app_core::IncomingReference {
+            action_id: action.into(),
+            space_id: format!("space-of-{action}"),
+            ordinal: 1,
+            content_block_id: Some("b1".into()),
+            range_start: Some(4),
+            range_end: Some(15),
+            annotation: None,
+            created_at: 0,
+            author_label: label.into(),
+            author_kind: kind.into(),
+            space_title: title.map(str::to_string),
+        }
     };
     cx.update(|cx| {
         space.update(cx, |s, _| {
             s.seed_incoming_references_for_test(
                 "a1",
                 vec![
-                    incoming("a2", "human", "user"),
-                    incoming("x1", "agent", "Sofia"),
-                    incoming("x2", "human", ""),
-                    incoming("x3", "tool", "  "),
+                    incoming("a2", "human", "user", Some("Here")),
+                    incoming("x1", "agent", "Sofia", Some("Tides and the moon")),
+                    // The finding: the **same author**, quoting the same
+                    // passage from a second conversation. Named by the author
+                    // alone these two rows read alike and open different
+                    // windows.
+                    incoming("x2", "agent", "Sofia", Some("Spring tides")),
+                    incoming("x3", "human", "", Some("A note to myself")),
+                    incoming("x4", "human", "", None),
+                    incoming("x5", "tool", "  ", Some("Harness output")),
+                    incoming("x6", "tool", "  ", None),
                 ],
             );
         });
     });
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.click_highlight_for_test("a1", &[0, 1, 2, 3], window, cx)
+            v.click_highlight_for_test("a1", &[0, 1, 2, 3, 4, 5, 6], window, cx)
         });
     })
     .unwrap();
@@ -7528,9 +7544,12 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
     let entries = fresh_entries(cx, window);
     for (index, expected) in [
         (0, "You: quoted right here"),
-        (1, "Sofia, in another space"),
-        (2, "You, in another space"),
-        (3, "A post in another space"),
+        (1, "Sofia, in Tides and the moon"),
+        (2, "Sofia, in Spring tides"),
+        (3, "You, in A note to myself"),
+        (4, "You, in another space"),
+        (5, "A post in Harness output"),
+        (6, "A post in another space"),
     ] {
         assert_probe(
             &entries,

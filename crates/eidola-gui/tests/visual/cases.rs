@@ -193,6 +193,7 @@ fn register_space(s: &mut Snapshots) {
                                 created_at: 0,
                                 author_label: "Ada".into(),
                                 author_kind: "agent".into(),
+                                space_title: None,
                             })
                             .collect(),
                     );

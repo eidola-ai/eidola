@@ -10453,6 +10453,7 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                         created_at: 0,
                         author_label: "Ada".into(),
                         author_kind: "agent".into(),
+                        space_title: None,
                     },
                     // A range past the block's end no longer maps: dropped,
                     // never approximated.
@@ -10467,6 +10468,7 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                         created_at: 0,
                         author_label: "Ada".into(),
                         author_kind: "agent".into(),
+                        space_title: None,
                     },
                 ],
             );
@@ -10489,9 +10491,9 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
         });
     })
     .unwrap();
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
         assert!(
-            v.highlight_picker_for_test().is_none(),
+            v.highlight_picker_for_test(cx).is_none(),
             "a single referencer needs no picker"
         );
     });
@@ -10530,6 +10532,7 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
         created_at: 0,
         author_label: "Ada".into(),
         author_kind: "agent".into(),
+        space_title: None,
     };
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, _| {
@@ -10549,7 +10552,7 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
     })
     .unwrap();
     let choices = view
-        .read_with(cx, |v, _| v.highlight_picker_for_test())
+        .read_with(cx, |v, cx| v.highlight_picker_for_test(cx))
         .expect("two referencers open the picker");
     assert_eq!(choices.len(), 2);
     assert_eq!(choices[0].0, "a2");
@@ -10565,8 +10568,8 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.navigate_to_action("a3".into(), window, cx));
     })
     .unwrap();
-    view.read_with(cx, |v, _| {
-        assert!(v.highlight_picker_for_test().is_none());
+    view.read_with(cx, |v, cx| {
+        assert!(v.highlight_picker_for_test(cx).is_none());
     });
 }
 
@@ -12783,6 +12786,7 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
         created_at: 0,
         author_label: "Ada".into(),
         author_kind: "agent".into(),
+        space_title: None,
     };
     vcx.update(|_, cx| {
         space.update(cx, |s, _| {
@@ -12798,22 +12802,22 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
         });
     });
     vcx.run_until_parked();
-    view.read_with(&vcx, |v, _| {
+    view.read_with(&vcx, |v, cx| {
         assert!(
-            v.highlight_picker_for_test().is_some(),
+            v.highlight_picker_for_test(cx).is_some(),
             "the picker is open"
         );
     });
 
     vcx.simulate_keystrokes("x");
     vcx.run_until_parked();
-    view.read_with(&vcx, |v, _| {
+    view.read_with(&vcx, |v, cx| {
         assert!(
             !v.has_active_draft_for_test(),
             "a printable character behind an open picker must not start a draft"
         );
         assert!(
-            v.highlight_picker_for_test().is_some(),
+            v.highlight_picker_for_test(cx).is_some(),
             "…and the picker is still the thing that owns the keyboard"
         );
         assert_eq!(

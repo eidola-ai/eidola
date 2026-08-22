@@ -5897,6 +5897,16 @@ pub struct IncomingReferenceRow {
     /// The label is not renderable on its own — see
     /// [`crate::IncomingReference::author_kind`].
     pub author_kind: String,
+    /// The referring space's title, `NULL` for one never named.
+    ///
+    /// An author does not identify a post: the same participant can quote one
+    /// passage from two conversations, and a surface listing backlinks would
+    /// then offer two rows that read alike and open different windows. The
+    /// title is what tells them apart, and it travels with the row that already
+    /// names that space by id. A surface that shows it wants
+    /// [`crate::AppCore::references_to_visible_to`], which reports only spaces
+    /// the viewer may read.
+    pub space_title: Option<String>,
 }
 
 /// All current-generation posts referencing `antecedent_action_id` (relation
@@ -5910,10 +5920,11 @@ pub async fn references_to(
         .prepare(&format!(
             "SELECT aa.action_id, ar.space_id, aa.ordinal, aa.content_block_id, \
                     aa.range_start, aa.range_end, aa.annotation, ar.created_at, \
-                    COALESCE(rsp.override_label, rp.label), rp.kind \
+                    COALESCE(rsp.override_label, rp.label), rp.kind, rs.title \
              FROM action_antecedent aa \
              JOIN action_resolved ar ON ar.action_id = aa.action_id \
              JOIN participant rp ON rp.id = ar.participant_id \
+             JOIN space rs ON rs.id = ar.space_id \
              LEFT JOIN space_participant rsp \
                ON rsp.space_id = ar.space_id AND rsp.participant_id = ar.participant_id \
              WHERE aa.antecedent_action_id = ?1 \
@@ -5942,6 +5953,7 @@ pub async fn references_to(
             created_at: row.get::<i64>(7).map_err(AppError::db)?,
             author_label: row.get::<String>(8).map_err(AppError::db)?,
             author_kind: row.get::<String>(9).map_err(AppError::db)?,
+            space_title: row.get::<Option<String>>(10).map_err(AppError::db)?,
         });
     }
     Ok(out)

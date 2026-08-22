@@ -358,8 +358,33 @@ pub(crate) enum PendingSettle {
 /// a choice — the band-menu pattern, one open at a time.
 #[derive(Clone, Debug)]
 pub(crate) struct HighlightPicker {
-    /// The candidates: `(referencing action id, its space, the row's label)`.
-    pub(crate) choices: Vec<(String, String, SharedString)>,
+    pub(crate) choices: Vec<PickerChoice>,
+}
+
+/// One candidate in the [`HighlightPicker`] — **the facts a row is built
+/// from, never the sentence it renders as.**
+///
+/// A row's text is localized, and a formatted string held in view state is a
+/// cached render decision: `i18n::apply` refreshes every window, this popover
+/// re-renders, and it would repaint its rows in the previous language until
+/// something else replaced them (`crates/eidola-gui/AGENTS.md` → Localization,
+/// "state holds the value, render chooses the words"). So the choice carries
+/// its inputs and [`SpaceView::choice_label`] composes at render.
+#[derive(Clone, Debug)]
+pub(crate) struct PickerChoice {
+    /// The referencing post — the click target. `navigate_to_action` resolves
+    /// its home space itself, which is why the id of that space is not carried
+    /// here: what the row needs about the destination is its *name*.
+    pub(crate) action_id: String,
+    /// The referring space's title, `None` for a conversation never named.
+    /// **What tells two rows apart** when one participant quoted the same
+    /// passage from two conversations — an author does not identify a post.
+    pub(crate) space_title: Option<String>,
+    /// The author identity the *edge* carries, as the referring space names
+    /// them. Read only where this window does not hold the post; the page's
+    /// own gutter byline wins where it does.
+    pub(crate) author_kind: String,
+    pub(crate) author_label: String,
 }
 
 /// An in-progress inline edit of a persisted post: the post's own body editor
@@ -1666,12 +1691,15 @@ impl SpaceView {
     }
 
     /// The open source-highlight picker's choices, as `(action id, label)`.
+    ///
+    /// Takes `cx` because a row's label is composed at render from the reader's
+    /// locale, never stored — see [`PickerChoice`].
     #[doc(hidden)]
-    pub fn highlight_picker_for_test(&self) -> Option<Vec<(String, String)>> {
+    pub fn highlight_picker_for_test(&self, cx: &gpui::App) -> Option<Vec<(String, String)>> {
         self.highlight_picker.as_ref().map(|p| {
             p.choices
                 .iter()
-                .map(|(a, _, label)| (a.clone(), label.to_string()))
+                .map(|c| (c.action_id.clone(), self.choice_label(c, cx).to_string()))
                 .collect()
         })
     }

@@ -1142,6 +1142,16 @@ pub struct IncomingReference {
     /// (an unnamed author's fallback depends entirely on the kind), so the two
     /// travel together.
     pub author_kind: String,
+    /// The referring space's title; `None` for a conversation never named.
+    ///
+    /// **An author does not identify a post.** The same participant can quote
+    /// one passage from two conversations, and a chooser offered two rows that
+    /// read alike cannot say which window each opens — so the identity pair is
+    /// not enough on its own and the place travels with it. It is the *place*
+    /// rather than the referring post's content on purpose: a title names where
+    /// the click goes, while lifting a post's prose out of a space the reader
+    /// may not be in would make this read a disclosure channel.
+    pub space_title: Option<String>,
 }
 
 /// One turn's operational trace, as a space UI discloses it (task 34): the
@@ -3181,6 +3191,7 @@ impl Inner {
                 created_at: r.created_at,
                 author_label: r.author_label,
                 author_kind: r.author_kind,
+                space_title: r.space_title,
             });
         }
         Ok(out)
@@ -3210,6 +3221,7 @@ impl Inner {
                 created_at: r.created_at,
                 author_label: r.author_label,
                 author_kind: r.author_kind,
+                space_title: r.space_title,
             })
             .collect())
     }

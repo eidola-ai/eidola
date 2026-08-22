@@ -1836,6 +1836,28 @@ fn an_incoming_reference_carries_its_referrers_author_identity() {
             .expect("reverse index");
         assert_eq!(incoming.len(), 1, "one post quotes the answer");
         assert_eq!(incoming[0].space_id, elsewhere.space_id);
+        // The place, joined on the **referring** post's space — the same
+        // discrimination the picker renders, and a join that slid onto the
+        // quoted post's space would name the source conversation instead.
+        let title_of = |space: &str| {
+            core.runtime()
+                .block_on(core.list_spaces(false))
+                .expect("index")
+                .into_iter()
+                .find(|s| s.id == space)
+                .expect("the space is listed")
+                .title
+        };
+        assert_eq!(
+            incoming[0].space_title,
+            title_of(&elsewhere.space_id),
+            "the referring conversation's own title"
+        );
+        assert_ne!(
+            incoming[0].space_title,
+            title_of(&source_space),
+            "not the quoted conversation's — the two are different rooms"
+        );
         assert_eq!(
             incoming[0].author_kind, "human",
             "the *referrer's* kind — not the quoted post's, whose author is the agent"
@@ -1876,7 +1898,7 @@ fn an_incoming_reference_carries_its_referrers_author_identity() {
 
         let unnamed = core
             .runtime()
-            .block_on(core.references_to(answer.action_id))
+            .block_on(core.references_to(answer.action_id.clone()))
             .expect("reverse index");
         assert!(
             unnamed[0].author_label.is_empty(),
@@ -1886,6 +1908,46 @@ fn an_incoming_reference_carries_its_referrers_author_identity() {
         assert_eq!(
             unnamed[0].author_kind, "human",
             "the kind is what is left to name them with, and it still arrives"
+        );
+
+        // **And the author is not enough to tell two referrers apart.** The
+        // same human quotes the same passage again, from a *third*
+        // conversation — so the only thing separating the two backlinks is
+        // where each one is, which is exactly what a chooser has to render.
+        let third = post(&core, "A third conversation.", None);
+        core.runtime()
+            .block_on(core.rename_space(third.space_id.clone(), "Spring tides".into()))
+            .expect("name the third conversation");
+        let spec = quote_of(&core, &source_space, &answer.action_id, &passage);
+        core.runtime()
+            .block_on(core.post_with_references(
+                "And again:\n\n{{ embed 1 }}".into(),
+                Some(third.space_id.clone()),
+                Some(third.action_id.clone()),
+                vec![spec],
+            ))
+            .expect("the same human quotes the same passage from elsewhere");
+
+        let both = core
+            .runtime()
+            .block_on(core.references_to(answer.action_id))
+            .expect("reverse index");
+        assert_eq!(both.len(), 2, "two posts quote the answer now");
+        assert!(
+            both.iter().all(|r| r.author_kind == "human"),
+            "one author, twice — which is why the author cannot be the discriminator"
+        );
+        let mut titles: Vec<_> = both.iter().map(|r| r.space_title.clone()).collect();
+        titles.sort();
+        let mut expected = vec![title_of(&elsewhere.space_id), title_of(&third.space_id)];
+        expected.sort();
+        assert_eq!(
+            titles, expected,
+            "each backlink names its own conversation, which is all that tells them apart"
+        );
+        assert!(
+            titles[0] != titles[1],
+            "and the two are distinguishable: {titles:?}"
         );
     });
 }
