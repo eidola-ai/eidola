@@ -5908,6 +5908,87 @@ fn a_regeneration_that_waited_for_the_claim_revises_the_generation_it_finds() {
     });
 }
 
+/// **What a reply written against a post being regenerated actually costs.**
+///
+/// The two doors are independent here by design: the claim keyed by item makes
+/// one *regeneration* of a post exclusive, and says nothing about a **reply**
+/// to it. So a reply started while the answer is being revised is accepted,
+/// spends, and commits — and because reply threading follows item identity, the
+/// tree then resolves its edge to the item's new tip and shows it beneath an
+/// answer it was never written against.
+///
+/// Pinned as the **current, deliberate** app-core behaviour, and as the reason
+/// the exclusivity lives where the verbs do: re-threading is what keeps a reply
+/// from dangling when any writer supersedes its antecedent — a second window, a
+/// delegated room's driver, a CLI post — and refusing every reply to a claimed
+/// item would take that asynchrony away from all of them to solve one surface's
+/// affordance problem. The surface that offers both verbs is the one that knows
+/// the reader pressed them a second apart.
+#[test]
+fn a_reply_written_during_a_regeneration_rethreads_onto_the_answer_it_never_saw() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            chat_delay_ms: 1_500,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+
+        // Both in flight at once: the answer is being revised while a reply is
+        // written against the generation that is on its way out.
+        let (regen, reply) = core.runtime().block_on(async {
+            let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            let regenerating = async {
+                let r = core.regenerate_stream(answer.clone(), MODEL.into(), tx1);
+                let (r, _) = tokio::join!(r, collect_deltas(rx1));
+                r
+            };
+            let replying = async {
+                // Let the regeneration claim and get its request out first.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                let r =
+                    core.respond_stream(first.space_id.clone(), MODEL.into(), answer.clone(), tx2);
+                let (r, _) = tokio::join!(r, collect_deltas(rx2));
+                r
+            };
+            tokio::join!(regenerating, replying)
+        });
+
+        let regen = regen.expect("the regeneration lands");
+        let reply = reply.expect("and the reply is accepted — nothing refuses it");
+        let new_tip = regen.response_action_id.expect("a successor generation");
+        let reply_id = reply.response_action_id.expect("the reply was written");
+        assert!(reply.credits_charged > 0, "and it was billed");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        let reply_row = tree
+            .iter()
+            .find(|n| n.action_id == reply_id)
+            .expect("the reply is in the tree");
+        assert_eq!(
+            reply_row.parent_action_id.as_deref(),
+            Some(new_tip.as_str()),
+            "the reply hangs beneath the regenerated answer — item identity \
+             resolved its edge onto a generation it was never written against"
+        );
+        assert_ne!(new_tip, answer, "the answer really was superseded");
+    });
+}
+
 /// **A regeneration that fails announces its end too.**
 ///
 /// Supersession is only half an ending: a regeneration that succeeds leaves a

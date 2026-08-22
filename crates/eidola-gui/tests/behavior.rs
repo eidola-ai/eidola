@@ -17616,6 +17616,60 @@ fn space_a_regeneration_running_elsewhere_is_marked_until_it_lands(cx: &mut Test
 }
 
 #[gpui::test]
+fn space_an_ask_waits_for_the_regeneration_of_the_post_it_would_answer(cx: &mut TestAppContext) {
+    // A regeneration streams, so it lives in `turn_runners` rather than the
+    // exclusive slot — and `ask` read the slot, which is how a post-level
+    // mutation stopped refusing one. The ask is written against the generation
+    // on screen; if it starts while that generation is being replaced it is
+    // billed, and reply threading follows item identity, so it comes back
+    // beneath the answer it never saw. The duplicate check is no substitute: a
+    // revising turn carries no `participant_id` and matches nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    space.update(cx, |s, cx| {
+        assert!(
+            s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the regeneration is accepted"
+        );
+        assert!(
+            s.mutation_in_flight(),
+            "and it is a post-level mutation, however it travels"
+        );
+        assert!(
+            s.ask("agent-b".into(), "a2".into(), cx).is_none(),
+            "so an ask about the generation being replaced is refused"
+        );
+        assert_eq!(
+            s.streams().len(),
+            1,
+            "and no billed turn was started beside it"
+        );
+    });
+
+    // **The fan-out's concurrency is untouched** — the narrower predicate is
+    // the whole point. In a conversation where nothing is being replaced,
+    // several asks still run side by side, each an ordinary streaming turn.
+    let (window_b, view_b) = open_space(cx, &stores, Some("s2".into()));
+    seed_space_pair(&view_b, window_b, cx);
+    let space_b = view_b.read_with(cx, |v, _| v.space().clone());
+    space_b.update(cx, |s, cx| {
+        assert!(s.ask("agent-b".into(), "a2".into(), cx).is_some());
+        assert!(
+            s.ask("agent-c".into(), "a2".into(), cx).is_some(),
+            "a second participant is still askable while the first streams"
+        );
+        assert_eq!(s.streams().len(), 2, "two turns, side by side");
+        assert!(
+            !s.mutation_in_flight(),
+            "because neither replaces a generation"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_a_verb_that_hides_its_own_gutter_hands_the_keyboard_back(cx: &mut TestAppContext) {
     // Every probed `Role::Button` is a real tab stop, and an accepted
     // Regenerate makes `accepts_mutation` false — which withholds the whole

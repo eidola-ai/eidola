@@ -1310,6 +1310,24 @@ impl Space {
         !self.is_busy()
     }
 
+    /// Whether a **post-level mutation** is running right now — one that
+    /// supersedes a generation rather than adding a turn beside it.
+    ///
+    /// The exclusive slot (a post, an edit's save) *or* a revising stream: a
+    /// regeneration is one of these, and the fact that it streams is a choice
+    /// of transport, not a change in what it does to the post. This is the
+    /// question [`Self::ask`] means — an ask is written against a generation,
+    /// so one may not start while that generation is being replaced — where
+    /// reading the slot alone only happened to answer it while every mutation
+    /// lived there.
+    ///
+    /// Deliberately narrower than [`Self::is_busy`]: ordinary fan-out turns
+    /// supersede nothing, and asking several participants at once is the point
+    /// of the fan-out.
+    pub fn mutation_in_flight(&self) -> bool {
+        self.post_runner.is_some() || self.streams.iter().any(|s| s.revising)
+    }
+
     /// The in-flight **regeneration** of `action_id`'s post, if one is running
     /// — the seq whose live buffers render in that post's place.
     pub fn revising_seq(&self, action_id: &str) -> Option<u64> {
@@ -2316,8 +2334,8 @@ impl Space {
     /// route here). Explicit asks bypass the cascade guard by construction
     /// (`AppCore::respond_stream_as`). Runs as an independent keyed turn, so
     /// asking is legal while other turns still stream; a duplicate ask (same
-    /// participant, same target, already in flight) and an ask during the
-    /// exclusive mutation are no-ops. Returns the **seq of the turn that
+    /// participant, same target, already in flight) and an ask while a
+    /// **post-level mutation** is in flight are no-ops. Returns the **seq of the turn that
     /// started** — the render key of the streaming leaf the answer will grow
     /// in, so the view can select *that branch* (a new sibling of whatever the
     /// target already replied with) rather than merely the target's path.
@@ -2328,7 +2346,15 @@ impl Space {
         target_action_id: String,
         cx: &mut Context<Self>,
     ) -> Option<u64> {
-        if self.post_runner.is_some() {
+        // **An ask is written against a generation**, so it may not start while
+        // that generation is being replaced. A regeneration is a post-level
+        // mutation that happens to stream, and moving it out of the exclusive
+        // slot moved it out of this gate with it: the ask was accepted, spent,
+        // and — because reply threading follows item identity — came back
+        // threaded beneath the answer it was never written against. The
+        // duplicate check below cannot stand in, either: a revising turn
+        // carries no `participant_id`, so it matches nothing.
+        if self.mutation_in_flight() {
             return None;
         }
         let duplicate = self.streams.iter().any(|s| {
