@@ -578,31 +578,79 @@
               generate-openapi > $out/openapi.json
             '';
 
-        # Statically-linked llama.cpp `llama-server`, shipped as the `local`
-        # backend's on-device inference engine sidecar. Bundled inside the
-        # macOS .app (Contents/MacOS), next to the CLI binary, and in
-        # the Linux GUI closure (exposed via EIDOLA_LLAMA_SERVER by the
-        # wrapper). App-core resolves the engine without ever scanning $PATH,
-        # so no system llama.cpp install is required.
+        # ── ELF assertions for the shipped Linux executables ────────────────
+        #
+        # Both live *inside* the derivation that produces the binary, so a
+        # nixpkgs bump that changes linkage or raises a symbol requirement
+        # fails the build. Asserting either of these outside the build — in a
+        # script or a workflow step — would let a raised requirement reach a
+        # user, who would meet it as a loader error at launch.
+        #
+        # readelf is called by absolute path rather than added to
+        # nativeBuildInputs: the sidecar's static build is a cross build
+        # (build gnu → host musl), where an unprefixed binutils on PATH would
+        # shadow the cross toolchain's own linker wrappers.
+        readelfBin = "${pkgs.binutils-unwrapped}/bin/readelf";
+
+        # No PT_INTERP (which would name a loader, and a store-built binary's
+        # loader is a /nix/store path) and no DT_NEEDED (which would name
+        # libraries the host must supply). This is the property that lets a
+        # binary be copied out of the store into a host-distro package with
+        # nothing following it.
+        assertFullyStatic = binary: ''
+          echo "checking static linkage: ${binary}"
+          if ${readelfBin} -lW "${binary}" | grep -q INTERP; then
+            echo "error: ${binary} has a PT_INTERP program header, so it is dynamically linked" >&2
+            ${readelfBin} -lW "${binary}" | grep -A1 INTERP >&2
+            exit 1
+          fi
+          if ${readelfBin} -dW "${binary}" 2>/dev/null | grep -q NEEDED; then
+            echo "error: ${binary} declares DT_NEEDED entries, so it is dynamically linked" >&2
+            ${readelfBin} -dW "${binary}" | grep NEEDED >&2
+            exit 1
+          fi
+        '';
+
+        # llama.cpp `llama-server`, shipped as the `local` backend's on-device
+        # inference engine sidecar. Bundled inside the macOS .app
+        # (Contents/MacOS), next to the CLI binary, and in the Linux GUI
+        # closure (exposed via EIDOLA_LLAMA_SERVER by the wrapper). App-core
+        # resolves the engine without ever scanning $PATH, so no system
+        # llama.cpp install is required.
+        #
+        # Linkage differs per platform, and the difference is load-bearing:
+        #
+        #   * Darwin: llama.cpp's own libraries are linked in, leaving only
+        #     the system frameworks (Metal/Accelerate/libc++/libSystem). That
+        #     is as static as an Apple platform gets — libSystem is never
+        #     statically linked — and it is what makes the binary relocatable
+        #     out of the store into the .app.
+        #   * Linux: fully static against musl (`pkgsStatic`), no PT_INTERP
+        #     and no DT_NEEDED at all. `staticLinkageCheck` below asserts
+        #     that in the derivation, because the property is what lets the
+        #     sidecar be copied into a host-distro package: a dynamic sidecar
+        #     carries a /nix/store interpreter and a glibc/libstdc++ symbol
+        #     floor that would follow the artifact onto every user's machine.
         #
         # The base package fn hardcodes LLAMA_CURL and BUILD_SHARED_LIBS to ON
         # and exposes no curlSupport arg; we flip both OFF via *appended*
         # cmakeFlags (later -D wins), which drops the libcurl runtime dep and
-        # statically links llama.cpp's own libs into the one binary we ship —
-        # leaving only system frameworks (Metal/Accelerate/libc++/libSystem on
-        # Darwin) so the binary is fully relocatable. On aarch64-darwin
-        # metalSupport is ON by default and the Metal library is *embedded*
-        # (LLAMA_METAL_EMBED_LIBRARY), compiled at runtime — no Xcode, no
-        # external .metallib, works inside the sandbox.
+        # folds llama.cpp's own libs into the one binary we ship. On
+        # aarch64-darwin metalSupport is ON by default and the Metal library
+        # is *embedded* (LLAMA_METAL_EMBED_LIBRARY), compiled at runtime — no
+        # Xcode, no external .metallib, works inside the sandbox.
         #
-        # Linux is CPU-only for now (default BLAS backend). A Vulkan build
-        # (`pkgs.llama-cpp.override { vulkanSupport = true; }`, shaderc compiles
-        # SPIR-V at build time) is coherent to *build*, but usable GPU
-        # inference also needs Vulkan ICD driver files at runtime, and the
-        # Linux wrapper hands app-core the bare EIDOLA_LLAMA_SERVER path
-        # (unwrapped, so it inherits none of the GUI wrapper's
-        # VK_ADD_DRIVER_FILES). Wiring that is the follow-up; CPU-only ships a
-        # working engine on every Linux host today.
+        # Linux is CPU-only for now, and with BLAS off: nixpkgs' default BLAS
+        # backend is a shared `libblas.so.3`, which a static binary cannot
+        # carry — and measured on a small model it slowed prompt processing
+        # by an order of magnitude anyway. OpenMP stays on; the static
+        # toolchain has libgomp.a. A Vulkan
+        # build (`vulkanSupport = true`, shaderc compiles SPIR-V at build
+        # time) is coherent to *build*, but usable GPU inference also needs
+        # Vulkan ICD driver files at runtime and a loader to dlopen, which a
+        # static binary cannot do. Wiring that is the follow-up; CPU-only
+        # ships a working engine on every Linux host today.
+        #
         # The pinned nixpkgs ships llama.cpp build 6981, which predates the
         # `gemma4` GGUF architecture the curated catalog uses ("unknown model
         # architecture: 'gemma4'"), so the source is bumped to release b9960
@@ -613,7 +661,12 @@
         # the known commit directly is equivalent and more reproducible.
         llamaServerVersion = "9960";
         llamaServerCommit = "a935fbff"; # short rev of tag b9960
-        llamaServer = pkgs.llama-cpp.overrideAttrs (o: {
+        llamaServerBase =
+          if pkgs.stdenv.hostPlatform.isDarwin then
+            pkgs.llama-cpp
+          else
+            pkgs.pkgsStatic.llama-cpp.override { blasSupport = false; };
+        llamaServer = llamaServerBase.overrideAttrs (o: {
           version = llamaServerVersion;
           src = pkgs.fetchFromGitHub {
             owner = "ggml-org";
@@ -647,12 +700,34 @@
             "-DBUILD_SHARED_LIBS=OFF"
             # The server auto-detects OpenSSL for httplib TLS; we speak plain
             # HTTP over loopback only, and a libssl dep would pin the binary
-            # to nix-store paths (not relocatable on user machines).
+            # to nix-store paths (not relocatable on user machines). This is
+            # the pre-b9960 spelling of the option, kept because changing it
+            # would move the macOS sidecar's bytes; what makes the detection
+            # miss on Darwin is that nothing in the sandbox provides OpenSSL
+            # once curl is out of buildInputs.
             "-DLLAMA_SERVER_SSL=OFF"
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            # Left on deliberately: the static toolchain has libgomp.a, so
+            # OpenMP costs nothing in linkage, and dropping it for ggml's own
+            # threadpool measured ~35% slower token generation.
+            "-DGGML_OPENMP=ON"
+            # The vendored cpp-httplib auto-detects OpenSSL under this option
+            # (`LLAMA_SERVER_SSL` above is the older spelling and is inert at
+            # this llama.cpp revision). We speak plain HTTP over loopback
+            # only, and a TLS stack would drag its CA-path assumptions into a
+            # binary that must run on any host.
+            "-DLLAMA_OPENSSL=OFF"
+            # tools/ui builds an asset-embedding generator that has to run on
+            # the *build* machine; a static build is a cross build, so CMake
+            # cannot reuse the target compiler for it.
+            "-DHOST_CXX_COMPILER=${pkgs.buildPackages.stdenv.cc}/bin/c++"
           ];
           # curl is unused with LLAMA_CURL=OFF, and its presence propagates
           # OpenSSL into the server's auto-detection — drop it entirely.
-          buildInputs = pkgs.lib.filter (d: (d.pname or "") != "curl") o.buildInputs;
+          # Matched by prefix because a static build's package names carry a
+          # `-static-<triple>` suffix.
+          buildInputs = pkgs.lib.filter (d: !(pkgs.lib.hasPrefix "curl" (d.pname or ""))) o.buildInputs;
           # Trim the closure to just the one tool we ship. The static build
           # embeds llama.cpp's libs into the binary, so the sibling llama-*
           # tools, the `llama` symlink, and the installed headers/archives are
@@ -700,6 +775,13 @@
                   f.write(data)
               ' "$out/bin/llama-server"
             '';
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # The build-platform compiler tools/ui's generator needs.
+          depsBuildBuild = (o.depsBuildBuild or [ ]) ++ [ pkgs.buildPackages.stdenv.cc ];
+          # postFixup, not postInstall: fixupPhase strips and rewrites RPATHs,
+          # so this reads the bytes that actually ship.
+          postFixup = assertFullyStatic "$out/bin/llama-server";
         });
 
         # signapple — the independent `apply` our own reattach is checked

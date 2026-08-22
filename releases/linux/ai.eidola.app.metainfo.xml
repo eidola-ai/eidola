@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata for the Linux GUI. GNOME Software, KDE Discover and
+  `gnome-software`-derived app centres render an installed application's page
+  from this file; without it a package installs as a bare desktop entry with
+  no description, no licence and no project links.
+
+  The component id MUST equal the desktop entry's basename
+  (ai.eidola.app.desktop), which in turn equals the Wayland app_id the binary
+  sets — that chain is how the shell resolves a running window to this
+  metadata. Installed at /usr/share/metainfo/ai.eidola.app.metainfo.xml.
+
+  Release entries are deliberately absent: a release note is per-version
+  content, so it belongs to the release commit rather than to a file that
+  would otherwise be stale on every build.
+-->
+<component type="desktop-application">
+  <id>ai.eidola.app</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+
+  <name>Eidola</name>
+  <summary>A quiet page for thinking with a machine</summary>
+
+  <description>
+    <p>
+      Eidola is a personal AI client whose privacy rests on verifiable
+      architecture and open code rather than on a policy taken on faith.
+    </p>
+    <p>
+      Conversations run against AI models hosted in confidential-computing
+      enclaves that the app itself verifies on every connection, so the
+      operator of the service — including its authors — cannot read what
+      passes through it. Models can also run entirely on this device, with no
+      network involved at all.
+    </p>
+    <p>
+      Every published build is reproducible from source, and the record that
+      binds a release to the bytes you install is signed and public.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">ai.eidola.app.desktop</launchable>
+  <provides>
+    <binary>eidola-gui</binary>
+  </provides>
+
+  <categories>
+    <category>Utility</category>
+    <category>Network</category>
+  </categories>
+
+  <keywords>
+    <keyword>AI</keyword>
+    <keyword>chat</keyword>
+    <keyword>private</keyword>
+    <keyword>confidential</keyword>
+  </keywords>
+
+  <developer id="ai.eidola">
+    <name>Eidola, Inc.</name>
+  </developer>
+
+  <url type="homepage">https://www.eidola.ai</url>
+  <url type="bugtracker">https://github.com/eidola-ai/eidola/issues</url>
+  <url type="help">https://www.eidola.ai/docs/</url>
+  <url type="vcs-browser">https://github.com/eidola-ai/eidola</url>
+
+  <!--
+    OARS content rating. The application renders whatever a model produces and
+    exchanges text with a network service, so it declares the two interaction
+    attributes that are structurally true and nothing else.
+  -->
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-info">mild</content_attribute>
+  </content_rating>
+</component>
