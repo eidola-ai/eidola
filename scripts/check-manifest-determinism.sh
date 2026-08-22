@@ -93,6 +93,45 @@ check_manifest() {
     exit 2
   fi
 
+  # The envelope first: the document's own shape. Checked before the
+  # entries because a nonce, a run ID or a build timestamp does not have to
+  # look like signing material to break determinism — it only has to be a
+  # field nobody validated. Key sets are compared for equality at every
+  # level, so an added field and a dropped one are both violations, and an
+  # empty `artifacts` object is not a vacuous pass.
+  out="$(
+    jq -r '
+      def keyset($who; $want):
+        if (keys != ($want | sort)) then
+          "\($who): allows exactly \($want | sort | join(", ")) — found \(keys | join(", "))"
+        else empty end;
+      if type != "object" then
+        "manifest: not a JSON object"
+      else
+        keyset("manifest"; ["artifacts", "enclave", "schema_version"]),
+        (if (.schema_version | type) != "number" then
+           "manifest.schema_version: not an integer"
+         else empty end),
+        (if (.artifacts | type) != "object" then
+           "manifest.artifacts: not an object"
+         elif (.artifacts | length) == 0 then
+           "manifest.artifacts: empty — a manifest that records nothing proves nothing"
+         else empty end),
+        (if (.enclave | type) != "object" then
+           "manifest.enclave: not an object"
+         else
+           (.enclave | keyset("enclave"; ["cmdline", "snp_measurement", "tdx_measurement"])),
+           (if (.enclave.tdx_measurement | type) != "object" then
+              "enclave.tdx_measurement: not an object"
+            else
+              (.enclave.tdx_measurement | keyset("enclave.tdx_measurement"; ["rtmr1", "rtmr2"]))
+            end)
+         end)
+      end
+    ' "$file"
+  )"
+  report_lines "$out"
+
   # Field allow-list per artifact type. `oci` records the image digest;
   # `nix` records the store-path checkpoint plus the archive hash a user
   # can check without Nix; `file` records the sha256 of a single published
@@ -106,7 +145,9 @@ check_manifest() {
           "nix":  ["archiveSha256", "narHash", "platform", "type"],
           "file": ["platform", "sha256", "type"]
         };
-      (.artifacts // {}) | to_entries[]
+      (if type == "object" then (.artifacts // {}) else {} end)
+      | objects
+      | to_entries[]
       | .key as $name
       | .value as $entry
       | (($entry | objects | .type) // "«missing»") as $type
@@ -161,10 +202,14 @@ check_workflow() {
         sub(/:[ \t]*$/, "", job)
         jobs[++njobs] = job
         collecting_needs = 0
+        collecting_env = 0
         next
       }
 
       job == "" { next }
+
+      # Any new key at job level closes whatever block was being collected.
+      /^    [A-Za-z0-9_-]+:/ { collecting_needs = 0; collecting_env = 0 }
 
       # `needs:` is either inline (`needs: oci`, `needs: [a, b]`) or a
       # block list of `- name` lines that follow it.
@@ -188,12 +233,23 @@ check_workflow() {
         needs[job] = needs[job] " " dep
         next
       }
-      collecting_needs && /^    [A-Za-z]/ { collecting_needs = 0 }
-
+      # `environment:` is either a scalar (a name, or an expression that
+      # resolves to one) or a mapping whose `name:` carries it — both are
+      # valid GitHub Actions, so the nested block is collected too. The
+      # whole block is kept rather than just `name`, which errs toward
+      # flagging.
       /^    environment:/ {
         env = $0
         sub(/^    environment:[ \t]*/, "", env)
-        environment[job] = environment[job] " " env
+        if (env ~ /[^ \t]/) {
+          environment[job] = environment[job] " " env
+        } else {
+          collecting_env = 1
+        }
+        next
+      }
+      collecting_env && /^      / {
+        environment[job] = environment[job] " " $0
         next
       }
 
@@ -215,11 +271,27 @@ check_workflow() {
         if (!found)
           print "no `artifact-manifest` job in this workflow — the job-graph assertion cannot be evaluated"
 
-        n = split(needs["artifact-manifest"], deps, /[ \t]+/)
-        for (i = 1; i <= n; i++) {
-          d = deps[i]
-          if (d != "" && signer[d])
-            print "the `artifact-manifest` job needs `" d "`, a signing job — a key-dependent value could then reach the manifest"
+        # Walk *every* ancestor, not just the direct `needs:`. A signing
+        # job two hops up hands its outputs down the chain just as well as
+        # one hop up, and the intermediate job is under no obligation to
+        # drop them.
+        head = 1
+        tail = 1
+        queue[1] = "artifact-manifest"
+        seen["artifact-manifest"] = 1
+        chain["artifact-manifest"] = "artifact-manifest"
+        while (head <= tail) {
+          cur = queue[head++]
+          n = split(needs[cur], deps, /[ \t]+/)
+          for (i = 1; i <= n; i++) {
+            d = deps[i]
+            if (d == "" || seen[d]) continue
+            seen[d] = 1
+            chain[d] = chain[cur] " -> " d
+            queue[++tail] = d
+            if (signer[d])
+              print "the `artifact-manifest` job depends on signing job `" d "` (" chain[d] ") — a key-dependent value could then reach the manifest"
+          }
         }
 
         for (i = 1; i <= njobs; i++) {
@@ -251,8 +323,12 @@ fi
 if [[ "$SELF_TEST" -eq 1 ]]; then
   echo "Self-test: every bad fixture must be rejected..."
   rc=0
+  manifest_fixtures=0
+  workflow_fixtures=0
+
   for fixture in "$FIXTURE_DIR"/bad-*.json; do
     [[ -e "$fixture" ]] || continue
+    manifest_fixtures=$((manifest_fixtures + 1))
     if "${BASH_SOURCE[0]}" --manifest "$fixture" > /dev/null 2>&1; then
       echo "  FAIL: $(basename "$fixture") was accepted" >&2
       rc=1
@@ -262,6 +338,7 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
   done
   for fixture in "$FIXTURE_DIR"/bad-*.yml; do
     [[ -e "$fixture" ]] || continue
+    workflow_fixtures=$((workflow_fixtures + 1))
     if "${BASH_SOURCE[0]}" --workflow "$fixture" > /dev/null 2>&1; then
       echo "  FAIL: $(basename "$fixture") was accepted" >&2
       rc=1
@@ -269,10 +346,24 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
       echo "  rejected: $(basename "$fixture")"
     fi
   done
+
+  # Counted per class, because an empty glob is silence: deleting every
+  # workflow fixture would otherwise retire half the self-test while the
+  # command still reported success.
+  if [[ "$manifest_fixtures" -eq 0 ]]; then
+    echo "FAIL: no bad-*.json fixture in $FIXTURE_DIR — the document assertions are unproven" >&2
+    rc=1
+  fi
+  if [[ "$workflow_fixtures" -eq 0 ]]; then
+    echo "FAIL: no bad-*.yml fixture in $FIXTURE_DIR — the job-graph assertion is unproven" >&2
+    rc=1
+  fi
+
   if [[ "$rc" -ne 0 ]]; then
-    echo "FAIL: the check has lost its teeth — a fixture it must reject passed." >&2
+    echo "FAIL: the check has lost its teeth — a fixture it must reject passed, or a fixture class is gone." >&2
     exit 1
   fi
+  echo "  ($manifest_fixtures manifest fixtures, $workflow_fixtures workflow fixtures)"
 fi
 
 echo "OK: no key-dependent material can reach artifact-manifest.json."

@@ -34,10 +34,22 @@ for tool in zip unzip; do
   fi
 done
 
-# ── the flake still asks for the flags this harness proves out ───────────
-invocation="$(grep -E 'find \. -mindepth 1 \| LC_ALL=C sort \| zip ' "$FLAKE" || true)"
+# ── the flake still asks for what this harness proves out ────────────────
+# Read the `mkShippingZip` block alone, never the whole file: other
+# derivations in flake.nix set SOURCE_DATE_EPOCH (to 0, which zip cannot
+# even represent), so a file-wide match would report a declaration this
+# recipe does not have.
+recipe="$(awk '/^ *mkShippingZip =/ { collecting = 1 }
+               collecting { print }
+               collecting && /^ *'"''"';$/ { exit }' "$FLAKE")"
+if [[ -z "$recipe" ]]; then
+  echo "FAIL: no mkShippingZip block found in flake.nix — has the recipe moved?" >&2
+  exit 1
+fi
+
+invocation="$(printf '%s\n' "$recipe" | grep -E 'find \. -mindepth 1 \| LC_ALL=C sort \| zip ' || true)"
 if [[ -z "$invocation" ]]; then
-  echo "FAIL: no shipping-zip invocation found in flake.nix — has the recipe moved?" >&2
+  echo "FAIL: mkShippingZip no longer runs a sorted find into zip" >&2
   exit 1
 fi
 for flag in -X -y; do
@@ -47,7 +59,17 @@ for flag in -X -y; do
     exit 1
   fi
 done
-echo "ok: flake.nix's shipping zip passes -X and -y"
+echo "ok: mkShippingZip passes -X and -y"
+
+# The stamp and the zone are hash inputs, so the derivation must state
+# them rather than inherit whatever stdenv happens to default to.
+for pinned in 'SOURCE_DATE_EPOCH = "315532800"' 'TZ = "UTC"'; do
+  if [[ "$recipe" != *"$pinned"* ]]; then
+    echo "FAIL: mkShippingZip no longer declares $pinned" >&2
+    exit 1
+  fi
+done
+echo "ok: mkShippingZip declares SOURCE_DATE_EPOCH = 315532800 and TZ = UTC"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

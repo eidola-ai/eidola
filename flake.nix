@@ -1204,9 +1204,18 @@ with open(path, "wb") as f:
           pkgs.runCommand "${pname}.zip"
             {
               nativeBuildInputs = [ pkgs.zip ];
+              # Declared, not inherited. stdenv does export both (its
+              # SOURCE_DATE_EPOCH fallback is the same 1980-01-01), but the
+              # stamp every entry carries and the zone the DOS fields are
+              # written in are inputs to this file's hash — they belong in
+              # the derivation that depends on them, where a nixpkgs change
+              # cannot move them silently. 1980-01-01 is also the earliest
+              # date the zip format can represent.
+              SOURCE_DATE_EPOCH = "315532800";
+              TZ = "UTC";
             }
             ''
-              export LC_ALL=C TZ=UTC
+              export LC_ALL=C
               cp -R ${payload} tree
               chmod -R u+w tree
               find tree -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
