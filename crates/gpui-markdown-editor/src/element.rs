@@ -753,6 +753,47 @@ fn compute_image_row_extra(
     }
 }
 
+/// The x at which each visual row's text ends — index `k` is row `k`'s
+/// right edge, in the line's own coordinates.
+///
+/// `WrappedLine::width()` is `min(wrap_width, unwrapped width)`, so for
+/// any line that actually wrapped it is the **configured wrap width**,
+/// not what a given row used. A decoration filling to it paints through
+/// the blank area after that row's last glyph — and a break at a word
+/// boundary leaves a lot of it. gpui's upper affinity supplies the real
+/// answer: the boundary index that *starts* row `k + 1` resolves to row
+/// `k`'s end, which is exactly the used width.
+///
+/// The last row has no boundary after it; it ends at the line's own
+/// width, which for the last row is the honest value.
+fn wrap_row_right_edges(line: &WrappedLine, row_stride: Pixels) -> SmallVec<[Pixels; 4]> {
+    let rows = line.wrap_boundaries().len() + 1;
+    let mut out: SmallVec<[Pixels; 4]> = SmallVec::with_capacity(rows);
+    if row_stride > px(0.) {
+        for k in 0..rows - 1 {
+            // Probe the vertical centre of row k+1, never its top edge —
+            // the same reason `downstream_row_position` does.
+            let next_row_start = match line.closest_index_for_position(
+                point(px(0.0), row_stride * ((k + 1) as f32 + 0.5)),
+                row_stride,
+            ) {
+                Ok(i) | Err(i) => i,
+            };
+            let edge = line
+                .position_for_index(next_row_start, row_stride)
+                .map(|p| p.x)
+                .unwrap_or_else(|| line.width());
+            out.push(edge);
+        }
+    } else {
+        for _ in 0..rows - 1 {
+            out.push(line.width());
+        }
+    }
+    out.push(line.width());
+    out
+}
+
 /// The chip fill a merged inline style asks for, if any.
 ///
 /// Dim takes precedence: the delimiter backticks share the run color but
@@ -836,7 +877,8 @@ fn push_row_spanning_bounds(
     // one that *ends* there ends at the upper row's edge, which is what
     // gpui's unbiased answer already gives.
     let start = downstream_row_position(line, lo, start_upper, row_stride);
-    let row_width = line.width();
+    let right_edges = wrap_row_right_edges(line, row_stride);
+    let row_right = |row: usize| origin.x + right_edges.get(row).copied().unwrap_or(line.width());
     if start.y == end.y {
         out.push(Bounds::from_corners(
             point(origin.x + start.x, origin.y + start.y),
@@ -844,17 +886,17 @@ fn push_row_spanning_bounds(
         ));
         return;
     }
-    out.push(Bounds::from_corners(
-        point(origin.x + start.x, origin.y + start.y),
-        point(origin.x + row_width, origin.y + start.y + row_height),
-    ));
     let first_row = (f32::from(start.y) / f32::from(row_stride)).round() as usize;
     let last_row = (f32::from(end.y) / f32::from(row_stride)).round() as usize;
+    out.push(Bounds::from_corners(
+        point(origin.x + start.x, origin.y + start.y),
+        point(row_right(first_row), origin.y + start.y + row_height),
+    ));
     for row in (first_row + 1)..last_row {
         let y = origin.y + row_stride * (row as f32);
         out.push(Bounds::from_corners(
             point(origin.x, y),
-            point(origin.x + row_width, y + row_height),
+            point(row_right(row), y + row_height),
         ));
     }
     out.push(Bounds::from_corners(
@@ -4985,7 +5027,17 @@ fn paint_selection_for_line(
     }
 
     let row_count = line.row_count();
-    let line_width = line.line.width();
+    // Per-row right edges, not the configured wrap width — see
+    // `wrap_row_right_edges`. The wash hugs the text on every row it
+    // crosses, the way the inline-code chip does.
+    let right_edges = wrap_row_right_edges(&line.line, row_stride);
+    let row_right = |row: usize| {
+        line.origin.x
+            + right_edges
+                .get(row)
+                .copied()
+                .unwrap_or_else(|| line.line.width())
+    };
     let start_row = (f32::from(start.y) / f32::from(row_stride)).round() as usize;
     let end_row = (f32::from(end.y) / f32::from(row_stride)).round() as usize;
 
@@ -4994,7 +5046,7 @@ fn paint_selection_for_line(
         fill(
             Bounds::from_corners(
                 point(line.origin.x + start.x, y_start),
-                point(line.origin.x + line_width, y_start + row_height),
+                point(row_right(start_row), y_start + row_height),
             ),
             color,
         ),
@@ -5007,7 +5059,7 @@ fn paint_selection_for_line(
             fill(
                 Bounds::from_corners(
                     point(line.origin.x, y),
-                    point(line.origin.x + line_width, y + row_height),
+                    point(row_right(row), y + row_height),
                 ),
                 color,
             ),
@@ -5546,6 +5598,147 @@ mod tests {
             assert_eq!(
                 chip.size.height, line_height,
                 "the chip fills the text row, not the stride"
+            );
+        }
+    }
+
+    /// Shape `src`'s first paragraph at `wrap_w` and return the chip
+    /// bounds plus each visual row's true right edge.
+    fn wrapped_chip_geometry(
+        cx: &mut TestAppContext,
+        src: &'static str,
+        wrap_w: Pixels,
+    ) -> (Vec<Bounds<Pixels>>, Vec<Pixels>) {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let shaped = shape_block_lines(src, block, style, font_size, Some(wrap_w), window);
+            let sl = shaped.first().expect("a shaped line");
+            let chips = run_background_bounds(
+                &sl.line,
+                &sl.display_to_source,
+                point(px(0.0), px(0.0)),
+                line_height,
+                line_height,
+                block,
+                style,
+            );
+            let edges = wrap_row_right_edges(&sl.line, line_height).to_vec();
+            (chips, edges)
+        })
+    }
+
+    #[gpui::test]
+    fn a_wrapped_inline_code_chip_ends_at_each_rows_last_glyph(cx: &mut TestAppContext) {
+        // A code span breaking at a word boundary leaves blank space
+        // between the row's last glyph and the wrap width.
+        // `WrappedLine::width()` reports the *configured* wrap width for
+        // any line that wrapped, so filling to it painted the chip
+        // through that blank.
+        let wrap_w = px(150.0);
+        let (chips, edges) =
+            wrapped_chip_geometry(cx, "`alpha beta gamma delta epsilon zeta` tail", wrap_w);
+        assert!(chips.len() > 2, "the span must cross at least two wraps");
+        assert!(
+            edges
+                .iter()
+                .take(edges.len() - 1)
+                .any(|e| *e < wrap_w - px(1.0)),
+            "the fixture must actually leave trailing blank on a row ({edges:?})"
+        );
+        for chip in &chips {
+            let right = chip.origin.x + chip.size.width;
+            assert!(
+                right <= wrap_w,
+                "no chip may reach past the wrap width (right {right:?})"
+            );
+        }
+        // Every chip's right edge is one of the rows' true text edges (or
+        // the span's own end on the last row) — never the wrap width when
+        // that row's text stopped short.
+        for (chip, edge) in chips.iter().zip(edges.iter()) {
+            let right = chip.origin.x + chip.size.width;
+            assert!(
+                right <= *edge + px(0.01),
+                "chip right {right:?} overruns its row's text edge {edge:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_wrapped_selection_wash_ends_at_each_rows_last_glyph(cx: &mut TestAppContext) {
+        // The wash shares the geometry, so it shared the defect — one
+        // rule now serves the chip, the selection and the highlight wash.
+        let src = "one two three four five six seven eight nine ten eleven twelve";
+        let wrap_w = px(150.0);
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Range {
+                anchor: 0,
+                head: src.len(),
+            },
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let (quads, edges) = with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let shaped = shape_block_lines(src, block, style, font_size, Some(wrap_w), window);
+            let sl = shaped.into_iter().next().expect("a shaped line");
+            let laid = LaidOutLine {
+                line: sl.line,
+                origin: point(px(0.0), px(0.0)),
+                row_height: line_height,
+                row_stride: line_height,
+                wrapped_height: line_height,
+                source_range: sl.source_range,
+                display_to_source: sl.display_to_source,
+                is_delimiter: sl.is_delimiter,
+            };
+            let edges = wrap_row_right_edges(&laid.line, line_height).to_vec();
+            let mut out = Vec::new();
+            paint_selection_for_line(
+                &laid,
+                0,
+                src.len(),
+                src.len(),
+                gpui::hsla(0., 0., 0., 1.),
+                &mut out,
+            );
+            (out, edges)
+        });
+        assert!(
+            quads.len() > 2,
+            "the selection must cross at least two wraps"
+        );
+        assert!(
+            edges
+                .iter()
+                .take(edges.len() - 1)
+                .any(|e| *e < wrap_w - px(1.0)),
+            "the fixture must leave trailing blank on a row ({edges:?})"
+        );
+        for (quad, edge) in quads.iter().zip(edges.iter()) {
+            let right = quad.quad.bounds.origin.x + quad.quad.bounds.size.width;
+            assert!(
+                right <= *edge + px(0.01),
+                "wash right {right:?} overruns its row's text edge {edge:?}"
             );
         }
     }

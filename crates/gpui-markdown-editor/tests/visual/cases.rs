@@ -176,6 +176,23 @@ pub fn register(s: &mut Snapshots) {
         },
     );
 
+    // An inline-code span crossing soft wraps at word boundaries: each
+    // row's chip ends at that row's last glyph, not at the wrap width
+    // (`WrappedLine::width()` reports the configured wrap width for any
+    // line that wrapped, which leaves blank trailing space unfilled).
+    s.add(
+        "inline_code_chip_wrapped",
+        size(px(240.), px(240.)),
+        |window, cx| {
+            editor_with_cursor(
+                window,
+                cx,
+                "lead in `alpha beta gamma delta epsilon zeta eta` and the tail after it",
+                "tail",
+            )
+        },
+    );
+
     // Strikethrough outside.
     s.add("strike_cursor_outside", win, |window, cx| {
         editor_with_cursor(window, cx, "keep ~~drop~~ keep", "keep")
