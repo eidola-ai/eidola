@@ -235,15 +235,46 @@ pub fn action_location(
     })
 }
 
-/// Regenerate an inference — append a new agent generation of its item.
-pub fn regenerate(
+/// Regenerate an inference — append a new agent generation of its item,
+/// **streaming**. Same event/completion pair as [`respond_stream_as`]: deltas
+/// arrive on the first channel, the finished turn on the second.
+///
+/// The streaming door is the one a window uses. A regeneration can run for many
+/// minutes on a reasoning model, and the blocking twin shows nothing at all
+/// until it lands — indistinguishable, from the reader's side, from a button
+/// that did nothing.
+pub fn regenerate_stream(
     core: Arc<AppCore>,
     action_id: String,
     model: String,
-) -> oneshot::Receiver<Result<ChatResult, AppError>> {
-    spawn_oneshot(core, move |core| async move {
-        core.regenerate(action_id, model).await
-    })
+) -> (
+    mpsc::UnboundedReceiver<ChatStreamEvent>,
+    oneshot::Receiver<Result<ChatResult, AppError>>,
+) {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (done_tx, done_rx) = oneshot::channel();
+    core.runtime().handle().clone().spawn(async move {
+        let res = core.regenerate_stream(action_id, model, event_tx).await;
+        let _ = done_tx.send(res);
+    });
+    (event_rx, done_rx)
+}
+
+/// **When the regeneration running against `item_id` ends** — however it ends.
+/// Resolves at once when nothing is running against it.
+///
+/// The other half of the claim a refused `regenerate_stream` reports. A surface
+/// that was refused has to be able to stop saying so, and a regeneration that
+/// *fails* writes no successor for a transcript refresh to notice — so the end
+/// is published from the one place that knows it rather than inferred from the
+/// tree.
+pub fn regeneration_settled(core: Arc<AppCore>, item_id: String) -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel();
+    core.runtime().handle().clone().spawn(async move {
+        core.regeneration_settled(item_id).await;
+        let _ = tx.send(());
+    });
+    rx
 }
 
 /// Load a space's threaded-post render tree (the reopened-space initial load

@@ -354,7 +354,12 @@ impl DelegationFailure {
             | AppError::NotJoined { .. }
             | AppError::DrivenConversation { .. }
             | AppError::SpaceArchived { .. } => Self::Configuration,
-            AppError::ToolLoop { .. }
+            // A truncation is the sharpest case of "ran, produced no answer",
+            // and a regeneration collision cannot reach a driven room at all
+            // (the driver never revises) — both land in the honest catch-all.
+            AppError::ResponseTruncated { .. }
+            | AppError::RegenerationInFlight { .. }
+            | AppError::ToolLoop { .. }
             | AppError::Internal { .. }
             | AppError::Database { .. }
             | AppError::DatabaseInUse { .. }
@@ -1810,6 +1815,13 @@ impl Inner {
     #[cfg(feature = "test-support")]
     pub(crate) async fn pause_in_report_persist_window(&self) {
         pause_in_window(&self.persist_window).await;
+    }
+
+    /// The same, for the window immediately before a regeneration claims its
+    /// item (see `Inner::claim_window`).
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn pause_in_regeneration_claim_window(&self) {
+        pause_in_window(&self.claim_window).await;
     }
 
     /// **What every door that closes a room owes it**: announce the room, and

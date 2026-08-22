@@ -7455,3 +7455,86 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
 
     probe::set_probes_enabled(false);
 }
+
+/// **The label a screen reader hears is the message a sighted reader sees.**
+///
+/// A conversation's three in-place turn states are readouts, so their accessible
+/// name *is* their text — and pinning that in English would have passed against
+/// a literal beside the accessor. The assertion is made in a non-English locale
+/// for the same reason `an_archived_conversations_refusal_is_localized` is: only
+/// there do the two spellings differ. The probe **names** are asserted from the
+/// same entries, unchanged by the locale — they are selectors, not prose.
+#[gpui::test]
+fn a_conversations_turn_states_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12 and 18:41.");
+    answer.action_type = "inference".into();
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    let mut second = probe_post("a2", "And high water at 12:26.");
+    second.action_type = "inference".into();
+    second.parent_action_id = Some("a1".into());
+    second.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    let mut third = probe_post("a3", "Springs run through to Sunday, and the range");
+    third.action_type = "inference".into();
+    third.parent_action_id = Some("a2".into());
+    third.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![answer, second, third], cx)
+        });
+    });
+
+    // Three states, one on each answer: a live regeneration pending in the
+    // first's place, a collision on the second, and a third that stopped at its
+    // length allowance. One per post because a pending revision draws over the
+    // whole body it replaces, marks included.
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.note_truncated_turn_for_test("a3", cx));
+        space.update(cx, |s, cx| {
+            s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+            let seq = s.revising_seq("a2").expect("the press is pending");
+            s.collide_revision_for_test(seq, cx);
+            s.regenerate_post("a1".into(), "kimi-k2".into(), cx);
+        });
+    });
+    let seq = space.read_with(cx, |s, _| s.revising_seq("a1").expect("pending"));
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/2/cut-off",
+        gpui::Role::Label,
+        "Cette réponse a atteint sa limite de longueur et s’interrompt en pleine pensée.",
+    );
+    assert_probe(
+        &entries,
+        "space/post/1/regenerating-elsewhere",
+        gpui::Role::Label,
+        "Cette réponse est déjà en cours de régénération.",
+    );
+    assert_probe(
+        &entries,
+        &format!("space/streaming/{seq}/regenerating"),
+        gpui::Role::Label,
+        "Régénération…",
+    );
+
+    probe::set_probes_enabled(false);
+}

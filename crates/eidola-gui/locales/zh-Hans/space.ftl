@@ -12,3 +12,8 @@ space-footnote-delegation-failed = 已中止：{ $reason ->
         [configuration] 其设置存在问题
        *[other] 有一个回合未能完成
     }
+
+space-regenerating = 正在重新生成…
+space-error-response-truncated = 模型把全部长度额度都用在了思考上，始终没有开始作答。没有新增或替换任何回答——请重试，或换一个更简短的问题。
+space-regenerating-elsewhere = 这条回复正在重新生成。
+space-answer-cut-off = 这条回复达到了长度上限，在中途停下。
