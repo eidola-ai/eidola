@@ -611,6 +611,50 @@
           fi
         '';
 
+        # The oldest glibc a shipped Linux executable may demand, expressed as
+        # the highest `GLIBC_` symbol version it is allowed to reference.
+        # 2.39 is Ubuntu 24.04 LTS and Debian 13; a host older than that
+        # cannot run the binary at all, so this number *is* the supported
+        # floor and moving it is a product decision, not a build detail.
+        glibcSymbolFloor = "2.39";
+
+        # Versioned-symbol requirements are what actually bind a glibc binary
+        # to a minimum host, and they move on their own: a nixpkgs bump can
+        # raise one without a line of our code changing.
+        #
+        # `GLIBCXX_`/`CXXABI_` are asserted absent rather than floored. No
+        # shipped executable links libstdc++ today (the sidecar is static,
+        # the GUI is Rust), and the two families version independently of
+        # glibc, so there is no honest single floor to compare them against.
+        # If C++ ever enters the link, this fails and someone picks a floor
+        # for it deliberately.
+        assertGlibcFloor = binary: ''
+          echo "checking symbol-version floor (GLIBC_${glibcSymbolFloor}): ${binary}"
+          symbolVersions="$(
+            ${readelfBin} --dyn-syms -W "${binary}" \
+              | grep -oE '@@?(GLIBC|GLIBCXX|CXXABI)_[0-9][0-9.]*' \
+              | tr -d '@' | sort -u
+          )"
+          maxGlibc="$(
+            printf '%s\n' "$symbolVersions" | grep '^GLIBC_' \
+              | cut -d_ -f2 | sort -V | tail -1
+          )"
+          if [ -n "$maxGlibc" ] \
+            && [ "$(printf '%s\n%s\n' "$maxGlibc" "${glibcSymbolFloor}" | sort -V | tail -1)" != "${glibcSymbolFloor}" ]; then
+            echo "error: ${binary} requires GLIBC_$maxGlibc, above the supported floor GLIBC_${glibcSymbolFloor}" >&2
+            ${readelfBin} --dyn-syms -W "${binary}" | grep -E "@GLIBC_$maxGlibc\$" >&2
+            exit 1
+          fi
+          cxxVersions="$(printf '%s\n' "$symbolVersions" | grep -E '^(GLIBCXX|CXXABI)_' || true)"
+          if [ -n "$cxxVersions" ]; then
+            echo "error: ${binary} requires libstdc++ symbol versions, which no shipped executable is expected to:" >&2
+            printf '%s\n' "$cxxVersions" >&2
+            echo "pick a libstdc++ floor deliberately before shipping this." >&2
+            exit 1
+          fi
+          echo "symbol-version floor ok (max GLIBC_''${maxGlibc:-none})"
+        '';
+
         # llama.cpp `llama-server`, shipped as the `local` backend's on-device
         # inference engine sidecar. Bundled inside the macOS .app
         # (Contents/MacOS), next to the CLI binary, and in the Linux GUI
@@ -626,8 +670,8 @@
         #     statically linked — and it is what makes the binary relocatable
         #     out of the store into the .app.
         #   * Linux: fully static against musl (`pkgsStatic`), no PT_INTERP
-        #     and no DT_NEEDED at all. `staticLinkageCheck` below asserts
-        #     that in the derivation, because the property is what lets the
+        #     and no DT_NEEDED at all. `assertFullyStatic` checks that in
+        #     the derivation, because the property is what lets the
         #     sidecar be copied into a host-distro package: a dynamic sidecar
         #     carries a /nix/store interpreter and a glibc/libstdc++ symbol
         #     floor that would follow the artifact onto every user's machine.
@@ -644,12 +688,12 @@
         # backend is a shared `libblas.so.3`, which a static binary cannot
         # carry — and measured on a small model it slowed prompt processing
         # by an order of magnitude anyway. OpenMP stays on; the static
-        # toolchain has libgomp.a. A Vulkan
-        # build (`vulkanSupport = true`, shaderc compiles SPIR-V at build
-        # time) is coherent to *build*, but usable GPU inference also needs
-        # Vulkan ICD driver files at runtime and a loader to dlopen, which a
-        # static binary cannot do. Wiring that is the follow-up; CPU-only
-        # ships a working engine on every Linux host today.
+        # toolchain has libgomp.a. A Vulkan build (`vulkanSupport = true`,
+        # shaderc compiles SPIR-V at build time) is coherent to *build*, but
+        # usable GPU inference also needs Vulkan ICD driver files at runtime
+        # and a loader to dlopen, which a static binary cannot do. Wiring
+        # that is the follow-up; CPU-only ships a working engine on every
+        # Linux host today.
         #
         # The pinned nixpkgs ships llama.cpp build 6981, which predates the
         # `gemma4` GGUF architecture the curated catalog uses ("unknown model
@@ -1325,6 +1369,270 @@ with open(path, "wb") as f:
                   $out/share/icons/
               '';
 
+        # ── The host-generic Linux payload and its .deb envelope ────────────
+        #
+        # The Nix installable above hands the GUI a complete userland out of
+        # the store. This one does the opposite: it keeps only our own bytes
+        # and resolves everything else from the host distro, which is what
+        # lets the host's Vulkan loader and its Mesa or proprietary NVIDIA
+        # drivers — all built against the host's glibc — load into our
+        # process. The Nix-glibc/host-driver mismatch the wrapped build works
+        # around by bundling Mesa does not arise here.
+        #
+        # Two pieces of post-link metadata are all that bind the release
+        # binary to the store, and patchelf removes both:
+        #
+        #   * RUNPATH, which points every lookup at the store. Dropping it is
+        #     safe because the only DT_NEEDED library outside glibc is
+        #     libxkbcommon; the Wayland client, the Vulkan loader and EGL are
+        #     dlopened by bare soname, and a bare soname is resolved through
+        #     the loader's default search path.
+        #   * PT_INTERP, the store's ld.so, rewritten to the path the
+        #     filesystem hierarchy standard gives glibc's loader.
+        #
+        # Nothing else changes: same source, same release profile, same
+        # linker output.
+        fdoInterpreter =
+          {
+            "x86_64-linux" = "/lib64/ld-linux-x86-64.so.2";
+            "aarch64-linux" = "/lib/ld-linux-aarch64.so.1";
+          }
+          .${system} or null;
+
+        eidolaGuiLinuxFdo =
+          if eidolaGuiLinux == null then
+            null
+          else
+            pkgs.runCommand "eidola-gui-linux-fdo"
+              {
+                nativeBuildInputs = [ pkgs.patchelf ];
+              }
+              ''
+                mkdir -p $out/bin
+                cp ${eidolaGuiLinux}/bin/eidola-gui $out/bin/eidola-gui
+                chmod u+w $out/bin/eidola-gui
+                patchelf --remove-rpath $out/bin/eidola-gui
+                patchelf --set-interpreter ${fdoInterpreter} $out/bin/eidola-gui
+                ${assertGlibcFloor "$out/bin/eidola-gui"}
+                chmod a-w $out/bin/eidola-gui
+              '';
+
+        # Debian dependencies, grouped by how each one is discovered, because
+        # only the first group can be checked against the artifact.
+        #
+        # DT_NEEDED — resolved eagerly by the loader. `assertDebNeededCovered`
+        # below fails the build if the shipped binary names a soname this
+        # table does not, so the package can never declare less than it links.
+        # The glibc entry carries the version floor, which turns an
+        # unsupported host into an apt refusal instead of a loader error.
+        debNeededPackages = {
+          "libc.so.6" = "libc6 (>= ${glibcSymbolFloor})";
+          "libm.so.6" = "libc6 (>= ${glibcSymbolFloor})";
+          # aarch64 links the loader itself; x86-64 does not, but both are
+          # libc6 and listing both keeps this table arch-independent.
+          "ld-linux-aarch64.so.1" = "libc6 (>= ${glibcSymbolFloor})";
+          "ld-linux-x86-64.so.2" = "libc6 (>= ${glibcSymbolFloor})";
+          "libgcc_s.so.1" = "libgcc-s1";
+          "libxkbcommon.so.0" = "libxkbcommon0";
+        };
+
+        # dlopened by bare soname, so absent from the ELF header and not
+        # derivable from it. Read out of the binary's string table:
+        # libwayland-client.so.0, libwayland-egl.so.1, libEGL.so.1,
+        # libvulkan.so.1. Note what is *not* here — fontconfig and freetype
+        # are Rust reimplementations in this build (`fontconfig_parser`), so
+        # neither library is loaded.
+        debDlopenPackages = [
+          "libwayland-client0"
+          "libwayland-egl1"
+          "libegl1"
+          "libvulkan1"
+        ];
+
+        # Not dependencies: a Vulkan ICD is a property of the machine's GPU
+        # (a host with proprietary NVIDIA drivers must not be made to install
+        # Mesa), and the font files the pure-Rust text stack reads off disk
+        # are supplied by any desktop install. Both are needed for the app to
+        # be useful, which is what Recommends means, and apt installs
+        # Recommends by default.
+        debRecommendsPackages = [
+          "mesa-vulkan-drivers"
+          "fonts-dejavu-core"
+        ];
+
+        assertDebNeededCovered = binary: ''
+          echo "checking that every DT_NEEDED soname has a declared package: ${binary}"
+          for soname in $(
+            ${readelfBin} -dW "${binary}" \
+              | grep NEEDED | tr -d '[]' | tr -s ' ' '\n' | grep '\.so'
+          ); do
+            case " ${pkgs.lib.concatStringsSep " " (builtins.attrNames debNeededPackages)} " in
+              *" $soname "*) ;;
+              *)
+                echo "error: ${binary} needs $soname, which no Debian package is declared for" >&2
+                echo "add it to debNeededPackages in flake.nix" >&2
+                exit 1
+                ;;
+            esac
+          done
+        '';
+
+        debArchitecture =
+          {
+            "x86_64-linux" = "amd64";
+            "aarch64-linux" = "arm64";
+          }
+          .${system} or null;
+
+        debVersion = workspaceCargoToml.workspace.package.version;
+
+        # The installed tree, exactly as it lands on the host.
+        #
+        # Both executables sit in /usr/libexec/eidola and /usr/bin/eidola-gui
+        # is a symlink to the GUI. That layout is not cosmetic: app-core
+        # resolves the inference engine as a `llama-server` sibling of the
+        # running executable, and /proc/self/exe reports the symlink's target,
+        # so a launch through /usr/bin lands in /usr/libexec/eidola and finds
+        # the sidecar there. The engine rule is unchanged on every platform.
+        eidolaLinuxDebTree =
+          if eidolaGuiLinuxFdo == null then
+            null
+          else
+            pkgs.runCommand "eidola-deb-tree"
+              {
+                nativeBuildInputs = [
+                  pkgs.appstream
+                  pkgs.desktop-file-utils
+                ];
+              }
+              ''
+                install -Dm755 ${eidolaGuiLinuxFdo}/bin/eidola-gui \
+                  $out/usr/libexec/eidola/eidola-gui
+                install -Dm755 ${llamaServer}/bin/llama-server \
+                  $out/usr/libexec/eidola/llama-server
+                mkdir -p $out/usr/bin
+                ln -s ../libexec/eidola/eidola-gui $out/usr/bin/eidola-gui
+
+                # Desktop entry — see the Nix installable above for why the
+                # comment header is stripped and why the basename is fixed.
+                mkdir -p $out/usr/share/applications
+                grep -v '^#' ${./releases/linux/ai.eidola.app.desktop} \
+                  > $out/usr/share/applications/ai.eidola.app.desktop
+
+                mkdir -p $out/usr/share/icons
+                cp -r --no-preserve=mode ${./releases/linux/icons}/. \
+                  $out/usr/share/icons/
+
+                # App-centre metadata. GNOME Software and KDE Discover render
+                # an installed app's page from this file.
+                install -Dm644 ${./releases/linux/ai.eidola.app.metainfo.xml} \
+                  $out/usr/share/metainfo/ai.eidola.app.metainfo.xml
+
+                # Both files are read by software nobody here controls, on
+                # machines we never see, so they are validated where a
+                # mistake is still cheap.
+                desktop-file-validate \
+                  $out/usr/share/applications/ai.eidola.app.desktop
+                appstreamcli validate --no-net --pedantic \
+                  $out/usr/share/metainfo/ai.eidola.app.metainfo.xml
+              '';
+
+        # The .deb: an `ar` archive of three members in a fixed order, the
+        # last two of which are tarballs of the control and data trees.
+        #
+        # Everything here is spelled out rather than delegated to dpkg-deb so
+        # the byte stream is a function of the tree: `ar -D` zeroes member
+        # timestamps, uids and modes, and the two tars carry the same
+        # discipline as `mkReproducibleArchive` above — sorted members, pinned
+        # mtime, no owner names, modes normalized. GNU tar format rather than
+        # that function's pax, because dpkg's extractor reads ustar plus the
+        # GNU long-name extensions and nothing else. dpkg-deb is still
+        # present, as the check that what we assembled is a package dpkg
+        # agrees with.
+        eidolaLinuxDeb =
+          if eidolaLinuxDebTree == null then
+            null
+          else
+            pkgs.runCommand "eidola_${debVersion}_${debArchitecture}.deb"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.gzip
+                  pkgs.binutils
+                  pkgs.dpkg
+                ];
+              }
+              ''
+                export LC_ALL=C
+                tree=${eidolaLinuxDebTree}
+
+                ${assertDebNeededCovered "$tree/usr/libexec/eidola/eidola-gui"}
+                ${assertGlibcFloor "$tree/usr/libexec/eidola/eidola-gui"}
+                ${assertFullyStatic "$tree/usr/libexec/eidola/llama-server"}
+
+                tarFlags="--format=gnu --sort=name --mtime=@0 \
+                  --owner=0 --group=0 --numeric-owner --mode=u=rwX,go=rX"
+
+                # data.tar.gz — the installed tree, rooted at `./`.
+                # shellcheck disable=SC2086
+                tar $tarFlags -C "$tree" -cf - . | gzip -n -9 > data.tar.gz
+
+                mkdir control
+
+                # md5sums, over every regular file in the payload. dpkg reads
+                # it for `dpkg --verify` and for conffile-less integrity
+                # checks; the symlink has no entry because it has no content.
+                ( cd "$tree" && find . -type f | sort | \
+                  while read -r f; do
+                    md5sum "$f"
+                  done ) | sed 's|\./||' > control/md5sums
+
+                installedSize=$(du -s -k --apparent-size "$tree" | cut -f1)
+
+                cat > control/control <<EOF
+                Package: eidola
+                Version: ${debVersion}
+                Architecture: ${debArchitecture}
+                Maintainer: Eidola, Inc. <hello@eidola.ai>
+                Installed-Size: $installedSize
+                Section: utils
+                Priority: optional
+                Homepage: https://www.eidola.ai
+                Depends: ${
+                  pkgs.lib.concatStringsSep ", " (
+                    pkgs.lib.naturalSort (
+                      pkgs.lib.unique (builtins.attrValues debNeededPackages ++ debDlopenPackages)
+                    )
+                  )
+                }
+                Recommends: ${pkgs.lib.concatStringsSep ", " debRecommendsPackages}
+                Description: private AI chat client
+                 A personal AI client whose privacy rests on verifiable architecture
+                 and open code rather than on a policy taken on faith. Conversations
+                 run against models in confidential-computing enclaves that the app
+                 verifies on every connection, or entirely on this device.
+                 .
+                 The bundled inference engine and the application binary are the only
+                 files this package installs beyond its desktop metadata; the Wayland,
+                 Vulkan and GPU stacks come from the host.
+                EOF
+
+                # shellcheck disable=SC2086
+                tar $tarFlags -C control -cf - . | gzip -n -9 > control.tar.gz
+
+                echo "2.0" > debian-binary
+
+                # `ar -D`: deterministic mode, which zeroes each member's
+                # timestamp, uid, gid and mode. Member order is dpkg's
+                # requirement, not ar's.
+                ar rcD "$out" debian-binary control.tar.gz data.tar.gz
+
+                echo "── dpkg-deb --info ──"
+                dpkg-deb --info "$out"
+                echo "── dpkg-deb --contents ──"
+                dpkg-deb --contents "$out"
+              '';
+
       in
       {
         packages = {
@@ -1362,6 +1670,10 @@ with open(path, "wb") as f:
             pname = "eidola-gui-linux";
             payload = eidolaGuiLinuxWrapped;
           };
+          # The host-generic GUI binary, and the Debian package built over it.
+          eidola-gui-linux-fdo = eidolaGuiLinuxFdo;
+          eidola-linux-deb-tree = eidolaLinuxDebTree;
+          eidola-linux-deb = eidolaLinuxDeb;
         };
 
         # Development shell (lightweight — daily Rust dev uses rustup)
