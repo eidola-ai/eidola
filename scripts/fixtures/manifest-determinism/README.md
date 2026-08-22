@@ -11,4 +11,7 @@ None of these is a real manifest or a real workflow. The `.yml` files deliberate
 | `bad-empty-artifacts.json` | `artifacts: {}`. A manifest that records nothing would otherwise satisfy every per-entry rule vacuously. |
 | `bad-signing-feeds-manifest.yml` | A signing job is a direct `needs:` of the manifest job, which also holds the signing environment. |
 | `bad-transitive-signing.yml` | The same, one hop further away: the manifest job needs `apple`, and `apple` needs the signing job. Ancestors are walked, not just direct edges. |
+| `bad-quoted-needs.yml` | The dependency on the key-holding job written as a quoted scalar (`- "apple-envelope"`), with a job name that says nothing about signing. Names are unquoted before the graph is built. |
+| `bad-quoted-job-name.yml` | The same graph with the quotes on the job key (`"apple-envelope":`), which an unquoted-only header pattern never registers as a job at all. |
+| `bad-fractional-schema.json` | `schema_version: 2.5`. The client reads that field with `as_u64()`, so a non-integer is malformed *there*; the gate has to reject what the verifier would. |
 | `bad-mapping-environment.yml` | `environment:` in mapping form (`name: apple-signing`) on the job that computes a manifest partial — valid GitHub Actions that a scalar-only parser reads as "no environment". |

@@ -109,8 +109,17 @@ check_manifest() {
         "manifest: not a JSON object"
       else
         keyset("manifest"; ["artifacts", "enclave", "schema_version"]),
+        # A positive integer, per docs/trust-root.md — and specifically what
+        # the client parses it as. The verifier reads it with `as_u64()`, so
+        # 2.5 or -3 is malformed *there* and reads as a claims change; this
+        # gate has to reject what that parser would reject, or a release
+        # passes here and alarms every client.
         (if (.schema_version | type) != "number" then
-           "manifest.schema_version: not an integer"
+           "manifest.schema_version: not a number"
+         elif (.schema_version | floor) != .schema_version then
+           "manifest.schema_version: \(.schema_version) is not an integer"
+         elif .schema_version < 1 then
+           "manifest.schema_version: \(.schema_version) is not a positive integer"
          else empty end),
         (if (.artifacts | type) != "object" then
            "manifest.artifacts: not an object"
@@ -193,13 +202,29 @@ check_workflow() {
 
   out="$(
     awk '
+      # YAML scalars may be quoted anywhere a name appears — `"apple-sign":`
+      # as a job key, `- "apple-sign"` in a needs list. Names are compared
+      # against each other to build the graph, so they are unquoted once,
+      # here, rather than at each comparison.
+      BEGIN { SQ = sprintf("%c", 39) }
+      function unquote(s,   first, last) {
+        gsub(/^[ \t]+/, "", s)
+        gsub(/[ \t]+$/, "", s)
+        first = substr(s, 1, 1)
+        last = substr(s, length(s), 1)
+        if ((first == "\"" || first == SQ) && last == first && length(s) > 1)
+          s = substr(s, 2, length(s) - 2)
+        return s
+      }
+
       # ── collect: job name -> needs, environment, produces-partial ──
       /^[^ #]/ { in_jobs = ($0 ~ /^jobs:/); next }
 
-      in_jobs && /^  [A-Za-z0-9_-]+:[ \t]*$/ {
+      in_jobs && /^  [^ \t#-][^:]*:[ \t]*$/ {
         job = $0
         sub(/^  /, "", job)
         sub(/:[ \t]*$/, "", job)
+        job = unquote(job)
         jobs[++njobs] = job
         collecting_needs = 0
         collecting_env = 0
@@ -220,7 +245,7 @@ check_workflow() {
         if (rest ~ /[^ \t]/) {
           n = split(rest, parts, /[ \t]+/)
           for (i = 1; i <= n; i++)
-            if (parts[i] != "") needs[job] = needs[job] " " parts[i]
+            if (parts[i] != "") needs[job] = needs[job] " " unquote(parts[i])
           collecting_needs = 0
         } else {
           collecting_needs = 1
@@ -230,7 +255,7 @@ check_workflow() {
       collecting_needs && /^      - / {
         dep = $0
         sub(/^      -[ \t]*/, "", dep)
-        needs[job] = needs[job] " " dep
+        needs[job] = needs[job] " " unquote(dep)
         next
       }
       # `environment:` is either a scalar (a name, or an expression that
@@ -289,7 +314,10 @@ check_workflow() {
             seen[d] = 1
             chain[d] = chain[cur] " -> " d
             queue[++tail] = d
-            if (signer[d])
+            # `signer[d]` covers jobs this file defines; the name test
+            # also covers a dependency on a job this parse never saw — a
+            # reusable workflow, or a job whose key it could not read.
+            if (signer[d] || d ~ /sign/)
               print "the `artifact-manifest` job depends on signing job `" d "` (" chain[d] ") — a key-dependent value could then reach the manifest"
           }
         }
