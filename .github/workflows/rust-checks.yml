@@ -52,7 +52,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -217,7 +217,7 @@ jobs:
         # so there's no per-PR thrash. This job only runs tests; no artifact
         # from here is published.
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true' || steps.scope.outputs.markdown == 'true'
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
 
@@ -259,6 +259,14 @@ jobs:
 
       - name: Test Apple archive verifier (tar + zip, read-only directories)
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true'
+        # The harness runs its body under the host userland and again under GNU
+        # tar + mawk, because bsdtar and BSD awk on a developer's Mac hide
+        # differences that bite on the GNU/Linux userland most people verifying
+        # a download run. This runner is that userland, so the second pass needs
+        # no Nix here — but it may only ever be skipped on a developer machine,
+        # never in CI, which is what this variable enforces.
+        env:
+          EIDOLA_TEST_REQUIRE_GNU_USERLAND: "1"
         run: ./scripts/test-verify-apple.sh
 
       - name: Check OpenAPI spec freshness

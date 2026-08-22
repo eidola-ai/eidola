@@ -2,6 +2,16 @@
 # Exercise the public two-archive verifier over both containers it reads: the
 # canonical gzip'd POSIX tar the flake publishes as the unsigned macOS
 # archive, and zip. Includes Nix-style read-only directories.
+#
+# verify-apple.sh is POSIX shell so it can run from a release tarball, and the
+# people running it are far more often on a GNU/Linux userland than on macOS.
+# The two differ where the verifier lives: GNU tar applies a directory's
+# archived mode the moment it creates the directory (bsdtar defers to the end
+# of extraction), and mawk is stricter than BSD awk about character classes
+# and writes to "/dev/stderr". So the whole body below runs twice — once under
+# the host's own tools, once under GNU tar plus mawk. On a GNU host the second
+# pass only has to point `awk` at mawk; on macOS Nix supplies the tools, and
+# without Nix the pass is skipped loudly (see EIDOLA_TEST_REQUIRE_GNU_USERLAND).
 set -eu
 
 command -v zip >/dev/null 2>&1 || {
@@ -16,11 +26,40 @@ command -v tar >/dev/null 2>&1 || {
   echo "test-verify-apple requires tar" >&2
   exit 2
 }
-# Same directory-mode deferral verify-apple.sh probes for: this harness
-# extracts a read-only archive itself to prove the modes survived the pack.
-tar_delay=
-if tar --delay-directory-restore --version >/dev/null 2>&1; then
-  tar_delay=--delay-directory-restore
+
+is_gnu_tar() {
+  tar --version 2>/dev/null | head -n 1 | grep -q 'GNU tar'
+}
+
+# Driver: no userland selected yet, so run one pass per userland and stop.
+if [ -z "${EIDOLA_TEST_USERLAND:-}" ]; then
+  EIDOLA_TEST_USERLAND=host "$0"
+
+  gnu_pass_ran=0
+  if is_gnu_tar && command -v mawk >/dev/null 2>&1; then
+    EIDOLA_TEST_USERLAND=gnu "$0"
+    gnu_pass_ran=1
+  elif command -v nix >/dev/null 2>&1; then
+    # --inputs-from . takes nixpkgs from this repo's flake lock rather than
+    # the ambient registry, so the pass is pinned like every other Nix input.
+    nix shell --inputs-from . \
+      nixpkgs#gnutar nixpkgs#mawk nixpkgs#coreutils nixpkgs#findutils \
+      --command env EIDOLA_TEST_USERLAND=gnu "$0"
+    gnu_pass_ran=1
+  fi
+
+  if [ "$gnu_pass_ran" -eq 0 ]; then
+    echo "" >&2
+    echo "test-verify-apple: SKIPPED the GNU userland pass." >&2
+    echo "  This host has neither a GNU tar + mawk userland nor nix, so the" >&2
+    echo "  verifier was only exercised against the host's own tools. Install" >&2
+    echo "  Nix to cover the userland most people verifying a download run." >&2
+    if [ -n "${EIDOLA_TEST_REQUIRE_GNU_USERLAND:-}" ]; then
+      echo "  EIDOLA_TEST_REQUIRE_GNU_USERLAND is set: this is a failure." >&2
+      exit 1
+    fi
+  fi
+  exit 0
 fi
 
 fixture=scripts/fixtures/apple-roundtrip/synthetic-universal
@@ -30,6 +69,34 @@ cleanup() {
   rm -rf "$test_root"
 }
 trap cleanup EXIT HUP INT TERM
+
+if [ "$EIDOLA_TEST_USERLAND" = gnu ]; then
+  is_gnu_tar || {
+    echo "test-verify-apple: the GNU pass did not get GNU tar" >&2
+    exit 1
+  }
+  mawk=$(command -v mawk) || {
+    echo "test-verify-apple: the GNU pass did not get mawk" >&2
+    exit 1
+  }
+  # Debian resolves `awk` through alternatives (gawk if installed) and nixpkgs'
+  # mawk installs only `mawk`, so neither reliably puts mawk behind the name
+  # the verifier calls. One symlink ahead of PATH makes it certain.
+  mkdir "$test_root/userland"
+  ln -s "$mawk" "$test_root/userland/awk"
+  PATH="$test_root/userland:$PATH"
+  export PATH
+fi
+printf '=== test-verify-apple: %s userland (%s, awk: %s) ===\n' \
+  "$EIDOLA_TEST_USERLAND" "$(tar --version 2>&1 | head -n 1)" "$(command -v awk)"
+
+# Same directory-mode deferral verify-apple.sh probes for: this harness
+# extracts a read-only archive itself to prove the modes survived the pack.
+tar_delay=
+if tar --delay-directory-restore --version >/dev/null 2>&1; then
+  tar_delay=--delay-directory-restore
+fi
+
 mkdir -p "$test_root/unsigned" "$test_root/detached"
 
 run_verify_bounded() {

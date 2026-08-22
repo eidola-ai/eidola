@@ -631,17 +631,54 @@ impl SpacesStore {
     /// everywhere at once, and an override is written per space), so the answer
     /// is every live space rather than one.
     ///
-    /// **Not routed through `notify_space_changed`**, whose other two effects
-    /// are about *posts*: nothing a participant edit does invalidates a cached
-    /// incoming-reference index or a trace round. Each entity's own
-    /// `is_busy` gate still applies, and it **defers rather than discards**.
+    /// **The reverse index answers to this signal too.** It used not to — the
+    /// rule below said a participant edit invalidates no incoming-reference
+    /// index, and that was true while an `IncomingReference` was pure
+    /// geometry. It now carries the *referrer's* author identity, resolved by
+    /// `db::references_to`'s own `COALESCE(space_participant.override_label,
+    /// participant.label)` join at read time and never re-derived — the same
+    /// sentence the transcript's names are true of, one direction over — so a
+    /// rename leaves every cached backlink naming its author as it was
+    /// (Codex review, PR #327). Traces are still exempt: a round is a tool
+    /// call, and nothing about it is a participant's name.
+    ///
+    /// Each entity's own `is_busy` gate still applies to the transcript, and it
+    /// **defers rather than discards**; the index needs no such gate, being a
+    /// cache with a lazy per-post refill rather than a read anything waits on.
     ///
     /// A space created a moment ago is an ordinary registry member — its row
     /// commits when its window opens — so a rename landing while its first
     /// read is in flight reaches it like any other (Codex review, PR #292).
     pub fn notify_participants_changed(&mut self, cx: &mut Context<Self>) {
         for entity in self.live_spaces() {
-            entity.update(cx, |space, cx| space.invalidate_transcript(cx));
+            entity.update(cx, |space, cx| {
+                space.invalidate_incoming_references(cx);
+                space.invalidate_transcript(cx);
+            });
+        }
+    }
+
+    /// React to a `Change::SpaceIndex` by dropping every live space's cached
+    /// **reverse index**. Routed here from `stores::dispatch_change`, beside
+    /// the Library re-list that signal has always driven.
+    ///
+    /// A conversation's **title** moves on that signal and nothing else:
+    /// `AppCore::rename_space` emits `SpaceIndex` alone. An
+    /// `IncomingReference` carries the *referring* space's title — what tells
+    /// one author's two backlinks apart in the highlight picker — joined at
+    /// read time like the author identity beside it, so a rename left every
+    /// cached backlink naming the conversation as it was, indefinitely, until
+    /// some unrelated `Change::Space` happened past (Codex review, PR #327).
+    ///
+    /// **Every** live space, because the signal names none: the renamed
+    /// conversation is the *referrer*, and the windows holding stale rows are
+    /// the ones on the space it quoted. Neither the transcript nor the trace
+    /// index is touched — a title appears in neither. The refill is lazy and
+    /// per rendered post, so the cost is a query per visible post at most, the
+    /// same bargain `notify_space_changed` already takes on every post.
+    pub fn notify_space_index_changed(&mut self, cx: &mut Context<Self>) {
+        for entity in self.live_spaces() {
+            entity.update(cx, |space, cx| space.invalidate_incoming_references(cx));
         }
     }
 
