@@ -70,6 +70,12 @@ fn test_core() -> (Arc<AppCore>, tempfile::TempDir) {
 /// thread is already panicking — a panic in `Drop` during unwinding aborts the
 /// process and would bury the assertion that actually failed.
 ///
+/// **And giving up on the wait leaks the core rather than releasing it.**
+/// Timing out is precisely the case where a task may still own an
+/// `Arc<AppCore>`, so releasing this one hands that task the last reference and
+/// the runtime gets dropped from a worker — the exact panic the barrier exists
+/// to prevent, arriving on the path where it does the most damage. See `Drop`.
+///
 /// **Some tasks never drain, and the barrier has to be told.** The hazard is
 /// only ever a task that *owns* an `Arc<AppCore>`; a task that owns none can
 /// never be the last owner, so waiting on it buys nothing and would hang out
@@ -82,6 +88,11 @@ struct Backing {
     /// How many alive tasks are known to hold no `Arc<AppCore>` — see
     /// [`Backing::excuse_ownerless_tasks`].
     ownerless: usize,
+    /// How long the barrier waits. A field rather than the bare constant so the
+    /// guard's own timeout behaviour is reachable from a test in under half a
+    /// minute — the only way this class is testable at all, since the hazard it
+    /// prevents is a race nothing can schedule.
+    drain_timeout: std::time::Duration,
 }
 
 /// How long teardown waits for the bridge tasks to drain. Generous: the tasks
@@ -105,13 +116,35 @@ impl Backing {
 
 impl Drop for Backing {
     fn drop(&mut self) {
-        let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+        let deadline = std::time::Instant::now() + self.drain_timeout;
         while self.core.runtime().metrics().num_alive_tasks() > self.ownerless {
             if std::time::Instant::now() >= deadline {
+                // **The invariant, restored the only way still available: if
+                // this guard could not prove the runtime idle, nothing may
+                // ever drop it.**
+                //
+                // Giving up on the wait used to hand the hazard straight back
+                // — this guard's `Arc` drops, `Stores` drops at `cx` teardown,
+                // and the still-running task becomes the last owner and drops
+                // the runtime from inside its own worker. On the unwinding
+                // path that is a second panic during an unwind, which aborts
+                // the process and takes the assertion failure that actually
+                // matters with it (Codex review, PR #327).
+                //
+                // So leak one owner. The strong count can no longer reach
+                // zero, the runtime is never dropped, and the class of panic
+                // this guard exists to prevent is unreachable rather than
+                // merely unlikely. The cost is one abandoned runtime and its
+                // threads for the rest of the process — paid only on a path
+                // where a test has already failed or is about to, and the
+                // alternative is losing the reason it failed.
+                std::mem::forget(self.core.clone());
                 if !std::thread::panicking() {
                     panic!(
-                        "bridge tasks did not drain within {DRAIN_TIMEOUT:?} — the last \
-                         Arc<AppCore> may drop on a tokio worker and take the runtime with it"
+                        "bridge tasks did not drain within {:?} — the runtime has \
+                         been leaked so the wait's failure is what you see, rather than a \
+                         worker dropping it out from under this thread",
+                        self.drain_timeout
                     );
                 }
                 return;
@@ -132,6 +165,7 @@ fn backed_stores(cx: &mut TestAppContext) -> (Stores, Backing) {
             core,
             _dir: dir,
             ownerless: 0,
+            drain_timeout: DRAIN_TIMEOUT,
         },
     )
 }
@@ -3074,5 +3108,62 @@ fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestA
         space.read_with(cx, |s, _| s.transcript_refresh_failure().is_none()
             && matches!(s.transcript(), Loadable::Loaded { .. })),
         "a read that answered leaves no failure surface standing"
+    );
+}
+
+/// REGRESSION (Codex review, PR #327): **a barrier that gives up must not hand
+/// the hazard back.**
+///
+/// Timing out is precisely the case where a task may still own an
+/// `Arc<AppCore>`. Releasing this guard's own reference there makes that task
+/// the last owner, so the runtime is dropped from inside one of its own workers
+/// — the panic the barrier exists to prevent, arriving on the path where it
+/// does the most damage: during an unwind, a second panic aborts the process
+/// and the assertion that actually failed is never printed.
+///
+/// So the give-up path leaks one owner and the invariant becomes structural —
+/// *if idleness could not be proven, nothing may ever drop the runtime*. That
+/// is what this asserts, by counting owners across the drop: the guard's
+/// reference is retained rather than released, so the strong count does not
+/// fall. The panic is expected on this path (nothing is unwinding yet) and is
+/// caught, because what is under test is what the guard did with its `Arc`, not
+/// how loudly it complained.
+#[gpui::test]
+fn a_drain_that_times_out_never_lets_go_of_the_runtime(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (core, dir) = test_core();
+    let weak = Arc::downgrade(&core);
+
+    // A task that owns the core and outlives any barrier — the shape the
+    // guard cannot wait out and must therefore never race.
+    let held = core.clone();
+    core.runtime().handle().spawn(async move {
+        let _core_owned_by_this_task = held;
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    });
+    while core.runtime().metrics().num_alive_tasks() == 0 {
+        std::thread::yield_now();
+    }
+
+    let owners_before = weak.strong_count();
+    assert_eq!(owners_before, 2, "the guard's reference and the task's");
+
+    let backing = Backing {
+        core,
+        _dir: dir,
+        ownerless: 0,
+        drain_timeout: std::time::Duration::from_millis(200),
+    };
+    let complained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(backing)));
+    assert!(
+        complained.is_err(),
+        "a drain that could not finish says so rather than passing quietly"
+    );
+
+    assert_eq!(
+        weak.strong_count(),
+        owners_before,
+        "the guard released its owner after failing to prove the runtime idle, so the task is \
+         now the last one and will drop the runtime from its own worker"
     );
 }
