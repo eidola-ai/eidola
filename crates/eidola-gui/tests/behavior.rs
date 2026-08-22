@@ -17614,3 +17614,70 @@ fn space_a_regeneration_running_elsewhere_is_marked_until_it_lands(cx: &mut Test
         "and the completion that superseded that generation took the mark with it: {after:?}"
     );
 }
+
+#[gpui::test]
+fn space_a_regeneration_that_fails_elsewhere_still_ends_the_mark(cx: &mut TestAppContext) {
+    // The other half of the ending. A regeneration that *fails* writes no
+    // successor — no action row, and for a ceiling truncation only a Record
+    // entry attached to nothing — so the transcript comes back byte-identical
+    // and supersession has nothing to say. The claim's release is what ends the
+    // mark, published by app-core and arriving as `RegenerationSettled`.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    use eidola_gui::probe;
+    let names = |cx: &mut TestAppContext| -> Vec<String> {
+        probe::set_probes_enabled(true);
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        probe::set_probes_enabled(false);
+        names
+    };
+
+    let before = names(cx);
+    assert!(
+        before
+            .iter()
+            .any(|n| n.ends_with("/regenerating-elsewhere")),
+        "the mark stands while the other regeneration runs: {before:?}"
+    );
+
+    // The other regeneration fails. **Nothing about the transcript changes** —
+    // same generation, same text, same everything — which is precisely why the
+    // mark needs an ending that does not come from the tree.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.settle_collision_for_test("a2", cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    space.read_with(cx, |s, _| {
+        let posts = s.messages();
+        assert_eq!(posts.len(), 2, "the transcript is what it was");
+        assert_eq!(
+            posts[1].action_id.as_deref(),
+            Some("a2"),
+            "nothing superseded the marked generation"
+        );
+    });
+    let after = names(cx);
+    assert!(
+        !after.iter().any(|n| n.ends_with("/regenerating-elsewhere")),
+        "and the released claim ended the mark anyway: {after:?}"
+    );
+}

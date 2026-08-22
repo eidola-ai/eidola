@@ -456,6 +456,19 @@ pub enum SpaceEvent {
     /// state the completion itself removes: the regeneration supersedes that
     /// action id, and the mark goes with the post it was about.
     RegenerationCollided { action_id: String },
+    /// The regeneration a [`Self::RegenerationCollided`] met has **ended**,
+    /// however it ended — the process-wide claim was released.
+    ///
+    /// Supersession is only half an ending. A regeneration that succeeds leaves
+    /// a new generation, and the mark goes with the one it replaced; a
+    /// regeneration that *fails* writes no successor at all — no action row,
+    /// and for a ceiling truncation only a Record entry attached to nothing —
+    /// so a surface waiting on the transcript alone would go on saying the
+    /// answer was being regenerated for the life of the window. The claim's
+    /// release is the fact that ends it, and app-core publishes it
+    /// ([`eidola_app_core::AppCore::regeneration_settled`]) rather than leaving
+    /// it to be inferred from a tree that never changed.
+    RegenerationSettled { action_id: String },
     /// A submit's (or a driven turn's) notification plan hit the space's
     /// cascade limit at `target_action_id` — the resumable paused state. The
     /// view renders a quiet, dismissible "cascade limit reached — ask to
@@ -499,6 +512,15 @@ pub struct Space {
     /// One runner per in-flight streaming turn, keyed by `seq` — the doctrine's
     /// keyed-slot pattern. Removing an entry cancels that turn only.
     turn_runners: HashMap<u64, Task<()>>,
+    /// One waiter per standing regeneration **collision**, keyed by the
+    /// generation the refused press named — each awaiting the end of the
+    /// regeneration it collided with (see [`Self::collide_revision`]).
+    ///
+    /// Deliberately **not** counted by [`Self::is_busy`]: nothing of this
+    /// space's is running. A waiter is doing exactly one thing — listening for
+    /// somebody else's turn to finish — and a space that refused to accept a
+    /// post while it listened would be busy on another window's behalf.
+    collision_waiters: HashMap<String, Task<()>>,
     /// The turn a failed ask leaves behind (who + what), for Retry.
     failed_turn: Option<FailedTurn>,
     /// Supersede slot for the reopened-space initial transcript load.
@@ -673,6 +695,7 @@ impl Space {
             last_edit_text: String::new(),
             post_runner: None,
             turn_runners: HashMap::new(),
+            collision_waiters: HashMap::new(),
             failed_turn: None,
             load_task: None,
             pending_transcript_refresh: false,
@@ -804,6 +827,7 @@ impl Space {
             last_edit_text: String::new(),
             post_runner: None,
             turn_runners: HashMap::new(),
+            collision_waiters: HashMap::new(),
             failed_turn: None,
             load_task: None,
             pending_transcript_refresh: false,
@@ -2162,8 +2186,8 @@ impl Space {
                         cx.notify();
                     });
                 }
-                (Err(AppError::RegenerationInFlight { .. }), _) => {
-                    let _ = this.update(cx, |this, cx| this.collide_revision(seq, cx));
+                (Err(AppError::RegenerationInFlight { item_id }), _) => {
+                    let _ = this.update(cx, |this, cx| this.collide_revision(seq, item_id, cx));
                 }
                 (Err(e), _) => {
                     let _ = this.update(cx, |this, cx| this.fail_turn(seq, None, None, e, cx));
@@ -2183,7 +2207,15 @@ impl Space {
     /// every removed operation owes), and the collision travels as
     /// [`SpaceEvent::RegenerationCollided`] naming the generation it collided
     /// on, so the surface can hold it in something that completion removes.
-    fn collide_revision(&mut self, seq: u64, cx: &mut Context<Self>) {
+    ///
+    /// **And its end is waited for, not inferred.** Supersession answers only
+    /// the regeneration that succeeds; one that fails leaves the transcript
+    /// exactly as it found it, so a mark keyed to the tree alone would stand
+    /// for the life of the window. A waiter is armed on the item app-core's
+    /// claim is keyed by — the id the refusal itself carries — and emits
+    /// [`SpaceEvent::RegenerationSettled`] naming the same generation the mark
+    /// does, so the two are the same key from both directions.
+    fn collide_revision(&mut self, seq: u64, item_id: String, cx: &mut Context<Self>) {
         let target = self
             .streams
             .iter()
@@ -2193,9 +2225,42 @@ impl Space {
         self.turn_runners.remove(&seq);
         self.load_transcript(cx);
         if let Some(action_id) = target {
+            self.await_regeneration_settled(action_id.clone(), item_id, cx);
             cx.emit(SpaceEvent::RegenerationCollided { action_id });
         }
         cx.notify();
+    }
+
+    /// Arm the waiter that ends a collision mark: hold until app-core says no
+    /// regeneration is running against `item_id`, then announce it against
+    /// `action_id` — the generation the refused press named.
+    ///
+    /// Keyed by the generation rather than the item so a second collision on a
+    /// later generation of the same post gets its own waiter, and so the slot
+    /// map reads the way the mark does. A repeat press on the *same* generation
+    /// replaces the waiter it already has, which is right: they are waiting on
+    /// the same claim, and the newer one was armed after it.
+    fn await_regeneration_settled(
+        &mut self,
+        action_id: String,
+        item_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(app_core) = self.app_core.clone() else {
+            return; // stub stores: the event is driven directly in tests
+        };
+        let key = action_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let _ = bridge::regeneration_settled(app_core, item_id).await;
+            let _ = this.update(cx, |this, cx| {
+                this.collision_waiters.remove(&key);
+                cx.emit(SpaceEvent::RegenerationSettled {
+                    action_id: key.clone(),
+                });
+                cx.notify();
+            });
+        });
+        self.collision_waiters.insert(action_id, task);
     }
 
     /// Shared completion for post-only/edit/regenerate: on success reload the
@@ -2595,7 +2660,19 @@ impl Space {
     /// it collided on. No `Failed`, no [`FailedTurn`]: nothing broke.
     #[doc(hidden)]
     pub fn collide_revision_for_test(&mut self, seq: u64, cx: &mut Context<Self>) {
-        self.collide_revision(seq, cx);
+        self.collide_revision(seq, "item-under-test".into(), cx);
+    }
+
+    /// Test-only: announce that the regeneration `action_id`'s press collided
+    /// with has ended — what the waiter emits when app-core's claim releases,
+    /// without a core to release one.
+    #[doc(hidden)]
+    pub fn settle_collision_for_test(&mut self, action_id: &str, cx: &mut Context<Self>) {
+        self.collision_waiters.remove(action_id);
+        cx.emit(SpaceEvent::RegenerationSettled {
+            action_id: action_id.to_string(),
+        });
+        cx.notify();
     }
 
     /// Test-only: push one synthetic in-flight turn (multi-stream scenes).

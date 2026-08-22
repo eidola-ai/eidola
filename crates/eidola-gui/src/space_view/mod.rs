@@ -2072,6 +2072,15 @@ impl SpaceView {
                     .insert(SharedString::from(action_id.clone()));
                 self.rebuild(cx);
             }
+            SpaceEvent::RegenerationSettled { action_id } => {
+                // The other half of the ending. Supersession covers the
+                // regeneration that succeeds; this covers the one that fails,
+                // which leaves the transcript exactly as it found it and so
+                // has nothing in the tree for the mark to end on.
+                self.regenerating_elsewhere
+                    .remove(&SharedString::from(action_id.clone()));
+                self.rebuild(cx);
+            }
             SpaceEvent::CascadePaused {
                 depth,
                 limit,

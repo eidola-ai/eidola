@@ -260,6 +260,23 @@ pub fn regenerate_stream(
     (event_rx, done_rx)
 }
 
+/// **When the regeneration running against `item_id` ends** — however it ends.
+/// Resolves at once when nothing is running against it.
+///
+/// The other half of the claim a refused `regenerate_stream` reports. A surface
+/// that was refused has to be able to stop saying so, and a regeneration that
+/// *fails* writes no successor for a transcript refresh to notice — so the end
+/// is published from the one place that knows it rather than inferred from the
+/// tree.
+pub fn regeneration_settled(core: Arc<AppCore>, item_id: String) -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel();
+    core.runtime().handle().clone().spawn(async move {
+        core.regeneration_settled(item_id).await;
+        let _ = tx.send(());
+    });
+    rx
+}
+
 /// Load a space's threaded-post render tree (the reopened-space initial load
 /// and the post-stream reload). The flattened `PostNode` list the transcript
 /// renders from — see `AppCore::get_space_tree` — **and the change-bus
