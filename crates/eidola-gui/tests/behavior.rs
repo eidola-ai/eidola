@@ -17592,10 +17592,14 @@ fn space_a_regeneration_running_elsewhere_is_marked_until_it_lands(cx: &mut Test
         "the reader is told which answer is already being regenerated: {before:?}"
     );
 
-    // The other regeneration commits: the item's tip is a new generation, so
-    // the generation the mark was about is no longer in the transcript.
+    // The other regeneration commits. It is a new **generation of the same
+    // item** — which is why keying the mark on the generation is what ends it,
+    // and keying it on the item would not have.
     let mut a3 = fixture_assistant_post("a3", "the regenerated reply");
     a3.parent_action_id = Some("a1".into());
+    a3.item_id = "item-a2".into();
+    a3.generation = 1;
+    a3.generation_count = 2;
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, cx| {
             s.set_post_tree_for_test(vec![fixture_user_post("a1", "original text"), a3], cx)

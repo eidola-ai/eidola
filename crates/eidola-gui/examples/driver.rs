@@ -303,6 +303,32 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_regenerating_elsewhere",
+                description: "Space view: a regeneration refused because one is already running against that answer somewhere this window cannot see — a quiet mark on the post, not a failure notice",
+                default_size: size(px(900.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx);
+                        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+                        if let Some(seq) = s.revising_seq("a2") {
+                            s.collide_revision_for_test(seq, cx);
+                        }
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_answer_cut_off",
                 description: "Space view: an answer that stopped at its length allowance — scroll the first reply to its end to see the mark beneath the text it is about",
                 default_size: size(px(900.), px(720.)),

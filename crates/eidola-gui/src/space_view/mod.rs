@@ -775,11 +775,13 @@ pub struct SpaceView {
     /// already being regenerated elsewhere (see
     /// `SpaceEvent::RegenerationCollided`).
     ///
-    /// Keyed by **generation**, which is what makes the state end on its own:
-    /// the regeneration it collided with supersedes that action id, the
-    /// reloaded transcript carries only the item's new tip, and
-    /// [`SpaceView::prune_post_marks`] drops the key with the post it was
-    /// about. Nothing has to notice the completion and clear it.
+    /// Keyed by **generation**, which is what makes the state end on its own.
+    /// The mark is drawn only on the post whose action id it names, and the
+    /// regeneration it collided with supersedes exactly that action id — so the
+    /// transcript refresh that carries the finished answer here is the same
+    /// event that takes the mark off the screen, with nothing watching for it.
+    /// Keyed by *item* it would have outlived the very completion it is waiting
+    /// for. [`SpaceView::prune_post_marks`] then drops the dead key.
     pub(crate) regenerating_elsewhere: HashSet<SharedString>,
 
     /// Whether this window's **inspector** (the per-space settings panel) is
@@ -1773,17 +1775,18 @@ impl SpaceView {
         self.posts = posts;
     }
 
-    /// Drop every session-scoped mark whose **generation** has left the
-    /// transcript, beside the two references that forward across one.
+    /// Drop every session-scoped post mark whose **generation** has left the
+    /// transcript, beside the two window-local references that forward across
+    /// one.
     ///
-    /// Both marks say something about one version of a post — that it stopped
-    /// at its length allowance, that a regeneration of it was already running —
-    /// and an edit or a regeneration answers both by producing a different
-    /// version. So this is not housekeeping: it is how the collision mark ends
-    /// when the regeneration it collided with lands, and it is why nothing has
-    /// to watch for that completion. Unlike a draft's antecedent or the tree
-    /// focus, neither mark forwards — what they assert is untrue of the new
-    /// generation.
+    /// Unlike a draft's antecedent or the tree focus, neither mark forwards:
+    /// each says something about one version of a post — that it stopped at its
+    /// length allowance, that a regeneration of it was already running — and an
+    /// edit or a regeneration answers it by producing a different version.
+    /// Neither is drawn anywhere but on the generation it names, so this
+    /// changes nothing a reader sees; what it does is make the state end where
+    /// the drawing already does, rather than accumulate a key per superseded
+    /// generation for the life of the window.
     ///
     /// A transcript with nothing in it is a read that has not answered, not an
     /// empty conversation, and nothing can be pruned against it.
@@ -1791,10 +1794,7 @@ impl SpaceView {
         if next.is_empty() {
             return;
         }
-        let live: HashSet<SharedString> = next
-            .iter()
-            .filter_map(|p| p.action_id.clone())
-            .collect::<HashSet<_>>();
+        let live: HashSet<SharedString> = next.iter().filter_map(|p| p.action_id.clone()).collect();
         self.truncated_posts.retain(|id| live.contains(id));
         self.regenerating_elsewhere.retain(|id| live.contains(id));
     }
