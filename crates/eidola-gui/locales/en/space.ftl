@@ -53,3 +53,8 @@ space-highlight-picker-elsewhere = { $byline }, in { $space }
 space-highlight-picker-elsewhere-untitled = { $byline }, in another space
 space-highlight-picker-unnamed = A post in { $space }
 space-highlight-picker-unnamed-untitled = A post in another space
+# Two rows that composed to the same sentence — one author quoting the same
+# passage from two conversations that share a title, or from two nobody named.
+# A counter, not context: it claims only that these are different rows and this
+# is the first of them, in the order the backlinks were written.
+space-highlight-picker-nth = { $label } ({ $n })

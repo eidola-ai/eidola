@@ -7480,7 +7480,12 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
 ///    the kind is what is left, and it is enough;
 /// 4. "another space" where the conversation was never named;
 /// 5. the original sentence, surviving only where nothing names anyone **and**
-///    nothing names the place.
+///    nothing names the place;
+/// 6. and, because a title is neither unique nor required, a **collision
+///    ordinal** wherever two rows would still read alike — rows 2/7 share a
+///    title, rows 8/9 share the absence of one (Codex review, PR #327). The
+///    closing assertion states the property the ordinals exist for, over
+///    whatever the fixture holds.
 #[gpui::test]
 fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext) {
     let _guard = probes_on();
@@ -7530,13 +7535,20 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
                     incoming("x4", "human", "", None),
                     incoming("x5", "tool", "  ", Some("Harness output")),
                     incoming("x6", "tool", "  ", None),
+                    // The discriminator is itself non-unique: a title is
+                    // neither required nor unique, so one author can reach
+                    // this picker from two conversations that share a name —
+                    // and from two that have none.
+                    incoming("x7", "agent", "Sofia", Some("Spring tides")),
+                    incoming("x8", "agent", "Mara", None),
+                    incoming("x9", "agent", "Mara", None),
                 ],
             );
         });
     });
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.click_highlight_for_test("a1", &[0, 1, 2, 3, 4, 5, 6], window, cx)
+            v.click_highlight_for_test("a1", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], window, cx)
         });
     })
     .unwrap();
@@ -7545,11 +7557,16 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
     for (index, expected) in [
         (0, "You: quoted right here"),
         (1, "Sofia, in Tides and the moon"),
-        (2, "Sofia, in Spring tides"),
+        // Rows 2 and 7 share a title, and rows 8 and 9 share the absence of
+        // one — each collision group is numbered in the index's own order.
+        (2, "Sofia, in Spring tides (1)"),
         (3, "You, in A note to myself"),
         (4, "You, in another space"),
         (5, "A post in Harness output"),
         (6, "A post in another space"),
+        (7, "Sofia, in Spring tides (2)"),
+        (8, "Mara, in another space (1)"),
+        (9, "Mara, in another space (2)"),
     ] {
         assert_probe(
             &entries,
@@ -7558,6 +7575,21 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
             expected,
         );
     }
+
+    // The property the rows are for, asserted as a property: whatever the
+    // fixture happens to contain, no two buttons in this picker read alike.
+    let labels: Vec<String> = view
+        .read_with(cx, |v, cx| v.highlight_picker_for_test(cx))
+        .expect("the picker is open")
+        .into_iter()
+        .map(|(_, label)| label)
+        .collect();
+    let unique: std::collections::BTreeSet<&String> = labels.iter().collect();
+    assert_eq!(
+        unique.len(),
+        labels.len(),
+        "a chooser whose rows read alike cannot say which button goes where: {labels:?}"
+    );
 
     probe::set_probes_enabled(false);
 }

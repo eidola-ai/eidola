@@ -3111,6 +3111,120 @@ fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestA
     );
 }
 
+/// REGRESSION (Codex review, PR #327): **the reverse index resolves names at
+/// read time, so it answers to every signal that moves one.**
+///
+/// An `IncomingReference` carries the *referring* post's author identity and
+/// its conversation's title — both joined by `db::references_to` at read time
+/// and never re-derived, which is exactly the shape the transcript's own
+/// bylines have. Neither signal that moves them reached the cache: a rename
+/// emits `Change::SpaceIndex`, which refreshed only the Library, and a
+/// participant rename emits `Change::Participants`, whose handler re-read only
+/// transcripts. So an open window's backlinks — the highlight picker's rows
+/// above all, where a title is what tells one author's two of them apart —
+/// went on naming both as they were when the window loaded, until an unrelated
+/// `Change::Space` happened past.
+///
+/// Both halves on one cached index: the quoting conversation is renamed, then
+/// its author is.
+#[gpui::test]
+fn a_rename_re_reads_the_cached_reverse_index(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    // The quoted passage, and a second conversation quoting it.
+    let source = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("source post");
+    let block = core
+        .runtime()
+        .block_on(core.get_space_tree(source.space_id.clone()))
+        .expect("tree")
+        .into_iter()
+        .find(|n| n.action_id == source.action_id)
+        .expect("the post")
+        .blocks
+        .remove(0);
+    let elsewhere = core
+        .runtime()
+        .block_on(core.post("A different conversation.".into(), None))
+        .expect("second conversation");
+    core.runtime()
+        .block_on(core.post_with_references(
+            "Quoting:\n\n{{ embed 1 }}".into(),
+            Some(elsewhere.space_id.clone()),
+            Some(elsewhere.action_id.clone()),
+            vec![eidola_app_core::ReferenceSpec {
+                antecedent_action_id: source.action_id.clone(),
+                content_block_id: Some(block.id.clone()),
+                range_start: Some(4),
+                range_end: Some(8),
+                annotation: None,
+            }],
+        ))
+        .expect("the quote");
+
+    // A window on the *quoted* conversation caches the backlink.
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(source.space_id.clone(), cx));
+    space.update(cx, |s, cx| {
+        s.ensure_incoming_references(&source.action_id, cx)
+    });
+    let carried = |cx: &mut TestAppContext| {
+        space.read_with(cx, |s, _| {
+            s.incoming_references(&source.action_id)
+                .first()
+                .map(|r| (r.space_title.clone(), r.author_label.clone()))
+        })
+    };
+    wait_until(cx, "the reverse index loads", |cx| carried(cx).is_some());
+    assert_eq!(
+        carried(cx),
+        Some((Some("A different conversation.".into()), "User".into())),
+        "the referring conversation's title and its author, as that space names them"
+    );
+
+    // Another window renames the quoting conversation. `rename_space` emits
+    // `Change::SpaceIndex` and nothing else.
+    core.runtime()
+        .block_on(core.rename_space(elsewhere.space_id.clone(), "Spring tides".into()))
+        .expect("rename");
+    space.update(cx, |s, cx| {
+        s.ensure_incoming_references(&source.action_id, cx)
+    });
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::SpaceIndex), cx));
+    wait_until(cx, "the index re-reads the title", |cx| {
+        space.update(cx, |s, cx| {
+            s.ensure_incoming_references(&source.action_id, cx)
+        });
+        carried(cx).is_some_and(|(title, _)| title.as_deref() == Some("Spring tides"))
+    });
+
+    // …and then its author, which emits `Change::Participants` and nothing
+    // else.
+    core.runtime()
+        .block_on(core.set_space_participant_override(
+            elsewhere.space_id.clone(),
+            eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            eidola_app_core::ParticipantOverride {
+                label: Some(Some("Skipper".into())),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: None,
+            },
+        ))
+        .expect("override");
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+    wait_until(cx, "the index re-reads the author", |cx| {
+        space.update(cx, |s, cx| {
+            s.ensure_incoming_references(&source.action_id, cx)
+        });
+        carried(cx).is_some_and(|(_, author)| author == "Skipper")
+    });
+}
+
 /// REGRESSION (Codex review, PR #327): **a barrier that gives up must not hand
 /// the hazard back.**
 ///

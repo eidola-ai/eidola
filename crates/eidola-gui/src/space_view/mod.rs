@@ -356,35 +356,31 @@ pub(crate) enum PendingSettle {
 /// reference, so a click can't disambiguate on its own. Anchored to the post
 /// whose text was clicked, listing each referencing post (byline + snippet) as
 /// a choice — the band-menu pattern, one open at a time.
+/// **It holds identity, never facts.**
+///
+/// The reverse index resolves an author's name and a conversation's title at
+/// *read* time, so any copy of them taken here is a cache with no invalidation
+/// — a rename repairs the index (see `SpacesStore::notify_participants_changed`
+/// and the `SpaceIndex` arm of `stores::dispatch_change`) and this popover
+/// would go on rendering the names it captured at the click. The same argument
+/// the localized sentence already lost: a formatted string in view state is a
+/// cached render decision (`crates/eidola-gui/AGENTS.md` → Localization, "state
+/// holds the value, render chooses the words"), and the *inputs* to that
+/// sentence are no different in kind.
+///
+/// So a choice is the reference edge's key and nothing else, and
+/// [`SpaceView::picker_rows`] resolves it against the live index every frame.
+/// A referrer that leaves the index simply stops being a row; a picker left
+/// with none renders nothing until the lazy re-fetch lands.
 #[derive(Clone, Debug)]
 pub(crate) struct HighlightPicker {
-    pub(crate) choices: Vec<PickerChoice>,
-}
-
-/// One candidate in the [`HighlightPicker`] — **the facts a row is built
-/// from, never the sentence it renders as.**
-///
-/// A row's text is localized, and a formatted string held in view state is a
-/// cached render decision: `i18n::apply` refreshes every window, this popover
-/// re-renders, and it would repaint its rows in the previous language until
-/// something else replaced them (`crates/eidola-gui/AGENTS.md` → Localization,
-/// "state holds the value, render chooses the words"). So the choice carries
-/// its inputs and [`SpaceView::choice_label`] composes at render.
-#[derive(Clone, Debug)]
-pub(crate) struct PickerChoice {
-    /// The referencing post — the click target. `navigate_to_action` resolves
-    /// its home space itself, which is why the id of that space is not carried
-    /// here: what the row needs about the destination is its *name*.
-    pub(crate) action_id: String,
-    /// The referring space's title, `None` for a conversation never named.
-    /// **What tells two rows apart** when one participant quoted the same
-    /// passage from two conversations — an author does not identify a post.
-    pub(crate) space_title: Option<String>,
-    /// The author identity the *edge* carries, as the referring space names
-    /// them. Read only where this window does not hold the post; the page's
-    /// own gutter byline wins where it does.
-    pub(crate) author_kind: String,
-    pub(crate) author_label: String,
+    /// The post whose passage was clicked — the index these choices name.
+    pub(crate) anchor_action_id: String,
+    /// The chosen edges, as `(referring action id, ordinal)`. **The pair, not
+    /// the action alone**: one post can quote the same passage twice, and it
+    /// is then two rows leading to two places within it. Deliberately not an
+    /// index into the cached vector, which an invalidation invalidates.
+    pub(crate) choices: Vec<(String, i64)>,
 }
 
 /// An in-progress inline edit of a persisted post: the post's own body editor
@@ -1690,18 +1686,21 @@ impl SpaceView {
         self.highlight_ranges(i, cx)
     }
 
-    /// The open source-highlight picker's choices, as `(action id, label)`.
+    /// The open source-highlight picker's rows, as `(action id, label)` —
+    /// exactly what it paints.
     ///
-    /// Takes `cx` because a row's label is composed at render from the reader's
-    /// locale, never stored — see [`PickerChoice`].
+    /// Takes `cx` because a row is resolved against the live reverse index and
+    /// worded in the reader's locale at render, never stored — see
+    /// [`HighlightPicker`].
     #[doc(hidden)]
     pub fn highlight_picker_for_test(&self, cx: &gpui::App) -> Option<Vec<(String, String)>> {
-        self.highlight_picker.as_ref().map(|p| {
-            p.choices
-                .iter()
-                .map(|c| (c.action_id.clone(), self.choice_label(c, cx).to_string()))
-                .collect()
-        })
+        self.highlight_picker.as_ref()?;
+        Some(
+            self.picker_rows(cx)
+                .into_iter()
+                .map(|(action_id, label)| (action_id, label.to_string()))
+                .collect(),
+        )
     }
 
     /// Drive a highlight click on post `node_id` with the given keys (the

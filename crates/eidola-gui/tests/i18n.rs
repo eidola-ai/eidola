@@ -257,6 +257,8 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("byline", "Sofia");
                 args.set("snippet", "the opening of what it says");
                 args.set("space", "Tides and the moon");
+                args.set("label", "Sofia, in another space");
+                args.set("n", 2);
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),

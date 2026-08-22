@@ -2189,14 +2189,10 @@ impl SpaceView {
             }
             many => {
                 self.highlight_picker = Some(super::HighlightPicker {
+                    anchor_action_id: action_id.to_string(),
                     choices: many
                         .iter()
-                        .map(|r| super::PickerChoice {
-                            action_id: r.action_id.clone(),
-                            space_title: r.space_title.clone(),
-                            author_kind: r.author_kind.clone(),
-                            author_label: r.author_label.clone(),
-                        })
+                        .map(|r| (r.action_id.clone(), r.ordinal))
                         .collect(),
                 });
                 cx.notify();
@@ -2236,16 +2232,16 @@ impl SpaceView {
     /// conversation nobody has named.
     ///
     /// **The words are composed at render, from Fluent**, never stored — see
-    /// [`super::PickerChoice`].
-    pub(crate) fn choice_label(
+    /// [`super::HighlightPicker`].
+    fn reference_label(
         &self,
-        choice: &super::PickerChoice,
+        reference: &eidola_app_core::IncomingReference,
         cx: &gpui::App,
     ) -> SharedString {
         if let Some(p) = self
             .posts
             .iter()
-            .find(|p| p.action_id.as_deref() == Some(choice.action_id.as_str()))
+            .find(|p| p.action_id.as_deref() == Some(reference.action_id.as_str()))
         {
             let head = footnote_snippet(&strip_embed_blocks(&p.content, &p.references));
             return if head.is_empty() {
@@ -2255,14 +2251,15 @@ impl SpaceView {
             };
         }
 
-        let space = choice
+        let space = reference
             .space_title
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty());
-        match crate::space::byline_for_participant(&choice.author_kind, &choice.author_label) {
+        match crate::space::byline_for_participant(&reference.author_kind, &reference.author_label)
+        {
             Some(byline) => {
-                let byline = if choice.author_kind == "agent" {
+                let byline = if reference.author_kind == "agent" {
                     self.model_display(&byline, cx).0
                 } else {
                     SharedString::from(byline)
@@ -2281,10 +2278,74 @@ impl SpaceView {
         }
     }
 
+    /// The picker's rows as it paints them: `(referring action id, label)`,
+    /// resolved against the **live** reverse index and worded for the reader.
+    ///
+    /// **Nothing is carried from the click but identity** — see
+    /// [`super::HighlightPicker`]. A chosen edge the index no longer holds is
+    /// simply not a row: an invalidation empties this until the lazy re-fetch
+    /// lands, and a referrer that was edited away never comes back.
+    ///
+    /// **And no two rows may read alike.** Naming the conversation tells one
+    /// author's two backlinks apart, but a title is neither unique nor
+    /// required — two conversations can share one, and two can have none at
+    /// all, which puts the reader back in front of a chooser that cannot say
+    /// which button goes where (Codex review, PR #327). So a group of rows
+    /// that composed to the same sentence is numbered, in the index's own
+    /// order (oldest first, `references_to`'s `ORDER BY`), and a row nothing
+    /// collides with is left exactly as it was. Deliberately a *counter* and
+    /// not more context: the honest thing an ordinal claims is "these are
+    /// different, and this is the first" — where a snippet of the referring
+    /// post would have to lift prose out of a conversation to label a chooser
+    /// with, which is what the place-not-content rule above refuses.
+    pub(crate) fn picker_rows(&self, cx: &gpui::App) -> Vec<(String, SharedString)> {
+        let Some(picker) = self.highlight_picker.as_ref() else {
+            return Vec::new();
+        };
+        let index = self
+            .space
+            .read(cx)
+            .incoming_references(&picker.anchor_action_id);
+
+        let mut rows: Vec<(String, SharedString)> = picker
+            .choices
+            .iter()
+            .filter_map(|(action_id, ordinal)| {
+                let reference = index
+                    .iter()
+                    .find(|r| &r.action_id == action_id && r.ordinal == *ordinal)?;
+                Some((action_id.clone(), self.reference_label(reference, cx)))
+            })
+            .collect();
+
+        let mut seen: std::collections::HashMap<SharedString, usize> =
+            std::collections::HashMap::new();
+        for (_, label) in &rows {
+            *seen.entry(label.clone()).or_insert(0) += 1;
+        }
+        let mut nth: std::collections::HashMap<SharedString, usize> =
+            std::collections::HashMap::new();
+        for (_, label) in &mut rows {
+            if seen.get(label).copied().unwrap_or(0) < 2 {
+                continue;
+            }
+            let n = nth.entry(label.clone()).or_insert(0);
+            *n += 1;
+            *label = msg::space_highlight_picker_nth(cx, label.to_string(), *n as i64);
+        }
+        rows
+    }
+
     /// The picker: a small popover of the posts that quoted the clicked
     /// passage. Dismissed by click-out or a choice — the band-menu pattern.
     pub(crate) fn render_highlight_picker(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let picker = self.highlight_picker.as_ref()?;
+        self.highlight_picker.as_ref()?;
+        // Rows come from the live index, so an invalidation empties the
+        // popover rather than leaving it painting names nobody holds any more.
+        let rows = self.picker_rows(cx);
+        if rows.is_empty() {
+            return None;
+        }
         let theme = cx.theme();
         let mut col = v_flex()
             .id("space-highlight-picker")
@@ -2318,9 +2379,8 @@ impl SpaceView {
                     .text_color(theme.muted_foreground)
                     .child(msg::space_highlight_picker_heading(cx)),
             );
-        for (idx, choice) in picker.choices.iter().enumerate() {
-            let target = choice.action_id.clone();
-            let label = self.choice_label(choice, cx);
+        for (idx, (action_id, label)) in rows.into_iter().enumerate() {
+            let target = action_id;
             col = col.child(
                 div()
                     .id(SharedString::from(format!("space-highlight-pick-{idx}")))
