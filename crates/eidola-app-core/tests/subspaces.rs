@@ -2469,6 +2469,41 @@ fn retiring_an_owner_stops_the_helpers_mid_cascade() {
 /// hole. Reads stay `pub` — they answer questions, they do not perform acts.
 /// It is the sibling of `the_raw_space_insert_has_no_production_caller` in
 /// `reap_pristine.rs`, which holds the raw space insert to the same rule.
+///
+/// **The rule is the shape, not the vintage.** The whole `_tx` family has it —
+/// each is a transaction whose refusals or side effects are the reason its
+/// door exists — so `promote_participant_tx` (the one-way promotion, with the
+/// persona that must travel inside it), `discard_space_if_pristine` (the
+/// disposal that decides *inside* the delete whether anything here was worth
+/// keeping) and `instantiate_template` (the only path that mints a space with
+/// participants from birth) are held here too, and so are the two whose doors
+/// are the clearest case of each category above:
+///
+/// * `archive_space_tx` closes a room and every live delegation beneath it, and
+///   `Inner::archive_space` is what **releases each closed room from any wait
+///   registered against it** and tells the Library once. That release cannot be
+///   done later by anybody: an archived room is never armed, so nothing on the
+///   bus can deliver the closure, and there is no un-archive door to recover
+///   from it. The transaction alone leaves every waiter outstanding forever.
+/// * `update_template_tx` replaces a template's owned participant set, and
+///   `Inner::update_template` decides **against the caller's own values in
+///   front of it** — a blank title, a `cascade_limit` below 1, an unvalidated
+///   participant tuple, a template already removed. That is the same category
+///   as `spawn_subspace`'s empty brief, and sound only while the transaction is
+///   unreachable.
+///
+/// **A guard duplicated into the primitive would be the same rule in two
+/// places**, so the doors stay the only way in and the primitives stay
+/// unreachable. The consequence for tests: a transaction-level regression
+/// belongs beside the writer, in `db.rs`'s own test module
+/// (`db::tests::tx_contention`, `db::tests::update_template_tx_*`), because an
+/// integration test under `tests/` is an external consumer like any dependent.
+///
+/// **And the `_tx` suffix closes the class by itself.** The enumeration below
+/// pins existence and naming, which a sweep cannot; the sweep pins *coverage*,
+/// which an enumeration cannot — a writer added to the family tomorrow is
+/// caught without anybody remembering to list it, which is exactly what a list
+/// of eleven names had already failed at twice.
 #[test]
 fn the_raw_db_writers_are_not_exported() {
     let source = include_str!("../src/db.rs");
@@ -2490,6 +2525,18 @@ fn the_raw_db_writers_are_not_exported() {
         // make unmintable, and `test-support` is enable-able by a downstream
         // crate's dev-dependencies.
         "test_insert_space_capability",
+        // The `_tx` family: each is a transaction whose refusals (or whose
+        // side effects) are the whole reason its door exists.
+        "remove_space_participant_tx",
+        "join_space_participant_tx",
+        "grant_space_membership_tx",
+        "retire_participant_tx",
+        "promote_participant_tx",
+        "archive_space_tx",
+        "update_template_tx",
+        // Two more of the same shape that carry no `_tx` in their names.
+        "discard_space_if_pristine",
+        "instantiate_template",
     ] {
         assert!(
             production.contains(&format!("async fn {raw}(")),
@@ -2499,10 +2546,37 @@ fn the_raw_db_writers_are_not_exported() {
             !production.contains(&format!("pub async fn {raw}(")),
             "{raw} is a raw write and must not be exported from db: reachable from outside, it \
              is a way to end a sub-space owner's membership, mint a second owner, retire an \
-             agent without archiving the rooms it owned, open a room on an empty brief, or hand \
-             a space a capability no parent held — each of which its caller exists to refuse"
+             agent without archiving the rooms it owned, promote one without the persona that \
+             must travel inside that transaction, close a room and leave every wait registered \
+             against it outstanding forever, rebuild a template's roster off values nothing \
+             validated, delete a space without asking whether it was pristine, mint a space \
+             with no participants, open a room on an empty brief, or hand a space a capability \
+             no parent held — each of which its caller exists to refuse"
         );
     }
+
+    // The class, not the members: every `_tx` writer is a transaction with a
+    // door in front of it, so finding a `pub` one is enough to fail without
+    // knowing which guard it bypasses. This is what the enumeration above kept
+    // missing — it can only hold the names somebody remembered to add.
+    let exported_tx: Vec<&str> = production
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub async fn "))
+        .map(|rest| {
+            rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("")
+        })
+        .filter(|name| name.ends_with("_tx"))
+        .collect();
+    assert!(
+        exported_tx.is_empty(),
+        "these `_tx` writers are exported from db: {exported_tx:?}\n\nA `_tx` name says the \
+         function is a transaction, and every transaction here has a door in front of it that \
+         adds what the transaction cannot — a refusal decided against the caller's own values, \
+         or a side effect (an announcement, a release, a wait torn down) that nothing can \
+         perform afterwards. Make it `pub(crate)` and let its door be the only way in."
+    );
 
     // An argument type reachable from outside is the write reachable from
     // outside, so the plan travels with the door.

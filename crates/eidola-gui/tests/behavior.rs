@@ -10451,6 +10451,9 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                         range_end: Some(9),
                         annotation: None,
                         created_at: 0,
+                        author_label: "Ada".into(),
+                        author_kind: "agent".into(),
+                        space_title: None,
                     },
                     // A range past the block's end no longer maps: dropped,
                     // never approximated.
@@ -10463,6 +10466,9 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                         range_end: Some(200),
                         annotation: None,
                         created_at: 0,
+                        author_label: "Ada".into(),
+                        author_kind: "agent".into(),
+                        space_title: None,
                     },
                 ],
             );
@@ -10485,9 +10491,9 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
         });
     })
     .unwrap();
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
         assert!(
-            v.highlight_picker_for_test().is_none(),
+            v.highlight_picker_for_test(cx).is_none(),
             "a single referencer needs no picker"
         );
     });
@@ -10524,6 +10530,9 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
         range_end: Some(hi),
         annotation: None,
         created_at: 0,
+        author_label: "Ada".into(),
+        author_kind: "agent".into(),
+        space_title: None,
     };
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, _| {
@@ -10543,7 +10552,7 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
     })
     .unwrap();
     let choices = view
-        .read_with(cx, |v, _| v.highlight_picker_for_test())
+        .read_with(cx, |v, cx| v.highlight_picker_for_test(cx))
         .expect("two referencers open the picker");
     assert_eq!(choices.len(), 2);
     assert_eq!(choices[0].0, "a2");
@@ -10559,8 +10568,8 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.navigate_to_action("a3".into(), window, cx));
     })
     .unwrap();
-    view.read_with(cx, |v, _| {
-        assert!(v.highlight_picker_for_test().is_none());
+    view.read_with(cx, |v, cx| {
+        assert!(v.highlight_picker_for_test(cx).is_none());
     });
 }
 
@@ -12775,6 +12784,9 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
         range_end: Some(hi),
         annotation: None,
         created_at: 0,
+        author_label: "Ada".into(),
+        author_kind: "agent".into(),
+        space_title: None,
     };
     vcx.update(|_, cx| {
         space.update(cx, |s, _| {
@@ -12790,28 +12802,247 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
         });
     });
     vcx.run_until_parked();
-    view.read_with(&vcx, |v, _| {
+    view.read_with(&vcx, |v, cx| {
         assert!(
-            v.highlight_picker_for_test().is_some(),
+            v.highlight_picker_for_test(cx).is_some(),
             "the picker is open"
         );
     });
 
     vcx.simulate_keystrokes("x");
     vcx.run_until_parked();
-    view.read_with(&vcx, |v, _| {
+    view.read_with(&vcx, |v, cx| {
         assert!(
             !v.has_active_draft_for_test(),
             "a printable character behind an open picker must not start a draft"
         );
         assert!(
-            v.highlight_picker_for_test().is_some(),
+            v.highlight_picker_for_test(cx).is_some(),
             "…and the picker is still the thing that owns the keyboard"
         );
         assert_eq!(
             v.tree_focus_for_test(),
             None,
             "nor does an overlay move tree focus"
+        );
+    });
+}
+
+/// REGRESSION (Codex review, PR #327): **a cleared cache is a question still
+/// out, not an answer of "none".**
+///
+/// The reverse index resolves names at read time, so every signal that moves
+/// one drops it — and it drops it on *every* live space, since a change to any
+/// space can move what another highlights. That invalidation and the
+/// close-when-empty rule beside it consumed each other: the close path read the
+/// resulting empty slice as "my referrers were deleted" and dismissed the
+/// picker in the exact moment the reload was about to repair its labels — so a
+/// rename, the thing the invalidation exists to propagate, closed the picker
+/// instead of repainting it.
+///
+/// `Space::incoming_references_pending` is the distinction
+/// `incoming_references` flattens. Both directions on one open picker: an
+/// index in flight keeps it (and the fresh answer repaints the rows), while an
+/// index that has answered with none of its edges closes it.
+#[gpui::test]
+fn space_a_picker_survives_the_invalidation_that_repairs_it(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let a1 = fixture_post_with_block("a1", "b1", "the quick brown fox jumps");
+    let mut a2 = fixture_assistant_post("a2", "first responder");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", "second responder");
+    a3.parent_action_id = Some("a1".into());
+    seed_quotable_space(&view, window, cx, vec![a1, a2, a3]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    // Two referrers from elsewhere, so the rows are named from the edges
+    // rather than from posts this window holds.
+    let incoming = |action: &str, label: &str, title: &str| eidola_app_core::IncomingReference {
+        action_id: action.into(),
+        space_id: format!("space-of-{action}"),
+        ordinal: 1,
+        content_block_id: Some("b1".into()),
+        range_start: Some(4),
+        range_end: Some(15),
+        annotation: None,
+        created_at: 0,
+        author_label: label.into(),
+        author_kind: "agent".into(),
+        space_title: Some(title.to_string()),
+    };
+    vcx.update(|_, cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![
+                    incoming("x1", "Sofia", "Tides"),
+                    incoming("x2", "Iris", "Ebb"),
+                ],
+            );
+        });
+    });
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0, 1], window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, cx| v
+            .highlight_picker_for_test(cx)
+            .map(|rows| rows.len())),
+        Some(2),
+        "the picker is open on two cross-space referrers"
+    );
+
+    // A rename elsewhere clears every live space's index; the re-fetch is in
+    // flight. Nothing has answered, so nothing may be concluded.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_loading_for_test("a1");
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, cx| v.highlight_picker_for_test(cx).is_some()),
+        "a cleared cache is not a deletion — the picker waits for the answer"
+    );
+
+    // The answer lands with the new title, and the rows repaint — which is the
+    // repair the invalidation was for.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![
+                    incoming("x1", "Sofia", "Spring tides"),
+                    incoming("x2", "Iris", "Ebb"),
+                ],
+            );
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    let labels: Vec<String> = view
+        .read_with(&vcx, |v, cx| v.highlight_picker_for_test(cx))
+        .expect("the picker survived to be repaired")
+        .into_iter()
+        .map(|(_, label, _)| label)
+        .collect();
+    assert!(
+        labels.contains(&"Sofia, in Spring tides".to_string()),
+        "the open picker repaints with the fresh title: {labels:?}"
+    );
+
+    // And a genuine answer of "none of your edges" still closes it.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_for_test("a1", Vec::new());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, cx| v.highlight_picker_for_test(cx).is_none()),
+        "an answered index carrying none of the chosen edges closes the picker"
+    );
+}
+
+/// REGRESSION (Codex review, PR #327): **a picker whose edges vanish is
+/// closed, not merely unpainted.**
+///
+/// Its rows resolve against the live reverse index, so an invalidation — or
+/// referrers edited until none of the chosen edges is current — can leave it
+/// naming nothing. Rendering nothing is not being closed: `highlight_picker`
+/// staying `Some` keeps `transient_overlay_open` true, and that predicate is
+/// the one definition of who owns the keyboard, so every arrow, Escape and
+/// printable went on being yielded to a popover the reader could not see. Nor
+/// was there a way out — Escape never reached `leave_focus_level`, and the
+/// click-out that clears the picker lives on the element no longer rendered.
+///
+/// The keyboard is the honest assertion here: ownership is not a field a
+/// reader can look at, it is whether typing reaches the conversation again.
+#[gpui::test]
+fn space_a_picker_whose_referrers_vanish_gives_the_keyboard_back(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let a1 = fixture_post_with_block("a1", "b1", "the quick brown fox jumps");
+    let mut a2 = fixture_assistant_post("a2", "first responder");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", "second responder");
+    a3.parent_action_id = Some("a1".into());
+    seed_quotable_space(&view, window, cx, vec![a1, a2, a3]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    let incoming = |action: &str, lo: i64, hi: i64| eidola_app_core::IncomingReference {
+        action_id: action.into(),
+        space_id: "s".into(),
+        ordinal: 1,
+        content_block_id: Some("b1".into()),
+        range_start: Some(lo),
+        range_end: Some(hi),
+        annotation: None,
+        created_at: 0,
+        author_label: "Ada".into(),
+        author_kind: "agent".into(),
+        space_title: None,
+    };
+    vcx.update(|_, cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![incoming("a2", 4, 15), incoming("a3", 10, 19)],
+            );
+        });
+    });
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0, 1], window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        assert!(
+            v.highlight_picker_for_test(cx).is_some(),
+            "the picker is open"
+        );
+    });
+
+    // Both referrers are edited until neither quote is current — the index
+    // re-reads and carries none of the chosen edges any more.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_for_test("a1", Vec::new());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        assert!(
+            v.highlight_picker_for_test(cx).is_none(),
+            "a picker naming nothing is closed, not left owning the window"
+        );
+    });
+
+    // And the keyboard is the conversation's again: a printable starts the
+    // trailing draft, which is exactly what an open overlay suppresses.
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.has_active_draft_for_test(),
+            "typing reaches the conversation once no invisible overlay owns it"
         );
     });
 }

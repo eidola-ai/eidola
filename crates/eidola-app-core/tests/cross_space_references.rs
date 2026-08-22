@@ -1771,3 +1771,183 @@ fn a_cross_space_quote_carries_its_authors_kind_beside_its_label() {
         );
     });
 }
+
+/// The same pair, in the **incoming** direction — and the join is the mirror
+/// image, so it is the one that can drift onto the wrong participant.
+///
+/// A backlink listing is exactly the surface that meets a referrer from a
+/// conversation the reader's window never loaded: "who quoted this passage"
+/// answered with "a post in another space" for every candidate is the one
+/// thing a chooser cannot do its job with. So `references_to` (and its
+/// per-viewer twin) joins the **referring** post's author, on the **referring**
+/// post's space — which the agent-quoted-by-a-human shape below pins from the
+/// other side: the *quoted* post's author is an agent, so a join that slid onto
+/// the antecedent would say `agent` where the truth is `human`.
+///
+/// The blank arm is here for the reason it is there: a per-space override of
+/// `''` is a real state, so the label can name nobody and only the kind is left
+/// to render from.
+#[test]
+fn an_incoming_reference_carries_its_referrers_author_identity() {
+    run(|| {
+        let script = tool_script();
+        let (_mock, core, _dir) = setup(script);
+
+        // A conversation whose answer is an **agent's** post — the quoted one.
+        let opening = turn(&core, "How do tides work?", None);
+        let source_space = opening.space_id.clone();
+        let answer = core
+            .runtime()
+            .block_on(core.get_space_tree(source_space.clone()))
+            .expect("tree")
+            .into_iter()
+            .find(|n| n.participant.kind == "agent")
+            .expect("the agent's answer");
+        let answer_text = answer.blocks[0].text.clone().expect("text");
+        let passage: String = answer_text.chars().take(12).collect();
+
+        // …quoted from a second conversation, by the human.
+        let elsewhere = post(&core, "A different conversation entirely.", None);
+        let spec = quote_of(&core, &source_space, &answer.action_id, &passage);
+        core.runtime()
+            .block_on(core.post_with_references(
+                "Someone said this:\n\n{{ embed 1 }}".into(),
+                Some(elsewhere.space_id.clone()),
+                Some(elsewhere.action_id.clone()),
+                vec![spec],
+            ))
+            .expect("the human quotes a space it belongs to");
+
+        // How the *quoting* space names its human — the label the backlink is
+        // expected to carry, read from that space's own tree.
+        let quoting_human_label = core
+            .runtime()
+            .block_on(core.get_space_tree(elsewhere.space_id.clone()))
+            .expect("tree")
+            .into_iter()
+            .find(|n| n.participant.kind == "human")
+            .expect("the human's post there")
+            .participant
+            .label;
+
+        let incoming = core
+            .runtime()
+            .block_on(core.references_to(answer.action_id.clone()))
+            .expect("reverse index");
+        assert_eq!(incoming.len(), 1, "one post quotes the answer");
+        assert_eq!(incoming[0].space_id, elsewhere.space_id);
+        // The place, joined on the **referring** post's space — the same
+        // discrimination the picker renders, and a join that slid onto the
+        // quoted post's space would name the source conversation instead.
+        let title_of = |space: &str| {
+            core.runtime()
+                .block_on(core.list_spaces(false))
+                .expect("index")
+                .into_iter()
+                .find(|s| s.id == space)
+                .expect("the space is listed")
+                .title
+        };
+        assert_eq!(
+            incoming[0].space_title,
+            title_of(&elsewhere.space_id),
+            "the referring conversation's own title"
+        );
+        assert_ne!(
+            incoming[0].space_title,
+            title_of(&source_space),
+            "not the quoted conversation's — the two are different rooms"
+        );
+        assert_eq!(
+            incoming[0].author_kind, "human",
+            "the *referrer's* kind — not the quoted post's, whose author is the agent"
+        );
+        assert_eq!(
+            incoming[0].author_label, quoting_human_label,
+            "as the referring space names them"
+        );
+
+        // The per-viewer twin answers the same pair — it is the same read with
+        // a membership filter in front of it, and a surface that filters is
+        // the one most likely to be rendering a cross-space backlink.
+        let filtered = core
+            .runtime()
+            .block_on(core.references_to_visible_to(
+                answer.action_id.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            ))
+            .expect("filtered");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].author_kind, "human");
+        assert_eq!(filtered[0].author_label, quoting_human_label);
+
+        // Now the state where the label says nothing: the **quoting** space
+        // overrides its human's label to empty.
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                elsewhere.space_id.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                eidola_app_core::ParticipantOverride {
+                    label: Some(Some(String::new())),
+                    model_ref: None,
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+            ))
+            .expect("override to empty");
+
+        let unnamed = core
+            .runtime()
+            .block_on(core.references_to(answer.action_id.clone()))
+            .expect("reverse index");
+        assert!(
+            unnamed[0].author_label.is_empty(),
+            "the referring space named nobody: {:?}",
+            unnamed[0].author_label
+        );
+        assert_eq!(
+            unnamed[0].author_kind, "human",
+            "the kind is what is left to name them with, and it still arrives"
+        );
+
+        // **And the author is not enough to tell two referrers apart.** The
+        // same human quotes the same passage again, from a *third*
+        // conversation — so the only thing separating the two backlinks is
+        // where each one is, which is exactly what a chooser has to render.
+        let third = post(&core, "A third conversation.", None);
+        core.runtime()
+            .block_on(core.rename_space(third.space_id.clone(), "Spring tides".into()))
+            .expect("name the third conversation");
+        let spec = quote_of(&core, &source_space, &answer.action_id, &passage);
+        core.runtime()
+            .block_on(core.post_with_references(
+                "And again:\n\n{{ embed 1 }}".into(),
+                Some(third.space_id.clone()),
+                Some(third.action_id.clone()),
+                vec![spec],
+            ))
+            .expect("the same human quotes the same passage from elsewhere");
+
+        let both = core
+            .runtime()
+            .block_on(core.references_to(answer.action_id))
+            .expect("reverse index");
+        assert_eq!(both.len(), 2, "two posts quote the answer now");
+        assert!(
+            both.iter().all(|r| r.author_kind == "human"),
+            "one author, twice — which is why the author cannot be the discriminator"
+        );
+        let mut titles: Vec<_> = both.iter().map(|r| r.space_title.clone()).collect();
+        titles.sort();
+        let mut expected = vec![title_of(&elsewhere.space_id), title_of(&third.space_id)];
+        expected.sort();
+        assert_eq!(
+            titles, expected,
+            "each backlink names its own conversation, which is all that tells them apart"
+        );
+        assert!(
+            titles[0] != titles[1],
+            "and the two are distinguishable: {titles:?}"
+        );
+    });
+}

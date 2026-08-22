@@ -4396,6 +4396,9 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
         range_end: Some(15),
         annotation: None,
         created_at: 0,
+        author_label: "Sofia".into(),
+        author_kind: "agent".into(),
+        space_title: None,
     };
     cx.update(|cx| {
         space.update(cx, |s, _| {
@@ -7452,6 +7455,219 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
             && names.contains(&"space/band/add".to_string()),
         "a member's verbs survive a failed refresh of the roster that names them: {names:?}"
     );
+
+    probe::set_probes_enabled(false);
+}
+
+/// REGRESSION: the highlight picker said "A post in another space" for every
+/// **incoming** reference it did not hold, so two cross-space referrers were
+/// indistinguishable — the one thing a chooser must never be.
+///
+/// The picker is exactly where a cross-space backlink shows up (a same-space
+/// referrer is already on the page with its byline), and it names one the same
+/// way the footnote rail names an outgoing quote's author: this window's own
+/// gutter byline where it has the post, otherwise the edge's carried identity
+/// — `(author_kind, author_label)`, as the *referring* space names them — read
+/// through `space::byline_for_participant`. Every arm on one passage:
+///
+/// 1. a referrer this window holds: its gutter byline plus what it says, which
+///    is **not** the edge's raw label (a human labelled `user` reads "You");
+/// 2. a referrer from a conversation this window never loaded, by name **and
+///    by conversation** — an author does not identify a post, so two rows from
+///    one participant (rows 1 and 2 here) are told apart by where they lead,
+///    which is the whole job of a chooser (Codex review, PR #327);
+/// 3. the same where the label is blank (the schema's "override to empty") —
+///    the kind is what is left, and it is enough;
+/// 4. "another space" where the conversation was never named;
+/// 5. the original sentence, surviving only where nothing names anyone **and**
+///    nothing names the place;
+/// 6. and, because a title is neither unique nor required, a **collision
+///    ordinal** wherever two rows would still read alike — rows 2/7 share a
+///    title, rows 8/9 share the absence of one (Codex review, PR #327).
+///
+/// Rows 10-12 are the round-3 shape: a duplicated title beside a conversation
+/// literally named what numbering that duplicate produces. The property
+/// assertion below had been passing throughout without covering it, which is
+/// the honest lesson — **a property test is only as strong as its inputs**, so
+/// the adversarial input is now one of them and `disambiguate`'s own
+/// `debug_assert` states the invariant at the site where it is established.
+#[gpui::test]
+fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let quoted = probe_post("a1", "the sentence everything else hangs off");
+    let mut here = probe_post("a2", "quoted right here");
+    here.parent_action_id = Some("a1".into());
+    here.relation = Some("reply".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![quoted, here], cx));
+    });
+
+    const LONG_TITLE: &str = "Everything we worked out about spring tides, the moon's declination, and \
+         why the harbour empties twice";
+    let incoming = |action: &str, kind: &str, label: &str, title: Option<&str>| {
+        eidola_app_core::IncomingReference {
+            action_id: action.into(),
+            space_id: format!("space-of-{action}"),
+            ordinal: 1,
+            content_block_id: Some("b1".into()),
+            range_start: Some(4),
+            range_end: Some(15),
+            annotation: None,
+            created_at: 0,
+            author_label: label.into(),
+            author_kind: kind.into(),
+            space_title: title.map(str::to_string),
+        }
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![
+                    incoming("a2", "human", "user", Some("Here")),
+                    incoming("x1", "agent", "Sofia", Some("Tides and the moon")),
+                    // The finding: the **same author**, quoting the same
+                    // passage from a second conversation. Named by the author
+                    // alone these two rows read alike and open different
+                    // windows.
+                    incoming("x2", "agent", "Sofia", Some("Spring tides")),
+                    incoming("x3", "human", "", Some("A note to myself")),
+                    incoming("x4", "human", "", None),
+                    incoming("x5", "tool", "  ", Some("Harness output")),
+                    incoming("x6", "tool", "  ", None),
+                    // The discriminator is itself non-unique: a title is
+                    // neither required nor unique, so one author can reach
+                    // this picker from two conversations that share a name —
+                    // and from two that have none.
+                    incoming("x7", "agent", "Sofia", Some("Spring tides")),
+                    incoming("x8", "agent", "Mara", None),
+                    incoming("x9", "agent", "Mara", None),
+                    // And the shape that beat the first numbering pass: a
+                    // duplicated title beside a conversation *literally
+                    // named* what numbering the duplicate would produce.
+                    // Numbering the pair alone turns the first of them into
+                    // "…, in Ebb (1)" — the third row's own text.
+                    incoming("y1", "agent", "Iris", Some("Ebb")),
+                    incoming("y2", "agent", "Iris", Some("Ebb")),
+                    incoming("y3", "agent", "Iris", Some("Ebb (1)")),
+                    // And a collision whose shared prefix is longer than the
+                    // row: the number is what tells these apart, and a number
+                    // inside the truncating text tells nobody anything.
+                    incoming("z1", "agent", "Wren", Some(LONG_TITLE)),
+                    incoming("z2", "agent", "Wren", Some(LONG_TITLE)),
+                ],
+            );
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test(
+                "a1",
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    let entries = fresh_entries(cx, window);
+    for (index, expected) in [
+        (0, "You: quoted right here"),
+        (1, "Sofia, in Tides and the moon"),
+        // Rows 2 and 7 share a title, and rows 8 and 9 share the absence of
+        // one — each collision group is numbered in the index's own order.
+        (2, "Sofia, in Spring tides (1)"),
+        (3, "You, in A note to myself"),
+        (4, "You, in another space"),
+        (5, "A post in Harness output"),
+        (6, "A post in another space"),
+        (7, "Sofia, in Spring tides (2)"),
+        (8, "Mara, in another space (1)"),
+        (9, "Mara, in another space (2)"),
+        // The number is chosen against what the picker will *show*: "(1)" is
+        // spoken for by row 12, which keeps its own name because a row that is
+        // already unique must not be renamed to tidy its neighbours.
+        (10, "Iris, in Ebb (2)"),
+        (11, "Iris, in Ebb (3)"),
+        (12, "Iris, in Ebb (1)"),
+    ] {
+        assert_probe(
+            &entries,
+            &format!("space/highlight/picker/{index}"),
+            gpui::Role::Button,
+            expected,
+        );
+    }
+
+    // The property the rows are for, asserted as a property: whatever the
+    // fixture happens to contain, no two buttons in this picker read alike.
+    let rows = view
+        .read_with(cx, |v, cx| v.highlight_picker_for_test(cx))
+        .expect("the picker is open");
+    let labels: Vec<&String> = rows.iter().map(|(_, label, _)| label).collect();
+    let unique: std::collections::BTreeSet<&&String> = labels.iter().collect();
+    assert_eq!(
+        unique.len(),
+        labels.len(),
+        "a chooser whose rows read alike cannot say which button goes where: {labels:?}"
+    );
+
+    // **And the discriminator has to survive the row.** A picker row is 280px
+    // and its sentence truncates, so a number living at the end of that
+    // sentence is the first thing thrown away — two long rows would ellipsize
+    // to the same prefix with only their accessible names differing, which is
+    // no help at all to the reader looking at them (Codex review, PR #327).
+    // The ordinal is reported separately because it is *painted* separately,
+    // outside the truncating text, so this is the property that fixes it.
+    let long_indices: Vec<(usize, &String)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, label, _))| label.starts_with("Wren, in "))
+        .map(|(i, (_, label, _))| (i, label))
+        .collect();
+    let long = rows
+        .iter()
+        .filter(|(_, label, _)| label.starts_with("Wren, in "))
+        .collect::<Vec<_>>();
+    assert_eq!(long.len(), 2, "the long-title collision pair: {long:?}");
+    assert_eq!(
+        long.iter().map(|(_, _, n)| *n).collect::<Vec<_>>(),
+        vec![Some(1), Some(2)],
+        "each is numbered: {long:?}"
+    );
+    // And the numbers are *painted* outside it — their own elements, which is
+    // what surviving the truncation means. `entries` is the frame that was
+    // just drawn, so an entry here is a thing on the screen.
+    let ordinals: Vec<&String> = entries
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| name.ends_with("/ordinal"))
+        .collect();
+    assert_eq!(
+        ordinals.len(),
+        8,
+        "one painted ordinal per numbered row — the four collision groups, and \
+         notably *not* row 12, whose \"(1)\" is its conversation's real name: {ordinals:?}"
+    );
+    for (index, _) in &long_indices {
+        let name = format!("space/highlight/picker/{index}/ordinal");
+        let entry = entries
+            .iter()
+            .find(|(n, _)| n == &name)
+            .unwrap_or_else(|| panic!("the long row's number is painted on its own: {name}"));
+        assert!(
+            entry.1.bounds.size.width > gpui::px(0.),
+            "and it takes real room beside the text that gives way: {entry:?}"
+        );
+    }
 
     probe::set_probes_enabled(false);
 }

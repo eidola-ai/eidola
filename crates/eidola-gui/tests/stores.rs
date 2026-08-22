@@ -19,6 +19,10 @@
 //! `backed_stores` therefore calls `cx.executor().allow_parking()`, the
 //! upstream idiom for tests that intentionally mix real OS threads; it
 //! disables the detector without changing what these tests assert.
+//!
+//! Teardown is a barrier, not a hope: the keepalive each test binds is a
+//! [`Backing`], whose `Drop` waits for the core's runtime to go idle before the
+//! last `Arc<AppCore>` can be dropped by a tokio worker.
 
 use std::sync::Arc;
 
@@ -45,12 +49,125 @@ fn test_core() -> (Arc<AppCore>, tempfile::TempDir) {
     (Arc::new(core), dir)
 }
 
-fn backed_stores(cx: &mut TestAppContext) -> (Stores, tempfile::TempDir) {
+/// The keepalive every backed test binds, and the **drain barrier** at its
+/// teardown.
+///
+/// A store's bridge task runs on the `AppCore`'s own tokio runtime holding an
+/// `Arc<AppCore>`, and the store entities keep the core alive only until `cx`
+/// tears down on this thread. If a bridge task is still running then it becomes
+/// the *last* owner and drops the tokio runtime from within its own worker →
+/// "Cannot drop a runtime in a context where blocking is not allowed". Waiting
+/// for the runtime to go idle first guarantees the last `Arc` always drops on
+/// the test thread — the same barrier
+/// `record_refresh_supersedes_in_flight_fetch` (`tests/behavior.rs`) takes
+/// inline, here as a guard so every test that calls [`backed_stores`] gets it
+/// without a line of its own.
+///
+/// **Bounded, unlike the record test's.** These tasks include network-connect
+/// paths, so "the count reaches zero" is not as obviously bounded as a local-DB
+/// read; the unreachable base URL fails fast, and a wait that outlives the
+/// deadline is reported rather than hung on. The report is skipped while the
+/// thread is already panicking — a panic in `Drop` during unwinding aborts the
+/// process and would bury the assertion that actually failed.
+///
+/// **And giving up on the wait leaks the core rather than releasing it.**
+/// Timing out is precisely the case where a task may still own an
+/// `Arc<AppCore>`, so releasing this one hands that task the last reference and
+/// the runtime gets dropped from a worker — the exact panic the barrier exists
+/// to prevent, arriving on the path where it does the most damage. See `Drop`.
+///
+/// **Some tasks never drain, and the barrier has to be told.** The hazard is
+/// only ever a task that *owns* an `Arc<AppCore>`; a task that owns none can
+/// never be the last owner, so waiting on it buys nothing and would hang out
+/// the whole timeout. [`Backing::excuse_ownerless_tasks`] is how a test that
+/// spawns one says so, and it is a claim about the task's captures — check them
+/// before calling it.
+struct Backing {
+    core: Arc<AppCore>,
+    _dir: tempfile::TempDir,
+    /// How many alive tasks are known to hold no `Arc<AppCore>` — see
+    /// [`Backing::excuse_ownerless_tasks`].
+    ownerless: usize,
+    /// How long the barrier waits. A field rather than the bare constant so the
+    /// guard's own timeout behaviour is reachable from a test in under half a
+    /// minute — the only way this class is testable at all, since the hazard it
+    /// prevents is a race nothing can schedule.
+    drain_timeout: std::time::Duration,
+}
+
+/// How long teardown waits for the bridge tasks to drain. Generous: the tasks
+/// fail fast against an unreachable URL, so reaching this means something is
+/// genuinely stuck.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Backing {
+    /// Excuse `n` tasks from the drain barrier, because they hold no
+    /// `Arc<AppCore>` and therefore cannot drop the runtime from a worker.
+    ///
+    /// The live case is `stores::install_bus_bridge`'s tokio half: it captures
+    /// a `broadcast::Receiver` and an mpsc `Sender` and nothing else, and it
+    /// ends only when its gpui counterpart does — at `cx` teardown, which is
+    /// *after* this guard runs. Waiting for it is waiting for something that
+    /// cannot happen.
+    fn excuse_ownerless_tasks(&mut self, n: usize) {
+        self.ownerless += n;
+    }
+}
+
+impl Drop for Backing {
+    fn drop(&mut self) {
+        let deadline = std::time::Instant::now() + self.drain_timeout;
+        while self.core.runtime().metrics().num_alive_tasks() > self.ownerless {
+            if std::time::Instant::now() >= deadline {
+                // **The invariant, restored the only way still available: if
+                // this guard could not prove the runtime idle, nothing may
+                // ever drop it.**
+                //
+                // Giving up on the wait used to hand the hazard straight back
+                // — this guard's `Arc` drops, `Stores` drops at `cx` teardown,
+                // and the still-running task becomes the last owner and drops
+                // the runtime from inside its own worker. On the unwinding
+                // path that is a second panic during an unwind, which aborts
+                // the process and takes the assertion failure that actually
+                // matters with it (Codex review, PR #327).
+                //
+                // So leak one owner. The strong count can no longer reach
+                // zero, the runtime is never dropped, and the class of panic
+                // this guard exists to prevent is unreachable rather than
+                // merely unlikely. The cost is one abandoned runtime and its
+                // threads for the rest of the process — paid only on a path
+                // where a test has already failed or is about to, and the
+                // alternative is losing the reason it failed.
+                std::mem::forget(self.core.clone());
+                if !std::thread::panicking() {
+                    panic!(
+                        "bridge tasks did not drain within {:?} — the runtime has \
+                         been leaked so the wait's failure is what you see, rather than a \
+                         worker dropping it out from under this thread",
+                        self.drain_timeout
+                    );
+                }
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+fn backed_stores(cx: &mut TestAppContext) -> (Stores, Backing) {
     // Declare the real tokio runtime to the test scheduler (see module docs).
     cx.executor().allow_parking();
     let (core, dir) = test_core();
-    let stores = cx.update(|cx| Stores::for_test(core, cx));
-    (stores, dir)
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    (
+        stores,
+        Backing {
+            core,
+            _dir: dir,
+            ownerless: 0,
+            drain_timeout: DRAIN_TIMEOUT,
+        },
+    )
 }
 
 /// The wave-2 launch-order bug: the first window's model list never loaded
@@ -65,7 +182,7 @@ fn backed_stores(cx: &mut TestAppContext) -> (Stores, tempfile::TempDir) {
 /// without running the (unreachable) network task.
 #[gpui::test]
 fn launch_order_does_not_starve_models(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // Launch sequence, in the order `lib.rs::run()` issues it: startup wallet
     // recovery first, then the first chat window triggers the models refresh.
@@ -99,7 +216,7 @@ fn launch_order_does_not_starve_models(cx: &mut TestAppContext) {
 /// exercises). A `Lagged` (`None`) refreshes everything.
 #[gpui::test]
 fn bus_bridge_dispatches_wallet_change(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // Idle to start: nothing refreshed yet.
     stores.wallet.read_with(cx, |w, _| assert!(!w.is_loading()));
@@ -141,7 +258,7 @@ fn bus_bridge_dispatches_wallet_change(cx: &mut TestAppContext) {
 /// open Record window never learned the trail grew (codex finding, PR #179).
 #[gpui::test]
 fn bus_bridge_routes_record_change_to_record_store(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     assert_eq!(stores.record.read_with(cx, |r, _| r.epoch()), 0);
 
@@ -168,7 +285,7 @@ fn bus_bridge_routes_record_change_to_record_store(cx: &mut TestAppContext) {
 /// asserted — the tasks' results need no network.
 #[gpui::test]
 fn bus_bridge_routes_backends_change(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     stores.backends.read_with(cx, |b, _| {
         assert!(
@@ -202,7 +319,7 @@ fn bus_bridge_routes_backends_change(cx: &mut TestAppContext) {
 /// one drives the (purely local-DB) tasks to completion by polling.
 #[gpui::test]
 fn backends_op_failure_refreshes_registry(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // Load the real registry (a local DB read — no network involved).
     stores.backends.update(cx, |b, cx| b.refresh(cx));
@@ -306,7 +423,7 @@ fn spaces_registry_joins_existing_and_new_spaces_are_distinct(cx: &mut TestAppCo
 fn space_mutation_failure_restarts_superseded_load(cx: &mut TestAppContext) {
     use eidola_app_core::error::AppError;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // Opening an existing space kicks the initial transcript load — a live
     // task in the load slot (this also stands in for a bus-driven refresh,
@@ -358,7 +475,7 @@ fn space_mutation_failure_restarts_superseded_load(cx: &mut TestAppContext) {
 /// a cancelled predecessor.
 #[gpui::test]
 fn refresh_supersede_cancels_predecessor(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // First refresh starts a task and enters Loading.
     stores.account.update(cx, |s, cx| s.refresh_balances(cx));
@@ -392,7 +509,7 @@ fn refresh_supersede_cancels_predecessor(cx: &mut TestAppContext) {
 fn config_store_circadian_settings_write_through(cx: &mut TestAppContext) {
     use eidola_app_core::config::{AppearanceSetting, LightCharacter, TimeOfDayTint};
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     stores.config.read_with(cx, |c, _| {
         let s = c.state().expect("backed store seeds a snapshot");
@@ -424,7 +541,7 @@ fn config_store_circadian_settings_write_through(cx: &mut TestAppContext) {
 fn config_store_zoom_ladder_writes_through(cx: &mut TestAppContext) {
     use eidola_app_core::config::{FONT_SCALE_DEFAULT, FONT_SCALE_MAX, FONT_SCALE_MIN};
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // Fresh backed store opens at Actual Size.
     stores.config.read_with(cx, |c, _| {
@@ -484,9 +601,14 @@ fn config_store_zoom_ladder_writes_through(cx: &mut TestAppContext) {
 /// is being asserted.
 #[gpui::test]
 fn a_quiesced_bus_bridge_dispatches_nothing(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, mut backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores have a core");
     let bridge = cx.update(|cx| stores::install_bus_bridge(&stores, cx));
+    // The bridge's tokio half is a forwarding loop that outlives this body —
+    // it ends with its gpui counterpart, at `cx` teardown. It captures only a
+    // `broadcast::Receiver` and an mpsc `Sender`, so it holds no
+    // `Arc<AppCore>` and the drain barrier has nothing to wait for.
+    backing.excuse_ownerless_tasks(1);
 
     // A real write on the core emits `Change::SpaceIndex`; the bridge should
     // carry it into the SpacesStore without anyone asking.
@@ -537,7 +659,7 @@ fn a_quiesced_bus_bridge_dispatches_nothing(cx: &mut TestAppContext) {
 /// would have left behind.
 #[gpui::test]
 fn template_router_write_survives_a_refresh_landing_mid_op(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     stores.templates.update(cx, |s, cx| {
@@ -616,7 +738,7 @@ fn wait_until(
 /// op's future has been polled even once.
 #[gpui::test]
 fn a_refresh_landing_mid_write_keeps_the_templates_ops_error(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     stores.templates.update(cx, |s, cx| s.refresh(cx));
@@ -669,7 +791,7 @@ fn a_refresh_landing_mid_write_keeps_the_templates_ops_error(cx: &mut TestAppCon
 /// drove `refresh_all` into their slot.
 #[gpui::test]
 fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -728,7 +850,7 @@ fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestApp
 /// correct even on a bus-less run.
 #[gpui::test]
 fn space_settings_write_through_and_reread(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -789,7 +911,7 @@ fn space_settings_write_through_and_reread(cx: &mut TestAppContext) {
 /// re-read.
 #[gpui::test]
 fn a_refresh_landing_mid_write_keeps_the_space_settings_op_error(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -836,7 +958,7 @@ fn a_refresh_landing_mid_write_keeps_the_space_settings_op_error(cx: &mut TestAp
 /// looking at should pay for a re-read.
 #[gpui::test]
 fn a_space_change_re_reads_only_cached_settings(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     cx.update(|cx| {
         stores::dispatch_change_for_test(&stores, Some(Change::Space("unseen".into())), cx)
@@ -878,7 +1000,7 @@ fn stale_row(id: &str) -> eidola_app_core::SpaceInfo {
 /// exit, reconciling the cached index back to what the database holds.
 #[gpui::test]
 fn a_refused_rename_reconciles_the_index_and_surfaces_the_refusal(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let real = core
         .runtime()
@@ -935,7 +1057,7 @@ fn a_refused_rename_reconciles_the_index_and_surfaces_the_refusal(cx: &mut TestA
 /// is what the re-list has to take back.
 #[gpui::test]
 fn an_archive_that_changed_nothing_says_so(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -980,7 +1102,7 @@ fn an_archive_that_changed_nothing_says_so(cx: &mut TestAppContext) {
 /// never did — a refused rename indistinguishable from an accepted one.
 #[gpui::test]
 fn a_refresh_landing_mid_rename_keeps_the_spaces_ops_error(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let real = core
         .runtime()
@@ -1022,7 +1144,7 @@ fn a_refresh_landing_mid_rename_keeps_the_spaces_ops_error(cx: &mut TestAppConte
 /// here, which is the narrowest form of it (the first has not run at all).
 #[gpui::test]
 fn two_renames_on_two_spaces_both_land(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let a = core
         .runtime()
@@ -1078,7 +1200,7 @@ fn two_renames_on_two_spaces_both_land(cx: &mut TestAppContext) {
 /// the **last** mutation, not eat either one's continuation.
 #[gpui::test]
 fn two_refused_mutations_each_keep_their_own_refusal(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let real = core
         .runtime()
@@ -1130,7 +1252,7 @@ fn two_refused_mutations_each_keep_their_own_refusal(cx: &mut TestAppContext) {
 /// — never either optimistic one.
 #[gpui::test]
 fn a_superseded_rename_leaves_no_optimism_behind(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let real = core
         .runtime()
@@ -1181,7 +1303,7 @@ fn a_superseded_rename_leaves_no_optimism_behind(cx: &mut TestAppContext) {
 /// first holds, and any drift fails.
 #[gpui::test]
 fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let a = core
         .runtime()
@@ -1252,7 +1374,7 @@ fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestApp
 /// the dispatcher is what makes one signal answer for two domains.
 #[gpui::test]
 fn a_participants_change_reaches_the_agent_library(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     stores
         .agents
         .read_with(cx, |a, _| assert!(!a.agents().is_loading()));
@@ -1267,7 +1389,7 @@ fn a_participants_change_reaches_the_agent_library(cx: &mut TestAppContext) {
 
     // A templates change is not one of its signals — the library holds no
     // template rows.
-    let (other, _dir2) = backed_stores(cx);
+    let (other, _backing2) = backed_stores(cx);
     cx.update(|cx| stores::dispatch_change_for_test(&other, Some(Change::Templates), cx));
     other.agents.read_with(cx, |a, _| {
         assert!(
@@ -1317,7 +1439,7 @@ fn two_shared_agents(cx: &mut TestAppContext, stores: &Stores) -> (String, Strin
 /// independent — and the resolving read is taken once the **last** one settles.
 #[gpui::test]
 fn two_writes_on_two_agents_both_land(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let (a, b) = two_shared_agents(cx, &stores);
 
@@ -1362,7 +1484,7 @@ fn two_writes_on_two_agents_both_land(cx: &mut TestAppContext) {
 /// row the reader was looking at.
 #[gpui::test]
 fn two_refused_agent_writes_each_keep_their_own_refusal(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let (a, b) = two_shared_agents(cx, &stores);
 
     // An invalid notify policy is refused before any write (zero trace).
@@ -1411,7 +1533,7 @@ fn two_refused_agent_writes_each_keep_their_own_refusal(cx: &mut TestAppContext)
 /// the persona back with it and the refusal leaves zero trace.
 #[gpui::test]
 fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -1485,7 +1607,7 @@ fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
 /// wants and lets one transaction decide the verb.
 #[gpui::test]
 fn a_grant_that_loses_the_race_to_a_promotion_still_adds_the_membership(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let home = core
         .runtime()
@@ -1537,7 +1659,7 @@ fn a_grant_that_loses_the_race_to_a_promotion_still_adds_the_membership(cx: &mut
 /// settles.
 #[gpui::test]
 fn two_writes_on_two_participants_of_one_space_both_land(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -1606,7 +1728,7 @@ fn two_writes_on_two_participants_of_one_space_both_land(cx: &mut TestAppContext
 /// never learn their other action was refused too.
 #[gpui::test]
 fn two_refused_participant_writes_each_keep_their_own_refusal(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -1679,7 +1801,7 @@ fn two_refused_participant_writes_each_keep_their_own_refusal(cx: &mut TestAppCo
 /// to ride the write.
 #[gpui::test]
 fn a_stale_owned_save_refuses_once_the_row_is_shared(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -1754,7 +1876,7 @@ fn a_stale_owned_save_refuses_once_the_row_is_shared(cx: &mut TestAppContext) {
 /// ran last).
 #[gpui::test]
 fn two_saves_on_one_agent_are_sequenced(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let (agent, _b) = two_shared_agents(cx, &stores);
 
@@ -1813,7 +1935,7 @@ fn two_saves_on_one_agent_are_sequenced(cx: &mut TestAppContext) {
 /// an override is written per space), so the answer is **every** live space.
 #[gpui::test]
 fn a_participants_change_re_reads_a_live_transcript(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -1866,7 +1988,7 @@ fn a_participants_change_re_reads_a_live_transcript(cx: &mut TestAppContext) {
 /// the recovery claimed to have refreshed all state.
 #[gpui::test]
 fn a_lagged_bus_re_reads_a_live_transcript(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -1914,7 +2036,7 @@ fn a_lagged_bus_re_reads_a_live_transcript(cx: &mut TestAppContext) {
 /// recorded and replayed once the last mutation or turn settles.
 #[gpui::test]
 fn a_participants_change_arriving_mid_operation_is_replayed(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -1972,7 +2094,7 @@ fn a_participants_change_arriving_mid_operation_is_replayed(cx: &mut TestAppCont
 /// report into the conversation the reader is mid-turn in.
 #[gpui::test]
 fn an_unattended_space_change_arriving_mid_operation_is_replayed(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -2026,7 +2148,7 @@ fn an_unattended_space_change_arriving_mid_operation_is_replayed(cx: &mut TestAp
 /// announces the room it closed); a post is what makes the loss observable.
 #[gpui::test]
 fn a_caller_space_change_from_another_window_is_replayed(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -2075,7 +2197,7 @@ fn a_caller_space_change_from_another_window_is_replayed(cx: &mut TestAppContext
 /// the property the ownership test was protecting, without its false premise.
 #[gpui::test]
 fn a_caller_space_change_the_read_already_covers_costs_no_re_read(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -2132,7 +2254,7 @@ fn a_caller_space_change_the_read_already_covers_costs_no_re_read(cx: &mut TestA
 /// announced is absent. Rejecting the older read holds both halves.
 #[gpui::test]
 fn a_transcript_read_that_lands_out_of_order_is_rejected(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -2214,7 +2336,7 @@ fn a_transcript_read_that_lands_out_of_order_is_rejected(cx: &mut TestAppContext
 /// has not reached the runtime when the post's does.
 #[gpui::test]
 fn a_first_post_into_a_brand_new_space_waits_out_its_insert(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let space = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2248,7 +2370,7 @@ fn a_first_post_into_a_brand_new_space_waits_out_its_insert(cx: &mut TestAppCont
 /// out to name.
 #[gpui::test]
 fn a_post_into_a_space_that_was_never_created_is_refused(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let space = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2315,7 +2437,7 @@ fn a_post_into_a_space_that_was_never_created_is_refused(cx: &mut TestAppContext
 /// gate defers rather than discards, and the save's exit replays it.
 #[gpui::test]
 fn a_participants_change_reaches_a_brand_new_space_mid_save(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     // ⌘N: the id is minted here and the row commits behind the window.
@@ -2406,7 +2528,7 @@ fn an_identity_switch_drops_the_previous_accounts_subscription(cx: &mut TestAppC
     use eidola_app_core::{SubscriptionInfo, SubscriptionState};
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     stores.account.update(cx, |s, cx| {
         s.set_subscription_for_test(
@@ -2450,7 +2572,7 @@ fn a_refused_account_operation_leaves_the_subscription_alone(cx: &mut TestAppCon
     use eidola_app_core::{SubscriptionInfo, SubscriptionState};
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     stores.account.update(cx, |s, cx| {
         s.set_subscription_for_test(
@@ -2516,7 +2638,7 @@ fn space_row_exists(core: &std::sync::Arc<AppCore>, space: &str) -> bool {
 /// row that existed and was pristine can produce.
 #[gpui::test]
 fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2579,7 +2701,7 @@ fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut Test
 /// reopening in one pass is what means the disposal's task has not.
 #[gpui::test]
 fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2651,7 +2773,7 @@ fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
 fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestAppContext) {
     use eidola_gui::space::Space;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space_id = core
         .runtime()
@@ -2745,7 +2867,7 @@ fn settle(cx: &mut TestAppContext) {
 /// `a_save_still_in_flight_holds_off_the_disposal`.)
 #[gpui::test]
 fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2793,7 +2915,7 @@ fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
 fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut TestAppContext) {
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     let space = stores.spaces.update(cx, |s, cx| s.create(cx));
     let space_id = space.read_with(cx, |s, _| s.id().to_string());
@@ -2849,7 +2971,7 @@ fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut T
 fn a_failed_initial_transcript_load_can_be_retried(cx: &mut TestAppContext) {
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space_id = eidola_app_core::new_space_id();
 
@@ -2917,7 +3039,7 @@ fn a_failed_initial_transcript_load_can_be_retried(cx: &mut TestAppContext) {
 fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestAppContext) {
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space_id = eidola_app_core::new_space_id();
 
@@ -2986,5 +3108,176 @@ fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestA
         space.read_with(cx, |s, _| s.transcript_refresh_failure().is_none()
             && matches!(s.transcript(), Loadable::Loaded { .. })),
         "a read that answered leaves no failure surface standing"
+    );
+}
+
+/// REGRESSION (Codex review, PR #327): **the reverse index resolves names at
+/// read time, so it answers to every signal that moves one.**
+///
+/// An `IncomingReference` carries the *referring* post's author identity and
+/// its conversation's title — both joined by `db::references_to` at read time
+/// and never re-derived, which is exactly the shape the transcript's own
+/// bylines have. Neither signal that moves them reached the cache: a rename
+/// emits `Change::SpaceIndex`, which refreshed only the Library, and a
+/// participant rename emits `Change::Participants`, whose handler re-read only
+/// transcripts. So an open window's backlinks — the highlight picker's rows
+/// above all, where a title is what tells one author's two of them apart —
+/// went on naming both as they were when the window loaded, until an unrelated
+/// `Change::Space` happened past.
+///
+/// Both halves on one cached index: the quoting conversation is renamed, then
+/// its author is.
+#[gpui::test]
+fn a_rename_re_reads_the_cached_reverse_index(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    // The quoted passage, and a second conversation quoting it.
+    let source = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("source post");
+    let block = core
+        .runtime()
+        .block_on(core.get_space_tree(source.space_id.clone()))
+        .expect("tree")
+        .into_iter()
+        .find(|n| n.action_id == source.action_id)
+        .expect("the post")
+        .blocks
+        .remove(0);
+    let elsewhere = core
+        .runtime()
+        .block_on(core.post("A different conversation.".into(), None))
+        .expect("second conversation");
+    core.runtime()
+        .block_on(core.post_with_references(
+            "Quoting:\n\n{{ embed 1 }}".into(),
+            Some(elsewhere.space_id.clone()),
+            Some(elsewhere.action_id.clone()),
+            vec![eidola_app_core::ReferenceSpec {
+                antecedent_action_id: source.action_id.clone(),
+                content_block_id: Some(block.id.clone()),
+                range_start: Some(4),
+                range_end: Some(8),
+                annotation: None,
+            }],
+        ))
+        .expect("the quote");
+
+    // A window on the *quoted* conversation caches the backlink.
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(source.space_id.clone(), cx));
+    space.update(cx, |s, cx| {
+        s.ensure_incoming_references(&source.action_id, cx)
+    });
+    let carried = |cx: &mut TestAppContext| {
+        space.read_with(cx, |s, _| {
+            s.incoming_references(&source.action_id)
+                .first()
+                .map(|r| (r.space_title.clone(), r.author_label.clone()))
+        })
+    };
+    wait_until(cx, "the reverse index loads", |cx| carried(cx).is_some());
+    assert_eq!(
+        carried(cx),
+        Some((Some("A different conversation.".into()), "User".into())),
+        "the referring conversation's title and its author, as that space names them"
+    );
+
+    // Another window renames the quoting conversation. `rename_space` emits
+    // `Change::SpaceIndex` and nothing else.
+    core.runtime()
+        .block_on(core.rename_space(elsewhere.space_id.clone(), "Spring tides".into()))
+        .expect("rename");
+    space.update(cx, |s, cx| {
+        s.ensure_incoming_references(&source.action_id, cx)
+    });
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::SpaceIndex), cx));
+    wait_until(cx, "the index re-reads the title", |cx| {
+        space.update(cx, |s, cx| {
+            s.ensure_incoming_references(&source.action_id, cx)
+        });
+        carried(cx).is_some_and(|(title, _)| title.as_deref() == Some("Spring tides"))
+    });
+
+    // …and then its author, which emits `Change::Participants` and nothing
+    // else.
+    core.runtime()
+        .block_on(core.set_space_participant_override(
+            elsewhere.space_id.clone(),
+            eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            eidola_app_core::ParticipantOverride {
+                label: Some(Some("Skipper".into())),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: None,
+            },
+        ))
+        .expect("override");
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+    wait_until(cx, "the index re-reads the author", |cx| {
+        space.update(cx, |s, cx| {
+            s.ensure_incoming_references(&source.action_id, cx)
+        });
+        carried(cx).is_some_and(|(_, author)| author == "Skipper")
+    });
+}
+
+/// REGRESSION (Codex review, PR #327): **a barrier that gives up must not hand
+/// the hazard back.**
+///
+/// Timing out is precisely the case where a task may still own an
+/// `Arc<AppCore>`. Releasing this guard's own reference there makes that task
+/// the last owner, so the runtime is dropped from inside one of its own workers
+/// — the panic the barrier exists to prevent, arriving on the path where it
+/// does the most damage: during an unwind, a second panic aborts the process
+/// and the assertion that actually failed is never printed.
+///
+/// So the give-up path leaks one owner and the invariant becomes structural —
+/// *if idleness could not be proven, nothing may ever drop the runtime*. That
+/// is what this asserts, by counting owners across the drop: the guard's
+/// reference is retained rather than released, so the strong count does not
+/// fall. The panic is expected on this path (nothing is unwinding yet) and is
+/// caught, because what is under test is what the guard did with its `Arc`, not
+/// how loudly it complained.
+#[gpui::test]
+fn a_drain_that_times_out_never_lets_go_of_the_runtime(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (core, dir) = test_core();
+    let weak = Arc::downgrade(&core);
+
+    // A task that owns the core and outlives any barrier — the shape the
+    // guard cannot wait out and must therefore never race.
+    let held = core.clone();
+    core.runtime().handle().spawn(async move {
+        let _core_owned_by_this_task = held;
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    });
+    while core.runtime().metrics().num_alive_tasks() == 0 {
+        std::thread::yield_now();
+    }
+
+    let owners_before = weak.strong_count();
+    assert_eq!(owners_before, 2, "the guard's reference and the task's");
+
+    let backing = Backing {
+        core,
+        _dir: dir,
+        ownerless: 0,
+        drain_timeout: std::time::Duration::from_millis(200),
+    };
+    let complained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(backing)));
+    assert!(
+        complained.is_err(),
+        "a drain that could not finish says so rather than passing quietly"
+    );
+
+    assert_eq!(
+        weak.strong_count(),
+        owners_before,
+        "the guard released its owner after failing to prove the runtime idle, so the task is \
+         now the last one and will drop the runtime from its own worker"
     );
 }
