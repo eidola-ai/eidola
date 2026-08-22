@@ -550,7 +550,9 @@ impl SpaceView {
                         "Regenerate",
                         "Regenerate this response".into(),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.regenerate(&id, cx))),
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.regenerate(&id, window, cx)),
+                    ),
                 )
             }
             _ => col,
@@ -810,7 +812,20 @@ impl SpaceView {
     /// the post's **own recorded model** (regenerating re-asks the model that
     /// answered; the config default is the fallback for rows that carry none).
     /// [`Space::regenerate_post`] refuses mid-stream.
-    pub fn regenerate(&mut self, action_id: &SharedString, cx: &mut Context<Self>) {
+    ///
+    /// **An accepted press takes this verb off the screen**, so the keyboard
+    /// leaves with it: the space stops accepting mutations, the whole action
+    /// gutter is withheld, and the reader would otherwise be left standing on a
+    /// slot handle tracked by nothing for the length of the regeneration (see
+    /// [`SpaceView::release_affordance_focus`]). Asked **before** it acts,
+    /// because the question is about the row that is about to stop being
+    /// painted, and moved only on acceptance — a refusal hides nothing.
+    pub fn regenerate(
+        &mut self,
+        action_id: &SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let model = self
             .posts
             .iter()
@@ -819,6 +834,7 @@ impl SpaceView {
             .map(|m| m.to_string())
             .unwrap_or_else(|| self.stores.config.read(cx).default_model());
         let id = action_id.to_string();
+        let held = self.affordance_row_holds_focus(window);
         let accepted = self
             .space
             .update(cx, |s, cx| s.regenerate_post(id, model, cx));
@@ -826,6 +842,9 @@ impl SpaceView {
             // A refusal is observed rather than dropped: nothing started, so
             // nothing should repaint as though it had.
             return;
+        }
+        if held {
+            self.release_affordance_focus(window, cx);
         }
         cx.notify();
     }

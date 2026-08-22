@@ -7025,9 +7025,9 @@ fn space_regenerate_uses_posts_own_model(cx: &mut TestAppContext) {
     let (window, view) = open_space(cx, &stores, Some("s".into()));
     seed_space_pair(&view, window, cx);
 
-    cx.update_window(window, |_, _, cx| {
+    cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.regenerate(&"a2".into(), cx);
+            v.regenerate(&"a2".into(), window, cx);
         });
     })
     .unwrap();
@@ -17311,8 +17311,8 @@ fn space_regenerate_shows_its_pending_state_in_the_same_frame(cx: &mut TestAppCo
     seed_space_pair(&view, window, cx);
     let space = view.read_with(cx, |v, _| v.space().clone());
 
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.regenerate(&"a2".into(), cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
     })
     .unwrap();
 
@@ -17613,6 +17613,119 @@ fn space_a_regeneration_running_elsewhere_is_marked_until_it_lands(cx: &mut Test
         !after.iter().any(|n| n.ends_with("/regenerating-elsewhere")),
         "and the completion that superseded that generation took the mark with it: {after:?}"
     );
+}
+
+#[gpui::test]
+fn space_a_verb_that_hides_its_own_gutter_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    // Every probed `Role::Button` is a real tab stop, and an accepted
+    // Regenerate makes `accepts_mutation` false — which withholds the whole
+    // action gutter, unmounting the verb that was just activated. The window
+    // goes on holding that slot's handle: `is_focused` answers `true` for a
+    // handle tracked on nothing, so even `sync_tree_focus` reads the level as
+    // live and leaves it there for the length of the regeneration. The row is
+    // ending, so the level ends with it — the post, where Escape already goes.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), Some(0))),
+            "the keyboard is on the answer's Regenerate verb"
+        );
+    });
+
+    // Activate it. gpui's keyboard click fires on key **up**, which
+    // `simulate_keystrokes` does not send — so the press is dispatched whole,
+    // exactly as `tests/probe.rs` drives the Library's verbs.
+    let ks = gpui::Keystroke::parse("enter").unwrap();
+    vcx.update_window(window, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: ks.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke: ks }),
+            cx,
+        );
+    })
+    .unwrap();
+    vcx.run_until_parked();
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    space.read_with(&vcx, |s, _| {
+        assert!(
+            s.revising_seq("a2").is_some(),
+            "the press was accepted — this is the state the gutter goes away in"
+        );
+    });
+    view.read_with(&vcx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            0,
+            "and the row the keyboard was standing on is gone"
+        );
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), None)),
+            "so the level ends with it, on the post — not stranded on a slot \
+             that is tracked by nothing"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_pointer_regenerate_leaves_the_keyboard_where_it_is(cx: &mut TestAppContext) {
+    // The other half of the handback rule: it is owed only by a reader who was
+    // actually holding the row. A pointer press on one of these verbs moves
+    // focus nowhere (gpui's `prevent_default`, the macOS convention), so a
+    // click while the caret is somewhere else must not drag it onto the post.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a2".to_string(), Some(0))));
+    });
+
+    // Move the keyboard off the row and press the verb by pointer in the same
+    // update — no frame in between, so the level is still recorded on the row
+    // the reader has just left. That is exactly the state a bare level check
+    // would misread as "the keyboard is here".
+    let root = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update_window(window, |_, window, cx| {
+        window.focus(&root, cx);
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    })
+    .unwrap();
+
+    vcx.update_window(window, |_, window, cx| {
+        assert!(
+            root.is_focused(window),
+            "the press took nothing from the reader's own place"
+        );
+        let _ = cx;
+    })
+    .unwrap();
 }
 
 #[gpui::test]

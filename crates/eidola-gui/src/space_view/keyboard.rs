@@ -391,6 +391,50 @@ impl SpaceView {
             .position(|h| h.is_focused(window))
     }
 
+    /// Whether the keyboard is standing **in a post's affordance row** right
+    /// now — asked *before* a verb acts, because the answer is about the row
+    /// that is about to stop being painted.
+    ///
+    /// A pointer press on one of these verbs moves focus nowhere (the macOS
+    /// convention gpui implements), so this is also what keeps a click from
+    /// taking a reader's caret somewhere they did not ask for.
+    pub(crate) fn affordance_row_holds_focus(&self, window: &Window) -> bool {
+        self.tree_focus
+            .as_ref()
+            .is_some_and(|f| matches!(f.level, FocusLevel::Affordance(_)))
+            && self.focused_affordance_slot(window).is_some()
+    }
+
+    /// **A verb that takes its own row away hands the keyboard back first.**
+    ///
+    /// Every probed `Role::Button` is a real tab stop, and an accepted Edit
+    /// commit or Regenerate makes [`crate::space::Space::accepts_mutation`]
+    /// false — which withholds the whole action gutter, unmounting the very
+    /// verb that was just activated. Nothing else recovers: a `FocusHandle`
+    /// tracked on no element still answers `is_focused`, so
+    /// [`SpaceView::sync_tree_focus`] reads the level as **live** and leaves it
+    /// standing for as long as the operation runs (minutes, on a reasoning
+    /// model). Arrow cycling then finds no verbs, Enter activates nothing, and
+    /// AccessKit reports focus on a node the tree does not contain.
+    ///
+    /// The destination is the **post**, which is exactly where Escape from the
+    /// affordance level already goes ([`SpaceView::leave_focus_level`]): the
+    /// row is ending, so the level ends with it. Deliberately not
+    /// [`SpaceView::keyboard_home`] — at this level that answers with the
+    /// *slot* handle, which is the dead one.
+    pub(crate) fn release_affordance_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node_id) = self
+            .tree_focus
+            .as_ref()
+            .filter(|f| matches!(f.level, FocusLevel::Affordance(_)))
+            .map(|f| f.node_id.clone())
+        else {
+            return;
+        };
+        self.focus_post(node_id, window, cx);
+        cx.notify();
+    }
+
     /// Whether a transient overlay currently owns the keyboard — **the one
     /// definition**, read by both the key handler and the focus observation.
     ///
@@ -735,11 +779,20 @@ impl SpaceView {
     /// the affordance level's cycle length. Mirrors
     /// [`SpaceView::render_post_actions`]'s own gating so the two cannot
     /// disagree about what is there to focus.
+    ///
+    /// **The mutation gate is asked first, exactly as the render asks it.** An
+    /// edit session's Save/Cancel are withheld along with every other verb once
+    /// a mutation is in flight — and committing that very edit is what puts one
+    /// there — so checking the session first claimed two verbs for a row the
+    /// render was drawing empty, for the whole length of the save.
     pub(crate) fn post_verb_count(&self, node_id: &str, cx: &gpui::App) -> usize {
+        if !self.space.read(cx).accepts_mutation() {
+            return 0;
+        }
         if self.editing.as_ref().map(|e| &e.node_id) == Some(&SharedString::from(node_id)) {
             return 2; // Save, Cancel
         }
-        if !self.space.read(cx).accepts_mutation() || self.editing.is_some() {
+        if self.editing.is_some() {
             return 0;
         }
         let Some(idx) = self.post_index(node_id) else {
