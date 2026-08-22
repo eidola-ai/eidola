@@ -751,6 +751,116 @@ fn compute_image_row_extra(
     }
 }
 
+/// The chip fill a merged inline style asks for, if any.
+///
+/// Dim takes precedence: the delimiter backticks share the run color but
+/// must not carry a chip — only the content does.
+fn run_background_color(style: &InlineStyle, md: &MarkdownStyle) -> Option<gpui::Hsla> {
+    (style.code && !style.dimmed).then_some(md.inline_code_background)
+}
+
+/// Fill bounds for the inline-code chips on one shaped line — one quad
+/// per visual row a chip spans.
+///
+/// **Why this isn't `WrappedLine::paint_background`.** gpui's background
+/// pass takes a single line height and uses it for *both* the quad's
+/// height and the step between wrap rows. Those are the same number only
+/// on a line with no tall inline construct on it; where one reserves
+/// extra leading (see [`LaidOutLine::row_stride`]) the stride has to grow
+/// while the chip must still fill only the text row, or a chip beside
+/// inline math stretches through the reserved leading. One argument
+/// cannot be both, so the chip is ours to draw: rows step by
+/// `row_stride`, quads fill `row_height`.
+///
+/// Geometry mirrors the selection wash (`push_selection_quads`) — the
+/// same first-row / middle-rows / last-row split over the same
+/// `position_for_index` coordinates.
+#[allow(clippy::too_many_arguments)]
+fn run_background_bounds(
+    line: &WrappedLine,
+    display_to_source: &[usize],
+    origin: Point<Pixels>,
+    row_stride: Pixels,
+    row_height: Pixels,
+    block: &RenderBlock,
+    style: &MarkdownStyle,
+) -> Vec<Bounds<Pixels>> {
+    let mut out = Vec::new();
+    let len = line.text.len();
+    let mut i = 0usize;
+    while i < len {
+        let color = display_to_source
+            .get(i)
+            .map(|&src| run_background_color(&effective_inline_style(src, block), style));
+        let Some(Some(color)) = color else {
+            i += 1;
+            continue;
+        };
+        // Extend over every following byte asking for the same fill.
+        let mut j = i + 1;
+        while j < len {
+            let next = display_to_source
+                .get(j)
+                .map(|&src| run_background_color(&effective_inline_style(src, block), style));
+            if next != Some(Some(color)) {
+                break;
+            }
+            j += 1;
+        }
+        push_row_spanning_bounds(line, i, j, origin, row_stride, row_height, &mut out);
+        i = j;
+    }
+    out
+}
+
+/// Emit one quad per visual row covered by the display range `lo..hi`.
+#[allow(clippy::too_many_arguments)]
+fn push_row_spanning_bounds(
+    line: &WrappedLine,
+    lo: usize,
+    hi: usize,
+    origin: Point<Pixels>,
+    row_stride: Pixels,
+    row_height: Pixels,
+    out: &mut Vec<Bounds<Pixels>>,
+) {
+    let (Some(start_upper), Some(end)) = (
+        line.position_for_index(lo, row_stride),
+        line.position_for_index(hi, row_stride),
+    ) else {
+        return;
+    };
+    // A span that *opens* on a wrap boundary belongs to the row it starts;
+    // one that *ends* there ends at the upper row's edge, which is what
+    // gpui's unbiased answer already gives.
+    let start = downstream_row_position(line, lo, start_upper, row_stride);
+    let row_width = line.width();
+    if start.y == end.y {
+        out.push(Bounds::from_corners(
+            point(origin.x + start.x, origin.y + start.y),
+            point(origin.x + end.x, origin.y + start.y + row_height),
+        ));
+        return;
+    }
+    out.push(Bounds::from_corners(
+        point(origin.x + start.x, origin.y + start.y),
+        point(origin.x + row_width, origin.y + start.y + row_height),
+    ));
+    let first_row = (f32::from(start.y) / f32::from(row_stride)).round() as usize;
+    let last_row = (f32::from(end.y) / f32::from(row_stride)).round() as usize;
+    for row in (first_row + 1)..last_row {
+        let y = origin.y + row_stride * (row as f32);
+        out.push(Bounds::from_corners(
+            point(origin.x, y),
+            point(origin.x + row_width, y + row_height),
+        ));
+    }
+    out.push(Bounds::from_corners(
+        point(origin.x, origin.y + end.y),
+        point(origin.x + end.x, origin.y + end.y + row_height),
+    ));
+}
+
 /// Bounds of the 着重号 emphasis dots for one shaped line — one square
 /// per emphasized CJK character, centered under its glyph.
 ///
@@ -1361,6 +1471,10 @@ struct EmbedLayoutOut {
     /// bounds — the same pass the editor's own lines get, re-emitted here
     /// because only the *shaping* path is shared.
     emphasis_dots: Vec<Bounds<Pixels>>,
+    /// Inline-code chip fills, relative bounds — re-emitted here for the
+    /// same reason, and drawn by us rather than gpui for the reason in
+    /// [`run_background_bounds`].
+    code_chips: Vec<Bounds<Pixels>>,
     size: Size<Pixels>,
 }
 
@@ -1533,6 +1647,7 @@ fn layout_embed(
         bars: Vec::new(),
         code_panels: Vec::new(),
         emphasis_dots: Vec::new(),
+        code_chips: Vec::new(),
         size: Size::default(),
     };
     let mut y = px(0.0);
@@ -1579,6 +1694,15 @@ fn layout_embed(
                             font_size,
                             body_ascent,
                             body_descent,
+                        ));
+                        out.code_chips.extend(run_background_bounds(
+                            &piece.line,
+                            &piece.display_to_source,
+                            rel_origin,
+                            line_height,
+                            line_height,
+                            block,
+                            style,
                         ));
                         out.pieces.push(EmbedPiece {
                             line: piece.line,
@@ -1718,6 +1842,15 @@ fn layout_embed(
                             body_ascent,
                             body_descent,
                         ));
+                        out.code_chips.extend(run_background_bounds(
+                            &sl.line,
+                            &sl.display_to_source,
+                            point(text_left, row_y),
+                            row_stride,
+                            line_height,
+                            &b,
+                            style,
+                        ));
                         out.pieces.push(EmbedPiece {
                             line: sl.line,
                             rel_origin: point(text_left, paint_y),
@@ -1783,6 +1916,7 @@ struct EmbedPaint {
     bars: Vec<Bounds<Pixels>>,
     code_panels: Vec<Bounds<Pixels>>,
     emphasis_dots: Vec<Bounds<Pixels>>,
+    code_chips: Vec<Bounds<Pixels>>,
     /// The embed's own quote bar (the container chrome).
     bar: Bounds<Pixels>,
     /// Full content bounds — the clip mask and the selection-wash rect.
@@ -2666,6 +2800,10 @@ impl Element for BlockElement {
                     dot.origin.x += origin.x;
                     dot.origin.y += origin.y;
                 }
+                for chip in &mut layout.code_chips {
+                    chip.origin.x += origin.x;
+                    chip.origin.y += origin.y;
+                }
                 let content_bounds = Bounds::new(
                     point(block_left, block_top),
                     size(block_width, (block_bottom - block_top).max(px(0.0))),
@@ -2680,6 +2818,7 @@ impl Element for BlockElement {
                     bars: layout.bars,
                     code_panels: layout.code_panels,
                     emphasis_dots: layout.emphasis_dots,
+                    code_chips: layout.code_chips,
                     bar: Bounds::new(
                         point(block_left + style.blockquote_border_inset, block_top),
                         size(
@@ -2995,17 +3134,10 @@ impl Element for BlockElement {
                     }
                     window.paint_quad(fill(*rule, color));
                 }
-                // Run backgrounds first (inline-code chips), then glyphs —
-                // the same two-pass order as the regular content path.
-                for piece in &ep.pieces {
-                    let _ = piece.line.paint_background(
-                        piece.rel_origin,
-                        piece.row_stride,
-                        gpui::TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
+                // Inline-code chips first, then glyphs — the same two-pass
+                // order as the regular content path.
+                for chip in &ep.code_chips {
+                    window.paint_quad(fill(*chip, self.style.inline_code_background));
                 }
                 for piece in &ep.pieces {
                     let _ = piece.line.paint(
@@ -3158,21 +3290,25 @@ impl Element for BlockElement {
                     }
                     window.paint_quad(fill(*rule, color));
                 }
-                // Run backgrounds (the inline-code chip fill carried on
-                // `TextRun::background_color`) paint first so the
-                // selection wash and the glyphs layer on top of them.
-                // `WrappedLine::paint` itself only draws glyphs +
-                // underline/strikethrough — backgrounds need the explicit
-                // `paint_background` pass or the chip never shows.
+                // Inline-code chips paint first so the selection wash and
+                // the glyphs layer on top of them. `WrappedLine::paint`
+                // draws glyphs + underline/strikethrough only, so the
+                // chip needs its own pass either way — and it has to be
+                // ours rather than gpui's, because a row reservation
+                // makes the stride and the fill height differ (see
+                // `run_background_bounds`).
                 for laid in &prepaint.laid_out.lines {
-                    let _ = laid.line.paint_background(
-                        laid.paint_origin(),
+                    for chip in run_background_bounds(
+                        &laid.line,
+                        &laid.display_to_source,
+                        laid.origin,
                         laid.row_stride,
-                        gpui::TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
+                        laid.row_height,
+                        &self.block,
+                        &self.style,
+                    ) {
+                        window.paint_quad(fill(chip, self.style.inline_code_background));
+                    }
                 }
                 for tq in highlight_quads {
                     window.paint_quad(tq.quad);
@@ -4630,16 +4766,6 @@ fn build_runs_for_line(
             None
         };
 
-        // Inline code: paint a faint background under the run so the
-        // span reads as a chip. Dim takes precedence (the delimiter
-        // backticks share the run color but should *not* paint a
-        // background — only the content does).
-        let background_color = if merged.code && !merged.dimmed {
-            Some(style.inline_code_background)
-        } else {
-            None
-        };
-
         // Inline link: single underline beneath the link text. No
         // underline on the bracket / url delimiters (those are
         // hidden when the cursor is outside, dimmed when inside).
@@ -4656,8 +4782,11 @@ fn build_runs_for_line(
         runs.push(TextRun {
             len: j - i,
             font: run_font,
+            // The inline-code chip is deliberately *not* carried here —
+            // `run_background_bounds` paints it. See that function
+            // for why gpui's own background pass cannot draw it.
+            background_color: None,
             color,
-            background_color,
             underline,
             strikethrough,
         });
