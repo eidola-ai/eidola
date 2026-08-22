@@ -57,4 +57,8 @@ space-highlight-picker-unnamed-untitled = A post in another space
 # passage from two conversations that share a title, or from two nobody named.
 # A counter, not context: it claims only that these are different rows and this
 # is the first of them, in the order the backlinks were written.
+# TRANSLATORS: $n is load-bearing, not decoration. It is what makes two
+# otherwise identical rows tell apart, and the picker searches upward for a
+# number no other row has taken — so a wording that drops it leaves rows the
+# reader cannot choose between.
 space-highlight-picker-nth = { $label } ({ $n })

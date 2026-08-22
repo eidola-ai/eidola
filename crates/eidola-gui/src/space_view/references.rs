@@ -234,6 +234,80 @@ fn delegation_note(end: DelegationEnd, cx: &gpui::App) -> SharedString {
     }
 }
 
+/// **Make every row read differently, and make that an outcome rather than an
+/// intention.**
+///
+/// Rows that composed to the same sentence are numbered; a row nothing
+/// collides with is left exactly as it was. The subtlety is that the number is
+/// *also* text, so a naive pass can manufacture the collision it was sent to
+/// remove: three rows reading `Foo`, `Foo`, `Foo (1)` have one duplicated base,
+/// and numbering that base alone turns the first row into `Foo (1)` — now a
+/// duplicate of a row the pre-count had already cleared as unique (Codex
+/// review, PR #327).
+///
+/// So the suffix is chosen against **what the picker will actually show**: the
+/// labels that keep their base are reserved first, and each numbered row takes
+/// the lowest number not already spoken for. `Foo`, `Foo`, `Foo (1)` therefore
+/// renders as `Foo (2)`, `Foo (3)`, `Foo (1)` — the numbers are not the
+/// group's own 1..k, because a row that is already unique must not be renamed
+/// to make its neighbours tidier.
+///
+/// `nth` is a formatting *function* rather than a format string because the
+/// wording is localized. The one thing it must do is vary with `n`; a
+/// translation that dropped the variable would leave this searching for a free
+/// candidate forever, so the search is bounded by the row count — beyond which
+/// no free candidate can exist for a well-formed message — and gives up into a
+/// duplicate rather than a hang. The `debug_assert` below is what says so out
+/// loud in a test build.
+fn disambiguate(
+    rows: &mut [(String, SharedString)],
+    nth: impl Fn(&SharedString, i64) -> SharedString,
+) {
+    let mut counts: std::collections::HashMap<&SharedString, usize> =
+        std::collections::HashMap::new();
+    for (_, label) in rows.iter() {
+        *counts.entry(label).or_insert(0) += 1;
+    }
+    // Every row that keeps its base speaks for that text first: a numbered row
+    // may not land on one of them.
+    let mut taken: std::collections::HashSet<SharedString> = rows
+        .iter()
+        .filter(|(_, label)| counts.get(label).copied().unwrap_or(0) == 1)
+        .map(|(_, label)| label.clone())
+        .collect();
+    let duplicated: std::collections::HashSet<SharedString> = counts
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(label, _)| label.clone())
+        .collect();
+
+    let limit = rows.len() as i64 + 1;
+    for (_, label) in rows.iter_mut() {
+        if !duplicated.contains(label) {
+            continue;
+        }
+        let mut n = 1;
+        loop {
+            let candidate = nth(label, n);
+            if taken.insert(candidate.clone()) || n >= limit {
+                *label = candidate;
+                break;
+            }
+            n += 1;
+        }
+    }
+
+    debug_assert!(
+        {
+            let unique: std::collections::HashSet<&SharedString> =
+                rows.iter().map(|(_, label)| label).collect();
+            unique.len() == rows.len()
+        },
+        "a chooser whose rows read alike cannot say which button goes where: {:?}",
+        rows.iter().map(|(_, l)| l).collect::<Vec<_>>()
+    );
+}
+
 /// What a footnote row can honestly say. The three cases are genuinely
 /// different states, not one nullable string: a quote that still resolves, a
 /// quote whose stored range no longer maps onto the generation it named (never
@@ -2318,21 +2392,9 @@ impl SpaceView {
             })
             .collect();
 
-        let mut seen: std::collections::HashMap<SharedString, usize> =
-            std::collections::HashMap::new();
-        for (_, label) in &rows {
-            *seen.entry(label.clone()).or_insert(0) += 1;
-        }
-        let mut nth: std::collections::HashMap<SharedString, usize> =
-            std::collections::HashMap::new();
-        for (_, label) in &mut rows {
-            if seen.get(label).copied().unwrap_or(0) < 2 {
-                continue;
-            }
-            let n = nth.entry(label.clone()).or_insert(0);
-            *n += 1;
-            *label = msg::space_highlight_picker_nth(cx, label.to_string(), *n as i64);
-        }
+        disambiguate(&mut rows, |label, n| {
+            msg::space_highlight_picker_nth(cx, label.to_string(), n)
+        });
         rows
     }
 

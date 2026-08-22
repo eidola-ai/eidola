@@ -7483,9 +7483,14 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
 ///    nothing names the place;
 /// 6. and, because a title is neither unique nor required, a **collision
 ///    ordinal** wherever two rows would still read alike — rows 2/7 share a
-///    title, rows 8/9 share the absence of one (Codex review, PR #327). The
-///    closing assertion states the property the ordinals exist for, over
-///    whatever the fixture holds.
+///    title, rows 8/9 share the absence of one (Codex review, PR #327).
+///
+/// Rows 10-12 are the round-3 shape: a duplicated title beside a conversation
+/// literally named what numbering that duplicate produces. The property
+/// assertion below had been passing throughout without covering it, which is
+/// the honest lesson — **a property test is only as strong as its inputs**, so
+/// the adversarial input is now one of them and `disambiguate`'s own
+/// `debug_assert` states the invariant at the site where it is established.
 #[gpui::test]
 fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext) {
     let _guard = probes_on();
@@ -7542,13 +7547,26 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
                     incoming("x7", "agent", "Sofia", Some("Spring tides")),
                     incoming("x8", "agent", "Mara", None),
                     incoming("x9", "agent", "Mara", None),
+                    // And the shape that beat the first numbering pass: a
+                    // duplicated title beside a conversation *literally
+                    // named* what numbering the duplicate would produce.
+                    // Numbering the pair alone turns the first of them into
+                    // "…, in Ebb (1)" — the third row's own text.
+                    incoming("y1", "agent", "Iris", Some("Ebb")),
+                    incoming("y2", "agent", "Iris", Some("Ebb")),
+                    incoming("y3", "agent", "Iris", Some("Ebb (1)")),
                 ],
             );
         });
     });
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.click_highlight_for_test("a1", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], window, cx)
+            v.click_highlight_for_test(
+                "a1",
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                window,
+                cx,
+            )
         });
     })
     .unwrap();
@@ -7567,6 +7585,12 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
         (7, "Sofia, in Spring tides (2)"),
         (8, "Mara, in another space (1)"),
         (9, "Mara, in another space (2)"),
+        // The number is chosen against what the picker will *show*: "(1)" is
+        // spoken for by row 12, which keeps its own name because a row that is
+        // already unique must not be renamed to tidy its neighbours.
+        (10, "Iris, in Ebb (2)"),
+        (11, "Iris, in Ebb (3)"),
+        (12, "Iris, in Ebb (1)"),
     ] {
         assert_probe(
             &entries,
