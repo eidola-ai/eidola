@@ -1519,6 +1519,16 @@ impl SpaceView {
         self.stream_overlays(cx)
     }
 
+    /// Test-only: the generations this window is marking as being regenerated
+    /// somewhere it cannot see — the mark whose ending the settlement is.
+    #[doc(hidden)]
+    pub fn regenerating_elsewhere_for_test(&self) -> Vec<String> {
+        self.regenerating_elsewhere
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     /// Test-only: record that this window watched `action_id`'s answer stop at
     /// its length allowance — what `SpaceEvent::TurnEnded { truncated: true }`
     /// does, without a backend to produce one.

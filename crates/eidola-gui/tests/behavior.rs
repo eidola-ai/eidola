@@ -17783,6 +17783,79 @@ fn space_a_pointer_regenerate_leaves_the_keyboard_where_it_is(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+fn space_an_ask_waits_for_a_regeneration_running_where_this_window_cannot_see(
+    cx: &mut TestAppContext,
+) {
+    // The seam between the collision design and the ask gate. A refused press
+    // takes the revising stream back out — nothing of *this* window's is
+    // running — while the answer is still being replaced elsewhere, so a gate
+    // reading only the local stream re-opened and an ask could be billed
+    // against the generation on its way out. The waiter is the fact: armed at
+    // the refusal, alive exactly until the claim releases.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.revising_seq("a2").is_none(),
+            "this window's own revising stream is gone…"
+        );
+        assert!(
+            s.mutation_in_flight(),
+            "…and yet the answer is still being replaced"
+        );
+    });
+    space.update(cx, |s, cx| {
+        assert!(
+            s.ask("agent-b".into(), "a2".into(), cx).is_none(),
+            "so an ask about it is refused, exactly as during a local revision"
+        );
+        assert!(s.streams().is_empty(), "nothing billed was started");
+    });
+
+    // **The same act ends both.** The mark and the gate read one map, so the
+    // settlement that takes the mark off the screen is the settlement that
+    // lets an ask through — there is no ordering between them to get wrong.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.settle_collision_for_test("a2", cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            !s.mutation_in_flight(),
+            "the released claim re-opens the gate"
+        );
+    });
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.regenerating_elsewhere_for_test()
+                .iter()
+                .any(|id| id == "a2"),
+            "and takes the mark with it, in the same act"
+        );
+    });
+    space.update(cx, |s, cx| {
+        assert!(
+            s.ask("agent-b".into(), "a2".into(), cx).is_some(),
+            "an ask about the settled answer is ordinary again"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_a_regeneration_that_fails_elsewhere_still_ends_the_mark(cx: &mut TestAppContext) {
     // The other half of the ending. A regeneration that *fails* writes no
     // successor — no action row, and for a ceiling truncation only a Record

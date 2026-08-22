@@ -1324,8 +1324,19 @@ impl Space {
     /// Deliberately narrower than [`Self::is_busy`]: ordinary fan-out turns
     /// supersede nothing, and asking several participants at once is the point
     /// of the fan-out.
+    ///
+    /// **A standing collision counts too**, and it is the case a local reading
+    /// alone cannot see. When this window's Regenerate meets the process-wide
+    /// claim, [`Self::collide_revision`] takes the revising stream back out —
+    /// nothing of *ours* is running — but the answer is still being replaced,
+    /// somewhere this window has no stream for. The waiter is the proof: it is
+    /// armed at the refusal and lives exactly until the claim releases, so a
+    /// non-empty map is the same fact the revising stream carries, held on
+    /// behalf of a regeneration running elsewhere.
     pub fn mutation_in_flight(&self) -> bool {
-        self.post_runner.is_some() || self.streams.iter().any(|s| s.revising)
+        self.post_runner.is_some()
+            || self.streams.iter().any(|s| s.revising)
+            || !self.collision_waiters.is_empty()
     }
 
     /// The in-flight **regeneration** of `action_id`'s post, if one is running
@@ -2264,13 +2275,22 @@ impl Space {
         item_id: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(app_core) = self.app_core.clone() else {
-            return; // stub stores: the event is driven directly in tests
-        };
+        let app_core = self.app_core.clone();
         let key = action_id.clone();
         let task = cx.spawn(async move |this, cx| {
+            // Without a core there is nobody to ask, so nothing can ever
+            // announce a settlement and the collision stands until it is ended
+            // explicitly. A real window always has one; a stub store is driven
+            // by the test that made the collision.
+            let Some(app_core) = app_core else {
+                return;
+            };
             let _ = bridge::regeneration_settled(app_core, item_id).await;
             let _ = this.update(cx, |this, cx| {
+                // **Removed before the announcement, in one body**, so the gate
+                // this entry holds shut and the mark it holds on screen end
+                // together. Nothing has to keep two facts in step because there
+                // is only one.
                 this.collision_waiters.remove(&key);
                 cx.emit(SpaceEvent::RegenerationSettled {
                     action_id: key.clone(),
@@ -2278,6 +2298,8 @@ impl Space {
                 cx.notify();
             });
         });
+        // Recorded whether or not there was a core to wait on: the entry *is*
+        // the standing collision, and [`Self::mutation_in_flight`] reads it.
         self.collision_waiters.insert(action_id, task);
     }
 
