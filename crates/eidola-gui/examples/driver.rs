@@ -602,6 +602,7 @@ mod driver {
                                 refs.iter()
                                     .map(|r| eidola_app_core::IncomingReference {
                                         action_id: r.action_id.clone(),
+                                        item_id: format!("item-of-{}", r.action_id),
                                         space_id: "demo".into(),
                                         ordinal: 1,
                                         content_block_id: Some(r.block_id.clone()),

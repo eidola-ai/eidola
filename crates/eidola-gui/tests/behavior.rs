@@ -10444,6 +10444,7 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                 vec![
                     eidola_app_core::IncomingReference {
                         action_id: "a2".into(),
+                        item_id: format!("item-of-{}", "a2"),
                         space_id: "s".into(),
                         ordinal: 1,
                         content_block_id: Some("b1".into()),
@@ -10459,6 +10460,7 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                     // never approximated.
                     eidola_app_core::IncomingReference {
                         action_id: "a2".into(),
+                        item_id: format!("item-of-{}", "a2"),
                         space_id: "s".into(),
                         ordinal: 2,
                         content_block_id: Some("b1".into()),
@@ -10523,6 +10525,7 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
     let space = view.read_with(cx, |v, _| v.space().clone());
     let incoming = |action: &str, lo: i64, hi: i64| eidola_app_core::IncomingReference {
         action_id: action.into(),
+        item_id: format!("item-of-{}", action),
         space_id: "s".into(),
         ordinal: 1,
         content_block_id: Some("b1".into()),
@@ -12777,6 +12780,7 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
     let space = view.read_with(&vcx, |v, _| v.space().clone());
     let incoming = |action: &str, lo: i64, hi: i64| eidola_app_core::IncomingReference {
         action_id: action.into(),
+        item_id: format!("item-of-{}", action),
         space_id: "s".into(),
         ordinal: 1,
         content_block_id: Some("b1".into()),
@@ -12863,6 +12867,7 @@ fn space_a_picker_survives_the_invalidation_that_repairs_it(cx: &mut TestAppCont
     // rather than from posts this window holds.
     let incoming = |action: &str, label: &str, title: &str| eidola_app_core::IncomingReference {
         action_id: action.into(),
+        item_id: format!("item-of-{}", action),
         space_id: format!("space-of-{action}"),
         ordinal: 1,
         content_block_id: Some("b1".into()),
@@ -12986,6 +12991,7 @@ fn space_a_picker_whose_referrers_vanish_gives_the_keyboard_back(cx: &mut TestAp
     let space = view.read_with(&vcx, |v, _| v.space().clone());
     let incoming = |action: &str, lo: i64, hi: i64| eidola_app_core::IncomingReference {
         action_id: action.into(),
+        item_id: format!("item-of-{}", action),
         space_id: "s".into(),
         ordinal: 1,
         content_block_id: Some("b1".into()),

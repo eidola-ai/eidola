@@ -1118,6 +1118,15 @@ pub(crate) struct AttachedReference {
 pub struct IncomingReference {
     /// The referring post (a current generation).
     pub action_id: String,
+    /// The referring post's **item** — its identity across generations, and
+    /// the only half of it that survives an edit.
+    ///
+    /// A reverse index reports current generations, and editing a referring
+    /// post replicates its quote onto a new one: the backlink is unchanged and
+    /// [`Self::action_id`] is a different string. A surface holding a
+    /// selection of these rows across a reload — the highlight picker — must
+    /// key on this or lose the row to an edit that changed nothing about it.
+    pub item_id: String,
     /// The referring post's space (references may cross spaces).
     pub space_id: String,
     /// The edge's ordinal within the referring post.
@@ -3192,6 +3201,7 @@ impl Inner {
                 author_label: r.author_label,
                 author_kind: r.author_kind,
                 space_title: r.space_title,
+                item_id: r.item_id,
             });
         }
         Ok(out)
@@ -3222,6 +3232,7 @@ impl Inner {
                 author_label: r.author_label,
                 author_kind: r.author_kind,
                 space_title: r.space_title,
+                item_id: r.item_id,
             })
             .collect())
     }

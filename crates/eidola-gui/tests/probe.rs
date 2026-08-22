@@ -4389,6 +4389,7 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
     // The multi-referencer picker.
     let incoming = |action: &str| eidola_app_core::IncomingReference {
         action_id: action.into(),
+        item_id: format!("item-of-{}", action),
         space_id: "s".into(),
         ordinal: 1,
         content_block_id: Some("b1".into()),
@@ -7514,6 +7515,7 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
     let incoming = |action: &str, kind: &str, label: &str, title: Option<&str>| {
         eidola_app_core::IncomingReference {
             action_id: action.into(),
+            item_id: format!("item-of-{}", action),
             space_id: format!("space-of-{action}"),
             ordinal: 1,
             content_block_id: Some("b1".into()),

@@ -1951,3 +1951,78 @@ fn an_incoming_reference_carries_its_referrers_author_identity() {
         );
     });
 }
+
+/// REGRESSION (Codex review, PR #327): **an edit to the referring post is a
+/// new generation of the same backlink, and the row says so.**
+///
+/// The reverse index reports current generations, and editing a post that
+/// quotes something replicates the edge onto the new one — the quote was never
+/// removed, so the backlink survives, but its `action_id` is a different
+/// string. Anything holding a selection of these rows across a reload keyed on
+/// the action alone therefore loses a row to an edit that changed nothing
+/// about it. `item_id` is the half that does not move, and it travels with the
+/// row for exactly that reason.
+#[test]
+fn an_edited_referrer_keeps_its_backlink_under_a_new_generation() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+
+        let source = post(&core, "The tide is the moon's doing.", None);
+        let block = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .expect("tree")
+            .into_iter()
+            .find(|n| n.action_id == source.action_id)
+            .expect("the post")
+            .blocks
+            .remove(0);
+        let elsewhere = post(&core, "A different conversation.", None);
+        let quoting = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "Quoting:\n\n{{ embed 1 }}".into(),
+                Some(elsewhere.space_id.clone()),
+                Some(elsewhere.action_id.clone()),
+                vec![ReferenceSpec {
+                    antecedent_action_id: source.action_id.clone(),
+                    content_block_id: Some(block.id.clone()),
+                    range_start: Some(4),
+                    range_end: Some(8),
+                    annotation: None,
+                }],
+            ))
+            .expect("the quote");
+
+        let before = core
+            .runtime()
+            .block_on(core.references_to(source.action_id.clone()))
+            .expect("reverse index");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].action_id, quoting.action_id);
+
+        // Reword the referring post, keeping its quote. A new generation of the
+        // same item, carrying the same edge.
+        core.runtime()
+            .block_on(core.edit_post(
+                quoting.action_id.clone(),
+                "Quoting, more carefully:\n\n{{ embed 1 }}".into(),
+            ))
+            .expect("the edit");
+
+        let after = core
+            .runtime()
+            .block_on(core.references_to(source.action_id))
+            .expect("reverse index");
+        assert_eq!(after.len(), 1, "the backlink survives an edit of its post");
+        assert_ne!(
+            after[0].action_id, before[0].action_id,
+            "under a new generation — which is why the action id cannot be a durable handle"
+        );
+        assert_eq!(
+            after[0].item_id, before[0].item_id,
+            "the item is what did not move, and it is on the row"
+        );
+        assert_eq!(after[0].ordinal, before[0].ordinal, "same edge, same slot");
+    });
+}

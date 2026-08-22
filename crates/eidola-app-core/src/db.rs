@@ -5879,6 +5879,14 @@ pub async fn visible_tip_of_action(
 pub struct IncomingReferenceRow {
     /// The referring post's action id (a current generation).
     pub action_id: String,
+    /// The referring post's **item** — its identity across generations.
+    ///
+    /// The action id is the generation, and an edit mints a new one: editing a
+    /// referring post without touching its quote replicates the edge onto a
+    /// fresh action, so the backlink is the same backlink while
+    /// [`Self::action_id`] is not the same string. Anything holding on to a
+    /// row across a reload wants this.
+    pub item_id: String,
     /// The referring post's space (references may cross spaces).
     pub space_id: String,
     pub ordinal: i64,
@@ -5920,7 +5928,8 @@ pub async fn references_to(
         .prepare(&format!(
             "SELECT aa.action_id, ar.space_id, aa.ordinal, aa.content_block_id, \
                     aa.range_start, aa.range_end, aa.annotation, ar.created_at, \
-                    COALESCE(rsp.override_label, rp.label), rp.kind, rs.title \
+                    COALESCE(rsp.override_label, rp.label), rp.kind, rs.title, \
+                    ar.item_id \
              FROM action_antecedent aa \
              JOIN action_resolved ar ON ar.action_id = aa.action_id \
              JOIN participant rp ON rp.id = ar.participant_id \
@@ -5954,6 +5963,7 @@ pub async fn references_to(
             author_label: row.get::<String>(8).map_err(AppError::db)?,
             author_kind: row.get::<String>(9).map_err(AppError::db)?,
             space_title: row.get::<Option<String>>(10).map_err(AppError::db)?,
+            item_id: row.get::<String>(11).map_err(AppError::db)?,
         });
     }
     Ok(out)
