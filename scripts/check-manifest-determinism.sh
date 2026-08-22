@@ -52,7 +52,18 @@
 # fields, or a merge key in a job body, is a violation rather than a
 # resolution attempt: GitHub resolves aliases (since September 2025), this
 # does not, and a scanner that guessed would be asserting something it
-# cannot know.
+# cannot know. The same answer covers the two other things it cannot read.
+# An `environment:` computed by a `${{ }}` expression is refused on any job
+# that can reach the manifest — GitHub evaluates those, this does not —
+# except expressions pinned in the check as read and shown harmless, which
+# is what makes adding one a review moment. And a job-level `uses:` in the
+# manifest job's ancestry is refused, because the called workflow's
+# environments and outputs are in a file this is not reading; nothing here
+# uses one today, and following calls is a real parser's job.
+#
+# `needs:` takes no expressions — it is absent from GitHub's
+# context-availability table, since the dependency graph must be known
+# before any context exists — so there is nothing to refuse there.
 #
 # Two backstops hold past its edges. A dependency whose *name* says signing
 # counts as a signing job even when this parse never saw its definition. And
@@ -315,7 +326,33 @@ check_workflow() {
       # and any letter case for an environment name. Values are collected
       # by indentation and normalized once, here, so a new spelling of the
       # same thing is a normalization change rather than a new rule.
-      BEGIN { SQ = sprintf("%c", 39) }
+      BEGIN {
+        SQ = sprintf("%c", 39)
+        # `environment:` accepts expressions (GitHub'"'"'s context-availability
+        # table lists it), and this scanner evaluates none. Rather than
+        # guess what one resolves to, expressions are refused on the jobs
+        # that could feed the manifest — except those pinned here, which
+        # have been read and shown to produce no signing environment.
+        # Adding one is deliberately a review moment: it widens the set of
+        # environments a manifest-producing job may receive.
+        PERMITTED_ENV[1] = "${{ (github.event_name == " SQ "push" SQ \
+          " && github.ref == " SQ "refs/heads/main" SQ ") && " \
+          SQ "cachix-write" SQ " || " SQ SQ " }}"
+        N_PERMITTED_ENV = 1
+      }
+
+      function normalize_ws(s) {
+        gsub(/[ \t]+/, " ", s)
+        gsub(/^ | $/, "", s)
+        return s
+      }
+
+      function permitted_env(s,   i) {
+        s = normalize_ws(s)
+        for (i = 1; i <= N_PERMITTED_ENV; i++)
+          if (s == PERMITTED_ENV[i]) return 1
+        return 0
+      }
 
       # A `#` opens a comment at line start or after whitespace — and only
       # there, so `a#b` stays the name `a#b`.
@@ -402,6 +439,16 @@ check_workflow() {
       # resolved.
       /^    <<[ \t]*:/ { merge_key[job] = 1; next }
 
+      # A job-level `uses:` is a call to another workflow. Its jobs, their
+      # environments and their outputs live in a file this scanner is not
+      # reading. Recorded here; refused below if it can reach the manifest.
+      /^    uses:[ \t]*/ {
+        calls = decomment($0)
+        sub(/^    uses:[ \t]*/, "", calls)
+        job_uses[job] = unquote(calls)
+        next
+      }
+
       # A job "produces a manifest partial" if it runs the manifest script
       # or exports the partial as a job output.
       /artifact-manifest\.sh/ || /artifact_manifest:/ { partial[job] = 1 }
@@ -472,6 +519,18 @@ check_workflow() {
           j = jobs[i]
           if (partial[j] && tolower(environment[j]) ~ /apple-signing/)
             print "job `" j "` produces a manifest partial and is granted the apple-signing environment"
+        }
+
+        # Scoped to the jobs whose environment could matter: an ancestor of
+        # the manifest job (seen by the walk above) or a job computing part
+        # of it. An unrelated job may compute whatever it likes.
+        for (i = 1; i <= njobs; i++) {
+          j = jobs[i]
+          if (!seen[j] && !partial[j]) continue
+          if (environment[j] ~ /\$\{\{/ && !permitted_env(environment[j]))
+            print "job `" j "` computes its `environment:` with an expression this check does not evaluate — the environment a job feeding the manifest receives has to be readable from the file, so pin the expression in the check once it is shown it cannot produce a signing environment"
+          if (seen[j] && job_uses[j] != "")
+            print "job `" j "` calls another workflow (`uses: " job_uses[j] "`) and the manifest job depends on it — this scanner does not follow calls, so the called workflow'"'"'s environments and outputs are unread"
         }
       }
     ' "$file"

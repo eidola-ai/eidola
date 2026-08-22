@@ -1,0 +1,36 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The environment name assembled at run time. `jobs.<job_id>.environment`
+# accepts expressions (it is in GitHub's context-availability table), so
+# this job really does receive `apple-signing` — while the file contains
+# neither that string nor anything else this check could match on.
+#
+# The rule is the alias rule again: expressions are refused, not
+# evaluated, on jobs that can reach the manifest. The workflow's own
+# cachix-write expression is pinned in the check as read-and-cleared,
+# which is what makes adding a second one a review moment rather than a
+# silent widening.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-assets:
+    name: Publish release assets
+    runs-on: self-hosted
+    environment: ${{ format('{0}-{1}', 'apple', 'signing') }}
+    steps:
+      - name: Build the macOS artifacts
+        run: ./scripts/artifact-manifest.sh build-macos
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - release-assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

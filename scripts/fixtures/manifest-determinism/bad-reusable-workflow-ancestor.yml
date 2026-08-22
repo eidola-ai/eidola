@@ -1,0 +1,33 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The ancestor is a call to another workflow. Everything that matters —
+# which environment its jobs receive, what outputs it hands back — lives
+# in a file this scanner is not reading, and the caller's own text says
+# nothing about signing.
+#
+# This scanner does not follow calls, so a call in the manifest job's
+# ancestry is refused rather than assumed harmless. Nothing in this repo's
+# workflows uses a job-level `uses:` today, so the rule costs nothing; if
+# one is ever wanted there, following it is a real parser's job and this
+# check should be told so out loud.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-assets:
+    name: Publish release assets
+    uses: ./.github/workflows/release-assets.yml
+    secrets: inherit
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - release-assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full
