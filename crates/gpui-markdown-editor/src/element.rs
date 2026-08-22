@@ -958,6 +958,12 @@ fn emphasis_dot_bounds(
         // A character that *ends* its wrap row has no trailing edge on
         // the same row; a CJK glyph is an em square, so its own font
         // size is the honest width to center within.
+        //
+        // A variation selector attached to this character needs nothing
+        // here: gpui's `x_for_index` answers with the first glyph whose
+        // index is *at or after* the one asked for, so a selector that
+        // shaped into its base's cluster (no glyph of its own) is
+        // skipped and the base still measures its own advance.
         let advance = match line.position_for_index(i + ch.len_utf8(), row_stride) {
             Some(trail) if trail.y == lead.y => trail.x - lead.x,
             _ => font_size,
@@ -5394,6 +5400,53 @@ mod tests {
             runs.iter()
                 .any(|(t, italic)| t.contains("latin") && *italic),
             "the Latin sub-run keeps true italic ({runs:?})"
+        );
+    }
+
+    #[gpui::test]
+    fn an_ideographic_variation_sequence_stays_in_one_shaped_run(cx: &mut TestAppContext) {
+        // gpui shapes each `TextRun` on its own, so a selector split off
+        // into the italic run beside its base can no longer select that
+        // base's glyph variant — the ideograph the reader sees changes.
+        let src = "*\u{845B}\u{E0100}\u{57CE} and latin*";
+        let runs = run_italics(cx, src);
+        let holder = runs
+            .iter()
+            .find(|(t, _)| t.contains('\u{E0100}'))
+            .unwrap_or_else(|| panic!("the selector must survive shaping ({runs:?})"));
+        assert!(
+            holder.0.contains('\u{845B}'),
+            "the selector must shape with its base ({runs:?})"
+        );
+        assert!(
+            !holder.1,
+            "the sequence is CJK and must not ask for an italic face ({runs:?})"
+        );
+        assert!(
+            runs.iter()
+                .any(|(t, italic)| t.contains("latin") && *italic),
+            "the Latin sub-run keeps true italic ({runs:?})"
+        );
+    }
+
+    #[gpui::test]
+    fn a_variation_selector_takes_no_dot_and_leaves_its_base_alone(cx: &mut TestAppContext) {
+        // The selector marks nothing of its own, and the base measures
+        // its own advance regardless (see `emphasis_dot_bounds`). Only
+        // the base's dot is compared: this harness's text system gives
+        // every character a uniform advance and so cannot represent a
+        // zero-width selector, which makes the *following* character's
+        // position a property of the stub rather than of the editor.
+        let with = emphasis_dots_for(cx, "*\u{845B}\u{E0100}\u{57CE}*");
+        let without = emphasis_dots_for(cx, "*\u{845B}\u{57CE}*");
+        assert_eq!(
+            with.len(),
+            2,
+            "one dot per ideograph, none for the selector"
+        );
+        assert_eq!(
+            with[0], without[0],
+            "the selector must not move its base's dot"
         );
     }
 

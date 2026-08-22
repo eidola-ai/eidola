@@ -33,8 +33,21 @@ pub fn is_cjk_script(c: char) -> bool {
 /// Hand-maintained, so keep it auditable: never merge two blocks into one
 /// entry and never round an edge, because a wrong edge is silent (the
 /// delimiters still vanish and the reader gets neither a dot nor an
-/// upright face). `block_edges_match_their_ranges` pins every edge, and
-/// the named-character tests below pin the ones review has caught.
+/// upright face). Merging is the same failure one level up — a range
+/// spanning several blocks hides its interior boundaries from
+/// `block_edges_match_their_ranges`, which can only audit the edges it
+/// is told about. Named-character tests below pin the ones review has
+/// caught.
+///
+/// **Enclosed Ideographic Supplement (`U+1F200..=U+1F2FF`) is
+/// deliberately absent.** Every character in it is `General_Category=So`
+/// with `Script=Common` (the single exception, U+1F200, is Hiragana), so
+/// none is a character of a sentence and none could take a dot under
+/// [`takes_emphasis_dot`]; they are squared/circled *symbols* that render
+/// from the emoji face. This is a script classifier, and Common-script
+/// symbols are not a script. Its BMP near-namesake, Enclosed CJK Letters
+/// and Months, *is* listed: that block carries real Hangul- and
+/// Katakana-script members set on the CJK body.
 const CJK_BLOCKS: &[(u32, u32)] = &[
     (0x1100, 0x11FF),   // Hangul Jamo
     (0x2E80, 0x2EFF),   // CJK Radicals Supplement
@@ -61,11 +74,21 @@ const CJK_BLOCKS: &[(u32, u32)] = &[
     (0xFE30, 0xFE4F),   // CJK Compatibility Forms
     (0xFE50, 0xFE6F),   // Small Form Variants
     (0xFF00, 0xFFEF),   // Halfwidth and Fullwidth Forms
+    (0x16FE0, 0x16FFF), // Ideographic Symbols and Punctuation
     (0x1AFF0, 0x1AFFF), // Kana Extended-B
     (0x1B000, 0x1B0FF), // Kana Supplement
     (0x1B100, 0x1B12F), // Kana Extended-A
     (0x1B130, 0x1B16F), // Small Kana Extension
-    (0x20000, 0x3FFFF), // CJK Unified Ideographs Extension B and later
+    (0x20000, 0x2A6DF), // CJK Unified Ideographs Extension B
+    (0x2A700, 0x2B73F), // CJK Unified Ideographs Extension C
+    (0x2B740, 0x2B81F), // CJK Unified Ideographs Extension D
+    (0x2B820, 0x2CEAF), // CJK Unified Ideographs Extension E
+    (0x2CEB0, 0x2EBEF), // CJK Unified Ideographs Extension F
+    (0x2EBF0, 0x2EE5F), // CJK Unified Ideographs Extension I
+    (0x2F800, 0x2FA1F), // CJK Compatibility Ideographs Supplement
+    (0x30000, 0x3134F), // CJK Unified Ideographs Extension G
+    (0x31350, 0x323AF), // CJK Unified Ideographs Extension H
+    (0x323B0, 0x3347F), // CJK Unified Ideographs Extension J
 ];
 
 /// True for a character that takes an emphasis dot of its own.
@@ -78,15 +101,42 @@ pub fn takes_emphasis_dot(c: char) -> bool {
     is_cjk_script(c) && c.is_alphanumeric()
 }
 
+/// True for a variation selector — `U+FE00..=U+FE0F` (Variation
+/// Selectors) or `U+E0100..=U+E01EF` (Variation Selectors Supplement).
+///
+/// **Deliberately not a [`CJK_BLOCKS`] entry**: a selector is not a
+/// script, it is a modifier of whatever script precedes it. It takes the
+/// classification of its base character, which is what
+/// [`cjk_segments`] implements — and it never takes a dot of its own,
+/// which falls out of [`takes_emphasis_dot`] unchanged, since a selector
+/// is a nonspacing mark rather than an alphanumeric.
+pub fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
 /// The maximal CJK-script sub-ranges of `text`, as byte ranges relative
 /// to its start.
 ///
 /// This is what splits one emphasized span into its two renderings: the
 /// ranges returned take dots, everything between them stays italic.
+///
+/// **A segment runs through the variation selectors attached to it.** An
+/// ideographic variation sequence (`葛` + `U+E0100`) is one shaped
+/// cluster, and gpui shapes each `TextRun` separately: leaving the
+/// selector to the italic run beside the base split the cluster across
+/// two runs, where the selector can no longer select the base's glyph
+/// variant — the ideograph the reader sees changes, silently, which is
+/// the same class of failure the dots exist to prevent. A selector with
+/// no CJK character immediately before it belongs to whatever *is*
+/// before it, so it stays out.
 pub fn cjk_segments(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut out: Vec<std::ops::Range<usize>> = Vec::new();
     for (offset, c) in text.char_indices() {
-        if !is_cjk_script(c) {
+        let attached = is_variation_selector(c)
+            && out
+                .last()
+                .is_some_and(|last: &std::ops::Range<usize>| last.end == offset);
+        if !is_cjk_script(c) && !attached {
             continue;
         }
         let end = offset + c.len_utf8();
@@ -228,6 +278,77 @@ mod tests {
     }
 
     #[test]
+    fn ideographic_symbols_and_punctuation_is_cjk() {
+        // U+16FE0..=U+16FFF sat in the gap between Halfwidth and
+        // Fullwidth Forms and the supplementary kana blocks. Most of it
+        // is `Script=Han` — the Old Chinese marks, the Vietnamese
+        // alternate reading marks, the small ER forms — and the
+        // iteration marks are the supplementary-plane analogue of
+        // U+3005, which the table has always claimed.
+        for c in ['\u{16FE0}', '\u{16FE3}', '\u{16FFF}'] {
+            assert!(
+                is_cjk_script(c),
+                "U+{:04X} is Ideographic Symbols and Punctuation",
+                c as u32
+            );
+        }
+        // An iteration mark stands for the character it repeats, so it
+        // is marked like one; the hook mark is punctuation and is not.
+        assert!(
+            takes_emphasis_dot('\u{16FE3}'),
+            "OLD CHINESE ITERATION MARK"
+        );
+        assert!(!takes_emphasis_dot('\u{16FE2}'), "OLD CHINESE HOOK MARK");
+    }
+
+    #[test]
+    fn enclosed_ideographic_supplement_stays_out() {
+        // Excluded on the merits, not by oversight — see the table's
+        // doc comment. `So` symbols with `Script=Common`, none of them
+        // alphanumeric, so listing the block could never change a dot;
+        // it would only pull emoji-face symbols into the CJK sub-run.
+        for c in ['\u{1F210}', '\u{1F250}', '\u{1F265}'] {
+            assert!(
+                !is_cjk_script(c),
+                "U+{:04X} is an enclosed symbol",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn the_ideograph_extensions_are_listed_block_by_block() {
+        // One merged `0x20000..=0x3FFFF` entry hid every boundary above
+        // U+20000 from `block_edges_match_their_ranges` and swallowed
+        // the unassigned gaps between the extensions.
+        for (name, lo, hi) in [
+            ("Extension B", 0x20000u32, 0x2A6DFu32),
+            ("Extension C", 0x2A700, 0x2B73F),
+            ("Extension D", 0x2B740, 0x2B81F),
+            ("Extension E", 0x2B820, 0x2CEAF),
+            ("Extension F", 0x2CEB0, 0x2EBEF),
+            ("Extension I", 0x2EBF0, 0x2EE5F),
+            ("Compatibility Ideographs Supplement", 0x2F800, 0x2FA1F),
+            ("Extension G", 0x30000, 0x3134F),
+            ("Extension H", 0x31350, 0x323AF),
+            ("Extension J", 0x323B0, 0x3347F),
+        ] {
+            for edge in [lo, hi] {
+                let c = char::from_u32(edge).expect("scalar value");
+                assert!(is_cjk_script(c), "U+{edge:04X} is in CJK {name}");
+            }
+        }
+        // The gaps the merged range used to claim.
+        for gap in [0x2A6E0u32, 0x2EE60, 0x2FA20, 0x33480, 0x3FFFF] {
+            let c = char::from_u32(gap).expect("scalar value");
+            assert!(
+                !is_cjk_script(c),
+                "U+{gap:04X} belongs to no CJK block and must not classify"
+            );
+        }
+    }
+
+    #[test]
     fn segments_split_a_mixed_run() {
         // "中文 mixed 测试" — two CJK segments around a Latin one.
         let text = "中文 mixed 测试";
@@ -243,6 +364,50 @@ mod tests {
         let segs = cjk_segments(text);
         assert_eq!(segs.len(), 1);
         assert_eq!(&text[segs[0].clone()], text);
+    }
+
+    #[test]
+    fn segments_run_through_attached_variation_selectors() {
+        // 葛 + VARIATION SELECTOR-17 is one ideographic variation
+        // sequence; the selector must not be handed to the italic run.
+        let text = "\u{845B}\u{E0100}\u{57CE}";
+        let segs = cjk_segments(text);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(&text[segs[0].clone()], text);
+
+        // The BMP selectors attach the same way.
+        let text = "\u{3297}\u{FE0F} latin";
+        let segs = cjk_segments(text);
+        assert_eq!(&text[segs[0].clone()], "\u{3297}\u{FE0F}");
+    }
+
+    #[test]
+    fn a_variation_selector_without_a_cjk_base_stays_out() {
+        // It modifies whatever precedes it, and nothing here does.
+        assert!(cjk_segments("a\u{FE0F}").is_empty());
+        assert!(cjk_segments("\u{E0100}").is_empty());
+        // A selector separated from the CJK run by a Latin character
+        // belongs to that character, not to the run.
+        let text = "\u{4E2D}a\u{FE0F}";
+        let segs = cjk_segments(text);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(&text[segs[0].clone()], "\u{4E2D}");
+    }
+
+    #[test]
+    fn a_variation_selector_takes_no_dot_of_its_own() {
+        for c in ['\u{FE00}', '\u{FE0F}', '\u{E0100}', '\u{E01EF}'] {
+            assert!(is_variation_selector(c));
+            assert!(
+                !takes_emphasis_dot(c),
+                "U+{:04X} marks nothing of its own",
+                c as u32
+            );
+        }
+        assert!(
+            !is_variation_selector('\u{FE10}'),
+            "Vertical Forms starts here"
+        );
     }
 
     #[test]
