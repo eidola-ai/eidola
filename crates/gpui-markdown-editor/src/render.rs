@@ -51,7 +51,7 @@ use std::ops::Range;
 
 use crate::render_spec::{
     BlockKind, Container, InlineRun, InlineStyle, ListItemKind, MarkerOverlay, RenderBlock,
-    RenderSpec,
+    RenderSpec, Substitution,
 };
 use crate::state::{EditorState, Selection};
 use crate::syntax::{ListKind, NodeKind, SyntaxNode};
@@ -164,27 +164,67 @@ fn render_with_cursor(state: &EditorState, tree: &[SyntaxNode], cursor: CursorRa
 /// Runs the element renders verbatim take no dots: inline code shapes in
 /// the mono face as literal source, and a dimmed run *is* the raw
 /// markdown revealed at the cursor.
+///
+/// **Classification follows what is displayed, not what is typed.** A
+/// backslash escape or an entity reference (`*&#x4E2D;*`) is ASCII in
+/// the buffer and a Han character on screen, so the pass runs *after*
+/// `apply_escapes_and_entities` and asks each substitution's display
+/// text, not its source bytes. Every display byte of a substitution maps
+/// back to its source start, so marking the whole substitution range is
+/// what reaches the element.
 fn mark_cjk_emphasis(block: &mut RenderBlock, source: &str) {
     let mut marks: Vec<InlineRun> = Vec::new();
+    let mut mark = |range: Range<usize>| {
+        marks.push(InlineRun {
+            source_range: range,
+            style: InlineStyle {
+                emphasis_dots: true,
+                ..InlineStyle::default()
+            },
+        });
+    };
     for run in &block.inlines {
         if !run.style.italic || run.style.code || run.style.dimmed {
             continue;
         }
-        let Some(text) = source.get(run.source_range.clone()) else {
-            continue;
-        };
-        let base = run.source_range.start;
-        for seg in crate::cjk::cjk_segments(text) {
-            marks.push(InlineRun {
-                source_range: (base + seg.start)..(base + seg.end),
-                style: InlineStyle {
-                    emphasis_dots: true,
-                    ..InlineStyle::default()
-                },
-            });
+        // Source bytes the substitutions do not cover classify as
+        // themselves; a covered range classifies as its display text.
+        let mut cursor = run.source_range.start;
+        let mut subs: Vec<&Substitution> = block
+            .substitutions
+            .iter()
+            .filter(|s| {
+                s.source_range.start >= run.source_range.start
+                    && s.source_range.end <= run.source_range.end
+            })
+            .collect();
+        subs.sort_by_key(|s| s.source_range.start);
+        for sub in subs {
+            if sub.source_range.start < cursor {
+                continue; // overlapping substitutions: first one wins
+            }
+            mark_plain_segments(source, cursor..sub.source_range.start, &mut mark);
+            if sub.display.chars().any(crate::cjk::is_cjk_script) {
+                mark(sub.source_range.clone());
+            }
+            cursor = sub.source_range.end;
         }
+        mark_plain_segments(source, cursor..run.source_range.end, &mut mark);
     }
     block.inlines.append(&mut marks);
+}
+
+/// Mark the CJK sub-ranges of `range`'s literal source bytes.
+fn mark_plain_segments(source: &str, range: Range<usize>, mark: &mut impl FnMut(Range<usize>)) {
+    if range.is_empty() {
+        return;
+    }
+    let Some(text) = source.get(range.clone()) else {
+        return;
+    };
+    for seg in crate::cjk::cjk_segments(text) {
+        mark((range.start + seg.start)..(range.start + seg.end));
+    }
 }
 
 /// Promote each **top-level** `Paragraph` block whose entire source is a

@@ -85,6 +85,53 @@ impl IntoElement for BlockElement {
     }
 }
 
+/// Resolve a display index that sits exactly on a soft-wrap boundary to
+/// the row it **starts**, rather than the row it ends.
+///
+/// gpui's `position_for_index` always gives a boundary index the end of
+/// the *upper* row (upper affinity). Anything drawn for the glyph that
+/// **follows** the boundary wants the lower row instead — a caret placed
+/// by Down/Home/Right, and the emphasis dot under a character that opens
+/// a wrap row, which would otherwise land at the previous row's right
+/// edge, past the wrap width. `upper` is the unbiased position; a
+/// non-boundary index is returned unchanged.
+///
+/// One rule, one implementation: [`LaidOutLine::local_position_for_source_offset_biased`]
+/// (source offsets, the caret) and [`emphasis_dot_bounds`] (display
+/// indices, the dots) both come through here.
+fn downstream_row_position(
+    line: &WrappedLine,
+    display_index: usize,
+    upper: Point<Pixels>,
+    row_stride: Pixels,
+) -> Point<Pixels> {
+    if row_stride <= px(0.) {
+        return upper;
+    }
+    let k = (upper.y / row_stride).round() as i64; // upper-affinity row index
+    let last_row = line.wrap_boundaries().len() as i64; // rows are 0..=last_row
+    if k < 0 || k >= last_row {
+        return upper; // already on the last row
+    }
+    // Is `display_index` exactly the boundary that STARTS row k+1? Probe the
+    // VERTICAL CENTER of row k+1 (`(k + 1.5) * row_stride`), never its top
+    // edge: gpui's `closest_index_for_position` floors `y / line_height`, and
+    // a top-edge sample `(k + 1) * row_stride` divided back by `row_stride`
+    // float-rounds to `k + 0.999… → k` (the row above), so a top-edge probe
+    // would ask the wrong row. The half-row offset keeps the floor exact.
+    let next_row_start = match line.closest_index_for_position(
+        point(px(0.0), row_stride * ((k + 1) as f32 + 0.5)),
+        row_stride,
+    ) {
+        Ok(i) | Err(i) => i,
+    };
+    if next_row_start == display_index {
+        point(px(0.0), row_stride * ((k + 1) as f32))
+    } else {
+        upper
+    }
+}
+
 /// One shaped, possibly soft-wrapped, logical line.
 pub struct LaidOutLine {
     pub line: Arc<WrappedLine>,
@@ -209,33 +256,12 @@ impl LaidOutLine {
         if !downstream {
             return upper;
         }
-        let row_h = self.row_stride;
-        if row_h <= px(0.) {
-            return upper;
-        }
-        let k = (upper.y / row_h).round() as i64; // upper-affinity row index
-        let last_row = self.line.wrap_boundaries().len() as i64; // rows are 0..=last_row
-        if k < 0 || k >= last_row {
-            return upper; // already on the last row
-        }
-        // Is `source_offset` exactly the boundary that STARTS row k+1? Probe the
-        // VERTICAL CENTER of row k+1 (`(k + 1.5) * row_h`), never its top edge:
-        // gpui's `closest_index_for_position` floors `y / line_height`, and a
-        // top-edge sample `(k + 1) * row_h` divided back by `row_h` float-rounds
-        // to `k + 0.999… → k` (the row above), so a top-edge probe would ask the
-        // wrong row. The half-row offset keeps the floor exact.
-        let display = self.display_offset_for_source(source_offset);
-        let next_row_start = match self
-            .line
-            .closest_index_for_position(point(px(0.0), row_h * ((k + 1) as f32 + 0.5)), row_h)
-        {
-            Ok(i) | Err(i) => i,
-        };
-        if next_row_start == display {
-            point(px(0.0), row_h * ((k + 1) as f32))
-        } else {
-            upper
-        }
+        downstream_row_position(
+            &self.line,
+            self.display_offset_for_source(source_offset),
+            upper,
+            self.row_stride,
+        )
     }
 
     pub fn source_offset_for_local_point(&self, local: Point<Pixels>) -> usize {
@@ -768,10 +794,14 @@ fn emphasis_dot_bounds(
         if !effective_inline_style(src, block).emphasis_dots {
             continue;
         }
-        let Some(lead) = line.position_for_index(i, row_stride) else {
+        let Some(upper) = line.position_for_index(i, row_stride) else {
             continue;
         };
-        // A character that ends its wrap row has no trailing edge on
+        // A character that *opens* a wrap row is a boundary index, which
+        // gpui resolves to the row above — the dot would land at the
+        // previous row's right edge, past the wrap width.
+        let lead = downstream_row_position(line, i, upper, row_stride);
+        // A character that *ends* its wrap row has no trailing edge on
         // the same row; a CJK glyph is an em square, so its own font
         // size is the honest width to center within.
         let advance = match line.position_for_index(i + ch.len_utf8(), row_stride) {
@@ -1527,13 +1557,32 @@ fn layout_embed(
         match &block.kind {
             BlockKind::Table { .. } => {
                 if let Some(t) = layout_table(block, content, font_size, style, inner_w, window) {
+                    let (body_ascent, body_descent) =
+                        body_metrics_for_block(&block.kind, style, font_size, window);
                     for piece in t.pieces {
+                        let rel_origin =
+                            point(indent + piece.rel_origin.x, block_top + piece.rel_origin.y);
+                        // A cell is a shaped line like any other, so its
+                        // emphasized CJK takes dots — and the embed has to
+                        // ask for them, since only the shaping path is
+                        // shared (the editor's own table pieces become
+                        // `LaidOutLine`s and are covered by the regular
+                        // per-line pass).
+                        out.emphasis_dots.extend(emphasis_dot_bounds(
+                            &piece.line,
+                            &piece.display_to_source,
+                            rel_origin,
+                            line_height,
+                            line_height,
+                            block,
+                            style,
+                            font_size,
+                            body_ascent,
+                            body_descent,
+                        ));
                         out.pieces.push(EmbedPiece {
                             line: piece.line,
-                            rel_origin: point(
-                                indent + piece.rel_origin.x,
-                                block_top + piece.rel_origin.y,
-                            ),
+                            rel_origin,
                             row_stride: line_height,
                         });
                     }
