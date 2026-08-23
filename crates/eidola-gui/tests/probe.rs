@@ -7508,12 +7508,16 @@ fn a_conversations_turn_states_speak_the_readers_language(cx: &mut TestAppContex
     // first's place, a collision on the second, and a third that stopped at its
     // length allowance. One per post because a pending revision draws over the
     // whole body it replaces, marks included.
+    // The collision mark is staged on the view rather than through the
+    // entity's gates: a standing collision now withholds the next
+    // regeneration, which is the point of that gate and would leave the live
+    // revision below unstarted.
     cx.update(|cx| {
-        view.update(cx, |v, cx| v.note_truncated_turn_for_test("a3", cx));
+        view.update(cx, |v, cx| {
+            v.note_truncated_turn_for_test("a3", cx);
+            v.note_regeneration_elsewhere_for_test("a2", cx);
+        });
         space.update(cx, |s, cx| {
-            s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
-            let seq = s.revising_seq("a2").expect("the press is pending");
-            s.collide_revision_for_test(seq, cx);
             s.regenerate_post("a1".into(), "kimi-k2".into(), cx);
         });
     });

@@ -1339,8 +1339,16 @@ impl Space {
     /// only about streams would keep drawing verbs whose handler is already
     /// certain to say no. A button that cannot act must not look like one that
     /// can.
+    /// **A standing collision withholds them too** (Codex review, PR #330).
+    /// The waiter is deliberately outside [`Self::is_busy`] — nothing of this
+    /// space's is running, and a space that refused a *post* while listening
+    /// for another window's turn would be busy on its behalf — so the gutter
+    /// remounted Regenerate beside the "already being regenerated" mark, and
+    /// every press before the settlement started a runner certain to meet the
+    /// claim again. Edit and Regenerate both supersede a generation, which is
+    /// exactly the question [`Self::mutation_in_flight`] asks.
     pub fn accepts_mutation(&self) -> bool {
-        !self.is_busy()
+        !self.is_busy() && !self.mutation_in_flight()
     }
 
     /// Whether a **post-level mutation** is running right now — one that
@@ -1879,13 +1887,24 @@ impl Space {
         // behalf, into a room that cannot reopen. One refusal that stands
         // supersedes any recovery it stands in front of. The notice still
         // explains itself either way — `SpaceEvent::Failed` carries the error.
-        if !is_retryable(&e) {
-            self.failed_turn = None;
-        } else if let (Some(p), Some(t)) = (participant_id, target_action_id) {
-            self.failed_turn = Some(FailedTurn {
-                participant_id: p,
-                target_action_id: t,
-            });
+        // **The record is total, so the notice and the recovery it offers can
+        // only ever describe one event.** A failure that brings its own re-ask
+        // records it; every other failure *ends* whatever recovery was standing
+        // — including one carrying no re-ask of its own, which is a
+        // regeneration (nothing was written, and Retry re-*asks* a participant,
+        // a different verb with a different bill). Leaving the old record there
+        // was the subtler half twice over: the band explains the newer failure
+        // while Retry acts on the older one's behalf, so a regeneration's
+        // notice — which deliberately offers no Retry — stood over a live
+        // Retry for an unrelated earlier ask.
+        match (is_retryable(&e), participant_id, target_action_id) {
+            (true, Some(p), Some(t)) => {
+                self.failed_turn = Some(FailedTurn {
+                    participant_id: p,
+                    target_action_id: t,
+                });
+            }
+            _ => self.failed_turn = None,
         }
         self.load_transcript(cx);
         cx.emit(SpaceEvent::Failed(e));
@@ -2153,7 +2172,11 @@ impl Space {
         model: String,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.is_busy() {
+        // The same predicate the verb is drawn from, so an accepted press and
+        // an offered verb can never disagree — and a press during a standing
+        // collision is refused here rather than starting a runner the
+        // process-wide claim is certain to refuse.
+        if !self.accepts_mutation() {
             return false;
         }
         self.last_submitted_model = Some(model.clone());
@@ -2611,8 +2634,16 @@ impl Space {
     /// nothing exclusive is in flight ([`Self::ask`] itself refuses a
     /// duplicate of a turn already streaming). Sibling turns streaming do
     /// *not* block a retry — per-turn recovery is independent by design.
+    /// **Retry re-asks, so it is withheld wherever an ask would be refused**
+    /// (Codex review, PR #330). [`Self::retry`] routes through [`Self::ask`],
+    /// which refuses while a post-level mutation is in flight — an ask is
+    /// written against a generation, and one may not start while that
+    /// generation is being replaced. Asking only about the exclusive slot left
+    /// the button live through a regeneration and through a standing collision,
+    /// where the press could only be refused. A sibling *stream* still does not
+    /// block it: that is the fan-out, and re-asking beside one is the point.
     pub fn can_retry(&self) -> bool {
-        self.failed_turn.is_some() && self.post_runner.is_none()
+        self.failed_turn.is_some() && !self.mutation_in_flight()
     }
 
     /// Forget the recorded failed turn (the recovery notice was **explicitly
