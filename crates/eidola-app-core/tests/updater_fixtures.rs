@@ -388,6 +388,25 @@ async fn refuses_a_bundle_whose_claims_disagree_with_the_attestation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn refuses_a_plan_that_names_an_identity_it_would_never_check() {
+    // The other direction: an identity the attestation requires, with no
+    // signature material to apply. Nothing is composed, `inspect` never
+    // runs, and the requirement would evaporate silently — an app staged
+    // as if it had been checked against a Team ID nobody ever read.
+    let published = publish();
+    let mut plan = plan(&published);
+    plan.envelope = None;
+
+    let staging = tempfile::tempdir().unwrap();
+    let root = staging.path().join("9.9.9");
+    let error = install::stage(&Fetcher::fixtures(published.dir.path()), &plan, &root)
+        .await
+        .expect_err("an identity with nothing to check it against should be refused");
+    assert!(matches!(error, InstallError::PlanIncomplete), "{error}");
+    assert!(!root.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn refuses_a_plan_that_would_apply_signatures_without_checking_them() {
     let published = publish();
     let mut plan = plan(&published);

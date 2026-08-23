@@ -29,6 +29,15 @@ use super::InstallError;
 /// *malformed* archive from asking for unbounded disk on the way there.
 const MAX_TOTAL_UNPACKED: u64 = 4 * 1024 * 1024 * 1024;
 
+/// The most members a container may hold.
+///
+/// A byte budget does not bound member *count*: a million empty files cost
+/// almost nothing to store and a great deal to create, in inodes and in
+/// the bookkeeping every step after this does per file. A real bundle is
+/// hundreds of entries; this is generous by an order of magnitude and
+/// still a bound.
+const MAX_MEMBERS: usize = 50_000;
+
 /// Unpack a zip container into `dest`, which must already exist and be
 /// empty.
 ///
@@ -40,6 +49,16 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
         label: label.to_string(),
         reason: format!("not a readable zip container: {e}"),
     })?;
+
+    if archive.len() > MAX_MEMBERS {
+        return Err(InstallError::Archive {
+            label: label.to_string(),
+            reason: format!(
+                "holds {} members, more than the {MAX_MEMBERS} this will unpack",
+                archive.len()
+            ),
+        });
+    }
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut written = 0usize;
@@ -72,11 +91,41 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
 
         let target = dest.join(&relative);
 
+        // What a member *claims to be* is read before anything dispatches
+        // on what it looks like. A name ending in `/` makes a member a
+        // directory to every zip reader, so a symlink mode behind a
+        // trailing slash would otherwise reach the directory branch and
+        // never meet the check written to refuse it.
+        if let Some(mode) = entry.unix_mode() {
+            let kind = mode & 0o170000;
+            if kind == 0o120000 {
+                return Err(InstallError::Archive {
+                    label: label.to_string(),
+                    reason: format!("member `{raw_name}` is a symbolic link; those are refused"),
+                });
+            }
+            if kind != 0 && kind != 0o040000 && kind != 0o100000 {
+                return Err(InstallError::Archive {
+                    label: label.to_string(),
+                    reason: format!(
+                        "member `{raw_name}` is neither a regular file nor a directory; only \
+                         those are unpacked, as reconstruction requires"
+                    ),
+                });
+            }
+        }
+
         if entry.is_dir() {
             std::fs::create_dir_all(&target).map_err(|e| InstallError::Staging {
                 path: target.clone(),
                 reason: e.to_string(),
             })?;
+            // Directories get the same exact mode set the files do. Left
+            // to `create_dir_all` they inherit the umask, so a staging run
+            // under 077 produces 0700 directories — and an app promoted
+            // from that tree is unreadable to anyone but the installing
+            // user, which is not what the packer recorded.
+            set_directory_mode(&target)?;
             continue;
         }
 
@@ -87,17 +136,6 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
                     "member `{raw_name}` is neither a regular file nor a directory; symbolic \
                      links and device nodes are refused, as they are by reconstruction"
                 ),
-            });
-        }
-
-        // A symlink is stored as a file whose mode says so — `is_file()`
-        // alone does not exclude it on every zip writer.
-        if let Some(mode) = entry.unix_mode()
-            && mode & 0o170000 == 0o120000
-        {
-            return Err(InstallError::Archive {
-                label: label.to_string(),
-                reason: format!("member `{raw_name}` is a symbolic link; those are refused"),
             });
         }
 
@@ -150,7 +188,41 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
         written += 1;
     }
 
+    // Directories get the same exact mode set the files do, in one pass at
+    // the end so implicitly created parents are covered as surely as
+    // explicit members. Left to `create_dir_all` they inherit the umask,
+    // so a staging run under 077 produces 0700 directories — and an app
+    // promoted from that tree is unreadable to anyone but the installing
+    // user, which is not the tree the packer recorded.
+    normalize_directory_modes(dest)?;
     Ok(written)
+}
+
+/// `u=rwX,go=rX` for every directory under `root`, inclusive — the same
+/// rule the packing recipe applies.
+fn normalize_directory_modes(root: &Path) -> Result<(), InstallError> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).map_err(|e| InstallError::Staging {
+            path: dir.clone(),
+            reason: e.to_string(),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| InstallError::Staging {
+                path: dir.clone(),
+                reason: e.to_string(),
+            })?;
+            let kind = entry.file_type().map_err(|e| InstallError::Staging {
+                path: entry.path(),
+                reason: e.to_string(),
+            })?;
+            if kind.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+        set_directory_mode(&dir)?;
+    }
+    Ok(())
 }
 
 /// Stream one member onto disk, spending `budget_used` as it goes.
@@ -214,6 +286,25 @@ fn copy_member(
 /// function quietly widening.
 fn collision_key(relative: &Path) -> String {
     relative.to_string_lossy().to_ascii_lowercase()
+}
+
+/// `u=rwX,go=rX` for a directory — the same rule the packing recipe
+/// applies, so the tree that comes out matches the tree that went in.
+#[cfg(unix)]
+fn set_directory_mode(path: &Path) -> Result<(), InstallError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
+        InstallError::Staging {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn set_directory_mode(_path: &Path) -> Result<(), InstallError> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -308,6 +399,113 @@ pub(super) fn single_component(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member whose name ends in `/` — which makes it a directory to
+    /// every zip reader — while its mode says symbolic link. Dispatching
+    /// on what a member looks like before reading what it claims to be
+    /// sends this down the directory branch, past the check written to
+    /// refuse it.
+    #[test]
+    fn refuses_a_symlink_mode_hidden_behind_a_trailing_slash() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(0o777);
+            writer.start_file("app/link/".to_string(), options).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut bytes = cursor.into_inner();
+
+        // The writer masks the file-type bits off, so the symlink mode is
+        // patched into the external attributes, where the mode lives in
+        // the high half.
+        let regular = (0o100777u32 << 16).to_le_bytes();
+        let symlink = (0o120777u32 << 16).to_le_bytes();
+        let mut patched = 0;
+        for i in 0..bytes.len().saturating_sub(4) {
+            if bytes[i..i + 4] == regular {
+                bytes[i..i + 4].copy_from_slice(&symlink);
+                patched += 1;
+            }
+        }
+        assert!(patched >= 1, "the fixture should record a mode somewhere");
+
+        let dest = tempfile::tempdir().unwrap();
+        let error = unpack_zip(&bytes, dest.path(), "a payload")
+            .expect_err("a symlink is refused however it is spelled");
+        assert!(
+            matches!(&error, InstallError::Archive { reason, .. } if reason.contains("symbolic link")),
+            "{error}"
+        );
+    }
+
+    /// A byte budget does not bound member count.
+    #[test]
+    fn refuses_a_container_with_more_members_than_a_bundle_has() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(0o644);
+            for i in 0..(MAX_MEMBERS + 1) {
+                writer.start_file(format!("app/{i}"), options).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+
+        let dest = tempfile::tempdir().unwrap();
+        let error = unpack_zip(&bytes, dest.path(), "a payload")
+            .expect_err("a container of empty members is still a container to refuse");
+        assert!(
+            matches!(&error, InstallError::Archive { reason, .. } if reason.contains("members")),
+            "{error}"
+        );
+    }
+
+    /// Directories carry the packer's mode set, not the caller's umask.
+    #[test]
+    fn normalizes_directory_modes_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            // One explicit directory member, and one implied by a nested
+            // file — both must come out the same.
+            writer
+                .add_directory("app/Contents".to_string(), options)
+                .unwrap();
+            writer
+                .start_file("app/Contents/Resources/data.bin".to_string(), options)
+                .unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+
+        let dest = tempfile::tempdir().unwrap();
+        // SAFETY: `umask` reads and sets process state; it cannot fail.
+        let previous = unsafe { libc::umask(0o077) };
+        let outcome = unpack_zip(&bytes, dest.path(), "a payload");
+        unsafe { libc::umask(previous) };
+        outcome.expect("the container is well formed");
+
+        for dir in ["app", "app/Contents", "app/Contents/Resources"] {
+            let mode = std::fs::metadata(dest.path().join(dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755, "`{dir}` should carry the packer's mode set");
+        }
+    }
 
     /// A member that decompresses to more than the container's own
     /// central directory claims. The budget is spent on bytes that

@@ -175,7 +175,10 @@ pub enum InstallError {
         expected: String,
         actual: String,
     },
-    #[error("an install plan carrying signature material must also carry the identity to check")]
+    #[error(
+        "an install plan must carry signature material and the identity to check it against, \
+         or neither"
+    )]
     PlanIncomplete,
     #[error("staging failed at `{path}`: {reason}")]
     Staging { path: PathBuf, reason: String },
@@ -200,7 +203,12 @@ pub async fn stage(
     plan: &InstallPlan,
     staging_root: &Path,
 ) -> Result<StagedInstall, InstallError> {
-    if plan.envelope.is_some() && plan.expected_signature.is_none() {
+    // Each half requires the other. Signature material with no identity to
+    // check means applying signatures nobody looks at; an identity with no
+    // material means the requirement is never applied *or* checked, and a
+    // plan that demands a Team ID would install an app that was never
+    // asked for one.
+    if plan.envelope.is_some() != plan.expected_signature.is_some() {
         return Err(InstallError::PlanIncomplete);
     }
 
@@ -489,9 +497,15 @@ fn remove_tree(path: &Path) -> Result<(), InstallError> {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromotionReadiness {
-    /// The bundle and the directory holding it are writable by this
-    /// process: a swap is an ordinary rename.
+    /// A swap is an ordinary rename: same filesystem, and this process may
+    /// replace entries in the directory holding the installed bundle.
     Ready,
+    /// The staged bundle and the install location are on different
+    /// filesystems, so `rename` cannot move one to the other — it would
+    /// fail `EXDEV` no matter the permissions. Reported rather than worked
+    /// around here: the caller chose where staging lives, so the caller is
+    /// who can move it or copy across.
+    DifferentFilesystem { staged: PathBuf, installed: PathBuf },
     /// Promotion would need privileges this process does not have — and
     /// must not acquire on its own.
     NeedsPrivileges { reason: String },
@@ -499,9 +513,13 @@ pub enum PromotionReadiness {
     NotInstalled,
 }
 
-/// Probe the install location. Reads only; nothing is created or moved.
+/// Probe the install location against a staged bundle. Reads only;
+/// nothing is created or moved.
+///
+/// `staged` is the bundle that would be renamed into place — its
+/// filesystem is half the question.
 #[cfg(target_os = "macos")]
-pub fn promotion_readiness(installed: &Path) -> PromotionReadiness {
+pub fn promotion_readiness(staged: &Path, installed: &Path) -> PromotionReadiness {
     // `exists()` answers false for "no" *and* for "an ancestor is not
     // searchable", which are opposite answers here: the second means a
     // bundle may well be installed and this process cannot get to it.
@@ -534,7 +552,80 @@ pub fn promotion_readiness(installed: &Path) -> PromotionReadiness {
             ),
         };
     }
+
+    // A sticky directory — `/tmp` and anything modelled on it — narrows
+    // write permission: an entry there may only be renamed or removed by
+    // whoever owns the entry, or owns the directory, or is root. Write and
+    // search on the parent are necessary and, here, not sufficient.
+    match sticky_verdict(parent, installed) {
+        Ok(true) => {}
+        Ok(false) => {
+            return PromotionReadiness::NeedsPrivileges {
+                reason: format!(
+                    "`{}` is sticky and this user owns neither it nor `{}`",
+                    parent.display(),
+                    installed.display()
+                ),
+            };
+        }
+        Err(e) => {
+            return PromotionReadiness::NeedsPrivileges {
+                reason: format!("`{}` could not be examined: {e}", parent.display()),
+            };
+        }
+    }
+
+    // `rename` does not cross filesystems, whatever the permissions say.
+    match (device_of(staged), device_of(parent)) {
+        (Ok(from), Ok(to)) if from != to => {
+            return PromotionReadiness::DifferentFilesystem {
+                staged: staged.to_path_buf(),
+                installed: installed.to_path_buf(),
+            };
+        }
+        (Ok(_), Ok(_)) => {}
+        (Err(e), _) | (_, Err(e)) => {
+            return PromotionReadiness::NeedsPrivileges {
+                reason: format!("the staged and installed paths could not be compared: {e}"),
+            };
+        }
+    }
+
     PromotionReadiness::Ready
+}
+
+/// Which filesystem a path lives on.
+#[cfg(target_os = "macos")]
+fn device_of(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)?.dev() as u64)
+}
+
+/// Whether a sticky parent still permits renaming `entry` out of it.
+#[cfg(target_os = "macos")]
+fn sticky_verdict(parent: &Path, entry: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let parent_meta = std::fs::metadata(parent)?;
+    if parent_meta.mode() & 0o1000 == 0 {
+        return Ok(true); // not sticky; the earlier access(2) answer stands
+    }
+    let entry_meta = std::fs::symlink_metadata(entry)?;
+    // SAFETY: `geteuid` reads process state and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    Ok(sticky_permits_rename(
+        parent_meta.uid(),
+        entry_meta.uid(),
+        euid,
+    ))
+}
+
+/// The sticky-directory rule itself, as arithmetic rather than as a
+/// filesystem: an entry in a sticky directory may be renamed by the
+/// owner of the entry, the owner of the directory, or root.
+#[cfg(target_os = "macos")]
+fn sticky_permits_rename(parent_uid: u32, entry_uid: u32, euid: u32) -> bool {
+    euid == 0 || euid == entry_uid || euid == parent_uid
 }
 
 /// Can this user replace an entry inside `dir`?
@@ -603,13 +694,16 @@ mod promotion_tests {
 
         let missing = root.path().join("Nothing.app");
         assert_eq!(
-            promotion_readiness(&missing),
+            promotion_readiness(&missing, &missing),
             PromotionReadiness::NotInstalled
         );
 
         let installed = root.path().join("Eidola.app");
         std::fs::create_dir(&installed).unwrap();
-        assert_eq!(promotion_readiness(&installed), PromotionReadiness::Ready);
+        assert_eq!(
+            promotion_readiness(&installed, &installed),
+            PromotionReadiness::Ready
+        );
 
         // Root bypasses the permission check entirely, so the negative
         // case only means something as an ordinary user.
@@ -617,7 +711,7 @@ mod promotion_tests {
         if unsafe { libc::geteuid() } != 0 {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-            let verdict = promotion_readiness(&installed);
+            let verdict = promotion_readiness(&installed, &installed);
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
             assert!(
                 matches!(verdict, PromotionReadiness::NeedsPrivileges { .. }),
@@ -629,6 +723,99 @@ mod promotion_tests {
         // Nothing was created or moved by any of the above.
         assert!(installed.is_dir());
         assert!(!missing.exists());
+    }
+
+    /// `rename` does not cross filesystems, whatever the permissions say,
+    /// so a staged bundle on a different volume from the install location
+    /// cannot be promoted by renaming — it fails `EXDEV`.
+    ///
+    /// Needs a second writable filesystem to mean anything. Verified
+    /// against a RAM disk during development: the rename returns
+    /// `CrossesDevices`, this probe reports `DifferentFilesystem`, and a
+    /// probe that asked only about permissions said `Ready`.
+    #[test]
+    fn a_staged_bundle_on_another_filesystem_cannot_be_renamed_into_place() {
+        let Some(elsewhere) = another_writable_filesystem() else {
+            eprintln!(
+                "skipped: no second writable filesystem is mounted, so the cross-device \
+                 case cannot be exercised here"
+            );
+            return;
+        };
+
+        let staged = elsewhere.join("eidola-promotion-probe.app");
+        if std::fs::create_dir_all(&staged).is_err() {
+            eprintln!("skipped: could not stage on {}", elsewhere.display());
+            return;
+        }
+
+        let here = tempfile::tempdir().unwrap();
+        let installed = here.path().join("Eidola.app");
+        std::fs::create_dir(&installed).unwrap();
+
+        let verdict = promotion_readiness(&staged, &installed);
+        let _ = std::fs::remove_dir_all(&staged);
+
+        assert!(
+            matches!(verdict, PromotionReadiness::DifferentFilesystem { .. }),
+            "a staged bundle on another filesystem is not promotable by rename: {verdict:?}"
+        );
+    }
+
+    /// A mounted filesystem that is not the one temporary directories live
+    /// on, and that this user can write to.
+    fn another_writable_filesystem() -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+
+        let here_dev = std::fs::metadata(std::env::temp_dir()).ok()?.dev();
+        for entry in std::fs::read_dir("/Volumes").ok()? {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_dir() || meta.dev() == here_dev {
+                continue;
+            }
+            if renamable_within(&path) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_sticky_rule_is_the_kernel_s_rule() {
+        // An entry in a sticky directory may be renamed by whoever owns
+        // the entry, whoever owns the directory, or root — and by nobody
+        // else, however writable the directory is.
+        assert!(sticky_permits_rename(0, 501, 501), "the entry's owner may");
+        assert!(
+            sticky_permits_rename(501, 0, 501),
+            "the directory's owner may"
+        );
+        assert!(sticky_permits_rename(0, 0, 0), "root may");
+        assert!(
+            !sticky_permits_rename(0, 0, 501),
+            "a user who owns neither may not, whatever the mode bits say"
+        );
+    }
+
+    #[test]
+    fn a_sticky_directory_this_user_owns_still_permits_promotion() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("sticky");
+        let installed = parent.join("Eidola.app");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+        assert_eq!(
+            promotion_readiness(&installed, &installed),
+            PromotionReadiness::Ready,
+            "the sticky rule is about ownership, and this user owns both"
+        );
     }
 
     #[test]
@@ -645,7 +832,7 @@ mod promotion_tests {
         std::fs::write(installed.join("Info.plist"), b"x").unwrap();
         std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let verdict = promotion_readiness(&installed);
+        let verdict = promotion_readiness(&installed, &installed);
         std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(
@@ -669,7 +856,7 @@ mod promotion_tests {
         std::fs::create_dir_all(&installed).unwrap();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let verdict = promotion_readiness(&installed);
+        let verdict = promotion_readiness(&installed, &installed);
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
@@ -692,7 +879,7 @@ mod promotion_tests {
         std::fs::create_dir_all(&installed).unwrap();
         std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let verdict = promotion_readiness(&installed);
+        let verdict = promotion_readiness(&installed, &installed);
         std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
