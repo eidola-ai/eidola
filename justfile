@@ -118,6 +118,7 @@ check:
     cargo fmt --check
     rumdl check .
     cargo-deny check licenses bans sources
+    ./scripts/check-manifest-determinism.sh
 
 # Apply auto-fixable markdown formatting via rumdl
 format:
@@ -197,6 +198,26 @@ test-verify-apple:
     ./scripts/test-verify-apple.sh
 
 # --- CI / Release ---
+
+# Assert no key-dependent value can reach artifact-manifest.json: the
+# per-type field allow-list, the signing-material key deny-list, and the
+# job-graph rule that keeps signing out of the manifest's inputs. Runs the
+# bad fixtures too, so the check is proven to still bite.
+check-manifest-determinism:
+    ./scripts/check-manifest-determinism.sh
+
+# Pack a directory tree into the macOS shipping container, byte for byte —
+# the re-zip half of forward verification, for the tree `just verify-apple`
+# reconstructs. Same recipe the flake's zip derivation runs; runs on macOS
+# or Linux with POSIX shell and Info-ZIP.
+pack-shipping-zip tree output:
+    ./scripts/pack-shipping-zip.sh "{{ tree }}" "{{ output }}"
+
+# Symlink and determinism regressions for the shipping-zip recipe, and the
+# assertion that the flake runs it rather than restating it. Info-ZIP only
+# — no Nix, no toolchain.
+test-shipping-zip:
+    ./scripts/test-shipping-zip.sh
 
 # Compute enclave measurements from tinfoil-config.yml and CVM artifacts
 measure:

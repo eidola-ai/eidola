@@ -1,0 +1,46 @@
+{
+  "artifacts": {
+    "eidola-cli": {
+      "digest": "sha256:3a14d1c807ce1ffdf9f41e6f67ef590f89042017b1a3e3e2b03eec98bee499f4",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-cli-macos-universal": {
+      "archiveSha256": "sha256:262947bfde2e1671128bda81a0653614b1bfc97a23416ccfc9b08bbc6908f722",
+      "narHash": Infinity,
+      "platform": "darwin/universal",
+      "type": "nix"
+    },
+    "eidola-gui-linux-amd64": {
+      "archiveSha256": "sha256:228adedaecb4ab2a441d3493e8b3e426b88995d173169524ee71ad5ddd1dc1ce",
+      "narHash": "sha256-lAcbRQIhpEuMUpUgVl+qWoiJ7QT8svlagHwV+eDX9WE=",
+      "platform": "linux/amd64",
+      "type": "nix"
+    },
+    "eidola-gui-macos-universal": {
+      "archiveSha256": "sha256:86fe1473b98373fb976159384d9a5d296691756ea20ecd52d72fd1eb5e736b2f",
+      "narHash": "sha256-QxqjmU0+KZ/65na8uAH9l/GgWjkRD5+06VZVIV/mPy4=",
+      "platform": "darwin/universal",
+      "type": "nix"
+    },
+    "eidola-postgres": {
+      "digest": "sha256:f572932f6879be2af219094844f86934a841501359fe16056348f085f8ba4116",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-server": {
+      "digest": "sha256:a3d085af891e7f18d132c1563fef17d0a139b2bcac2a3fbdef3b16729115be8d",
+      "platform": "linux/amd64",
+      "type": "oci"
+    }
+  },
+  "enclave": {
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=06227009c142651b92cf5b3534c0f5975d4a57bf5733650dd291da08d86efafa",
+    "snp_measurement": "3d4bf3e5105d21ffc7078d52719644df09b5c942bf3d840e7f73c96f11da53aca7239876349ffbbae709784761de9a21",
+    "tdx_measurement": {
+      "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
+      "rtmr2": "5f935649c7fbc57c9fa930def584520c1df54b646ae040caf0db46e24854575b182f40b8f88db4f70bc4a31f75d9d3cc"
+    }
+  },
+  "schema_version": 2
+}

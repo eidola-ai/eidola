@@ -1,0 +1,27 @@
+{
+  "artifacts": {
+    "eidola-gui-macos-universal": {
+      "appleTeamId": "XXXXXXXXXX",
+      "archiveSha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "platform": "darwin/universal",
+      "type": "nix"
+    }
+  },
+  "artifacts": {
+    "eidola-server": {
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "platform": "linux/amd64",
+      "type": "oci"
+    }
+  },
+  "enclave": {
+    "cmdline": "readonly=on root=/dev/mapper/root",
+    "snp_measurement": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tdx_measurement": {
+      "rtmr1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "rtmr2": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  },
+  "schema_version": 2
+}

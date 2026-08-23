@@ -1,0 +1,35 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# Found by sweeping the constructs against the extraction paths rather
+# than reported: a job key may hold an apostrophe as a plain scalar
+# (`release'-assets`), and a `needs:` entry may name it in the quoted
+# spelling, where `''` is the one escape a single-quoted scalar has. A
+# tokenizer that ends the scalar at the first closing quote splits one
+# name into two, and the edge to the key-holder disappears from the graph
+# while GitHub resolves both spellings to the same job.
+#
+# The doubled quote keeps the scalar whole, so the classifier sees the
+# escape and refuses it.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release'-assets:
+    name: Publish release assets
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Wrap
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs: ['release''-assets']
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

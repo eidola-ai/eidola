@@ -1,0 +1,20 @@
+{
+  "artifacts": {
+    "eidola-server": {
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "platform": "linux/amd64",
+      "type": "oci"
+    }
+  },
+  "build_nonce": "9f3c1a7e",
+  "enclave": {
+    "cmdline": "readonly=on root=/dev/mapper/root",
+    "snp_measurement": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tdx_measurement": {
+      "rtmr1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "rtmr2": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  },
+  "run_id": "1234567890",
+  "schema_version": 2
+}

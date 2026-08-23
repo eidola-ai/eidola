@@ -1292,6 +1292,42 @@ with open(path, "wb") as f:
               | gzip -n -9 > "$out"
             '';
 
+        # The macOS shipping container: a deterministic zip of the payload,
+        # in the shape a browser download and Gatekeeper expect. Distinct
+        # from mkReproducibleArchive's `.tar.gz` and not a replacement for
+        # it — `archiveSha256` stays the payload's canonical identity. What
+        # this adds is a *published recipe* for the container itself, which
+        # is what makes `apply(archive, envelope) = installable` checkable:
+        # reconstructing the signed bundle only reproduces a tree, and the
+        # shipped file is a zip, so re-zipping has to land on the same bytes
+        # CI produced or the comparison has nothing to compare.
+        #
+        # The recipe itself lives in `scripts/pack-shipping-zip.sh`, which
+        # this runs rather than restates. That is the whole point of the
+        # split: a verifier has a tree this attribute cannot pack — some
+        # other directory, usually on Linux, reconstructed by
+        # `just verify-apple` — and two copies of a byte-exact recipe would
+        # be two recipes. The script carries the reasoning for each flag,
+        # including why Info-ZIP and never `ditto`.
+        #
+        # The copy is made here because the store path is read-only and the
+        # script normalizes modes in place; `u+w` only makes the copy
+        # writable, and the script then sets the exact mode set.
+        mkShippingZip =
+          {
+            pname,
+            payload,
+          }:
+          pkgs.runCommand "${pname}.zip"
+            {
+              nativeBuildInputs = [ pkgs.zip ];
+            }
+            ''
+              cp -R ${payload} tree
+              chmod -R u+w tree
+              ${./scripts/pack-shipping-zip.sh} tree "$out"
+            '';
+
         # The shippable Linux GUI: a *copied* GUI binary, a *copied*
         # llama-server sidecar (both sets of bytes in this NAR — same
         # measurement rule as macOS), and a *referenced* nixpkgs Mesa ICD
@@ -1659,6 +1695,13 @@ with open(path, "wb") as f:
         // pkgs.lib.optionalAttrs (eidolaGuiMacosUniversal != null) {
           eidola-gui-macos-universal = eidolaGuiMacosUniversal;
           eidola-gui-macos-universal-archive = mkReproducibleArchive {
+            pname = "eidola-gui-macos-universal";
+            payload = eidolaGuiMacosUniversal;
+          };
+          # The unsigned shipping container. Signing happens outside Nix
+          # (it needs a key), so this is the *unsigned* zip: the recipe a
+          # signed release's zip is produced by, exercised on every build.
+          eidola-gui-macos-universal-zip = mkShippingZip {
             pname = "eidola-gui-macos-universal";
             payload = eidolaGuiMacosUniversal;
           };

@@ -21,12 +21,15 @@ Attestations and `artifact-manifest.json` live **beside** the installable on the
 
 ## What the manifest records
 
-`artifact-manifest.json` is committed at the git ref, signed by CI, and what the engineer attests they reproduced. `schema_version` is `2`.
+`artifact-manifest.json` is committed at the git ref, signed by CI, and what the engineer attests they reproduced. `schema_version` is `2`; clients also accept `3`, which adds the macOS unsigned shipping zip as a `file` row (accept-before-emit — see [`releases/README.md`](../releases/README.md#rotating-document-schema-versions)).
 
 | Artifact `type` | Identity of the payload | Identity of the archive | Envelope / installable |
 | --- | --- | --- | --- |
 | `oci` | Layers of the image | `digest` (`sha256:` + hex) — this *is* the archive | Empty. `docker pull` is the installable. |
 | `nix` | `narHash` (Nix SRI of the store-path NAR) — rebuild/debug checkpoint | `archiveSha256` (`sha256:` + hex of the flake-built `.tar.gz`) | macOS: Apple material, hashes in the **human attestation** only. Current Linux Nix GUI: empty envelope. |
+| `file` (schema 3) | — | `sha256` (`sha256:` + hex) of one published file | The macOS unsigned shipping zip: the *container* an installable takes, before any envelope. |
+
+Every value in this file is a function of source. Nothing key-dependent may enter it — no signed-artifact hash, no detached-bundle hash, no Team ID, no ticket; those live in the human attestation, which is signed and non-deterministic already. That is enforced rather than remembered: `scripts/check-manifest-determinism.sh` (run by `just check` and by the `Rust checks` workflow) validates the document's envelope and holds each artifact type to an exact field list (so an unrecognized field is rejected whether or not it names a key), rejects any key naming signing material, and asserts over `.github/workflows/artifacts.yml` that no ancestor of the job assembling the manifest is a signing job and that no job computing part of it holds the signing environment.
 
 `narHash` is kept because it is free and isolates "the packer changed" from "the payload changed." It is not the user-facing check. Two serializations of the same tree: if they disagree, the archive derivation is impure. That split is load-bearing in one routine case: the archive is gzip-compressed, so the pinned **gzip version** is an input to `archiveSha256`. A `flake.lock` bump can move the archive hash with a byte-identical payload — `narHash` holding steady while `archiveSha256` moves is that, not tampering.
 
@@ -68,6 +71,8 @@ The macOS universal attrs (`.#eidola-cli-macos-universal`, `.#eidola-gui-macos-u
 2. **Reverse.** Invert the Mach-O edits and drop the envelope until the unmodified archive reappears, then hash it. That is not "skip `_CodeSignature`." Load commands and `__LINKEDIT` already changed.
 
 "Unsigned" means not Developer ID-signed. Nix ad-hoc signatures on the payload are part of the archive, not of the envelope.
+
+**The container is part of the check.** The forward direction reconstructs a *tree*, but the file a browser downloaded is a zip — so comparing them requires re-zipping, and a zip of the same tree is only the same file if the recipe is. That recipe is published as a script, not left to a release runbook: `just pack-shipping-zip <tree> <out.zip>` packs any directory — including the one the forward check reconstructs — and the flake's `.#eidola-gui-macos-universal-zip` runs that same script over the Nix-built `.app`, so there is one recipe rather than two that resemble each other. It packs with Info-ZIP (never `ditto`, which is macOS-only and stamps wall-clock time), symlinks stored as symlinks, mtimes pinned to `SOURCE_DATE_EPOCH`, and entries ordered by a sorted `find`. Two runs over the same payload produce the same file, modes are normalized so the packer's umask cannot reach the hash, and nothing in it is macOS-only — POSIX shell and Info-ZIP, the same contract `verify-apple` states — so a verifier who re-zips a reconstructed tree on Linux lands on the same bytes, which is what makes the last step of the comparison meaningful. CI builds it on every macOS run and publishes it as a workflow artifact; from manifest schema 3 its `sha256` is recorded as `eidola-gui-macos-universal-zip`.
 
 Apple-specific disclosure, ticket stapling, and Team ID are in [apple-distribution.md](apple-distribution.md).
 

@@ -65,6 +65,22 @@ This ordering is what prevents a coerced release from silently weakening a requi
 1. Make the change; ship a release whose `supported_release_schema_versions` / `supported_attestation_schema_versions` list both `1` and `2`. The engineer continues signing schema-`1` documents.
 2. Once in-the-wild clients have updated, cut another release where the engineer signs schema-`2` documents. `1` can be removed from the supported list in a later release.
 
+#### `artifact-manifest.json` — the same rotation, with no human in it
+
+The manifest carries a `schema_version` too, and rotates under the same accept-before-emit rule — but nobody chooses to emit it: CI regenerates the manifest from source on every run. The two sides are therefore *two files*, and they must move in different releases:
+
+| Side | Where | Effect |
+| --- | --- | --- |
+| Accept | `SUPPORTED_MANIFEST_SCHEMA_VERSIONS` in `crates/eidola-app-core/src/updates.rs` | which manifest shapes a shipped client will read as authentic |
+| Emit | `MANIFEST_SCHEMA_VERSION` in `scripts/artifact-manifest.sh`, plus whatever new rows the version adds | what every subsequent CI run produces |
+
+1. Land the accept side alone: add the new version to the supported set, teach `attested_claims` / `describe_artifact` the new shape, and make the new rows tolerated-when-absent so releases still emitting the old version stay clean. Ship it.
+2. Once in-the-wild clients carry that build, land the emit side: bump `MANIFEST_SCHEMA_VERSION` and record the new rows. The committed `artifact-manifest.json` moves with the next `just update-manifest`.
+
+Landing them together is the failure this ordering exists to prevent: every installed client would meet a manifest shape it does not know and report `ClaimsChanged` — an authentic release that looks like a threat-model change, for everyone at once.
+
+**Currently mid-rotation:** clients accept `2` and `3`; CI still emits `2`. Schema `3` adds the macOS unsigned shipping zip (`eidola-gui-macos-universal-zip`, `type: "file"` — the `sha256` of the container a macOS download arrives in, built by `nix build .#eidola-gui-macos-universal-zip`). Step 2 above is what turns it on.
+
 ### Rotating the Sigstore trusted root
 
 `sigstore-trusted-root.json` is a snapshot of Sigstore's upstream `TrustedRoot` (Fulcio CAs, Rekor public keys, CT log keys, TSAs). It rotates rarely. To refresh:
