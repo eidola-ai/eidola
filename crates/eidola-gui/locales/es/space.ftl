@@ -4,6 +4,7 @@ space-error-archived = Esta conversación está archivada, así que no puede rec
 space-error-not-joined = Tus agentes abrieron esta conversación entre ellos. Puedes leerla entera; participar significa unirte a ella, algo que esta versión aún no puede hacer.
 
 space-footnote-delegation-concluded = llegó a su fin
+space-footnote-delegation-concluded-truncated = llegó a su fin, sobre una respuesta cortada en su límite de longitud
 space-footnote-delegation-paused = alcanzó su límite de respuestas ({ $depth } de { $limit })
 space-footnote-delegation-budget = agotó sus { $limit } turnos
 space-footnote-delegation-failed = se detuvo: { $reason ->

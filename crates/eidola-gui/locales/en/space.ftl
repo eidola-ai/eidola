@@ -25,6 +25,9 @@ space-error-not-joined = Your agents opened this conversation between themselves
 # reader's language rather than stored in one. All four sit in the rail's quiet
 # register: they finish the clause "this conversation …".
 space-footnote-delegation-concluded = ran to a stop
+# The same ending, resting on an answer that stopped at its length limit: the
+# room ran out of things to say, but not on a finished thought.
+space-footnote-delegation-concluded-truncated = ran to a stop, on an answer cut off at its length limit
 space-footnote-delegation-paused = reached its reply limit ({ $depth } of { $limit })
 space-footnote-delegation-budget = used all { $limit } of its turns
 # Why a delegated conversation stopped short, by kind. The reason is a bounded

@@ -297,6 +297,49 @@ fn a_room_that_pauses_at_its_cascade_guard_says_so() {
 /// The report is a turn for the owning agent in the **parent**, replying to the
 /// owner's own last word there, carrying the delegated room's last post as a
 /// quoted reference the driver attached — and the model is shown that passage
+/// **A room that ran to a stop on a cut-off answer says both.**
+///
+/// The driver has no reader to show a marker to — it drops the event receiver
+/// on purpose — so the only surface a delegated room ever gets is its report.
+/// `ChatResult::truncated` was discarded there, and the walk replanned from the
+/// partial post and reported the room as plainly `concluded`: a claim that it
+/// ran out of things to say, made about an answer that stops mid-thought.
+/// Replanning is kept — partial text is real text and the room may well have
+/// more to say about it — and what changes is only what the ending may claim.
+#[test]
+fn a_room_that_concluded_on_a_truncated_answer_says_so_in_its_report() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            // Real content, then `finish_reason: "length"` — a turn that keeps
+            // its text and must not be called finished.
+            chat: ChatBehavior::PartialAnswerLength,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        let end = report.references[0]
+            .delegation_end
+            .expect("the edge carries the ending");
+        assert_eq!(
+            end,
+            DelegationEnd::Concluded { truncated: true },
+            "the conclusion carries that it rests on an answer cut off at its length limit"
+        );
+        assert!(
+            end.token().ends_with("concluded/truncated"),
+            "and says so durably: {}",
+            end.token()
+        );
+    });
+}
+
 /// before it writes.
 #[test]
 fn a_finished_delegation_reports_back_with_the_rooms_last_word_attached() {
@@ -341,7 +384,7 @@ fn a_finished_delegation_reports_back_with_the_rooms_last_word_attached() {
         assert!(!snippet.is_empty());
         assert_eq!(
             reference.delegation_end,
-            Some(DelegationEnd::Concluded),
+            Some(DelegationEnd::Concluded { truncated: false }),
             "the edge carries what ended the room, typed"
         );
         assert_eq!(reference.annotation, None, "and says nothing as a person");
@@ -2288,7 +2331,7 @@ fn regenerating_a_report_keeps_its_finding_and_its_ending() {
         assert_eq!(after.references[0].ordinal, 1, "at the ordinal it had");
         assert_eq!(
             after.references[0].delegation_end,
-            Some(DelegationEnd::Concluded),
+            Some(DelegationEnd::Concluded { truncated: false }),
             "and the ending with it"
         );
         assert!(

@@ -8983,6 +8983,30 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
     });
     let agent = share_the_seeded_agent(cx, &stores, &space);
 
+    // **The target has to be a node the reader is told about.** gpui only
+    // reports focus on a node the a11y tree actually has, and an element with a
+    // tracked handle but no role never gets one — the adapter leaves focus at
+    // the window root, which is the whole of what a handback was to prevent.
+    // The Backends pane already names itself; this is the twin its shape was
+    // borrowed from, swept here.
+    {
+        use eidola_gui::probe;
+        let _probes = probes_on();
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        let entries = probe::window_entries(window.window_id().as_u64());
+        let (_, entry) = entries
+            .iter()
+            .find(|(n, _)| n == "settings/agents/pane")
+            .expect("the pane carries its own landmark");
+        assert_eq!(
+            entry.role,
+            gpui::Role::Region,
+            "the handback target is a named region, not a role-less div"
+        );
+        assert_eq!(entry.label, "Agents");
+    }
+
     let pane_holds_the_keyboard = |cx: &mut TestAppContext| {
         cx.update_window(window, |_, window, cx| {
             view.read(cx).focus_handle().is_focused(window)
@@ -17924,6 +17948,88 @@ fn space_marks_an_answer_that_stopped_at_its_length_limit(cx: &mut TestAppContex
         names.iter().any(|n| n.ends_with("/cut-off")),
         "the answer says where it stopped: {names:?}"
     );
+}
+
+#[gpui::test]
+fn space_a_reply_waits_for_the_answer_it_names_but_a_post_does_not(cx: &mut TestAppContext) {
+    // The harm is a durable edge naming a generation about to be superseded:
+    // item threading resolves it onto the new tip, so the post renders beneath
+    // an answer nobody wrote it against. That is a fact about the *antecedent*,
+    // not about the space — refusing every post for the length of somebody
+    // else's regeneration would take the conversation away for minutes.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.update(cx, |s, cx| {
+        assert!(!s.is_busy(), "nothing of this space's is running");
+        assert!(
+            s.revision_targets("a2"),
+            "but a2's generation is being replaced"
+        );
+        assert!(
+            !s.revision_targets("a1"),
+            "and a1's is not — the question is per-post"
+        );
+        assert!(
+            !s.submit(
+                "about that answer".into(),
+                Some("a2".into()),
+                Vec::new(),
+                cx
+            ),
+            "a reply to the answer being replaced is refused"
+        );
+        assert!(
+            s.submit("a fresh question".into(), Some("a1".into()), Vec::new(), cx),
+            "a reply to anything else is ordinary — posting supersedes nothing"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_both_mutation_doors_answer_the_same_question(cx: &mut TestAppContext) {
+    // Edit and Regenerate both supersede a generation, so both ask the mutation
+    // question — not merely whether something is running. Their verbs are drawn
+    // from `accepts_mutation` and `post_verb_count` reads it too, so a door
+    // answering differently is a door the surface no longer offers but that
+    // would still say yes if reached.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.update(cx, |s, cx| {
+        assert!(!s.is_busy(), "nothing of this space's is running…");
+        assert!(!s.accepts_mutation(), "…but a generation is being replaced");
+        assert!(
+            !s.edit("a1".into(), "a revised question".into(), Vec::new(), cx),
+            "so an edit is refused, exactly as a regeneration is"
+        );
+        assert!(
+            !s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the twin door agrees"
+        );
+    });
 }
 
 #[gpui::test]

@@ -217,7 +217,15 @@ pub(crate) struct FootnoteRow {
 /// footnote, not a banner — and finishes the clause "this conversation …".
 fn delegation_note(end: DelegationEnd, cx: &gpui::App) -> SharedString {
     match end {
-        DelegationEnd::Concluded => msg::space_footnote_delegation_concluded(cx),
+        DelegationEnd::Concluded { truncated: false } => {
+            msg::space_footnote_delegation_concluded(cx)
+        }
+        // The room ran out of things to say, but not on a finished thought —
+        // the rail says both, because "ran to a stop" alone would carry a
+        // completeness the answer beneath it does not have.
+        DelegationEnd::Concluded { truncated: true } => {
+            msg::space_footnote_delegation_concluded_truncated(cx)
+        }
         DelegationEnd::Paused { depth, limit } => {
             msg::space_footnote_delegation_paused(cx, depth, limit)
         }

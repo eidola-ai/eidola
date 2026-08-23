@@ -1351,6 +1351,24 @@ impl Space {
         !self.is_busy() && !self.mutation_in_flight()
     }
 
+    /// Whether **this generation** is being replaced right now — by a revision
+    /// streaming here, or by one running elsewhere that this window holds a
+    /// standing collision for.
+    ///
+    /// The per-target question, for the writes that have a target. A durable
+    /// edge naming a generation about to be superseded is the whole harm:
+    /// reply threading follows item identity, so the write comes back rendered
+    /// beneath an answer it was never written against. A write whose antecedent
+    /// is *not* being replaced takes no such risk, and refusing it would take
+    /// the conversation away from a reader for the length of somebody else's
+    /// turn.
+    pub fn revision_targets(&self, action_id: &str) -> bool {
+        self.streams
+            .iter()
+            .any(|s| s.revising && s.target_action_id.as_deref() == Some(action_id))
+            || self.collision_waiters.contains_key(action_id)
+    }
+
     /// Whether a **post-level mutation** is running right now — one that
     /// supersedes a generation rather than adding a turn beside it.
     ///
@@ -1934,6 +1952,20 @@ impl Space {
         if self.is_busy() {
             return false;
         }
+        // **A post keeps its freedom; its antecedent is what it may not name.**
+        // Posting supersedes nothing, so a revision running elsewhere must not
+        // close the conversation for the length of it (`is_busy` deliberately
+        // excludes a standing collision for exactly that reason). But a reply
+        // edge naming the generation being replaced is durable, and item
+        // threading resolves it onto the new tip — so the post would come back
+        // beneath an answer nobody wrote it against. Only that reply is
+        // refused, and only while its antecedent is the one being replaced.
+        if reply_to
+            .as_deref()
+            .is_some_and(|t| self.revision_targets(t))
+        {
+            return false;
+        }
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
             return false;
@@ -2065,6 +2097,13 @@ impl Space {
         if self.is_busy() {
             return false;
         }
+        // The same rule as `submit`: the post is free, its antecedent is not.
+        if reply_to
+            .as_deref()
+            .is_some_and(|t| self.revision_targets(t))
+        {
+            return false;
+        }
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
             return false;
@@ -2118,7 +2157,13 @@ impl Space {
         remove_references: Vec<i64>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.is_busy() {
+        // The same predicate the verb is drawn from — an edit supersedes a
+        // generation, so it asks the mutation question, not merely whether
+        // anything is running. Its twin `regenerate_post` was moved here for
+        // exactly this reason; `begin_edit` and `post_verb_count` already gate
+        // on it, so leaving this one on `is_busy` was a door the surface no
+        // longer offered but that answered differently if reached.
+        if !self.accepts_mutation() {
             return false;
         }
         let new_prompt = new_prompt.trim().to_string();

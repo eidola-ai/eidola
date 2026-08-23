@@ -388,6 +388,16 @@ impl Render for AgentsSettingsView {
         let mut col = v_flex()
             .id("agents-pane")
             .track_focus(&self.focus_handle)
+            // **The handback target has to be a node, and a node needs a
+            // role.** [`Self::hand_back_focus`] sends the keyboard here when a
+            // form that was holding it goes away, and gpui registers an element
+            // with a tracked handle and an id as focusable — but `set_focus`
+            // only reports a node the tree actually has, and an element with no
+            // role never got one, so focus fell back to the window root and the
+            // reader lost the pane. The same fix the Backends pane carries,
+            // whose shape this borrowed: a landmark it was owed anyway.
+            // `Region` is a container role, so it adds no tab stop.
+            .probe("settings/agents/pane", gpui::Role::Region, "Agents")
             .px_6()
             .py_5()
             .gap_3()

@@ -441,7 +441,14 @@ pub enum DelegationEnd {
     /// Planning returned no turns: nobody's notify policy fired on the room's
     /// last post, which is what a conversation running out of things to say
     /// looks like from here.
-    Concluded,
+    Concluded {
+        /// Some answer in the room stopped at its **completion ceiling** with
+        /// partial text. The room still ran out of things to say, but it did so
+        /// resting on an answer that stops mid-thought — so the ending says
+        /// both, rather than letting "concluded" carry a completeness nobody
+        /// established.
+        truncated: bool,
+    },
     /// The room hit its own cascade guard. Resumable by posting into it.
     Paused { depth: i64, limit: i64 },
     /// The per-delegation turn budget is spent.
@@ -463,7 +470,12 @@ impl DelegationEnd {
     /// person's note.
     pub fn token(&self) -> String {
         match self {
-            Self::Concluded => format!("{DELEGATION_END_PREFIX}concluded"),
+            Self::Concluded { truncated: false } => {
+                format!("{DELEGATION_END_PREFIX}concluded")
+            }
+            Self::Concluded { truncated: true } => {
+                format!("{DELEGATION_END_PREFIX}concluded/truncated")
+            }
             Self::Paused { depth, limit } => {
                 format!("{DELEGATION_END_PREFIX}paused/{depth}/{limit}")
             }
@@ -483,7 +495,15 @@ impl DelegationEnd {
         let rest = annotation.strip_prefix(DELEGATION_END_PREFIX)?;
         let mut parts = rest.split('/');
         let out = match parts.next()? {
-            "concluded" => Self::Concluded,
+            // The marker is an optional tail, so a token written before it
+            // existed still reads as an ordinary conclusion — and any *future*
+            // marker this version does not know degrades to "a note" through
+            // the trailing check below, which is the safe direction.
+            "concluded" => match parts.next() {
+                None => Self::Concluded { truncated: false },
+                Some("truncated") => Self::Concluded { truncated: true },
+                _ => return None,
+            },
             "paused" => Self::Paused {
                 depth: parts.next()?.parse().ok()?,
                 limit: parts.next()?.parse().ok()?,
@@ -503,7 +523,14 @@ impl DelegationEnd {
     /// never stored.
     pub(crate) fn describe(&self) -> String {
         match self {
-            Self::Concluded => "the delegated conversation ran to a stop".to_string(),
+            Self::Concluded { truncated: false } => {
+                "the delegated conversation ran to a stop".to_string()
+            }
+            Self::Concluded { truncated: true } => {
+                "the delegated conversation ran to a stop, but an answer in it reached its \
+                 length limit and stops mid-thought"
+                    .to_string()
+            }
             Self::Paused { depth, limit } => format!(
                 "the delegated conversation reached its reply limit ({depth} replies in a row, \
                  limit {limit}) and can be resumed by posting there"
@@ -1114,6 +1141,14 @@ impl Inner {
         // siblings — abandoning them there would drop their findings exactly
         // the way a single witness did.
         let mut paused: Option<(i64, i64)> = None;
+        // Whether any turn in this walk stopped at its **completion ceiling**
+        // with partial text. The walk goes on — a partial answer is real text
+        // and the room may well have more to say about it — but it changes what
+        // the ending is allowed to claim: `Concluded` says the room ran out of
+        // things to say, and a room resting on an answer that stopped
+        // mid-thought did not. Walk-wide rather than per-branch, because the
+        // report speaks for the whole room.
+        let mut truncated_any = false;
         // Every post this walk has planned off. It is what tells the walk's own
         // work apart from a stranger's, and there is nothing durable that could:
         // a post the driver planned and a post nobody has looked at are the same
@@ -1161,7 +1196,9 @@ impl Inner {
                 if frontier.is_empty() {
                     let end = match paused {
                         Some((depth, limit)) => DelegationEnd::Paused { depth, limit },
-                        None => DelegationEnd::Concluded,
+                        None => DelegationEnd::Concluded {
+                            truncated: truncated_any,
+                        },
                     };
                     let conn = self.db_conn().await?;
                     let quoted = Self::visible_fallback(&conn, space_id, &tail).await?;
@@ -1297,8 +1334,9 @@ impl Inner {
                     // A turn that wrote a post is a post to re-plan from, and
                     // the room's newest word; a turn that declined wrote a
                     // decision, which is not something anyone replies to.
-                    Ok(Some(post_action_id)) => {
+                    Ok(Some((post_action_id, was_truncated))) => {
                         answered = true;
+                        truncated_any |= was_truncated;
                         frontier.push(post_action_id);
                         #[cfg(feature = "test-support")]
                         if !std::mem::replace(&mut paused_once, true) {
@@ -1448,7 +1486,7 @@ impl Inner {
         &self,
         space_id: &str,
         turn: &PlannedTurn,
-    ) -> Result<Option<String>, AppError> {
+    ) -> Result<Option<(String, bool)>, AppError> {
         // **The receiver is dropped before the turn runs, not held.** Nothing
         // here watches a delegated room stream; keeping the handle alive would
         // buffer every delta of every turn for the length of the walk, for a
@@ -1467,7 +1505,14 @@ impl Inner {
             tx,
         ))
         .await?;
-        Ok(result.response_action_id)
+        // The post **and whether it stopped at the ceiling**. There is no
+        // reader here to show a marker to, which is exactly why the fact has to
+        // travel: the only surface a delegated room ever gets is its report,
+        // and an ending that claims the room ran to a stop is a claim about an
+        // answer that stopped mid-thought. (A turn cut off before writing *any*
+        // answer never reaches here — that is `AppError::ResponseTruncated`,
+        // which stops the walk as a failure like any other.)
+        Ok(result.response_action_id.map(|id| (id, result.truncated)))
     }
 
     /// Deliver the owner's report into the parent conversation.
@@ -2044,7 +2089,11 @@ mod tests {
     #[test]
     fn every_ending_survives_being_written_down_and_read_back() {
         for end in [
-            DelegationEnd::Concluded,
+            DelegationEnd::Concluded { truncated: false },
+            // The marker is part of the ending, so it has to survive the round
+            // trip too — a conclusion resting on a cut-off answer that read
+            // back as an ordinary one would be the lie in durable form.
+            DelegationEnd::Concluded { truncated: true },
             DelegationEnd::Paused { depth: 4, limit: 4 },
             DelegationEnd::BudgetSpent { limit: 32 },
             DelegationEnd::TurnFailed {
