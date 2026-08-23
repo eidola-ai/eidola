@@ -14,10 +14,12 @@
 #
 # Four assertions:
 #
-#   0. The file is one document: no repeated members. Parsers keep the last
-#      of a duplicate and drop the rest, so a file with two `artifacts`
-#      members would be *checked* as one reading and *signed* as the whole
-#      bytes. Nothing below means anything until this holds.
+#   0. The file is one document, and one every reader agrees on: no
+#      repeated members (parsers keep the last and drop the rest, so a file
+#      with two `artifacts` members would be *checked* as one reading and
+#      *signed* as the whole bytes) and no `NaN`/`Infinity` (Python accepts
+#      them, JSON has no such literal, and the client's parser refuses the
+#      whole document). Nothing below means anything until this holds.
 #   1. The document's envelope and every artifact entry carry exactly the
 #      fields they are allowed. A new field cannot appear unnoticed — and
 #      determinism dies to any unvalidated field, not only to key-shaped
@@ -49,8 +51,9 @@
 # passing quietly, which is the behavior every unparsed shape should have.
 #
 # What it will not do is guess. A YAML alias or anchor in one of those
-# fields, or a merge key in a job body, is a violation rather than a
-# resolution attempt: GitHub resolves aliases (since September 2025), this
+# fields, an escape inside a quoted scalar there, a merge key in a job
+# body, or a job body written as a flow mapping is a violation rather than
+# a resolution attempt: GitHub resolves aliases (since September 2025), this
 # does not, and a scanner that guessed would be asserting something it
 # cannot know. The same answer covers the two other things it cannot read.
 # An `environment:` computed by a `${{ }}` expression is refused on any job
@@ -172,6 +175,16 @@ ALLOWED = {
 
 violations = []
 duplicates = []
+constants = []
+
+
+def note_constant(text):
+    # NaN / Infinity / -Infinity: Python accepts them, JSON does not have
+    # them, and the client parses these bytes with serde_json, which
+    # refuses the whole document. Same theme as duplicate members — the
+    # thing checked here would not be the thing anyone can read.
+    constants.append(text)
+    return 0.0
 
 
 def note_duplicates(pairs):
@@ -204,10 +217,19 @@ def walk_keys(node, out):
 
 try:
     with open(sys.argv[1], "rb") as handle:
-        manifest = json.load(handle, object_pairs_hook=note_duplicates)
+        manifest = json.load(
+            handle, object_pairs_hook=note_duplicates, parse_constant=note_constant
+        )
 except ValueError as exc:
     print("not parseable as JSON: {}".format(exc))
     sys.exit(0)
+
+for text in constants:
+    print(
+        "non-standard JSON constant `{}` — JSON has no such literal, and the "
+        "client reads these bytes with a parser that refuses the whole "
+        "document".format(text)
+    )
 
 for key in duplicates:
     print(
@@ -362,6 +384,18 @@ check_workflow() {
         return s
       }
 
+      # A quoted scalar carrying an escape. YAML decodes `\u002d` inside a
+      # double-quoted scalar, and `\x27\x27` inside a single-quoted one; this
+      # decodes neither, so a name written that way would be compared in a
+      # spelling GitHub never sees. Refused, like an alias.
+      function escaped_scalar(s,   first) {
+        s = normalize_ws(s)
+        first = substr(s, 1, 1)
+        if (first == "\"" && index(s, "\\") > 0) return 1
+        if (first == SQ && index(substr(s, 2), SQ SQ) > 0) return 1
+        return 0
+      }
+
       function unquote(s,   first, last) {
         gsub(/^[ \t]+/, "", s)
         gsub(/[ \t]+$/, "", s)
@@ -391,10 +425,27 @@ check_workflow() {
       # ── collect: job name -> needs, environment, produces-partial ──
       /^[^ #]/ { in_jobs = ($0 ~ /^jobs:/); next }
 
+      # A job written as a flow mapping on one line. Registered so the graph
+      # knows the job exists; its body is not read, which is what the
+      # refusal below says out loud.
+      in_jobs && /^  [^ \t#-][^:]*:[ \t]*\{/ {
+        job = $0
+        sub(/^  /, "", job)
+        sub(/:[ \t]*\{.*$/, "", job)
+        raw_key[unquote(job)] = job
+        job = unquote(job)
+        jobs[++njobs] = job
+        flow_body[job] = 1
+        collecting_needs = 0
+        collecting_env = 0
+        next
+      }
+
       in_jobs && /^  [^ \t#-][^:]*:[ \t]*(&[A-Za-z0-9_.-]+)?[ \t]*(#.*)?$/ {
         job = decomment($0)
         sub(/^  /, "", job)
         sub(/:[ \t]*(&[A-Za-z0-9_.-]+)?[ \t]*$/, "", job)
+        raw_key[unquote(job)] = job
         job = unquote(job)
         jobs[++njobs] = job
         collecting_needs = 0
@@ -476,6 +527,16 @@ check_workflow() {
             print "job `" j "` uses a YAML alias or anchor in `environment:` — this scanner does not resolve them, so the environment must be named literally"
           if (merge_key[j])
             print "job `" j "` uses a merge key (`<<:`) — it can splice in an `environment:` this scanner never sees, so it is refused rather than merged"
+          if (escaped_scalar(raw_key[j]))
+            print "job `" j "` writes its name as a quoted scalar carrying an escape — this scanner decodes none, so the name it compares is not the name GitHub reads"
+          if (escaped_scalar(environment[j]))
+            print "job `" j "` writes its `environment:` as a quoted scalar carrying an escape — this scanner decodes none, so the environment must be written plainly"
+          n = split(needs_raw[j], parts, /[ \t]+/)
+          for (k = 1; k <= n; k++)
+            if (escaped_scalar(parts[k])) {
+              print "job `" j "` writes a `needs:` entry as a quoted scalar carrying an escape — this scanner decodes none, so the dependency must be written plainly"
+              break
+            }
         }
 
         for (i = 1; i <= njobs; i++) {
@@ -529,6 +590,8 @@ check_workflow() {
           if (!seen[j] && !partial[j]) continue
           if (environment[j] ~ /\$\{\{/ && !permitted_env(environment[j]))
             print "job `" j "` computes its `environment:` with an expression this check does not evaluate — the environment a job feeding the manifest receives has to be readable from the file, so pin the expression in the check once it is shown it cannot produce a signing environment"
+          if (seen[j] && flow_body[j])
+            print "job `" j "` is written as a flow mapping and the manifest job depends on it — this scanner reads block-form job bodies, so its environment and outputs are unread"
           if (seen[j] && job_uses[j] != "")
             print "job `" j "` calls another workflow (`uses: " job_uses[j] "`) and the manifest job depends on it — this scanner does not follow calls, so the called workflow'"'"'s environments and outputs are unread"
         }

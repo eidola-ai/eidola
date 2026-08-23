@@ -1,0 +1,32 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The single-quoted scalar's one escape: `''` is a literal quote, so this
+# job is `apple'-envelope` to GitHub and `apple''-envelope` to anything
+# that strips the outer quotes without decoding. The dependency below is
+# written the way GitHub reads it, so the graph this check walks has an
+# edge to a job it thinks does not exist — and the key-holder deliberately
+# produces no manifest partial, so no other rule covers for it.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  'apple''-envelope':
+    name: Wrap the macOS app
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Wrap
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - apple'-envelope
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

@@ -1,0 +1,24 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The whole job body as a flow mapping on one line. A header pattern that
+# expects a block body never registers the job, so its `environment:` is
+# never read and the manifest job's dependency points at a job the graph
+# does not have. Nothing else covers it: the job's name says nothing about
+# signing, which is the backstop that catches the unregistered cases.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  apple: {runs-on: self-hosted, environment: apple-signing, steps: [{name: Wrap, run: codesign --sign X Eidola.app}]}
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs: apple
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full
