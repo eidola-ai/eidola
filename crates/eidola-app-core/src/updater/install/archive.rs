@@ -126,13 +126,13 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
         // the container is still held, and the process would be killed
         // instead of returning a refusal. The budget is spent here, on
         // bytes that actually arrived.
-        let written_bytes = copy_member(&mut entry, &target, &mut total_bytes).map_err(|e| {
-            // A partially written member is not left where a later step
-            // could mistake it for a whole one. The staging tree is
-            // removed on any failure too; this keeps the invariant local.
-            let _ = std::fs::remove_file(&target);
-            e
-        })?;
+        let written_bytes =
+            copy_member(&mut entry, &target, &mut total_bytes).inspect_err(|_| {
+                // A partially written member is not left where a later step
+                // could mistake it for a whole one. The staging tree is
+                // removed on any failure too; this keeps the invariant local.
+                let _ = std::fs::remove_file(&target);
+            })?;
         if written_bytes > entry.size() {
             let _ = std::fs::remove_file(&target);
             return Err(InstallError::Archive {
