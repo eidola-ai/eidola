@@ -75,13 +75,13 @@ echo "ok: the packing script passes -X and -y"
 
 # The stamp, the zone and the mode set are hash inputs, so the script must
 # state them rather than inherit whatever the caller's shell provides.
-for pinned in 'chmod -R u=rwX,go=rX' 'touch -h -t 198001010000.00' 'TZ=UTC'; do
+for pinned in 'chmod -R u=rwX,go=rX' 'touch -h -t 198001010000.00' 'TZ=UTC' 'unset ZIPOPT ZIP' 'zip -q -6 -X -y -@'; do
   if ! grep -qF "$pinned" "$PACK"; then
     echo "FAIL: the packing script no longer pins: $pinned" >&2
     exit 1
   fi
 done
-echo "ok: the packing script pins the mode set, the stamp and the zone"
+echo "ok: the packing script pins the mode set, the stamp, the zone, the level, and clears ZIPOPT"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -124,6 +124,21 @@ if ! cmp -s "$WORK/one.zip" "$WORK/strict.zip"; then
   exit 1
 fi
 echo "ok: the same payload under umask 077 produces the same bytes"
+
+# ── the caller's environment must not reach the hash ─────────────────────
+# Info-ZIP prepends ZIPOPT (and its alias ZIP) to its own command line, so
+# a shell that exports one would otherwise choose the compression level of
+# a container the whole scheme compares by hash. The Nix sandbox strips the
+# environment for the derivation; a verifier running the script by hand has
+# no such sandbox, and that run is the forward-verification path.
+for hostile in ZIPOPT ZIP; do
+  env "$hostile=-0" "$PACK" "$WORK/payload" "$WORK/hostile.zip"
+  if ! cmp -s "$WORK/one.zip" "$WORK/hostile.zip"; then
+    echo "FAIL: packing under $hostile=-0 produced different bytes — the caller's environment reaches the hash" >&2
+    exit 1
+  fi
+done
+echo "ok: a hostile ZIPOPT/ZIP does not change the bytes"
 
 # ── the script packs a tree the caller names, wherever it came from ──────
 # The point of the script existing: a verifier's reconstructed tree is not

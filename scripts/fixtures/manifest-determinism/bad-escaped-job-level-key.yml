@@ -1,0 +1,36 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The key itself spelled with an escape. YAML decodes it, so GitHub reads
+# `needs: apple-envelope` and builds the edge to the key-holding job; a
+# reader that keeps the raw text when it cannot decode sees a key it does
+# not recognize and moves on — and an unrecognized job-level key is exactly
+# what `needs:` and `environment:` look like in another spelling.
+#
+# So an unreadable key is a refusal, not an unknown key. The failure this
+# closes is silence: the dependency disappeared and nothing said so. The
+# key-holder is named so that nothing about it says signing, and it
+# produces no manifest partial, so no other rule covers for the missing
+# edge.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  apple-envelope:
+    name: Wrap the macOS app
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Wrap
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    "nee\u0064s": apple-envelope
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

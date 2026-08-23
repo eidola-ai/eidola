@@ -16,6 +16,7 @@ None of these is a real manifest or a real workflow. The `.yml` files deliberate
 | `bad-environment-case.yml` | `environment: Apple-Signing`. Environment names are case-insensitive to GitHub: same environment, same secrets, different string. |
 | `bad-block-scalar-needs.yml` | `needs: >-` with the job name on the next line. |
 | `bad-flow-sequence-needs.yml` | A flow sequence broken across lines, so the key's own line carries no name. |
+| `bad-escaped-job-level-key.yml` | The *key* spelled with an escape (`"nee\u0064s"`), which YAML decodes to `needs`. A reader that keeps the raw text when it cannot decode sees an unrecognized key and moves on — and an unrecognized job-level key is what `needs:` and `environment:` look like in another spelling, so the dependency vanishes in silence. An unreadable key is a refusal, never an unknown key. |
 | `bad-spaced-colon-needs.yml` | `needs : release-assets` — YAML allows whitespace before a colon, so this is the `needs` key and the dependency resolves, while a pattern anchored to `needs:` collects nothing. Job-level keys are now read the way job keys are, so the spelling stops mattering. |
 | `bad-commented-job-key.yml` | A comment after the job key, which ends the key early for YAML but not for a pattern anchored to end-of-line. |
 | `bad-quoted-needs.yml` | The dependency on the key-holding job written as a quoted scalar (`- "apple-envelope"`), with a job name that says nothing about signing. Names are unquoted before the graph is built. |

@@ -27,7 +27,12 @@
 #     and silently writes copies — a bundle with a framework comes back
 #     invalid, and nothing errors;
 #   * `-X` drops the extra fields carrying uid/gid and second-resolution
-#     timestamps.
+#     timestamps;
+#   * the compression level is stated rather than defaulted (`-6` is what
+#     Info-ZIP would choose today, so pinning it moves no published hash),
+#     because a default is a property of the tool rather than of this
+#     recipe — and `ZIPOPT`/`ZIP` are cleared, since Info-ZIP reads its
+#     command line from them.
 #
 # One thing it cannot normalize: a symlink's own mode, which no portable
 # chmod sets and which differs by platform (0755 on macOS, 0777 on Linux).
@@ -68,6 +73,15 @@ LC_ALL=C
 TZ=UTC
 export LC_ALL TZ
 
+# Info-ZIP prepends whatever these hold to its own command line, so a
+# caller's shell could set the compression level, add entries, or change
+# the format — and the container would stop being a function of the tree.
+# The Nix sandbox already strips the environment for the derivation; this
+# is what extends the same guarantee to a direct run, which is the
+# forward-verification path. `ZIP` is this build's documented alias for
+# `ZIPOPT`; both are cleared rather than trusted.
+unset ZIPOPT ZIP 2> /dev/null || true
+
 # Written beside the tree and moved into place: zip writes its temporary
 # archive in the *output's* directory, which may be read-only (the Nix
 # store, when the derivation calls this).
@@ -82,7 +96,7 @@ find "$tree" -exec touch -h -t 198001010000.00 {} +
 
 (
   cd "$tree" || exit 1
-  find . -mindepth 1 | LC_ALL=C sort | zip -q -X -y -@ "$work/shipping.zip"
+  find . -mindepth 1 | LC_ALL=C sort | zip -q -6 -X -y -@ "$work/shipping.zip"
 )
 
 mv "$work/shipping.zip" "$out"

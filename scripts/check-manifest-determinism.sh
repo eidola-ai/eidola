@@ -46,7 +46,11 @@
 # anything is matched against it, and every job body passes one header
 # reader (name, then anchor, then body form) before its shape is decided.
 # A pairing nobody anticipated meets the refusal its parts would have met
-# individually, instead of falling between two rules. Both graders also
+# individually, instead of falling between two rules. Where the classifier
+# refuses, the answer is a violation and never a shrug: an unreadable job
+# key, field or job-level *key* is reported, because a key this cannot read
+# may be `needs:` in another spelling, and skipping it would drop the
+# dependency it declared without a word. Both graders also
 # announce that they ran: an empty report has to be distinguishable from a
 # scanner that died, and this awk exits 0 on a syntax error on some
 # platforms.
@@ -567,8 +571,17 @@ check_workflow() {
         sub(/^    /, "", line)
         if (split_key(line)) {
           key = KEY
-          if (classify_scalar(key) == "") key = SCALAR
-          else key = normalize_ws(key)
+          # A key the classifier cannot read is a refusal, never a key this
+          # scanner does not happen to recognize. `"nee\u0064s"` is `needs`
+          # to GitHub; treating it as an unknown key would drop a
+          # dependency in silence, which is exactly how a signing ancestor
+          # disappears.
+          reason = classify_scalar(key)
+          if (reason != "") {
+            refusal[job, "key"] = reason
+            next
+          }
+          key = SCALAR
           value = normalize_ws(REST)
           collecting_needs = 0
           collecting_env = 0
@@ -619,6 +632,8 @@ check_workflow() {
             print "job `" j "` writes its name with " refusal[j, "name"] " — this scanner resolves and decodes nothing, so the name it compares would not be the name GitHub reads"
           if (refusal[j, "needs"] != "")
             print "job `" j "` writes a `needs:` entry with " refusal[j, "needs"] " — this scanner resolves and decodes nothing, so the dependency must be written plainly"
+          if (refusal[j, "key"] != "")
+            print "job `" j "` writes a job-level key with " refusal[j, "key"] " — a key this scanner cannot read may be `needs:` or `environment:` in another spelling, and ignoring it would drop what it declared"
           if (refusal[j, "environment"] != "")
             print "job `" j "` writes its `environment:` with " refusal[j, "environment"] " — this scanner resolves and decodes nothing, so the environment must be written plainly"
           if (merge_key[j])
