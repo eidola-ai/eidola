@@ -7,8 +7,9 @@ Usage:
   scripts/artifact-manifest.sh build [--push] [--metadata-file PATH] [--builder NAME] [--ensure-builder] [--targets GROUP] [--set PATTERN=VALUE ...]
   scripts/artifact-manifest.sh print [--push] [(--metadata-file PATH [--targets "NAME ..."])...]
   scripts/artifact-manifest.sh verify [--push] [(--metadata-file PATH [--targets "NAME ..."])...] [--manifest PATH]
-  scripts/artifact-manifest.sh build-macos [--output PATH]
-  scripts/artifact-manifest.sh build-linux-gui [--output PATH]
+  scripts/artifact-manifest.sh build-macos [--output PATH] [--artifact-dir DIR]
+  scripts/artifact-manifest.sh build-linux-gui [--output PATH] [--artifact-dir DIR]
+  scripts/artifact-manifest.sh build-linux-deb [--output PATH] [--artifact-dir DIR]
   scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations] [--server-enclave-output PATH]
   scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--config PATH] [--server-enclave PATH] [--output PATH] [--server-enclave-output PATH] [--verify-attestations]
   scripts/artifact-manifest.sh stamp-config [--metadata-file PATH] [--config PATH]
@@ -37,6 +38,10 @@ Options:
                                releases/trust/server-enclave.json). Valid for `verify-full`.
   --server-enclave-output PATH Write the computed enclave block (with `schema_version: 1`
                                envelope) to PATH. Valid for `measure` and `verify-full`.
+  --artifact-dir DIR           Copy the files a release publishes (the Nix installable's
+                               `.tar.gz`, each `.deb`) into DIR, named after the manifest
+                               key that records each one. Valid for `build-macos`,
+                               `build-linux-gui` and `build-linux-deb`.
   --verify-attestations        Verify CVM manifest provenance via Sigstore (requires gh CLI).
                                Fails the command if attestation verification fails.
 EOF
@@ -50,17 +55,34 @@ fi
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 BUILDKIT_IMAGE="moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b"
 
-# Pinned Nix runner image for cross-host Linux GUI builds (see
+# Pinned Nix runner image for cross-host Linux builds (see
 # build_linux_gui_via_docker). This is a deliberately *different* mechanism
 # from the StageX buildx builder: a plain `docker run` against nixos/nix, not
 # the `eidola` BuildKit builder. Pinned by the multi-arch index digest so
-# `--platform linux/amd64` selects the amd64 variant on any host.
+# `--platform` selects the matching variant on any host.
 NIX_IMAGE="nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894"
 
 # `artifact-manifest.json` schema. Distinct from `server-enclave.json`
 # (`schema_version: 1`). Bump when the artifact-entry shape changes (schema
 # 2 added `archiveSha256` on Nix rows). See docs/verification.md.
+#
+# This assignment is the *emit* side of the manifest schema rotation, and
+# the only site that turns a new shape on: everything schema-dependent
+# below reads it. Clients accept a new version one release before this
+# moves — `releases/README.md` → "Rotating document schema versions".
 MANIFEST_SCHEMA_VERSION=2
+
+# The schema at which the Linux artifact rows take their current shape (the
+# same boundary `ARTIFACT_SET_SCHEMA` names on the client side). Below it,
+# the Nix installable is recorded as `eidola-gui-linux-<arch>` and the
+# Debian packages are not recorded at all; from it, the Nix installable
+# narrows to `eidola-gui-linux-nix-<arch>` — there are two Linux
+# installables now, and the old key implied there was one — and each
+# `.deb` gets a `eidola-gui-linux-deb-<arch>` row. The flake attribute
+# already carries the narrowed name; the manifest key does not follow it
+# until this schema is emitted, because the key is what a shipped client
+# compares against.
+ARTIFACT_SET_SCHEMA=3
 
 # CVM image artifacts for enclave measurement computation.
 # The OVMF firmware version is pinned to match tinfoilsh/measure-image-action.
@@ -113,6 +135,7 @@ GUI_PATH=""
 CONFIG_FILE="$REPO_ROOT/tinfoil-config.yml"
 VERIFY_ATTESTATIONS=0
 PUSH_MODE=0
+ARTIFACT_DIR=""
 TARGETS="all"
 PARTIAL_FILES=()
 BUILDX_SET_ARGS=()
@@ -133,6 +156,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --output)
       OUTPUT_FILE="$2"
+      shift 2
+      ;;
+    --artifact-dir)
+      ARTIFACT_DIR="$2"
       shift 2
       ;;
     --manifest)
@@ -579,41 +606,117 @@ manifest_arch() {
   esac
 }
 
+# Does the emitted schema record the current Linux artifact shape?
+records_current_linux_shape() {
+  ((MANIFEST_SCHEMA_VERSION >= ARTIFACT_SET_SCHEMA))
+}
+
+# The manifest key for the Nix Linux installable, per emitted schema.
+linux_nix_key() {
+  if records_current_linux_shape; then
+    echo "eidola-gui-linux-nix-$1"
+  else
+    echo "eidola-gui-linux-$1"
+  fi
+}
+
+linux_deb_key() {
+  echo "eidola-gui-linux-deb-$1"
+}
+
+# Published-asset names are derived from the manifest key they are covered
+# by, so a downloaded file and the row a user checks it against cannot be
+# mismatched by eye (docs/verification.md's hash table is that mapping).
+copy_named_artifact() {
+  local src="$1" name="$2"
+  [[ -n "${ARTIFACT_DIR:-}" ]] || return 0
+  mkdir -p "$ARTIFACT_DIR"
+  # Removed rather than overwritten: store paths are read-only, so a copy
+  # left by an earlier run — which is the normal case on a self-hosted
+  # runner — would refuse the write.
+  rm -f "$ARTIFACT_DIR/$name"
+  cp "$src" "$ARTIFACT_DIR/$name"
+  chmod u+w "$ARTIFACT_DIR/$name"
+}
+
+# Record the `.deb` built for one architecture: its sha256 for the manifest
+# row, and (when --artifact-dir was given) the file itself for publication.
+record_linux_deb() {
+  local arch="$1" path="$2"
+  case "$arch" in
+    amd64) LINUX_DEB_AMD64_SHA256="$(file_sha256_hex "$path")" ;;
+    arm64) LINUX_DEB_ARM64_SHA256="$(file_sha256_hex "$path")" ;;
+    *)
+      echo "error: unsupported deb architecture: $arch" >&2
+      exit 1
+      ;;
+  esac
+  copy_named_artifact "$path" "$(linux_deb_key "$arch").deb"
+}
+
 # Build the Linux GUI via Nix (glibc dynamic binary; see flake.nix for why
-# the GUI can't be a static musl artifact like the server/cli). On a Linux
-# host this runs Nix natively (sets LINUX_GUI_PATH + LINUX_GUI_ARCHIVE_PATH).
-# On any other host (e.g. Darwin) it reproduces CI's native x86_64-linux
-# build inside a pinned linux/amd64 Nix container (sets LINUX_GUI_NARHASH
-# and LINUX_GUI_ARCHIVE_SHA256), so `just update-manifest` can compose the
+# the GUI can't be a static musl artifact like the server/cli), plus the
+# `.deb` built over the same release binary. On a Linux host this runs Nix
+# natively (sets LINUX_GUI_PATH + LINUX_GUI_ARCHIVE_PATH). On any other host
+# (e.g. Darwin) it reproduces CI's native x86_64-linux build inside a pinned
+# linux/amd64 Nix container (sets LINUX_GUI_NARHASH and
+# LINUX_GUI_ARCHIVE_SHA256), so `just update-manifest` can compose the
 # *full* manifest from a Mac instead of carrying the Linux GUI entry over
 # stale.
 build_linux_gui_artifact() {
   if [[ "$(uname -s)" == "Linux" ]]; then
     LINUX_GUI_PATH="$(
       nix build \
-        '.#eidola-gui-linux' \
+        '.#eidola-gui-linux-nix' \
         --no-link \
         --print-out-paths \
         --show-trace
     )"
     LINUX_GUI_ARCHIVE_PATH="$(
       nix build \
-        '.#eidola-gui-linux-archive' \
+        '.#eidola-gui-linux-nix-archive' \
         --no-link \
         --print-out-paths \
         --show-trace
     )"
+    copy_named_artifact "$LINUX_GUI_ARCHIVE_PATH" \
+      "$(linux_nix_key "$(manifest_arch)").tar.gz"
+    build_linux_deb_artifact
   else
     build_linux_gui_via_docker
   fi
 }
 
-# Cross-host Linux GUI build: run `nix build .#eidola-gui-linux` (and the
-# matching `-archive` derivation) inside a pinned linux/amd64 Nix container
-# and capture narHash + archiveSha256. The store paths only exist inside
-# the container, so hashes are computed there: `nix hash path --sri` for
-# the payload NAR (byte-identical to `nix path-info`'s narHash) and
-# `nix hash file --base16` for the flake-built `.tar.gz`.
+# The `.deb` for the host's own architecture. Split out because the deb is
+# also built alone, on the arm64 runner that produces no Nix installable.
+build_linux_deb_artifact() {
+  local deb_path
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "error: building the Linux .deb natively requires a Linux host" >&2
+    exit 1
+  fi
+  deb_path="$(
+    nix build \
+      '.#eidola-linux-deb' \
+      --no-link \
+      --print-out-paths \
+      --show-trace
+  )"
+  record_linux_deb "$(manifest_arch)" "$deb_path"
+}
+
+# Cross-host Linux build: run `nix build .#eidola-gui-linux-nix` (plus the
+# matching `-archive` derivation and the `.deb`) inside a pinned Nix
+# container and capture narHash + archiveSha256 + the deb's sha256. The
+# store paths only exist inside the container, so hashes are computed
+# there: `nix hash path --sri` for the payload NAR (byte-identical to
+# `nix path-info`'s narHash) and `nix hash file --base16` for the
+# flake-built `.tar.gz` and `.deb`.
+#
+# The container platform is a parameter because the arm64 `.deb` is a
+# manifest row of its own from ARTIFACT_SET_SCHEMA on, and no Linux runner
+# here builds both arches. On an Apple-silicon host the linux/arm64 run is
+# the *native* one; linux/amd64 is the emulated one.
 #
 # Correctness rests on the same determinism CI's linux-gui job trusts: a
 # pinned, sandboxed, reproducible derivation yields an identical narHash
@@ -637,53 +740,155 @@ build_linux_gui_artifact() {
 # emulated build. Bumping NIX_IMAGE keys a new volume so the store is never
 # stale relative to the pinned Nix.
 build_linux_gui_via_docker() {
-  local nix_store_volume digest hashes
+  # The linux/amd64 run mirrors CI's Nix installable *and* its deb.
+  run_linux_nix_container amd64 gui
+
+  # The arm64 deb has no Nix-installable sibling — it is a deb row and
+  # nothing else — so it is built only once the emitted schema records it.
+  # Below that schema, building it would cost a second full gpui compile to
+  # produce a hash no manifest carries.
+  if records_current_linux_shape; then
+    run_linux_nix_container arm64 deb
+  fi
+}
+
+# One container build. `what` is `gui` (Nix installable + archive + deb) or
+# `deb` (deb only).
+run_linux_nix_container() {
+  local arch="$1" what="$2"
+  local nix_store_volume digest hashes platform build_script
 
   if ! command -v docker >/dev/null 2>&1; then
-    echo "error: building the Linux GUI on a non-Linux host requires docker" >&2
+    echo "error: building the Linux artifacts on a non-Linux host requires docker" >&2
     exit 1
   fi
 
+  case "$arch" in
+    amd64) platform="linux/amd64" ;;
+    arm64) platform="linux/arm64" ;;
+    *)
+      echo "error: unsupported container architecture: $arch" >&2
+      exit 1
+      ;;
+  esac
+
+  # The store volume is keyed by image digest *and* platform: one Nix store
+  # cannot hold two architectures' builds of the same derivation names
+  # without thrashing, and each platform's closure is expensive to warm.
   digest="${NIX_IMAGE##*@sha256:}"
-  nix_store_volume="eidola-nix-store-${digest:0:16}"
+  nix_store_volume="eidola-nix-store-${digest:0:16}-${arch}"
 
-  echo "Building Linux GUI in a linux/amd64 Nix container (first run is a cold, emulated build — this is slow)..." >&2
-
-  hashes="$(
-    docker run --rm --platform linux/amd64 \
-      --privileged \
-      -v "$REPO_ROOT":/repo \
-      -v "${nix_store_volume}:/nix" \
-      -w /repo \
-      "$NIX_IMAGE" \
-      sh -euc '
+  # shellcheck disable=SC2016 # $WHAT/$OUT_DIR/… are the container's env, not this shell's
+  build_script='
         export NIX_CONFIG="experimental-features = nix-command flakes
 sandbox = true
 sandbox-fallback = false
 filter-syscalls = false"
         git config --global --add safe.directory /repo
-        out="$(nix build .#eidola-gui-linux --no-link --print-out-paths --show-trace)"
-        archive="$(nix build .#eidola-gui-linux-archive --no-link --print-out-paths --show-trace)"
-        printf "NARHASH=%s\n" "$(nix hash path --sri "$out")"
-        printf "ARCHIVESHA=%s\n" "$(nix hash file --base16 --type sha256 "$archive")"
-      '
-  )"
+        if [ "$WHAT" = gui ]; then
+          out="$(nix build .#eidola-gui-linux-nix --no-link --print-out-paths --show-trace)"
+          archive="$(nix build .#eidola-gui-linux-nix-archive --no-link --print-out-paths --show-trace)"
+          printf "NARHASH=%s\n" "$(nix hash path --sri "$out")"
+          printf "ARCHIVESHA=%s\n" "$(nix hash file --base16 --type sha256 "$archive")"
+          if [ -n "$OUT_DIR" ]; then cp "$archive" "$OUT_DIR/$ARCHIVE_NAME"; fi
+        fi
+        deb="$(nix build .#eidola-linux-deb --no-link --print-out-paths --show-trace)"
+        printf "DEBSHA=%s\n" "$(nix hash file --base16 --type sha256 "$deb")"
+        if [ -n "$OUT_DIR" ]; then cp "$deb" "$OUT_DIR/$DEB_NAME"; fi
+  '
 
-  LINUX_GUI_NARHASH="$(printf '%s\n' "$hashes" | sed -n 's/^NARHASH=//p')"
-  LINUX_GUI_ARCHIVE_SHA256="$(printf '%s\n' "$hashes" | sed -n 's/^ARCHIVESHA=//p')"
+  echo "Building Linux ${what} in a ${platform} Nix container (first run is a cold build — this is slow)..." >&2
 
-  if [[ -z "$LINUX_GUI_NARHASH" || -z "$LINUX_GUI_ARCHIVE_SHA256" ]]; then
-    echo "error: Linux GUI docker build produced no narHash/archiveSha256" >&2
+  # --artifact-dir has to be reachable from inside the container, so the
+  # files are written under the mounted repo and moved out afterwards.
+  local container_out=""
+  if [[ -n "${ARTIFACT_DIR:-}" ]]; then
+    container_out="$(mktemp -d "$REPO_ROOT/.artifact-out.XXXXXX")"
+  fi
+
+  # The staging directory sits inside the repo, so a failed build must not
+  # leave it behind: an untracked directory in the working tree is exactly
+  # the kind of thing a later flake build trips over.
+  if ! hashes="$(
+    docker run --rm --platform "$platform" \
+      --privileged \
+      -v "$REPO_ROOT":/repo \
+      -v "${nix_store_volume}:/nix" \
+      -w /repo \
+      -e WHAT="$what" \
+      -e OUT_DIR="${container_out:+/repo/$(basename "$container_out")}" \
+      -e ARCHIVE_NAME="$(linux_nix_key "$arch").tar.gz" \
+      -e DEB_NAME="$(linux_deb_key "$arch").deb" \
+      "$NIX_IMAGE" \
+      sh -euc "$build_script"
+  )"; then
+    [[ -n "$container_out" ]] && rm -rf "$container_out"
+    echo "error: the ${platform} Nix container build failed" >&2
+    exit 1
+  fi
+
+  if [[ -n "$container_out" ]]; then
+    mkdir -p "$ARTIFACT_DIR"
+    cp -f "$container_out"/* "$ARTIFACT_DIR/"
+    chmod -R u+w "$ARTIFACT_DIR"
+    rm -rf "$container_out"
+  fi
+
+  local deb_sha
+  deb_sha="$(printf '%s\n' "$hashes" | sed -n 's/^DEBSHA=//p')"
+  if [[ -z "$deb_sha" ]]; then
+    echo "error: Linux docker build produced no deb sha256" >&2
     echo "$hashes" >&2
     exit 1
   fi
+  case "$arch" in
+    amd64) LINUX_DEB_AMD64_SHA256="$deb_sha" ;;
+    arm64) LINUX_DEB_ARM64_SHA256="$deb_sha" ;;
+  esac
+
+  if [[ "$what" == gui ]]; then
+    LINUX_GUI_NARHASH="$(printf '%s\n' "$hashes" | sed -n 's/^NARHASH=//p')"
+    LINUX_GUI_ARCHIVE_SHA256="$(printf '%s\n' "$hashes" | sed -n 's/^ARCHIVESHA=//p')"
+    if [[ -z "$LINUX_GUI_NARHASH" || -z "$LINUX_GUI_ARCHIVE_SHA256" ]]; then
+      echo "error: Linux GUI docker build produced no narHash/archiveSha256" >&2
+      echo "$hashes" >&2
+      exit 1
+    fi
+  fi
+}
+
+# The `.deb` rows for whichever architectures this run recorded, as an
+# artifacts object. Empty below ARTIFACT_SET_SCHEMA: a manifest declaring a
+# schema that does not record these rows must not carry them, which is the
+# half of accept-before-emit the emitter owns.
+linux_deb_rows() {
+  local acc='{}' arch sha
+
+  if records_current_linux_shape; then
+    for arch in amd64 arm64; do
+      case "$arch" in
+        amd64) sha="${LINUX_DEB_AMD64_SHA256:-}" ;;
+        arm64) sha="${LINUX_DEB_ARM64_SHA256:-}" ;;
+      esac
+      [[ -n "$sha" ]] || continue
+      acc="$(
+        jq -n \
+          --argjson acc "$acc" \
+          --arg key "$(linux_deb_key "$arch")" \
+          --arg platform "linux/${arch}" \
+          --arg sha "sha256:${sha}" \
+          '$acc + { ($key): { type: "file", platform: $platform, sha256: $sha } }'
+      )"
+    done
+  fi
+  printf '%s\n' "$acc"
 }
 
 print_linux_gui_manifest() {
   local gui_hash archive_sha arch
 
   if [[ -n "${LINUX_GUI_NARHASH:-}" ]]; then
-    # Cross-host docker path: the container always builds linux/amd64
+    # Cross-host docker path: the GUI container always builds linux/amd64
     # (matching CI), regardless of the host's own arch — so the key/platform
     # are fixed to amd64 rather than derived from `uname -m`.
     gui_hash="$LINUX_GUI_NARHASH"
@@ -702,19 +907,32 @@ print_linux_gui_manifest() {
     --argjson schema "$MANIFEST_SCHEMA_VERSION" \
     --arg gui_hash "$gui_hash" \
     --arg archive_sha "$archive_sha" \
-    --arg key "eidola-gui-linux-${arch}" \
+    --arg key "$(linux_nix_key "$arch")" \
     --arg platform "linux/${arch}" \
+    --argjson debs "$(linux_deb_rows)" \
     '{
       schema_version: $schema,
-      artifacts: {
+      artifacts: ({
         ($key): {
           type: "nix",
           platform: $platform,
           narHash: $gui_hash,
           archiveSha256: $archive_sha
         }
-      }
+      } + $debs)
     }'
+}
+
+# The partial from a runner that builds only a `.deb` — the arm64 job,
+# which has no Nix installable to record. Empty artifacts below
+# ARTIFACT_SET_SCHEMA, which is exactly right: the build still runs (so the
+# path is exercised on every main push) while the manifest keeps its
+# schema-2 shape.
+print_linux_deb_manifest() {
+  jq -n \
+    --argjson schema "$MANIFEST_SCHEMA_VERSION" \
+    --argjson debs "$(linux_deb_rows)" \
+    '{ schema_version: $schema, artifacts: $debs }'
 }
 
 # Extract a subset of artifact entries from the committed manifest as a
@@ -771,6 +989,9 @@ build_macos_artifacts() {
       --print-out-paths \
       --show-trace
   )"
+
+  copy_named_artifact "$CLI_ARCHIVE_PATH" "eidola-cli-macos-universal.tar.gz"
+  copy_named_artifact "$GUI_ARCHIVE_PATH" "eidola-gui-macos-universal.tar.gz"
 }
 
 nix_nar_hash() {
@@ -780,10 +1001,10 @@ nix_nar_hash() {
     | jq -er --arg path "$store_path" '.[$path].narHash | select(type == "string" and startswith("sha256-"))'
 }
 
-# SHA-256 of a file as `sha256:` + lowercase hex — comparable with
-# `sha256sum` / `shasum -a 256` without Nix. Prefer those tools; fall
-# back to `nix hash file` when neither is on PATH (the Nix container).
-file_sha256() {
+# SHA-256 of a file as lowercase hex, using `sha256sum` / `shasum -a 256`
+# where available and falling back to `nix hash file` when neither is on
+# PATH (the Nix container).
+file_sha256_hex() {
   local path="$1" hex
 
   if command -v sha256sum >/dev/null 2>&1; then
@@ -797,6 +1018,14 @@ file_sha256() {
     echo "error: could not hash $path (got ${hex:-empty})" >&2
     return 1
   fi
+  printf '%s\n' "$hex"
+}
+
+# The same hash in the manifest's `sha256:` + hex form — what a user
+# compares a `sha256sum` line against.
+file_sha256() {
+  local hex
+  hex="$(file_sha256_hex "$1")" || return 1
   printf 'sha256:%s\n' "$hex"
 }
 
@@ -1047,8 +1276,19 @@ update_manifest() {
   else
     build_linux_gui_artifact
     linux_gui_partial="$(print_linux_gui_manifest)"
-    macos_partial="$(carry_over_partial "eidola-cli-macos-" "eidola-gui-macos-")"
-    echo "note: darwin narHash/archiveSha256 carried over from committed manifest (not buildable on Linux); CI verifies them" >&2
+    # A Linux host builds only its own architecture, so the *other* arch's
+    # `.deb` row is carried over the same way the darwin rows are. (The
+    # Darwin path above needs no such carry-over: its containers cover both
+    # Linux architectures.)
+    local other_arch="amd64"
+    if [[ "$(manifest_arch)" == "amd64" ]]; then
+      other_arch="arm64"
+    fi
+    macos_partial="$(
+      carry_over_partial "eidola-cli-macos-" "eidola-gui-macos-" \
+        "$(linux_deb_key "$other_arch")"
+    )"
+    echo "note: darwin narHash/archiveSha256 and the ${other_arch} .deb carried over from committed manifest (not buildable on this host); CI verifies them" >&2
   fi
 
   # ── Phase 4: compose final artifact-manifest.json ───────────────────────
@@ -1093,6 +1333,10 @@ case "$COMMAND" in
   build-linux-gui)
     build_linux_gui_artifact
     write_output "$(print_linux_gui_manifest)"
+    ;;
+  build-linux-deb)
+    build_linux_deb_artifact
+    write_output "$(print_linux_deb_manifest)"
     ;;
   measure)
     enclave_json="$(compute_measurements)"
