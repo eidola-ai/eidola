@@ -547,6 +547,8 @@ fn parse_and_gate_release(
         }));
     }
 
+    check_schema_shape(&release)?;
+
     match compare_versions(&release.version, installed_version)? {
         VersionCompare::OlderOrEqual => return Err(NoUpdateOrError::NoUpdate),
         VersionCompare::Newer => {}
@@ -555,6 +557,50 @@ fn parse_and_gate_release(
     check_continuity(&release, installed_git_commit)?;
 
     Ok(release)
+}
+
+/// The schema a release document *declares* is the shape it is held to.
+///
+/// Both directions matter, and for the same reason a manifest is held to
+/// its own declared schema (`releases/README.md`, and `crate::updates`):
+/// a rotation ships acceptance one release before emission, so between
+/// those releases this client reads the old shape and the new one as
+/// equally authentic — but a document that declares the old version while
+/// carrying the new fields, or declares the new one and omits what it
+/// promises, is not a shape either release ever produced. Tolerating
+/// either would make the version number decorative.
+fn check_schema_shape(release: &ReleaseIndex) -> Result<(), NoUpdateOrError> {
+    const ARTIFACT_INDEX_SINCE: u32 = 2;
+
+    let refuse = |message: String| NoUpdateOrError::Error(AppError::Update { message });
+
+    if release.schema_version < ARTIFACT_INDEX_SINCE {
+        if release.artifacts.is_some() {
+            return Err(refuse(format!(
+                "release.json declares schema_version `{}` but carries an `artifacts` \
+                 index, which releases record only from schema {ARTIFACT_INDEX_SINCE} on",
+                release.schema_version,
+            )));
+        }
+        if release.apple_signature_bundle.is_some() {
+            return Err(refuse(format!(
+                "release.json declares schema_version `{}` but carries \
+                 `apple_signature_bundle`, which releases record only from schema \
+                 {ARTIFACT_INDEX_SINCE} on",
+                release.schema_version,
+            )));
+        }
+    } else if release.artifacts.is_none() {
+        // `apple_signature_bundle` stays optional at schema 2: a release
+        // with no signed macOS installable publishes none.
+        return Err(refuse(format!(
+            "release.json declares schema_version `{}` but carries no `artifacts` \
+             index, which every release from schema {ARTIFACT_INDEX_SINCE} on records",
+            release.schema_version,
+        )));
+    }
+
+    Ok(())
 }
 
 enum VersionCompare {
