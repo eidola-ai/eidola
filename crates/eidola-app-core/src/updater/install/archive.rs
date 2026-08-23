@@ -44,6 +44,28 @@ const MAX_MEMBERS: usize = 50_000;
 /// Returns the number of regular files written. Directory entries are
 /// created as needed; every other member kind is a refusal.
 pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize, InstallError> {
+    // Read the count the container claims before handing it to a parser
+    // that will believe it. `ZipArchive::new` walks the whole central
+    // directory eagerly and retains a record per member, so a container
+    // claiming millions of them costs memory before `len()` can be
+    // consulted — and the crate exposes no cheaper way to ask.
+    //
+    // This reads one fixed-layout record at the end of the file rather
+    // than parsing the archive: it can only refuse early, never accept
+    // something the parser would reject. When it cannot tell — a ZIP64
+    // count, or an end record it cannot find — it says so and the parser
+    // decides, which is no worse than not looking.
+    if let Some(claimed) = claimed_member_count(bytes)
+        && claimed > MAX_MEMBERS as u64
+    {
+        return Err(InstallError::Archive {
+            label: label.to_string(),
+            reason: format!(
+                "claims {claimed} members, more than the {MAX_MEMBERS} this will unpack"
+            ),
+        });
+    }
+
     let reader = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(reader).map_err(|e| InstallError::Archive {
         label: label.to_string(),
@@ -222,13 +244,19 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
     // so a staging run under 077 produces 0700 directories — and an app
     // promoted from that tree is unreadable to anyone but the installing
     // user, which is not the tree the packer recorded.
-    normalize_directory_modes(dest)?;
+    normalize_modes(dest)?;
     Ok(written)
 }
 
-/// `u=rwX,go=rX` for every directory under `root`, inclusive — the same
-/// rule the packing recipe applies.
-fn normalize_directory_modes(root: &Path) -> Result<(), InstallError> {
+/// `u=rwX,go=rX` over a whole tree — the rule the packing recipe applies,
+/// which is to say: directories and anything already executable become
+/// 0755, every other file 0644.
+///
+/// Applied to the unpacked tree, and again after reconstruction, because
+/// reconstruction creates paths with ordinary creates and those carry the
+/// umask. What a staged tree looks like should not depend on which step
+/// wrote each path.
+pub(super) fn normalize_modes(root: &Path) -> Result<(), InstallError> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = std::fs::read_dir(&dir).map_err(|e| InstallError::Staging {
@@ -240,13 +268,18 @@ fn normalize_directory_modes(root: &Path) -> Result<(), InstallError> {
                 path: dir.clone(),
                 reason: e.to_string(),
             })?;
+            let path = entry.path();
             let kind = entry.file_type().map_err(|e| InstallError::Staging {
-                path: entry.path(),
+                path: path.clone(),
                 reason: e.to_string(),
             })?;
             if kind.is_dir() {
-                stack.push(entry.path());
+                stack.push(path);
+            } else if kind.is_file() {
+                set_file_mode(&path)?;
             }
+            // Anything else was refused on the way in and is not created
+            // by reconstruction; leaving it alone is the honest default.
         }
         set_directory_mode(&dir)?;
     }
@@ -293,6 +326,36 @@ fn copy_member(
     Ok(written)
 }
 
+/// How many members a container's end-of-central-directory record says it
+/// holds, when that can be read without parsing anything else.
+///
+/// The record is the last 22 bytes plus an optional trailing comment, so
+/// it is found by scanning back for its signature. `None` means "cannot
+/// tell": no record found, or a ZIP64 count that lives in a different
+/// record. Nothing is concluded from `None` — it is not evidence of
+/// anything, and the authoritative check still runs after the parse.
+fn claimed_member_count(bytes: &[u8]) -> Option<u64> {
+    const SIGNATURE: [u8; 4] = [b'P', b'K', 5, 6];
+    const RECORD_LEN: usize = 22;
+    // A zip comment is at most 64 KiB, so the record starts no earlier.
+    const MAX_COMMENT: usize = u16::MAX as usize;
+
+    if bytes.len() < RECORD_LEN {
+        return None;
+    }
+    let earliest = bytes.len().saturating_sub(RECORD_LEN + MAX_COMMENT);
+    let start = (earliest..=bytes.len() - RECORD_LEN)
+        .rev()
+        .find(|&i| bytes[i..i + 4] == SIGNATURE)?;
+
+    let total = u16::from_le_bytes([bytes[start + 10], bytes[start + 11]]);
+    if total == u16::MAX {
+        // The real count is in the ZIP64 record; reading that is parsing.
+        return None;
+    }
+    Some(u64::from(total))
+}
+
 /// The name two members would have to share to be one file.
 ///
 /// A `PathBuf` comparison is not that test on the filesystems this
@@ -318,6 +381,34 @@ fn collision_key(relative: &Path) -> String {
 
 /// `u=rwX,go=rX` for a directory — the same rule the packing recipe
 /// applies, so the tree that comes out matches the tree that went in.
+/// 0755 if it is already executable, 0644 otherwise — `X` in the packer's
+/// `u=rwX,go=rX`, which keys off the executable bit rather than inventing
+/// one.
+#[cfg(unix)]
+fn set_file_mode(path: &Path) -> Result<(), InstallError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = std::fs::metadata(path)
+        .map_err(|e| InstallError::Staging {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?
+        .permissions()
+        .mode();
+    let normalized = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(normalized)).map_err(|e| {
+        InstallError::Staging {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn set_file_mode(_path: &Path) -> Result<(), InstallError> {
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_directory_mode(path: &Path) -> Result<(), InstallError> {
     use std::os::unix::fs::PermissionsExt;
@@ -528,6 +619,45 @@ mod tests {
                 "`{name}`: {error}"
             );
         }
+    }
+
+    /// The count a container claims is readable without parsing it, and
+    /// an absurd one is refused before a parser retains a record per
+    /// member.
+    #[test]
+    fn reads_the_claimed_member_count_without_parsing() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(0o644);
+            for i in 0..3 {
+                writer.start_file(format!("app/{i}"), options).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let mut bytes = cursor.into_inner();
+        assert_eq!(claimed_member_count(&bytes), Some(3));
+
+        // Claim far more than the ceiling; the refusal must come before
+        // the parse, so a container that never had those members is still
+        // refused on what it said about itself.
+        let signature = [b'P', b'K', 5u8, 6u8];
+        let start = (0..=bytes.len() - 22)
+            .rev()
+            .find(|&i| bytes[i..i + 4] == signature)
+            .expect("the fixture has an end record");
+        let absurd = (MAX_MEMBERS as u16).saturating_add(1);
+        bytes[start + 10..start + 12].copy_from_slice(&absurd.to_le_bytes());
+
+        let dest = tempfile::tempdir().unwrap();
+        let error = unpack_zip(&bytes, dest.path(), "a payload")
+            .expect_err("a container claiming more members than this unpacks is refused");
+        assert!(
+            matches!(&error, InstallError::Archive { reason, .. } if reason.contains("claims")),
+            "{error}"
+        );
     }
 
     /// A byte budget does not bound member count.

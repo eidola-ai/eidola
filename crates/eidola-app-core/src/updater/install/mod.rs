@@ -272,31 +272,40 @@ pub async fn stage(
 /// the final component is joined back on. A parent that cannot be resolved
 /// is a parent that does not exist, which is the caller's to create.
 fn absolutize_staging_root(staging_root: &Path) -> Result<PathBuf, InstallError> {
-    let Some(name) = staging_root.file_name() else {
-        return Err(InstallError::Staging {
-            path: staging_root.to_path_buf(),
-            reason: "is not a directory this could create (it names no final component)"
-                .to_string(),
-        });
+    resolve_parent_keeping_entry(staging_root).map_err(|e| InstallError::Staging {
+        path: staging_root.to_path_buf(),
+        reason: format!(
+            "could not be resolved ({e}); the directory holding a staging root belongs to \
+             the caller, so this will not create it"
+        ),
+    })
+}
+
+/// An absolute path whose *parent* is resolved and whose final component
+/// is left exactly as written.
+///
+/// Both callers want the same thing and for the same reason. A staging
+/// root does not exist yet, so only its parent can be resolved; an install
+/// location may exist and be a symlink, and resolving it would name the
+/// target rather than the entry a rename acts on. Keeping the final
+/// component is what makes those one rule instead of two.
+fn resolve_parent_keeping_entry(path: &Path) -> std::io::Result<PathBuf> {
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "names no final component",
+        ));
     };
 
     // `Some("")` is what a single-component relative path reports; that
     // parent is the working directory.
-    let parent = match staging_root.parent() {
+    let parent = match path.parent() {
         Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
         Some(parent) => parent,
         None => Path::new("."),
     };
 
-    let resolved = parent.canonicalize().map_err(|e| InstallError::Staging {
-        path: parent.to_path_buf(),
-        reason: format!(
-            "could not be resolved ({e}); the directory holding a staging root belongs to \
-             the caller, so this will not create it"
-        ),
-    })?;
-
-    Ok(resolved.join(name))
+    Ok(parent.canonicalize()?.join(name))
 }
 
 /// Removes the staging tree unless the install got far enough to hand it
@@ -384,6 +393,17 @@ async fn stage_inner(
 
     // ── compose, then read back what the composition claims ─────────────
     eidola_apple::apply(&bundle, &envelope_root)?;
+
+    // Reconstruction creates paths of its own — the signing directories
+    // and the seal — with ordinary creates, so they carry the umask while
+    // everything unpacked from the container already carries the packer's
+    // mode set. One tree with two rules in it is one rule too many: what
+    // gets promoted should not depend on which step happened to write each
+    // path. Normalizing again afterwards is the local cure; the
+    // reconstruction crate is a shared contract, and the mode a staged
+    // tree ends up with is this module's business, not its.
+    archive::normalize_modes(&bundle)?;
+
     let facts = eidola_apple::inspect(&bundle)?;
 
     let expected = plan
@@ -582,7 +602,15 @@ pub fn promotion_readiness(staged: &Path, installed: &Path) -> PromotionReadines
     // single-component path is `Some("")`, and asking the kernel about an
     // empty pathname fails, which would report a perfectly writable
     // directory as needing privileges.
-    let installed = &match installed.canonicalize() {
+    //
+    // The *parent* is what gets resolved, and the final component is kept
+    // as written. Resolving the whole path would follow a symlink at the
+    // install location and then ask about the target's directory — while
+    // the rename acts on the symlink itself, in the directory the symlink
+    // lives in. An `/Applications/Eidola.app` pointing into a user-owned
+    // folder would read as promotable on the strength of a directory the
+    // swap never touches.
+    let installed = &match resolve_parent_keeping_entry(installed) {
         Ok(path) => path,
         Err(e) => {
             return PromotionReadiness::NeedsPrivileges {
@@ -907,6 +935,44 @@ mod promotion_tests {
             }
         }
         None
+    }
+
+    /// An install location that is a symlink is still an entry in the
+    /// directory the symlink lives in, and that is the entry a rename
+    /// replaces. Resolving the whole path asks about the target's
+    /// directory instead — a different question with a different answer.
+    #[test]
+    fn a_symlinked_install_location_is_judged_where_it_lives() {
+        // SAFETY: `geteuid` reads process state and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes anywhere; the distinction cannot show.
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+
+        // Where the symlink lives: this user cannot write here.
+        let system = root.path().join("Applications");
+        std::fs::create_dir(&system).unwrap();
+
+        // Where it points: entirely this user's.
+        let mine = root.path().join("mine");
+        let target = mine.join("Eidola.app");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let link = system.join("Eidola.app");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::set_permissions(&system, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let staged = root.path().join("staged.app");
+        std::fs::create_dir(&staged).unwrap();
+        let verdict = promotion_readiness(&staged, &link);
+        std::fs::set_permissions(&system, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(verdict, PromotionReadiness::NeedsPrivileges { .. }),
+            "the rename replaces the symlink, in a directory this user cannot write: {verdict:?}"
+        );
     }
 
     #[test]
