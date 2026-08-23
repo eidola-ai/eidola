@@ -832,6 +832,79 @@ mod tests {
         assert!(msg.contains("schema_version"), "got: {msg}");
     }
 
+    /// Both halves of the artifact-index rotation, on the shape a release
+    /// declares rather than on the shape this build would prefer.
+    ///
+    /// Between the release that accepts schema 2 and the release that
+    /// emits it, both shapes are authentic — but a document that declares
+    /// one and carries the other is neither, and reading it as whichever
+    /// it resembles would make the version number decorative.
+    mod artifact_index_rotation {
+        use super::*;
+
+        fn release(schema: u32, extra: &str) -> Vec<u8> {
+            format!(
+                r#"{{
+                    "schema_version": {schema},
+                    "version": "1.1.0",
+                    "git_commit": "9c3a000000000000000000000000000000000001",
+                    "git_tag": "v1.1.0",
+                    "released_at": "2026-05-26T17:00:00Z",
+                    "artifact_manifest": {{"url":"x","sigstore_bundle_url":"x"}},
+                    "human_attestations": [{{"attestant_id":"x","url":"x","bundle_url":"x"}}]
+                    {extra}
+                }}"#
+            )
+            .into_bytes()
+        }
+
+        const INDEX: &str = r#", "artifacts": {"eidola-gui-macos-universal-zip": {"url": "https://example.com/p.zip"}}"#;
+
+        #[test]
+        fn schema_1_without_an_index_is_the_shape_releases_emit_today() {
+            let release = parse_and_gate_release(&release(1, ""), "1.0.0", None)
+                .expect("today's emitted shape must keep verifying");
+            assert!(release.artifacts.is_none());
+        }
+
+        #[test]
+        fn schema_2_with_an_index_is_accepted_before_anything_emits_it() {
+            let release = parse_and_gate_release(&release(2, INDEX), "1.0.0", None)
+                .expect("the shape the next rotation emits must already verify");
+            assert_eq!(release.artifacts.unwrap().len(), 1);
+        }
+
+        #[test]
+        fn schema_1_carrying_an_index_is_refused() {
+            let err = unwrap_err(parse_and_gate_release(&release(1, INDEX), "1.0.0", None));
+            let msg = format!("{err}");
+            assert!(msg.contains("only from schema 2 on"), "got: {msg}");
+        }
+
+        #[test]
+        fn schema_2_without_an_index_is_refused() {
+            let err = unwrap_err(parse_and_gate_release(&release(2, ""), "1.0.0", None));
+            let msg = format!("{err}");
+            assert!(msg.contains("carries no `artifacts`"), "got: {msg}");
+        }
+
+        #[test]
+        fn schema_1_carrying_signature_material_is_refused() {
+            let extra = r#", "apple_signature_bundle": {"url": "https://example.com/s.zip"}"#;
+            let err = unwrap_err(parse_and_gate_release(&release(1, extra), "1.0.0", None));
+            let msg = format!("{err}");
+            assert!(msg.contains("apple_signature_bundle"), "got: {msg}");
+        }
+
+        #[test]
+        fn schema_2_may_omit_signature_material() {
+            // A release with no signed macOS installable publishes none;
+            // that is an absence, not an omission.
+            parse_and_gate_release(&release(2, INDEX), "1.0.0", None)
+                .expect("a release without an envelope must still verify");
+        }
+    }
+
     #[test]
     fn rejects_invalid_semver_in_release() {
         let bytes = release_json("not.semver.at.all", None);

@@ -162,9 +162,12 @@ fn set_mode(_path: &Path, _stored: Option<u32>) -> Result<(), InstallError> {
 
 /// A member name this is willing to write, as a relative path.
 ///
-/// Absolute paths, drive prefixes, `..`, `.` and empty names are all
-/// refused rather than normalized: normalizing is how an extractor ends up
-/// writing somewhere its caller did not name.
+/// The check runs on the archive's own `/`-separated segments before any
+/// path type sees them, because path types normalize: Rust drops an
+/// interior `.` component, so `a/./b` and `a/b` would arrive here as the
+/// same path and only one of them is a name our packer can produce.
+/// Normalizing is how an extractor ends up writing somewhere its caller
+/// did not name, so nothing is normalized — an unusual name is refused.
 fn safe_relative_path(name: &str) -> Option<PathBuf> {
     if name.is_empty() || name.starts_with('/') || name.starts_with('\\') {
         return None;
@@ -173,17 +176,25 @@ fn safe_relative_path(name: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let candidate = Path::new(name);
+    // A directory member arrives with one trailing slash, which is the
+    // archive saying "directory" rather than a path component. Every other
+    // empty segment is a doubled separator: two names for one place, and
+    // this compares names.
+    let body = name.strip_suffix('/').unwrap_or(name);
+
     let mut out = PathBuf::new();
-    for component in candidate.components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            // Anything else is either an escape or a no-op that only
-            // exists to make one look like the other.
-            Component::CurDir
-            | Component::ParentDir
-            | Component::RootDir
-            | Component::Prefix(_) => return None,
+    for segment in body.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return None;
+        }
+        out.push(segment);
+    }
+
+    // Re-walking with the platform's own parser catches anything the
+    // segment scan could not see — a drive prefix on Windows, say.
+    for component in out.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return None;
         }
     }
 
@@ -208,6 +219,7 @@ mod tests {
             "./same",
             "a/./b",
             "with\0nul",
+            "a//b",
         ] {
             assert!(
                 safe_relative_path(name).is_none(),
