@@ -40,6 +40,7 @@ pub use eidola_attestation::{
 
 pub mod ci_sigstore;
 pub mod human_attestation;
+pub mod install;
 mod merkle;
 mod rekor_verify;
 pub mod sigstore_bundle;
