@@ -2,7 +2,7 @@
 
 Every piece of the Eidola trust chain that is intentionally deferred is catalogued here. Each gap closes a specific class of attack that is already constrained by other parts of the chain — but they are real and worth understanding. Reading this page is the fastest way to see what Eidola does not yet defend against.
 
-The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs) and `rekor.rs`, and the install-side gap is at the `TODO (step 5)` marker on `verify_each_artifact_hash` in [`crates/eidola-app-core/src/updater/mod.rs`](../crates/eidola-app-core/src/updater/mod.rs). The same two cryptographic-verifier gaps apply to the server-side runtime upstream-measurement resolver ([`crates/eidola-server/src/upstream_trust/sigstore.rs`](../crates/eidola-server/src/upstream_trust/sigstore.rs)), which reuses the same Fulcio/Rekor primitives.
+The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs) and `rekor.rs`, and the install-side gap is described where the verifier hands off to [`crates/eidola-app-core/src/updater/install/`](../crates/eidola-app-core/src/updater/install/mod.rs). The same two cryptographic-verifier gaps apply to the server-side runtime upstream-measurement resolver ([`crates/eidola-server/src/upstream_trust/sigstore.rs`](../crates/eidola-server/src/upstream_trust/sigstore.rs)), which reuses the same Fulcio/Rekor primitives.
 
 ## Cryptographic verifier
 
@@ -22,7 +22,7 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **What it would catch.** A tampered binary download — the *manifest* is signed and content-verified, but the actual binary bytes that would run are not yet hashed against the manifest's declared digests.
 
-**What constrains it today.** The verifier already proves `artifact-manifest.json` itself is authentic and unmodified. The install-time hash check lives naturally in a to-be-implemented install / atomic-replace step, once we know which platform's artifact the user is downloading. The verifier code is in place; only the wiring to the download path is deferred.
+**What constrains it today.** The check itself now exists: `updater::install::stage` hashes each downloaded container against the value the verified manifest records and refuses on any difference, leaving no staged tree. What is still missing is the wiring that builds an install plan from a verified release — which waits on the attestation carrying the detached material's hash and the signing identity to expect.
 
 ### Multi-hop / fast-forward continuity
 
@@ -34,9 +34,9 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 ### Install / atomic-replace
 
-**Current behavior.** `eidola update` runs the full verification pipeline and prints the verified attestation prose, but does not download or swap the binary.
+**Current behavior.** `eidola update` runs the full verification pipeline and prints the verified attestation prose. Downloading and verifying an update is implemented — `updater::install::stage` fetches the payload, hashes it against the manifest, reconstructs the signed macOS app from the detached material, and checks that the result claims the identity the attestation names — but it stops at a *staged* bundle. Nothing replaces the running application.
 
-**Future.** Step 5: download the artifact for the user's platform from `artifact-manifest.json`, hash-verify, atomic-replace, restart. Platform-specific (CLI = file swap; macOS GUI = staged swap on next launch).
+**Future.** Promotion: swapping a staged bundle for the installed one, and relaunching. That is a product decision rather than a missing mechanism, because the answer differs by install location — `updater::install::promotion_readiness` reports whether this process could do it without privileges it should not be acquiring on its own. The CLI stays out of scope (no TCC need, and a bare Mach-O cannot be stapled).
 
 ### Single-attestant policy
 

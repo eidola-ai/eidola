@@ -486,17 +486,17 @@ pub async fn check_for_update_with(
         ),
     );
 
-    // TODO (step 5): `verify_each_artifact_hash` — fetch
-    // `artifact-manifest.json`, walk its `artifacts` table, and for each
-    // artifact this client is about to install (today: just the
-    // platform-appropriate CLI/GUI binary), download it and verify its
-    // hash against the manifest's declared digest. The manifest itself
-    // was already CI-signature-verified above, so its declared hashes
-    // are trustworthy — this stage just turns "manifest authentic" into
-    // "downloaded bytes authentic." Lives in step 5 because the natural
-    // home is the install/replace flow, where we already need to be
-    // downloading the binary anyway. See `docs/gaps.md` for the
-    // audit-side description.
+    // Turning "manifest authentic" into "downloaded bytes authentic" is
+    // [`install::stage`]'s job, not this function's: it hashes each
+    // downloaded artifact against what the manifest here declares, and
+    // the natural place to do that is where the bytes are being fetched
+    // anyway. This function stops at a verified `ReleaseSummary` because
+    // the user approves a release *before* anything is downloaded.
+    //
+    // What is still missing is the wiring between the two — building an
+    // [`install::InstallPlan`] from this summary plus the manifest — and
+    // it waits on the attestation carrying the envelope's hash and the
+    // identity to expect. See `docs/gaps.md`.
 
     tracer.log("present", format!("release {} verified", release.version));
 
