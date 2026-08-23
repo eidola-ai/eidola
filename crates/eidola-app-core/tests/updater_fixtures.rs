@@ -401,3 +401,106 @@ async fn refuses_a_plan_that_would_apply_signatures_without_checking_them() {
     assert!(matches!(error, InstallError::PlanIncomplete));
     assert!(!root.exists());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refuses_a_staging_path_that_is_already_something_and_leaves_it_alone() {
+    // A staging path can collide with a directory the caller never meant
+    // to hand over. Refusing it is half the answer; the other half is not
+    // deleting it on the way out, which is only structurally true if the
+    // cleanup can run exclusively on a directory this call created.
+    let published = publish();
+    let root = tempfile::tempdir().unwrap();
+    let occupied = root.path().join("not-ours");
+    std::fs::create_dir(&occupied).unwrap();
+    std::fs::write(occupied.join("irreplaceable.txt"), b"years of work").unwrap();
+
+    let error = install::stage(
+        &Fetcher::fixtures(published.dir.path()),
+        &plan(&published),
+        &occupied,
+    )
+    .await
+    .expect_err("an occupied staging path should be refused");
+
+    assert!(matches!(error, InstallError::Staging { .. }), "{error}");
+    assert!(
+        occupied.join("irreplaceable.txt").exists(),
+        "refusing a staging path must never delete what was already there"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refuses_a_bundle_name_that_would_reach_outside_the_staging_tree() {
+    // Reconstruction *writes*. A plan that could name a path rather than a
+    // directory would hand it somewhere this module promised never to go.
+    for name in [
+        "../../../outside",
+        "/tmp/eidola-install-escape",
+        "a/b",
+        "..",
+    ] {
+        let published = publish();
+        let mut p = plan(&published);
+        p.bundle_name = name.to_string();
+
+        let staging = tempfile::tempdir().unwrap();
+        let root = staging.path().join("9.9.9");
+        let error = install::stage(&Fetcher::fixtures(published.dir.path()), &p, &root)
+            .await
+            .expect_err("a bundle name that is not one component should be refused");
+        assert!(
+            matches!(&error, InstallError::BundleMissing { expected } if expected == name),
+            "`{name}`: {error}"
+        );
+        assert!(!root.exists());
+        assert!(
+            !Path::new("/tmp/eidola-install-escape").exists(),
+            "nothing outside the staging tree may be created"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refuses_members_that_the_filesystem_would_fold_together() {
+    // `A.app/x` and `a.app/x` are one file on a case-insensitive volume —
+    // the macOS default — so accepting both means the bytes that land are
+    // whichever the extractor wrote last.
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for name in ["A.app/Contents/Info.plist", "a.app/Contents/Info.plist"] {
+            writer.start_file(name.to_string(), options).unwrap();
+            std::io::Write::write_all(&mut writer, b"body").unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let payload = cursor.into_inner();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("payload.zip"), &payload).unwrap();
+
+    let plan = InstallPlan {
+        version: "9.9.9".to_string(),
+        bundle_name: "A.app".to_string(),
+        payload: RemoteFile {
+            url: "https://example.com/v9.9.9/payload.zip".to_string(),
+            sha256: sha256_hex(&payload),
+        },
+        envelope: None,
+        expected_signature: None,
+    };
+
+    let staging = tempfile::tempdir().unwrap();
+    let root = staging.path().join("9.9.9");
+    let error = install::stage(&Fetcher::fixtures(dir.path()), &plan, &root)
+        .await
+        .expect_err("case-equivalent members should be refused");
+    assert!(
+        matches!(&error, InstallError::Archive { reason, .. } if reason.contains("same file")),
+        "{error}"
+    );
+    assert!(!root.exists());
+}

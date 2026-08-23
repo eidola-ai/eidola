@@ -186,6 +186,27 @@ pub async fn stage(
         return Err(InstallError::PlanIncomplete);
     }
 
+    // Creating the directory is what earns the right to delete it. The
+    // check and the claim are one atomic step: `create_dir` fails if
+    // anything is already there, so a staging path that collides with a
+    // caller's data is refused *before* any cleanup is armed, and cannot
+    // be created by someone else in between. An earlier shape checked
+    // `exists()` first and cleaned up on every error path — which meant a
+    // colliding directory was refused and then recursively deleted.
+    if let Some(parent) = staging_root.parent() {
+        create_dir_all(parent)?;
+    }
+    std::fs::create_dir(staging_root).map_err(|e| InstallError::Staging {
+        path: staging_root.to_path_buf(),
+        reason: if e.kind() == std::io::ErrorKind::AlreadyExists {
+            "already exists; staging directories are created fresh, and this one is not \
+             ours to remove"
+                .to_string()
+        } else {
+            e.to_string()
+        },
+    })?;
+
     match stage_inner(fetcher, plan, staging_root).await {
         Ok(staged) => Ok(staged),
         Err(e) => {
@@ -203,24 +224,24 @@ async fn stage_inner(
     plan: &InstallPlan,
     staging_root: &Path,
 ) -> Result<StagedInstall, InstallError> {
-    if staging_root.exists() {
-        return Err(InstallError::Staging {
-            path: staging_root.to_path_buf(),
-            reason: "already exists; staging directories are created fresh".to_string(),
-        });
-    }
-    create_dir(staging_root)?;
-
     // ── the payload: bytes a signed manifest already vouched for ────────
     let payload_bytes = fetch(fetcher, &plan.payload, "the update payload").await?;
     verify_hash(&payload_bytes, &plan.payload.sha256, "update payload")?;
 
     let payload_root = staging_root.join("payload");
-    create_dir(&payload_root)?;
+    create_dir_all(&payload_root)?;
     archive::unpack_zip(&payload_bytes, &payload_root, "update payload")?;
     drop(payload_bytes);
 
-    let bundle = payload_root.join(&plan.bundle_name);
+    // A plan names the directory it expects; it does not get to name a
+    // *path*. Everything downstream of this — including reconstruction,
+    // which writes — would otherwise act on whatever the join reached.
+    let bundle_name = archive::single_component(&plan.bundle_name).ok_or_else(|| {
+        InstallError::BundleMissing {
+            expected: plan.bundle_name.clone(),
+        }
+    })?;
+    let bundle = payload_root.join(&bundle_name);
     if !bundle.is_dir() {
         return Err(InstallError::BundleMissing {
             expected: plan.bundle_name.clone(),
@@ -241,7 +262,7 @@ async fn stage_inner(
     verify_hash(&envelope_bytes, &envelope.sha256, "signature material")?;
 
     let envelope_root = staging_root.join("envelope");
-    create_dir(&envelope_root)?;
+    create_dir_all(&envelope_root)?;
     archive::unpack_zip(&envelope_bytes, &envelope_root, "signature material")?;
     drop(envelope_bytes);
 
@@ -292,15 +313,31 @@ fn compare_signature(
     Ok(())
 }
 
+/// The most this will hold in memory for one container.
+///
+/// The URL these bytes come from is **attacker-suppliable by design**:
+/// `release.json` is unsigned, which is exactly why the hash that judges
+/// them lives in the manifest and the attestation instead. So the fetch
+/// has to be robust against a hostile URL and not merely a wrong one — a
+/// body is bounded *before* it is buffered, because a hash cannot be
+/// checked until the bytes are already here, and the unpack limit is a
+/// bound on the tree, not on the wire.
+///
+/// Today's macOS container is around 40 MB; this leaves an order of
+/// magnitude of headroom and still bounds what a hostile server can make
+/// this allocate.
+const MAX_CONTAINER_BYTES: u64 = 512 * 1024 * 1024;
+
 async fn fetch(fetcher: &Fetcher, file: &RemoteFile, label: &str) -> Result<Vec<u8>, InstallError> {
     fetcher
-        .fetch_url(&file.url, label)
+        .fetch_url_bounded(&file.url, label, MAX_CONTAINER_BYTES)
         .await
         .map_err(|e| InstallError::Download {
             label: label.to_string(),
-            // `AppError::Update`'s text is already URL-stripped by the
-            // fetch layer; a download error must never quote the URL back,
-            // since a redirect can put credentials in it.
+            // The fetch layer strips URLs from error text (`AppError`'s
+            // `request_error_text`), so this passes the message through
+            // rather than reformatting it: a redirect can leave a
+            // credential in a URL, and a standing failure is rendered.
             reason: match e {
                 AppError::Update { message } => message,
                 other => other.to_string(),
@@ -332,7 +369,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn create_dir(path: &Path) -> Result<(), InstallError> {
+fn create_dir_all(path: &Path) -> Result<(), InstallError> {
     std::fs::create_dir_all(path).map_err(|e| InstallError::Staging {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -379,8 +416,17 @@ pub enum PromotionReadiness {
 /// Probe the install location. Reads only; nothing is created or moved.
 #[cfg(target_os = "macos")]
 pub fn promotion_readiness(installed: &Path) -> PromotionReadiness {
-    if !installed.exists() {
-        return PromotionReadiness::NotInstalled;
+    // `exists()` answers false for "no" *and* for "an ancestor is not
+    // searchable", which are opposite answers here: the second means a
+    // bundle may well be installed and this process cannot get to it.
+    match installed.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return PromotionReadiness::NotInstalled,
+        Err(e) => {
+            return PromotionReadiness::NeedsPrivileges {
+                reason: format!("`{}` could not be examined: {e}", installed.display()),
+            };
+        }
     }
     // A swap replaces the bundle *within* its parent, so the parent has to
     // be writable too — a writable bundle inside a read-only directory can
@@ -456,5 +502,29 @@ mod promotion_tests {
         // Nothing was created or moved by any of the above.
         assert!(installed.is_dir());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn an_unreachable_bundle_is_not_an_absent_one() {
+        // SAFETY: `geteuid` reads process state and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root searches anything; the case cannot arise.
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let outer = root.path().join("outer");
+        let installed = outer.join("Eidola.app");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let verdict = promotion_readiness(&installed);
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(verdict, PromotionReadiness::NeedsPrivileges { .. }),
+            "an ancestor this process cannot search means the answer is unknown, and an \
+             unknown answer is not `NotInstalled`: {verdict:?}"
+        );
     }
 }

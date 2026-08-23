@@ -92,9 +92,24 @@ impl Fetcher {
     }
 
     /// Fetch a referenced asset by URL.
+    ///
+    /// Bounded at [`MAX_DOCUMENT_BYTES`]: every URL reached this way comes
+    /// out of `release.json`, which is unsigned and therefore chosen by
+    /// whoever served it.
     async fn fetch_url(&self, url: &str, label: &str) -> Result<Vec<u8>, AppError> {
+        self.fetch_url_bounded(url, label, MAX_DOCUMENT_BYTES).await
+    }
+
+    /// Fetch a referenced asset with an explicit ceiling, for callers whose
+    /// artifacts are larger than a signed document.
+    pub(crate) async fn fetch_url_bounded(
+        &self,
+        url: &str,
+        label: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AppError> {
         match self {
-            Fetcher::Network(client) => fetch_url_network(client, url, label).await,
+            Fetcher::Network(client) => fetch_url_network(client, url, label, max_bytes).await,
             Fetcher::Fixtures(dir) => {
                 let name = url_to_filename(url).ok_or_else(|| AppError::Update {
                     message: format!(
@@ -704,38 +719,87 @@ async fn fetch_release_json_network(client: &reqwest::Client) -> Result<Vec<u8>,
                 .to_string(),
         })?;
 
-    fetch_url_network(client, &asset.browser_download_url, "release.json").await
+    fetch_url_network(
+        client,
+        &asset.browser_download_url,
+        "release.json",
+        MAX_DOCUMENT_BYTES,
+    )
+    .await
 }
 
 /// Fetch a single URL's body bytes. Errors carry the file label so the
 /// caller doesn't have to reformat them.
+/// The most any signed release document may be. Manifests and
+/// attestations are kilobytes; this is a ceiling, not a size.
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Fetch a URL, refusing a body larger than `max_bytes`.
+///
+/// The bound is applied while reading rather than after: `Content-Length`
+/// is a claim by the same server that supplies the body, so it is used
+/// only to refuse early, never to decide when to stop. Every URL that
+/// reaches here came from an unsigned index, so a hostile one is in scope.
+///
+/// No error text here carries the URL. `reqwest` attaches it to the error
+/// it returns and prints it in `Display`, and a redirect can leave a
+/// credential in it, so errors go through `request_error_text` — the one
+/// path a `reqwest::Error` becomes text through in this crate.
 async fn fetch_url_network(
     client: &reqwest::Client,
     url: &str,
     label: &str,
+    max_bytes: u64,
 ) -> Result<Vec<u8>, AppError> {
+    use futures_util::StreamExt;
+
     let resp = client
         .get(url)
         .header("Accept", "application/octet-stream")
         .send()
         .await
         .map_err(|e| AppError::Update {
-            message: format!("GET {label} ({url}): {e}"),
+            message: format!("GET {label}: {}", crate::error::request_error_text(e)),
         })?;
     let status = resp.status();
-    let bytes = resp.bytes().await.map_err(|e| AppError::Update {
-        message: format!("reading {label} body: {e}"),
-    })?;
+
+    if let Some(claimed) = resp.content_length()
+        && claimed > max_bytes
+    {
+        return Err(AppError::Update {
+            message: format!(
+                "{label} is {claimed} bytes, more than the {max_bytes} this will read"
+            ),
+        });
+    }
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AppError::Update {
+            message: format!(
+                "reading {label} body: {}",
+                crate::error::request_error_text(e)
+            ),
+        })?;
+        if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
+            return Err(AppError::Update {
+                message: format!("{label} is larger than the {max_bytes} bytes this will read"),
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
     if !status.is_success() {
         return Err(AppError::Update {
             message: format!(
-                "{label} ({url}) returned HTTP {} ({})",
+                "{label} returned HTTP {} ({})",
                 status,
                 String::from_utf8_lossy(&bytes).trim()
             ),
         });
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client, AppError> {
@@ -830,6 +894,127 @@ mod tests {
         let err = unwrap_err(parse_and_gate_release(&bytes, "1.0.0", None));
         let msg = format!("{err}");
         assert!(msg.contains("schema_version"), "got: {msg}");
+    }
+
+    /// The fetch path, against the threat model it actually has: every URL
+    /// it is given comes out of an unsigned index, so "hostile" is the
+    /// ordinary case rather than the exotic one.
+    mod fetching {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refuses_a_body_larger_than_the_ceiling() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0u8; 4096]))
+                .mount(&server)
+                .await;
+
+            let client = build_http_client().unwrap();
+            let err = fetch_url_network(&client, &format!("{}/big", server.uri()), "a payload", 64)
+                .await
+                .expect_err("an oversized body must be refused");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("larger than") || msg.contains("more than"),
+                "got: {msg}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refuses_an_oversized_body_before_reading_it() {
+            // The claim is the server's, so it is only ever grounds to
+            // refuse early — never grounds to stop counting.
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0u8; 4096]))
+                .mount(&server)
+                .await;
+
+            let client = build_http_client().unwrap();
+            let err =
+                fetch_url_network(&client, &format!("{}/big", server.uri()), "a payload", 100)
+                    .await
+                    .expect_err("an oversized body must be refused");
+            assert!(format!("{err}").contains("4096") || format!("{err}").contains("100"));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_credential_in_the_url_stays_out_of_the_error() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("nope"))
+                .mount(&server)
+                .await;
+
+            let url = format!(
+                "{}/asset.zip?X-Amz-Signature=SUPERSECRETTOKEN",
+                server.uri()
+            );
+            let err = fetch_url_network(&client_for_test(), &url, "a payload", 1024)
+                .await
+                .expect_err("a 404 is an error");
+            let msg = format!("{err}");
+            assert!(
+                !msg.contains("SUPERSECRETTOKEN"),
+                "a redirect can leave a credential in a URL, and this text is rendered: {msg}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_credential_stays_out_of_a_transport_error_too() {
+            // Nothing listening: the failure comes from reqwest itself,
+            // which attaches the URL to its own `Display`.
+            let url = "http://127.0.0.1:1/asset.zip?X-Amz-Signature=SUPERSECRETTOKEN";
+            let err = fetch_url_network(&client_for_test(), url, "a payload", 1024)
+                .await
+                .expect_err("a closed port is an error");
+            let msg = format!("{err}");
+            assert!(!msg.contains("SUPERSECRETTOKEN"), "got: {msg}");
+            assert!(!msg.contains("127.0.0.1"), "got: {msg}");
+        }
+
+        /// A body with **no** `Content-Length`, which is the case the
+        /// running count exists for: the early check is a courtesy the
+        /// server may decline to make possible, so the bound that matters
+        /// is the one applied while reading.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refuses_an_unbounded_chunked_body() {
+            use tokio::io::AsyncWriteExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    // Read the request first; hyper will not accept a
+                    // response that arrives before it has sent one.
+                    use tokio::io::AsyncReadExt;
+                    let mut scratch = [0u8; 2048];
+                    let _ = socket.read(&mut scratch).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await;
+                    // Keep sending; a reader without a bound never stops.
+                    let chunk = format!("{:x}\r\n{}\r\n", 4096, "A".repeat(4096));
+                    for _ in 0..64 {
+                        if socket.write_all(chunk.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let url = format!("http://{addr}/asset.zip");
+            let err = fetch_url_network(&client_for_test(), &url, "a payload", 1024)
+                .await
+                .expect_err("a chunked body past the ceiling must be refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("larger than"), "got: {msg}");
+        }
+
+        fn client_for_test() -> reqwest::Client {
+            build_http_client().unwrap()
+        }
     }
 
     /// Both halves of the artifact-index rotation, on the shape a release

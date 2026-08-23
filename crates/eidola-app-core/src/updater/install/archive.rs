@@ -41,7 +41,7 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
         reason: format!("not a readable zip container: {e}"),
     })?;
 
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut written = 0usize;
     let mut total_bytes = 0u64;
 
@@ -60,12 +60,12 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
             reason: format!("member `{raw_name}` is not a safe relative path"),
         })?;
 
-        if !seen.insert(relative.clone()) {
+        if !seen.insert(collision_key(&relative)) {
             return Err(InstallError::Archive {
                 label: label.to_string(),
                 reason: format!(
-                    "member `{raw_name}` appears twice; which one an extractor keeps is not \
-                     something this will guess at"
+                    "member `{raw_name}` names the same file as an earlier member; which one \
+                     an extractor keeps is not something this will guess at"
                 ),
             });
         }
@@ -141,6 +141,29 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
     Ok(written)
 }
 
+/// The name two members would have to share to be one file.
+///
+/// A `PathBuf` comparison is not that test on the filesystems this
+/// unpacks onto. Measured on APFS rather than recalled:
+///
+/// * a case-insensitive volume — the macOS default — makes `A.app/x` and
+///   `a.app/x` one file;
+/// * APFS is normalization-insensitive *independently of case*, so NFC
+///   `café.txt` and its NFD spelling are one entry on a case-sensitive
+///   volume too, and the second write wins.
+///
+/// Case is folded here. Normalization is not: comparing it faithfully
+/// needs a Unicode normalization table, and guessing at it would be the
+/// same mistake as guessing at an escape. Instead [`safe_relative_path`]
+/// refuses non-ASCII names outright, which is what makes ASCII folding a
+/// complete answer rather than a partial one — and costs nothing, because
+/// the packing recipe produces ASCII bundle paths. A payload that ever
+/// needs a non-ASCII name needs that table and a decision, not this
+/// function quietly widening.
+fn collision_key(relative: &Path) -> String {
+    relative.to_string_lossy().to_ascii_lowercase()
+}
+
 #[cfg(unix)]
 fn set_mode(path: &Path, stored: Option<u32>) -> Result<(), InstallError> {
     use std::os::unix::fs::PermissionsExt;
@@ -182,6 +205,11 @@ fn safe_relative_path(name: &str) -> Option<PathBuf> {
     // this compares names.
     let body = name.strip_suffix('/').unwrap_or(name);
 
+    // Non-ASCII is refused rather than normalized — see `collision_key`.
+    if !name.is_ascii() {
+        return None;
+    }
+
     let mut out = PathBuf::new();
     for segment in body.split('/') {
         if segment.is_empty() || segment == "." || segment == ".." {
@@ -205,6 +233,26 @@ fn safe_relative_path(name: &str) -> Option<PathBuf> {
     }
 }
 
+/// A name that must be exactly one directory component — the bundle
+/// directory an install expects to find inside a container.
+///
+/// Same refusals as a member name, then one more: a single component. A
+/// plan naming `../..` or an absolute path would otherwise send everything
+/// downstream — including reconstruction, which *writes* — outside the
+/// staging tree this module promises never to leave.
+pub(super) fn single_component(name: &str) -> Option<PathBuf> {
+    let path = safe_relative_path(name)?;
+    let mut components = path.components();
+    let first = components.next()?;
+    if components.next().is_some() {
+        return None;
+    }
+    match first {
+        Component::Normal(_) => Some(path),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +271,36 @@ mod tests {
         ] {
             assert!(
                 safe_relative_path(name).is_none(),
+                "`{name}` should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_names_it_cannot_compare_faithfully() {
+        // APFS folds these onto one file; this refuses rather than guess
+        // which spelling the archive meant.
+        assert!(safe_relative_path("caf\u{e9}.txt").is_none());
+        assert!(safe_relative_path("cafe\u{301}.txt").is_none());
+    }
+
+    #[test]
+    fn collision_key_sees_what_the_filesystem_sees() {
+        assert_eq!(
+            collision_key(Path::new("A.app/Contents/Info.plist")),
+            collision_key(Path::new("a.app/CONTENTS/info.plist"))
+        );
+    }
+
+    #[test]
+    fn a_bundle_name_is_one_component_or_nothing() {
+        assert_eq!(
+            single_component("Eidola.app"),
+            Some(PathBuf::from("Eidola.app"))
+        );
+        for name in ["", "..", "../escape", "/Applications/Evil.app", "a/b", "."] {
+            assert!(
+                single_component(name).is_none(),
                 "`{name}` should be refused"
             );
         }
