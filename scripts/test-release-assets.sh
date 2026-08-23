@@ -18,6 +18,13 @@
 #   * `oci` rows and the unsigned macOS container are skipped by
 #     construction, and their absence from the directory is not an error.
 #
+# It also drives `wait-budget`, the other half of the same release path:
+# the publisher waits on the artifact workflow with no clock of its own, so
+# its `timeout-minutes` is the only bound, and that number lives in a
+# different file from the timeouts it has to cover. Checked here against
+# the real committed workflows, plus the two ways the relationship can
+# break.
+#
 # Bash + python3 only.
 
 set -euo pipefail
@@ -200,6 +207,47 @@ with open(path, "w") as handle:
 PY
 if run_case "$TMP_ROOT/empty"; then
   fail "an empty manifest produced a successful release upload"
+else
+  note "rejected"
+fi
+
+echo "── the publisher outlasts the workflow it waits on ──"
+ARTIFACTS_WORKFLOW="$REPO_ROOT/.github/workflows/artifacts.yml"
+RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/tinfoil-build.yml"
+
+budget() {
+  "$VERIFY" wait-budget \
+    --artifacts-workflow "$1" --release-workflow "$2" > "$3" 2>&1
+}
+
+if budget "$ARTIFACTS_WORKFLOW" "$RELEASE_WORKFLOW" "$TMP_ROOT/budget"; then
+  note "$(grep 'longest declared path' "$TMP_ROOT/budget")"
+else
+  fail "the committed workflows do not satisfy the wait budget:"$'\n'"$(cat "$TMP_ROOT/budget")"
+fi
+
+echo "── a producer timeout bump the publisher cannot cover is rejected ──"
+# The failure this pair exists to prevent: someone raises a build job's
+# timeout, and the publisher silently starts giving up on valid runs.
+sed 's/^    timeout-minutes: 180$/    timeout-minutes: 900/' \
+  "$ARTIFACTS_WORKFLOW" > "$TMP_ROOT/artifacts-bumped.yml"
+if cmp -s "$ARTIFACTS_WORKFLOW" "$TMP_ROOT/artifacts-bumped.yml"; then
+  fail "the fixture edit changed nothing — the timeout it targets moved"
+elif budget "$TMP_ROOT/artifacts-bumped.yml" "$RELEASE_WORKFLOW" "$TMP_ROOT/bumped"; then
+  fail "a producer that outlives the publisher was accepted"
+else
+  note "rejected, naming the minimum: $(grep -o 'at least [0-9]*' "$TMP_ROOT/bumped" | head -1)"
+fi
+
+echo "── a publisher timeout GitHub will not honor is rejected ──"
+# Patience beyond the hosted-runner limit is a promise nobody keeps, so it
+# must not be the way the check above gets satisfied.
+sed 's/^    timeout-minutes: 330$/    timeout-minutes: 3000/' \
+  "$RELEASE_WORKFLOW" > "$TMP_ROOT/release-overlong.yml"
+if cmp -s "$RELEASE_WORKFLOW" "$TMP_ROOT/release-overlong.yml"; then
+  fail "the fixture edit changed nothing — the publisher timeout moved"
+elif budget "$ARTIFACTS_WORKFLOW" "$TMP_ROOT/release-overlong.yml" "$TMP_ROOT/overlong"; then
+  fail "a timeout beyond the hosted-runner limit was accepted"
 else
   note "rejected"
 fi

@@ -161,10 +161,20 @@ jobs:
     name: Attach verified release assets
     needs: release
     runs-on: ubuntu-24.04
-    # The artifact workflow's Nix builds can take two hours from a cold
-    # cache, and on a tag they deliberately build without the project
-    # cache. This job spends most of its time waiting for them.
-    timeout-minutes: 180
+    # This job spends nearly all of its time waiting for `artifacts.yml`,
+    # whose Nix builds are slow from a cold cache and, on a tag,
+    # deliberately skip the project cache entirely. So this is the *only*
+    # clock in the waiting path — the step below polls until that run
+    # reaches a conclusion and declares no deadline of its own.
+    #
+    # The number is not maintained by hand against a workflow in another
+    # file: `scripts/release-assets.sh wait-budget` derives the producer's
+    # longest declared path from its own `needs` and `timeout-minutes` and
+    # fails if this does not exceed it with room for queueing. That check
+    # runs on every PR, so bumping a timeout over there fails here at once
+    # rather than at release time. GitHub stops a hosted job at 360
+    # minutes, which is the ceiling this has to stay under.
+    timeout-minutes: 330
     permissions:
       contents: write # attach assets to the tag's release
       actions: read # read the artifact workflow's run for this tag
@@ -199,16 +209,21 @@ jobs:
                     | select(. != null) | \"\(.id) \(.status) \(.conclusion)\""
           }
 
-          deadline=$(( $(date +%s) + 170 * 60 ))
+          # No deadline here. A run that has not concluded is still a
+          # valid run, and the honest end condition is its conclusion, not
+          # a clock this step would have to keep in step with another
+          # workflow's timeouts. The job's own `timeout-minutes` is the
+          # single bound, and `wait-budget` is what keeps it sufficient.
+          started=$(date +%s)
           while :; do
             # `|| true`: a transient API failure is one poll lost, not a
-            # failed release. The deadline is what ends this loop.
+            # failed release.
             found="$(find_run || true)"
             if [ -n "$found" ]; then
               # shellcheck disable=SC2086
               set -- $found
               run_id="$1"; status="$2"; conclusion="${3:-}"
-              echo "artifacts.yml run $run_id: status=$status conclusion=$conclusion"
+              echo "[$(( ($(date +%s) - started) / 60 ))m] artifacts.yml run $run_id: status=$status conclusion=$conclusion"
               if [ "$status" = "completed" ]; then
                 if [ "$conclusion" != "success" ]; then
                   echo "::error::The artifact workflow for $TAG concluded '$conclusion'. Its outputs are what a release publishes, so nothing is attached. Fix and re-run both."
@@ -218,11 +233,7 @@ jobs:
                 break
               fi
             else
-              echo "no artifacts.yml run for $TAG yet"
-            fi
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::Timed out waiting for the artifact workflow run for $TAG. Re-run this job once it finishes."
-              exit 1
+              echo "[$(( ($(date +%s) - started) / 60 ))m] no artifacts.yml run for $TAG yet"
             fi
             sleep 60
           done
