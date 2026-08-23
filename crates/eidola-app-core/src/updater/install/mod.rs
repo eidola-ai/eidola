@@ -356,51 +356,105 @@ fn remove_tree(path: &Path) -> Result<(), InstallError> {
 /// Whether the running process could replace `installed` with a staged
 /// bundle, without asking anyone for anything.
 ///
-/// This only ever reads. Replacing a running application is a product
-/// decision about restart behaviour rather than a mechanical one, and the
-/// answer differs by where the app was installed — so the mechanism reports
-/// what it found and leaves the decision to its caller.
+/// This only ever reads. Replacing a running application is a decision
+/// about restart behaviour rather than a mechanical step, and the answer
+/// depends on where the app was installed — so the mechanism reports what
+/// it found and leaves the decision to its caller.
+///
+/// macOS-only, because replacing an `.app` in place is: the other
+/// platforms install through a package manager that owns this question.
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromotionReadiness {
-    /// The bundle and its parent directory are writable by this process:
-    /// a swap is an ordinary rename.
+    /// The bundle and the directory holding it are writable by this
+    /// process: a swap is an ordinary rename.
     Ready,
-    /// The install location is not writable by this user. Promotion would
-    /// need privileges this process does not have and must not acquire on
-    /// its own.
+    /// Promotion would need privileges this process does not have — and
+    /// must not acquire on its own.
     NeedsPrivileges { reason: String },
     /// Nothing is installed at that path.
     NotInstalled,
 }
 
 /// Probe the install location. Reads only; nothing is created or moved.
+#[cfg(target_os = "macos")]
 pub fn promotion_readiness(installed: &Path) -> PromotionReadiness {
     if !installed.exists() {
         return PromotionReadiness::NotInstalled;
     }
-    // A swap replaces the bundle *within* its parent, so the parent's
-    // writability is what decides it — a writable bundle inside a
-    // read-only directory cannot be replaced, only edited in place, which
-    // is precisely what an update must not do to a running app.
+    // A swap replaces the bundle *within* its parent, so the parent has to
+    // be writable too — a writable bundle inside a read-only directory can
+    // only be edited in place, which is precisely what an update must not
+    // do to a running app.
     let Some(parent) = installed.parent() else {
         return PromotionReadiness::NeedsPrivileges {
             reason: "the install location has no parent directory".to_string(),
         };
     };
     for dir in [parent, installed] {
-        match std::fs::metadata(dir) {
-            Ok(meta) if meta.permissions().readonly() => {
-                return PromotionReadiness::NeedsPrivileges {
-                    reason: format!("`{}` is not writable by this user", dir.display()),
-                };
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return PromotionReadiness::NeedsPrivileges {
-                    reason: format!("`{}` could not be examined: {e}", dir.display()),
-                };
-            }
+        if !writable(dir) {
+            return PromotionReadiness::NeedsPrivileges {
+                reason: format!("`{}` is not writable by this user", dir.display()),
+            };
         }
     }
     PromotionReadiness::Ready
+}
+
+/// Ask the kernel, not the mode bits.
+///
+/// `Permissions::readonly()` reports whether *any* write bit is set, which
+/// says nothing about whether **this** user may write: a root-owned
+/// `/Applications` is mode 0755 and would read as writable to everyone.
+/// `access(2)` accounts for ownership, groups and ACLs, which is the
+/// question being asked.
+#[cfg(target_os = "macos")]
+fn writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+    // call, and `access` only reads it.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod promotion_tests {
+    use super::*;
+
+    #[test]
+    fn reports_what_it_found_without_touching_anything() {
+        let root = tempfile::tempdir().unwrap();
+
+        let missing = root.path().join("Nothing.app");
+        assert_eq!(
+            promotion_readiness(&missing),
+            PromotionReadiness::NotInstalled
+        );
+
+        let installed = root.path().join("Eidola.app");
+        std::fs::create_dir(&installed).unwrap();
+        assert_eq!(promotion_readiness(&installed), PromotionReadiness::Ready);
+
+        // Root bypasses the permission check entirely, so the negative
+        // case only means something as an ordinary user.
+        // SAFETY: `geteuid` reads process state and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            let verdict = promotion_readiness(&installed);
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                matches!(verdict, PromotionReadiness::NeedsPrivileges { .. }),
+                "a bundle whose parent this user cannot write must not read as promotable: \
+                 {verdict:?}"
+            );
+        }
+
+        // Nothing was created or moved by any of the above.
+        assert!(installed.is_dir());
+        assert!(!missing.exists());
+    }
 }
