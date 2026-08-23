@@ -39,6 +39,18 @@
 # here already ships, so this gate adds nothing to a fresh checkout's
 # prerequisites.
 #
+# Assertion 3's scanner is built as two pipelines rather than a set of
+# patterns, because patterns compose badly: every scalar it reads — a job
+# name, a `needs:` entry, an `environment:` name, however it was spelled and
+# whichever extraction path it arrived by — passes one classifier before
+# anything is matched against it, and every job body passes one header
+# reader (name, then anchor, then body form) before its shape is decided.
+# A pairing nobody anticipated meets the refusal its parts would have met
+# individually, instead of falling between two rules. Both graders also
+# announce that they ran: an empty report has to be distinguishable from a
+# scanner that died, and this awk exits 0 on a syntax error on some
+# platforms.
+#
 # What this is not: assertion 3 reads the workflow with a scanner, not a
 # YAML parser, because a real one is not available here without adding a
 # dependency to a check whose whole value is being cheap. It reads job
@@ -159,7 +171,7 @@ check_manifest() {
     echo "error: python3 is required (manifest validation)" >&2
     exit 2
   fi
-  out="$(
+  if ! out="$(
     python3 -c '
 import json
 import re
@@ -320,9 +332,19 @@ for key in sorted(keys):
 
 for line in violations:
     print(line)
+
+# Same liveness marker as the workflow scanner, for the same reason.
+print("@graded")
 ' "$file"
-  )"
-  report_lines "$out"
+  )"; then
+    echo "error: the manifest grader failed to run over $file" >&2
+    exit 2
+  fi
+  if [[ "$out" != *"@graded"* ]]; then
+    echo "error: the manifest grader did not run to completion over $file" >&2
+    exit 2
+  fi
+  report_lines "$(printf '%s\n' "$out" | grep -v '^@graded$')"
 }
 
 # ── 3: the job graph ─────────────────────────────────────────────────────
@@ -338,16 +360,25 @@ check_workflow() {
     exit 2
   fi
 
-  out="$(
+  # A scanner that fails to run prints nothing, and nothing is what a clean
+  # file prints too. The status is checked so a broken scanner fails the
+  # gate instead of passing it — the one failure mode a check like this
+  # must not have.
+  if ! out="$(
     awk '
       # ── the scanner ─────────────────────────────────────────────────
       # Not a YAML parser. It reads the constructs the assertions need —
       # job keys, `needs:`, `environment:` — in the forms GitHub Actions
-      # accepts for them: quoted or bare scalars, flow sequences (on one
-      # line or several), block lists, block scalars, trailing comments,
-      # and any letter case for an environment name. Values are collected
-      # by indentation and normalized once, here, so a new spelling of the
-      # same thing is a normalization change rather than a new rule.
+      # accepts for them, and refuses the ones it cannot read.
+      #
+      # It is a pipeline rather than a set of patterns, because patterns
+      # compose badly: every scalar reaches `classify_scalar` before
+      # anything is matched against it, and every job body reaches the same
+      # header reader before its form is classified. A construct arriving
+      # by a path nobody anticipated — an escape inside a mapping, an
+      # anchor in front of a flow body — meets the same refusal as the form
+      # that was anticipated, because there is one place where a value
+      # becomes readable and one place where a body becomes a form.
       BEGIN {
         SQ = sprintf("%c", 39)
         # `environment:` accepts expressions (GitHub'"'"'s context-availability
@@ -384,70 +415,141 @@ check_workflow() {
         return s
       }
 
-      # A quoted scalar carrying an escape. YAML decodes `\u002d` inside a
-      # double-quoted scalar, and `\x27\x27` inside a single-quoted one; this
-      # decodes neither, so a name written that way would be compared in a
-      # spelling GitHub never sees. Refused, like an alias.
-      function escaped_scalar(s,   first) {
-        s = normalize_ws(s)
-        first = substr(s, 1, 1)
-        if (first == "\"" && index(s, "\\") > 0) return 1
-        if (first == SQ && index(substr(s, 2), SQ SQ) > 0) return 1
+      # ── the one gate every scalar passes ────────────────────────────
+      # Returns "" for a scalar this scanner can read, leaving its plain
+      # text in SCALAR; otherwise the reason it cannot. An alias or anchor
+      # names something defined elsewhere; an escape means GitHub decodes a
+      # spelling this does not. Neither is guessed at.
+      function classify_scalar(tok,   first, last) {
+        tok = normalize_ws(tok)
+        SCALAR = ""
+        if (tok == "") return ""
+        first = substr(tok, 1, 1)
+        if (first == "*" || first == "&") return "a YAML alias or anchor"
+        if (first == "\"" && index(tok, "\\") > 0)
+          return "an escape inside a quoted scalar"
+        if (first == SQ && index(substr(tok, 2, length(tok) - 2), SQ SQ) > 0)
+          return "an escape inside a quoted scalar"
+        last = substr(tok, length(tok), 1)
+        if ((first == "\"" || first == SQ) && last == first && length(tok) > 1)
+          tok = substr(tok, 2, length(tok) - 2)
+        SCALAR = tok
+        return ""
+      }
+
+      # ── the one tokenizer every collected value passes ──────────────
+      # Splits a value into scalars, keeping a quoted scalar whole even
+      # when it holds spaces or flow punctuation. Fills TOK[1..NTOK] and
+      # returns 0, or 1 if a quote never closed — itself a value this
+      # scanner cannot read.
+      function tokenize(s,   i, c, n, cur, q) {
+        NTOK = 0
+        n = length(s)
+        cur = ""
+        q = ""
+        for (i = 1; i <= n; i++) {
+          c = substr(s, i, 1)
+          if (q != "") {
+            cur = cur c
+            if (c == q) {
+              # A doubled quote inside a single-quoted scalar is YAML'"'"'s one
+              # escape, not the end of the scalar. Closing the token here
+              # would split one scalar into two and lose whatever it named
+              # — so the run stays whole, and the classifier refuses it for
+              # carrying an escape.
+              if (q == SQ && substr(s, i + 1, 1) == SQ) { cur = cur SQ; i++; continue }
+              TOK[++NTOK] = cur
+              cur = ""
+              q = ""
+            }
+            continue
+          }
+          if (c == "\"" || c == SQ) {
+            if (cur != "") TOK[++NTOK] = cur
+            cur = c
+            q = c
+            continue
+          }
+          if (c == " " || c == "\t" || c == "[" || c == "]" || c == "{" || c == "}" || c == ",") {
+            if (cur != "") { TOK[++NTOK] = cur; cur = "" }
+            continue
+          }
+          cur = cur c
+        }
+        if (q != "") return 1
+        if (cur != "") TOK[++NTOK] = cur
         return 0
       }
 
-      function unquote(s,   first, last) {
-        gsub(/^[ \t]+/, "", s)
-        gsub(/[ \t]+$/, "", s)
-        first = substr(s, 1, 1)
-        last = substr(s, length(s), 1)
-        if ((first == "\"" || first == SQ) && last == first && length(s) > 1)
-          s = substr(s, 2, length(s) - 2)
-        return s
-      }
-
-      # Collected `needs:` text -> the job names in it. Flow punctuation is
-      # whitespace; a `-` is a list bullet; `>`/`|` with their chomping and
-      # indentation indicators are block-scalar markers, never job names.
-      function job_names(s,   n, i, t, out) {
-        gsub(/[][,]/, " ", s)
-        n = split(s, parts, /[ \t]+/)
-        out = ""
-        for (i = 1; i <= n; i++) {
-          t = unquote(parts[i])
-          if (t == "" || t == "-") continue
-          if (t ~ /^[>|][-+0-9]*$/) continue
-          out = out " " t
+      # ── one reader for every collected field ────────────────────────
+      # `needs:` and `environment:` are collected as text — the value on
+      # the key line plus everything indented under it — and become
+      # readable only here. Which spelling the text used (inline, list,
+      # flow sequence, block scalar, nested mapping) is the tokenizer'"'"'s
+      # problem; whether each scalar can be read at all is the
+      # classifier'"'"'s; nothing downstream sees anything else.
+      function read_field(jb, field, blob,   i, t, reason, out) {
+        blob = normalize_ws(blob)
+        if (blob == "") return
+        if (index(blob, "${{") > 0) { expression[jb, field] = 1; return }
+        if (tokenize(blob) != 0) {
+          refusal[jb, field] = "an unterminated quoted scalar"
+          return
         }
-        return out
+        out = ""
+        for (i = 1; i <= NTOK; i++) {
+          t = TOK[i]
+          # Structure, not scalars: list bullets, block-scalar markers with
+          # their chomping and indentation indicators, and the keys of a
+          # nested mapping (`name:`, `url:`) — a job ID cannot hold a
+          # colon, so a trailing one always marks a key.
+          if (t == "-") continue
+          if (t ~ /^[>|][-+0-9]*$/) continue
+          if (t ~ /:$/) continue
+          reason = classify_scalar(t)
+          if (reason != "") { refusal[jb, field] = reason; continue }
+          if (SCALAR != "") out = out " " SCALAR
+        }
+        values[jb, field] = out
       }
 
-      # ── collect: job name -> needs, environment, produces-partial ──
+      # Reads a mapping key up to its first colon outside quotes, so a
+      # quoted key holding one stays whole. Sets KEY and REST.
+      function split_key(line,   i, c, n, q) {
+        n = length(line)
+        q = ""
+        for (i = 1; i <= n; i++) {
+          c = substr(line, i, 1)
+          if (q != "") { if (c == q) q = ""; continue }
+          if (c == "\"" || c == SQ) { q = c; continue }
+          if (c == ":") { KEY = substr(line, 1, i - 1); REST = substr(line, i + 1); return 1 }
+        }
+        return 0
+      }
+
+      # ── collect ─────────────────────────────────────────────────────
       /^[^ #]/ { in_jobs = ($0 ~ /^jobs:/); next }
 
-      # A job written as a flow mapping on one line. Registered so the graph
-      # knows the job exists; its body is not read, which is what the
-      # refusal below says out loud.
-      in_jobs && /^  [^ \t#-][^:]*:[ \t]*\{/ {
-        job = $0
-        sub(/^  /, "", job)
-        sub(/:[ \t]*\{.*$/, "", job)
-        raw_key[unquote(job)] = job
-        job = unquote(job)
+      # One job-header reader. The name goes through the scalar gate; the
+      # body form is classified only after any anchor, quoting and comment
+      # have been taken off, so anchor-plus-flow and quote-plus-flow are
+      # handled by the order of these steps rather than by a pattern for
+      # each pairing.
+      in_jobs && /^  [^ \t#]/ {
+        line = decomment($0)
+        sub(/^  /, "", line)
+        if (!split_key(line)) next
+        reason = classify_scalar(KEY)
+        job = (reason == "" ? SCALAR : normalize_ws(KEY))
         jobs[++njobs] = job
-        flow_body[job] = 1
-        collecting_needs = 0
-        collecting_env = 0
-        next
-      }
-
-      in_jobs && /^  [^ \t#-][^:]*:[ \t]*(&[A-Za-z0-9_.-]+)?[ \t]*(#.*)?$/ {
-        job = decomment($0)
-        sub(/^  /, "", job)
-        sub(/:[ \t]*(&[A-Za-z0-9_.-]+)?[ \t]*$/, "", job)
-        raw_key[unquote(job)] = job
-        job = unquote(job)
-        jobs[++njobs] = job
+        if (reason != "") refusal[job, "name"] = reason
+        rest = normalize_ws(REST)
+        # An anchor names the body; it does not hide it. Taken off before
+        # the form is read, so an anchored body is read like any other.
+        sub(/^&[A-Za-z0-9_.-]+[ \t]*/, "", rest)
+        if (rest == "") body[job] = "block"
+        else if (substr(rest, 1, 1) == "{") body[job] = "flow"
+        else { body[job] = "other"; body_text[job] = rest }
         collecting_needs = 0
         collecting_env = 0
         next
@@ -458,30 +560,26 @@ check_workflow() {
       # Any new key at job level closes whatever block was being collected.
       /^    [A-Za-z0-9_-]+:/ { collecting_needs = 0; collecting_env = 0 }
 
-      # `needs:` and `environment:` are both collected as *text*: the value
-      # on the key line plus every line indented under it. What form that
-      # text took — inline, list, flow sequence, block scalar — is the
-      # normalizer'"'"'s problem, not the scanner'"'"'s.
       /^    needs:/ {
         value = decomment($0)
         sub(/^    needs:[ \t]*/, "", value)
-        needs_raw[job] = needs_raw[job] " " value
+        raw[job, "needs"] = raw[job, "needs"] " " value
         collecting_needs = 1
         next
       }
       collecting_needs && /^      / {
-        needs_raw[job] = needs_raw[job] " " decomment($0)
+        raw[job, "needs"] = raw[job, "needs"] " " decomment($0)
         next
       }
       /^    environment:/ {
-        env = decomment($0)
-        sub(/^    environment:[ \t]*/, "", env)
-        environment[job] = environment[job] " " env
+        value = decomment($0)
+        sub(/^    environment:[ \t]*/, "", value)
+        raw[job, "environment"] = raw[job, "environment"] " " value
         collecting_env = 1
         next
       }
       collecting_env && /^      / {
-        environment[job] = environment[job] " " decomment($0)
+        raw[job, "environment"] = raw[job, "environment"] " " decomment($0)
         next
       }
 
@@ -496,7 +594,7 @@ check_workflow() {
       /^    uses:[ \t]*/ {
         calls = decomment($0)
         sub(/^    uses:[ \t]*/, "", calls)
-        job_uses[job] = unquote(calls)
+        raw[job, "uses"] = calls
         next
       }
 
@@ -505,44 +603,35 @@ check_workflow() {
       /artifact-manifest\.sh/ || /artifact_manifest:/ { partial[job] = 1 }
 
       END {
-        # A signing job is one granted the Apple signing environment. The
-        # name is checked too, so a signing job that has not yet been given
-        # its environment (or was renamed) is still caught.
-        # Environment names are case-insensitive to GitHub, so they are
-        # matched that way here; `Apple-Signing` is the same protected
-        # environment as `apple-signing`.
-        # Aliases are refused, not resolved. GitHub has resolved `*alias`
-        # in workflows since September 2025, so `environment: *signing_env`
-        # grants the protected environment while this scanner sees a
-        # literal `*signing_env` — and a scanner that does not parse YAML
-        # has no business guessing what an alias meant. Merge keys are
-        # refused for the same reason and one more: GitHub rejects `<<:`
-        # itself, but pre-processing actions that expand it before GitHub
-        # sees the file exist, so the shape must not sit here unremarked.
+        # Everything collected becomes readable here, through the one
+        # reader, before a single conclusion is drawn from it.
         for (i = 1; i <= njobs; i++) {
           j = jobs[i]
-          if (needs_raw[j] ~ /(^|[ \t[,])[*&][A-Za-z0-9_.-]+/)
-            print "job `" j "` uses a YAML alias or anchor in `needs:` — this scanner does not resolve them, so the dependency must be written literally"
-          if (environment[j] ~ /(^|[ \t{,])[*&][A-Za-z0-9_.-]+/)
-            print "job `" j "` uses a YAML alias or anchor in `environment:` — this scanner does not resolve them, so the environment must be named literally"
-          if (merge_key[j])
-            print "job `" j "` uses a merge key (`<<:`) — it can splice in an `environment:` this scanner never sees, so it is refused rather than merged"
-          if (escaped_scalar(raw_key[j]))
-            print "job `" j "` writes its name as a quoted scalar carrying an escape — this scanner decodes none, so the name it compares is not the name GitHub reads"
-          if (escaped_scalar(environment[j]))
-            print "job `" j "` writes its `environment:` as a quoted scalar carrying an escape — this scanner decodes none, so the environment must be written plainly"
-          n = split(needs_raw[j], parts, /[ \t]+/)
-          for (k = 1; k <= n; k++)
-            if (escaped_scalar(parts[k])) {
-              print "job `" j "` writes a `needs:` entry as a quoted scalar carrying an escape — this scanner decodes none, so the dependency must be written plainly"
-              break
-            }
+          read_field(j, "needs", raw[j, "needs"])
+          read_field(j, "environment", raw[j, "environment"])
+          read_field(j, "uses", raw[j, "uses"])
         }
 
         for (i = 1; i <= njobs; i++) {
           j = jobs[i]
-          needs[j] = job_names(needs_raw[j])
-          if (tolower(environment[j]) ~ /apple-signing/ || tolower(j) ~ /sign/) signer[j] = 1
+          if (refusal[j, "name"] != "")
+            print "job `" j "` writes its name with " refusal[j, "name"] " — this scanner resolves and decodes nothing, so the name it compares would not be the name GitHub reads"
+          if (refusal[j, "needs"] != "")
+            print "job `" j "` writes a `needs:` entry with " refusal[j, "needs"] " — this scanner resolves and decodes nothing, so the dependency must be written plainly"
+          if (refusal[j, "environment"] != "")
+            print "job `" j "` writes its `environment:` with " refusal[j, "environment"] " — this scanner resolves and decodes nothing, so the environment must be written plainly"
+          if (merge_key[j])
+            print "job `" j "` uses a merge key (`<<:`) — it can splice in an `environment:` this scanner never sees, so it is refused rather than merged"
+        }
+
+        # A signing job is one granted the Apple signing environment.
+        # Environment names are case-insensitive to GitHub, so they are
+        # matched that way here. The job name is checked too, so a signing
+        # job not yet given its environment (or renamed) is still caught.
+        for (i = 1; i <= njobs; i++) {
+          j = jobs[i]
+          needs[j] = values[j, "needs"]
+          if (tolower(values[j, "environment"]) ~ /apple-signing/ || tolower(j) ~ /sign/) signer[j] = 1
         }
 
         found = 0
@@ -578,27 +667,42 @@ check_workflow() {
 
         for (i = 1; i <= njobs; i++) {
           j = jobs[i]
-          if (partial[j] && tolower(environment[j]) ~ /apple-signing/)
+          if (partial[j] && tolower(values[j, "environment"]) ~ /apple-signing/)
             print "job `" j "` produces a manifest partial and is granted the apple-signing environment"
         }
 
-        # Scoped to the jobs whose environment could matter: an ancestor of
-        # the manifest job (seen by the walk above) or a job computing part
-        # of it. An unrelated job may compute whatever it likes.
+        # Scoped to the jobs whose body could matter: an ancestor of the
+        # manifest job (seen by the walk above) or a job computing part of
+        # it. An unrelated job may be written however it likes.
         for (i = 1; i <= njobs; i++) {
           j = jobs[i]
           if (!seen[j] && !partial[j]) continue
-          if (environment[j] ~ /\$\{\{/ && !permitted_env(environment[j]))
+          if (expression[j, "environment"] && !permitted_env(raw[j, "environment"]))
             print "job `" j "` computes its `environment:` with an expression this check does not evaluate — the environment a job feeding the manifest receives has to be readable from the file, so pin the expression in the check once it is shown it cannot produce a signing environment"
-          if (seen[j] && flow_body[j])
+          if (!seen[j]) continue
+          if (body[j] == "flow")
             print "job `" j "` is written as a flow mapping and the manifest job depends on it — this scanner reads block-form job bodies, so its environment and outputs are unread"
-          if (seen[j] && job_uses[j] != "")
-            print "job `" j "` calls another workflow (`uses: " job_uses[j] "`) and the manifest job depends on it — this scanner does not follow calls, so the called workflow'"'"'s environments and outputs are unread"
+          if (body[j] == "other")
+            print "job `" j "` has a body this scanner cannot read (`" body_text[j] "`) and the manifest job depends on it"
+          if (values[j, "uses"] != "" || expression[j, "uses"] || refusal[j, "uses"] != "")
+            print "job `" j "` calls another workflow (`uses:" values[j, "uses"] "`) and the manifest job depends on it — this scanner does not follow calls, so the called workflow'"'"'s environments and outputs are unread"
         }
+        # Announced last so the caller can tell "nothing to report" from
+        # "never ran": this awk exits 0 on a syntax error on some
+        # platforms, and an empty report is exactly what a clean file
+        # produces.
+        print "@scanned " njobs " jobs"
       }
     ' "$file"
-  )"
-  report_lines "$out"
+  )"; then
+    echo "error: the workflow scanner failed to run over $file" >&2
+    exit 2
+  fi
+  if [[ "$out" != *"@scanned "* ]]; then
+    echo "error: the workflow scanner did not run to completion over $file" >&2
+    exit 2
+  fi
+  report_lines "$(printf '%s\n' "$out" | grep -v '^@scanned ')"
 }
 
 # ── run ──────────────────────────────────────────────────────────────────

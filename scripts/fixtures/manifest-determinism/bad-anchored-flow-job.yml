@@ -1,0 +1,29 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The other half of the same lesson: an anchor in front of a flow-mapping
+# job body. A pattern for flow bodies that expects `{` straight after the
+# colon does not match, and a pattern for block bodies that expects nothing
+# after the colon does not match either — so the job is never registered,
+# its `environment:` is never read, and the manifest job depends on a job
+# the graph does not have.
+#
+# This is why the job header is read in steps: name, then anchor, then
+# body form. Anchor-plus-flow needs no rule of its own.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-assets: &release {runs-on: self-hosted, environment: apple-signing, steps: [{name: Wrap, run: codesign --sign X Eidola.app}]}
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - release-assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full
