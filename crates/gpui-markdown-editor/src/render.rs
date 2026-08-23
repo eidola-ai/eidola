@@ -168,63 +168,135 @@ fn render_with_cursor(state: &EditorState, tree: &[SyntaxNode], cursor: CursorRa
 /// **Classification follows what is displayed, not what is typed.** A
 /// backslash escape or an entity reference (`*&#x4E2D;*`) is ASCII in
 /// the buffer and a Han character on screen, so the pass runs *after*
-/// `apply_escapes_and_entities` and asks each substitution's display
-/// text, not its source bytes. Every display byte of a substitution maps
-/// back to its source start, so marking the whole substitution range is
-/// what reaches the element.
+/// `apply_escapes_and_entities` and classifies the text the reader
+/// sees. It reconstructs that text for the whole run — literal bytes
+/// and substitution display spliced into one string — and segments
+/// *that*, because the segmentation rule spans characters: a variation
+/// selector or a Zhuyin tone mark attaches to the character before it,
+/// and either side of that pair may have arrived through a
+/// substitution. Classifying each piece on its own broke exactly those
+/// pairs apart.
+///
+/// Segments map back per piece. A literal piece maps byte for byte; a
+/// substitution maps to its **whole** source range as soon as a segment
+/// touches it, since every display byte of a substitution maps back to
+/// its source start and the element cannot mark a fraction of one.
 fn mark_cjk_emphasis(block: &mut RenderBlock, source: &str) {
+    // Coalesce first. A substitution splits the inline list at its own
+    // edges, so `*葛&#xE0100;*` arrives as two adjacent italic runs —
+    // and the segmentation rule reaches across characters, so the base
+    // and its selector must be classified in one sequence or the pair
+    // breaks apart exactly where the rule exists to hold it together.
+    let mut spans: Vec<Range<usize>> = block
+        .inlines
+        .iter()
+        .filter(|r| r.style.italic && !r.style.code && !r.style.dimmed)
+        .map(|r| r.source_range.clone())
+        .collect();
+    spans.sort_by_key(|r| r.start);
+    spans.dedup_by(|next, prev| {
+        let touching = next.start <= prev.end;
+        if touching {
+            prev.end = prev.end.max(next.end);
+        }
+        touching
+    });
+
     let mut marks: Vec<InlineRun> = Vec::new();
-    let mut mark = |range: Range<usize>| {
-        marks.push(InlineRun {
-            source_range: range,
-            style: InlineStyle {
-                emphasis_dots: true,
-                ..InlineStyle::default()
-            },
-        });
-    };
-    for run in &block.inlines {
-        if !run.style.italic || run.style.code || run.style.dimmed {
+    for span in spans {
+        let Some((display, pieces)) = displayed_span_text(source, span, &block.substitutions)
+        else {
             continue;
-        }
-        // Source bytes the substitutions do not cover classify as
-        // themselves; a covered range classifies as its display text.
-        let mut cursor = run.source_range.start;
-        let mut subs: Vec<&Substitution> = block
-            .substitutions
-            .iter()
-            .filter(|s| {
-                s.source_range.start >= run.source_range.start
-                    && s.source_range.end <= run.source_range.end
-            })
-            .collect();
-        subs.sort_by_key(|s| s.source_range.start);
-        for sub in subs {
-            if sub.source_range.start < cursor {
-                continue; // overlapping substitutions: first one wins
+        };
+        for seg in crate::cjk::cjk_segments(&display) {
+            for range in source_ranges_for(&pieces, &seg) {
+                match marks.last_mut() {
+                    Some(last) if last.source_range.end == range.start => {
+                        last.source_range.end = range.end;
+                    }
+                    _ => marks.push(InlineRun {
+                        source_range: range,
+                        style: InlineStyle {
+                            emphasis_dots: true,
+                            ..InlineStyle::default()
+                        },
+                    }),
+                }
             }
-            mark_plain_segments(source, cursor..sub.source_range.start, &mut mark);
-            if sub.display.chars().any(crate::cjk::is_cjk_script) {
-                mark(sub.source_range.clone());
-            }
-            cursor = sub.source_range.end;
         }
-        mark_plain_segments(source, cursor..run.source_range.end, &mut mark);
     }
     block.inlines.append(&mut marks);
 }
 
-/// Mark the CJK sub-ranges of `range`'s literal source bytes.
-fn mark_plain_segments(source: &str, range: Range<usize>, mark: &mut impl FnMut(Range<usize>)) {
-    if range.is_empty() {
-        return;
-    }
-    let Some(text) = source.get(range.clone()) else {
-        return;
+/// One stretch of a run's displayed text and the source bytes behind it.
+///
+/// A literal piece maps display byte to source byte; a substituted one
+/// maps its whole display span back to one source range, which is all
+/// the element can mark (see [`RenderBlock::substitutions`]).
+struct DisplayPiece {
+    display: Range<usize>,
+    source: Range<usize>,
+    substituted: bool,
+}
+
+/// Reconstruct what `span` displays — literal source bytes with each
+/// substitution's display text spliced in — together with the map back.
+fn displayed_span_text(
+    source: &str,
+    span: Range<usize>,
+    substitutions: &[Substitution],
+) -> Option<(String, Vec<DisplayPiece>)> {
+    let mut subs: Vec<&Substitution> = substitutions
+        .iter()
+        .filter(|s| s.source_range.start >= span.start && s.source_range.end <= span.end)
+        .collect();
+    subs.sort_by_key(|s| s.source_range.start);
+
+    let mut display = String::new();
+    let mut pieces: Vec<DisplayPiece> = Vec::new();
+    let mut cursor = span.start;
+    let mut push = |display: &mut String, source_range: Range<usize>, text: &str, sub: bool| {
+        if text.is_empty() {
+            return;
+        }
+        let start = display.len();
+        display.push_str(text);
+        pieces.push(DisplayPiece {
+            display: start..display.len(),
+            source: source_range,
+            substituted: sub,
+        });
     };
-    for seg in crate::cjk::cjk_segments(text) {
-        mark((range.start + seg.start)..(range.start + seg.end));
+    for sub in subs {
+        if sub.source_range.start < cursor {
+            continue; // overlapping substitutions: first one wins
+        }
+        let gap = cursor..sub.source_range.start;
+        push(&mut display, gap.clone(), source.get(gap)?, false);
+        push(&mut display, sub.source_range.clone(), &sub.display, true);
+        cursor = sub.source_range.end;
     }
+    let tail = cursor..span.end;
+    push(&mut display, tail.clone(), source.get(tail)?, false);
+    Some((display, pieces))
+}
+
+/// The source ranges a display-byte range covers, in order.
+fn source_ranges_for(pieces: &[DisplayPiece], seg: &Range<usize>) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for piece in pieces {
+        if piece.display.end <= seg.start || piece.display.start >= seg.end {
+            continue;
+        }
+        if piece.substituted {
+            out.push(piece.source.clone());
+            continue;
+        }
+        let lo = seg.start.max(piece.display.start) - piece.display.start;
+        let hi = seg.end.min(piece.display.end) - piece.display.start;
+        out.push((piece.source.start + lo)..(piece.source.start + hi));
+    }
+    out
 }
 
 /// Promote each **top-level** `Paragraph` block whose entire source is a
@@ -4525,6 +4597,36 @@ mod tests {
         assert!(
             style_at(block, 1).emphasis_dots,
             "the substituted range is marked ({:?})",
+            block.inlines
+        );
+    }
+
+    #[test]
+    fn a_variation_sequence_written_across_an_entity_stays_whole() {
+        // `*葛&#xE0100;*` — the base is literal, the selector arrives
+        // through a substitution. Classifying each piece on its own put
+        // the base in the upright sub-run and left the selector to the
+        // italic one, which is the same split shaping the segmentation
+        // rule exists to prevent.
+        let src = "*\u{845B}&#xE0100;*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let sel = src.find("&#x").expect("entity present");
+        assert!(
+            style_at(block, sel).emphasis_dots,
+            "the substituted selector rides its base ({:?})",
+            block.inlines
+        );
+
+        // The other order: the base arrives through the entity and the
+        // selector is literal.
+        let src = "*&#x845B;\u{E0100}*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let sel = src.find('\u{E0100}').expect("selector present");
+        assert!(
+            style_at(block, sel).emphasis_dots,
+            "the literal selector rides its substituted base ({:?})",
             block.inlines
         );
     }

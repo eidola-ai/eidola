@@ -160,6 +160,19 @@ pub fn register(s: &mut Snapshots) {
         )
     });
 
+    // Inline math whose LaTeX will not typeset falls back to dimmed
+    // delimiters + mono content with the faint inline-code background.
+    // That fallback is added to the block the element *shapes*, so the
+    // chip pass has to read the shaped block, not the render output.
+    s.add("inline_math_fallback_chip", win, |window, cx| {
+        editor_with_cursor(
+            window,
+            cx,
+            "lead paragraph\n\nbroken $\\frac{1}$ math here\n\ntail paragraph",
+            "tail",
+        )
+    });
+
     // An emphasized CJK run soft-wrapped at a narrow measure: the dot for
     // the character that *opens* a wrap row belongs on that row, not at
     // the previous row's right edge.
