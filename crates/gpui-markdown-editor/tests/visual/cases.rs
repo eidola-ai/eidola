@@ -122,6 +122,90 @@ pub fn register(s: &mut Snapshots) {
         editor_with_cursor(window, cx, "leading *italic* trailing", "talic")
     });
 
+    // CJK emphasis — 着重号 dots stand in for the italic no CJK face
+    // has. Cursor outside: delimiters gone, dots under each character.
+    s.add("cjk_emphasis_cursor_outside", win, |window, cx| {
+        editor_with_cursor(window, cx, "前面 *强调的文字* 后面", "后面")
+    });
+
+    // CJK emphasis — cursor inside. Entering reveals the delimiters and
+    // leaves the content's emphasis exactly as it was.
+    s.add("cjk_emphasis_cursor_inside", win, |window, cx| {
+        editor_with_cursor(window, cx, "前面 *强调的文字* 后面", "调的文")
+    });
+
+    // One emphasized span carrying both renderings: the Latin word
+    // shapes italic, the Han characters take dots, and the CJK comma
+    // between them takes none.
+    s.add("cjk_emphasis_mixed_run", win, |window, cx| {
+        editor_with_cursor(window, cx, "混排 *中文，with latin，测试* 收尾", "收尾")
+    });
+
+    // Bold and bold+emphasis on CJK: strong stays a bold face (the CJK
+    // fallback ships one), strong+emphasis is bold *and* dotted.
+    s.add("cjk_strong_and_strong_emphasis", win, |window, cx| {
+        editor_with_cursor(window, cx, "**粗体文字** 与 ***粗体强调*** 收尾", "收尾")
+    });
+
+    // A tall inline construct grows the row stride; the inline-code chip
+    // beside it must still fill only the text row (the editor draws the
+    // chip itself — gpui's background pass takes one number for both the
+    // fill height and the row step).
+    s.add("inline_code_chip_beside_tall_math", win, |window, cx| {
+        editor_with_cursor(
+            window,
+            cx,
+            "lead paragraph\n\nsee $\\frac{\\frac{a}{b}}{\\frac{c}{d}}$ and `code` here\n\ntail paragraph",
+            "tail",
+        )
+    });
+
+    // Inline math whose LaTeX will not typeset falls back to dimmed
+    // delimiters + mono content with the faint inline-code background.
+    // That fallback is added to the block the element *shapes*, so the
+    // chip pass has to read the shaped block, not the render output.
+    s.add("inline_math_fallback_chip", win, |window, cx| {
+        editor_with_cursor(
+            window,
+            cx,
+            "lead paragraph\n\nbroken $\\frac{1}$ math here\n\ntail paragraph",
+            "tail",
+        )
+    });
+
+    // An emphasized CJK run soft-wrapped at a narrow measure: the dot for
+    // the character that *opens* a wrap row belongs on that row, not at
+    // the previous row's right edge.
+    s.add(
+        "cjk_emphasis_wrapped",
+        size(px(200.), px(240.)),
+        |window, cx| {
+            editor_with_cursor(
+                window,
+                cx,
+                "*中文测试强调的文字还有更多内容需要换行* 收尾",
+                "收尾",
+            )
+        },
+    );
+
+    // An inline-code span crossing soft wraps at word boundaries: each
+    // row's chip ends at that row's last glyph, not at the wrap width
+    // (`WrappedLine::width()` reports the configured wrap width for any
+    // line that wrapped, which leaves blank trailing space unfilled).
+    s.add(
+        "inline_code_chip_wrapped",
+        size(px(240.), px(240.)),
+        |window, cx| {
+            editor_with_cursor(
+                window,
+                cx,
+                "lead in `alpha beta gamma delta epsilon zeta eta` and the tail after it",
+                "tail",
+            )
+        },
+    );
+
     // Strikethrough outside.
     s.add("strike_cursor_outside", win, |window, cx| {
         editor_with_cursor(window, cx, "keep ~~drop~~ keep", "keep")
@@ -982,17 +1066,15 @@ const EMBED_AUDIT_CORPORA: &[(&str, &str, f32)] = &[
         260.,
     ),
     // Tall inline math on a *non-final* visual row of a soft-wrapped
-    // paragraph. KNOWN DEFECT — this case currently renders wrong, in the
-    // live editor and the embed alike: `compute_math_row_extra` is a
-    // per-*logical*-line overshoot, but the row layout multiplies it into
-    // the height (`(line_height + extra) * wrap_count`) while the shaped
-    // line is still painted with `row_height: line_height`, so gpui strides
-    // its visual rows by the bare `line_height` (`line.rs`'s
-    // `glyph_origin.y += line_height` at each wrap boundary). Two visible
-    // consequences: the construct overlaps the glyphs of the row beneath
-    // it, and `(wrap_count - 1) * extra` of reserved space piles up as dead
-    // air after the whole logical line. Kept as the reproduction for the
-    // fix; see the audit note for the measured numbers.
+    // paragraph — the pixel record of `LaidOutLine::row_stride`, in the
+    // live editor and the embed alike. The reservation
+    // `compute_math_row_extra` returns lands in the per-row stride, so
+    // every visual row of the line is that much further apart: the
+    // construct's ink stays off the glyphs of the row beneath it and no
+    // reserved space piles up after the logical line (the embedded twin's
+    // quote bar ends at the text). The uniform extra leading on the rows
+    // that carry no math is the cost of gpui striding a whole
+    // `WrappedLine` by one line height.
     (
         "wrapped_math",
         "A paragraph whose tall $\\frac{\\frac{\\frac{a}{b}}{\\frac{c}{d}}}{\\frac{e}{f}}$ \
@@ -1006,6 +1088,19 @@ const EMBED_AUDIT_CORPORA: &[(&str, &str, f32)] = &[
         "list_with_code",
         "- item with a fence:\n\n  ```\n  let x = 1;\n  ```\n\n- plain item\n",
         260.,
+    ),
+    // 着重号 emphasis dots are painted in their own pass, so the embed —
+    // which shares only the *shaping* path — has to re-emit them. This
+    // pair is what keeps the two surfaces from drifting.
+    (
+        "cjk_emphasis",
+        "前面 *强调的文字* 后面\n\n\
+         混排 *中文，with latin，测试* 收尾\n\n\
+         **粗体文字** 与 ***粗体强调*** 收尾\n\n\
+         | 表头 | 说明 |\n\
+         | --- | --- |\n\
+         | *中文* | `code` |\n",
+        300.,
     ),
     (
         "quote_with_list",

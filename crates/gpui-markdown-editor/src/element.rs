@@ -13,10 +13,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Edges, Element, ElementId, ElementInputHandler, Entity,
-    FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels,
-    Point, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, Style, TextRun,
-    Window, WrappedLine, fill, point, px, quad, relative, size,
+    App, BorderStyle, Bounds, ContentMask, Corners, Edges, Element, ElementId, ElementInputHandler,
+    Entity, FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, Style,
+    TextRun, Window, WrappedLine, fill, point, px, quad, relative, size,
 };
 use smallvec::SmallVec;
 
@@ -85,11 +85,79 @@ impl IntoElement for BlockElement {
     }
 }
 
+/// Resolve a display index that sits exactly on a soft-wrap boundary to
+/// the row it **starts**, rather than the row it ends.
+///
+/// gpui's `position_for_index` always gives a boundary index the end of
+/// the *upper* row (upper affinity). Anything drawn for the glyph that
+/// **follows** the boundary wants the lower row instead — a caret placed
+/// by Down/Home/Right, and the emphasis dot under a character that opens
+/// a wrap row, which would otherwise land at the previous row's right
+/// edge, past the wrap width. `upper` is the unbiased position; a
+/// non-boundary index is returned unchanged.
+///
+/// One rule, one implementation: [`LaidOutLine::local_position_for_source_offset_biased`]
+/// (source offsets, the caret) and [`emphasis_dot_bounds`] (display
+/// indices, the dots) both come through here.
+fn downstream_row_position(
+    line: &WrappedLine,
+    display_index: usize,
+    upper: Point<Pixels>,
+    row_stride: Pixels,
+) -> Point<Pixels> {
+    if row_stride <= px(0.) {
+        return upper;
+    }
+    let k = (upper.y / row_stride).round() as i64; // upper-affinity row index
+    let last_row = line.wrap_boundaries().len() as i64; // rows are 0..=last_row
+    if k < 0 || k >= last_row {
+        return upper; // already on the last row
+    }
+    // Is `display_index` exactly the boundary that STARTS row k+1? Probe the
+    // VERTICAL CENTER of row k+1 (`(k + 1.5) * row_stride`), never its top
+    // edge: gpui's `closest_index_for_position` floors `y / line_height`, and
+    // a top-edge sample `(k + 1) * row_stride` divided back by `row_stride`
+    // float-rounds to `k + 0.999… → k` (the row above), so a top-edge probe
+    // would ask the wrong row. The half-row offset keeps the floor exact.
+    let next_row_start = match line.closest_index_for_position(
+        point(px(0.0), row_stride * ((k + 1) as f32 + 0.5)),
+        row_stride,
+    ) {
+        Ok(i) | Err(i) => i,
+    };
+    if next_row_start == display_index {
+        point(px(0.0), row_stride * ((k + 1) as f32))
+    } else {
+        upper
+    }
+}
+
 /// One shaped, possibly soft-wrapped, logical line.
 pub struct LaidOutLine {
     pub line: Arc<WrappedLine>,
+    /// Top-left of the line's **first** visual row's text box. Caret and
+    /// selection geometry are expressed against this point; the y gpui is
+    /// painted at is [`Self::paint_origin`], which differs whenever
+    /// `row_stride > row_height`.
     pub origin: Point<Pixels>,
+    /// Height of one visual row's text box — the caret's height, the
+    /// selection quad's height, and the box whose vertical centering
+    /// puts the body baseline where every other line in the block has it.
     pub row_height: Pixels,
+    /// Distance between the tops of consecutive visual rows of this
+    /// soft-wrapped line. Equals `row_height` unless a tall inline
+    /// construct (math, an image) on this logical line reserves extra
+    /// vertical space.
+    ///
+    /// The reservation has to live in the *stride*, not merely in
+    /// `wrapped_height`: `gpui::WrappedLine::paint` advances every wrap
+    /// row by the single line height it is handed, so a reservation that
+    /// only inflated the total would leave the construct overlapping the
+    /// row beneath it and pile the reserved space up as dead air after
+    /// the whole logical line. Every row-index computation over this
+    /// line — `position_for_index`, `closest_index_for_position`, the
+    /// per-row selection quads — must use this, not `row_height`.
+    pub row_stride: Pixels,
     pub wrapped_height: Pixels,
     /// Source byte range covered by this line (including trailing `\n` if
     /// any, so the cursor at end-of-line resolves to the next paragraph).
@@ -117,6 +185,27 @@ impl LaidOutLine {
         offset >= self.source_range.start && offset <= self.source_range.end
     }
 
+    /// Where `gpui` is asked to draw this line's glyphs — `paint` takes
+    /// this origin and `row_stride` as the line height. (The local points
+    /// `position_for_index` returns stay relative to [`Self::origin`]:
+    /// they are whole multiples of the stride in y and independent of the
+    /// origin in x. Decorations that fill the *text row* — the
+    /// inline-code chip, the selection wash — measure from `origin`, not
+    /// from here.)
+    ///
+    /// gpui centers the shaped text inside the height it is given, so
+    /// painting the stride at [`Self::origin`] would push the text down by
+    /// half the reservation. Lifting the origin by that half puts the text
+    /// box back on `origin`, which splits the reservation above and below
+    /// exactly as the row extra asked for and keeps the body baseline
+    /// identical to a reservation-free row.
+    pub fn paint_origin(&self) -> Point<Pixels> {
+        point(
+            self.origin.x,
+            self.origin.y - (self.row_stride - self.row_height) / 2.0,
+        )
+    }
+
     fn display_offset_for_source(&self, source_offset: usize) -> usize {
         if source_offset <= self.source_range.start {
             return 0;
@@ -134,22 +223,9 @@ impl LaidOutLine {
 
     pub fn local_position_for_source_offset(&self, source_offset: usize) -> Point<Pixels> {
         let display = self.display_offset_for_source(source_offset);
-        if let Some(p) = self.line.position_for_index(display, self.row_height) {
-            return p;
-        }
-        // Fallback for end-of-line cursors when the shaped text
-        // ended in whitespace that gpui collapsed at a soft-break
-        // boundary. `display` sits at `text.len()` but is past the
-        // last *glyph* in the wrap layout, so `position_for_index`
-        // walks all wrap rows and returns `None`. Place the caret
-        // at the line's right edge on its last row instead — that's
-        // where the user expects the typing position after a
-        // trailing space. Without this, the caret quad lands at
-        // `(0, 0)` and visually disappears against the leftmost
-        // glyph of the line.
-        let last_row = self.line.wrap_boundaries().len();
-        let y = self.row_height * (last_row as f32);
-        point(self.line.width(), y)
+        self.line
+            .position_for_index(display, self.row_stride)
+            .unwrap_or_else(|| end_of_line_position(&self.line, self.row_stride))
     }
 
     /// Like [`Self::local_position_for_source_offset`], but when `downstream` is
@@ -169,33 +245,12 @@ impl LaidOutLine {
         if !downstream {
             return upper;
         }
-        let row_h = self.row_height;
-        if row_h <= px(0.) {
-            return upper;
-        }
-        let k = (upper.y / row_h).round() as i64; // upper-affinity row index
-        let last_row = self.line.wrap_boundaries().len() as i64; // rows are 0..=last_row
-        if k < 0 || k >= last_row {
-            return upper; // already on the last row
-        }
-        // Is `source_offset` exactly the boundary that STARTS row k+1? Probe the
-        // VERTICAL CENTER of row k+1 (`(k + 1.5) * row_h`), never its top edge:
-        // gpui's `closest_index_for_position` floors `y / line_height`, and a
-        // top-edge sample `(k + 1) * row_h` divided back by `row_h` float-rounds
-        // to `k + 0.999… → k` (the row above), so a top-edge probe would ask the
-        // wrong row. The half-row offset keeps the floor exact.
-        let display = self.display_offset_for_source(source_offset);
-        let next_row_start = match self
-            .line
-            .closest_index_for_position(point(px(0.0), row_h * ((k + 1) as f32 + 0.5)), row_h)
-        {
-            Ok(i) | Err(i) => i,
-        };
-        if next_row_start == display {
-            point(px(0.0), row_h * ((k + 1) as f32))
-        } else {
-            upper
-        }
+        downstream_row_position(
+            &self.line,
+            self.display_offset_for_source(source_offset),
+            upper,
+            self.row_stride,
+        )
     }
 
     pub fn source_offset_for_local_point(&self, local: Point<Pixels>) -> usize {
@@ -206,7 +261,7 @@ impl LaidOutLine {
         if p.y < px(0.0) {
             p.y = px(0.0);
         }
-        let display_idx = match self.line.closest_index_for_position(p, self.row_height) {
+        let display_idx = match self.line.closest_index_for_position(p, self.row_stride) {
             Ok(i) => i,
             Err(i) => i,
         };
@@ -268,6 +323,14 @@ pub struct EmbedContentGeometry {
 
 pub struct PrepaintState {
     laid_out: LaidOutBlock,
+    /// The block the lines in `laid_out` were actually shaped from —
+    /// `self.block` plus whatever the math and image augment passes
+    /// added (substitutions, and the dim/mono fallback runs a construct
+    /// that failed to typeset falls back to). Every paint-pass decision
+    /// that reads inline *styles* must read them from here: the styles
+    /// the glyphs shaped with are these, and querying the un-augmented
+    /// block silently drops the fallback's chip.
+    shaped_block: RenderBlock,
     cursor_quad: Option<TaggedQuad>,
     selection_quads: Vec<TaggedQuad>,
     /// Wash quads for host-supplied highlight ranges (see
@@ -683,6 +746,256 @@ fn compute_image_row_extra(
         top: max_overshoot,
         bottom: max_overshoot,
     }
+}
+
+/// The x at which each visual row's text ends — index `k` is row `k`'s
+/// right edge, in the line's own coordinates.
+///
+/// `WrappedLine::width()` is `min(wrap_width, unwrapped width)`, so for
+/// any line that actually wrapped it is the **configured wrap width**,
+/// not what a given row used. A decoration filling to it paints through
+/// the blank area after that row's last glyph — and a break at a word
+/// boundary leaves a lot of it. gpui's upper affinity supplies the real
+/// answer: the boundary index that *starts* row `k + 1` resolves to row
+/// `k`'s end, which is exactly the used width.
+///
+/// The last row has no boundary after it; it ends at the line's own
+/// width, which for the last row is the honest value.
+fn wrap_row_right_edges(line: &WrappedLine, row_stride: Pixels) -> SmallVec<[Pixels; 4]> {
+    let rows = line.wrap_boundaries().len() + 1;
+    let mut out: SmallVec<[Pixels; 4]> = SmallVec::with_capacity(rows);
+    if row_stride > px(0.) {
+        for k in 0..rows - 1 {
+            // Probe the vertical centre of row k+1, never its top edge —
+            // the same reason `downstream_row_position` does.
+            let next_row_start = match line.closest_index_for_position(
+                point(px(0.0), row_stride * ((k + 1) as f32 + 0.5)),
+                row_stride,
+            ) {
+                Ok(i) | Err(i) => i,
+            };
+            let edge = line
+                .position_for_index(next_row_start, row_stride)
+                .map(|p| p.x)
+                .unwrap_or_else(|| line.width());
+            out.push(edge);
+        }
+    } else {
+        for _ in 0..rows - 1 {
+            out.push(line.width());
+        }
+    }
+    out.push(line.width());
+    out
+}
+
+/// Where an index `WrappedLine::position_for_index` cannot answer for
+/// belongs: the line's right edge on its last row.
+///
+/// gpui answers `None` for an index past the last *glyph* in the wrap
+/// layout, which an index at `text.len()` can be when the shaped text
+/// ended in whitespace the layout did not carry. There is exactly one
+/// sensible answer — the end of the last row — and **two callers must
+/// agree on it**: the caret, whose typing position after a trailing
+/// space is there, and any decoration whose span ends there. A chip or
+/// wash that treated the unanswerable end as a failure would discard
+/// every quad of a span whose *start* resolved perfectly well, losing a
+/// whole decoration to a partial answer.
+fn end_of_line_position(line: &WrappedLine, row_stride: Pixels) -> Point<Pixels> {
+    let last_row = line.wrap_boundaries().len();
+    point(line.width(), row_stride * (last_row as f32))
+}
+
+/// The chip fill a merged inline style asks for, if any.
+///
+/// Dim takes precedence: the delimiter backticks share the run color but
+/// must not carry a chip — only the content does.
+fn run_background_color(style: &InlineStyle, md: &MarkdownStyle) -> Option<gpui::Hsla> {
+    (style.code && !style.dimmed).then_some(md.inline_code_background)
+}
+
+/// Fill bounds for the inline-code chips on one shaped line — one quad
+/// per visual row a chip spans.
+///
+/// **Why this isn't `WrappedLine::paint_background`.** gpui's background
+/// pass takes a single line height and uses it for *both* the quad's
+/// height and the step between wrap rows. Those are the same number only
+/// on a line with no tall inline construct on it; where one reserves
+/// extra leading (see [`LaidOutLine::row_stride`]) the stride has to grow
+/// while the chip must still fill only the text row, or a chip beside
+/// inline math stretches through the reserved leading. One argument
+/// cannot be both, so the chip is ours to draw: rows step by
+/// `row_stride`, quads fill `row_height`.
+///
+/// Geometry mirrors the selection wash (`push_selection_quads`) — the
+/// same first-row / middle-rows / last-row split over the same
+/// `position_for_index` coordinates.
+#[allow(clippy::too_many_arguments)]
+fn run_background_bounds(
+    line: &WrappedLine,
+    display_to_source: &[usize],
+    origin: Point<Pixels>,
+    row_stride: Pixels,
+    row_height: Pixels,
+    block: &RenderBlock,
+    style: &MarkdownStyle,
+) -> Vec<Bounds<Pixels>> {
+    let mut out = Vec::new();
+    let len = line.text.len();
+    let mut i = 0usize;
+    while i < len {
+        let color = display_to_source
+            .get(i)
+            .map(|&src| run_background_color(&effective_inline_style(src, block), style));
+        let Some(Some(color)) = color else {
+            i += 1;
+            continue;
+        };
+        // Extend over every following byte asking for the same fill.
+        let mut j = i + 1;
+        while j < len {
+            let next = display_to_source
+                .get(j)
+                .map(|&src| run_background_color(&effective_inline_style(src, block), style));
+            if next != Some(Some(color)) {
+                break;
+            }
+            j += 1;
+        }
+        push_row_spanning_bounds(line, i, j, origin, row_stride, row_height, &mut out);
+        i = j;
+    }
+    out
+}
+
+/// Emit one quad per visual row covered by the display range `lo..hi`.
+#[allow(clippy::too_many_arguments)]
+fn push_row_spanning_bounds(
+    line: &WrappedLine,
+    lo: usize,
+    hi: usize,
+    origin: Point<Pixels>,
+    row_stride: Pixels,
+    row_height: Pixels,
+    out: &mut Vec<Bounds<Pixels>>,
+) {
+    let Some(start_upper) = line.position_for_index(lo, row_stride) else {
+        return;
+    };
+    let end = line
+        .position_for_index(hi, row_stride)
+        .unwrap_or_else(|| end_of_line_position(line, row_stride));
+    // A span that *opens* on a wrap boundary belongs to the row it starts;
+    // one that *ends* there ends at the upper row's edge, which is what
+    // gpui's unbiased answer already gives.
+    let start = downstream_row_position(line, lo, start_upper, row_stride);
+    let right_edges = wrap_row_right_edges(line, row_stride);
+    let row_right = |row: usize| origin.x + right_edges.get(row).copied().unwrap_or(line.width());
+    if start.y == end.y {
+        out.push(Bounds::from_corners(
+            point(origin.x + start.x, origin.y + start.y),
+            point(origin.x + end.x, origin.y + start.y + row_height),
+        ));
+        return;
+    }
+    let first_row = (f32::from(start.y) / f32::from(row_stride)).round() as usize;
+    let last_row = (f32::from(end.y) / f32::from(row_stride)).round() as usize;
+    out.push(Bounds::from_corners(
+        point(origin.x + start.x, origin.y + start.y),
+        point(row_right(first_row), origin.y + start.y + row_height),
+    ));
+    for row in (first_row + 1)..last_row {
+        let y = origin.y + row_stride * (row as f32);
+        out.push(Bounds::from_corners(
+            point(origin.x, y),
+            point(row_right(row), y + row_height),
+        ));
+    }
+    out.push(Bounds::from_corners(
+        point(origin.x, origin.y + end.y),
+        point(origin.x + end.x, origin.y + end.y + row_height),
+    ));
+}
+
+/// Bounds of the 着重号 emphasis dots for one shaped line — one square
+/// per emphasized CJK character, centered under its glyph.
+///
+/// `WrappedLine::paint` draws glyphs only, so the dots are their own
+/// pass, exactly like the inline-code chip background. Everything the
+/// geometry needs is already solved: `position_for_index` gives each
+/// glyph's leading and trailing edge on its wrap row, and the row-local
+/// baseline is the one the math overlays sit on.
+///
+/// The dot sits in the descender space below the baseline, and it never
+/// reaches the row beneath — a mark that overflowed would read as
+/// belonging to the wrong line. That space is not the editor's to
+/// guarantee, though: `line_height` is a host knob, and tightening it
+/// toward ascent + descent leaves less room than
+/// `emphasis_dot_baseline_offset_factor` asks for. So the dot's bottom
+/// **clamps to its own row's bottom**. Clamping rather than reserving is
+/// deliberate — a reservation would move every line's layout to serve a
+/// configuration most hosts never choose.
+#[allow(clippy::too_many_arguments)]
+fn emphasis_dot_bounds(
+    line: &WrappedLine,
+    display_to_source: &[usize],
+    origin: Point<Pixels>,
+    row_stride: Pixels,
+    row_height: Pixels,
+    block: &RenderBlock,
+    style: &MarkdownStyle,
+    font_size: Pixels,
+    body_ascent: Pixels,
+    body_descent: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    let mut out = Vec::new();
+    if block.inlines.iter().all(|run| !run.style.emphasis_dots) {
+        return out;
+    }
+    let diameter = (font_size * style.emphasis_dot_size_factor).max(px(1.5));
+    let radius = diameter / 2.0;
+    let half_leading = ((row_height - body_ascent - body_descent) / 2.0).max(px(0.0));
+    let drop = font_size * style.emphasis_dot_baseline_offset_factor;
+    for (i, ch) in line.text.char_indices() {
+        if !crate::cjk::takes_emphasis_dot(ch) {
+            continue;
+        }
+        let Some(&src) = display_to_source.get(i) else {
+            continue;
+        };
+        if !effective_inline_style(src, block).emphasis_dots {
+            continue;
+        }
+        let Some(upper) = line.position_for_index(i, row_stride) else {
+            continue;
+        };
+        // A character that *opens* a wrap row is a boundary index, which
+        // gpui resolves to the row above — the dot would land at the
+        // previous row's right edge, past the wrap width.
+        let lead = downstream_row_position(line, i, upper, row_stride);
+        // A character that *ends* its wrap row has no trailing edge on
+        // the same row; a CJK glyph is an em square, so its own font
+        // size is the honest width to center within.
+        //
+        // A variation selector attached to this character needs nothing
+        // here: gpui's `x_for_index` answers with the first glyph whose
+        // index is *at or after* the one asked for, so a selector that
+        // shaped into its base's cluster (no glyph of its own) is
+        // skipped and the base still measures its own advance.
+        let advance = match line.position_for_index(i + ch.len_utf8(), row_stride) {
+            Some(trail) if trail.y == lead.y => trail.x - lead.x,
+            _ => font_size,
+        };
+        let center_x = origin.x + lead.x + advance / 2.0;
+        let baseline = origin.y + lead.y + half_leading + body_ascent;
+        let row_bottom = origin.y + lead.y + row_height;
+        let top = (baseline + drop - radius).min(row_bottom - diameter);
+        out.push(Bounds::new(
+            point(center_x - radius, top),
+            size(diameter, diameter),
+        ));
+    }
+    out
 }
 
 /// Combine math and image row extras for one shaped line. Both
@@ -1192,8 +1505,13 @@ fn layout_table(
 /// coordinates.
 struct EmbedPiece {
     line: Arc<WrappedLine>,
+    /// The origin to *paint* at, already lifted by half of any row
+    /// reservation — see `LaidOutLine::paint_origin`.
     rel_origin: Point<Pixels>,
-    row_height: Pixels,
+    /// Distance between the tops of consecutive visual rows, which is
+    /// also what gpui is handed as the line height — see
+    /// `LaidOutLine::row_stride`.
+    row_stride: Pixels,
 }
 
 /// One typeset display-math sub-block of an embed.
@@ -1219,6 +1537,14 @@ struct EmbedLayoutOut {
     /// strip, because an embed collapses the fence rows that frame would
     /// need — the panel *is* the content area.
     code_panels: Vec<Bounds<Pixels>>,
+    /// 着重号 emphasis dots under emphasized CJK characters, relative
+    /// bounds — the same pass the editor's own lines get, re-emitted here
+    /// because only the *shaping* path is shared.
+    emphasis_dots: Vec<Bounds<Pixels>>,
+    /// Inline-code chip fills, relative bounds — re-emitted here for the
+    /// same reason, and drawn by us rather than gpui for the reason in
+    /// [`run_background_bounds`].
+    code_chips: Vec<Bounds<Pixels>>,
     size: Size<Pixels>,
 }
 
@@ -1364,7 +1690,7 @@ fn emit_embed_marker_overlays(
         pieces.push(EmbedPiece {
             rel_origin: point((strip_right - glyph.width()).max(px(0.0)), row_y),
             line: glyph,
-            row_height: line_height,
+            row_stride: line_height,
         });
     }
 }
@@ -1390,6 +1716,8 @@ fn layout_embed(
         rules: Vec::new(),
         bars: Vec::new(),
         code_panels: Vec::new(),
+        emphasis_dots: Vec::new(),
+        code_chips: Vec::new(),
         size: Size::default(),
     };
     let mut y = px(0.0);
@@ -1414,14 +1742,42 @@ fn layout_embed(
         match &block.kind {
             BlockKind::Table { .. } => {
                 if let Some(t) = layout_table(block, content, font_size, style, inner_w, window) {
+                    let (body_ascent, body_descent) =
+                        body_metrics_for_block(&block.kind, style, font_size, window);
                     for piece in t.pieces {
+                        let rel_origin =
+                            point(indent + piece.rel_origin.x, block_top + piece.rel_origin.y);
+                        // A cell is a shaped line like any other, so its
+                        // emphasized CJK takes dots — and the embed has to
+                        // ask for them, since only the shaping path is
+                        // shared (the editor's own table pieces become
+                        // `LaidOutLine`s and are covered by the regular
+                        // per-line pass).
+                        out.emphasis_dots.extend(emphasis_dot_bounds(
+                            &piece.line,
+                            &piece.display_to_source,
+                            rel_origin,
+                            line_height,
+                            line_height,
+                            block,
+                            style,
+                            font_size,
+                            body_ascent,
+                            body_descent,
+                        ));
+                        out.code_chips.extend(run_background_bounds(
+                            &piece.line,
+                            &piece.display_to_source,
+                            rel_origin,
+                            line_height,
+                            line_height,
+                            block,
+                            style,
+                        ));
                         out.pieces.push(EmbedPiece {
                             line: piece.line,
-                            rel_origin: point(
-                                indent + piece.rel_origin.x,
-                                block_top + piece.rel_origin.y,
-                            ),
-                            row_height: line_height,
+                            rel_origin,
+                            row_stride: line_height,
                         });
                     }
                     for (i, ry) in t.rule_ys.iter().enumerate() {
@@ -1521,26 +1877,54 @@ fn layout_embed(
                             body_descent,
                             line_height,
                         );
+                        let row_stride = line_height + extra.total();
                         let wrap_count = (sl.line.wrap_boundaries().len() as f32) + 1.0;
-                        let h = (line_height + extra.total()) * wrap_count;
+                        let h = row_stride * wrap_count;
                         let row_y = y + extra.top;
+                        // The reservation belongs to the stride (see
+                        // `LaidOutLine::row_stride`), and gpui centers the
+                        // text in whatever height it is handed, so the paint
+                        // origin lifts by half of it to leave the baseline
+                        // where a reservation-free row puts it.
+                        let paint_y = row_y - (row_stride - line_height) / 2.0;
                         if text_left + sl.line.width() > max_w {
                             max_w = text_left + sl.line.width();
                         }
                         place_embed_inline_math(
                             &mut math_specs,
                             &sl,
-                            point(text_left, row_y),
-                            line_height,
+                            point(text_left, paint_y),
+                            row_stride,
                             body_ascent,
                             body_descent,
                             &mut out.math,
                         );
                         shaped_rows.push((sl.source_range.clone(), row_y));
+                        out.emphasis_dots.extend(emphasis_dot_bounds(
+                            &sl.line,
+                            &sl.display_to_source,
+                            point(text_left, row_y),
+                            row_stride,
+                            line_height,
+                            &b,
+                            style,
+                            font_size,
+                            body_ascent,
+                            body_descent,
+                        ));
+                        out.code_chips.extend(run_background_bounds(
+                            &sl.line,
+                            &sl.display_to_source,
+                            point(text_left, row_y),
+                            row_stride,
+                            line_height,
+                            &b,
+                            style,
+                        ));
                         out.pieces.push(EmbedPiece {
                             line: sl.line,
-                            rel_origin: point(text_left, row_y),
-                            row_height: line_height,
+                            rel_origin: point(text_left, paint_y),
+                            row_stride,
                         });
                         y += h;
                         advanced = true;
@@ -1601,6 +1985,8 @@ struct EmbedPaint {
     rules: Vec<(Bounds<Pixels>, bool)>,
     bars: Vec<Bounds<Pixels>>,
     code_panels: Vec<Bounds<Pixels>>,
+    emphasis_dots: Vec<Bounds<Pixels>>,
+    code_chips: Vec<Bounds<Pixels>>,
     /// The embed's own quote bar (the container chrome).
     bar: Bounds<Pixels>,
     /// Full content bounds — the clip mask and the selection-wash rect.
@@ -2146,15 +2532,16 @@ impl Element for BlockElement {
             // A line carrying math overlays taller than what the
             // body's natural half-leading already covers reserves
             // extra vertical space — `top` above the row's natural
-            // top, `bottom` past its natural bottom. The row_height
-            // passed to gpui stays at `line_height` so its
-            // internal text-vertical-centering keeps the body
-            // baseline in the same place across math and non-math
-            // rows; we shift `origin.y` down by `extra.top` so the
-            // *visible* row top floats up by that amount. Math
-            // overlays paint relative to `line.origin.y + ...`,
-            // and the formula in `paint_inline_math_overlays`
-            // accounts for gpui's centering using `line.row_height`.
+            // top, `bottom` past its natural bottom. The reservation
+            // goes into the row *stride*, so every visual row of a
+            // soft-wrapped line keeps it (gpui advances wrap rows by
+            // one line height, so a stride that ignored the extra
+            // would let the construct overlap the row below and pile
+            // the reservation up after the logical line). `origin.y`
+            // still shifts down by `extra.top`, keeping the body
+            // baseline at the same place it sits on reservation-free
+            // rows — `LaidOutLine::paint_origin` undoes gpui's
+            // centering of the taller row.
             let math_extra = compute_math_row_extra(
                 &sl.source_range,
                 &inline_math_specs,
@@ -2165,8 +2552,9 @@ impl Element for BlockElement {
             let image_extra =
                 compute_image_row_extra(&sl.source_range, &inline_image_specs, line_height);
             let extra = combined_row_extra(math_extra, image_extra);
+            let row_stride = line_height + extra.total();
             let wrap_count = (sl.line.wrap_boundaries().len() as f32) + 1.0;
-            let wrapped_h = (line_height + extra.total()) * wrap_count;
+            let wrapped_h = row_stride * wrap_count;
             let origin = point(content_left, content_cursor_y + extra.top);
             if !sl.is_delimiter && sl.line.width() > max_content_line_width {
                 max_content_line_width = sl.line.width();
@@ -2175,6 +2563,7 @@ impl Element for BlockElement {
                 line: sl.line,
                 origin,
                 row_height: line_height,
+                row_stride,
                 wrapped_height: wrapped_h,
                 source_range: sl.source_range,
                 display_to_source: sl.display_to_source,
@@ -2197,6 +2586,7 @@ impl Element for BlockElement {
                         content_top + piece.rel_origin.y,
                     ),
                     row_height: line_height,
+                    row_stride: line_height,
                     wrapped_height: piece.wrapped_height,
                     source_range: piece.source_range,
                     display_to_source: piece.display_to_source,
@@ -2224,6 +2614,7 @@ impl Element for BlockElement {
                     line,
                     origin: point(content_left, content_cursor_y),
                     row_height: line_height,
+                    row_stride: line_height,
                     wrapped_height: line_height,
                     source_range: self.block.source_range.clone(),
                     display_to_source: vec![self.block.source_range.start],
@@ -2475,6 +2866,14 @@ impl Element for BlockElement {
                     panel.origin.x += origin.x;
                     panel.origin.y += origin.y;
                 }
+                for dot in &mut layout.emphasis_dots {
+                    dot.origin.x += origin.x;
+                    dot.origin.y += origin.y;
+                }
+                for chip in &mut layout.code_chips {
+                    chip.origin.x += origin.x;
+                    chip.origin.y += origin.y;
+                }
                 let content_bounds = Bounds::new(
                     point(block_left, block_top),
                     size(block_width, (block_bottom - block_top).max(px(0.0))),
@@ -2488,6 +2887,8 @@ impl Element for BlockElement {
                     rules: layout.rules,
                     bars: layout.bars,
                     code_panels: layout.code_panels,
+                    emphasis_dots: layout.emphasis_dots,
+                    code_chips: layout.code_chips,
                     bar: Bounds::new(
                         point(block_left + style.blockquote_border_inset, block_top),
                         size(
@@ -2550,6 +2951,7 @@ impl Element for BlockElement {
 
         PrepaintState {
             laid_out,
+            shaped_block: augmented_block,
             cursor_quad,
             selection_quads,
             highlight_quads,
@@ -2803,22 +3205,15 @@ impl Element for BlockElement {
                     }
                     window.paint_quad(fill(*rule, color));
                 }
-                // Run backgrounds first (inline-code chips), then glyphs —
-                // the same two-pass order as the regular content path.
-                for piece in &ep.pieces {
-                    let _ = piece.line.paint_background(
-                        piece.rel_origin,
-                        piece.row_height,
-                        gpui::TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
+                // Inline-code chips first, then glyphs — the same two-pass
+                // order as the regular content path.
+                for chip in &ep.code_chips {
+                    window.paint_quad(fill(*chip, self.style.inline_code_background));
                 }
                 for piece in &ep.pieces {
                     let _ = piece.line.paint(
                         piece.rel_origin,
-                        piece.row_height,
+                        piece.row_stride,
                         gpui::TextAlign::Left,
                         None,
                         window,
@@ -2831,6 +3226,13 @@ impl Element for BlockElement {
                 for m in &ep.math {
                     m.layout
                         .paint(m.rel_origin, m.em_px, self.style.text_color, window, cx);
+                }
+                for dot in &ep.emphasis_dots {
+                    let radius = dot.size.width / 2.0;
+                    window.paint_quad(
+                        fill(*dot, self.style.emphasis_dot_color)
+                            .corner_radii(Corners::all(radius)),
+                    );
                 }
             });
             // Record what was painted (moving, not cloning — `ep` is dropped
@@ -2883,8 +3285,8 @@ impl Element for BlockElement {
             for laid in &prepaint.laid_out.lines {
                 if laid.is_delimiter {
                     let _ = laid.line.paint(
-                        laid.origin,
-                        laid.row_height,
+                        laid.paint_origin(),
+                        laid.row_stride,
                         gpui::TextAlign::Left,
                         None,
                         window,
@@ -2914,8 +3316,8 @@ impl Element for BlockElement {
                 for laid in &prepaint.laid_out.lines {
                     if !laid.is_delimiter {
                         let _ = laid.line.paint(
-                            laid.origin,
-                            laid.row_height,
+                            laid.paint_origin(),
+                            laid.row_stride,
                             gpui::TextAlign::Left,
                             None,
                             window,
@@ -2959,21 +3361,25 @@ impl Element for BlockElement {
                     }
                     window.paint_quad(fill(*rule, color));
                 }
-                // Run backgrounds (the inline-code chip fill carried on
-                // `TextRun::background_color`) paint first so the
-                // selection wash and the glyphs layer on top of them.
-                // `WrappedLine::paint` itself only draws glyphs +
-                // underline/strikethrough — backgrounds need the explicit
-                // `paint_background` pass or the chip never shows.
+                // Inline-code chips paint first so the selection wash and
+                // the glyphs layer on top of them. `WrappedLine::paint`
+                // draws glyphs + underline/strikethrough only, so the
+                // chip needs its own pass either way — and it has to be
+                // ours rather than gpui's, because a row reservation
+                // makes the stride and the fill height differ (see
+                // `run_background_bounds`).
                 for laid in &prepaint.laid_out.lines {
-                    let _ = laid.line.paint_background(
+                    for chip in run_background_bounds(
+                        &laid.line,
+                        &laid.display_to_source,
                         laid.origin,
+                        laid.row_stride,
                         laid.row_height,
-                        gpui::TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
+                        &prepaint.shaped_block,
+                        &self.style,
+                    ) {
+                        window.paint_quad(fill(chip, self.style.inline_code_background));
+                    }
                 }
                 for tq in highlight_quads {
                     window.paint_quad(tq.quad);
@@ -2983,14 +3389,23 @@ impl Element for BlockElement {
                 }
                 for laid in &prepaint.laid_out.lines {
                     let _ = laid.line.paint(
-                        laid.origin,
-                        laid.row_height,
+                        laid.paint_origin(),
+                        laid.row_stride,
                         gpui::TextAlign::Left,
                         None,
                         window,
                         cx,
                     );
                 }
+                // Emphasis dots under emphasized CJK characters, in
+                // the same over-the-text / under-the-cursor band as
+                // the overlays below.
+                paint_emphasis_dots(
+                    &prepaint.laid_out.lines,
+                    &prepaint.shaped_block,
+                    &self.style,
+                    window,
+                );
                 // Inline math overlays paint *after* the line text (so
                 // they sit on top of the NBSP placeholders that
                 // reserved the space) but *before* the cursor (so the
@@ -3419,7 +3834,7 @@ fn paint_inline_math_overlays(
         };
         let local = match line
             .line
-            .position_for_index(display_offset, line.row_height)
+            .position_for_index(display_offset, line.row_stride)
         {
             Some(p) => p,
             None => continue,
@@ -3483,7 +3898,7 @@ fn paint_inline_image_overlays(
         };
         let local = match line
             .line
-            .position_for_index(display_offset, line.row_height)
+            .position_for_index(display_offset, line.row_stride)
         {
             Some(p) => p,
             None => continue,
@@ -3498,6 +3913,39 @@ fn paint_inline_image_overlays(
             line.origin.y + local.y + (line.row_height - spec.display_size.height) / 2.0;
         let bounds = Bounds::new(point(image_left, image_top), spec.display_size);
         crate::image::paint(spec.image.clone(), bounds, window);
+    }
+}
+
+/// Paint the 着重号 emphasis dots for every laid-out line of a block.
+fn paint_emphasis_dots(
+    lines: &[LaidOutLine],
+    block: &RenderBlock,
+    style: &MarkdownStyle,
+    window: &mut Window,
+) {
+    if !block.inlines.iter().any(|run| run.style.emphasis_dots) {
+        return;
+    }
+    let font_size = font_size_for_block(&block.kind, style);
+    let (body_ascent, body_descent) = body_metrics_for_block(&block.kind, style, font_size, window);
+    for line in lines {
+        for bounds in emphasis_dot_bounds(
+            &line.line,
+            &line.display_to_source,
+            line.origin,
+            line.row_stride,
+            line.row_height,
+            block,
+            style,
+            font_size,
+            body_ascent,
+            body_descent,
+        ) {
+            let radius = bounds.size.width / 2.0;
+            window.paint_quad(
+                fill(bounds, style.emphasis_dot_color).corner_radii(Corners::all(radius)),
+            );
+        }
     }
 }
 
@@ -4368,7 +4816,12 @@ fn build_runs_for_line(
         } else if base_weight != FontWeight::NORMAL {
             run_font.weight = base_weight;
         }
-        if merged.italic {
+        // Emphasized CJK takes 着重号 dots instead of an italic face —
+        // no CJK face has one, and `FontStyle::Italic` there is worse
+        // than a no-op (see `crate::cjk`). `italic` still covers the
+        // whole emphasized span, so the Latin parts of a mixed span
+        // shape italic and only the marked sub-runs opt out.
+        if merged.italic && !merged.emphasis_dots {
             run_font.style = FontStyle::Italic;
         }
 
@@ -4389,16 +4842,6 @@ fn build_runs_for_line(
             None
         };
 
-        // Inline code: paint a faint background under the run so the
-        // span reads as a chip. Dim takes precedence (the delimiter
-        // backticks share the run color but should *not* paint a
-        // background — only the content does).
-        let background_color = if merged.code && !merged.dimmed {
-            Some(style.inline_code_background)
-        } else {
-            None
-        };
-
         // Inline link: single underline beneath the link text. No
         // underline on the bracket / url delimiters (those are
         // hidden when the cursor is outside, dimmed when inside).
@@ -4415,8 +4858,11 @@ fn build_runs_for_line(
         runs.push(TextRun {
             len: j - i,
             font: run_font,
+            // The inline-code chip is deliberately *not* carried here —
+            // `run_background_bounds` paints it. See that function
+            // for why gpui's own background pass cannot draw it.
+            background_color: None,
             color,
-            background_color,
             underline,
             strikethrough,
         });
@@ -4591,7 +5037,11 @@ fn paint_selection_for_line(
     };
     let start = line.local_position_for_source_offset(lo);
     let end = line.local_position_for_source_offset(hi);
+    // A wash covers one visual row's *text* box (`row_height`) but steps
+    // between rows by the line's stride, which a tall inline construct
+    // makes larger — see `LaidOutLine::row_stride`.
     let row_height = line.row_height;
+    let row_stride = line.row_stride;
     let eol_pad = if hi == line_hi { px(6.0) } else { px(0.0) };
 
     if start.y == end.y {
@@ -4609,16 +5059,26 @@ fn paint_selection_for_line(
     }
 
     let row_count = line.row_count();
-    let line_width = line.line.width();
-    let start_row = (f32::from(start.y) / f32::from(row_height)).round() as usize;
-    let end_row = (f32::from(end.y) / f32::from(row_height)).round() as usize;
+    // Per-row right edges, not the configured wrap width — see
+    // `wrap_row_right_edges`. The wash hugs the text on every row it
+    // crosses, the way the inline-code chip does.
+    let right_edges = wrap_row_right_edges(&line.line, row_stride);
+    let row_right = |row: usize| {
+        line.origin.x
+            + right_edges
+                .get(row)
+                .copied()
+                .unwrap_or_else(|| line.line.width())
+    };
+    let start_row = (f32::from(start.y) / f32::from(row_stride)).round() as usize;
+    let end_row = (f32::from(end.y) / f32::from(row_stride)).round() as usize;
 
     let y_start = line.origin.y + start.y;
     push(
         fill(
             Bounds::from_corners(
                 point(line.origin.x + start.x, y_start),
-                point(line.origin.x + line_width, y_start + row_height),
+                point(row_right(start_row), y_start + row_height),
             ),
             color,
         ),
@@ -4626,12 +5086,12 @@ fn paint_selection_for_line(
     );
 
     for row in (start_row + 1)..end_row.min(row_count) {
-        let y = line.origin.y + row_height * (row as f32);
+        let y = line.origin.y + row_stride * (row as f32);
         push(
             fill(
                 Bounds::from_corners(
                     point(line.origin.x, y),
-                    point(line.origin.x + line_width, y + row_height),
+                    point(row_right(row), y + row_height),
                 ),
                 color,
             ),
@@ -4829,6 +5289,7 @@ mod tests {
                             line: sl.line,
                             origin: point(px(0.0), px(0.0)),
                             row_height: line_height,
+                            row_stride: line_height,
                             wrapped_height: line_height,
                             source_range: sl.source_range,
                             display_to_source: sl.display_to_source,
@@ -4841,6 +5302,854 @@ mod tests {
             px(0.0)
         })
         .expect("update window")
+    }
+
+    /// Emphasis-dot geometry for a document's first paragraph, computed
+    /// with **caller-supplied vertical metrics** — returning the dots,
+    /// the baseline they were placed against, and the leading/trailing
+    /// edge of the first emphasized glyph.
+    ///
+    /// The metrics are arguments rather than the harness's because this
+    /// test app's stub text system reports a *negative* descent, which
+    /// leaves a row no descender space at all and is not what any real
+    /// font supplies. A test about where the dot sits vertically has to
+    /// say which font shape it means; the count/x tests use
+    /// [`emphasis_dots_for`] and are indifferent.
+    fn emphasis_dot_geometry(
+        cx: &mut TestAppContext,
+        src: &str,
+        row_height: Pixels,
+        ascent: Pixels,
+        descent: Pixels,
+    ) -> (Vec<Bounds<Pixels>>, Pixels, (Pixels, Pixels)) {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph block");
+            let font_size = font_size_for_block(&block.kind, &style);
+            let shaped = shape_block_lines(
+                &src_owned,
+                block,
+                &style,
+                font_size,
+                Some(px(720.0)),
+                window,
+            );
+            let sl = shaped.first().expect("a shaped line");
+            let lead = sl
+                .line
+                .position_for_index(0, row_height)
+                .expect("lead edge");
+            let trail = sl
+                .line
+                .position_for_index(3, row_height)
+                .expect("trail edge");
+            let dots = emphasis_dot_bounds(
+                &sl.line,
+                &sl.display_to_source,
+                point(px(0.0), px(0.0)),
+                row_height,
+                row_height,
+                block,
+                &style,
+                font_size,
+                ascent,
+                descent,
+            );
+            let half_leading = ((row_height - ascent - descent) / 2.0).max(px(0.0));
+            (dots, half_leading + ascent, (lead.x, trail.x))
+        })
+        .expect("update window")
+    }
+
+    /// Shape a document's first paragraph and return the emphasis-dot
+    /// bounds the paint pass would draw, in layout order.
+    fn emphasis_dots_for(cx: &mut TestAppContext, src: &str) -> Vec<Bounds<Pixels>> {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph block");
+            let font_size = font_size_for_block(&block.kind, &style);
+            let line_height = font_size * style.line_height.0;
+            let (body_ascent, body_descent) =
+                body_metrics_for_block(&block.kind, &style, font_size, window);
+            let shaped = shape_block_lines(
+                &src_owned,
+                block,
+                &style,
+                font_size,
+                Some(px(720.0)),
+                window,
+            );
+            let mut out = Vec::new();
+            for sl in shaped {
+                out.extend(emphasis_dot_bounds(
+                    &sl.line,
+                    &sl.display_to_source,
+                    point(px(0.0), px(0.0)),
+                    line_height,
+                    line_height,
+                    block,
+                    &style,
+                    font_size,
+                    body_ascent,
+                    body_descent,
+                ));
+            }
+            out
+        })
+        .expect("update window")
+    }
+
+    /// The `(text, is_italic)` of every shaped run of a document's first
+    /// paragraph — what `WrappedLine` is actually asked to draw.
+    fn run_italics(cx: &mut TestAppContext, src: &str) -> Vec<(String, bool)> {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph block");
+            let font_size = font_size_for_block(&block.kind, &style);
+            let shaped = shape_block_lines(
+                &src_owned,
+                block,
+                &style,
+                font_size,
+                Some(px(720.0)),
+                window,
+            );
+            let sl = shaped.into_iter().next().expect("a shaped line");
+            let runs = build_runs_for_line(&sl.line.text, &sl.display_to_source, block, &style);
+            let mut out = Vec::new();
+            let mut at = 0usize;
+            for run in runs {
+                let text = sl.line.text[at..at + run.len].to_string();
+                out.push((text, run.font.style == FontStyle::Italic));
+                at += run.len;
+            }
+            out
+        })
+        .expect("update window")
+    }
+
+    #[gpui::test]
+    fn emphasized_cjk_shapes_upright_while_latin_beside_it_shapes_italic(cx: &mut TestAppContext) {
+        // The whole span is emphasized, and the shaped runs carry both
+        // renderings: `FontStyle::Italic` matches no CJK face, so the
+        // dots stand in for it there and only there.
+        let runs = run_italics(cx, "*中文 latin 测试*");
+        let han: Vec<&(String, bool)> = runs
+            .iter()
+            .filter(|(t, _)| t.chars().any(crate::cjk::takes_emphasis_dot))
+            .collect();
+        assert!(!han.is_empty(), "the Han sub-runs must be present");
+        assert!(
+            han.iter().all(|(_, italic)| !*italic),
+            "no CJK run may ask for an italic face ({runs:?})"
+        );
+        assert!(
+            runs.iter()
+                .any(|(t, italic)| t.contains("latin") && *italic),
+            "the Latin sub-run keeps true italic ({runs:?})"
+        );
+    }
+
+    #[gpui::test]
+    fn an_ideographic_variation_sequence_stays_in_one_shaped_run(cx: &mut TestAppContext) {
+        // gpui shapes each `TextRun` on its own, so a selector split off
+        // into the italic run beside its base can no longer select that
+        // base's glyph variant — the ideograph the reader sees changes.
+        let src = "*\u{845B}\u{E0100}\u{57CE} and latin*";
+        let runs = run_italics(cx, src);
+        let holder = runs
+            .iter()
+            .find(|(t, _)| t.contains('\u{E0100}'))
+            .unwrap_or_else(|| panic!("the selector must survive shaping ({runs:?})"));
+        assert!(
+            holder.0.contains('\u{845B}'),
+            "the selector must shape with its base ({runs:?})"
+        );
+        assert!(
+            !holder.1,
+            "the sequence is CJK and must not ask for an italic face ({runs:?})"
+        );
+        assert!(
+            runs.iter()
+                .any(|(t, italic)| t.contains("latin") && *italic),
+            "the Latin sub-run keeps true italic ({runs:?})"
+        );
+    }
+
+    #[gpui::test]
+    fn a_zhuyin_tone_mark_shapes_with_its_syllable(cx: &mut TestAppContext) {
+        // ㄓㄨˋ with the tone in the italic run is mixed typography
+        // inside one syllable — two upright letters and a slanted tone.
+        let runs = run_italics(cx, "*\u{3113}\u{3128}\u{02CB} and latin*");
+        let holder = runs
+            .iter()
+            .find(|(t, _)| t.contains('\u{02CB}'))
+            .unwrap_or_else(|| panic!("the tone mark must survive shaping ({runs:?})"));
+        assert!(
+            holder.0.contains('\u{3128}'),
+            "the tone must shape with its syllable ({runs:?})"
+        );
+        assert!(
+            !holder.1,
+            "the syllable is CJK and must not ask for an italic face ({runs:?})"
+        );
+        assert!(
+            runs.iter()
+                .any(|(t, italic)| t.contains("latin") && *italic),
+            "the Latin sub-run keeps true italic ({runs:?})"
+        );
+
+        // The neutral tone is written before its syllable.
+        let runs = run_italics(cx, "*\u{02D9}\u{3109}\u{311C}*");
+        let holder = runs
+            .iter()
+            .find(|(t, _)| t.contains('\u{02D9}'))
+            .unwrap_or_else(|| panic!("the dot must survive shaping ({runs:?})"));
+        assert!(
+            holder.0.contains('\u{3109}') && !holder.1,
+            "the neutral-tone dot joins the syllable that follows it ({runs:?})"
+        );
+    }
+
+    #[gpui::test]
+    fn a_caron_in_latin_text_keeps_its_italic_face(cx: &mut TestAppContext) {
+        // The control for the case above: attachment is to the
+        // character immediately before the mark, and only when that
+        // character is already CJK. A caron riding a Latin letter is
+        // Latin typography and stays italic — even with a CJK run in
+        // the same emphasized span.
+        let runs = run_italics(cx, "*\u{4E2D}\u{6587} s\u{02C7} latin*");
+        let holder = runs
+            .iter()
+            .find(|(t, _)| t.contains('\u{02C7}'))
+            .unwrap_or_else(|| panic!("the caron must survive shaping ({runs:?})"));
+        assert!(
+            holder.1,
+            "a Latin caron must not be dragged upright ({runs:?})"
+        );
+        assert_eq!(
+            emphasis_dots_for(cx, "*\u{4E2D}\u{6587} s\u{02C7} latin*").len(),
+            2,
+            "only the two Han characters are marked"
+        );
+    }
+
+    #[gpui::test]
+    fn a_variation_selector_takes_no_dot_and_leaves_its_base_alone(cx: &mut TestAppContext) {
+        // The selector marks nothing of its own, and the base measures
+        // its own advance regardless (see `emphasis_dot_bounds`). Only
+        // the base's dot is compared: this harness's text system gives
+        // every character a uniform advance and so cannot represent a
+        // zero-width selector, which makes the *following* character's
+        // position a property of the stub rather than of the editor.
+        let with = emphasis_dots_for(cx, "*\u{845B}\u{E0100}\u{57CE}*");
+        let without = emphasis_dots_for(cx, "*\u{845B}\u{57CE}*");
+        assert_eq!(
+            with.len(),
+            2,
+            "one dot per ideograph, none for the selector"
+        );
+        assert_eq!(
+            with[0], without[0],
+            "the selector must not move its base's dot"
+        );
+    }
+
+    /// Open a window and run `f` with a theme-derived style.
+    fn with_style<R>(
+        cx: &mut TestAppContext,
+        f: impl FnOnce(&mut Window, &MarkdownStyle) -> R,
+    ) -> R {
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            f(window, &style)
+        })
+        .expect("update window")
+    }
+
+    #[gpui::test]
+    fn an_embedded_table_cell_gets_its_emphasis_dots(cx: &mut TestAppContext) {
+        // Only the *shaping* path is shared with an embed, so every
+        // non-text decoration has to be re-emitted there. The editor's
+        // own table pieces become `LaidOutLine`s and ride the regular
+        // per-line pass; the embed's do not, and shaping has already
+        // dropped the italic face — so without this the cell showed
+        // upright unmarked text.
+        let content = "| head | col |\n| --- | --- |\n| *中文* | plain |\n";
+        let dots = with_style(cx, |window, style| {
+            layout_embed(content, style, px(600.0), window)
+                .emphasis_dots
+                .len()
+        });
+        assert_eq!(dots, 2, "one dot per emphasized character in the cell");
+    }
+
+    #[gpui::test]
+    fn a_table_cell_gets_its_emphasis_dots_outside_an_embed_too(cx: &mut TestAppContext) {
+        // The control for the case above — the editor's own table path.
+        let src = "| head | col |\n| --- | --- |\n| *中文* | plain |\n";
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let dots = with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+                .expect("table block");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let (a, d) = body_metrics_for_block(&block.kind, style, font_size, window);
+            let layout = layout_table(block, src, font_size, style, px(600.0), window)
+                .expect("table layout");
+            layout
+                .pieces
+                .iter()
+                .map(|piece| {
+                    emphasis_dot_bounds(
+                        &piece.line,
+                        &piece.display_to_source,
+                        point(px(0.0), px(0.0)),
+                        line_height,
+                        line_height,
+                        block,
+                        style,
+                        font_size,
+                        a,
+                        d,
+                    )
+                    .len()
+                })
+                .sum::<usize>()
+        });
+        assert_eq!(dots, 2);
+    }
+
+    #[gpui::test]
+    fn a_dot_under_the_first_glyph_of_a_wrap_row_lands_on_that_row(cx: &mut TestAppContext) {
+        // A boundary index resolves to the *upper* row in gpui, so the
+        // dot for the character that opens a wrap row was painted at the
+        // previous row's right edge — past the wrap width, on the wrong
+        // line.
+        let src = "*中文测试强调的文字还有更多内容*";
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let wrap_w = px(90.0);
+        let (dots, rows) = with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let (a, d) = body_metrics_for_block(&block.kind, style, font_size, window);
+            let shaped = shape_block_lines(src, block, style, font_size, Some(wrap_w), window);
+            let sl = shaped.first().expect("a shaped line");
+            let rows = sl.line.wrap_boundaries().len() + 1;
+            let dots = emphasis_dot_bounds(
+                &sl.line,
+                &sl.display_to_source,
+                point(px(0.0), px(0.0)),
+                line_height,
+                line_height,
+                block,
+                style,
+                font_size,
+                a,
+                d,
+            );
+            (dots, rows)
+        });
+        assert!(
+            rows > 1,
+            "the line must soft-wrap for this to mean anything"
+        );
+        assert!(!dots.is_empty());
+        for dot in &dots {
+            assert!(
+                dot.origin.x + dot.size.width <= wrap_w,
+                "no dot may sit past the wrap width (dot at {:?})",
+                dot.origin
+            );
+        }
+        // Dots march left to right *within* a row and reset each row, so
+        // an x that goes backwards must be paired with a new y.
+        for pair in dots.windows(2) {
+            if pair[1].origin.x <= pair[0].origin.x {
+                assert!(
+                    pair[1].origin.y > pair[0].origin.y,
+                    "an x that resets belongs to a new row ({:?} then {:?})",
+                    pair[0].origin,
+                    pair[1].origin
+                );
+            } else {
+                assert_eq!(
+                    pair[1].origin.y, pair[0].origin.y,
+                    "dots advancing rightwards stay on one row"
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn math_that_fails_to_typeset_keeps_the_chip_of_its_fallback(cx: &mut TestAppContext) {
+        // A construct whose LaTeX will not parse falls back to dimmed
+        // delimiters + mono content — the same treatment the cursor-
+        // inside view gives, faint background included. That fallback is
+        // added by `augment_block_with_math` to the block it *shapes*,
+        // so a paint pass reading the un-augmented block sees no `code`
+        // style and paints no chip. `PrepaintState::shaped_block` is
+        // what the paint pass must consult, and this is why.
+        let src = r"before $\frac{1}$ after";
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let (before_augment, after_augment) = with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph");
+            assert_eq!(
+                block.math_overlays.len(),
+                1,
+                "the fixture must actually produce a math overlay"
+            );
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let (augmented, specs) = augment_block_with_math(block, src, font_size, style, window);
+            assert!(
+                specs.is_empty(),
+                "the fixture's LaTeX must actually fail to typeset"
+            );
+            let shaped =
+                shape_block_lines(src, &augmented, style, font_size, Some(px(720.0)), window);
+            let sl = shaped.first().expect("a shaped line");
+            let chips = |b: &RenderBlock| {
+                run_background_bounds(
+                    &sl.line,
+                    &sl.display_to_source,
+                    point(px(0.0), px(0.0)),
+                    line_height,
+                    line_height,
+                    b,
+                    style,
+                )
+                .len()
+            };
+            (chips(block), chips(&augmented))
+        });
+        assert_eq!(
+            before_augment, 0,
+            "the un-augmented block carries no fallback style — the trap"
+        );
+        assert!(
+            after_augment > 0,
+            "the shaped block does, so the fallback keeps its chip"
+        );
+    }
+
+    #[gpui::test]
+    fn a_row_reservation_does_not_stretch_the_inline_code_chip(cx: &mut TestAppContext) {
+        // Tall math and an inline-code span on one logical line: the row
+        // stride grows to hold the math's overshoot, but the chip must
+        // still fill only the text row. gpui's own background pass takes
+        // one number for both, which is why the editor draws the chip.
+        let src = r"see $\frac{\frac{a}{b}}{\frac{c}{d}}$ and `code` here";
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let (chips, line_height, stride) = with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let (augmented, math_specs) =
+                augment_block_with_math(block, src, font_size, style, window);
+            let (a, d) = body_metrics_for_block(&block.kind, style, font_size, window);
+            let shaped =
+                shape_block_lines(src, &augmented, style, font_size, Some(px(720.0)), window);
+            let sl = shaped.first().expect("a shaped line");
+            let extra = compute_math_row_extra(&sl.source_range, &math_specs, a, d, line_height);
+            let stride = line_height + extra.total();
+            let chips = run_background_bounds(
+                &sl.line,
+                &sl.display_to_source,
+                point(px(0.0), px(0.0)),
+                stride,
+                line_height,
+                &augmented,
+                style,
+            );
+            (chips, line_height, stride)
+        });
+        assert!(
+            stride > line_height,
+            "the math must actually reserve a row extra (stride {stride:?})"
+        );
+        assert!(
+            !chips.is_empty(),
+            "the inline-code span must produce a chip"
+        );
+        for chip in &chips {
+            assert_eq!(
+                chip.size.height, line_height,
+                "the chip fills the text row, not the stride"
+            );
+        }
+    }
+
+    /// Shape `src`'s first paragraph at `wrap_w` and return the chip
+    /// bounds plus each visual row's true right edge.
+    fn wrapped_chip_geometry(
+        cx: &mut TestAppContext,
+        src: &'static str,
+        wrap_w: Pixels,
+    ) -> (Vec<Bounds<Pixels>>, Vec<Pixels>) {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let shaped = shape_block_lines(src, block, style, font_size, Some(wrap_w), window);
+            let sl = shaped.first().expect("a shaped line");
+            let chips = run_background_bounds(
+                &sl.line,
+                &sl.display_to_source,
+                point(px(0.0), px(0.0)),
+                line_height,
+                line_height,
+                block,
+                style,
+            );
+            let edges = wrap_row_right_edges(&sl.line, line_height).to_vec();
+            (chips, edges)
+        })
+    }
+
+    #[gpui::test]
+    fn a_wrapped_inline_code_chip_ends_at_each_rows_last_glyph(cx: &mut TestAppContext) {
+        // A code span breaking at a word boundary leaves blank space
+        // between the row's last glyph and the wrap width.
+        // `WrappedLine::width()` reports the *configured* wrap width for
+        // any line that wrapped, so filling to it painted the chip
+        // through that blank.
+        let wrap_w = px(150.0);
+        let (chips, edges) =
+            wrapped_chip_geometry(cx, "`alpha beta gamma delta epsilon zeta` tail", wrap_w);
+        assert!(chips.len() > 2, "the span must cross at least two wraps");
+        assert!(
+            edges
+                .iter()
+                .take(edges.len() - 1)
+                .any(|e| *e < wrap_w - px(1.0)),
+            "the fixture must actually leave trailing blank on a row ({edges:?})"
+        );
+        for chip in &chips {
+            let right = chip.origin.x + chip.size.width;
+            assert!(
+                right <= wrap_w,
+                "no chip may reach past the wrap width (right {right:?})"
+            );
+        }
+        // Every chip's right edge is one of the rows' true text edges (or
+        // the span's own end on the last row) — never the wrap width when
+        // that row's text stopped short.
+        for (chip, edge) in chips.iter().zip(edges.iter()) {
+            let right = chip.origin.x + chip.size.width;
+            assert!(
+                right <= *edge + px(0.01),
+                "chip right {right:?} overruns its row's text edge {edge:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_span_whose_end_the_layout_cannot_answer_still_paints(cx: &mut TestAppContext) {
+        // `position_for_index` answers `None` for an index past the last
+        // glyph in the wrap layout. Treating that as failure discarded
+        // *every* quad of a span whose start resolved perfectly well —
+        // a whole decoration lost to a partial answer. The end falls
+        // back to the line's last-row right edge, which is the same
+        // answer `LaidOutLine::local_position_for_source_offset` gives
+        // the caret in that position.
+        let src = "`alpha beta gamma delta epsilon zeta` tail";
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let wrap_w = px(150.0);
+        with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let shaped = shape_block_lines(src, block, style, font_size, Some(wrap_w), window);
+            let sl = shaped.first().expect("a shaped line");
+            let unanswerable = sl.line.text.len() + 1;
+            assert!(
+                sl.line
+                    .position_for_index(unanswerable, line_height)
+                    .is_none(),
+                "the fixture must actually be unanswerable"
+            );
+
+            let mut out = Vec::new();
+            push_row_spanning_bounds(
+                &sl.line,
+                0,
+                unanswerable,
+                point(px(0.0), px(0.0)),
+                line_height,
+                line_height,
+                &mut out,
+            );
+            assert!(
+                !out.is_empty(),
+                "the span's rows must still paint when only its end is unanswerable"
+            );
+            let last = out.last().expect("a quad");
+            assert_eq!(
+                last.origin.x + last.size.width,
+                end_of_line_position(&sl.line, line_height).x,
+                "the end falls back to the caret's end-of-line rule"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_wrapped_selection_wash_ends_at_each_rows_last_glyph(cx: &mut TestAppContext) {
+        // The wash shares the geometry, so it shared the defect — one
+        // rule now serves the chip, the selection and the highlight wash.
+        let src = "one two three four five six seven eight nine ten eleven twelve";
+        let wrap_w = px(150.0);
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Range {
+                anchor: 0,
+                head: src.len(),
+            },
+            ..Default::default()
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let (quads, edges) = with_style(cx, |window, style| {
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph");
+            let font_size = font_size_for_block(&block.kind, style);
+            let line_height = font_size * style.line_height.0;
+            let shaped = shape_block_lines(src, block, style, font_size, Some(wrap_w), window);
+            let sl = shaped.into_iter().next().expect("a shaped line");
+            let laid = LaidOutLine {
+                line: sl.line,
+                origin: point(px(0.0), px(0.0)),
+                row_height: line_height,
+                row_stride: line_height,
+                wrapped_height: line_height,
+                source_range: sl.source_range,
+                display_to_source: sl.display_to_source,
+                is_delimiter: sl.is_delimiter,
+            };
+            let edges = wrap_row_right_edges(&laid.line, line_height).to_vec();
+            let mut out = Vec::new();
+            paint_selection_for_line(
+                &laid,
+                0,
+                src.len(),
+                src.len(),
+                gpui::hsla(0., 0., 0., 1.),
+                &mut out,
+            );
+            (out, edges)
+        });
+        assert!(
+            quads.len() > 2,
+            "the selection must cross at least two wraps"
+        );
+        assert!(
+            edges
+                .iter()
+                .take(edges.len() - 1)
+                .any(|e| *e < wrap_w - px(1.0)),
+            "the fixture must leave trailing blank on a row ({edges:?})"
+        );
+        for (quad, edge) in quads.iter().zip(edges.iter()) {
+            let right = quad.quad.bounds.origin.x + quad.quad.bounds.size.width;
+            assert!(
+                right <= *edge + px(0.01),
+                "wash right {right:?} overruns its row's text edge {edge:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn emphasized_cjk_gets_one_dot_per_character(cx: &mut TestAppContext) {
+        // Four emphasized Han characters, four dots — and nothing under
+        // the unemphasized text on either side.
+        let dots = emphasis_dots_for(cx, "前面 *强调的字* 后面");
+        assert_eq!(dots.len(), 4, "one dot per emphasized character");
+        let xs: Vec<f32> = dots.iter().map(|b| b.origin.x.into()).collect();
+        assert!(
+            xs.windows(2).all(|w| w[1] > w[0]),
+            "dots march left to right with the glyphs ({xs:?})"
+        );
+    }
+
+    #[gpui::test]
+    fn a_tight_line_height_keeps_the_dot_inside_its_row(cx: &mut TestAppContext) {
+        // `line_height` is a host knob. Tightened below ascent + descent
+        // it leaves less descender space than the dot's drop asks for,
+        // and an unclamped dot lands in the row below — where it reads
+        // as marking the wrong character.
+        let (ascent, descent) = (px(14.5), px(4.5));
+        let row_height = px(17.0);
+        let (dots, baseline, _) =
+            emphasis_dot_geometry(cx, "*\u{4E2D}\u{6587}*", row_height, ascent, descent);
+        assert_eq!(dots.len(), 2, "both characters still take a dot");
+        for dot in &dots {
+            // Resting exactly on the row's bottom edge: the clamp is
+            // what placed it, so this fixture is genuinely tight.
+            assert_eq!(dot.origin.y + dot.size.height, row_height);
+            assert!(
+                dot.origin.y > baseline,
+                "clamping must not push the mark onto its glyph \
+                 (dot {:?}, baseline {baseline:?})",
+                dot.origin.y
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_mixed_emphasis_run_dots_only_its_cjk(cx: &mut TestAppContext) {
+        // `中文` + `测试` take dots; `latin` shapes italic and the two
+        // fullwidth commas are punctuation, so six characters carry four
+        // dots.
+        let dots = emphasis_dots_for(cx, "*中文，latin，测试*");
+        assert_eq!(dots.len(), 4);
+    }
+
+    #[gpui::test]
+    fn latin_emphasis_paints_no_dots(cx: &mut TestAppContext) {
+        assert!(emphasis_dots_for(cx, "before *italic* after").is_empty());
+    }
+
+    #[gpui::test]
+    fn an_emphasis_dot_clears_the_baseline_and_centers_under_its_glyph(cx: &mut TestAppContext) {
+        // The mark belongs under the character it emphasizes: below the
+        // baseline so it never touches the glyph, and centered on the
+        // glyph's own advance so a row of dots tracks the characters.
+        // Metrics of a real body face at this size, stated rather than
+        // taken from the harness — see `emphasis_dot_geometry`.
+        let row_height = px(24.0);
+        let (dots, baseline, glyph_edges) =
+            emphasis_dot_geometry(cx, "*\u{5F3A}\u{8C03}*", row_height, px(14.5), px(4.5));
+        assert_eq!(dots.len(), 2);
+
+        let dot = dots[0];
+        assert!(
+            dot.origin.y > baseline,
+            "the dot clears the baseline (dot {:?}, baseline {baseline:?})",
+            dot.origin.y
+        );
+        assert!(
+            dot.origin.y + dot.size.height < row_height,
+            "and sits well inside a generous row, unclamped ({dot:?})"
+        );
+        let center_x = dot.origin.x + dot.size.width / 2.0;
+        assert!(
+            center_x > glyph_edges.0 && center_x < glyph_edges.1,
+            "the dot centers under its glyph (center {center_x:?} in {glyph_edges:?})"
+        );
     }
 
     #[gpui::test]
@@ -4910,6 +6219,7 @@ mod tests {
                     line: piece.line.clone(),
                     origin: point(piece.rel_origin.x, piece.rel_origin.y),
                     row_height: line_height,
+                    row_stride: line_height,
                     wrapped_height: piece.wrapped_height,
                     source_range: piece.source_range.clone(),
                     display_to_source: piece.display_to_source.clone(),

@@ -1268,7 +1268,7 @@ impl MarkdownEditorState {
         );
         let global_x = line.origin.x + local.x;
         let target_x = self.intended_x.unwrap_or(global_x);
-        let row_h = line.row_height;
+        let row_h = line.row_stride;
         if row_h <= px(0.) {
             return None;
         }
@@ -1487,7 +1487,7 @@ impl MarkdownEditorState {
             cursor,
             matches!(self.wrap_affinity, WrapAffinity::Downstream),
         );
-        let row_h = line.row_height;
+        let row_h = line.row_stride;
         if row_h <= px(0.) {
             return None;
         }

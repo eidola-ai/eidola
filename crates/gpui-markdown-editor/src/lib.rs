@@ -14,6 +14,7 @@
 //! ```
 
 pub mod analysis;
+pub mod cjk;
 pub mod editor;
 pub mod element;
 pub mod embed;
