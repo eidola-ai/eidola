@@ -119,6 +119,7 @@ check:
     rumdl check .
     cargo-deny check licenses bans sources
     ./scripts/check-manifest-determinism.sh
+    ./scripts/test-release-assets.sh
 
 # Apply auto-fixable markdown formatting via rumdl
 format:
@@ -218,6 +219,12 @@ pack-shipping-zip tree output:
 # — no Nix, no toolchain.
 test-shipping-zip:
     ./scripts/test-shipping-zip.sh
+
+# Drive every branch of the release-asset check — the gate between the
+# signed manifest and the files a tagged release attaches. That check
+# otherwise runs only on a real `v*` tag; this runs it on every PR.
+test-release-assets:
+    ./scripts/test-release-assets.sh
 
 # Compute enclave measurements from tinfoil-config.yml and CVM artifacts
 measure:

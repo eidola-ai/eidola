@@ -400,11 +400,24 @@ jobs:
         id: partial
         run: |
           ./scripts/artifact-manifest.sh build-macos \
-            --output /tmp/macos-artifact-manifest.json
+            --output /tmp/macos-artifact-manifest.json \
+            --artifact-dir /tmp/eidola-release-assets
 
           echo "actual<<EOF" >> "$GITHUB_OUTPUT"
           cat /tmp/macos-artifact-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the macOS archives
+        # The bytes `archiveSha256` covers, kept rather than discarded:
+        # docs/verification.md promises a `sha256sum` a user can run, which
+        # needs the file to exist somewhere they can fetch it. The tagged
+        # release workflow pulls these from this run and re-checks each
+        # hash against the manifest before attaching them.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets-macos
+          path: /tmp/eidola-release-assets
+          if-no-files-found: error
 
       - name: Build the unsigned macOS shipping zip
         # The container a macOS download arrives in, built from the same
@@ -431,7 +444,7 @@ jobs:
 
   # ── Linux GUI (cheap ubuntu runner, Nix) ─────────────────────────────────────
   # The GUI's Linux release artifact is Nix-built (glibc dynamic binary; see
-  # flake.nix's eidola-gui-linux for why it can't be a static musl OCI
+  # flake.nix's eidola-gui-linux-nix for why it can't be a static musl OCI
   # artifact like the server/cli). Mirrors the apple job: install the
   # stamped trust root from the oci job, then record the narHash +
   # archiveSha256 partial.
@@ -509,15 +522,113 @@ jobs:
           name: eidola
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
-      - name: Build Linux GUI
+      - name: Build Linux GUI and the amd64 Debian package
         id: partial
         run: |
           ./scripts/artifact-manifest.sh build-linux-gui \
-            --output /tmp/linux-gui-artifact-manifest.json
+            --output /tmp/linux-gui-artifact-manifest.json \
+            --artifact-dir /tmp/eidola-release-assets
 
           echo "actual<<EOF" >> "$GITHUB_OUTPUT"
           cat /tmp/linux-gui-artifact-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the Linux amd64 release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets-linux-amd64
+          path: /tmp/eidola-release-assets
+          if-no-files-found: error
+
+  # ── Linux arm64 Debian package (native arm runner, Nix) ──────────────────────
+  # The arm64 `.deb` has no Nix-installable sibling — it is one artifact row
+  # and one release asset. It gets a *native* runner rather than emulation:
+  # the release build's fat LTO link peaks over 9 GiB of RSS, which under
+  # qemu is not a CI-shaped workload.
+  #
+  # Below the schema that records the arm64 deb, this job's manifest partial
+  # is deliberately empty: the build still runs on every main push, so the
+  # path is exercised long before the release that first records it, while
+  # the emitted manifest keeps the shape shipped clients expect.
+  linux-deb-arm64:
+    name: Linux arm64 .deb build
+    needs: oci
+    runs-on: ubuntu-24.04-arm
+    # Longer than the amd64 job's 120: the project cache starts with no
+    # aarch64-linux paths at all, so the first runs compile the whole gpui
+    # tree and the static sidecar from source. Warm runs finish in minutes.
+    timeout-minutes: 180
+    # Same Cachix write-token gating as the apple and linux-gui jobs.
+    environment: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'cachix-write' || '' }}
+    outputs:
+      artifact_manifest: ${{ steps.partial.outputs.actual }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free up disk space
+        # Same reclaim as the linux-gui job: the Nix build compiles the full
+        # gpui tree from source on a cold Cachix cache. `rm -rf` ignores any
+        # path absent on a given image.
+        run: |
+          before=$(df --output=avail -BG / | tail -1)
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift
+          echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
+
+      - name: Install stamped tinfoil-config.yml + recomputed server-enclave.json
+        env:
+          STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
+          SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
+        run: |
+          # The package embeds app-core's trust root, so it must be built
+          # against exactly the trust root the oci job produced.
+          printf '%s\n' "$STAMPED_CONFIG" > tinfoil-config.yml
+          printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            sandbox = true
+            sandbox-fallback = false
+
+      # Skipped on v* release tags, like every other attested build here.
+      - name: Configure Nix binary cache
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: eidola
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+
+      - name: Build the arm64 Debian package
+        id: partial
+        run: |
+          ./scripts/artifact-manifest.sh build-linux-deb \
+            --output /tmp/linux-deb-artifact-manifest.json \
+            --artifact-dir /tmp/eidola-release-assets
+
+          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/linux-deb-artifact-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the Linux arm64 release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets-linux-arm64
+          path: /tmp/eidola-release-assets
+          if-no-files-found: error
 
   artifact-manifest:
     name: Verify artifact manifest
@@ -525,6 +636,7 @@ jobs:
       - oci
       - apple
       - linux-gui
+      - linux-deb-arm64
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -567,6 +679,7 @@ jobs:
           OCI_MANIFEST: ${{ needs.oci.outputs.artifact_manifest }}
           APPLE_MANIFEST: ${{ needs.apple.outputs.artifact_manifest }}
           LINUX_GUI_MANIFEST: ${{ needs.linux-gui.outputs.artifact_manifest }}
+          LINUX_DEB_MANIFEST: ${{ needs.linux-deb-arm64.outputs.artifact_manifest }}
         run: |
           # Overwrite the workspace tinfoil-config.yml and server-enclave.json
           # with the authoritative values the oci job produced. verify-full
@@ -580,6 +693,7 @@ jobs:
           printf '%s' "$OCI_MANIFEST" > /tmp/oci-artifact-manifest.json
           printf '%s' "$APPLE_MANIFEST" > /tmp/apple-artifact-manifest.json
           printf '%s' "$LINUX_GUI_MANIFEST" > /tmp/linux-gui-artifact-manifest.json
+          printf '%s' "$LINUX_DEB_MANIFEST" > /tmp/linux-deb-artifact-manifest.json
 
       - name: Verify full artifact manifest
         id: verify
@@ -590,6 +704,7 @@ jobs:
             --partial /tmp/oci-artifact-manifest.json \
             --partial /tmp/apple-artifact-manifest.json \
             --partial /tmp/linux-gui-artifact-manifest.json \
+            --partial /tmp/linux-deb-artifact-manifest.json \
             --manifest artifact-manifest.json \
             --config tinfoil-config.yml \
             --server-enclave releases/trust/server-enclave.json \

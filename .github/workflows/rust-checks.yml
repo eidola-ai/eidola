@@ -132,6 +132,13 @@ jobs:
         # determinism regressions behind flake.nix's mkShippingZip.
         run: ./scripts/test-shipping-zip.sh
 
+      - name: Test release-asset verification
+        # Deliberately ungated, like the determinism check above: this is
+        # the gate between the signed manifest and the files a tagged
+        # release attaches, and it otherwise runs only on a real `v*` tag.
+        # Bash + python3, no toolchain.
+        run: ./scripts/test-release-assets.sh
+
       - name: Check legal document versioning
         # The published legal documents (www/pages/terms.md, privacy.md)
         # are accepted by the SHA-256 of their exact bytes, ordered by a
