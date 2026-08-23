@@ -557,44 +557,45 @@ check_workflow() {
 
       job == "" { next }
 
-      # Any new key at job level closes whatever block was being collected.
-      /^    [A-Za-z0-9_-]+:/ { collecting_needs = 0; collecting_env = 0 }
-
-      /^    needs:/ {
-        value = decomment($0)
-        sub(/^    needs:[ \t]*/, "", value)
-        raw[job, "needs"] = raw[job, "needs"] " " value
-        collecting_needs = 1
-        next
+      # One reader for job-level keys, the same one the header uses. YAML
+      # allows whitespace before a colon and quotes around a key, so the
+      # key is read rather than pattern-matched — `needs :`, `"needs":` and
+      # `needs:` are one key, and any job-level key at all closes whatever
+      # block was being collected.
+      /^    [^ \t#]/ {
+        line = decomment($0)
+        sub(/^    /, "", line)
+        if (split_key(line)) {
+          key = KEY
+          if (classify_scalar(key) == "") key = SCALAR
+          else key = normalize_ws(key)
+          value = normalize_ws(REST)
+          collecting_needs = 0
+          collecting_env = 0
+          if (key == "needs") {
+            raw[job, "needs"] = raw[job, "needs"] " " value
+            collecting_needs = 1
+          } else if (key == "environment") {
+            raw[job, "environment"] = raw[job, "environment"] " " value
+            collecting_env = 1
+          } else if (key == "uses") {
+            raw[job, "uses"] = value
+          } else if (key == "<<") {
+            # A merge key splices another mapping into this job, which can
+            # carry an `environment:` that never appears here as a key.
+            # Recorded, not resolved.
+            merge_key[job] = 1
+          }
+          next
+        }
       }
+
       collecting_needs && /^      / {
         raw[job, "needs"] = raw[job, "needs"] " " decomment($0)
         next
       }
-      /^    environment:/ {
-        value = decomment($0)
-        sub(/^    environment:[ \t]*/, "", value)
-        raw[job, "environment"] = raw[job, "environment"] " " value
-        collecting_env = 1
-        next
-      }
       collecting_env && /^      / {
         raw[job, "environment"] = raw[job, "environment"] " " decomment($0)
-        next
-      }
-
-      # A merge key splices another mapping into this job, which can carry
-      # an `environment:` that never appears here as a key. Recorded, not
-      # resolved.
-      /^    <<[ \t]*:/ { merge_key[job] = 1; next }
-
-      # A job-level `uses:` is a call to another workflow. Its jobs, their
-      # environments and their outputs live in a file this scanner is not
-      # reading. Recorded here; refused below if it can reach the manifest.
-      /^    uses:[ \t]*/ {
-        calls = decomment($0)
-        sub(/^    uses:[ \t]*/, "", calls)
-        raw[job, "uses"] = calls
         next
       }
 

@@ -206,8 +206,16 @@ test-verify-apple:
 check-manifest-determinism:
     ./scripts/check-manifest-determinism.sh
 
-# Symlink and determinism regressions for flake.nix's macOS shipping-zip
-# recipe. Info-ZIP only — no Nix, no toolchain.
+# Pack a directory tree into the macOS shipping container, byte for byte —
+# the re-zip half of forward verification, for the tree `just verify-apple`
+# reconstructs. Same recipe the flake's zip derivation runs; runs on macOS
+# or Linux with POSIX shell and Info-ZIP.
+pack-shipping-zip tree output:
+    ./scripts/pack-shipping-zip.sh "{{ tree }}" "{{ output }}"
+
+# Symlink and determinism regressions for the shipping-zip recipe, and the
+# assertion that the flake runs it rather than restating it. Info-ZIP only
+# — no Nix, no toolchain.
 test-shipping-zip:
     ./scripts/test-shipping-zip.sh
 
