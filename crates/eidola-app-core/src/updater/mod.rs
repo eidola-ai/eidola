@@ -684,28 +684,19 @@ fn check_continuity(
 
 /// Fetch the latest `release.json` asset from the GitHub releases API.
 async fn fetch_release_json_network(client: &reqwest::Client) -> Result<Vec<u8>, AppError> {
-    let resp = client
-        .get(trust_root::UPDATE_DISCOVERY_URL)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| AppError::Update {
-            message: format!("GET {}: {e}", trust_root::UPDATE_DISCOVERY_URL),
-        })?;
-    let status = resp.status();
-    let body_bytes = resp.bytes().await.map_err(|e| AppError::Update {
-        message: format!("reading response body: {e}"),
-    })?;
-    if !status.is_success() {
-        return Err(AppError::Update {
-            message: format!(
-                "GET {} → HTTP {} ({})",
-                trust_root::UPDATE_DISCOVERY_URL,
-                status,
-                String::from_utf8_lossy(&body_bytes).trim()
-            ),
-        });
-    }
+    // Same bounds as every other fetch. This URL is pinned in the trust
+    // root rather than taken from an index, but the *response* is still
+    // someone else's, and a discovery endpoint that stalls or answers with
+    // gigabytes should not be the one unbounded read left in the pipeline.
+    let body_bytes = fetch_url_network_with(
+        client,
+        trust_root::UPDATE_DISCOVERY_URL,
+        "application/vnd.github+json",
+        "the release feed",
+        MAX_DOCUMENT_BYTES,
+        FETCH_STALL_TIMEOUT,
+    )
+    .await?;
     let gh: GhRelease = serde_json::from_slice(&body_bytes).map_err(|e| AppError::Update {
         message: format!("parsing GitHub release JSON: {e}"),
     })?;
@@ -730,6 +721,33 @@ async fn fetch_release_json_network(client: &reqwest::Client) -> Result<Vec<u8>,
 
 /// Fetch a single URL's body bytes. Errors carry the file label so the
 /// caller doesn't have to reformat them.
+/// As much of a failed response as is worth repeating back.
+///
+/// An error body is a diagnostic, and a hostile one is whatever the server
+/// felt like sending — up to the ceiling the read allows. Interpolating it
+/// whole would allocate a second copy of it, and a lossy conversion of
+/// invalid UTF-8 grows: every bad byte becomes a three-byte replacement.
+/// So it is cut first, on a character boundary, and cut again if the
+/// conversion inflates it.
+const ERROR_BODY_EXCERPT: usize = 1024;
+
+fn excerpt(bytes: &[u8]) -> String {
+    let head = &bytes[..bytes.len().min(ERROR_BODY_EXCERPT)];
+    let mut text = String::from_utf8_lossy(head).trim().to_string();
+    if text.len() > ERROR_BODY_EXCERPT {
+        // The lossy conversion inflated it; cut on a character boundary.
+        let mut end = ERROR_BODY_EXCERPT;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    if bytes.len() > head.len() {
+        text.push('…');
+    }
+    text
+}
+
 /// How long a transfer may say nothing before it counts as dead.
 ///
 /// Shorter than the model downloader's equivalent because these fetches
@@ -758,7 +776,15 @@ async fn fetch_url_network(
     label: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>, AppError> {
-    fetch_url_network_with(client, url, label, max_bytes, FETCH_STALL_TIMEOUT).await
+    fetch_url_network_with(
+        client,
+        url,
+        "application/octet-stream",
+        label,
+        max_bytes,
+        FETCH_STALL_TIMEOUT,
+    )
+    .await
 }
 
 /// The body of [`fetch_url_network`], with the silence bound supplied —
@@ -766,20 +792,30 @@ async fn fetch_url_network(
 async fn fetch_url_network_with(
     client: &reqwest::Client,
     url: &str,
+    accept: &str,
     label: &str,
     max_bytes: u64,
     stall: std::time::Duration,
 ) -> Result<Vec<u8>, AppError> {
     use futures_util::StreamExt;
 
-    let resp = client
-        .get(url)
-        .header("Accept", "application/octet-stream")
-        .send()
-        .await
-        .map_err(|e| AppError::Update {
-            message: format!("GET {label}: {}", crate::error::request_error_text(e)),
-        })?;
+    // Connecting is bounded on the client and each body read is bounded
+    // below, which leaves the gap between them: a server can complete the
+    // handshake and then never send a status line. `send()` resolves when
+    // the *headers* arrive, so that wait needs the same silence bound —
+    // and not a whole-request timeout, which would cut off a large
+    // container that is still arriving.
+    let resp =
+        match tokio::time::timeout(stall, client.get(url).header("Accept", accept).send()).await {
+            Ok(sent) => sent.map_err(|e| AppError::Update {
+                message: format!("GET {label}: {}", crate::error::request_error_text(e)),
+            })?,
+            Err(_) => {
+                return Err(AppError::Update {
+                    message: format!("{label} sent no response headers within {stall:?}"),
+                });
+            }
+        };
     let status = resp.status();
 
     if let Some(claimed) = resp.content_length()
@@ -825,11 +861,7 @@ async fn fetch_url_network_with(
 
     if !status.is_success() {
         return Err(AppError::Update {
-            message: format!(
-                "{label} returned HTTP {} ({})",
-                status,
-                String::from_utf8_lossy(&bytes).trim()
-            ),
+            message: format!("{label} returned HTTP {} ({})", status, excerpt(&bytes)),
         });
     }
     Ok(bytes)
@@ -1077,6 +1109,7 @@ mod tests {
             let err = fetch_url_network_with(
                 &client_for_test(),
                 &url,
+                "application/octet-stream",
                 "a payload",
                 1024,
                 std::time::Duration::from_millis(200),
@@ -1084,6 +1117,70 @@ mod tests {
             .await
             .expect_err("a silent transfer must not be waited on forever");
             assert!(format!("{err}").contains("stopped sending"), "got: {err}");
+        }
+
+        /// Headers that never arrive. The handshake completes, so the
+        /// connect bound is satisfied and the body bound never gets a
+        /// chance to apply — this is the gap between the two.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refuses_a_server_that_never_sends_headers() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((socket, _)) = listener.accept().await {
+                    // Accept, read nothing, answer nothing, hold it open.
+                    let _held = socket;
+                    std::future::pending::<()>().await;
+                }
+            });
+
+            let url = format!("http://{addr}/asset.zip");
+            let err = fetch_url_network_with(
+                &client_for_test(),
+                &url,
+                "application/octet-stream",
+                "a payload",
+                1024,
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect_err("a server that never answers must not be waited on forever");
+            assert!(
+                format!("{err}").contains("no response headers"),
+                "got: {err}"
+            );
+        }
+
+        /// A failed response is a diagnostic. Repeating a hostile one back
+        /// whole is a second allocation of whatever it felt like sending —
+        /// and invalid UTF-8 grows on the way.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn quotes_only_an_excerpt_of_a_failure_body() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(
+                    wiremock::ResponseTemplate::new(500).set_body_bytes(vec![0xffu8; 200_000]),
+                )
+                .mount(&server)
+                .await;
+
+            let err = fetch_url_network_with(
+                &client_for_test(),
+                &format!("{}/asset.zip", server.uri()),
+                "application/octet-stream",
+                "a payload",
+                1_000_000,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("HTTP 500 is an error");
+            let msg = format!("{err}");
+            assert!(msg.contains("500"), "got: {msg}");
+            assert!(
+                msg.len() < 4096,
+                "a failure message must not carry the body back: {} bytes",
+                msg.len()
+            );
         }
 
         fn client_for_test() -> reqwest::Client {

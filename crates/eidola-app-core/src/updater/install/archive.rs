@@ -101,8 +101,12 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
             });
         }
 
-        total_bytes = total_bytes.saturating_add(entry.size());
-        if total_bytes > MAX_TOTAL_UNPACKED {
+        // `entry.size()` is the container's own claim about the member.
+        // It is worth refusing early on, but it is not what the budget is
+        // spent against — that is counted below, on bytes actually
+        // written, so a member that understates itself cannot overrun the
+        // limit by lying.
+        if total_bytes.saturating_add(entry.size()) > MAX_TOTAL_UNPACKED {
             return Err(InstallError::Archive {
                 label: label.to_string(),
                 reason: format!("unpacks to more than {MAX_TOTAL_UNPACKED} bytes"),
@@ -116,18 +120,26 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
             })?;
         }
 
-        let mut contents = Vec::with_capacity(entry.size() as usize);
-        entry
-            .read_to_end(&mut contents)
-            .map_err(|e| InstallError::Archive {
-                label: label.to_string(),
-                reason: format!("member `{raw_name}` could not be decompressed: {e}"),
-            })?;
-
-        std::fs::write(&target, &contents).map_err(|e| InstallError::Staging {
-            path: target.clone(),
-            reason: e.to_string(),
+        // Copied to disk in fixed-size pieces rather than decompressed
+        // whole. A member is compressed data until it is not: one that
+        // expands to gigabytes would otherwise be allocated entire, while
+        // the container is still held, and the process would be killed
+        // instead of returning a refusal. The budget is spent here, on
+        // bytes that actually arrived.
+        let written_bytes = copy_member(&mut entry, &target, &mut total_bytes).map_err(|e| {
+            // A partially written member is not left where a later step
+            // could mistake it for a whole one. The staging tree is
+            // removed on any failure too; this keeps the invariant local.
+            let _ = std::fs::remove_file(&target);
+            e
         })?;
+        if written_bytes > entry.size() {
+            let _ = std::fs::remove_file(&target);
+            return Err(InstallError::Archive {
+                label: label.to_string(),
+                reason: format!("member `{raw_name}` decompressed to more than it declared"),
+            });
+        }
 
         // The packing recipe normalizes modes to `u=rwX,go=rX`, so the
         // executable bit is the only mode information the container
@@ -136,6 +148,46 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
         set_mode(&target, entry.unix_mode())?;
 
         written += 1;
+    }
+
+    Ok(written)
+}
+
+/// Stream one member onto disk, spending `budget_used` as it goes.
+///
+/// Returns the number of bytes written.
+fn copy_member(
+    entry: &mut zip::read::ZipFile<'_, std::io::Cursor<&[u8]>>,
+    target: &Path,
+    budget_used: &mut u64,
+) -> Result<u64, InstallError> {
+    let staging_error = |path: &Path, e: std::io::Error| InstallError::Staging {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    };
+
+    let mut file = std::fs::File::create(target).map_err(|e| staging_error(target, e))?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut written = 0u64;
+
+    loop {
+        let read = entry.read(&mut buffer).map_err(|e| InstallError::Archive {
+            label: target.display().to_string(),
+            reason: format!("could not be decompressed: {e}"),
+        })?;
+        if read == 0 {
+            break;
+        }
+        *budget_used = budget_used.saturating_add(read as u64);
+        if *budget_used > MAX_TOTAL_UNPACKED {
+            return Err(InstallError::Archive {
+                label: target.display().to_string(),
+                reason: format!("unpacks to more than {MAX_TOTAL_UNPACKED} bytes"),
+            });
+        }
+        std::io::Write::write_all(&mut file, &buffer[..read])
+            .map_err(|e| staging_error(target, e))?;
+        written += read as u64;
     }
 
     Ok(written)
@@ -256,6 +308,49 @@ pub(super) fn single_component(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member that decompresses to more than the container's own
+    /// central directory claims. The budget is spent on bytes that
+    /// arrive, so understating a member cannot buy extra room; a check
+    /// against the declared size alone would let it through.
+    #[test]
+    fn refuses_a_member_that_decompresses_past_its_declared_size() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            writer.start_file("big.bin".to_string(), options).unwrap();
+            std::io::Write::write_all(&mut writer, &vec![0u8; 256 * 1024]).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut bytes = cursor.into_inner();
+
+        // Rewrite every recorded uncompressed size to a small lie. The
+        // reader believes the container; the extractor counts.
+        let truthful = (256u32 * 1024).to_le_bytes();
+        let lie = 16u32.to_le_bytes();
+        let mut patched = 0;
+        for i in 0..bytes.len().saturating_sub(4) {
+            if bytes[i..i + 4] == truthful {
+                bytes[i..i + 4].copy_from_slice(&lie);
+                patched += 1;
+            }
+        }
+        assert!(patched >= 1, "the fixture should record its size somewhere");
+
+        let dest = tempfile::tempdir().unwrap();
+        let outcome = unpack_zip(&bytes, dest.path(), "a payload");
+        assert!(
+            outcome.is_err(),
+            "a member that outgrows what the container declared must be refused"
+        );
+        assert!(
+            !dest.path().join("big.bin").exists(),
+            "a refused member must not be left half-written"
+        );
+    }
 
     #[test]
     fn refuses_the_paths_an_extractor_must_never_write() {

@@ -514,42 +514,48 @@ pub fn promotion_readiness(installed: &Path) -> PromotionReadiness {
             };
         }
     }
-    // A swap replaces the bundle *within* its parent, so the parent has to
-    // be writable too — a writable bundle inside a read-only directory can
-    // only be edited in place, which is precisely what an update must not
-    // do to a running app.
+    // The swap renames the installed bundle aside and renames the staged
+    // one into its place. Both are operations on entries *in the parent
+    // directory*, so what they need is write and search there — and
+    // nothing at all inside the old bundle, whose contents are never
+    // touched. Asking whether the bundle itself is writable answers a
+    // question the swap does not ask, and answers it wrongly for the
+    // ordinary case of a read-only `.app` in a writable directory.
     let Some(parent) = installed.parent() else {
         return PromotionReadiness::NeedsPrivileges {
             reason: "the install location has no parent directory".to_string(),
         };
     };
-    for dir in [parent, installed] {
-        if !writable(dir) {
-            return PromotionReadiness::NeedsPrivileges {
-                reason: format!("`{}` is not writable by this user", dir.display()),
-            };
-        }
+    if !renamable_within(parent) {
+        return PromotionReadiness::NeedsPrivileges {
+            reason: format!(
+                "`{}` does not allow this user to replace entries in it",
+                parent.display()
+            ),
+        };
     }
     PromotionReadiness::Ready
 }
 
-/// Ask the kernel, not the mode bits.
+/// Can this user replace an entry inside `dir`?
 ///
-/// `Permissions::readonly()` reports whether *any* write bit is set, which
-/// says nothing about whether **this** user may write: a root-owned
-/// `/Applications` is mode 0755 and would read as writable to everyone.
-/// `access(2)` accounts for ownership, groups and ACLs, which is the
-/// question being asked.
+/// That is write plus search on the directory: renaming needs to resolve
+/// the name and to modify the directory itself. Asked of the kernel rather
+/// than of the mode bits, because `Permissions::readonly()` reports
+/// whether *any* write bit is set and says nothing about whether **this**
+/// user may write — a root-owned `/Applications` is mode 0755 and would
+/// read as writable to everyone. `access(2)` accounts for ownership,
+/// groups and ACLs.
 #[cfg(target_os = "macos")]
-fn writable(path: &Path) -> bool {
+fn renamable_within(dir: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+    let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
         return false;
     };
     // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
     // call, and `access` only reads it.
-    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
 #[cfg(test)]
@@ -623,6 +629,53 @@ mod promotion_tests {
         // Nothing was created or moved by any of the above.
         assert!(installed.is_dir());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_read_only_bundle_in_a_writable_directory_is_promotable() {
+        // The swap renames entries in the parent; it never writes inside
+        // the old bundle. Requiring the bundle to be writable refuses the
+        // ordinary case — an `.app` whose contents are read-only, which is
+        // what a reconstructed one looks like.
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let installed = root.path().join("Eidola.app");
+        std::fs::create_dir(&installed).unwrap();
+        std::fs::write(installed.join("Info.plist"), b"x").unwrap();
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let verdict = promotion_readiness(&installed);
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            verdict,
+            PromotionReadiness::Ready,
+            "a read-only bundle under a writable directory can still be renamed aside"
+        );
+    }
+
+    #[test]
+    fn a_writable_bundle_in_a_read_only_directory_is_not() {
+        // SAFETY: `geteuid` reads process state and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root renames anything.
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("Applications");
+        let installed = parent.join("Eidola.app");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let verdict = promotion_readiness(&installed);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(verdict, PromotionReadiness::NeedsPrivileges { .. }),
+            "nothing can be renamed into a directory this user cannot write: {verdict:?}"
+        );
     }
 
     #[test]
