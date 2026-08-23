@@ -25,8 +25,16 @@ space-error-not-joined = Your agents opened this conversation between themselves
 # reader's language rather than stored in one. All four sit in the rail's quiet
 # register: they finish the clause "this conversation …".
 space-footnote-delegation-concluded = ran to a stop
+# The same ending, resting on an answer that stopped at its length limit: the
+# room ran out of things to say, but not on a finished thought.
+space-footnote-delegation-concluded-truncated = ran to a stop, on an answer cut off at its length limit
 space-footnote-delegation-paused = reached its reply limit ({ $depth } of { $limit })
+# The same pause, resting on an answer that stopped at its length limit —
+# resuming would continue from a mid-thought answer, so the row says both.
+space-footnote-delegation-paused-truncated = reached its reply limit ({ $depth } of { $limit }), on an answer cut off at its length limit
 space-footnote-delegation-budget = used all { $limit } of its turns
+# The same spent budget, resting on an answer cut off at its length limit.
+space-footnote-delegation-budget-truncated = used all { $limit } of its turns, on an answer cut off at its length limit
 # Why a delegated conversation stopped short, by kind. The reason is a bounded
 # category — never an upstream's own words — so this select covers all of them.
 space-footnote-delegation-failed = stopped: { $reason ->
@@ -36,6 +44,22 @@ space-footnote-delegation-failed = stopped: { $reason ->
        *[other] a turn could not be finished
     }
 
+# Shown in place of an answer while it is being regenerated, from the frame the
+# press was accepted in. A reasoning model can spend minutes before the first
+# word of the new answer arrives, so this is often the only thing on screen for
+# a long while — it says the request is out, not that anything is nearly done.
+space-regenerating = Regenerating…
+# Shown in the conversation's recovery notice when a response used its whole
+# length allowance on its own reasoning and never began an answer. Nothing was
+# recorded and nothing was replaced, so the answer already there is untouched.
+space-error-response-truncated = The model used its whole length allowance thinking and never started an answer. No answer was added or replaced — try again, or ask a shorter question.
+# A quiet marker beneath a response a regeneration was asked for while one was
+# already running against it somewhere this window cannot see. Not a failure:
+# the first one is still going, and its result will arrive here.
+space-regenerating-elsewhere = This response is already being regenerated.
+# A quiet marker beneath an answer that stopped because it reached its length
+# allowance rather than because the model was finished.
+space-answer-cut-off = This answer reached its length limit and stops mid-thought.
 # The source-highlight picker (src/space_view/references.rs): the popover that
 # opens when a clicked passage was quoted by more than one post, listing each
 # so the reader chooses the target rather than the app guessing.

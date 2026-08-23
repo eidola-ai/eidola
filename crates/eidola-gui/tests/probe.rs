@@ -4625,7 +4625,11 @@ fn space_footnote_rail_says_how_a_delegated_conversation_stopped(cx: &mut TestAp
             range_start: Some(0),
             range_end: Some(4),
             annotation: None,
-            delegation_end: Some(eidola_app_core::DelegationEnd::Paused { depth: 2, limit: 2 }),
+            delegation_end: Some(eidola_app_core::DelegationEnd::Paused {
+                depth: 2,
+                limit: 2,
+                truncated: false,
+            }),
             snippet: Some("the evening one is the spring".into()),
             antecedent_author_label: "Surveyor".into(),
             antecedent_author_kind: "agent".into(),
@@ -5430,6 +5434,25 @@ fn keyboard_focus_reveals_a_library_rows_verbs(cx: &mut TestAppContext) {
         gpui::Role::Button,
         "Rename Tides and the moon",
     );
+}
+
+/// Send one key **down** — what a view's own key listener reads (navigation,
+/// Escape). Activation of a focused control needs the up too; see
+/// [`press_enter`].
+fn press_key(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
+    let ks = gpui::Keystroke::parse(key).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: ks,
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
 }
 
 /// Press Enter as a real keyboard activation: gpui maps it on **key up** (the
@@ -7460,6 +7483,92 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// **The label a screen reader hears is the message a sighted reader sees.**
+///
+/// A conversation's three in-place turn states are readouts, so their accessible
+/// name *is* their text — and pinning that in English would have passed against
+/// a literal beside the accessor. The assertion is made in a non-English locale
+/// for the same reason `an_archived_conversations_refusal_is_localized` is: only
+/// there do the two spellings differ. The probe **names** are asserted from the
+/// same entries, unchanged by the locale — they are selectors, not prose.
+#[gpui::test]
+fn a_conversations_turn_states_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12 and 18:41.");
+    answer.action_type = "inference".into();
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    let mut second = probe_post("a2", "And high water at 12:26.");
+    second.action_type = "inference".into();
+    second.parent_action_id = Some("a1".into());
+    second.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    let mut third = probe_post("a3", "Springs run through to Sunday, and the range");
+    third.action_type = "inference".into();
+    third.parent_action_id = Some("a2".into());
+    third.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![answer, second, third], cx)
+        });
+    });
+
+    // Three states, one on each answer: a live regeneration pending in the
+    // first's place, a collision on the second, and a third that stopped at its
+    // length allowance. One per post because a pending revision draws over the
+    // whole body it replaces, marks included.
+    // The collision mark is staged on the view rather than through the
+    // entity's gates: a standing collision now withholds the next
+    // regeneration, which is the point of that gate and would leave the live
+    // revision below unstarted.
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.note_truncated_turn_for_test("a3", cx);
+            v.note_regeneration_elsewhere_for_test("a2", cx);
+        });
+        space.update(cx, |s, cx| {
+            s.regenerate_post("a1".into(), "kimi-k2".into(), cx);
+        });
+    });
+    let seq = space.read_with(cx, |s, _| s.revising_seq("a1").expect("pending"));
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/2/cut-off",
+        gpui::Role::Label,
+        "Cette réponse a atteint sa limite de longueur et s’interrompt en pleine pensée.",
+    );
+    assert_probe(
+        &entries,
+        "space/post/1/regenerating-elsewhere",
+        gpui::Role::Label,
+        "Cette réponse est déjà en cours de régénération.",
+    );
+    assert_probe(
+        &entries,
+        &format!("space/streaming/{seq}/regenerating"),
+        gpui::Role::Label,
+        "Régénération…",
+    );
+    probe::set_probes_enabled(false);
+}
+
 /// REGRESSION: the highlight picker said "A post in another space" for every
 /// **incoming** reference it did not hold, so two cross-space referrers were
 /// indistinguishable — the one thing a chooser must never be.
@@ -7714,4 +7823,87 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
     }
 
     probe::set_probes_enabled(false);
+}
+
+/// **A post being regenerated keeps its node; it goes quiet on the value
+/// alone.**
+///
+/// The keyboard hands focus back to the post when Regenerate takes its own row
+/// away (`release_affordance_focus`), and the row keeps `track_focus` for the
+/// whole regeneration. gpui builds an AccessKit node only for an element with a
+/// role, so dropping the article while still tracking the handle left focus on
+/// a handle with no node — AccessKit falls back to the window root and the
+/// reader loses their place until the turn commits, which on a reasoning model
+/// is minutes.
+///
+/// The settled-value rule is untouched: the **value** is what must not stream,
+/// because AT re-reads a focused control's whole value on every change. Name
+/// and role do not stream — byline, backend and time all come from the
+/// generation being replaced — so they stay.
+#[gpui::test]
+fn a_post_being_regenerated_keeps_its_node_and_loses_only_its_value(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12 and 18:41.");
+    answer.action_type = "inference".into();
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+
+    // Settled: role, name, and the whole text as the value.
+    let entries = fresh_entries(cx, window);
+    let settled_label = entries
+        .iter()
+        .find(|(n, _)| n == "space/post/0")
+        .map(|(_, e)| e.label.to_string())
+        .expect("the settled post is an article");
+    assert_probe_value(
+        &entries,
+        "space/post/0",
+        gpui::Role::Article,
+        &settled_label,
+        "Low water at 06:12 and 18:41.",
+    );
+
+    // Enter the post, then activate Regenerate the way a keyboard user does.
+    press_key(cx, window, "down");
+    press_key(cx, window, "enter");
+    press_enter(cx, window);
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.revising_seq("a1").is_some(),
+            "the press was accepted — this is the frame the value goes quiet in"
+        );
+    });
+
+    let entries = fresh_entries(cx, window);
+    // The node is still there, under the same name…
+    assert_probe(
+        &entries,
+        "space/post/0",
+        gpui::Role::Article,
+        &settled_label,
+    );
+    // …and it is the *value* that is withheld, not the node.
+    let (_, entry) = entries
+        .iter()
+        .find(|(n, _)| n == "space/post/0")
+        .expect("still an article");
+    assert!(
+        entry.value.is_none(),
+        "the streaming revision must not bind a value AT would re-read per token: {:?}",
+        entry.value
+    );
 }

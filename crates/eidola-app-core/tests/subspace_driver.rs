@@ -278,7 +278,11 @@ fn a_room_that_pauses_at_its_cascade_guard_says_so() {
         assert!(
             matches!(
                 report.references[0].delegation_end,
-                Some(DelegationEnd::Paused { depth: 1, limit: 1 })
+                Some(DelegationEnd::Paused {
+                    depth: 1,
+                    limit: 1,
+                    truncated: false
+                })
             ),
             "the pause is carried as a value, not a sentence: {:?}",
             report.references[0].delegation_end
@@ -297,6 +301,104 @@ fn a_room_that_pauses_at_its_cascade_guard_says_so() {
 /// The report is a turn for the owning agent in the **parent**, replying to the
 /// owner's own last word there, carrying the delegated room's last post as a
 /// quoted reference the driver attached — and the model is shown that passage
+/// **A room that ran to a stop on a cut-off answer says both.**
+///
+/// The driver has no reader to show a marker to — it drops the event receiver
+/// on purpose — so the only surface a delegated room ever gets is its report.
+/// `ChatResult::truncated` was discarded there, and the walk replanned from the
+/// partial post and reported the room as plainly `concluded`: a claim that it
+/// ran out of things to say, made about an answer that stops mid-thought.
+/// Replanning is kept — partial text is real text and the room may well have
+/// more to say about it — and what changes is only what the ending may claim.
+#[test]
+fn a_room_that_concluded_on_a_truncated_answer_says_so_in_its_report() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            // Real content, then `finish_reason: "length"` — a turn that keeps
+            // its text and must not be called finished.
+            chat: ChatBehavior::PartialAnswerLength,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        let end = report.references[0]
+            .delegation_end
+            .expect("the edge carries the ending");
+        assert_eq!(
+            end,
+            DelegationEnd::Concluded { truncated: true },
+            "the conclusion carries that it rests on an answer cut off at its length limit"
+        );
+        assert!(
+            end.token().ends_with("concluded/truncated"),
+            "and says so durably: {}",
+            end.token()
+        );
+    });
+}
+
+/// **A pause resting on a cut-off answer says both too.**
+///
+/// The marker rides every ending that invites an action assuming coherent words
+/// to build on, and "can be resumed by posting there" is one of them: resuming
+/// means continuing from the room's last word, and that word stops mid-thought.
+/// The accumulator was already true here — only the arm could not carry it, so
+/// the parent report mentioned the cascade limit and the mid-thought answer
+/// lost its one warning.
+#[test]
+fn a_room_that_paused_on_a_truncated_answer_says_so_in_its_report() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::PartialAnswerLength,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        // Two lets one turn run — and be cut off — before the guard binds.
+        core.runtime()
+            .block_on(core.set_space_cascade_limit(parent.clone(), 2))
+            .expect("cascade limit");
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let report = report(&core, &parent).expect("a paused room still reports");
+        let end = report.references[0]
+            .delegation_end
+            .expect("the edge carries the ending");
+        assert!(
+            matches!(
+                end,
+                DelegationEnd::Paused {
+                    truncated: true,
+                    ..
+                }
+            ),
+            "the pause carries that it rests on an answer cut off at its length \
+             limit: {end:?}"
+        );
+        assert!(
+            end.token().ends_with("/truncated"),
+            "and says so durably, after the arm's own fields: {}",
+            end.token()
+        );
+        assert_eq!(
+            DelegationEnd::parse(&end.token()),
+            Some(end),
+            "the whole ending survives the round trip, marker included"
+        );
+    });
+}
+
 /// before it writes.
 #[test]
 fn a_finished_delegation_reports_back_with_the_rooms_last_word_attached() {
@@ -341,7 +443,7 @@ fn a_finished_delegation_reports_back_with_the_rooms_last_word_attached() {
         assert!(!snippet.is_empty());
         assert_eq!(
             reference.delegation_end,
-            Some(DelegationEnd::Concluded),
+            Some(DelegationEnd::Concluded { truncated: false }),
             "the edge carries what ended the room, typed"
         );
         assert_eq!(reference.annotation, None, "and says nothing as a person");
@@ -2183,6 +2285,7 @@ fn a_budget_stopped_walk_reports_what_arrived_while_it_walked() {
         assert_eq!(
             report.references[0].delegation_end,
             Some(DelegationEnd::BudgetSpent {
+                truncated: false,
                 limit: MAX_DELEGATION_TURNS
             }),
             "the room stopped on its budget"
@@ -2288,7 +2391,7 @@ fn regenerating_a_report_keeps_its_finding_and_its_ending() {
         assert_eq!(after.references[0].ordinal, 1, "at the ordinal it had");
         assert_eq!(
             after.references[0].delegation_end,
-            Some(DelegationEnd::Concluded),
+            Some(DelegationEnd::Concluded { truncated: false }),
             "and the ending with it"
         );
         assert!(
@@ -3074,7 +3177,8 @@ fn a_wide_walk_reports_every_tip_and_not_a_roster_sized_tail() {
         assert!(
             report.references.iter().all(|r| r.delegation_end
                 == Some(DelegationEnd::BudgetSpent {
-                    limit: MAX_DELEGATION_TURNS
+                    limit: MAX_DELEGATION_TURNS,
+                    truncated: false
                 })),
             "each carries the ending the walk stopped at"
         );
@@ -3305,6 +3409,7 @@ fn a_delegation_stops_at_its_turn_budget_and_says_so() {
         assert_eq!(
             report.references[0].delegation_end,
             Some(DelegationEnd::BudgetSpent {
+                truncated: false,
                 limit: MAX_DELEGATION_TURNS
             }),
             "budget exhaustion is information, not silence"
@@ -3370,6 +3475,7 @@ fn empty_router_hops_still_spend_the_delegation_budget() {
         assert_eq!(
             report.references[0].delegation_end,
             Some(DelegationEnd::BudgetSpent {
+                truncated: false,
                 limit: MAX_DELEGATION_TURNS
             }),
             "planning hops bind the budget, not only persisted turns"
@@ -3447,6 +3553,7 @@ fn empty_router_hops_share_the_budget_with_persisted_turns() {
         assert_eq!(
             report.references[0].delegation_end,
             Some(DelegationEnd::BudgetSpent {
+                truncated: false,
                 limit: MAX_DELEGATION_TURNS
             }),
             "the shared ceiling binds"

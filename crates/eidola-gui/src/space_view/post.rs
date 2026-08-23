@@ -75,9 +75,10 @@ impl SpaceView {
         let editing_this = self.editing.as_ref().map(|e| &e.node_id) == Some(&node.id);
 
         // A **settled** post carries its byline/backend/time as the article's
-        // accessible name and its whole text as the article's value. A
-        // streaming one deliberately carries neither — see `article` below.
-        let mut article: Option<(usize, SharedString, SharedString)> = None;
+        // accessible name and its whole text as the article's value. A post
+        // being revised keeps the name and drops only the value — see
+        // `article` below.
+        let mut article: Option<(usize, SharedString, Option<SharedString>)> = None;
 
         let (byline, byline_backend, time, body): (
             SharedString,
@@ -87,20 +88,55 @@ impl SpaceView {
         ) = match node.src {
             NodeSrc::Msg(i) => {
                 let post = &self.posts[i];
-                article = Some((
-                    i,
-                    article_label(&post.byline, post.byline_backend.as_deref(), &post.time),
-                    SharedString::from(super::minimap::spoken_text(
-                        &post.content,
-                        &post.references,
-                    )),
-                ));
-                (
-                    post.byline.clone(),
-                    post.byline_backend.clone(),
-                    post.time.clone(),
-                    self.render_post_body(i, node, bw, editing_this, cx),
-                )
+                // A regeneration in flight draws **here**, over the generation
+                // it is replacing: same post, same byline, new version
+                // arriving. The old text stays until the new one commits, so a
+                // turn that fails or is cut off leaves the answer that is
+                // already there — and the reader can see, from the frame the
+                // click was accepted in, that something is happening.
+                let revising = post
+                    .action_id
+                    .as_deref()
+                    .and_then(|id| self.space.read(cx).revising_seq(id));
+                if let Some(seq) = revising {
+                    // **The node stays; only the value goes.** The verb that
+                    // started this revision may have handed the keyboard to
+                    // this very post (see `release_affordance_focus`), and a
+                    // row that keeps `track_focus` while losing its role has no
+                    // AccessKit node at all — focus falls back to the window
+                    // root and the reader loses their place for the whole
+                    // regeneration. The name is safe to keep because it is not
+                    // what streams: byline, backend and time all come from the
+                    // generation being replaced and do not move until the new
+                    // one commits. Only the *text* mutates per token, and that
+                    // is exactly the value.
+                    article = Some((
+                        i,
+                        article_label(&post.byline, post.byline_backend.as_deref(), &post.time),
+                        None,
+                    ));
+                    (
+                        post.byline.clone(),
+                        post.byline_backend.clone(),
+                        post.time.clone(),
+                        self.render_revision_body(seq, bw, cx),
+                    )
+                } else {
+                    article = Some((
+                        i,
+                        article_label(&post.byline, post.byline_backend.as_deref(), &post.time),
+                        Some(SharedString::from(super::minimap::spoken_text(
+                            &post.content,
+                            &post.references,
+                        ))),
+                    ));
+                    (
+                        post.byline.clone(),
+                        post.byline_backend.clone(),
+                        post.time.clone(),
+                        self.render_post_body(i, node, bw, editing_this, cx),
+                    )
+                }
             }
             NodeSrc::Streaming(seq) => {
                 // The in-flight turn's byline resolves live (the snapshot only
@@ -196,15 +232,21 @@ impl SpaceView {
             GutterPlacement::Stacked => v_flex().items_center(),
         }
         .id(SharedString::from(format!("space-post-{}", node.id)))
-        // The conversation itself, in the tree at last: each settled post
-        // is an `Article` (`AXGroup` + `AXDocumentArticle`) named for its
-        // author and time, carrying its whole text as the value. Only
-        // settled posts — a streaming reply's text mutates every token, and
-        // AT re-reads a changed value in full, so binding one there would
-        // make the app *less* usable than silence (audit §4). The row
-        // becomes a node the moment the stream finalizes into a `Msg`.
+        // The conversation itself, in the tree at last: each post is an
+        // `Article` (`AXGroup` + `AXDocumentArticle`) named for its author and
+        // time. **The value is what a settled post adds**, and only a settled
+        // one: text that mutates every token would be re-read in full on every
+        // change, which is less usable than silence (audit §4). A post being
+        // revised keeps the node and its name, and goes quiet on the value
+        // alone — the row is already on screen and may hold the keyboard, so
+        // taking its node away is a different act from never giving one to a
+        // streaming leaf that has not appeared yet.
         .when_some(article, |d, (i, label, value)| {
-            d.probe_value(format!("space/post/{i}"), gpui::Role::Article, label, value)
+            let name = format!("space/post/{i}");
+            match value {
+                Some(value) => d.probe_value(name, gpui::Role::Article, label, value),
+                None => d.probe(name, gpui::Role::Article, label),
+            }
         })
         // Wave B: the *focused* post row tracks the view's single post
         // focus handle. `Role::Article` already made the row focusable and
@@ -341,6 +383,60 @@ impl SpaceView {
                     )),
             );
         }
+        // The answer stopped where its length allowance ran out, not where the
+        // model was done — said beneath the text it is about, in the quiet
+        // register, because the alternative is a reader who reads a
+        // mid-sentence stop as the model's own choice.
+        if post
+            .action_id
+            .as_ref()
+            .is_some_and(|id| self.truncated_posts.contains(id))
+        {
+            // The label a screen reader hears **is** the message a sighted
+            // reader sees — the probe name is the stable selector, the label is
+            // never a second English copy of the sentence.
+            let cut_off = crate::i18n::msg::space_answer_cut_off(cx);
+            col = col.child(
+                div()
+                    .id(SharedString::from(format!("space-cut-off-{}", node.id)))
+                    .probe(
+                        format!("space/post/{i}/cut-off"),
+                        gpui::Role::Label,
+                        cut_off.clone(),
+                    )
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(cut_off),
+            );
+        }
+        // A regeneration of this generation is already running somewhere this
+        // window cannot see. Said in the same quiet register, on the post it is
+        // about, because that is what the sentence is about — and because a
+        // notice in the recovery band would have nothing to end it: the other
+        // regeneration lands as a transcript refresh, which supersedes this
+        // generation and takes the mark with it (`prune_post_marks`).
+        if post
+            .action_id
+            .as_ref()
+            .is_some_and(|id| self.regenerating_elsewhere.contains(id))
+        {
+            let elsewhere = crate::i18n::msg::space_regenerating_elsewhere(cx);
+            col = col.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "space-regenerating-elsewhere-{}",
+                        node.id
+                    )))
+                    .probe(
+                        format!("space/post/{i}/regenerating-elsewhere"),
+                        gpui::Role::Label,
+                        elsewhere.clone(),
+                    )
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(elsewhere),
+            );
+        }
         // The footnote rail — the post's references, rendered *outside* the
         // markdown (the editor never learns what a reference is).
         if let Some(rail) = self.render_post_footnotes(i, node, editing, cx) {
@@ -360,8 +456,8 @@ impl SpaceView {
     /// of the post's editor, committed as a new generation) and **Regenerate**
     /// (the assistant's; a new agent generation via the current model). While
     /// this post is being edited it shows the session's Save/Cancel verbs
-    /// instead. Hidden entirely while streaming (the entity refuses mutations
-    /// mid-stream, so dead verbs would lie).
+    /// instead. Hidden entirely while the space refuses mutations (a stream, a
+    /// regeneration, a save in flight — dead verbs would lie).
     fn render_post_actions(
         &self,
         node: &TreeNode,
@@ -379,10 +475,13 @@ impl SpaceView {
         if !matches!(post.role.as_ref(), "user" | "assistant") {
             return empty();
         }
-        if self.space.read(cx).is_streaming() {
-            // This settled row remains actionable once the turn finishes, so
+        if !self.space.read(cx).accepts_mutation() {
+            // This settled row remains actionable once the space is free, so
             // compact layout keeps its latent action line stable while the
-            // temporarily disabled verbs stay hidden.
+            // temporarily disabled verbs stay hidden. The question is whether a
+            // mutation would be *accepted*, not merely whether something is
+            // streaming: a regeneration or a save in flight refuses one just as
+            // firmly, and a verb offered there is a press that does nothing.
             return action_gutter(page_layout, true).gap_0p5();
         }
 
@@ -474,7 +573,9 @@ impl SpaceView {
                         "Regenerate",
                         "Regenerate this response".into(),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.regenerate(&id, cx))),
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.regenerate(&id, window, cx)),
+                    ),
                 )
             }
             _ => col,
@@ -631,7 +732,7 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.space.read(cx).is_streaming() {
+        if !self.space.read(cx).accepts_mutation() {
             return;
         }
         let Some(post) = self
@@ -734,7 +835,20 @@ impl SpaceView {
     /// the post's **own recorded model** (regenerating re-asks the model that
     /// answered; the config default is the fallback for rows that carry none).
     /// [`Space::regenerate_post`] refuses mid-stream.
-    pub fn regenerate(&mut self, action_id: &SharedString, cx: &mut Context<Self>) {
+    ///
+    /// **An accepted press takes this verb off the screen**, so the keyboard
+    /// leaves with it: the space stops accepting mutations, the whole action
+    /// gutter is withheld, and the reader would otherwise be left standing on a
+    /// slot handle tracked by nothing for the length of the regeneration (see
+    /// [`SpaceView::release_affordance_focus`]). Asked **before** it acts,
+    /// because the question is about the row that is about to stop being
+    /// painted, and moved only on acceptance — a refusal hides nothing.
+    pub fn regenerate(
+        &mut self,
+        action_id: &SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let model = self
             .posts
             .iter()
@@ -743,9 +857,18 @@ impl SpaceView {
             .map(|m| m.to_string())
             .unwrap_or_else(|| self.stores.config.read(cx).default_model());
         let id = action_id.to_string();
-        self.space.update(cx, |s, cx| {
-            s.regenerate_post(id, model, cx);
-        });
+        let held = self.affordance_row_holds_focus(window);
+        let accepted = self
+            .space
+            .update(cx, |s, cx| s.regenerate_post(id, model, cx));
+        if !accepted {
+            // A refusal is observed rather than dropped: nothing started, so
+            // nothing should repaint as though it had.
+            return;
+        }
+        if held {
+            self.release_affordance_focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -887,6 +1010,44 @@ impl SpaceView {
     /// the same quiet line in the same slot as "Thinking…", because it answers
     /// the same question (what is this silence?) with the honest reason. It is
     /// a readout, not a control: no click, `Role::Label`.
+    /// The **pending revision** rendered in a post's own place: an immediate
+    /// "Regenerating…" line until anything arrives, then the ordinary streaming
+    /// treatment (thinking disclosure, then the answer as it comes).
+    ///
+    /// The label is not decoration. A reasoning model can spend its whole
+    /// budget before the first content token, so for minutes at a stretch the
+    /// only honest thing to draw is that the request is out.
+    fn render_revision_body(&self, seq: u64, bw: gpui::Pixels, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let started = self
+            .space
+            .read(cx)
+            .streams()
+            .iter()
+            .find(|t| t.seq == seq)
+            .is_some_and(|t| !t.response.reasoning.is_empty() || !t.response.content.is_empty());
+        let regenerating = crate::i18n::msg::space_regenerating(cx);
+        v_flex()
+            .w(bw)
+            .gap_2()
+            .child(
+                div()
+                    .id(SharedString::from(format!("space-regenerating-{seq}")))
+                    .probe(
+                        format!("space/streaming/{seq}/regenerating"),
+                        gpui::Role::Label,
+                        regenerating.clone(),
+                    )
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(regenerating),
+            )
+            .when(started, |d| {
+                d.child(self.render_streaming_body(seq, bw, cx))
+            })
+            .into_any_element()
+    }
+
     fn render_streaming_body(&self, seq: u64, bw: gpui::Pixels, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let turn = self

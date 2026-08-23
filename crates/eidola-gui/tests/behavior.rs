@@ -156,6 +156,33 @@ fn wallet_view_constructs_against_stub_stores(cx: &mut TestAppContext) {
 
 /// A minimal fixture post — a user post with a real `action_id`, so the
 /// per-post affordances apply.
+/// Enable probe recording for the rest of the scope, **holding the suite's
+/// lock** — released, with probes switched back off, on drop.
+///
+/// Probe recording is a process-global flag, and this suite runs its tests in
+/// parallel. Toggling it bare let a neighbour's `set_probes_enabled(false)`
+/// land between one section's enable and its own `draw_window`, so the frame
+/// recorded nothing and the section's assertion failed with no defect behind
+/// it — reproducible at `--test-threads=32`, invisible at the default width.
+/// `tests/probe.rs` takes the same lock for the same reason; this is that
+/// idiom in the suite that grew probe reads later, made RAII so a failing
+/// assertion cannot leave the flag on for every test after it.
+struct ProbeSection(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for ProbeSection {
+    fn drop(&mut self) {
+        eidola_gui::probe::set_probes_enabled(false);
+    }
+}
+
+#[must_use]
+fn probes_on() -> ProbeSection {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    eidola_gui::probe::set_probes_enabled(true);
+    ProbeSection(guard)
+}
+
 fn fixture_user_post(action_id: &str, text: &str) -> PostNode {
     PostNode {
         action_id: action_id.into(),
@@ -7025,9 +7052,9 @@ fn space_regenerate_uses_posts_own_model(cx: &mut TestAppContext) {
     let (window, view) = open_space(cx, &stores, Some("s".into()));
     seed_space_pair(&view, window, cx);
 
-    cx.update_window(window, |_, _, cx| {
+    cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.regenerate(&"a2".into(), cx);
+            v.regenerate(&"a2".into(), window, cx);
         });
     })
     .unwrap();
@@ -8955,6 +8982,30 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
         cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
     });
     let agent = share_the_seeded_agent(cx, &stores, &space);
+
+    // **The target has to be a node the reader is told about.** gpui only
+    // reports focus on a node the a11y tree actually has, and an element with a
+    // tracked handle but no role never gets one — the adapter leaves focus at
+    // the window root, which is the whole of what a handback was to prevent.
+    // The Backends pane already names itself; this is the twin its shape was
+    // borrowed from, swept here.
+    {
+        use eidola_gui::probe;
+        let _probes = probes_on();
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        let entries = probe::window_entries(window.window_id().as_u64());
+        let (_, entry) = entries
+            .iter()
+            .find(|(n, _)| n == "settings/agents/pane")
+            .expect("the pane carries its own landmark");
+        assert_eq!(
+            entry.role,
+            gpui::Role::Region,
+            "the handback target is a named region, not a role-less div"
+        );
+        assert_eq!(entry.label, "Agents");
+    }
 
     let pane_holds_the_keyboard = |cx: &mut TestAppContext| {
         cx.update_window(window, |_, window, cx| {
@@ -16859,11 +16910,10 @@ fn backends_a_failed_download_verb_hands_the_keyboard_back(cx: &mut TestAppConte
     // of what a handback was supposed to prevent. So the pane names itself.
     {
         use eidola_gui::probe;
-        probe::set_probes_enabled(true);
+        let _probes = probes_on();
         probe::clear_window(window.window_id().as_u64());
         draw_window(cx, window);
         let entries = probe::window_entries(window.window_id().as_u64());
-        probe::set_probes_enabled(false);
         let (_, entry) = entries
             .iter()
             .find(|(n, _)| n == "settings/backends/pane")
@@ -17011,7 +17061,7 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
     })
     .unwrap();
 
-    probe::set_probes_enabled(true);
+    let _probes = probes_on();
     probe::clear_window(window.window_id().as_u64());
     draw_window(cx, window);
     let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
@@ -17049,7 +17099,6 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    probe::set_probes_enabled(false);
     assert!(
         !names.contains(&"settings/backends/local/installed/0/retry".to_string()),
         "a pending retry must not leave a second door onto itself: {names:?}"
@@ -17485,7 +17534,7 @@ fn backends_a_catalog_row_stands_down_while_its_transfer_starts(cx: &mut TestApp
     seed(cx);
 
     let probes = |cx: &mut TestAppContext| -> Vec<String> {
-        probe::set_probes_enabled(true);
+        let _probes = probes_on();
         probe::clear_window(window.window_id().as_u64());
         // Synchronous: `draw_window` would run the pending continuation with it.
         cx.update_window(window, |_, window, cx| window.draw(cx).clear())
@@ -17494,7 +17543,6 @@ fn backends_a_catalog_row_stands_down_while_its_transfer_starts(cx: &mut TestApp
             .into_iter()
             .map(|(n, _)| n)
             .collect();
-        probe::set_probes_enabled(false);
         names
     };
 
@@ -17662,4 +17710,1004 @@ fn space_a_transcript_retry_hands_the_keyboard_back(cx: &mut TestAppContext) {
     );
 
     drain_runtime(&core);
+}
+
+// ---------------------------------------------------------------------------
+// Regeneration: an accepted press is visible, a refused one is not a press
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn space_regenerate_shows_its_pending_state_in_the_same_frame(cx: &mut TestAppContext) {
+    // The reported defect: an accepted Regenerate could be silent for minutes,
+    // so nothing on screen distinguished it from a dead button. The pending
+    // state is pushed before the backend is consulted, and it renders **in
+    // place of the post being replaced** — never as a child leaf, which would
+    // draw as a reply to the post it is about to become.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        let seq = s
+            .revising_seq("a2")
+            .expect("the accepted press is pending on the post it replaces");
+        assert!(
+            s.streams().iter().any(|t| t.seq == seq && t.revising),
+            "the turn knows it is a revision, not a reply"
+        );
+        assert!(!s.accepts_mutation(), "and the space is busy while it runs");
+    });
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        names.iter().any(|n| n.ends_with("/regenerating")),
+        "the reader is told, in the frame that accepted the press: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("/regenerate")),
+        "and the verb it came from is gone, not left looking live: {names:?}"
+    );
+}
+
+#[gpui::test]
+fn space_regenerate_while_busy_is_refused_not_silently_dropped(cx: &mut TestAppContext) {
+    // A second press must not look accepted. The entity refuses it, and the
+    // affordance is already withheld — the two answers agree.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    space.update(cx, |s, cx| {
+        assert!(
+            s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the first press is accepted"
+        );
+        assert!(
+            !s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the second is refused while the first runs"
+        );
+        assert_eq!(
+            s.streams().iter().filter(|t| t.revising).count(),
+            1,
+            "and no second pending state was created"
+        );
+    });
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            0,
+            "no verb is offered while the space would refuse one"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_withholds_post_verbs_while_a_save_is_in_flight(cx: &mut TestAppContext) {
+    // The exclusive mutation slot makes the space busy **without** anything
+    // streaming. Asking only "is something streaming?" left Edit and
+    // Regenerate on screen through that whole window, where the handler was
+    // already certain to refuse them — a press that does nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+    space.read_with(cx, |s, _| {
+        assert!(!s.is_streaming(), "nothing is streaming…");
+        assert!(!s.accepts_mutation(), "…and yet no mutation is accepted");
+    });
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.post_verb_count_for_test("a2", cx), 0);
+        assert_eq!(v.post_verb_count_for_test("a1", cx), 0);
+    });
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.set_post_hover_for_test("a2", true, cx);
+        });
+    })
+    .unwrap();
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("/regenerate")),
+        "even hovered, a post offers no verb the space would refuse: {names:?}"
+    );
+
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            1,
+            "and they come back when the space is free"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_regeneration_deltas_render_on_the_post_being_replaced(cx: &mut TestAppContext) {
+    // Reasoning and answer arrive on the pending revision, in the post's own
+    // place. The transcript gains no node: a regeneration is a new version of
+    // an existing post, not a new post.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.push_content_delta_for_test(seq, "a better answer", cx)
+        });
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        let turn = s.streams().iter().find(|t| t.seq == seq).expect("the turn");
+        assert_eq!(turn.response.content, "a better answer");
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.stream_overlays_for_test(cx).is_empty(),
+            "a revision claims no leaf of its own"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_regeneration_failure_keeps_the_generation_it_would_replace(cx: &mut TestAppContext) {
+    // Nothing was written, so the answer already on screen is the answer.
+    // Retry is deliberately not armed: it re-*asks* a participant, which is a
+    // different verb from regenerating.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.fail_revision_for_test(
+                seq,
+                AppError::ResponseTruncated {
+                    output_tokens: Some(4096),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(s.revising_seq("a2").is_none(), "the pending state is gone");
+        assert!(s.accepts_mutation(), "and the space is free again");
+        assert!(
+            s.failed_turn().is_none(),
+            "a regeneration leaves no re-ask behind it"
+        );
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx)
+                .is_some_and(|t| t.contains("length allowance")),
+            "the reader is told what happened, in their own language"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_marks_an_answer_that_stopped_at_its_length_limit(cx: &mut TestAppContext) {
+    // A partial answer is kept — it is real text — but it must not read as a
+    // finished one. The mark sits beneath the answer it is about.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.note_truncated_turn_for_test("a2", cx));
+    })
+    .unwrap();
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        names.iter().any(|n| n.ends_with("/cut-off")),
+        "the answer says where it stopped: {names:?}"
+    );
+}
+
+#[gpui::test]
+fn space_a_reply_waits_for_the_answer_it_names_but_a_post_does_not(cx: &mut TestAppContext) {
+    // The harm is a durable edge naming a generation about to be superseded:
+    // item threading resolves it onto the new tip, so the post renders beneath
+    // an answer nobody wrote it against. That is a fact about the *antecedent*,
+    // not about the space — refusing every post for the length of somebody
+    // else's regeneration would take the conversation away for minutes.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.update(cx, |s, cx| {
+        assert!(!s.is_busy(), "nothing of this space's is running");
+        assert!(
+            s.revision_targets("a2"),
+            "but a2's generation is being replaced"
+        );
+        assert!(
+            !s.revision_targets("a1"),
+            "and a1's is not — the question is per-post"
+        );
+        assert!(
+            !s.submit(
+                "about that answer".into(),
+                Some("a2".into()),
+                Vec::new(),
+                cx
+            ),
+            "a reply to the answer being replaced is refused"
+        );
+        assert!(
+            s.submit("a fresh question".into(), Some("a1".into()), Vec::new(), cx),
+            "a reply to anything else is ordinary — posting supersedes nothing"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_both_mutation_doors_answer_the_same_question(cx: &mut TestAppContext) {
+    // Edit and Regenerate both supersede a generation, so both ask the mutation
+    // question — not merely whether something is running. Their verbs are drawn
+    // from `accepts_mutation` and `post_verb_count` reads it too, so a door
+    // answering differently is a door the surface no longer offers but that
+    // would still say yes if reached.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.update(cx, |s, cx| {
+        assert!(!s.is_busy(), "nothing of this space's is running…");
+        assert!(!s.accepts_mutation(), "…but a generation is being replaced");
+        assert!(
+            !s.edit("a1".into(), "a revised question".into(), Vec::new(), cx),
+            "so an edit is refused, exactly as a regeneration is"
+        );
+        assert!(
+            !s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the twin door agrees"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_standing_collision_withholds_the_verbs_and_the_retry(cx: &mut TestAppContext) {
+    // The waiter is outside `is_busy` on purpose (nothing of *ours* is
+    // running), so every affordance whose press could only be refused while it
+    // stands has to ask the mutation question instead. Regenerate remounted
+    // beside its own "already being regenerated" mark; Retry re-asks, and an
+    // ask is refused for the same reason.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::Internal {
+                    message: "the ask fell over".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    space.read_with(cx, |s, _| assert!(s.can_retry(), "Retry is armed"));
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(!s.is_busy(), "nothing of this space's is running…");
+        assert!(
+            !s.accepts_mutation(),
+            "…and yet no mutation would be accepted"
+        );
+        assert!(
+            !s.can_retry(),
+            "so Retry — which re-asks — is withheld with them"
+        );
+    });
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            0,
+            "the keyboard model agrees with the render"
+        );
+    });
+    space.update(cx, |s, cx| {
+        assert!(
+            !s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "and a press is refused rather than starting a doomed runner"
+        );
+        assert!(s.streams().is_empty(), "nothing was started");
+    });
+
+    use eidola_gui::probe;
+    let names = {
+        let _probes = probes_on();
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect::<Vec<String>>()
+    };
+    assert!(
+        names.iter().any(|n| n.ends_with("/regenerating-elsewhere")),
+        "the mark is showing: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("/regenerate")),
+        "and no Regenerate stands beside it: {names:?}"
+    );
+
+    // The settlement gives all of them back together.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.settle_collision_for_test("a2", cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.accepts_mutation(),
+            "the released claim restores the verbs"
+        );
+        assert!(
+            s.can_retry(),
+            "and the recovery its failure still stands for"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_refused_retry_keeps_the_notice_that_explains_it(cx: &mut TestAppContext) {
+    // An affordance that can be refused must not spend the state its refusal
+    // depends on: clearing the notice before `retry` answered left the record
+    // standing with nothing on screen explaining it.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::Internal {
+                    message: "the ask fell over".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    // A regeneration starts, so the ask Retry would make is now refused.
+    space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.retry_failed(window, cx));
+    })
+    .unwrap();
+
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx).is_some(),
+            "the refused press left the explanation on screen"
+        );
+    });
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.failed_turn().is_some(),
+            "and the recovery it belongs to intact"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_mark_waits_for_the_post_it_names_to_be_read(cx: &mut TestAppContext) {
+    // A mark is recorded when the *turn* ends; its post reaches this window
+    // only when a snapshot carries it. A truncated turn whose own exit reload
+    // failed leaves the answer durable and unread here — and a rebuild driven
+    // by anything at all (a concurrent sibling's delta) then read "not in the
+    // current posts" as "superseded" and dropped the mark, so the answer came
+    // back after the retry with nothing saying it had been cut off.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // The turn ends naming a generation no snapshot here has ever held.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.note_truncated_turn_for_test("a3", cx));
+    })
+    .unwrap();
+
+    // Something unrelated rebuilds the snapshot — the reload has not landed,
+    // so the posts are still a3-less.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.rebuild_for_test(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.truncated_posts_for_test().iter().any(|id| id == "a3"),
+            "a post this window has never seen is pending, not gone"
+        );
+    });
+
+    // The retry lands and a3 is finally read: now the mark has something to be
+    // about, and it is drawn on it.
+    let mut a3 = fixture_assistant_post("a3", "the answer, cut off mid-");
+    a3.parent_action_id = Some("a2".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![
+                    fixture_user_post("a1", "original text"),
+                    {
+                        let mut a2 = fixture_assistant_post("a2", "the reply");
+                        a2.parent_action_id = Some("a1".into());
+                        a2
+                    },
+                    a3,
+                ],
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        names.iter().any(|n| n.ends_with("/cut-off")),
+        "the mark survived to reach the answer it is about: {names:?}"
+    );
+
+    // And once seen, a snapshot's silence about it means what it always did.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "original text")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.truncated_posts_for_test().is_empty(),
+            "a generation that was read and is now gone is gone"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_regeneration_failure_takes_a_stale_retry_with_it(cx: &mut TestAppContext) {
+    // The notice and the recovery it offers must describe one event. An
+    // earlier ask failed and armed Retry; a regeneration then failed
+    // retryably, carrying no re-ask of its own — so the band explained the
+    // regeneration (which deliberately offers no Retry) while the Retry
+    // beneath it re-asked the unrelated earlier turn.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::Internal {
+                    message: "the ask fell over".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    space.read_with(cx, |s, _| {
+        assert!(s.can_retry(), "the earlier ask armed a Retry");
+    });
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.fail_revision_for_test(
+                seq,
+                AppError::Internal {
+                    message: "the regeneration fell over".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.failed_turn().is_none(),
+            "the regeneration's failure ended the recovery it stood in front of"
+        );
+        assert!(!s.can_retry(), "so no Retry is offered under its notice");
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx)
+                .is_some_and(|t| t.contains("the regeneration fell over")),
+            "and the notice is the regeneration's own"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_regeneration_running_elsewhere_is_marked_until_it_lands(cx: &mut TestAppContext) {
+    // The collision is transient by construction — the claim refuses precisely
+    // because the work is finishing somewhere this window cannot see (the
+    // regeneration it started before it was closed and reopened). So it is not
+    // a failure and does not stand in the recovery band, which has nothing to
+    // end it: the other regeneration arrives as a transcript refresh, never as
+    // a `StreamEnded`. It is held on the generation it collided with, and that
+    // refresh is exactly what takes that generation — and the mark — away.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(s.revising_seq("a2").is_none(), "the pending state is gone");
+        assert!(!s.is_busy(), "and nothing of this space's is running…");
+        assert!(
+            !s.accepts_mutation(),
+            "…though the answer is still being replaced, so no verb is offered"
+        );
+        assert!(s.failed_turn().is_none(), "there is nothing to re-ask");
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx).is_none(),
+            "nothing failed, so nothing stands in the recovery band"
+        );
+    });
+
+    use eidola_gui::probe;
+    let names = |cx: &mut TestAppContext| -> Vec<String> {
+        let _probes = probes_on();
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        names
+    };
+
+    let before = names(cx);
+    assert!(
+        before
+            .iter()
+            .any(|n| n.ends_with("/regenerating-elsewhere")),
+        "the reader is told which answer is already being regenerated: {before:?}"
+    );
+
+    // The other regeneration commits. It is a new **generation of the same
+    // item** — which is why keying the mark on the generation is what ends it,
+    // and keying it on the item would not have.
+    let mut a3 = fixture_assistant_post("a3", "the regenerated reply");
+    a3.parent_action_id = Some("a1".into());
+    a3.item_id = "item-a2".into();
+    a3.generation = 1;
+    a3.generation_count = 2;
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "original text"), a3], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let after = names(cx);
+    assert!(
+        !after.iter().any(|n| n.ends_with("/regenerating-elsewhere")),
+        "and the completion that superseded that generation took the mark with it: {after:?}"
+    );
+}
+
+#[gpui::test]
+fn space_an_ask_waits_for_the_regeneration_of_the_post_it_would_answer(cx: &mut TestAppContext) {
+    // A regeneration streams, so it lives in `turn_runners` rather than the
+    // exclusive slot — and `ask` read the slot, which is how a post-level
+    // mutation stopped refusing one. The ask is written against the generation
+    // on screen; if it starts while that generation is being replaced it is
+    // billed, and reply threading follows item identity, so it comes back
+    // beneath the answer it never saw. The duplicate check is no substitute: a
+    // revising turn carries no `participant_id` and matches nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    space.update(cx, |s, cx| {
+        assert!(
+            s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the regeneration is accepted"
+        );
+        assert!(
+            s.mutation_in_flight(),
+            "and it is a post-level mutation, however it travels"
+        );
+        assert!(
+            s.ask("agent-b".into(), "a2".into(), cx).is_none(),
+            "so an ask about the generation being replaced is refused"
+        );
+        assert_eq!(
+            s.streams().len(),
+            1,
+            "and no billed turn was started beside it"
+        );
+    });
+
+    // **The fan-out's concurrency is untouched** — the narrower predicate is
+    // the whole point. In a conversation where nothing is being replaced,
+    // several asks still run side by side, each an ordinary streaming turn.
+    let (window_b, view_b) = open_space(cx, &stores, Some("s2".into()));
+    seed_space_pair(&view_b, window_b, cx);
+    let space_b = view_b.read_with(cx, |v, _| v.space().clone());
+    space_b.update(cx, |s, cx| {
+        assert!(s.ask("agent-b".into(), "a2".into(), cx).is_some());
+        assert!(
+            s.ask("agent-c".into(), "a2".into(), cx).is_some(),
+            "a second participant is still askable while the first streams"
+        );
+        assert_eq!(s.streams().len(), 2, "two turns, side by side");
+        assert!(
+            !s.mutation_in_flight(),
+            "because neither replaces a generation"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_verb_that_hides_its_own_gutter_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    // Every probed `Role::Button` is a real tab stop, and an accepted
+    // Regenerate makes `accepts_mutation` false — which withholds the whole
+    // action gutter, unmounting the verb that was just activated. The window
+    // goes on holding that slot's handle: `is_focused` answers `true` for a
+    // handle tracked on nothing, so even `sync_tree_focus` reads the level as
+    // live and leaves it there for the length of the regeneration. The row is
+    // ending, so the level ends with it — the post, where Escape already goes.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), Some(0))),
+            "the keyboard is on the answer's Regenerate verb"
+        );
+    });
+
+    // Activate it. gpui's keyboard click fires on key **up**, which
+    // `simulate_keystrokes` does not send — so the press is dispatched whole,
+    // exactly as `tests/probe.rs` drives the Library's verbs.
+    let ks = gpui::Keystroke::parse("enter").unwrap();
+    vcx.update_window(window, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: ks.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke: ks }),
+            cx,
+        );
+    })
+    .unwrap();
+    vcx.run_until_parked();
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    space.read_with(&vcx, |s, _| {
+        assert!(
+            s.revising_seq("a2").is_some(),
+            "the press was accepted — this is the state the gutter goes away in"
+        );
+    });
+    view.read_with(&vcx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            0,
+            "and the row the keyboard was standing on is gone"
+        );
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), None)),
+            "so the level ends with it, on the post — not stranded on a slot \
+             that is tracked by nothing"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_pointer_regenerate_leaves_the_keyboard_where_it_is(cx: &mut TestAppContext) {
+    // The other half of the handback rule: it is owed only by a reader who was
+    // actually holding the row. A pointer press on one of these verbs moves
+    // focus nowhere (gpui's `prevent_default`, the macOS convention), so a
+    // click while the caret is somewhere else must not drag it onto the post.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a2".to_string(), Some(0))));
+    });
+
+    // Move the keyboard off the row and press the verb by pointer in the same
+    // update — no frame in between, so the level is still recorded on the row
+    // the reader has just left. That is exactly the state a bare level check
+    // would misread as "the keyboard is here".
+    let root = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update_window(window, |_, window, cx| {
+        window.focus(&root, cx);
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    })
+    .unwrap();
+
+    vcx.update_window(window, |_, window, cx| {
+        assert!(
+            root.is_focused(window),
+            "the press took nothing from the reader's own place"
+        );
+        let _ = cx;
+    })
+    .unwrap();
+}
+
+#[gpui::test]
+fn space_an_ask_waits_for_a_regeneration_running_where_this_window_cannot_see(
+    cx: &mut TestAppContext,
+) {
+    // The seam between the collision design and the ask gate. A refused press
+    // takes the revising stream back out — nothing of *this* window's is
+    // running — while the answer is still being replaced elsewhere, so a gate
+    // reading only the local stream re-opened and an ask could be billed
+    // against the generation on its way out. The waiter is the fact: armed at
+    // the refusal, alive exactly until the claim releases.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.revising_seq("a2").is_none(),
+            "this window's own revising stream is gone…"
+        );
+        assert!(
+            s.mutation_in_flight(),
+            "…and yet the answer is still being replaced"
+        );
+    });
+    space.update(cx, |s, cx| {
+        assert!(
+            s.ask("agent-b".into(), "a2".into(), cx).is_none(),
+            "so an ask about it is refused, exactly as during a local revision"
+        );
+        assert!(s.streams().is_empty(), "nothing billed was started");
+    });
+
+    // **The same act ends both.** The mark and the gate read one map, so the
+    // settlement that takes the mark off the screen is the settlement that
+    // lets an ask through — there is no ordering between them to get wrong.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.settle_collision_for_test("a2", cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            !s.mutation_in_flight(),
+            "the released claim re-opens the gate"
+        );
+    });
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.regenerating_elsewhere_for_test()
+                .iter()
+                .any(|id| id == "a2"),
+            "and takes the mark with it, in the same act"
+        );
+    });
+    space.update(cx, |s, cx| {
+        assert!(
+            s.ask("agent-b".into(), "a2".into(), cx).is_some(),
+            "an ask about the settled answer is ordinary again"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_regeneration_that_fails_elsewhere_still_ends_the_mark(cx: &mut TestAppContext) {
+    // The other half of the ending. A regeneration that *fails* writes no
+    // successor — no action row, and for a ceiling truncation only a Record
+    // entry attached to nothing — so the transcript comes back byte-identical
+    // and supersession has nothing to say. The claim's release is what ends the
+    // mark, published by app-core and arriving as `RegenerationSettled`.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    use eidola_gui::probe;
+    let names = |cx: &mut TestAppContext| -> Vec<String> {
+        let _probes = probes_on();
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        names
+    };
+
+    let before = names(cx);
+    assert!(
+        before
+            .iter()
+            .any(|n| n.ends_with("/regenerating-elsewhere")),
+        "the mark stands while the other regeneration runs: {before:?}"
+    );
+
+    // The other regeneration fails. **Nothing about the transcript changes** —
+    // same generation, same text, same everything — which is precisely why the
+    // mark needs an ending that does not come from the tree.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.settle_collision_for_test("a2", cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    space.read_with(cx, |s, _| {
+        let posts = s.messages();
+        assert_eq!(posts.len(), 2, "the transcript is what it was");
+        assert_eq!(
+            posts[1].action_id.as_deref(),
+            Some("a2"),
+            "nothing superseded the marked generation"
+        );
+    });
+    let after = names(cx);
+    assert!(
+        !after.iter().any(|n| n.ends_with("/regenerating-elsewhere")),
+        "and the released claim ended the mark anyway: {after:?}"
+    );
 }

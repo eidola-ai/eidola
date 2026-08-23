@@ -43,8 +43,13 @@ where
 }
 
 fn setup() -> (MockServer, AppCore, tempfile::TempDir) {
+    // **Answers whichever transport asked.** Several tests here drive real
+    // turns, and a driven turn always streams — pointed at the blocking-only
+    // behaviour those read a completion body as a stream, found no `data:`
+    // frames, and passed on an empty answer nothing complained about. Surfaced
+    // by the unterminated-stream rule.
     let (mock, core, dir) = chat_harness::core_for(MockConfig {
-        chat: ChatBehavior::OkBlocking,
+        chat: ChatBehavior::OkEitherTransport,
         ..MockConfig::default()
     });
     core.runtime()

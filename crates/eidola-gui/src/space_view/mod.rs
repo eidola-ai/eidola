@@ -797,6 +797,31 @@ pub struct SpaceView {
     /// failure — nothing broke, there is nothing to retry, and the band it
     /// renders in is the muted one.
     pub(crate) reference_notice: Option<SharedString>,
+    /// The posts this window watched stop at their **length allowance** — the
+    /// marker's whole state (see `SpaceEvent::TurnEnded`).
+    pub(crate) truncated_posts: HashSet<SharedString>,
+    /// The generations this window asked to regenerate and was told were
+    /// already being regenerated elsewhere (see
+    /// `SpaceEvent::RegenerationCollided`).
+    ///
+    /// Keyed by **generation**, which is what makes the state end on its own.
+    /// The mark is drawn only on the post whose action id it names, and the
+    /// regeneration it collided with supersedes exactly that action id — so the
+    /// transcript refresh that carries the finished answer here is the same
+    /// event that takes the mark off the screen, with nothing watching for it.
+    /// Keyed by *item* it would have outlived the very completion it is waiting
+    /// for. [`SpaceView::prune_post_marks`] then drops the dead key.
+    pub(crate) regenerating_elsewhere: HashSet<SharedString>,
+    /// The marked generations this window has actually **seen** in a snapshot —
+    /// the evidence [`SpaceView::prune_post_marks`] needs before a later
+    /// snapshot's silence about one may be read as supersession.
+    ///
+    /// A mark is recorded when its turn ends, which can precede any snapshot
+    /// carrying its post (a turn whose own exit reload failed leaves the post
+    /// durable and unread here), so "absent" and "gone" are different facts and
+    /// only this tells them apart. Pruned to the marks themselves, so it can
+    /// outlive neither.
+    pub(crate) marks_seen: HashSet<SharedString>,
 
     /// Whether this window's **inspector** (the per-space settings panel) is
     /// open. Per-window by design — two windows on one space are two vantage
@@ -1064,6 +1089,9 @@ impl SpaceView {
             minimap_drag: None,
             error: None,
             reference_notice: None,
+            truncated_posts: HashSet::new(),
+            regenerating_elsewhere: HashSet::new(),
+            marks_seen: HashSet::new(),
             inspector_open: false,
             inspector_scroll: ScrollHandle::new(),
             inspector_title: None,
@@ -1521,6 +1549,71 @@ impl SpaceView {
         self.error.as_ref().map(|e| error_copy(e, cx))
     }
 
+    /// Test-only: how many affordance-row verbs a post currently offers — the
+    /// same answer the render and the keyboard model both read, so a test can
+    /// ask whether a verb is *there* rather than infer it from a paint.
+    #[doc(hidden)]
+    pub fn post_verb_count_for_test(&self, node_id: &str, cx: &gpui::App) -> usize {
+        self.post_verb_count(node_id, cx)
+    }
+
+    /// Test-only: the streaming leaves the tree will grow this frame. A
+    /// regeneration is deliberately absent — it renders in place.
+    #[doc(hidden)]
+    pub fn stream_overlays_for_test(&self, cx: &gpui::App) -> Vec<(u64, Option<SharedString>)> {
+        self.stream_overlays(cx)
+    }
+
+    /// Test-only: the generations this window is marking as cut off at their
+    /// length allowance — pending ones included, which is the distinction
+    /// `prune_post_marks` turns on.
+    #[doc(hidden)]
+    pub fn truncated_posts_for_test(&self) -> Vec<String> {
+        self.truncated_posts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Test-only: re-derive the render snapshot, as any unrelated space change
+    /// does — a concurrent sibling turn's delta, for instance.
+    #[doc(hidden)]
+    pub fn rebuild_for_test(&mut self, cx: &mut Context<Self>) {
+        self.rebuild(cx);
+    }
+
+    /// Test-only: the generations this window is marking as being regenerated
+    /// somewhere it cannot see — the mark whose ending the settlement is.
+    #[doc(hidden)]
+    pub fn regenerating_elsewhere_for_test(&self) -> Vec<String> {
+        self.regenerating_elsewhere
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Test-only: mark `action_id` as being regenerated somewhere this window
+    /// cannot see — what `SpaceEvent::RegenerationCollided` does, without
+    /// staging a collision through the entity's gates (which now withhold the
+    /// next regeneration, as they should).
+    #[doc(hidden)]
+    pub fn note_regeneration_elsewhere_for_test(
+        &mut self,
+        action_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.regenerating_elsewhere
+            .insert(SharedString::from(action_id.to_string()));
+        cx.notify();
+    }
+
+    /// Test-only: record that this window watched `action_id`'s answer stop at
+    /// its length allowance — what `SpaceEvent::TurnEnded { truncated: true }`
+    /// does, without a backend to produce one.
+    #[doc(hidden)]
+    pub fn note_truncated_turn_for_test(&mut self, action_id: &str, cx: &mut Context<Self>) {
+        self.truncated_posts
+            .insert(SharedString::from(action_id.to_string()));
+        cx.notify();
+    }
+
     /// The node id whose separator band menu is open, if any.
     #[doc(hidden)]
     pub fn band_menu_for_test(&self) -> Option<String> {
@@ -1777,7 +1870,72 @@ impl SpaceView {
         self.ensure_viewer_gate(cx);
         self.rethread_drafts(&posts);
         self.retarget_tree_focus(&posts);
+        self.prune_post_marks(&posts);
         self.posts = posts;
+    }
+
+    /// Drop every session-scoped post mark whose **generation** has left the
+    /// transcript, beside the two window-local references that forward across
+    /// one.
+    ///
+    /// Unlike a draft's antecedent or the tree focus, neither mark forwards:
+    /// each says something about one version of a post — that it stopped at its
+    /// length allowance, that a regeneration of it was already running — and an
+    /// edit or a regeneration answers it by producing a different version.
+    /// Neither is drawn anywhere but on the generation it names, so this
+    /// changes nothing a reader sees; what it does is make the state end where
+    /// the drawing already does, rather than accumulate a key per superseded
+    /// generation for the life of the window.
+    ///
+    /// **Evidence of absence, never absence of evidence** (Codex review, PR
+    /// #330). A mark is recorded when the *turn* ends, which can be many frames
+    /// ahead of any snapshot containing the post it names: a truncated turn
+    /// persists its answer and then fails its own exit reload, so the mark's
+    /// generation is durable and absent from every snapshot this window holds
+    /// until a retry succeeds. Pruning on "not in the current posts" read that
+    /// as superseded and dropped it — and the rebuild that did so needed
+    /// nothing to do with the turn, a concurrent sibling's `StreamDelta` being
+    /// enough — so the answer came back after the Retry with no mark on it. A
+    /// mark therefore becomes prunable only once its generation has actually
+    /// been *seen* here; until then it is pending, and no snapshot can say
+    /// anything about it.
+    ///
+    /// A transcript with nothing in it is a read that has not answered, not an
+    /// empty conversation, and nothing can be pruned against it.
+    fn prune_post_marks(&mut self, next: &[PostData]) {
+        if next.is_empty() {
+            return;
+        }
+        let live: HashSet<SharedString> = next.iter().filter_map(|p| p.action_id.clone()).collect();
+
+        // Seeing a mark's generation once is what turns "pending" into
+        // "prunable" — the evidence a later snapshot's silence then means
+        // something.
+        for id in self
+            .truncated_posts
+            .iter()
+            .chain(&self.regenerating_elsewhere)
+        {
+            if live.contains(id) {
+                self.marks_seen.insert(id.clone());
+            }
+        }
+
+        let seen = &self.marks_seen;
+        self.truncated_posts
+            .retain(|id| live.contains(id) || !seen.contains(id));
+        self.regenerating_elsewhere
+            .retain(|id| live.contains(id) || !seen.contains(id));
+
+        // The witness list is bookkeeping for the two marks and outlives
+        // neither.
+        let held: HashSet<SharedString> = self
+            .truncated_posts
+            .iter()
+            .chain(&self.regenerating_elsewhere)
+            .cloned()
+            .collect();
+        self.marks_seen.retain(|id| held.contains(id));
     }
 
     /// Carry every draft's reply antecedent across a generation change of the
@@ -2023,7 +2181,16 @@ impl SpaceView {
             SpaceEvent::TurnEnded {
                 seq,
                 response_action_id,
+                truncated,
             } => {
+                // An answer that stopped at its length allowance is marked
+                // where it is read, beneath the post itself — the only place
+                // the mark means anything. Session-scoped by necessity: the
+                // reason an answer stops is not part of what is stored.
+                if let (true, Some(id)) = (*truncated, response_action_id.as_deref()) {
+                    self.truncated_posts
+                        .insert(SharedString::from(id.to_string()));
+                }
                 // A selection aimed at this turn's streaming leaf — pending, or
                 // the branch the reader is parked on — has to follow the turn
                 // onto the post it wrote; the leaf is already gone (see
@@ -2032,6 +2199,25 @@ impl SpaceView {
             }
             SpaceEvent::Failed(e) => {
                 self.error = Some(e.clone());
+                self.rebuild(cx);
+            }
+            SpaceEvent::RegenerationCollided { action_id } => {
+                // Marked on the generation it collided on, never in the
+                // recovery band: the band has nothing to end this state on
+                // (the other regeneration lands as a transcript refresh), while
+                // the generation itself is exactly what that refresh takes
+                // away — see `prune_post_marks`.
+                self.regenerating_elsewhere
+                    .insert(SharedString::from(action_id.clone()));
+                self.rebuild(cx);
+            }
+            SpaceEvent::RegenerationSettled { action_id } => {
+                // The other half of the ending. Supersession covers the
+                // regeneration that succeeds; this covers the one that fails,
+                // which leaves the transcript exactly as it found it and so
+                // has nothing in the tree for the mark to end on.
+                self.regenerating_elsewhere
+                    .remove(&SharedString::from(action_id.clone()));
                 self.rebuild(cx);
             }
             SpaceEvent::CascadePaused {
@@ -2152,6 +2338,10 @@ impl SpaceView {
             .read(cx)
             .streams()
             .iter()
+            // A regeneration has no leaf of its own: it renders **in place of**
+            // the post it replaces (see `render_post`). Attached as a child it
+            // would draw as a reply to the post it is about to become.
+            .filter(|t| !t.revising)
             .map(|t| (t.seq, t.target_action_id.clone().map(SharedString::from)))
             .collect()
     }
@@ -2289,6 +2479,9 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
         }
         AppError::SpaceArchived { .. } => crate::i18n::msg::space_error_archived(cx).to_string(),
         AppError::NotJoined { .. } => crate::i18n::msg::space_error_not_joined(cx).to_string(),
+        AppError::ResponseTruncated { .. } => {
+            crate::i18n::msg::space_error_response_truncated(cx).to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -3536,8 +3729,17 @@ impl SpaceView {
     /// (and later `StreamEnded`/`Failed`) drives the rest. Sibling turns
     /// still streaming are untouched.
     pub fn retry_failed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.error = None;
+        // **The notice is cleared by the retry succeeding, not by the press.**
+        // `Space::retry` can be refused (it routes through `ask`), and clearing
+        // first left the recovery record standing with nothing on screen
+        // explaining it — the failure still unresolved and its only visible way
+        // out gone. `can_retry` makes the refusal unreachable from the button,
+        // but an affordance that *can* be refused must not spend the state its
+        // refusal depends on.
         let seq = self.space.update(cx, |s, cx| s.retry(cx));
+        if seq.is_some() {
+            self.error = None;
+        }
         // Select the branch the retried turn's streaming node lands on — not
         // whatever branch the user navigated to after the failure (PR #218
         // review), and not merely the target's path (the retry is a new

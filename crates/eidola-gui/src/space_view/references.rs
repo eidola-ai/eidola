@@ -217,11 +217,39 @@ pub(crate) struct FootnoteRow {
 /// footnote, not a banner — and finishes the clause "this conversation …".
 fn delegation_note(end: DelegationEnd, cx: &gpui::App) -> SharedString {
     match end {
-        DelegationEnd::Concluded => msg::space_footnote_delegation_concluded(cx),
-        DelegationEnd::Paused { depth, limit } => {
-            msg::space_footnote_delegation_paused(cx, depth, limit)
+        DelegationEnd::Concluded { truncated: false } => {
+            msg::space_footnote_delegation_concluded(cx)
         }
-        DelegationEnd::BudgetSpent { limit } => msg::space_footnote_delegation_budget(cx, limit),
+        // The room ran out of things to say, but not on a finished thought —
+        // the rail says both, because "ran to a stop" alone would carry a
+        // completeness the answer beneath it does not have.
+        DelegationEnd::Concluded { truncated: true } => {
+            msg::space_footnote_delegation_concluded_truncated(cx)
+        }
+        // The same rule as the conclusion above, on the two other endings that
+        // invite an action assuming coherent words to build on: "resume by
+        // posting there" and "raise the cap" both read differently when the
+        // room's last word stops mid-thought. Whole sentences per arm rather
+        // than a composed clause — a translator needs the sentence, and the
+        // rail's register is theirs to keep.
+        DelegationEnd::Paused {
+            depth,
+            limit,
+            truncated: false,
+        } => msg::space_footnote_delegation_paused(cx, depth, limit),
+        DelegationEnd::Paused {
+            depth,
+            limit,
+            truncated: true,
+        } => msg::space_footnote_delegation_paused_truncated(cx, depth, limit),
+        DelegationEnd::BudgetSpent {
+            limit,
+            truncated: false,
+        } => msg::space_footnote_delegation_budget(cx, limit),
+        DelegationEnd::BudgetSpent {
+            limit,
+            truncated: true,
+        } => msg::space_footnote_delegation_budget_truncated(cx, limit),
         DelegationEnd::TurnFailed { reason } => msg::space_footnote_delegation_failed(
             cx,
             match reason {

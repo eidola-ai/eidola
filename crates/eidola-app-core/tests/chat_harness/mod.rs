@@ -100,6 +100,23 @@ pub enum ChatBehavior {
     /// 200 SSE stream that the server aborts mid-event (writes a partial event,
     /// then drops the TCP connection). Exercises the mid-SSE read failure arm.
     StreamingMidAbort,
+    /// 200 SSE stream that ends **cleanly** after real content but never says
+    /// it is over: well-formed events, a proper end to the chunked body, and
+    /// no `[DONE]` and no terminal `finish_reason` anywhere.
+    ///
+    /// Deliberately not [`ChatBehavior::StreamingMidAbort`], which dies inside
+    /// a frame and so fails in the transport's own decoder. Nothing fails here
+    /// — the bytes are valid to the last one — which is exactly why the turn
+    /// used to persist as a completed answer: the only thing wrong with it is
+    /// that the upstream never claimed it was finished.
+    StreamingEndsWithoutDone,
+    /// The first chat request answers ordinarily; every later one is
+    /// [`ChatBehavior::StreamingEndsWithoutDone`]. Whichever transport asked.
+    ///
+    /// How a test gets a **real answer already in the transcript** and then a
+    /// regeneration whose stream dies — the case where reading the cut text as
+    /// a completion would supersede the answer it was meant to improve.
+    OkThenStreamEndsWithoutDone,
     /// Non-2xx JSON error body (e.g. 500). Exercises the non-2xx arm of both
     /// `chat` and `chat_stream`.
     Non2xx(u16),
@@ -201,6 +218,27 @@ pub enum ChatBehavior {
     /// handles that only exist once the fixture space has been built — so the
     /// script is set at runtime rather than at mock construction.
     ToolScript,
+    /// **The reasoning model that never starts answering**, in whichever
+    /// transport asked: reasoning all the way to the completion ceiling, no
+    /// content at all, `finish_reason: "length"`, and honest usage saying the
+    /// whole budget went.
+    ///
+    /// One behaviour across both transports on purpose — the classification is
+    /// a property of the turn, not of how its bytes arrived, and two behaviours
+    /// could drift apart while both stayed green.
+    ReasoningOnlyLength,
+    /// A **partial** answer stopped at the ceiling: real content, then
+    /// `finish_reason: "length"`. Whichever transport asked. The turn is
+    /// ordinary — the text is worth keeping — but it must not be called
+    /// finished.
+    PartialAnswerLength,
+    /// The first chat request answers ordinarily; every later one is
+    /// [`ChatBehavior::ReasoningOnlyLength`]. Whichever transport asked.
+    ///
+    /// This is how a test gets a *readable answer already in the transcript*
+    /// and then a regeneration that hits the ceiling — the reported case, and
+    /// the one where the classification decides whether a real answer survives.
+    OkThenReasoningOnlyLength,
 }
 
 /// The reason the decline behaviours state; asserted on the persisted
@@ -319,6 +357,13 @@ pub struct MockConfig {
     pub models_status: Option<u16>,
     /// The calls [`ChatBehavior::ToolScript`] serves (ignored otherwise).
     pub tool_script: ToolScript,
+    /// How long a chat request is held before it is answered.
+    ///
+    /// A real model request takes time — that is the whole reason a surface
+    /// needs a pending state, and the reason two clicks can overlap. The mock
+    /// answers instantly, which makes an in-flight turn unobservable, so a test
+    /// about *concurrency* asks for a window it can act inside.
+    pub chat_delay_ms: u64,
 }
 
 impl Default for MockConfig {
@@ -331,6 +376,7 @@ impl Default for MockConfig {
             balance: 10_000_000,
             models_status: None,
             tool_script: tool_script(),
+            chat_delay_ms: 0,
         }
     }
 }
@@ -1074,6 +1120,9 @@ async fn handle_chat(
     hit: u64,
     request: &serde_json::Value,
 ) -> std::io::Result<()> {
+    if config.chat_delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(config.chat_delay_ms)).await;
+    }
     // Compute an inline refund object once (shared by the blocking happy path).
     let inline_refund = if config.refund == RefundMode::Succeed {
         auth.and_then(Issuer::spend_proof_from_auth)
@@ -1148,6 +1197,28 @@ async fn handle_chat(
             .await
         }
         ChatBehavior::StreamingMidAbort => write_sse_stream(stream, false, &[STREAM_CONTENT]).await,
+        ChatBehavior::StreamingEndsWithoutDone => {
+            write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
+        }
+        ChatBehavior::OkThenStreamEndsWithoutDone if hit == 1 => {
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
+            }
+            let mut body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::OkThenStreamEndsWithoutDone => {
+            write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
+        }
         ChatBehavior::ToolRoundsBlocking(rounds) => {
             if hit <= rounds {
                 let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
@@ -1272,12 +1343,76 @@ async fn handle_chat(
                 )
                 .await;
             }
+            // **The retry is answered in the transport that asked.** Both
+            // doors reach this behaviour — the sub-space driver only ever
+            // streams — and answering a stream with a completion body sends no
+            // `data:` frames at all, so the turn read as an empty answer that
+            // nothing complained about.
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
+            }
             let mut body = serde_json::json!({
                 "choices": [{ "message": {
                     "role": "assistant",
                     "content": "Hello from the mock.",
                 } }],
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::OkThenReasoningOnlyLength if hit == 1 => {
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
+            }
+            let mut body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::ReasoningOnlyLength | ChatBehavior::OkThenReasoningOnlyLength => {
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_length_stream(stream, &[]).await;
+            }
+            let mut body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": TRUNCATED_REASONING,
+                    },
+                    "finish_reason": "length",
+                }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::PartialAnswerLength => {
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_length_stream(stream, &[STREAM_CONTENT]).await;
+            }
+            let mut body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": STREAM_CONTENT,
+                        "reasoning_content": TRUNCATED_REASONING,
+                    },
+                    "finish_reason": "length",
+                }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
             });
             if let Some(refund) = inline_refund {
                 body["refund"] = refund;
@@ -1574,6 +1709,58 @@ fn sse_event(payload: &str) -> Vec<u8> {
 /// The streaming mock's answer text.
 pub const STREAM_CONTENT: &str = "Hello from the stream.";
 
+/// What a model that spent its whole budget thinking has to show for it.
+pub const TRUNCATED_REASONING: &str = "still working through it…";
+
+/// The completion ceiling the truncating behaviours report as consumed — the
+/// client's own `max_completion_tokens` for a model with room for it, which is
+/// what makes the response honest rather than merely shaped right.
+pub const CEILING_TOKENS: i64 = 4096;
+
+/// An SSE stream that ends at the **completion ceiling**: reasoning deltas,
+/// then whatever `content_chunks` holds (possibly nothing), then a terminal
+/// chunk carrying `finish_reason: "length"` and the spent budget, then
+/// `[DONE]`.
+///
+/// The reason lands on its own trailing chunk with an empty delta, which is
+/// where real providers put it — a client that only reads chunks carrying
+/// content would miss it entirely.
+async fn write_sse_length_stream(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let reasoning = serde_json::json!({
+        "choices": [{ "delta": { "reasoning": TRUNCATED_REASONING }, "finish_reason": null }]
+    });
+    stream.write_all(&sse_event(&reasoning.to_string())).await?;
+    stream.flush().await?;
+
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "choices": [{ "delta": { "content": chunk }, "finish_reason": null }]
+        });
+        stream.write_all(&sse_event(&content.to_string())).await?;
+        stream.flush().await?;
+    }
+
+    let terminal = serde_json::json!({
+        "choices": [{ "delta": {}, "finish_reason": "length" }],
+        "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS }
+    });
+    stream.write_all(&sse_event(&terminal.to_string())).await?;
+    stream.write_all(&sse_event("[DONE]")).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 /// A header-shaped first line a model might mimic (see
 /// `ChatBehavior::OkStreamingWithHeader`). Deliberately *not* a real handle of
 /// anything — strip-on-receipt is shape-based, not identity-based.
@@ -1583,6 +1770,54 @@ pub const MIMICKED_HEADER: &str = "#a2c3d4e · Gemma4 31b";
 /// delta per entry of `content_chunks`, a usage chunk, and `[DONE]`. When not
 /// complete, emits one partial event and then drops the connection mid-stream
 /// (simulating an abort).
+/// An SSE stream that **ends without ever saying it is over**: reasoning, then
+/// `content_chunks`, then a proper end to the chunked body — and no `[DONE]`,
+/// no `finish_reason`, on any chunk.
+///
+/// Every byte is well-formed, so nothing in the transport complains; the only
+/// thing missing is the upstream's claim to have finished. That is what
+/// separates it from [`ChatBehavior::StreamingMidAbort`], which dies inside a
+/// frame and fails in the decoder.
+async fn write_sse_unterminated_stream(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let frame = |payload: String| -> Vec<u8> {
+        let event = format!("data: {payload}\n\n");
+        let mut out = format!("{:x}\r\n", event.len()).into_bytes();
+        out.extend_from_slice(event.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+
+    let reasoning = serde_json::json!({
+        "choices": [{ "delta": { "reasoning": "thinking…" } }]
+    });
+    stream.write_all(&frame(reasoning.to_string())).await?;
+    stream.flush().await?;
+
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "choices": [{ "delta": { "content": chunk } }]
+        });
+        stream.write_all(&frame(content.to_string())).await?;
+        stream.flush().await?;
+    }
+
+    // The body ends properly. No `[DONE]`, and nothing ever named a
+    // `finish_reason` — the connection simply stopped having more to say.
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 async fn write_sse_stream(
     stream: &mut TcpStream,
     complete: bool,
