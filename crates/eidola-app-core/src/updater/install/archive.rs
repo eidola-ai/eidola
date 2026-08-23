@@ -113,6 +113,34 @@ pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize
                     ),
                 });
             }
+            // A member says what it is twice: in its name, where a trailing
+            // slash means directory, and in its mode. Reading the mode
+            // first stops a symlink hiding behind a slash, but the two can
+            // still disagree — a directory mode on a plain name, a file
+            // mode on a name ending in `/` — and then whichever one the
+            // code happens to dispatch on decides what lands. They have to
+            // agree, or the member is not something this can unpack.
+            let says_directory = kind == 0o040000;
+            let named_directory = entry.is_dir();
+            if kind != 0 && says_directory != named_directory {
+                return Err(InstallError::Archive {
+                    label: label.to_string(),
+                    reason: format!(
+                        "member `{raw_name}` names {} and its mode says {}; a member that \
+                         cannot say what it is once is refused",
+                        if named_directory {
+                            "a directory"
+                        } else {
+                            "a file"
+                        },
+                        if says_directory {
+                            "a directory"
+                        } else {
+                            "a file"
+                        }
+                    ),
+                });
+            }
         }
 
         if entry.is_dir() {
@@ -439,6 +467,67 @@ mod tests {
             matches!(&error, InstallError::Archive { reason, .. } if reason.contains("symbolic link")),
             "{error}"
         );
+    }
+
+    /// A member says what it is twice — in its name and in its mode — and
+    /// a container where the two disagree is one where whichever the code
+    /// dispatches on decides what lands.
+    #[test]
+    fn refuses_a_member_whose_name_and_mode_disagree() {
+        // A file-shaped name carrying a directory mode needs the mode
+        // patched in; a directory-shaped name carrying a file mode needs
+        // nothing, because the writer stores `S_IFREG` regardless of the
+        // trailing slash. Both are read back before use, so the fixture
+        // proves it really holds the disagreement it is testing.
+        for (name, patch) in [
+            ("app/oddity", Some((0o100755u32, 0o040755u32))),
+            ("app/oddity/", None),
+        ] {
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            {
+                let mut writer = zip::ZipWriter::new(&mut cursor);
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored)
+                    .unix_permissions(0o755);
+                writer.start_file(name.to_string(), options).unwrap();
+                writer.finish().unwrap();
+            }
+            let mut bytes = cursor.into_inner();
+
+            if let Some((from, to)) = patch {
+                let from_bytes = (from << 16).to_le_bytes();
+                let to_bytes = (to << 16).to_le_bytes();
+                let mut patched = 0;
+                for i in 0..bytes.len().saturating_sub(4) {
+                    if bytes[i..i + 4] == from_bytes {
+                        bytes[i..i + 4].copy_from_slice(&to_bytes);
+                        patched += 1;
+                    }
+                }
+                assert!(patched >= 1, "`{name}`: the fixture should record a mode");
+            }
+
+            // The fixture is only worth anything if the two really differ.
+            {
+                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..])).unwrap();
+                let entry = archive.by_index(0).unwrap();
+                let mode_says_dir = entry.unix_mode().unwrap() & 0o170000 == 0o040000;
+                assert_ne!(
+                    mode_says_dir,
+                    entry.is_dir(),
+                    "`{name}`: this fixture is supposed to disagree with itself"
+                );
+            }
+
+            let dest = tempfile::tempdir().unwrap();
+            let error = unpack_zip(&bytes, dest.path(), "a payload")
+                .expect_err("a member that cannot say what it is once is refused");
+            assert!(
+                matches!(&error, InstallError::Archive { reason, .. }
+                    if reason.contains("cannot say what it is once")),
+                "`{name}`: {error}"
+            );
+        }
     }
 
     /// A byte budget does not bound member count.

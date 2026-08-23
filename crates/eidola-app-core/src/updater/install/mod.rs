@@ -45,6 +45,7 @@
 
 mod archive;
 
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use eidola_apple::SignatureFacts;
@@ -195,7 +196,15 @@ impl From<InstallError> for AppError {
 /// Download, verify, reconstruct, and inspect — leaving a staged bundle.
 ///
 /// `staging_root` must not exist; this creates it and owns everything under
-/// it. On **any** failure it is removed before returning, so a failed
+/// it. Its parent must exist — the directory holding a staging root is the
+/// caller's, not this module's.
+///
+/// The path is **resolved** before anything is created, so a relative one
+/// cannot re-resolve later and a symlinked ancestor is followed once.
+/// [`StagedInstall::bundle`] therefore sits under the resolved root, which
+/// may be spelled differently than the path passed here — on macOS a
+/// temporary directory under `/var` comes back under `/private/var`. A
+/// caller comparing the two should resolve its own path too. On **any** failure it is removed before returning, so a failed
 /// install leaves no tree for a later run to find and mistake for a good
 /// one.
 pub async fn stage(
@@ -212,38 +221,39 @@ pub async fn stage(
         return Err(InstallError::PlanIncomplete);
     }
 
-    // The caller chooses where staging happens, so the directory *holding*
-    // it is the caller's — creating it here would mean creating something
-    // this call never removes, which is the same ownership mistake in the
-    // other direction.
-    match staging_root.parent() {
-        Some(parent) if parent.as_os_str().is_empty() => {}
-        Some(parent) if !parent.is_dir() => {
-            return Err(InstallError::Staging {
-                path: parent.to_path_buf(),
-                reason: "does not exist; the directory holding a staging root belongs to the \
-                         caller, so this will not create it"
-                    .to_string(),
-            });
-        }
-        _ => {}
-    }
+    // Pinned to one absolute path before anything touches the filesystem.
+    // A relative path is not a location, it is a location *plus* whatever
+    // the process working directory happens to be — and this function
+    // awaits, so that can change underneath it. Every later operation, and
+    // the guard that deletes on the way out, would then be naming
+    // something else. Resolving the parent also *is* round 2's ownership
+    // check: the directory holding a staging root belongs to the caller,
+    // so one that cannot be resolved is refused rather than created.
+    let staging_root = &absolutize_staging_root(staging_root)?;
 
     // Creating the directory is what earns the right to delete it. The
     // check and the claim are one atomic step: `create_dir` fails if
     // anything is already there, so a staging path that collides with a
     // caller's data is refused *before* any cleanup is armed, and cannot
     // be created by someone else in between.
-    std::fs::create_dir(staging_root).map_err(|e| InstallError::Staging {
-        path: staging_root.to_path_buf(),
-        reason: if e.kind() == std::io::ErrorKind::AlreadyExists {
-            "already exists; staging directories are created fresh, and this one is not \
-             ours to remove"
-                .to_string()
-        } else {
-            e.to_string()
-        },
-    })?;
+    //
+    // The mode is stated rather than left to the umask. Under a permissive
+    // one the tree would be world-writable, and every hash this module
+    // checks would be checkable-then-replaceable: another local user could
+    // swap a payload after it was verified and before it was used.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(staging_root)
+        .map_err(|e| InstallError::Staging {
+            path: staging_root.clone(),
+            reason: if e.kind() == std::io::ErrorKind::AlreadyExists {
+                "already exists; staging directories are created fresh, and this one is not \
+                 ours to remove"
+                    .to_string()
+            } else {
+                e.to_string()
+            },
+        })?;
 
     // From here on the tree is removed by *going out of scope*, not by
     // reaching an error arm. An install can also end by never finishing —
@@ -253,6 +263,40 @@ pub async fn stage(
     let guard = StagingGuard::arm(staging_root);
     let staged = stage_inner(fetcher, plan, staging_root).await?;
     Ok(guard.keep(staged))
+}
+
+/// One absolute path for the staging root, resolved before any filesystem
+/// operation names it.
+///
+/// The root does not exist yet, so its *parent* is what gets resolved and
+/// the final component is joined back on. A parent that cannot be resolved
+/// is a parent that does not exist, which is the caller's to create.
+fn absolutize_staging_root(staging_root: &Path) -> Result<PathBuf, InstallError> {
+    let Some(name) = staging_root.file_name() else {
+        return Err(InstallError::Staging {
+            path: staging_root.to_path_buf(),
+            reason: "is not a directory this could create (it names no final component)"
+                .to_string(),
+        });
+    };
+
+    // `Some("")` is what a single-component relative path reports; that
+    // parent is the working directory.
+    let parent = match staging_root.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => Path::new("."),
+    };
+
+    let resolved = parent.canonicalize().map_err(|e| InstallError::Staging {
+        path: parent.to_path_buf(),
+        reason: format!(
+            "could not be resolved ({e}); the directory holding a staging root belongs to \
+             the caller, so this will not create it"
+        ),
+    })?;
+
+    Ok(resolved.join(name))
 }
 
 /// Removes the staging tree unless the install got far enough to hand it
@@ -532,6 +576,20 @@ pub fn promotion_readiness(staged: &Path, installed: &Path) -> PromotionReadines
             };
         }
     }
+
+    // Resolved for the same reason a staging root is: a relative path is
+    // not a location. It also settles the parent — `Path::parent` of a
+    // single-component path is `Some("")`, and asking the kernel about an
+    // empty pathname fails, which would report a perfectly writable
+    // directory as needing privileges.
+    let installed = &match installed.canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            return PromotionReadiness::NeedsPrivileges {
+                reason: format!("`{}` could not be resolved: {e}", installed.display()),
+            };
+        }
+    };
     // The swap renames the installed bundle aside and renames the staged
     // one into its place. Both are operations on entries *in the parent
     // directory*, so what they need is write and search there — and
@@ -647,6 +705,72 @@ fn renamable_within(dir: &Path) -> bool {
     // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
     // call, and `access` only reads it.
     unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+#[cfg(test)]
+mod path_pinning_tests {
+    use super::*;
+
+    /// Changing the working directory is process-wide, so the tests that
+    /// need to are serialized against each other. Everything else in this
+    /// crate's tests names absolute paths, which is why a brief change is
+    /// safe here at all.
+    static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_relative_staging_root_resolves_before_anything_is_created() {
+        let _guard = CWD.lock().unwrap_or_else(|e| e.into_inner());
+        let workdir = tempfile::tempdir().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(workdir.path()).unwrap();
+
+        let single = absolutize_staging_root(Path::new("staging"));
+        let nested = absolutize_staging_root(Path::new("./deeper/staging"));
+        std::fs::create_dir("deeper").unwrap();
+        let nested_now = absolutize_staging_root(Path::new("./deeper/staging"));
+
+        std::env::set_current_dir(&previous).unwrap();
+
+        let single = single.expect("a single-component relative root has the cwd as its parent");
+        assert!(
+            single.is_absolute(),
+            "a relative staging root re-resolves later unless it is pinned now: {}",
+            single.display()
+        );
+        assert!(single.ends_with("staging"));
+
+        assert!(
+            nested.is_err(),
+            "a parent that does not exist is the caller's to create"
+        );
+        assert!(
+            nested_now.expect("the parent exists now").is_absolute(),
+            "a nested relative root pins too"
+        );
+    }
+
+    #[test]
+    fn a_single_component_install_path_is_not_a_privilege_problem() {
+        // `Path::parent` of a single-component path is `Some("")`, and the
+        // kernel rejects an empty pathname — which reported a perfectly
+        // writable directory as needing privileges.
+        assert_eq!(
+            Path::new("Eidola.app").parent().map(Path::to_path_buf),
+            Some(PathBuf::new()),
+            "this is the shape the probe has to survive"
+        );
+
+        let _guard = CWD.lock().unwrap_or_else(|e| e.into_inner());
+        let workdir = tempfile::tempdir().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(workdir.path()).unwrap();
+        std::fs::create_dir("Eidola.app").unwrap();
+
+        let verdict = promotion_readiness(Path::new("Eidola.app"), Path::new("Eidola.app"));
+
+        std::env::set_current_dir(&previous).unwrap();
+        assert_eq!(verdict, PromotionReadiness::Ready, "{verdict:?}");
+    }
 }
 
 #[cfg(test)]

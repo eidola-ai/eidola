@@ -283,7 +283,10 @@ async fn stages_a_reconstructed_bundle_that_matches_the_signed_release() {
     );
 
     // Nothing was installed — only staged.
-    assert!(staged.bundle().starts_with(&root));
+    // Under the *resolved* root: on macOS the temporary directory lives
+    // below a symlinked `/var`, so the pinned path is spelled differently
+    // than the one this test asked for.
+    assert!(staged.bundle().starts_with(root.canonicalize().unwrap()));
     staged.discard().unwrap();
     assert!(!root.exists(), "discarding removes the staged tree");
 }
@@ -522,6 +525,36 @@ async fn refuses_members_that_the_filesystem_would_fold_together() {
         "{error}"
     );
     assert!(!root.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn creates_the_staging_root_private_whatever_the_umask() {
+    // Every hash this module checks would be checkable-then-replaceable if
+    // the tree were world-writable: another local user could swap a
+    // verified payload before it was used.
+    use std::os::unix::fs::PermissionsExt;
+
+    let published = publish();
+    let staging = tempfile::tempdir().unwrap();
+    let root = staging.path().join("9.9.9");
+
+    // SAFETY: `umask` reads and sets process state; it cannot fail.
+    let previous = unsafe { libc::umask(0o000) };
+    let staged = install::stage(
+        &Fetcher::fixtures(published.dir.path()),
+        &plan(&published),
+        &root,
+    )
+    .await;
+    unsafe { libc::umask(previous) };
+
+    let staged = staged.expect("the fixture release should install");
+    let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "the staging root must not be reachable by others"
+    );
+    staged.discard().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
