@@ -4625,7 +4625,11 @@ fn space_footnote_rail_says_how_a_delegated_conversation_stopped(cx: &mut TestAp
             range_start: Some(0),
             range_end: Some(4),
             annotation: None,
-            delegation_end: Some(eidola_app_core::DelegationEnd::Paused { depth: 2, limit: 2 }),
+            delegation_end: Some(eidola_app_core::DelegationEnd::Paused {
+                depth: 2,
+                limit: 2,
+                truncated: false,
+            }),
             snippet: Some("the evening one is the spring".into()),
             antecedent_author_label: "Surveyor".into(),
             antecedent_author_kind: "agent".into(),

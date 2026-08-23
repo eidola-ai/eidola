@@ -29,7 +29,12 @@ space-footnote-delegation-concluded = ran to a stop
 # room ran out of things to say, but not on a finished thought.
 space-footnote-delegation-concluded-truncated = ran to a stop, on an answer cut off at its length limit
 space-footnote-delegation-paused = reached its reply limit ({ $depth } of { $limit })
+# The same pause, resting on an answer that stopped at its length limit —
+# resuming would continue from a mid-thought answer, so the row says both.
+space-footnote-delegation-paused-truncated = reached its reply limit ({ $depth } of { $limit }), on an answer cut off at its length limit
 space-footnote-delegation-budget = used all { $limit } of its turns
+# The same spent budget, resting on an answer cut off at its length limit.
+space-footnote-delegation-budget-truncated = used all { $limit } of its turns, on an answer cut off at its length limit
 # Why a delegated conversation stopped short, by kind. The reason is a bounded
 # category — never an upstream's own words — so this select covers all of them.
 space-footnote-delegation-failed = stopped: { $reason ->

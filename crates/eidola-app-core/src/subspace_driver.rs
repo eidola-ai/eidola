@@ -437,23 +437,47 @@ pub(crate) fn is_reserved_annotation(annotation: &str) -> bool {
 /// the presentation layer's own words for people, from
 /// [`crate::PostReference::delegation_end`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// **The truncation marker rides every ending a reader might act on as if the
+/// room's words were whole.** A turn that stopped at its completion ceiling
+/// keeps its partial text and the walk goes on — partial text is real text —
+/// but three of these four endings would otherwise let a reader take the room's
+/// last word for a finished thought: `Concluded` says it ran out of things to
+/// say, `Paused` says it can be resumed by posting there, and `BudgetSpent`
+/// says an external cap stopped it. Each invites an action (accept the result,
+/// resume, raise the budget) that assumes coherent words to build on.
+/// `TurnFailed` invites none of them, which is why it alone carries no marker.
+///
+/// Durably the marker is an **optional trailing `/truncated`** on the arm's own
+/// token, so every ending written before it existed still reads as itself.
 pub enum DelegationEnd {
     /// Planning returned no turns: nobody's notify policy fired on the room's
     /// last post, which is what a conversation running out of things to say
     /// looks like from here.
     Concluded {
-        /// Some answer in the room stopped at its **completion ceiling** with
-        /// partial text. The room still ran out of things to say, but it did so
-        /// resting on an answer that stops mid-thought — so the ending says
-        /// both, rather than letting "concluded" carry a completeness nobody
-        /// established.
+        /// See the type's own note on the marker.
         truncated: bool,
     },
     /// The room hit its own cascade guard. Resumable by posting into it.
-    Paused { depth: i64, limit: i64 },
+    Paused {
+        depth: i64,
+        limit: i64,
+        /// See the type's own note on the marker.
+        truncated: bool,
+    },
     /// The per-delegation turn budget is spent.
-    BudgetSpent { limit: i64 },
+    BudgetSpent {
+        limit: i64,
+        /// See the type's own note on the marker.
+        truncated: bool,
+    },
     /// A turn failed, in the bounded sense of [`DelegationFailure`].
+    ///
+    /// **Deliberately carries no truncation marker.** The marker exists to stop
+    /// an ending claiming the room's words were whole, and this one claims the
+    /// opposite already: it says the room did not go well and names why. A
+    /// reader acts on the failure either way, so adding "and an earlier answer
+    /// was cut off" changes nothing they would do and dilutes the reason that
+    /// does. See the type's own note.
     TurnFailed { reason: DelegationFailure },
 }
 
@@ -469,20 +493,26 @@ impl DelegationEnd {
     /// The durable form: locale-neutral, stable, and unmistakable for a
     /// person's note.
     pub fn token(&self) -> String {
+        let body = match self {
+            Self::Concluded { .. } => "concluded".to_string(),
+            Self::Paused { depth, limit, .. } => format!("paused/{depth}/{limit}"),
+            Self::BudgetSpent { limit, .. } => format!("budget/{limit}"),
+            Self::TurnFailed { reason } => format!("failed/{}", reason.token()),
+        };
+        // One tail for every arm that has one, appended after the arm's own
+        // fields, so the marker never has to be threaded through their shapes.
+        let tail = if self.truncated() { "/truncated" } else { "" };
+        format!("{DELEGATION_END_PREFIX}{body}{tail}")
+    }
+
+    /// Whether this ending rests on an answer cut off at its completion
+    /// ceiling. Always `false` for [`Self::TurnFailed`] — see the type's note.
+    pub fn truncated(&self) -> bool {
         match self {
-            Self::Concluded { truncated: false } => {
-                format!("{DELEGATION_END_PREFIX}concluded")
-            }
-            Self::Concluded { truncated: true } => {
-                format!("{DELEGATION_END_PREFIX}concluded/truncated")
-            }
-            Self::Paused { depth, limit } => {
-                format!("{DELEGATION_END_PREFIX}paused/{depth}/{limit}")
-            }
-            Self::BudgetSpent { limit } => format!("{DELEGATION_END_PREFIX}budget/{limit}"),
-            Self::TurnFailed { reason } => {
-                format!("{DELEGATION_END_PREFIX}failed/{}", reason.token())
-            }
+            Self::Concluded { truncated }
+            | Self::Paused { truncated, .. }
+            | Self::BudgetSpent { truncated, .. } => *truncated,
+            Self::TurnFailed { .. } => false,
         }
     }
 
@@ -493,49 +523,46 @@ impl DelegationEnd {
     /// interpret rather than claiming an ending it guessed at.
     pub fn parse(annotation: &str) -> Option<Self> {
         let rest = annotation.strip_prefix(DELEGATION_END_PREFIX)?;
-        let mut parts = rest.split('/');
-        let out = match parts.next()? {
-            // The marker is an optional tail, so a token written before it
-            // existed still reads as an ordinary conclusion — and any *future*
-            // marker this version does not know degrades to "a note" through
-            // the trailing check below, which is the safe direction.
-            "concluded" => match parts.next() {
-                None => Self::Concluded { truncated: false },
-                Some("truncated") => Self::Concluded { truncated: true },
-                _ => return None,
-            },
-            "paused" => Self::Paused {
-                depth: parts.next()?.parse().ok()?,
-                limit: parts.next()?.parse().ok()?,
-            },
-            "budget" => Self::BudgetSpent {
-                limit: parts.next()?.parse().ok()?,
-            },
-            "failed" => Self::TurnFailed {
-                reason: DelegationFailure::parse(parts.next()?)?,
-            },
-            _ => return None,
-        };
-        parts.next().is_none().then_some(out)
+        // **The marker comes off first, so every arm parses the shape it always
+        // did.** It is an optional tail, so a token written before it existed
+        // still reads as itself; anything else trailing falls through to the
+        // exhaustive match below and degrades to "a note", which is the safe
+        // direction.
+        let mut parts: Vec<&str> = rest.split('/').collect();
+        let truncated = parts.len() > 1 && parts.last() == Some(&"truncated");
+        if truncated {
+            parts.pop();
+        }
+        match parts.as_slice() {
+            ["concluded"] => Some(Self::Concluded { truncated }),
+            ["paused", depth, limit] => Some(Self::Paused {
+                depth: depth.parse().ok()?,
+                limit: limit.parse().ok()?,
+                truncated,
+            }),
+            ["budget", limit] => Some(Self::BudgetSpent {
+                limit: limit.parse().ok()?,
+                truncated,
+            }),
+            // A failure carries no marker, so one on the wire is not a token
+            // this version wrote — and not one it should guess at either.
+            ["failed", reason] if !truncated => Some(Self::TurnFailed {
+                reason: DelegationFailure::parse(reason)?,
+            }),
+            _ => None,
+        }
     }
 
     /// What a model reads where a person's annotation would go — built here,
     /// never stored.
     pub(crate) fn describe(&self) -> String {
-        match self {
-            Self::Concluded { truncated: false } => {
-                "the delegated conversation ran to a stop".to_string()
-            }
-            Self::Concluded { truncated: true } => {
-                "the delegated conversation ran to a stop, but an answer in it reached its \
-                 length limit and stops mid-thought"
-                    .to_string()
-            }
-            Self::Paused { depth, limit } => format!(
+        let base = match self {
+            Self::Concluded { .. } => "the delegated conversation ran to a stop".to_string(),
+            Self::Paused { depth, limit, .. } => format!(
                 "the delegated conversation reached its reply limit ({depth} replies in a row, \
                  limit {limit}) and can be resumed by posting there"
             ),
-            Self::BudgetSpent { limit } => format!(
+            Self::BudgetSpent { limit, .. } => format!(
                 "the delegated conversation used all {limit} of the turns it is allowed and was \
                  stopped there"
             ),
@@ -543,6 +570,15 @@ impl DelegationEnd {
                 "the delegated conversation stopped because {}",
                 reason.describe()
             ),
+        };
+        // One clause for every arm that carries the marker — this is
+        // model-facing English in a single language, so it composes safely
+        // where the reader-facing strings deliberately do not (a translator
+        // needs the whole sentence; see the GUI's footnote messages).
+        if self.truncated() {
+            format!("{base}, and an answer in it reached its length limit and stops mid-thought")
+        } else {
+            base
         }
     }
 }
@@ -1195,7 +1231,11 @@ impl Inner {
                 frontier.extend(arrived.into_iter().rev().filter(|id| !served.contains(id)));
                 if frontier.is_empty() {
                     let end = match paused {
-                        Some((depth, limit)) => DelegationEnd::Paused { depth, limit },
+                        Some((depth, limit)) => DelegationEnd::Paused {
+                            depth,
+                            limit,
+                            truncated: truncated_any,
+                        },
                         None => DelegationEnd::Concluded {
                             truncated: truncated_any,
                         },
@@ -1242,6 +1282,7 @@ impl Inner {
                         space_id,
                         DelegationEnd::BudgetSpent {
                             limit: MAX_DELEGATION_TURNS,
+                            truncated: truncated_any,
                         },
                         with(leaves, post),
                         &frontier,
@@ -1314,6 +1355,7 @@ impl Inner {
                             space_id,
                             DelegationEnd::BudgetSpent {
                                 limit: MAX_DELEGATION_TURNS,
+                                truncated: truncated_any,
                             },
                             with(leaves, post),
                             &frontier,
@@ -2094,8 +2136,28 @@ mod tests {
             // trip too — a conclusion resting on a cut-off answer that read
             // back as an ordinary one would be the lie in durable form.
             DelegationEnd::Concluded { truncated: true },
-            DelegationEnd::Paused { depth: 4, limit: 4 },
-            DelegationEnd::BudgetSpent { limit: 32 },
+            DelegationEnd::Paused {
+                depth: 4,
+                limit: 4,
+                truncated: false,
+            },
+            // The marker rides every arm that carries one, so each round-trips
+            // both ways — a resumable room resting on a cut-off answer that
+            // read back as an ordinary pause would be the same lie in durable
+            // form the conclusion's marker exists to prevent.
+            DelegationEnd::Paused {
+                depth: 4,
+                limit: 4,
+                truncated: true,
+            },
+            DelegationEnd::BudgetSpent {
+                limit: 32,
+                truncated: false,
+            },
+            DelegationEnd::BudgetSpent {
+                limit: 32,
+                truncated: true,
+            },
             DelegationEnd::TurnFailed {
                 reason: DelegationFailure::Upstream,
             },

@@ -100,6 +100,23 @@ pub enum ChatBehavior {
     /// 200 SSE stream that the server aborts mid-event (writes a partial event,
     /// then drops the TCP connection). Exercises the mid-SSE read failure arm.
     StreamingMidAbort,
+    /// 200 SSE stream that ends **cleanly** after real content but never says
+    /// it is over: well-formed events, a proper end to the chunked body, and
+    /// no `[DONE]` and no terminal `finish_reason` anywhere.
+    ///
+    /// Deliberately not [`ChatBehavior::StreamingMidAbort`], which dies inside
+    /// a frame and so fails in the transport's own decoder. Nothing fails here
+    /// — the bytes are valid to the last one — which is exactly why the turn
+    /// used to persist as a completed answer: the only thing wrong with it is
+    /// that the upstream never claimed it was finished.
+    StreamingEndsWithoutDone,
+    /// The first chat request answers ordinarily; every later one is
+    /// [`ChatBehavior::StreamingEndsWithoutDone`]. Whichever transport asked.
+    ///
+    /// How a test gets a **real answer already in the transcript** and then a
+    /// regeneration whose stream dies — the case where reading the cut text as
+    /// a completion would supersede the answer it was meant to improve.
+    OkThenStreamEndsWithoutDone,
     /// Non-2xx JSON error body (e.g. 500). Exercises the non-2xx arm of both
     /// `chat` and `chat_stream`.
     Non2xx(u16),
@@ -1180,6 +1197,28 @@ async fn handle_chat(
             .await
         }
         ChatBehavior::StreamingMidAbort => write_sse_stream(stream, false, &[STREAM_CONTENT]).await,
+        ChatBehavior::StreamingEndsWithoutDone => {
+            write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
+        }
+        ChatBehavior::OkThenStreamEndsWithoutDone if hit == 1 => {
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
+            }
+            let mut body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::OkThenStreamEndsWithoutDone => {
+            write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
+        }
         ChatBehavior::ToolRoundsBlocking(rounds) => {
             if hit <= rounds {
                 let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
@@ -1303,6 +1342,14 @@ async fn handle_chat(
                     &error_body("tools param requires --jinja flag"),
                 )
                 .await;
+            }
+            // **The retry is answered in the transport that asked.** Both
+            // doors reach this behaviour — the sub-space driver only ever
+            // streams — and answering a stream with a completion body sends no
+            // `data:` frames at all, so the turn read as an empty answer that
+            // nothing complained about.
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
             }
             let mut body = serde_json::json!({
                 "choices": [{ "message": {
@@ -1723,6 +1770,54 @@ pub const MIMICKED_HEADER: &str = "#a2c3d4e · Gemma4 31b";
 /// delta per entry of `content_chunks`, a usage chunk, and `[DONE]`. When not
 /// complete, emits one partial event and then drops the connection mid-stream
 /// (simulating an abort).
+/// An SSE stream that **ends without ever saying it is over**: reasoning, then
+/// `content_chunks`, then a proper end to the chunked body — and no `[DONE]`,
+/// no `finish_reason`, on any chunk.
+///
+/// Every byte is well-formed, so nothing in the transport complains; the only
+/// thing missing is the upstream's claim to have finished. That is what
+/// separates it from [`ChatBehavior::StreamingMidAbort`], which dies inside a
+/// frame and fails in the decoder.
+async fn write_sse_unterminated_stream(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let frame = |payload: String| -> Vec<u8> {
+        let event = format!("data: {payload}\n\n");
+        let mut out = format!("{:x}\r\n", event.len()).into_bytes();
+        out.extend_from_slice(event.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+
+    let reasoning = serde_json::json!({
+        "choices": [{ "delta": { "reasoning": "thinking…" } }]
+    });
+    stream.write_all(&frame(reasoning.to_string())).await?;
+    stream.flush().await?;
+
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "choices": [{ "delta": { "content": chunk } }]
+        });
+        stream.write_all(&frame(content.to_string())).await?;
+        stream.flush().await?;
+    }
+
+    // The body ends properly. No `[DONE]`, and nothing ever named a
+    // `finish_reason` — the connection simply stopped having more to say.
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 async fn write_sse_stream(
     stream: &mut TcpStream,
     complete: bool,

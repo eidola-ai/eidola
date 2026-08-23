@@ -7755,6 +7755,51 @@ impl Inner {
         // A tool round settles its hold here, before the next round's.
         let _ = prep.try_refund_recovery().await;
 
+        // **A stream that stopped without ever saying it was over is a
+        // transport failure, not an answer.** The body ended: no `[DONE]`, and
+        // no terminal `finish_reason` on any chunk. Nothing about that is a
+        // *completion* — the upstream never claimed one — and nothing about it
+        // is a truncation either, since no ceiling was reached; it is partial
+        // data from a connection that died, and the loop's `finished` flag was
+        // read only to break early, so the text fell through and persisted as
+        // whole.
+        //
+        // **One rule for both modes, and the revision is why it has to be this
+        // one.** `Revise` supersedes an intact answer with what it writes, so
+        // keeping transport-cut text there destroys a real answer and puts a
+        // severed one in its place. An ordinary turn could in principle keep
+        // the text behind a marker — but the only marker available is
+        // session-scoped by construction (`ChatResult::truncated`), so a
+        // reopened window would show severed text with nothing saying so,
+        // which is exactly the lie `ResponseTruncated` exists to make
+        // unrepresentable. Two rules would also mean the classification
+        // depended on who asked rather than on what happened.
+        //
+        // Reported as `Network` because that is what it is, which also puts it
+        // in `DelegationFailure::Upstream` for a delegated room and leaves it
+        // retryable for a window — re-asking is the right remedy for a dropped
+        // connection. The blocking twin needs no equivalent: a body that ends
+        // early fails in `resp.text()` and never reaches persistence.
+        //
+        // `finish_reason` is checked beside `[DONE]` so a provider that ends a
+        // stream without the sentinel — the spec does not require it — is not
+        // punished for saying it was done in the other place.
+        if !finished && finish_reason.is_none() {
+            prep.insert_unattached_request(
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_buf,
+            )
+            .await?;
+            self.bus.emit(Change::Space(prep.space_id.clone()));
+            self.bus.emit(Change::Record);
+            return Err(AppError::Network {
+                message: "the model's response stream ended without finishing".to_string(),
+            });
+        }
+
         let assembled = match tool_call_shape_error {
             Some(e) => Err(e),
             None => finish_streaming_tool_calls(tool_call_acc),

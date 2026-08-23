@@ -6,7 +6,9 @@ space-error-not-joined = Vos agents ont ouvert cette conversation entre eux. Vou
 space-footnote-delegation-concluded = est arrivée à son terme
 space-footnote-delegation-concluded-truncated = est arrivée à son terme, sur une réponse coupée à sa limite de longueur
 space-footnote-delegation-paused = a atteint sa limite de réponses ({ $depth } sur { $limit })
+space-footnote-delegation-paused-truncated = a atteint sa limite de réponses ({ $depth } sur { $limit }), sur une réponse coupée à sa limite de longueur
 space-footnote-delegation-budget = a épuisé ses { $limit } tours
+space-footnote-delegation-budget-truncated = a épuisé ses { $limit } tours, sur une réponse coupée à sa limite de longueur
 space-footnote-delegation-failed = s’est arrêtée : { $reason ->
         [upstream] le modèle était injoignable
         [funding] le tour n’a pas pu être payé

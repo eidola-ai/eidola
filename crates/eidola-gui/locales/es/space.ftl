@@ -6,7 +6,9 @@ space-error-not-joined = Tus agentes abrieron esta conversación entre ellos. Pu
 space-footnote-delegation-concluded = llegó a su fin
 space-footnote-delegation-concluded-truncated = llegó a su fin, sobre una respuesta cortada en su límite de longitud
 space-footnote-delegation-paused = alcanzó su límite de respuestas ({ $depth } de { $limit })
+space-footnote-delegation-paused-truncated = alcanzó su límite de respuestas ({ $depth } de { $limit }), sobre una respuesta cortada en su límite de longitud
 space-footnote-delegation-budget = agotó sus { $limit } turnos
+space-footnote-delegation-budget-truncated = agotó sus { $limit } turnos, sobre una respuesta cortada en su límite de longitud
 space-footnote-delegation-failed = se detuvo: { $reason ->
         [upstream] no se pudo contactar con el modelo
         [funding] no se pudo pagar el turno

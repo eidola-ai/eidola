@@ -226,10 +226,30 @@ fn delegation_note(end: DelegationEnd, cx: &gpui::App) -> SharedString {
         DelegationEnd::Concluded { truncated: true } => {
             msg::space_footnote_delegation_concluded_truncated(cx)
         }
-        DelegationEnd::Paused { depth, limit } => {
-            msg::space_footnote_delegation_paused(cx, depth, limit)
-        }
-        DelegationEnd::BudgetSpent { limit } => msg::space_footnote_delegation_budget(cx, limit),
+        // The same rule as the conclusion above, on the two other endings that
+        // invite an action assuming coherent words to build on: "resume by
+        // posting there" and "raise the cap" both read differently when the
+        // room's last word stops mid-thought. Whole sentences per arm rather
+        // than a composed clause — a translator needs the sentence, and the
+        // rail's register is theirs to keep.
+        DelegationEnd::Paused {
+            depth,
+            limit,
+            truncated: false,
+        } => msg::space_footnote_delegation_paused(cx, depth, limit),
+        DelegationEnd::Paused {
+            depth,
+            limit,
+            truncated: true,
+        } => msg::space_footnote_delegation_paused_truncated(cx, depth, limit),
+        DelegationEnd::BudgetSpent {
+            limit,
+            truncated: false,
+        } => msg::space_footnote_delegation_budget(cx, limit),
+        DelegationEnd::BudgetSpent {
+            limit,
+            truncated: true,
+        } => msg::space_footnote_delegation_budget_truncated(cx, limit),
         DelegationEnd::TurnFailed { reason } => msg::space_footnote_delegation_failed(
             cx,
             match reason {

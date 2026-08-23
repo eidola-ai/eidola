@@ -6114,3 +6114,114 @@ fn a_failed_regeneration_still_settles_its_claim() {
         );
     });
 }
+
+// ===========================================================================
+// A stream that ends without ever saying it is over
+// ===========================================================================
+
+/// **Partial data from a connection that stopped is not an answer.** Every byte
+/// is well-formed — this is not the mid-frame abort, which fails in the
+/// decoder — and the only thing missing is the upstream's claim to have
+/// finished. Read as a completion, the text persisted as whole.
+#[test]
+fn a_stream_that_never_says_it_finished_writes_no_answer() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingEndsWithoutDone,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content) = core.runtime().block_on(async {
+            let chat = core.chat_stream("stream me".into(), MODEL.into(), None, tx);
+            let (res, (content, _)) = tokio::join!(chat, collect_deltas(events_rx));
+            (res, content)
+        });
+
+        let err = res.expect_err("a stream that never finished is not an answer");
+        assert!(
+            matches!(err, AppError::Network { .. }),
+            "it is a transport failure — not a truncation, which needs a \
+             ceiling nobody reached; got {err:?}"
+        );
+        // The reader did watch text arrive. That is what makes the old
+        // behaviour tempting and wrong: the deltas were real, the answer was
+        // not finished, and nothing durable could have said so.
+        assert!(!content.is_empty(), "the deltas reached the consumer");
+
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id.clone()))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "only the user's turn; got {messages:?}");
+        assert_eq!(messages[0].role, "user");
+
+        // The exchange is still forensically kept, attached to no action — the
+        // same shape every other "ran, wrote nothing" exit takes.
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        assert!(
+            changes.contains(&Change::Space(space_id)),
+            "got {changes:?}"
+        );
+    });
+}
+
+/// **And a regeneration keeps the answer it would have replaced.** This is why
+/// the rule is the conservative one: `Revise` supersedes, so persisting
+/// transport-cut text here destroys a real answer and leaves a severed one in
+/// its place. The claim releases and announces itself as it does on any other
+/// failure, so a window marking the collision stops marking it.
+#[test]
+fn a_regeneration_whose_stream_never_finished_keeps_the_answer_it_would_replace() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkThenStreamEndsWithoutDone,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let item = tree[1].item_id.clone();
+        let original = block_text(&tree[1]);
+        assert!(!original.is_empty(), "there is a real answer to protect");
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let res = core.runtime().block_on(async {
+            let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+            let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+            res
+        });
+        assert!(matches!(res, Err(AppError::Network { .. })), "got {res:?}");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "no successor post; got {tree:#?}");
+        assert_eq!(tree[1].action_id, answer, "the tip did not move");
+        assert_eq!(block_text(&tree[1]), original, "the answer is intact");
+        assert_eq!(tree[1].generation_count, 1, "still one generation");
+
+        // The claim ends the way it ends on every other failure.
+        let settled = core.runtime().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                core.regeneration_settled(item),
+            )
+            .await
+        });
+        assert!(settled.is_ok(), "the claim released and announced it");
+    });
+}

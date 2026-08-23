@@ -6,7 +6,9 @@ space-error-not-joined = 这是你的助理之间开启的对话。你可以阅�
 space-footnote-delegation-concluded = 已告一段落
 space-footnote-delegation-concluded-truncated = 已告一段落，但结束在一条因长度上限而中断的回复上
 space-footnote-delegation-paused = 已达到回复上限（{ $depth }/{ $limit }）
+space-footnote-delegation-paused-truncated = 已达到回复上限（{ $depth }/{ $limit }），且停在一条因长度上限而中断的回复上
 space-footnote-delegation-budget = 已用完全部 { $limit } 个回合
+space-footnote-delegation-budget-truncated = 已用完全部 { $limit } 个回合，且停在一条因长度上限而中断的回复上
 space-footnote-delegation-failed = 已中止：{ $reason ->
         [upstream] 无法连接到模型
         [funding] 无法为该回合付费

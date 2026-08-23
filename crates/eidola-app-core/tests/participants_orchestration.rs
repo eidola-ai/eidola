@@ -1565,8 +1565,14 @@ fn the_decline_name_alone_is_not_a_decline_without_the_tool_registered() {
         // Same scripted `decline` call, but the registry never got the tool:
         // the model gets an ordinary unknown-tool result and the turn goes on
         // to answer normally.
+        // **The SSE twin, because the turn below is a streaming one.** Pointed
+        // at the blocking body this asked `respond_stream_as` to read a
+        // completion as a stream: no `data:` frames, so no tool call, so no
+        // loop — and the assertion passed vacuously on an empty answer,
+        // exercising none of what it names. The unterminated-stream rule is
+        // what made that visible.
         let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
-            chat: ChatBehavior::DeclineBlocking,
+            chat: ChatBehavior::DeclineStreaming,
             ..MockConfig::default()
         });
         with_account(&core);
