@@ -102,19 +102,37 @@ pub struct InstallPlan {
 /// said, the envelope hashed to what the attestation said, reconstruction
 /// succeeded, and the reconstructed bundle claims the identity the
 /// attestation named. It does **not** mean anything has been installed.
+///
+/// The fields are private and there is no public constructor, which is the
+/// whole point: [`Self::discard`] deletes a tree recursively, so the path
+/// it deletes must be one this module created rather than one a caller
+/// supplied. Holding a `StagedInstall` *is* the evidence that `stage`
+/// created that directory.
 #[derive(Debug)]
 pub struct StagedInstall {
-    pub version: String,
-    /// The reconstructed bundle, inside the staging root.
-    pub bundle: PathBuf,
-    /// The staging root this owns. Removing it removes the staged bundle.
-    pub staging_root: PathBuf,
-    /// What the bundle claims about its signature, read back after
-    /// reconstruction. `None` when the plan carried no envelope.
-    pub signature: Option<SignatureFacts>,
+    version: String,
+    bundle: PathBuf,
+    staging_root: PathBuf,
+    signature: Option<SignatureFacts>,
 }
 
 impl StagedInstall {
+    /// The release version this bundle is.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// The reconstructed bundle, inside the staging root.
+    pub fn bundle(&self) -> &Path {
+        &self.bundle
+    }
+
+    /// What the bundle claims about its signature, read back after
+    /// reconstruction. `None` when the plan carried no envelope.
+    pub fn signature(&self) -> Option<&SignatureFacts> {
+        self.signature.as_ref()
+    }
+
     /// Discard the staged tree. Called by whoever decides not to promote.
     pub fn discard(self) -> Result<(), InstallError> {
         remove_tree(&self.staging_root)
@@ -186,16 +204,28 @@ pub async fn stage(
         return Err(InstallError::PlanIncomplete);
     }
 
+    // The caller chooses where staging happens, so the directory *holding*
+    // it is the caller's — creating it here would mean creating something
+    // this call never removes, which is the same ownership mistake in the
+    // other direction.
+    match staging_root.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => {}
+        Some(parent) if !parent.is_dir() => {
+            return Err(InstallError::Staging {
+                path: parent.to_path_buf(),
+                reason: "does not exist; the directory holding a staging root belongs to the \
+                         caller, so this will not create it"
+                    .to_string(),
+            });
+        }
+        _ => {}
+    }
+
     // Creating the directory is what earns the right to delete it. The
     // check and the claim are one atomic step: `create_dir` fails if
     // anything is already there, so a staging path that collides with a
     // caller's data is refused *before* any cleanup is armed, and cannot
-    // be created by someone else in between. An earlier shape checked
-    // `exists()` first and cleaned up on every error path — which meant a
-    // colliding directory was refused and then recursively deleted.
-    if let Some(parent) = staging_root.parent() {
-        create_dir_all(parent)?;
-    }
+    // be created by someone else in between.
     std::fs::create_dir(staging_root).map_err(|e| InstallError::Staging {
         path: staging_root.to_path_buf(),
         reason: if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -207,14 +237,49 @@ pub async fn stage(
         },
     })?;
 
-    match stage_inner(fetcher, plan, staging_root).await {
-        Ok(staged) => Ok(staged),
-        Err(e) => {
-            // Best effort: the error that got us here is the one worth
+    // From here on the tree is removed by *going out of scope*, not by
+    // reaching an error arm. An install can also end by never finishing —
+    // a caller that times out or races this against a quit drops the
+    // future mid-download, and a cleanup written as an error arm never
+    // runs. `Drop` runs then too.
+    let guard = StagingGuard::arm(staging_root);
+    let staged = stage_inner(fetcher, plan, staging_root).await?;
+    Ok(guard.keep(staged))
+}
+
+/// Removes the staging tree unless the install got far enough to hand it
+/// over.
+///
+/// The removal is blocking, and it runs on whatever thread drops this —
+/// including an async worker. That is deliberate: the tree is one this
+/// call created, so the work is bounded, and the alternative to a brief
+/// blocking `remove_dir_all` is leaving a half-reconstructed bundle on
+/// disk for a later run to find.
+struct StagingGuard {
+    root: Option<PathBuf>,
+}
+
+impl StagingGuard {
+    fn arm(root: &Path) -> Self {
+        Self {
+            root: Some(root.to_path_buf()),
+        }
+    }
+
+    /// Disarm, because the staged tree now belongs to the returned value.
+    fn keep(mut self, staged: StagedInstall) -> StagedInstall {
+        self.root = None;
+        staged
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Some(root) = self.root.take() {
+            // Best effort: the reason we are unwinding is the one worth
             // reporting, and a staging root that cannot be removed is
             // still a staging root nothing will promote.
-            let _ = remove_tree(staging_root);
-            Err(e)
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }
@@ -241,12 +306,11 @@ async fn stage_inner(
             expected: plan.bundle_name.clone(),
         }
     })?;
-    let bundle = payload_root.join(&bundle_name);
-    if !bundle.is_dir() {
-        return Err(InstallError::BundleMissing {
+    let bundle = directory_named(&payload_root, &bundle_name).ok_or_else(|| {
+        InstallError::BundleMissing {
             expected: plan.bundle_name.clone(),
-        });
-    }
+        }
+    })?;
 
     // ── the envelope: bytes a signed attestation vouched for ────────────
     let Some(envelope) = plan.envelope.as_ref() else {
@@ -282,6 +346,28 @@ async fn stage_inner(
         staging_root: staging_root.to_path_buf(),
         signature: Some(facts),
     })
+}
+
+/// Find a directory entry whose name is *exactly* `name`.
+///
+/// `path.is_dir()` answers a different question: it asks the filesystem
+/// whether that path resolves, and the filesystems this unpacks onto
+/// resolve names that are not the name asked for. Measured on APFS: a
+/// case-insensitive volume resolves `eidola.app` for `Eidola.app`, and
+/// normalization-insensitivity resolves an NFC spelling for an NFD entry
+/// even on a case-sensitive one. Either way the plan's exact-name
+/// requirement would go unenforced and the path handed downstream would be
+/// an alias. So the entries are read and the names compared, which is the
+/// same rule the container's members are already held to.
+fn directory_named(parent: &Path, name: &Path) -> Option<PathBuf> {
+    let wanted = name.as_os_str();
+    for entry in std::fs::read_dir(parent).ok()? {
+        let Ok(entry) = entry else { continue };
+        if entry.file_name() == wanted {
+            return entry.file_type().ok()?.is_dir().then(|| entry.path());
+        }
+    }
+    None
 }
 
 /// The identity check: what a person attested against what the bundle says.
@@ -464,6 +550,41 @@ fn writable(path: &Path) -> bool {
     // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
     // call, and `access` only reads it.
     unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(test)]
+mod bundle_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_the_filesystem_folds_is_still_not_the_name() {
+        // APFS resolves an NFC spelling for an NFD entry regardless of
+        // case sensitivity, so `is_dir()` says yes to a name that is not
+        // the one on disk. Reading the entry and comparing says no, which
+        // is the answer a plan naming an exact directory asked for.
+        let root = tempfile::tempdir().unwrap();
+        let on_disk = "cafe\u{301}.app";
+        let asked_for = "caf\u{e9}.app";
+        std::fs::create_dir(root.path().join(on_disk)).unwrap();
+
+        assert_eq!(
+            directory_named(root.path(), Path::new(on_disk)),
+            Some(root.path().join(on_disk)),
+            "the name that is really there resolves"
+        );
+        assert_eq!(
+            directory_named(root.path(), Path::new(asked_for)),
+            None,
+            "a spelling the filesystem folds onto it does not"
+        );
+    }
+
+    #[test]
+    fn a_file_of_the_right_name_is_not_a_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Eidola.app"), b"not a directory").unwrap();
+        assert_eq!(directory_named(root.path(), Path::new("Eidola.app")), None);
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

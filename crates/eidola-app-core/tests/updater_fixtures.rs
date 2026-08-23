@@ -269,12 +269,12 @@ async fn stages_a_reconstructed_bundle_that_matches_the_signed_release() {
     // The composition happened, and it produced exactly the bytes the
     // release publishes as its signed app.
     assert_eq!(
-        tree(&staged.bundle),
+        tree(staged.bundle()),
         tree(&apple_fixtures().join("signed/Fixture.app")),
         "the staged bundle should be byte-identical to the signed release"
     );
 
-    let facts = staged.signature.as_ref().expect("signature facts");
+    let facts = staged.signature().expect("signature facts");
     assert_eq!(facts.identifier, "ai.eidola.fixture");
     assert!(
         facts.hardened_runtime,
@@ -283,7 +283,7 @@ async fn stages_a_reconstructed_bundle_that_matches_the_signed_release() {
     );
 
     // Nothing was installed — only staged.
-    assert!(staged.bundle.starts_with(&root));
+    assert!(staged.bundle().starts_with(&root));
     staged.discard().unwrap();
     assert!(!root.exists(), "discarding removes the staged tree");
 }
@@ -500,6 +500,115 @@ async fn refuses_members_that_the_filesystem_would_fold_together() {
         .expect_err("case-equivalent members should be refused");
     assert!(
         matches!(&error, InstallError::Archive { reason, .. } if reason.contains("same file")),
+        "{error}"
+    );
+    assert!(!root.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refuses_a_staging_path_whose_parent_does_not_exist() {
+    // The caller picks where staging happens, so the directory holding it
+    // is the caller's. Creating it would be the same ownership mistake as
+    // deleting one we did not create, pointed the other way.
+    let published = publish();
+    let root = tempfile::tempdir().unwrap();
+    let deep = root.path().join("a/b/c/staging");
+
+    let error = install::stage(
+        &Fetcher::fixtures(published.dir.path()),
+        &plan(&published),
+        &deep,
+    )
+    .await
+    .expect_err("a missing parent should be refused");
+
+    assert!(matches!(error, InstallError::Staging { .. }), "{error}");
+    assert!(
+        !root.path().join("a").exists(),
+        "refusing must not leave ancestors behind"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_install_takes_its_staging_tree_with_it() {
+    // An install can end by never finishing: a caller that times out, or a
+    // quit that races the download, drops the future mid-flight. Cleanup
+    // written as an error arm never runs then.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_bytes(vec![0u8; 64])
+                .set_delay(std::time::Duration::from_secs(30)),
+        )
+        .mount(&server)
+        .await;
+
+    let staging = tempfile::tempdir().unwrap();
+    let root = staging.path().join("9.9.9");
+    let fetcher = Fetcher::network().unwrap();
+    let mut plan = plan(&publish());
+    plan.payload.url = format!("{}/payload.zip", server.uri());
+    plan.envelope = None;
+    plan.expected_signature = None;
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        install::stage(&fetcher, &plan, &root),
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "the install should still have been running"
+    );
+    assert!(
+        !root.exists(),
+        "an abandoned install must not leave a staging tree for a later run to find"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bundle_name_is_matched_exactly_not_resolved_by_the_filesystem() {
+    // A container whose bundle directory differs from the plan's name only
+    // by a spelling the filesystem folds. `Path::is_dir` would resolve it;
+    // the plan's exact-name requirement would go unenforced and the path
+    // handed to reconstruction would be an alias.
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        writer
+            .start_file("fixture.app/Contents/Info.plist".to_string(), options)
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"body").unwrap();
+        writer.finish().unwrap();
+    }
+    let payload = cursor.into_inner();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("payload.zip"), &payload).unwrap();
+
+    let plan = InstallPlan {
+        version: "9.9.9".to_string(),
+        bundle_name: "Fixture.app".to_string(),
+        payload: RemoteFile {
+            url: "https://example.com/v9.9.9/payload.zip".to_string(),
+            sha256: sha256_hex(&payload),
+        },
+        envelope: None,
+        expected_signature: None,
+    };
+
+    let staging = tempfile::tempdir().unwrap();
+    let root = staging.path().join("9.9.9");
+    let error = install::stage(&Fetcher::fixtures(dir.path()), &plan, &root)
+        .await
+        .expect_err("a bundle that is not the named one should be refused");
+    assert!(
+        matches!(&error, InstallError::BundleMissing { expected } if expected == "Fixture.app"),
         "{error}"
     );
     assert!(!root.exists());

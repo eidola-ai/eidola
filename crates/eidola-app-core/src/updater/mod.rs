@@ -730,6 +730,13 @@ async fn fetch_release_json_network(client: &reqwest::Client) -> Result<Vec<u8>,
 
 /// Fetch a single URL's body bytes. Errors carry the file label so the
 /// caller doesn't have to reformat them.
+/// How long a transfer may say nothing before it counts as dead.
+///
+/// Shorter than the model downloader's equivalent because these fetches
+/// sit behind something a person is waiting on, and because the bodies are
+/// small enough that a live connection has no reason to go quiet this long.
+pub(crate) const FETCH_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The most any signed release document may be. Manifests and
 /// attestations are kilobytes; this is a ceiling, not a size.
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
@@ -750,6 +757,18 @@ async fn fetch_url_network(
     url: &str,
     label: &str,
     max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
+    fetch_url_network_with(client, url, label, max_bytes, FETCH_STALL_TIMEOUT).await
+}
+
+/// The body of [`fetch_url_network`], with the silence bound supplied —
+/// which is how a test drives it in milliseconds rather than minutes.
+async fn fetch_url_network_with(
+    client: &reqwest::Client,
+    url: &str,
+    label: &str,
+    max_bytes: u64,
+    stall: std::time::Duration,
 ) -> Result<Vec<u8>, AppError> {
     use futures_util::StreamExt;
 
@@ -775,7 +794,21 @@ async fn fetch_url_network(
 
     let mut bytes: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        // A server that accepts the connection and then says nothing is
+        // indistinguishable from a slow one, right up until it never
+        // finishes. The bound is per read rather than overall: a large
+        // container on a slow link keeps arriving, and only silence is
+        // grounds to give up.
+        let next = match tokio::time::timeout(stall, stream.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                return Err(AppError::Update {
+                    message: format!("{label} stopped sending for {:?}", stall),
+                });
+            }
+        };
+        let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|e| AppError::Update {
             message: format!(
                 "reading {label} body: {}",
@@ -814,6 +847,12 @@ pub(crate) fn build_http_client() -> Result<reqwest::Client, AppError> {
     reqwest::Client::builder()
         .tls_backend_preconfigured(tls_config)
         .user_agent(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION")))
+        // Bounds the handshake only. A whole-request timeout would be
+        // wrong here: the same client fetches a small signed document and
+        // a container of tens of megabytes, and the second is allowed to
+        // take as long as it keeps making progress — which is what the
+        // per-read stall bound measures.
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| AppError::Update {
             message: format!("constructing HTTPS client: {e}"),
@@ -1010,6 +1049,41 @@ mod tests {
                 .expect_err("a chunked body past the ceiling must be refused");
             let msg = format!("{err}");
             assert!(msg.contains("larger than"), "got: {msg}");
+        }
+
+        /// Accept the connection, then say nothing. Without a bound this
+        /// never returns — the failure mode is a hang, so the assertion
+        /// that matters is that it comes back at all.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refuses_a_transfer_that_goes_quiet() {
+            use tokio::io::AsyncWriteExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    use tokio::io::AsyncReadExt;
+                    let mut scratch = [0u8; 2048];
+                    let _ = socket.read(&mut scratch).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await;
+                    // Headers, then silence.
+                    std::future::pending::<()>().await;
+                }
+            });
+
+            let url = format!("http://{addr}/asset.zip");
+            let err = fetch_url_network_with(
+                &client_for_test(),
+                &url,
+                "a payload",
+                1024,
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect_err("a silent transfer must not be waited on forever");
+            assert!(format!("{err}").contains("stopped sending"), "got: {err}");
         }
 
         fn client_for_test() -> reqwest::Client {
