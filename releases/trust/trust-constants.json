@@ -6,7 +6,7 @@
   "min_human_attestations": 1,
   "expected_ci_identity_pattern": "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*",
   "expected_ci_issuer": "https://token.actions.githubusercontent.com",
-  "supported_release_schema_versions": [1],
+  "supported_release_schema_versions": [1, 2],
   "supported_attestation_schema_versions": [1],
   "update_discovery_url": "https://api.github.com/repos/eidola-ai/eidola/releases/latest",
   "server_url_template": "https://gateway-{hash}.eidola.containers.tinfoil.sh",

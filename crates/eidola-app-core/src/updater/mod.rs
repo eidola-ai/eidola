@@ -40,6 +40,7 @@ pub use eidola_attestation::{
 
 pub mod ci_sigstore;
 pub mod human_attestation;
+pub mod install;
 mod merkle;
 mod rekor_verify;
 pub mod sigstore_bundle;
@@ -91,9 +92,24 @@ impl Fetcher {
     }
 
     /// Fetch a referenced asset by URL.
+    ///
+    /// Bounded at [`MAX_DOCUMENT_BYTES`]: every URL reached this way comes
+    /// out of `release.json`, which is unsigned and therefore chosen by
+    /// whoever served it.
     async fn fetch_url(&self, url: &str, label: &str) -> Result<Vec<u8>, AppError> {
+        self.fetch_url_bounded(url, label, MAX_DOCUMENT_BYTES).await
+    }
+
+    /// Fetch a referenced asset with an explicit ceiling, for callers whose
+    /// artifacts are larger than a signed document.
+    pub(crate) async fn fetch_url_bounded(
+        &self,
+        url: &str,
+        label: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AppError> {
         match self {
-            Fetcher::Network(client) => fetch_url_network(client, url, label).await,
+            Fetcher::Network(client) => fetch_url_network(client, url, label, max_bytes).await,
             Fetcher::Fixtures(dir) => {
                 let name = url_to_filename(url).ok_or_else(|| AppError::Update {
                     message: format!(
@@ -485,17 +501,17 @@ pub async fn check_for_update_with(
         ),
     );
 
-    // TODO (step 5): `verify_each_artifact_hash` — fetch
-    // `artifact-manifest.json`, walk its `artifacts` table, and for each
-    // artifact this client is about to install (today: just the
-    // platform-appropriate CLI/GUI binary), download it and verify its
-    // hash against the manifest's declared digest. The manifest itself
-    // was already CI-signature-verified above, so its declared hashes
-    // are trustworthy — this stage just turns "manifest authentic" into
-    // "downloaded bytes authentic." Lives in step 5 because the natural
-    // home is the install/replace flow, where we already need to be
-    // downloading the binary anyway. See `docs/gaps.md` for the
-    // audit-side description.
+    // Turning "manifest authentic" into "downloaded bytes authentic" is
+    // [`install::stage`]'s job, not this function's: it hashes each
+    // downloaded artifact against what the manifest here declares, and
+    // the natural place to do that is where the bytes are being fetched
+    // anyway. This function stops at a verified `ReleaseSummary` because
+    // the user approves a release *before* anything is downloaded.
+    //
+    // What is still missing is the wiring between the two — building an
+    // [`install::InstallPlan`] from this summary plus the manifest — and
+    // it waits on the attestation carrying the envelope's hash and the
+    // identity to expect. See `docs/gaps.md`.
 
     tracer.log("present", format!("release {} verified", release.version));
 
@@ -547,6 +563,8 @@ fn parse_and_gate_release(
         }));
     }
 
+    check_schema_shape(&release)?;
+
     match compare_versions(&release.version, installed_version)? {
         VersionCompare::OlderOrEqual => return Err(NoUpdateOrError::NoUpdate),
         VersionCompare::Newer => {}
@@ -555,6 +573,50 @@ fn parse_and_gate_release(
     check_continuity(&release, installed_git_commit)?;
 
     Ok(release)
+}
+
+/// The schema a release document *declares* is the shape it is held to.
+///
+/// Both directions matter, and for the same reason a manifest is held to
+/// its own declared schema (`releases/README.md`, and `crate::updates`):
+/// a rotation ships acceptance one release before emission, so between
+/// those releases this client reads the old shape and the new one as
+/// equally authentic — but a document that declares the old version while
+/// carrying the new fields, or declares the new one and omits what it
+/// promises, is not a shape either release ever produced. Tolerating
+/// either would make the version number decorative.
+fn check_schema_shape(release: &ReleaseIndex) -> Result<(), NoUpdateOrError> {
+    const ARTIFACT_INDEX_SINCE: u32 = 2;
+
+    let refuse = |message: String| NoUpdateOrError::Error(AppError::Update { message });
+
+    if release.schema_version < ARTIFACT_INDEX_SINCE {
+        if release.artifacts.is_some() {
+            return Err(refuse(format!(
+                "release.json declares schema_version `{}` but carries an `artifacts` \
+                 index, which releases record only from schema {ARTIFACT_INDEX_SINCE} on",
+                release.schema_version,
+            )));
+        }
+        if release.apple_signature_bundle.is_some() {
+            return Err(refuse(format!(
+                "release.json declares schema_version `{}` but carries \
+                 `apple_signature_bundle`, which releases record only from schema \
+                 {ARTIFACT_INDEX_SINCE} on",
+                release.schema_version,
+            )));
+        }
+    } else if release.artifacts.is_none() {
+        // `apple_signature_bundle` stays optional at schema 2: a release
+        // with no signed macOS installable publishes none.
+        return Err(refuse(format!(
+            "release.json declares schema_version `{}` but carries no `artifacts` \
+             index, which every release from schema {ARTIFACT_INDEX_SINCE} on records",
+            release.schema_version,
+        )));
+    }
+
+    Ok(())
 }
 
 enum VersionCompare {
@@ -622,28 +684,19 @@ fn check_continuity(
 
 /// Fetch the latest `release.json` asset from the GitHub releases API.
 async fn fetch_release_json_network(client: &reqwest::Client) -> Result<Vec<u8>, AppError> {
-    let resp = client
-        .get(trust_root::UPDATE_DISCOVERY_URL)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| AppError::Update {
-            message: format!("GET {}: {e}", trust_root::UPDATE_DISCOVERY_URL),
-        })?;
-    let status = resp.status();
-    let body_bytes = resp.bytes().await.map_err(|e| AppError::Update {
-        message: format!("reading response body: {e}"),
-    })?;
-    if !status.is_success() {
-        return Err(AppError::Update {
-            message: format!(
-                "GET {} → HTTP {} ({})",
-                trust_root::UPDATE_DISCOVERY_URL,
-                status,
-                String::from_utf8_lossy(&body_bytes).trim()
-            ),
-        });
-    }
+    // Same bounds as every other fetch. This URL is pinned in the trust
+    // root rather than taken from an index, but the *response* is still
+    // someone else's, and a discovery endpoint that stalls or answers with
+    // gigabytes should not be the one unbounded read left in the pipeline.
+    let body_bytes = fetch_url_network_with(
+        client,
+        trust_root::UPDATE_DISCOVERY_URL,
+        "application/vnd.github+json",
+        "the release feed",
+        MAX_DOCUMENT_BYTES,
+        FETCH_STALL_TIMEOUT,
+    )
+    .await?;
     let gh: GhRelease = serde_json::from_slice(&body_bytes).map_err(|e| AppError::Update {
         message: format!("parsing GitHub release JSON: {e}"),
     })?;
@@ -657,38 +710,161 @@ async fn fetch_release_json_network(client: &reqwest::Client) -> Result<Vec<u8>,
                 .to_string(),
         })?;
 
-    fetch_url_network(client, &asset.browser_download_url, "release.json").await
+    fetch_url_network(
+        client,
+        &asset.browser_download_url,
+        "release.json",
+        MAX_DOCUMENT_BYTES,
+    )
+    .await
 }
 
 /// Fetch a single URL's body bytes. Errors carry the file label so the
 /// caller doesn't have to reformat them.
+/// As much of a failed response as is worth repeating back.
+///
+/// An error body is a diagnostic, and a hostile one is whatever the server
+/// felt like sending — up to the ceiling the read allows. Interpolating it
+/// whole would allocate a second copy of it, and a lossy conversion of
+/// invalid UTF-8 grows: every bad byte becomes a three-byte replacement.
+/// So it is cut first, on a character boundary, and cut again if the
+/// conversion inflates it.
+const ERROR_BODY_EXCERPT: usize = 1024;
+
+fn excerpt(bytes: &[u8]) -> String {
+    let head = &bytes[..bytes.len().min(ERROR_BODY_EXCERPT)];
+    let mut text = String::from_utf8_lossy(head).trim().to_string();
+    if text.len() > ERROR_BODY_EXCERPT {
+        // The lossy conversion inflated it; cut on a character boundary.
+        let mut end = ERROR_BODY_EXCERPT;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    if bytes.len() > head.len() {
+        text.push('…');
+    }
+    text
+}
+
+/// How long a transfer may say nothing before it counts as dead.
+///
+/// Shorter than the model downloader's equivalent because these fetches
+/// sit behind something a person is waiting on, and because the bodies are
+/// small enough that a live connection has no reason to go quiet this long.
+pub(crate) const FETCH_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most any signed release document may be. Manifests and
+/// attestations are kilobytes; this is a ceiling, not a size.
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Fetch a URL, refusing a body larger than `max_bytes`.
+///
+/// The bound is applied while reading rather than after: `Content-Length`
+/// is a claim by the same server that supplies the body, so it is used
+/// only to refuse early, never to decide when to stop. Every URL that
+/// reaches here came from an unsigned index, so a hostile one is in scope.
+///
+/// No error text here carries the URL. `reqwest` attaches it to the error
+/// it returns and prints it in `Display`, and a redirect can leave a
+/// credential in it, so errors go through `request_error_text` — the one
+/// path a `reqwest::Error` becomes text through in this crate.
 async fn fetch_url_network(
     client: &reqwest::Client,
     url: &str,
     label: &str,
+    max_bytes: u64,
 ) -> Result<Vec<u8>, AppError> {
-    let resp = client
-        .get(url)
-        .header("Accept", "application/octet-stream")
-        .send()
-        .await
-        .map_err(|e| AppError::Update {
-            message: format!("GET {label} ({url}): {e}"),
-        })?;
+    fetch_url_network_with(
+        client,
+        url,
+        "application/octet-stream",
+        label,
+        max_bytes,
+        FETCH_STALL_TIMEOUT,
+    )
+    .await
+}
+
+/// The body of [`fetch_url_network`], with the silence bound supplied —
+/// which is how a test drives it in milliseconds rather than minutes.
+async fn fetch_url_network_with(
+    client: &reqwest::Client,
+    url: &str,
+    accept: &str,
+    label: &str,
+    max_bytes: u64,
+    stall: std::time::Duration,
+) -> Result<Vec<u8>, AppError> {
+    use futures_util::StreamExt;
+
+    // Connecting is bounded on the client and each body read is bounded
+    // below, which leaves the gap between them: a server can complete the
+    // handshake and then never send a status line. `send()` resolves when
+    // the *headers* arrive, so that wait needs the same silence bound —
+    // and not a whole-request timeout, which would cut off a large
+    // container that is still arriving.
+    let resp =
+        match tokio::time::timeout(stall, client.get(url).header("Accept", accept).send()).await {
+            Ok(sent) => sent.map_err(|e| AppError::Update {
+                message: format!("GET {label}: {}", crate::error::request_error_text(e)),
+            })?,
+            Err(_) => {
+                return Err(AppError::Update {
+                    message: format!("{label} sent no response headers within {stall:?}"),
+                });
+            }
+        };
     let status = resp.status();
-    let bytes = resp.bytes().await.map_err(|e| AppError::Update {
-        message: format!("reading {label} body: {e}"),
-    })?;
-    if !status.is_success() {
+
+    if let Some(claimed) = resp.content_length()
+        && claimed > max_bytes
+    {
         return Err(AppError::Update {
             message: format!(
-                "{label} ({url}) returned HTTP {} ({})",
-                status,
-                String::from_utf8_lossy(&bytes).trim()
+                "{label} is {claimed} bytes, more than the {max_bytes} this will read"
             ),
         });
     }
-    Ok(bytes.to_vec())
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    loop {
+        // A server that accepts the connection and then says nothing is
+        // indistinguishable from a slow one, right up until it never
+        // finishes. The bound is per read rather than overall: a large
+        // container on a slow link keeps arriving, and only silence is
+        // grounds to give up.
+        let next = match tokio::time::timeout(stall, stream.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                return Err(AppError::Update {
+                    message: format!("{label} stopped sending for {:?}", stall),
+                });
+            }
+        };
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|e| AppError::Update {
+            message: format!(
+                "reading {label} body: {}",
+                crate::error::request_error_text(e)
+            ),
+        })?;
+        if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
+            return Err(AppError::Update {
+                message: format!("{label} is larger than the {max_bytes} bytes this will read"),
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    if !status.is_success() {
+        return Err(AppError::Update {
+            message: format!("{label} returned HTTP {} ({})", status, excerpt(&bytes)),
+        });
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client, AppError> {
@@ -703,6 +879,12 @@ pub(crate) fn build_http_client() -> Result<reqwest::Client, AppError> {
     reqwest::Client::builder()
         .tls_backend_preconfigured(tls_config)
         .user_agent(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION")))
+        // Bounds the handshake only. A whole-request timeout would be
+        // wrong here: the same client fetches a small signed document and
+        // a container of tens of megabytes, and the second is allowed to
+        // take as long as it keeps making progress — which is what the
+        // per-read stall bound measures.
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| AppError::Update {
             message: format!("constructing HTTPS client: {e}"),
@@ -783,6 +965,300 @@ mod tests {
         let err = unwrap_err(parse_and_gate_release(&bytes, "1.0.0", None));
         let msg = format!("{err}");
         assert!(msg.contains("schema_version"), "got: {msg}");
+    }
+
+    /// The fetch path, against the threat model it actually has: every URL
+    /// it is given comes out of an unsigned index, so "hostile" is the
+    /// ordinary case rather than the exotic one.
+    mod fetching {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refuses_a_body_larger_than_the_ceiling() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0u8; 4096]))
+                .mount(&server)
+                .await;
+
+            let client = build_http_client().unwrap();
+            let err = fetch_url_network(&client, &format!("{}/big", server.uri()), "a payload", 64)
+                .await
+                .expect_err("an oversized body must be refused");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("larger than") || msg.contains("more than"),
+                "got: {msg}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refuses_an_oversized_body_before_reading_it() {
+            // The claim is the server's, so it is only ever grounds to
+            // refuse early — never grounds to stop counting.
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0u8; 4096]))
+                .mount(&server)
+                .await;
+
+            let client = build_http_client().unwrap();
+            let err =
+                fetch_url_network(&client, &format!("{}/big", server.uri()), "a payload", 100)
+                    .await
+                    .expect_err("an oversized body must be refused");
+            assert!(format!("{err}").contains("4096") || format!("{err}").contains("100"));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_credential_in_the_url_stays_out_of_the_error() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("nope"))
+                .mount(&server)
+                .await;
+
+            let url = format!(
+                "{}/asset.zip?X-Amz-Signature=SUPERSECRETTOKEN",
+                server.uri()
+            );
+            let err = fetch_url_network(&client_for_test(), &url, "a payload", 1024)
+                .await
+                .expect_err("a 404 is an error");
+            let msg = format!("{err}");
+            assert!(
+                !msg.contains("SUPERSECRETTOKEN"),
+                "a redirect can leave a credential in a URL, and this text is rendered: {msg}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_credential_stays_out_of_a_transport_error_too() {
+            // Nothing listening: the failure comes from reqwest itself,
+            // which attaches the URL to its own `Display`.
+            let url = "http://127.0.0.1:1/asset.zip?X-Amz-Signature=SUPERSECRETTOKEN";
+            let err = fetch_url_network(&client_for_test(), url, "a payload", 1024)
+                .await
+                .expect_err("a closed port is an error");
+            let msg = format!("{err}");
+            assert!(!msg.contains("SUPERSECRETTOKEN"), "got: {msg}");
+            assert!(!msg.contains("127.0.0.1"), "got: {msg}");
+        }
+
+        /// A body with **no** `Content-Length`, which is the case the
+        /// running count exists for: the early check is a courtesy the
+        /// server may decline to make possible, so the bound that matters
+        /// is the one applied while reading.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refuses_an_unbounded_chunked_body() {
+            use tokio::io::AsyncWriteExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    // Read the request first; hyper will not accept a
+                    // response that arrives before it has sent one.
+                    use tokio::io::AsyncReadExt;
+                    let mut scratch = [0u8; 2048];
+                    let _ = socket.read(&mut scratch).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await;
+                    // Keep sending; a reader without a bound never stops.
+                    let chunk = format!("{:x}\r\n{}\r\n", 4096, "A".repeat(4096));
+                    for _ in 0..64 {
+                        if socket.write_all(chunk.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let url = format!("http://{addr}/asset.zip");
+            let err = fetch_url_network(&client_for_test(), &url, "a payload", 1024)
+                .await
+                .expect_err("a chunked body past the ceiling must be refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("larger than"), "got: {msg}");
+        }
+
+        /// Accept the connection, then say nothing. Without a bound this
+        /// never returns — the failure mode is a hang, so the assertion
+        /// that matters is that it comes back at all.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refuses_a_transfer_that_goes_quiet() {
+            use tokio::io::AsyncWriteExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    use tokio::io::AsyncReadExt;
+                    let mut scratch = [0u8; 2048];
+                    let _ = socket.read(&mut scratch).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await;
+                    // Headers, then silence.
+                    std::future::pending::<()>().await;
+                }
+            });
+
+            let url = format!("http://{addr}/asset.zip");
+            let err = fetch_url_network_with(
+                &client_for_test(),
+                &url,
+                "application/octet-stream",
+                "a payload",
+                1024,
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect_err("a silent transfer must not be waited on forever");
+            assert!(format!("{err}").contains("stopped sending"), "got: {err}");
+        }
+
+        /// Headers that never arrive. The handshake completes, so the
+        /// connect bound is satisfied and the body bound never gets a
+        /// chance to apply — this is the gap between the two.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refuses_a_server_that_never_sends_headers() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((socket, _)) = listener.accept().await {
+                    // Accept, read nothing, answer nothing, hold it open.
+                    let _held = socket;
+                    std::future::pending::<()>().await;
+                }
+            });
+
+            let url = format!("http://{addr}/asset.zip");
+            let err = fetch_url_network_with(
+                &client_for_test(),
+                &url,
+                "application/octet-stream",
+                "a payload",
+                1024,
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect_err("a server that never answers must not be waited on forever");
+            assert!(
+                format!("{err}").contains("no response headers"),
+                "got: {err}"
+            );
+        }
+
+        /// A failed response is a diagnostic. Repeating a hostile one back
+        /// whole is a second allocation of whatever it felt like sending —
+        /// and invalid UTF-8 grows on the way.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn quotes_only_an_excerpt_of_a_failure_body() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(
+                    wiremock::ResponseTemplate::new(500).set_body_bytes(vec![0xffu8; 200_000]),
+                )
+                .mount(&server)
+                .await;
+
+            let err = fetch_url_network_with(
+                &client_for_test(),
+                &format!("{}/asset.zip", server.uri()),
+                "application/octet-stream",
+                "a payload",
+                1_000_000,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("HTTP 500 is an error");
+            let msg = format!("{err}");
+            assert!(msg.contains("500"), "got: {msg}");
+            assert!(
+                msg.len() < 4096,
+                "a failure message must not carry the body back: {} bytes",
+                msg.len()
+            );
+        }
+
+        fn client_for_test() -> reqwest::Client {
+            build_http_client().unwrap()
+        }
+    }
+
+    /// Both halves of the artifact-index rotation, on the shape a release
+    /// declares rather than on the shape this build would prefer.
+    ///
+    /// Between the release that accepts schema 2 and the release that
+    /// emits it, both shapes are authentic — but a document that declares
+    /// one and carries the other is neither, and reading it as whichever
+    /// it resembles would make the version number decorative.
+    mod artifact_index_rotation {
+        use super::*;
+
+        fn release(schema: u32, extra: &str) -> Vec<u8> {
+            format!(
+                r#"{{
+                    "schema_version": {schema},
+                    "version": "1.1.0",
+                    "git_commit": "9c3a000000000000000000000000000000000001",
+                    "git_tag": "v1.1.0",
+                    "released_at": "2026-05-26T17:00:00Z",
+                    "artifact_manifest": {{"url":"x","sigstore_bundle_url":"x"}},
+                    "human_attestations": [{{"attestant_id":"x","url":"x","bundle_url":"x"}}]
+                    {extra}
+                }}"#
+            )
+            .into_bytes()
+        }
+
+        const INDEX: &str = r#", "artifacts": {"eidola-gui-macos-universal-zip": {"url": "https://example.com/p.zip"}}"#;
+
+        #[test]
+        fn schema_1_without_an_index_is_the_shape_releases_emit_today() {
+            let release = parse_and_gate_release(&release(1, ""), "1.0.0", None)
+                .expect("today's emitted shape must keep verifying");
+            assert!(release.artifacts.is_none());
+        }
+
+        #[test]
+        fn schema_2_with_an_index_is_accepted_before_anything_emits_it() {
+            let release = parse_and_gate_release(&release(2, INDEX), "1.0.0", None)
+                .expect("the shape the next rotation emits must already verify");
+            assert_eq!(release.artifacts.unwrap().len(), 1);
+        }
+
+        #[test]
+        fn schema_1_carrying_an_index_is_refused() {
+            let err = unwrap_err(parse_and_gate_release(&release(1, INDEX), "1.0.0", None));
+            let msg = format!("{err}");
+            assert!(msg.contains("only from schema 2 on"), "got: {msg}");
+        }
+
+        #[test]
+        fn schema_2_without_an_index_is_refused() {
+            let err = unwrap_err(parse_and_gate_release(&release(2, ""), "1.0.0", None));
+            let msg = format!("{err}");
+            assert!(msg.contains("carries no `artifacts`"), "got: {msg}");
+        }
+
+        #[test]
+        fn schema_1_carrying_signature_material_is_refused() {
+            let extra = r#", "apple_signature_bundle": {"url": "https://example.com/s.zip"}"#;
+            let err = unwrap_err(parse_and_gate_release(&release(1, extra), "1.0.0", None));
+            let msg = format!("{err}");
+            assert!(msg.contains("apple_signature_bundle"), "got: {msg}");
+        }
+
+        #[test]
+        fn schema_2_may_omit_signature_material() {
+            // A release with no signed macOS installable publishes none;
+            // that is an absence, not an omission.
+            parse_and_gate_release(&release(2, INDEX), "1.0.0", None)
+                .expect("a release without an envelope must still verify");
+        }
     }
 
     #[test]

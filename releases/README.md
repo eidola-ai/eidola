@@ -65,6 +65,8 @@ This ordering is what prevents a coerced release from silently weakening a requi
 1. Make the change; ship a release whose `supported_release_schema_versions` / `supported_attestation_schema_versions` list both `1` and `2`. The engineer continues signing schema-`1` documents.
 2. Once in-the-wild clients have updated, cut another release where the engineer signs schema-`2` documents. `1` can be removed from the supported list in a later release.
 
+**Currently mid-rotation:** clients accept `release.json` at `1` and `2`, and `release-tool` still emits `1`. Schema `2` adds the artifact index the installer downloads from (`artifacts`, keyed by manifest artifact key, plus `apple_signature_bundle` where one was published) — URLs only, since this document is unsigned. Step 2 is what turns it on, in `crates/release-tool/src/attest.rs`.
+
 #### `artifact-manifest.json` — the same rotation, with no human in it
 
 The manifest carries a `schema_version` too, and rotates under the same accept-before-emit rule — but nobody chooses to emit it: CI regenerates the manifest from source on every run. The two sides are therefore *two files*, and they must move in different releases:

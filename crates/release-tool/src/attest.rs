@@ -342,6 +342,14 @@ pub fn run(args: Args) -> Result<()> {
     // identities, allowed schema versions) live in the verifier's embedded
     // trust root so a forged index can't downgrade them — see
     // `docs/trust-root.md`.
+    //
+    // Emitted at schema 1 while clients accept 1 and 2. Schema 2 adds the
+    // artifact index the installer downloads from (`artifacts`, and
+    // `apple_signature_bundle` where one was published); this is the emit
+    // half of that rotation, and it flips a release *after* the accepting
+    // build is in the wild — `releases/README.md`, "Rotating document
+    // schema versions". Emitting the index here before then would strand
+    // every installed client on a shape it refuses.
     let release_json = serde_json::json!({
         "schema_version": 1,
         "version": release_version,

@@ -9,10 +9,14 @@
 //!   trust root, so values shared between the two paths must round-trip
 //!   identically.
 //! - [`ReleaseIndex`] (+ sub-types) ↔ `release.json` (one per release,
-//!   uploaded to the GitHub release). Pure URL index — *no* policy fields.
-//!   Threshold and identity policy live in the verifier's embedded trust
-//!   root, never here, because an attacker who controls `release.json`
-//!   must not be able to lower the bar (see `docs/trust-root.md`).
+//!   uploaded to the GitHub release). Pure URL index — *no* policy fields
+//!   and no hashes. Threshold and identity policy live in the verifier's
+//!   embedded trust root, never here, because an attacker who controls
+//!   `release.json` must not be able to lower the bar (see
+//!   `docs/trust-root.md`); by the same argument the artifact index it
+//!   grew at schema 2 says only *where* bytes live, while *what they must
+//!   hash to* comes from the CI-signed manifest and the human
+//!   attestation.
 //!
 //! These are intentionally data-only: no methods, no business logic, just
 //! `Serialize`/`Deserialize`. Behaviour belongs in the consuming crates.
@@ -96,6 +100,24 @@ pub struct ReleaseIndex {
     pub previous_release: Option<PreviousRelease>,
     pub artifact_manifest: ArtifactManifestRef,
     pub human_attestations: Vec<HumanAttestationRef>,
+    /// Where to download each artifact `artifact-manifest.json` names,
+    /// keyed by the same artifact key. Present from schema 2.
+    ///
+    /// URLs only, and deliberately no hashes: this document is unsigned,
+    /// so a hash recorded here would be an attacker-suppliable value the
+    /// installer might compare against itself. The hash of an artifact
+    /// comes from the CI-signed manifest, and the hash of the detached
+    /// Apple material from the human attestation — the same reason
+    /// threshold and identity policy are absent above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<std::collections::BTreeMap<String, ArtifactRef>>,
+    /// Where to download the detached Apple signature material for this
+    /// release, when one was published. Present from schema 2, and
+    /// optional even then: a release with no signed macOS installable has
+    /// none, and it is not a manifest artifact — its bytes depend on a
+    /// key, which is exactly what the manifest may never record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apple_signature_bundle: Option<ArtifactRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +132,14 @@ pub struct PreviousRelease {
 pub struct ArtifactManifestRef {
     pub url: String,
     pub sigstore_bundle_url: String,
+}
+
+/// One downloadable file. A URL and nothing else — see [`ReleaseIndex`]'s
+/// `artifacts` field for why no hash lives here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactRef {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
