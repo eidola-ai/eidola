@@ -5432,6 +5432,25 @@ fn keyboard_focus_reveals_a_library_rows_verbs(cx: &mut TestAppContext) {
     );
 }
 
+/// Send one key **down** — what a view's own key listener reads (navigation,
+/// Escape). Activation of a focused control needs the up too; see
+/// [`press_enter`].
+fn press_key(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
+    let ks = gpui::Keystroke::parse(key).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: ks,
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
 /// Press Enter as a real keyboard activation: gpui maps it on **key up** (the
 /// key-down only records the pending activation), and `TestAppContext`'s
 /// `dispatch_keystroke` sends the down alone.
@@ -7800,4 +7819,87 @@ fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext
     }
 
     probe::set_probes_enabled(false);
+}
+
+/// **A post being regenerated keeps its node; it goes quiet on the value
+/// alone.**
+///
+/// The keyboard hands focus back to the post when Regenerate takes its own row
+/// away (`release_affordance_focus`), and the row keeps `track_focus` for the
+/// whole regeneration. gpui builds an AccessKit node only for an element with a
+/// role, so dropping the article while still tracking the handle left focus on
+/// a handle with no node — AccessKit falls back to the window root and the
+/// reader loses their place until the turn commits, which on a reasoning model
+/// is minutes.
+///
+/// The settled-value rule is untouched: the **value** is what must not stream,
+/// because AT re-reads a focused control's whole value on every change. Name
+/// and role do not stream — byline, backend and time all come from the
+/// generation being replaced — so they stay.
+#[gpui::test]
+fn a_post_being_regenerated_keeps_its_node_and_loses_only_its_value(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12 and 18:41.");
+    answer.action_type = "inference".into();
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+
+    // Settled: role, name, and the whole text as the value.
+    let entries = fresh_entries(cx, window);
+    let settled_label = entries
+        .iter()
+        .find(|(n, _)| n == "space/post/0")
+        .map(|(_, e)| e.label.to_string())
+        .expect("the settled post is an article");
+    assert_probe_value(
+        &entries,
+        "space/post/0",
+        gpui::Role::Article,
+        &settled_label,
+        "Low water at 06:12 and 18:41.",
+    );
+
+    // Enter the post, then activate Regenerate the way a keyboard user does.
+    press_key(cx, window, "down");
+    press_key(cx, window, "enter");
+    press_enter(cx, window);
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.revising_seq("a1").is_some(),
+            "the press was accepted — this is the frame the value goes quiet in"
+        );
+    });
+
+    let entries = fresh_entries(cx, window);
+    // The node is still there, under the same name…
+    assert_probe(
+        &entries,
+        "space/post/0",
+        gpui::Role::Article,
+        &settled_label,
+    );
+    // …and it is the *value* that is withheld, not the node.
+    let (_, entry) = entries
+        .iter()
+        .find(|(n, _)| n == "space/post/0")
+        .expect("still an article");
+    assert!(
+        entry.value.is_none(),
+        "the streaming revision must not bind a value AT would re-read per token: {:?}",
+        entry.value
+    );
 }

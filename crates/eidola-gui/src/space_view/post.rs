@@ -75,9 +75,10 @@ impl SpaceView {
         let editing_this = self.editing.as_ref().map(|e| &e.node_id) == Some(&node.id);
 
         // A **settled** post carries its byline/backend/time as the article's
-        // accessible name and its whole text as the article's value. A
-        // streaming one deliberately carries neither — see `article` below.
-        let mut article: Option<(usize, SharedString, SharedString)> = None;
+        // accessible name and its whole text as the article's value. A post
+        // being revised keeps the name and drops only the value — see
+        // `article` below.
+        let mut article: Option<(usize, SharedString, Option<SharedString>)> = None;
 
         let (byline, byline_backend, time, body): (
             SharedString,
@@ -98,6 +99,22 @@ impl SpaceView {
                     .as_deref()
                     .and_then(|id| self.space.read(cx).revising_seq(id));
                 if let Some(seq) = revising {
+                    // **The node stays; only the value goes.** The verb that
+                    // started this revision may have handed the keyboard to
+                    // this very post (see `release_affordance_focus`), and a
+                    // row that keeps `track_focus` while losing its role has no
+                    // AccessKit node at all — focus falls back to the window
+                    // root and the reader loses their place for the whole
+                    // regeneration. The name is safe to keep because it is not
+                    // what streams: byline, backend and time all come from the
+                    // generation being replaced and do not move until the new
+                    // one commits. Only the *text* mutates per token, and that
+                    // is exactly the value.
+                    article = Some((
+                        i,
+                        article_label(&post.byline, post.byline_backend.as_deref(), &post.time),
+                        None,
+                    ));
                     (
                         post.byline.clone(),
                         post.byline_backend.clone(),
@@ -108,10 +125,10 @@ impl SpaceView {
                     article = Some((
                         i,
                         article_label(&post.byline, post.byline_backend.as_deref(), &post.time),
-                        SharedString::from(super::minimap::spoken_text(
+                        Some(SharedString::from(super::minimap::spoken_text(
                             &post.content,
                             &post.references,
-                        )),
+                        ))),
                     ));
                     (
                         post.byline.clone(),
@@ -215,15 +232,21 @@ impl SpaceView {
             GutterPlacement::Stacked => v_flex().items_center(),
         }
         .id(SharedString::from(format!("space-post-{}", node.id)))
-        // The conversation itself, in the tree at last: each settled post
-        // is an `Article` (`AXGroup` + `AXDocumentArticle`) named for its
-        // author and time, carrying its whole text as the value. Only
-        // settled posts — a streaming reply's text mutates every token, and
-        // AT re-reads a changed value in full, so binding one there would
-        // make the app *less* usable than silence (audit §4). The row
-        // becomes a node the moment the stream finalizes into a `Msg`.
+        // The conversation itself, in the tree at last: each post is an
+        // `Article` (`AXGroup` + `AXDocumentArticle`) named for its author and
+        // time. **The value is what a settled post adds**, and only a settled
+        // one: text that mutates every token would be re-read in full on every
+        // change, which is less usable than silence (audit §4). A post being
+        // revised keeps the node and its name, and goes quiet on the value
+        // alone — the row is already on screen and may hold the keyboard, so
+        // taking its node away is a different act from never giving one to a
+        // streaming leaf that has not appeared yet.
         .when_some(article, |d, (i, label, value)| {
-            d.probe_value(format!("space/post/{i}"), gpui::Role::Article, label, value)
+            let name = format!("space/post/{i}");
+            match value {
+                Some(value) => d.probe_value(name, gpui::Role::Article, label, value),
+                None => d.probe(name, gpui::Role::Article, label),
+            }
         })
         // Wave B: the *focused* post row tracks the view's single post
         // focus handle. `Role::Article` already made the row focusable and
