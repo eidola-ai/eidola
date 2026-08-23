@@ -127,6 +127,13 @@ jobs:
         # stopped catching anything fails here too.
         run: ./scripts/check-manifest-determinism.sh
 
+      - name: Check artifact-manifest completeness
+        # The committed manifest must carry exactly the artifact set the
+        # emitted schema requires. A schema change that forgets a row is
+        # caught here rather than at release time — or, worse, by every
+        # installed client's claims dialog.
+        run: ./scripts/artifact-manifest.sh check-complete
+
       - name: Test macOS shipping-zip recipe
         # Info-ZIP flags only (no Nix, no toolchain): the symlink and
         # determinism regressions behind flake.nix's mkShippingZip.

@@ -119,6 +119,7 @@ check:
     rumdl check .
     cargo-deny check licenses bans sources
     ./scripts/check-manifest-determinism.sh
+    ./scripts/artifact-manifest.sh check-complete
     ./scripts/test-release-assets.sh
 
 # Apply auto-fixable markdown formatting via rumdl

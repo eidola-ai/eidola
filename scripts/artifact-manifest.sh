@@ -11,6 +11,7 @@ Usage:
   scripts/artifact-manifest.sh build-linux-gui [--output PATH] [--artifact-dir DIR]
   scripts/artifact-manifest.sh build-linux-deb [--output PATH] [--artifact-dir DIR]
   scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations] [--server-enclave-output PATH]
+  scripts/artifact-manifest.sh check-complete [--manifest PATH]
   scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--config PATH] [--server-enclave PATH] [--output PATH] [--server-enclave-output PATH] [--verify-attestations]
   scripts/artifact-manifest.sh stamp-config [--metadata-file PATH] [--config PATH]
   scripts/artifact-manifest.sh update [--output PATH] [--metadata-file PATH] [--builder NAME] [--ensure-builder]
@@ -83,6 +84,71 @@ MANIFEST_SCHEMA_VERSION=2
 # until this schema is emitted, because the key is what a shipped client
 # compares against.
 ARTIFACT_SET_SCHEMA=3
+
+# Every artifact key the emitted schema requires — the emitter's half of the
+# contract `crates/eidola-app-core/src/updates.rs` states for clients. A
+# manifest that omits one of these is not merely incomplete: an installed
+# client reads the absence as `ClaimsChanged`, so composing one and writing
+# it out is worse than refusing to.
+#
+# This exists because the composition can go short without anything failing.
+# `just update-manifest` fills rows the current host cannot build by copying
+# them from the committed manifest — which works only while the committed
+# manifest already has them. The release that first emits a new schema is
+# exactly the release where it does not.
+required_artifact_keys() {
+  local keys=(
+    eidola-cli
+    eidola-cli-macos-universal
+    eidola-gui-macos-universal
+    eidola-postgres
+    eidola-server
+  )
+  if records_current_linux_shape; then
+    keys+=(
+      eidola-gui-linux-deb-amd64
+      eidola-gui-linux-deb-arm64
+      eidola-gui-linux-nix-amd64
+      eidola-gui-macos-universal-zip
+    )
+  else
+    keys+=(eidola-gui-linux-amd64)
+  fi
+  printf '%s\n' "${keys[@]}" | sort
+}
+
+# Hold a composed manifest to that set — exactly, in both directions, since
+# an unreviewed extra row is as much a claims change as a missing one.
+# Returns 1 and explains rather than exiting, so callers that already
+# accumulate a status can report everything they found.
+assert_manifest_complete() {
+  local manifest="$1" actual missing extra
+  actual="$(printf '%s\n' "$manifest" | jq -r '.artifacts | keys[]' | sort)"
+  missing="$(comm -23 <(required_artifact_keys) <(printf '%s\n' "$actual"))"
+  extra="$(comm -13 <(required_artifact_keys) <(printf '%s\n' "$actual"))"
+
+  if [[ -z "$missing" && -z "$extra" ]]; then
+    return 0
+  fi
+
+  echo "::error::the composed manifest does not carry the artifact set schema ${MANIFEST_SCHEMA_VERSION} requires." >&2
+  if [[ -n "$missing" ]]; then
+    printf 'missing:\n%s\n' "$missing" >&2
+  fi
+  if [[ -n "$extra" ]]; then
+    printf 'unexpected:\n%s\n' "$extra" >&2
+  fi
+
+  # The remedy is host-specific, and worth spelling out: no Linux host can
+  # build the other architecture's `.deb`, so a schema whose Linux rows have
+  # just changed cannot be regenerated from Linux at all until a manifest
+  # carrying the new rows exists to copy from.
+  if [[ "$(uname -s)" == "Linux" ]] && printf '%s\n' "$missing" | grep -q '^eidola-gui-linux-deb-'; then
+    echo "This host builds only $(manifest_arch), and the committed manifest has no row to copy the other architecture from." >&2
+    echo "Regenerate on a macOS host (its container path builds both Linux architectures), or take the manifest CI composes." >&2
+  fi
+  return 1
+}
 
 # CVM image artifacts for enclave measurement computation.
 # The OVMF firmware version is pinned to match tinfoilsh/measure-image-action.
@@ -1152,6 +1218,10 @@ verify_full_manifest() {
   if [[ -n "$OUTPUT_FILE" ]]; then
     write_output "$actual_manifest"
   fi
+  if ! assert_manifest_complete "$actual_manifest"; then
+    rc=1
+  fi
+
   actual_norm="$(printf '%s\n' "$actual_manifest" | jq -cS .)"
   committed_norm="$(jq -cS . "$MANIFEST_FILE")"
 
@@ -1306,6 +1376,11 @@ update_manifest() {
   actual_manifest="$(merge_partials)"
   rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
 
+  # Nothing is written until the composition is whole. A short manifest is
+  # not a smaller version of a good one — every installed client reads the
+  # gap as a claims change.
+  assert_manifest_complete "$actual_manifest" || exit 1
+
   write_output "$actual_manifest"
   if [[ -n "$OUTPUT_FILE" ]]; then
     echo "Updated $OUTPUT_FILE"
@@ -1352,6 +1427,17 @@ case "$COMMAND" in
     # bake completes and before the enclave is recomputed.
     stamp_config_digests
     echo "Stamped $CONFIG_FILE with server digest from $METADATA_FILE"
+    ;;
+  check-complete)
+    # Drift guard for the committed manifest: it must carry exactly the
+    # artifact set the emitted schema requires. Cheap enough to run on
+    # every PR, which is where a schema change should be caught — not at
+    # release time, and not by a client's claims dialog.
+    if assert_manifest_complete "$(jq -c . "$MANIFEST_FILE")"; then
+      echo "$MANIFEST_FILE carries the artifact set schema ${MANIFEST_SCHEMA_VERSION} requires."
+    else
+      exit 1
+    fi
     ;;
   verify-full)
     verify_full_manifest
