@@ -69,11 +69,22 @@
 //! | `enclave.cmdline` | `kernel command line (non-empty)` | manifest schema 2 — the cmdline binds the tinfoil-config hash into the measurement |
 //! | `artifacts.eidola-cli` | `oci (linux/amd64)` | [`EXPECTED_ARTIFACTS`] — the artifact set every accepted schema records |
 //! | `artifacts.eidola-cli-macos-universal` | `nix (darwin/universal)` | ditto |
-//! | `artifacts.eidola-gui-linux-amd64` | `nix (linux/amd64)` | ditto |
 //! | `artifacts.eidola-gui-macos-universal` | `nix (darwin/universal)` | ditto |
 //! | `artifacts.eidola-postgres` | `oci (linux/amd64)` | ditto |
 //! | `artifacts.eidola-server` | `oci (linux/amd64)` | ditto |
-//! | `artifacts.eidola-gui-macos-universal-zip` | `file (darwin/universal) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] — the macOS unsigned shipping zip. Absent from the schema-2 manifests this build also accepts; required of any manifest declaring schema 3 |
+//! | `artifacts.eidola-gui-linux-amd64` | `nix (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`] — the Linux Nix installable's schema-2 key. Schema 3 records it as `…-nix-amd64` instead, so a manifest declaring 3 must *not* carry it |
+//! | `artifacts.eidola-gui-linux-deb-amd64` | `file (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] — the Debian package a user installs with `apt install ./…`; the `.deb` itself is the hashed byte stream |
+//! | `artifacts.eidola-gui-linux-deb-arm64` | `file (linux/arm64) or absent` | ditto, 64-bit ARM |
+//! | `artifacts.eidola-gui-linux-nix-amd64` | `nix (linux/amd64) or absent` | ditto — the Linux Nix installable under the name schema 3 gives it |
+//! | `artifacts.eidola-gui-macos-universal-zip` | `file (darwin/universal) or absent` | ditto — the macOS unsigned shipping zip |
+//!
+//! The `or absent` rows are the schema-conditional half: absent from the
+//! schema-2 manifests this build also accepts, required of any manifest
+//! declaring schema 3 — and, for the retiring row, the reverse. The
+//! retiring row is bounded on both sides, because a row that stops being
+//! recorded also started somewhere: below the oldest schema this build
+//! accepts it gets no verdict at all, since the artifact set of a shape
+//! this module never understood is not something it can report on.
 //!
 //! An attested manifest produces its own claim list via
 //! [`attested_claims`]: a claim disappears when the field is absent, gains
@@ -88,8 +99,12 @@
 //! the manifest declares. `archiveSha256` arrived with schema 2 and is
 //! mandatory from there on — it is the only artifact hash a user can check
 //! without Nix, so a schema-2 manifest that drops it has weakened the claim
-//! and reads as `ClaimsChanged`. Schema-1 rows legitimately have none. The
-//! macOS unsigned shipping zip's row arrives the same way with schema 3.
+//! and reads as `ClaimsChanged`. Schema-1 rows legitimately have none. Whole
+//! rows arrive the same way with schema 3 — and one *leaves* the same way,
+//! because schema 3 renames the Linux Nix installable's key rather than
+//! adding to it. A rename is two schema-conditional rows, one arriving and
+//! one retiring, so that each spelling is expected exactly under the schema
+//! that records it.
 //!
 //! That two-sided tolerance is the shape of every manifest schema rotation:
 //! a build **accepts** the new schema one release before any release
@@ -117,9 +132,11 @@ use crate::updater::ci_sigstore;
 /// verification failure.
 pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2, 3];
 
-/// The schema at which [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] rows become
-/// required. Named once so the tolerance and the requirement cannot drift.
-const SCHEMA_WITH_MACOS_SHIPPING_ZIP: u64 = 3;
+/// The schema the current artifact set was introduced at:
+/// [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] rows become required at it, and
+/// [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`] rows retire at it. Named once so
+/// requirement, retirement and tolerance cannot drift apart.
+const ARTIFACT_SET_SCHEMA: u64 = 3;
 
 /// The artifact entries every accepted `artifact-manifest.json` records, as
 /// `(name, type, platform)`. Structure only — digests / narHashes /
@@ -127,23 +144,49 @@ const SCHEMA_WITH_MACOS_SHIPPING_ZIP: u64 = 3;
 pub const EXPECTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     ("eidola-cli", "oci", "linux/amd64"),
     ("eidola-cli-macos-universal", "nix", "darwin/universal"),
-    ("eidola-gui-linux-amd64", "nix", "linux/amd64"),
     ("eidola-gui-macos-universal", "nix", "darwin/universal"),
     ("eidola-postgres", "oci", "linux/amd64"),
     ("eidola-server", "oci", "linux/amd64"),
 ];
 
-/// Artifact entries schema 3 adds: the macOS unsigned shipping zip, whose
-/// `sha256` is the identity of the container a signed release is built from
-/// (`type: "file"` — one published file, one hash, no Nix).
+/// Artifact entries schema 3 adds:
+///
+/// * the macOS unsigned shipping zip, whose `sha256` is the identity of the
+///   container a signed release is built from;
+/// * the Linux Nix installable under its narrowed name — `eidola-gui-linux-nix-amd64`
+///   rather than `eidola-gui-linux-amd64`, which used to imply "the Linux
+///   GUI" and is now one of two Linux installables (the schema-2 spelling
+///   retires in [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`]);
+/// * the Debian packages, one per architecture. Each is `type: "file"`
+///   because the `.deb` a user downloads *is* the byte stream its hash
+///   covers — no Nix and no unpacking between the download and
+///   `sha256sum` — the same reading the shipping zip gets.
 ///
 /// Kept separate from [`EXPECTED_ARTIFACTS`] because this build accepts both
-/// schemas: a schema-2 manifest legitimately has no such row, and only a
-/// manifest declaring schema 3 or later is required to carry it. When 2
-/// leaves [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] the row becomes
-/// unconditionally required, with no further edit here.
-pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_3: &[(&str, &str, &str)] =
-    &[("eidola-gui-macos-universal-zip", "file", "darwin/universal")];
+/// schemas: a schema-2 manifest legitimately has none of these rows, and only
+/// a manifest declaring schema 3 or later is required to carry them. When 2
+/// leaves [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] they become unconditionally
+/// required, with no further edit here.
+pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_3: &[(&str, &str, &str)] = &[
+    ("eidola-gui-linux-deb-amd64", "file", "linux/amd64"),
+    ("eidola-gui-linux-deb-arm64", "file", "linux/arm64"),
+    ("eidola-gui-linux-nix-amd64", "nix", "linux/amd64"),
+    ("eidola-gui-macos-universal-zip", "file", "darwin/universal"),
+];
+
+/// Artifact entries schema 3 *retires*: the Linux Nix installable's old key,
+/// which schema 3 records as `eidola-gui-linux-nix-amd64` instead.
+///
+/// The mirror image of [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`], and it exists
+/// for the same reason: a rename is not an addition, so accepting both
+/// schemas means accepting both spellings — each only under the schema that
+/// records it. A schema-2 manifest without this row has dropped an artifact;
+/// a schema-3 manifest carrying it has recorded one its own schema does not
+/// have. Symmetric self-tightening: the row disappears from the expected set
+/// entirely once 2 leaves [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`], with no
+/// further edit here.
+pub const EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2: &[(&str, &str, &str)] =
+    &[("eidola-gui-linux-amd64", "nix", "linux/amd64")];
 
 /// How often the background poll re-checks while the app is running.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
@@ -628,10 +671,32 @@ const CMDLINE_CLAIM_VALUE: &str = "kernel command line (non-empty)";
 /// manifest to carry. See the module docs for the full table and the
 /// derivation of each row.
 pub fn expected_claims() -> Vec<Claim> {
+    expected_claims_for(SUPPORTED_MANIFEST_SCHEMA_VERSIONS)
+}
+
+/// Does this build accept any manifest schema satisfying `pred`?
+fn accepts_schema(supported: &[u32], pred: impl Fn(u64) -> bool) -> bool {
+    supported.iter().any(|v| pred(u64::from(*v)))
+}
+
+/// The oldest manifest schema this build accepts — the lower bound of the
+/// range [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`] rows are recorded in.
+fn oldest_supported_schema() -> u64 {
+    SUPPORTED_MANIFEST_SCHEMA_VERSIONS
+        .iter()
+        .map(|v| u64::from(*v))
+        .min()
+        .unwrap_or(0)
+}
+
+/// [`expected_claims`] over an arbitrary supported-schema set, so the
+/// self-tightening the two schema-conditional artifact lists promise is
+/// testable at the sets this build will actually reach.
+fn expected_claims_for(supported: &[u32]) -> Vec<Claim> {
     let mut claims = Vec::new();
     claims.push(Claim {
         key: "manifest.schema_version".into(),
-        value: SUPPORTED_MANIFEST_SCHEMA_VERSIONS
+        value: supported
             .iter()
             .map(|v| v.to_string())
             .collect::<Vec<_>>()
@@ -670,24 +735,44 @@ pub fn expected_claims() -> Vec<Claim> {
             value: format!("{ty} ({platform})"),
         });
     }
-    // Rows a later schema introduced, while an earlier schema this build
-    // still accepts legitimately lacks them. `" or absent"` is what makes
-    // the acceptance real: without it every release still emitting the
-    // older schema would read as a claims change on this row.
-    let tolerate_absence = SUPPORTED_MANIFEST_SCHEMA_VERSIONS
-        .iter()
-        .any(|v| u64::from(*v) < SCHEMA_WITH_MACOS_SHIPPING_ZIP);
-    for (name, ty, platform) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3 {
-        let value = format!("{ty} ({platform})");
-        claims.push(Claim {
-            key: format!("artifacts.{name}"),
-            value: if tolerate_absence {
-                format!("{value} or {ABSENT_CLAIM}")
-            } else {
-                value
-            },
-        });
-    }
+    // The two schema-conditional halves of the artifact set, and the one
+    // rule they share: a row is *expected* only while some accepted schema
+    // records it, and *tolerated absent* while some accepted schema does
+    // not. `" or absent"` is what makes acceptance real — without it every
+    // release emitting the other schema would read as a claims change on
+    // that row.
+    let accepts_older = accepts_schema(supported, |v| v < ARTIFACT_SET_SCHEMA);
+    let accepts_current = accepts_schema(supported, |v| v >= ARTIFACT_SET_SCHEMA);
+    let mut push_conditional = |rows: &[(&str, &str, &str)], recorded: bool, tolerated: bool| {
+        if !recorded {
+            return;
+        }
+        for (name, ty, platform) in rows {
+            let value = format!("{ty} ({platform})");
+            claims.push(Claim {
+                key: format!("artifacts.{name}"),
+                value: if tolerated {
+                    format!("{value} or {ABSENT_CLAIM}")
+                } else {
+                    value
+                },
+            });
+        }
+    };
+    // Retiring rows: recorded only by the older schemas, so they leave the
+    // expected set outright once no accepted schema records them.
+    push_conditional(
+        EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2,
+        accepts_older,
+        accepts_current,
+    );
+    // Arriving rows, the mirror: tolerated absent while an older accepted
+    // schema still lacks them.
+    push_conditional(
+        EXPECTED_ARTIFACTS_SINCE_SCHEMA_3,
+        accepts_current,
+        accepts_older,
+    );
     claims
 }
 
@@ -783,25 +868,52 @@ pub fn attested_claims(manifest: &serde_json::Value) -> Vec<Claim> {
 
     if let Some(artifacts) = obj.get("artifacts") {
         if let Some(artifacts_obj) = artifacts.as_object() {
-            let records_since_3 =
-                schema_version.is_none_or(|v| v >= SCHEMA_WITH_MACOS_SHIPPING_ZIP);
+            // A manifest with no `schema_version` at all is held to the
+            // newest shape: the field's absence is already a delta of its
+            // own, and reading the rest under the *older* shape would let a
+            // manifest escape a requirement by dropping the field.
+            let records_current = schema_version.is_none_or(|v| v >= ARTIFACT_SET_SCHEMA);
+            // The retiring rows are bounded on *both* sides, unlike the
+            // arriving ones: a row that stops being recorded also started
+            // being recorded somewhere. Below the oldest schema this build
+            // accepts, this module does not know what the artifact set was
+            // — the captured schema-1 release predates the Linux GUI
+            // entirely — so it says so once, on `manifest.schema_version`,
+            // rather than reporting a row missing from a shape it never
+            // understood.
+            let records_older = schema_version
+                .is_some_and(|v| v >= oldest_supported_schema() && v < ARTIFACT_SET_SCHEMA);
+            let declared =
+                || schema_version.map_or_else(|| "«missing»".into(), |v: u64| v.to_string());
             for (name, entry) in artifacts_obj {
-                let since_3 = EXPECTED_ARTIFACTS_SINCE_SCHEMA_3
-                    .iter()
-                    .any(|(n, _, _)| n == name);
+                let in_set = |rows: &[(&str, &str, &str)]| rows.iter().any(|(n, _, _)| n == name);
                 claims.push(Claim {
                     key: format!("artifacts.{name}"),
-                    // A row the declared schema does not record yet is a
-                    // claim made outside the shape it was announced under.
-                    // Tolerating it would make the rotation one-sided: a
-                    // release could start emitting the row without bumping
-                    // the version, and neither the gate on the committed
-                    // manifest nor this verifier would say a word.
-                    value: if since_3 && !records_since_3 {
+                    // A row the declared schema does not record is a claim
+                    // made outside the shape it was announced under —
+                    // whether the row arrived too early or outlived its
+                    // schema. Tolerating either would make the rotation
+                    // one-sided: a release could start emitting the new
+                    // shape without bumping the version, and neither the
+                    // gate on the committed manifest nor this verifier
+                    // would say a word.
+                    value: if in_set(EXPECTED_ARTIFACTS_SINCE_SCHEMA_3) && !records_current {
                         format!(
                             "present, but schema {} records it only from \
-                             schema {SCHEMA_WITH_MACOS_SHIPPING_ZIP} on",
-                            schema_version.map_or_else(|| "«missing»".into(), |v| v.to_string())
+                             schema {ARTIFACT_SET_SCHEMA} on",
+                            declared()
+                        )
+                    // `records_current`, not `!records_older`: the row is a
+                    // claim out of shape once its schema has *retired* it,
+                    // which is not the same as any schema that does not
+                    // record it — a schema older than this build accepts
+                    // does neither, and gets no verdict here.
+                    } else if in_set(EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2) && records_current {
+                        format!(
+                            "present, but schema {} records it only through \
+                             schema {}",
+                            declared(),
+                            ARTIFACT_SET_SCHEMA - 1
                         )
                     } else {
                         describe_artifact(entry, schema_version)
@@ -812,19 +924,32 @@ pub fn attested_claims(manifest: &serde_json::Value) -> Vec<Claim> {
             // carry is a claim it *stopped* making — so it has to appear in
             // the attested list, or the expected side's "or absent"
             // tolerance would silently excuse it.
-            if records_since_3 {
-                for (name, _, _) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3 {
+            let mut note_missing = |rows: &[(&str, &str, &str)], recorded: bool, note: String| {
+                if !recorded {
+                    return;
+                }
+                for (name, _, _) in rows {
                     if !artifacts_obj.contains_key(*name) {
                         claims.push(Claim {
                             key: format!("artifacts.{name}"),
-                            value: format!(
-                                "missing (recorded from schema \
-                                 {SCHEMA_WITH_MACOS_SHIPPING_ZIP} on)"
-                            ),
+                            value: note.clone(),
                         });
                     }
                 }
-            }
+            };
+            note_missing(
+                EXPECTED_ARTIFACTS_SINCE_SCHEMA_3,
+                records_current,
+                format!("missing (recorded from schema {ARTIFACT_SET_SCHEMA} on)"),
+            );
+            note_missing(
+                EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2,
+                records_older,
+                format!(
+                    "missing (recorded through schema {})",
+                    ARTIFACT_SET_SCHEMA - 1
+                ),
+            );
         } else {
             claims.push(Claim {
                 key: "artifacts".into(),
@@ -1072,37 +1197,106 @@ mod tests {
                 "enclave.cmdline",
                 "artifacts.eidola-cli",
                 "artifacts.eidola-cli-macos-universal",
-                "artifacts.eidola-gui-linux-amd64",
                 "artifacts.eidola-gui-macos-universal",
                 "artifacts.eidola-postgres",
                 "artifacts.eidola-server",
+                "artifacts.eidola-gui-linux-amd64",
+                "artifacts.eidola-gui-linux-deb-amd64",
+                "artifacts.eidola-gui-linux-deb-arm64",
+                "artifacts.eidola-gui-linux-nix-amd64",
                 "artifacts.eidola-gui-macos-universal-zip",
             ]
         );
     }
 
+    #[test]
+    fn schema_conditional_rows_tighten_when_a_schema_leaves_the_supported_set() {
+        // The property both conditional lists promise: no edit here when a
+        // version is dropped. Accepting only schema 3 must make its rows
+        // unconditional and must drop the retired key outright — a client
+        // that no longer reads schema 2 has no business expecting a row
+        // only schema 2 records.
+        let only_3 = expected_claims_for(&[3]);
+        let value = |claims: &[Claim], key: &str| {
+            claims
+                .iter()
+                .find(|c| c.key == key)
+                .map(|c| c.value.clone())
+        };
+        assert_eq!(
+            value(&only_3, "artifacts.eidola-gui-linux-nix-amd64").as_deref(),
+            Some("nix (linux/amd64)")
+        );
+        assert_eq!(
+            value(&only_3, "artifacts.eidola-gui-linux-deb-arm64").as_deref(),
+            Some("file (linux/arm64)")
+        );
+        assert_eq!(value(&only_3, "artifacts.eidola-gui-linux-amd64"), None);
+
+        // And the far side of the same rotation, for completeness: a build
+        // that accepted only schema 2 expects only the old spelling.
+        let only_2 = expected_claims_for(&[2]);
+        assert_eq!(
+            value(&only_2, "artifacts.eidola-gui-linux-amd64").as_deref(),
+            Some("nix (linux/amd64)")
+        );
+        assert_eq!(value(&only_2, "artifacts.eidola-gui-linux-nix-amd64"), None);
+        assert_eq!(
+            value(&only_2, "artifacts.eidola-gui-macos-universal-zip"),
+            None
+        );
+    }
+
     /// A schema-3 manifest — the shape a later release will emit. It adds
-    /// the macOS unsigned shipping zip and nothing else, and must read as a
+    /// the macOS unsigned shipping zip and both Debian packages, and moves
+    /// the Linux Nix installable to its narrowed key; it must read as a
     /// clean update, not a claims change.
     fn schema_3_manifest() -> serde_json::Value {
         let mut manifest = current_manifest();
         manifest["schema_version"] = serde_json::json!(3);
-        manifest["artifacts"]["eidola-gui-macos-universal-zip"] = serde_json::json!({
-            "platform": "darwin/universal",
-            "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-            "type": "file"
-        });
+        let artifacts = manifest["artifacts"].as_object_mut().unwrap();
+        artifacts.remove("eidola-gui-linux-amd64");
+        artifacts.insert(
+            "eidola-gui-linux-nix-amd64".into(),
+            serde_json::json!({
+                "archiveSha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "narHash": "sha256-cc",
+                "platform": "linux/amd64",
+                "type": "nix"
+            }),
+        );
+        for (key, platform, hash) in [
+            ("eidola-gui-linux-deb-amd64", "linux/amd64", "e"),
+            ("eidola-gui-linux-deb-arm64", "linux/arm64", "f"),
+        ] {
+            artifacts.insert(
+                key.into(),
+                serde_json::json!({
+                    "platform": platform,
+                    "sha256": format!("sha256:{}", hash.repeat(64)),
+                    "type": "file"
+                }),
+            );
+        }
+        artifacts.insert(
+            "eidola-gui-macos-universal-zip".into(),
+            serde_json::json!({
+                "platform": "darwin/universal",
+                "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "type": "file"
+            }),
+        );
         manifest
     }
 
     #[test]
-    fn schema_3_manifest_with_the_zip_row_is_not_a_claims_change() {
+    fn schema_3_manifest_with_its_own_rows_is_not_a_claims_change() {
         let deltas = compare_claims(&expected_claims(), &attested_claims(&schema_3_manifest()));
         assert!(deltas.is_empty(), "unexpected deltas: {deltas:#?}");
     }
 
     #[test]
-    fn schema_2_manifest_without_the_zip_row_is_not_a_claims_change() {
+    fn schema_2_manifest_without_the_schema_3_rows_is_not_a_claims_change() {
         // Accept-before-emit: this build accepts schema 3, while releases
         // keep emitting schema 2 until the release after. If the new row
         // were required unconditionally, every release in that window would
@@ -1115,39 +1309,109 @@ mod tests {
     }
 
     #[test]
-    fn schema_3_manifest_missing_the_zip_row_is_a_delta() {
+    fn schema_3_manifest_missing_a_schema_3_row_is_a_delta() {
         // The other half of the tolerance: a manifest that declares schema 3
-        // has promised the row, so dropping it is a weakened claim rather
+        // has promised each row, so dropping one is a weakened claim rather
         // than an older shape.
+        for (row, _, _) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3 {
+            let mut manifest = schema_3_manifest();
+            manifest["artifacts"].as_object_mut().unwrap().remove(*row);
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "{row}: unexpected deltas: {deltas:#?}");
+            assert_eq!(deltas[0].key, format!("artifacts.{row}"));
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some("missing (recorded from schema 3 on)"),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_3_rows_present_before_schema_3_are_deltas() {
+        // The other side of the rotation. Accept-before-emit means a
+        // release must not start recording a row until the version says
+        // so — emission without the bump has to be as loud as the bump
+        // without emission, or "accepted but not yet emitted" is a claim
+        // nothing enforces.
+        for (row, _, _) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3 {
+            let mut manifest = current_manifest();
+            manifest["artifacts"][*row] = schema_3_manifest()["artifacts"][*row].clone();
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "{row}: unexpected deltas: {deltas:#?}");
+            assert_eq!(deltas[0].key, format!("artifacts.{row}"));
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some("present, but schema 2 records it only from schema 3 on"),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_retired_linux_key_at_schema_3_is_a_delta() {
+        // The rename's own accept-before-emit edge, and the reason the
+        // retiring row exists at all: schema 3 records the Linux Nix
+        // installable as `…-nix-amd64`, so a manifest declaring 3 that
+        // still carries the old key has recorded an artifact its own schema
+        // does not have. Without this the rename would be readable as a
+        // pure addition, and a manifest could quietly claim both.
         let mut manifest = schema_3_manifest();
-        manifest["artifacts"]
-            .as_object_mut()
-            .unwrap()
-            .remove("eidola-gui-macos-universal-zip");
+        manifest["artifacts"]["eidola-gui-linux-amd64"] = serde_json::json!({
+            "archiveSha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "narHash": "sha256-cc",
+            "platform": "linux/amd64",
+            "type": "nix"
+        });
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
         assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
-        assert_eq!(deltas[0].key, "artifacts.eidola-gui-macos-universal-zip");
-        assert!(
-            deltas[0].attested.as_deref().unwrap().contains("missing"),
-            "got: {deltas:?}"
+        assert_eq!(deltas[0].key, "artifacts.eidola-gui-linux-amd64");
+        assert_eq!(
+            deltas[0].attested.as_deref(),
+            Some("present, but schema 3 records it only through schema 2")
         );
     }
 
     #[test]
-    fn zip_row_present_before_schema_3_is_a_delta() {
-        // The other side of the rotation. Accept-before-emit means a
-        // release must not start recording the row until the version says
-        // so — emission without the bump has to be as loud as the bump
-        // without emission, or "accepted but not yet emitted" is a claim
-        // nothing enforces.
-        let mut manifest = schema_3_manifest();
-        manifest["schema_version"] = serde_json::json!(2);
+    fn the_retired_linux_key_gets_no_verdict_below_the_oldest_accepted_schema() {
+        // A retiring row is bounded on both sides. The captured schema-1
+        // release predates the Linux GUI entirely, so neither its absence
+        // nor its presence there says anything about the rename — the only
+        // honest complaint about such a manifest is its schema version, and
+        // piling a row verdict on top would make every captured old release
+        // read as two problems instead of one.
+        for present in [false, true] {
+            let mut manifest = current_manifest();
+            manifest["schema_version"] = serde_json::json!(1);
+            if !present {
+                manifest["artifacts"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("eidola-gui-linux-amd64");
+            }
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "present={present}: deltas {deltas:#?}");
+            assert_eq!(deltas[0].key, "manifest.schema_version");
+        }
+    }
+
+    #[test]
+    fn schema_2_manifest_missing_the_retired_linux_key_is_a_delta() {
+        // And its mirror: while schema 2 is still accepted, a schema-2
+        // manifest that drops the row has dropped an artifact. The "or
+        // absent" tolerance covers schema 3 having renamed it, not schema 2
+        // having lost it.
+        let mut manifest = current_manifest();
+        manifest["artifacts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("eidola-gui-linux-amd64");
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
         assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
-        assert_eq!(deltas[0].key, "artifacts.eidola-gui-macos-universal-zip");
+        assert_eq!(deltas[0].key, "artifacts.eidola-gui-linux-amd64");
         assert_eq!(
             deltas[0].attested.as_deref(),
-            Some("present, but schema 2 records it only from schema 3 on")
+            Some("missing (recorded through schema 2)")
         );
     }
 
@@ -1183,17 +1447,24 @@ mod tests {
     }
 
     #[test]
-    fn malformed_zip_sha256_is_a_delta() {
-        let mut manifest = schema_3_manifest();
-        manifest["artifacts"]["eidola-gui-macos-universal-zip"]["sha256"] =
-            serde_json::json!("sha256:nope");
-        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
-        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
-        assert_eq!(deltas[0].key, "artifacts.eidola-gui-macos-universal-zip");
-        assert!(
-            deltas[0].attested.as_deref().unwrap().contains("malformed"),
-            "got: {deltas:?}"
-        );
+    fn malformed_file_sha256_is_a_delta() {
+        // Every `file` row's whole claim is one hash of one published byte
+        // stream — the shipping zip and both Debian packages alike — so a
+        // hash that isn't one is the row saying nothing.
+        for (row, ty, _) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3 {
+            if *ty != "file" {
+                continue;
+            }
+            let mut manifest = schema_3_manifest();
+            manifest["artifacts"][*row]["sha256"] = serde_json::json!("sha256:nope");
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "{row}: unexpected deltas: {deltas:#?}");
+            assert_eq!(deltas[0].key, format!("artifacts.{row}"));
+            assert!(
+                deltas[0].attested.as_deref().unwrap().contains("malformed"),
+                "{row}: got {deltas:?}"
+            );
+        }
     }
 
     #[test]

@@ -749,6 +749,7 @@ mod path_pinning_tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_single_component_install_path_is_not_a_privilege_problem() {
         // `Path::parent` of a single-component path is `Some("")`, and the
