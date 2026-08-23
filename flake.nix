@@ -1178,7 +1178,7 @@ with open(path, "wb") as f:
         # DT_NEEDED, so the built binary stays X11-free at runtime.
         #
         # The artifact recorded in artifact-manifest.json is the *wrapped*
-        # derivation below (eidolaGuiLinuxWrapped), which bundles Mesa; this
+        # derivation below (eidolaGuiLinuxNix), which bundles Mesa; this
         # unwrapped build is the bare binary + library RUNPATH. End-user
         # packaging (AppImage/tarball/deb) is still a ship-time step on top.
         #
@@ -1328,10 +1328,12 @@ with open(path, "wb") as f:
               ${./scripts/pack-shipping-zip.sh} tree "$out"
             '';
 
-        # The shippable Linux GUI: a *copied* GUI binary, a *copied*
+        # The Nix Linux installable: a *copied* GUI binary, a *copied*
         # llama-server sidecar (both sets of bytes in this NAR — same
         # measurement rule as macOS), and a *referenced* nixpkgs Mesa ICD
-        # set.
+        # set. It is one of two Linux installables — the `.deb` below is
+        # the other — which is why the attribute names the packaging
+        # rather than claiming the platform.
         #
         # Both executables are copied rather than symlinked/wrapped-by-
         # reference on purpose. A makeWrapper over `${eidolaGuiLinux}/bin/
@@ -1369,11 +1371,11 @@ with open(path, "wb") as f:
         # our payload entirely. VK_ADD_DRIVER_FILES is *additive* and set
         # only as a default, so a NixOS host's /run/opengl-driver drivers
         # coexist and a user can override outright.
-        eidolaGuiLinuxWrapped =
+        eidolaGuiLinuxNix =
           if eidolaGuiLinux == null then
             null
           else
-            pkgs.runCommand "eidola-gui-linux"
+            pkgs.runCommand "eidola-gui-linux-nix"
               {
                 nativeBuildInputs = [ pkgs.makeWrapper ];
               }
@@ -1707,11 +1709,11 @@ with open(path, "wb") as f:
           };
         }
         // pkgs.lib.optionalAttrs (eidolaGuiLinux != null) {
-          eidola-gui-linux = eidolaGuiLinuxWrapped;
+          eidola-gui-linux-nix = eidolaGuiLinuxNix;
           eidola-gui-linux-unwrapped = eidolaGuiLinux;
-          eidola-gui-linux-archive = mkReproducibleArchive {
-            pname = "eidola-gui-linux";
-            payload = eidolaGuiLinuxWrapped;
+          eidola-gui-linux-nix-archive = mkReproducibleArchive {
+            pname = "eidola-gui-linux-nix";
+            payload = eidolaGuiLinuxNix;
           };
           # The host-generic GUI binary, and the Debian package built over it.
           eidola-gui-linux-fdo = eidolaGuiLinuxFdo;

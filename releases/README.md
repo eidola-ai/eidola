@@ -79,7 +79,17 @@ The manifest carries a `schema_version` too, and rotates under the same accept-b
 
 Landing them together is the failure this ordering exists to prevent: every installed client would meet a manifest shape it does not know and report `ClaimsChanged` — an authentic release that looks like a threat-model change, for everyone at once.
 
-**Currently mid-rotation:** clients accept `2` and `3`; CI still emits `2`. Schema `3` adds the macOS unsigned shipping zip (`eidola-gui-macos-universal-zip`, `type: "file"` — the `sha256` of the container a macOS download arrives in, built by `nix build .#eidola-gui-macos-universal-zip`). Step 2 above is what turns it on.
+**Currently mid-rotation:** clients accept `2` and `3`; CI still emits `2`. Schema `3` changes the artifact set in three ways:
+
+- adds the macOS unsigned shipping zip (`eidola-gui-macos-universal-zip`, `type: "file"` — the `sha256` of the container a macOS download arrives in, built by `nix build .#eidola-gui-macos-universal-zip`);
+- adds the Debian packages (`eidola-gui-linux-deb-amd64`, `…-arm64`, `type: "file"` — the `sha256` of the `.deb` itself, which is byte-reproducible and needs no archive indirection);
+- **renames** the Nix Linux installable's key from `eidola-gui-linux-amd64` to `eidola-gui-linux-nix-amd64`, because Linux now has two installables and the old key implied it had one.
+
+A rename is not an addition, so it is two schema-conditional rows in `updates.rs` rather than one: `EXPECTED_ARTIFACTS_SINCE_SCHEMA_3` for the arriving key and `EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2` for the retiring one. Each spelling is expected exactly under the schema that records it — a schema-2 manifest that drops the old key, and a schema-3 manifest that keeps it, both read as `ClaimsChanged`. Both lists tighten by themselves when a version leaves the supported set.
+
+Step 2 above is one assignment — `MANIFEST_SCHEMA_VERSION` in `scripts/artifact-manifest.sh` — but it is not unconditional. The flake attributes and the CI jobs already carry the schema-3 shape, and the Linux keys and deb rows are gated on that number alone; what the assignment additionally requires is that *every* producer emit its schema-3 rows, because the generator refuses to write a manifest missing a row its own schema promises (`scripts/artifact-manifest.sh check-complete`, run by `just check` and `rust-checks`). Today the macOS unsigned shipping zip is built by CI but not yet recorded, so the flip will refuse until that row is emitted — by design: a manifest short of a row its schema requires is read as `ClaimsChanged` by every installed client, which is precisely what the rotation exists to avoid.
+
+Regeneration host matters too. A Linux host builds only its own architecture, so at the moment of the flip it cannot supply the other architecture's `.deb` and has no committed row to copy one from; `just update-manifest` says so and stops. The macOS path builds both Linux architectures in containers, and CI composes the full set from its per-architecture jobs.
 
 ### Rotating the Sigstore trusted root
 

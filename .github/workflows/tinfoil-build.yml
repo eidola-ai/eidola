@@ -138,3 +138,137 @@ jobs:
             artifact-manifest.json.sigstore \
             --clobber \
             --repo "$GITHUB_REPOSITORY"
+
+  # ── Attach the measured files themselves ─────────────────────────────────
+  # The signed manifest records a hash for every artifact and
+  # docs/verification.md promises that hash is checkable with nothing but
+  # `sha256sum` — which needs the file published, not just measured. The
+  # files are built and measured by `artifacts.yml`, a *different* workflow
+  # triggered by the same tag, so they are fetched from that run rather than
+  # rebuilt here: whichever job produced the bytes the manifest measured is
+  # the job whose bytes must be published, and a rebuild would make that an
+  # assumption instead of a fact.
+  #
+  # Nothing is taken on trust across that seam. `scripts/release-assets.sh`
+  # re-hashes every downloaded file against the manifest and decides what
+  # may be uploaded; a mismatch, a missing file, or an artifact class no one
+  # decided about fails this job before `gh release upload` runs. The
+  # release itself already exists at that point (the manifest and its
+  # Sigstore bundle are attached above), so a failure here is loud and
+  # re-runnable rather than a half-created release — and `--clobber` makes
+  # the re-run idempotent.
+  publish-assets:
+    name: Attach verified release assets
+    needs: release
+    runs-on: ubuntu-24.04
+    # This job spends nearly all of its time waiting for `artifacts.yml`,
+    # whose Nix builds are slow from a cold cache and, on a tag,
+    # deliberately skip the project cache entirely. So this is the *only*
+    # clock in the waiting path — the step below polls until that run
+    # reaches a conclusion and declares no deadline of its own.
+    #
+    # The number is not maintained by hand against a workflow in another
+    # file: `scripts/release-assets.sh wait-budget` derives the producer's
+    # longest declared path from its own `needs` and `timeout-minutes` and
+    # fails if this does not exceed it with room for queueing. That check
+    # runs on every PR, so bumping a timeout over there fails here at once
+    # rather than at release time. GitHub stops a hosted job at 360
+    # minutes, which is the ceiling this has to stay under.
+    timeout-minutes: 330
+    permissions:
+      contents: write # attach assets to the tag's release
+      actions: read # read the artifact workflow's run for this tag
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Wait for this tag's artifact workflow run
+        id: artifacts-run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # The tag's own run, not the `main` push run of the same commit:
+          # only the tag run skips the project binary cache, so it is the
+          # one that built these bytes from source.
+          find_run() {
+            # No --paginate: with it, --jq runs once per page and a
+            # "pick the newest" filter would answer once per page too.
+            # Runs for one commit are few; 100 is generous.
+            gh api -X GET "repos/$REPO/actions/workflows/artifacts.yml/runs" \
+              -f head_sha="$SHA" -f event=push -f per_page=100 \
+              --jq "[.workflow_runs[] | select(.head_branch == \"$TAG\")]
+                    | sort_by(.run_number) | last
+                    | select(. != null) | \"\(.id) \(.status) \(.conclusion)\""
+          }
+
+          # No deadline here. A run that has not concluded is still a
+          # valid run, and the honest end condition is its conclusion, not
+          # a clock this step would have to keep in step with another
+          # workflow's timeouts. The job's own `timeout-minutes` is the
+          # single bound, and `wait-budget` is what keeps it sufficient.
+          started=$(date +%s)
+          while :; do
+            # `|| true`: a transient API failure is one poll lost, not a
+            # failed release.
+            found="$(find_run || true)"
+            if [ -n "$found" ]; then
+              # shellcheck disable=SC2086
+              set -- $found
+              run_id="$1"; status="$2"; conclusion="${3:-}"
+              echo "[$(( ($(date +%s) - started) / 60 ))m] artifacts.yml run $run_id: status=$status conclusion=$conclusion"
+              if [ "$status" = "completed" ]; then
+                if [ "$conclusion" != "success" ]; then
+                  echo "::error::The artifact workflow for $TAG concluded '$conclusion'. Its outputs are what a release publishes, so nothing is attached. Fix and re-run both."
+                  exit 1
+                fi
+                echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+                break
+              fi
+            else
+              echo "[$(( ($(date +%s) - started) / 60 ))m] no artifacts.yml run for $TAG yet"
+            fi
+            sleep 60
+          done
+
+      - name: Download the measured files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ steps.artifacts-run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/release-assets
+          # Every `release-assets-*` artifact of that run, flattened into
+          # one directory: the names inside are the manifest keys, so a
+          # collision between two producers would be a duplicate key, which
+          # the manifest cannot have.
+          gh run download "$RUN_ID" --repo "$REPO" \
+            --pattern 'release-assets-*' --dir /tmp/release-assets-raw
+          find /tmp/release-assets-raw -type f -exec mv -n {} /tmp/release-assets/ \;
+          ls -l /tmp/release-assets
+
+      - name: Verify every file against the signed manifest
+        run: |
+          ./scripts/release-assets.sh verify \
+            --manifest artifact-manifest.json \
+            --dir /tmp/release-assets \
+            --list /tmp/release-assets.list
+
+      - name: Attach verified assets to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < /tmp/release-assets.list
+          gh release upload "$TAG" "${assets[@]}" \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
