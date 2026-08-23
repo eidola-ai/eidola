@@ -30,7 +30,7 @@ eidola-common = { path = "../eidola-common" }
 # Advisory (flock) file locking for the local-database lockfile. Pure Rust
 # (rustix), sync backend only — no async runtime pulled in.
 fs4 = { version = "1", default-features = false, features = ["sync"] }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 regex = "1"
