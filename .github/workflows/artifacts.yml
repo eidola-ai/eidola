@@ -418,6 +418,9 @@ jobs:
           name: release-assets-macos
           path: /tmp/eidola-release-assets
           if-no-files-found: error
+          # A job re-run reaches the original failure instead of dying on the
+          # artifact this attempt already uploaded.
+          overwrite: true
 
       - name: Build the unsigned macOS shipping zip
         # The container a macOS download arrives in, built from the same
@@ -438,6 +441,9 @@ jobs:
           name: eidola-gui-macos-universal-zip
           path: /tmp/eidola-shipping/eidola-gui-macos-universal.zip
           if-no-files-found: error
+          # A job re-run reaches the original failure instead of dying on the
+          # artifact this attempt already uploaded.
+          overwrite: true
 
       - name: Verify detached Apple signature contract
         run: ./scripts/apple-signature-differential.sh
@@ -539,6 +545,9 @@ jobs:
           name: release-assets-linux-amd64
           path: /tmp/eidola-release-assets
           if-no-files-found: error
+          # A job re-run reaches the original failure instead of dying on the
+          # artifact this attempt already uploaded.
+          overwrite: true
 
   # ── Linux arm64 Debian package (native arm runner, Nix) ──────────────────────
   # The arm64 `.deb` has no Nix-installable sibling — it is one artifact row
@@ -629,6 +638,9 @@ jobs:
           name: release-assets-linux-arm64
           path: /tmp/eidola-release-assets
           if-no-files-found: error
+          # A job re-run reaches the original failure instead of dying on the
+          # artifact this attempt already uploaded.
+          overwrite: true
 
   artifact-manifest:
     name: Verify artifact manifest
