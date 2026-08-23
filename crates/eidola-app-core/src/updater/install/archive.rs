@@ -349,11 +349,48 @@ fn claimed_member_count(bytes: &[u8]) -> Option<u64> {
         .find(|&i| bytes[i..i + 4] == SIGNATURE)?;
 
     let total = u16::from_le_bytes([bytes[start + 10], bytes[start + 11]]);
-    if total == u16::MAX {
-        // The real count is in the ZIP64 record; reading that is parsing.
+    if total != u16::MAX {
+        return Some(u64::from(total));
+    }
+
+    // `0xFFFF` is the classic record saying "look in the ZIP64 record" —
+    // which is two more fixed-layout structures, not a parse: a locator
+    // immediately before this record points at the ZIP64 end record, whose
+    // own total-entries field is a plain u64.
+    zip64_member_count(bytes, start)
+}
+
+/// The ZIP64 total-entries count, when the classic record defers to it.
+///
+/// `classic_start` is where the classic end record begins; the ZIP64
+/// locator sits immediately before it. Every failure to read is `None` —
+/// deferring to the parser, never concluding anything.
+fn zip64_member_count(bytes: &[u8], classic_start: usize) -> Option<u64> {
+    const LOCATOR: [u8; 4] = [b'P', b'K', 6, 7];
+    const LOCATOR_LEN: usize = 20;
+    const END: [u8; 4] = [b'P', b'K', 6, 6];
+    const END_MIN_LEN: usize = 56;
+
+    let locator_start = classic_start.checked_sub(LOCATOR_LEN)?;
+    if bytes[locator_start..locator_start + 4] != LOCATOR {
         return None;
     }
-    Some(u64::from(total))
+
+    // Offset of the ZIP64 end record, at locator offset 8.
+    let offset = u64::from_le_bytes(
+        bytes[locator_start + 8..locator_start + 16]
+            .try_into()
+            .ok()?,
+    );
+    let offset = usize::try_from(offset).ok()?;
+    if offset.checked_add(END_MIN_LEN)? > bytes.len() || bytes[offset..offset + 4] != END {
+        return None;
+    }
+
+    // Total entries across all disks, at record offset 32.
+    Some(u64::from_le_bytes(
+        bytes[offset + 32..offset + 40].try_into().ok()?,
+    ))
 }
 
 /// The name two members would have to share to be one file.
@@ -660,6 +697,59 @@ mod tests {
         );
     }
 
+    /// A ZIP64 container puts its real count in a second end record, and
+    /// says so by writing `0xFFFF` in the first. Deferring on that is how
+    /// a container claiming millions of members walks straight into the
+    /// eager parse.
+    #[test]
+    fn reads_a_zip64_member_count_too() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(0o644);
+            writer.start_file("app/one".to_string(), options).unwrap();
+            writer.finish().unwrap();
+        }
+        let classic = cursor.into_inner();
+
+        // Build the ZIP64 shape by hand: the record, its locator, then the
+        // classic record deferring to them. Only the fields this reads are
+        // meaningful; the rest is zero, which is what "fixed layout" buys.
+        let mut bytes = classic[..classic.len() - 22].to_vec();
+        let zip64_start = bytes.len() as u64;
+        let absurd = MAX_MEMBERS as u64 + 1;
+
+        let mut end64 = vec![0u8; 56];
+        end64[0..4].copy_from_slice(&[b'P', b'K', 6, 6]);
+        end64[32..40].copy_from_slice(&absurd.to_le_bytes());
+        bytes.extend_from_slice(&end64);
+
+        let mut locator = vec![0u8; 20];
+        locator[0..4].copy_from_slice(&[b'P', b'K', 6, 7]);
+        locator[8..16].copy_from_slice(&zip64_start.to_le_bytes());
+        bytes.extend_from_slice(&locator);
+
+        let mut classic_end = classic[classic.len() - 22..].to_vec();
+        classic_end[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        bytes.extend_from_slice(&classic_end);
+
+        assert_eq!(
+            claimed_member_count(&bytes),
+            Some(absurd),
+            "the count a ZIP64 container claims is readable without parsing it"
+        );
+
+        let dest = tempfile::tempdir().unwrap();
+        let error = unpack_zip(&bytes, dest.path(), "a payload")
+            .expect_err("a ZIP64 container claiming more members than this unpacks is refused");
+        assert!(
+            matches!(&error, InstallError::Archive { reason, .. } if reason.contains("claims")),
+            "{error}"
+        );
+    }
+
     /// A byte budget does not bound member count.
     #[test]
     fn refuses_a_container_with_more_members_than_a_bundle_has() {
@@ -687,8 +777,8 @@ mod tests {
 
     /// Directories carry the packer's mode set, not the caller's umask.
     #[test]
-    fn normalizes_directory_modes_whatever_the_umask() {
-        use std::os::unix::fs::PermissionsExt;
+    fn normalizes_directory_modes_whatever_they_were_created_with() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
@@ -709,20 +799,39 @@ mod tests {
         }
         let bytes = cursor.into_inner();
 
-        let dest = tempfile::tempdir().unwrap();
-        // SAFETY: `umask` reads and sets process state; it cannot fail.
-        let previous = unsafe { libc::umask(0o077) };
-        let outcome = unpack_zip(&bytes, dest.path(), "a payload");
-        unsafe { libc::umask(previous) };
-        outcome.expect("the container is well formed");
+        // The unpack root is created deliberately wrong — 0700, which is
+        // what a restrictive umask would have produced — so the assertion
+        // has something to turn on without this test reaching for a
+        // process-wide mask it would share with every test beside it.
+        // (`tempdir` itself creates 0755, so it proves nothing on its own.)
+        let holder = tempfile::tempdir().unwrap();
+        let dest = holder.path().join("unpacked");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dest)
+            .unwrap();
+        unpack_zip(&bytes, &dest, "a payload").expect("the container is well formed");
 
-        for dir in ["app", "app/Contents", "app/Contents/Resources"] {
-            let mode = std::fs::metadata(dest.path().join(dir))
+        // The root is the case that discriminates: `tempdir` creates it
+        // 0700, while the ambient mask already gives created subdirectories
+        // 0755 — so a test that only looked at those would pass whether or
+        // not anything normalized them.
+        for dir in ["", "app", "app/Contents", "app/Contents/Resources"] {
+            let mode = std::fs::metadata(dest.join(dir))
                 .unwrap()
                 .permissions()
                 .mode()
                 & 0o777;
-            assert_eq!(mode, 0o755, "`{dir}` should carry the packer's mode set");
+            assert_eq!(
+                mode,
+                0o755,
+                "`{}` should carry the packer's mode set",
+                if dir.is_empty() {
+                    "the unpack root"
+                } else {
+                    dir
+                }
+            );
         }
     }
 

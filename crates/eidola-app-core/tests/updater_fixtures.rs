@@ -528,57 +528,7 @@ async fn refuses_members_that_the_filesystem_would_fold_together() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn every_path_in_a_staged_bundle_carries_the_packers_modes() {
-    // Reconstruction creates the signing directory and the seal itself,
-    // with ordinary creates that take the umask — after the unpacked tree
-    // was already normalized. A staged bundle should not carry two mode
-    // rules depending on which step wrote each path.
-    use std::os::unix::fs::PermissionsExt;
-
-    let published = publish();
-    let staging = tempfile::tempdir().unwrap();
-    let root = staging.path().join("9.9.9");
-
-    // SAFETY: `umask` reads and sets process state; it cannot fail.
-    let previous = unsafe { libc::umask(0o077) };
-    let staged = install::stage(
-        &Fetcher::fixtures(published.dir.path()),
-        &plan(&published),
-        &root,
-    )
-    .await;
-    unsafe { libc::umask(previous) };
-    let staged = staged.expect("the fixture release should install");
-
-    // Everything reconstruction wrote, not just everything unpacked.
-    let seal = staged.bundle().join("Contents/_CodeSignature");
-    assert!(seal.is_dir(), "the fixture reconstructs a bundle seal");
-
-    let mut checked = 0;
-    let mut stack = vec![staged.bundle().to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            if path.is_dir() {
-                assert_eq!(mode, 0o755, "{}", path.display());
-                stack.push(path);
-            } else {
-                assert!(
-                    mode == 0o644 || mode == 0o755,
-                    "{} is {mode:o}",
-                    path.display()
-                );
-            }
-            checked += 1;
-        }
-    }
-    assert!(checked > 3, "the walk should have seen the bundle");
-    staged.discard().unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn creates_the_staging_root_private_whatever_the_umask() {
+async fn creates_the_staging_root_private_by_stating_its_mode() {
     // Every hash this module checks would be checkable-then-replaceable if
     // the tree were world-writable: another local user could swap a
     // verified payload before it was used.
@@ -588,17 +538,18 @@ async fn creates_the_staging_root_private_whatever_the_umask() {
     let staging = tempfile::tempdir().unwrap();
     let root = staging.path().join("9.9.9");
 
-    // SAFETY: `umask` reads and sets process state; it cannot fail.
-    let previous = unsafe { libc::umask(0o000) };
     let staged = install::stage(
         &Fetcher::fixtures(published.dir.path()),
         &plan(&published),
         &root,
     )
-    .await;
-    unsafe { libc::umask(previous) };
+    .await
+    .expect("the fixture release should install");
 
-    let staged = staged.expect("the fixture release should install");
+    // No umask is set here on purpose. A stated 0700 differs from whatever
+    // an inherited mask would produce, so the assertion turns on the
+    // explicit mode either way — and a process-wide mask changed around an
+    // await puts every concurrently running test under it.
     let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
     assert_eq!(
         mode, 0o700,

@@ -587,9 +587,16 @@ pub fn promotion_readiness(staged: &Path, installed: &Path) -> PromotionReadines
     // `exists()` answers false for "no" *and* for "an ancestor is not
     // searchable", which are opposite answers here: the second means a
     // bundle may well be installed and this process cannot get to it.
-    match installed.try_exists() {
-        Ok(true) => {}
-        Ok(false) => return PromotionReadiness::NotInstalled,
+    // Asked of the entry, not of what it points at. `try_exists` follows a
+    // symlink, so a broken one reads as nothing installed and one whose
+    // target this user cannot reach reads as a privilege problem — but the
+    // rename replaces the *entry*, and neither the target's existence nor
+    // its permissions have anything to do with whether it can.
+    match std::fs::symlink_metadata(installed) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return PromotionReadiness::NotInstalled;
+        }
         Err(e) => {
             return PromotionReadiness::NeedsPrivileges {
                 reason: format!("`{}` could not be examined: {e}", installed.display()),
@@ -972,6 +979,24 @@ mod promotion_tests {
         assert!(
             matches!(verdict, PromotionReadiness::NeedsPrivileges { .. }),
             "the rename replaces the symlink, in a directory this user cannot write: {verdict:?}"
+        );
+    }
+
+    /// A symlink whose target is gone, or unreachable, is still an entry
+    /// in a directory — and replacing that entry is all a swap does.
+    #[test]
+    fn a_dangling_install_symlink_is_still_something_to_replace() {
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("Eidola.app");
+        std::os::unix::fs::symlink(root.path().join("gone"), &link).unwrap();
+
+        let staged = root.path().join("staged.app");
+        std::fs::create_dir(&staged).unwrap();
+
+        assert_eq!(
+            promotion_readiness(&staged, &link),
+            PromotionReadiness::Ready,
+            "the target's absence says nothing about replacing the entry"
         );
     }
 
