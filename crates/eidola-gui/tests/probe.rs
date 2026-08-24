@@ -690,6 +690,68 @@ fn a_stale_transcript_says_so_where_the_reader_is(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// Two pieces of chrome over the document's top must not stand in the same
+/// place. The stale-read strip is painted *after* the find bar, so overlapping
+/// it would not merely look wrong — the strip's centred pill wins the hit test
+/// over the query field beneath it, leaving part of the find controls
+/// unclickable for a reader who just asked to search.
+#[gpui::test]
+fn a_stale_read_strip_stands_clear_of_the_find_bar(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "a kestrel hovers over the verge");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "about the kestrel"), a2], cx);
+            s.fail_transcript_refresh_for_test(cx);
+        });
+    });
+    draw(cx, window);
+
+    let before = fresh_entries(cx, window)
+        .iter()
+        .find(|(n, _)| n == "space/transcript/refresh-retry")
+        .map(|(_, e)| e.bounds)
+        .expect("the strip paints over a stale transcript");
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    let strip = entries
+        .iter()
+        .find(|(n, _)| n == "space/transcript/refresh-retry")
+        .map(|(_, e)| e.bounds)
+        .expect("the strip is still standing");
+    let field = entries
+        .iter()
+        .find(|(n, _)| n == "space/find/field")
+        .map(|(_, e)| e.bounds)
+        .expect("the find field paints");
+
+    assert!(
+        strip.origin.y > before.origin.y,
+        "the strip moved down by the bar the reserve grew: {before:?} → {strip:?}"
+    );
+    assert!(
+        strip.origin.y >= field.bottom(),
+        "the strip must begin below the find controls: strip {strip:?}, field {field:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn a_streaming_reply_is_not_an_article(cx: &mut TestAppContext) {
     // The §4 trap: a value bound to streaming text makes assistive technology

@@ -19152,3 +19152,206 @@ fn space_find_reveals_the_match_it_steps_to(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+fn space_find_reveals_its_first_match_without_a_step(cx: &mut TestAppContext) {
+    // The readout says "1 of N" the moment a query is typed, so match 1 has to
+    // be somewhere the reader can see it. The anchor does not exist when the
+    // query is applied — a new search re-anchors from `sync_find`, against the
+    // frame's own selected path — so the reveal is a debt recorded there and
+    // discharged where the anchor is established. Without that, the first match
+    // sat off-screen until the reader pressed Return.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "the only kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "nothing to find up here"), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+    let at_top = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    view.read_with(&vcx, |v, _| {
+        let (matches, index) = v.find_matches_for_test();
+        assert_eq!(matches.len(), 1, "one match, far below the fold");
+        assert_eq!(index, Some(1), "and the readout calls it current");
+        assert!(
+            v.page_scroll_offset_y_for_test() < at_top - 100.0,
+            "…so the page went to it without a step ({} → {})",
+            at_top,
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_to_the_composer_it_opened_over(cx: &mut TestAppContext) {
+    // A draft that is active but not focused is a dead window: the
+    // conversation's key handler yields every printable to "a composing session
+    // owns the keyboard entirely", and the composer is not there to take them —
+    // so typing does nothing until the reader clicks back in. Closing the bar
+    // therefore hands the keyboard to the composing session, not the view root.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    // Start composing (type-to-compose activates the trailing draft).
+    vcx.simulate_keystrokes("h i");
+    vcx.run_until_parked();
+    let draft = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the reader is composing");
+    assert_eq!(draft.read_with(&vcx, |e, _| e.value().to_string()), "hi");
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The proof is the only honest one: typing reaches the draft again.
+    vcx.simulate_keystrokes("!");
+    vcx.run_until_parked();
+    assert_eq!(
+        draft.read_with(&vcx, |e, _| e.value().to_string()),
+        "hi!",
+        "the keystroke after the bar closed landed in the composer it was \
+         opened over"
+    );
+}
+
+#[gpui::test]
+fn space_find_searches_an_edit_in_progress_not_the_post_it_will_replace(cx: &mut TestAppContext) {
+    // An inline edit's body editor keeps the unsaved buffer while the post's
+    // `content` stays the generation the commit will replace — the divergence
+    // *is* the edit. Searching the persisted text there reports source ranges
+    // of a string nobody is looking at, and the highlight layer paints them
+    // onto the modified buffer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    })
+    .unwrap();
+    let editor = view
+        .read_with(cx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post's body editor is the edit buffer");
+    editor.update(cx, |e, cx| {
+        e.set_value("a merlin, not the bird it was".to_string(), cx)
+    });
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "merlin");
+    view.read_with(&vcx, |v, _| {
+        let (matches, _) = v.find_matches_for_test();
+        assert_eq!(
+            matches.iter().map(|(n, _)| n.as_ref()).collect::<Vec<_>>(),
+            vec!["a1"],
+            "the word only the unsaved buffer carries is found: {matches:?}"
+        );
+        let (_, source) = &matches[0];
+        assert_eq!(
+            &editor.read_with(&vcx, |e, _| e.value().to_string())[source.clone()],
+            "merlin",
+            "and its range addresses the buffer the highlight paints on"
+        );
+    });
+
+    // The other direction: the persisted generation is no longer searched.
+    run_find(&view, window, &mut vcx, "Tell me about");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "the replaced text is not what the reader is looking at"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_reveals_a_match_in_the_off_branch_composer(cx: &mut TestAppContext) {
+    // The scope deliberately admits the active draft whatever branch it belongs
+    // to, because its composer floats over whatever is showing — so a match in
+    // it can be named current while the page is on another branch entirely and
+    // has no document position for it. The composer's own viewport is what
+    // reveals it; find never moves the reader's branch.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut left = fixture_assistant_post("a2", "the left branch, which the page is showing");
+    left.parent_action_id = Some("a1".into());
+    let mut right = fixture_assistant_post("a3", "the right branch, off to one side");
+    right.parent_action_id = Some("a1".into());
+    space.update(cx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", "the fork"), left, right], cx)
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    let right_index = view
+        .read_with(&vcx, |v, _| v.draft_parents_for_test())
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a3"))
+        .expect("the right branch has a tail draft");
+    // Activating a draft does not select its branch — the page stays on the
+    // left one, which is exactly the situation under test.
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(right_index, cx));
+    vcx.run_until_parked();
+
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the off-branch draft is the active composer");
+    let mut long: String = "a line of the tangent draft that says nothing much\n".repeat(60);
+    long.push_str("and one kestrel at the very bottom of it\n");
+    editor.update(&mut vcx, |e, cx| e.set_value(long, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    // The reveal is the *composer's* scroll, so start it at its own top.
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.composer_scroll_offset_y_for_test().abs() < 0.5,
+            "the composer starts at its top ({})",
+            v.composer_scroll_offset_y_for_test()
+        );
+    });
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    // One more frame: the exact span comes from the editor's last paint.
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let (matches, index) = v.find_matches_for_test();
+        assert_eq!(matches.len(), 1, "the off-branch draft is in scope");
+        assert_eq!(index, Some(1), "and the readout calls it current");
+        assert!(
+            v.composer_scroll_offset_y_for_test() < -1.0,
+            "…so the composer scrolled its own viewport to it (offset {} \
+             should be negative)",
+            v.composer_scroll_offset_y_for_test()
+        );
+    });
+}

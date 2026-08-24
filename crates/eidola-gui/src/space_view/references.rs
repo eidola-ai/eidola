@@ -1058,7 +1058,8 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         if dest.focus.contains_focused(window, cx) {
-            window.focus(&self.keyboard_home(), cx);
+            let back = self.keyboard_home(cx);
+            window.focus(&back, cx);
         }
     }
 

@@ -3566,13 +3566,23 @@ impl SpaceView {
     /// paused cascade), each a card that has to be dismissed and ordered against
     /// the others, while a stale read is a standing property of the page with
     /// nothing to acknowledge — it ends when the read succeeds.
+    ///
+    /// **It hangs off the document's top reserve, not the title band's share of
+    /// it.** Every other surface that covers the document's top reads
+    /// [`Self::doc_reserve`], which is the one accessor that knows what chrome
+    /// is standing — and this strip is painted *after* the find bar, so a
+    /// constant here put its centred pill over the query field and won the
+    /// hit-test for it: part of the find controls obscured, and the field
+    /// unclickable, in a window whose reader had just asked to search. Reading
+    /// the same accessor is what makes the two surfaces unable to overlap,
+    /// whatever chrome the reserve grows next.
     fn render_transcript_refresh_failure(&self, cx: &Context<Self>) -> Option<AnyElement> {
         self.space.read(cx).transcript_refresh_failure()?;
         let theme = cx.theme();
         Some(
             div()
                 .absolute()
-                .top(TITLE_BAR_RESERVE)
+                .top(px(self.doc_reserve()))
                 .left_0()
                 .right_0()
                 .flex()
@@ -3819,7 +3829,8 @@ impl SpaceView {
     /// so a reader typing beside a notice keeps their caret.
     fn hand_back_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
         if held {
-            window.focus(&self.keyboard_home(), cx);
+            let back = self.keyboard_home(cx);
+            window.focus(&back, cx);
         }
     }
 

@@ -2285,7 +2285,12 @@ const CARET_SCROLL_MARGIN: f32 = 8.0;
 /// caret is already comfortably visible or when `scroll_max == 0` (a fit-height
 /// composer can't scroll — the phantom-scroll invariant). Pure so the geometry
 /// is unit-testable without a real render.
-fn caret_scroll_offset(
+///
+/// Shared with the find bar's composer reveal ([`SpaceView::scroll_composer_to`]):
+/// bringing a *match* into the floating bar's viewport is the same geometry with
+/// a different span and a different margin, and one rule is what keeps the two
+/// motions from disagreeing about where the fold is.
+pub(crate) fn caret_scroll_offset(
     caret_top: f32,
     caret_bot: f32,
     viewport_h: f32,

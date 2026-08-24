@@ -111,6 +111,23 @@ enum Mark<'a> {
     Skip,
 }
 
+/// The barrier a table's grid chrome projects as — the block gap's newline,
+/// reached by the other door.
+///
+/// **Not every hidden range is zero-width formatting.** A read-only table hides
+/// the pipes and padding between cells, so deleting them wholesale would
+/// concatenate the visible cell texts and let `| left | right |` match
+/// `leftright` — a phrase occupying two cells the reader plainly sees apart.
+/// The chrome is *structural*, the way a paragraph gap is, so it projects as
+/// the same thing: one newline, which a query typed into a one-line field can
+/// never contain.
+///
+/// It is a **substitution**, not a fabricated run: the newline stands for the
+/// chrome's own source bytes, so the projected text still maps back to a range
+/// of the post — the one rule [`ProjectionBuilder`] exists to keep. (Nothing
+/// can ever match *into* it, so the atom-coverage semantics never come up.)
+const TABLE_CELL_BARRIER: &str = "\n";
+
 fn append_block(
     builder: &mut ProjectionBuilder<'_>,
     content: &str,
@@ -124,9 +141,24 @@ fn append_block(
             marks.push((r, Mark::Substitute(sub.display.as_str())));
         }
     }
+    // **Which hidden ranges are a barrier rather than a deletion**, decided
+    // by where they fall rather than by re-deriving the render's own chrome
+    // arithmetic: a table's cell content ranges come out of the same
+    // `geometry` the render laid the grid from, so a hidden range *inside* a
+    // cell is inline markup (a link's brackets, an emphasis run) and one
+    // outside every cell is the grid itself — the leading `| `, each ` | `,
+    // the trailing ` |`, the whole delimiter row. Non-table blocks have no
+    // cells and take the ordinary path unchanged.
+    let cells = table_cells(block);
     for hidden in &block.hidden_ranges {
         let r = clamp(hidden, content.len());
-        if r.start < r.end {
+        if r.start >= r.end {
+            continue;
+        }
+        let inline = cells.iter().any(|c| c.start <= r.start && r.end <= c.end);
+        if !cells.is_empty() && !inline {
+            marks.push((r, Mark::Substitute(TABLE_CELL_BARRIER)));
+        } else {
             marks.push((r, Mark::Skip));
         }
     }
@@ -189,6 +221,22 @@ fn append_block(
 
 fn clamp(range: &Range<usize>, len: usize) -> Range<usize> {
     range.start.min(len)..range.end.min(len)
+}
+
+/// The content ranges of every cell a table block carries, or an empty vec for
+/// any other block. The delimiter row has no cells to name — the render hides
+/// its whole line, which is then outside every cell and so a barrier like the
+/// rest of the grid.
+fn table_cells(block: &gpui_markdown_editor::RenderBlock) -> Vec<Range<usize>> {
+    let gpui_markdown_editor::BlockKind::Table { geometry, .. } = &block.kind else {
+        return Vec::new();
+    };
+    geometry
+        .rows
+        .iter()
+        .filter(|row| row.kind != gpui_markdown_editor::table::RowKind::Delimiter)
+        .flat_map(|row| row.cells.iter().cloned())
+        .collect()
 }
 
 /// One match: where it is, and the identity that lets the current-match anchor
@@ -290,6 +338,19 @@ pub(crate) struct FindSession {
     pub(crate) projections: HashMap<SharedString, (SharedString, Projection)>,
     /// A reveal waiting for its post to render for real.
     pub(crate) pending_reveal: Option<PendingReveal>,
+    /// **A reveal a new query is owed, once the search has said what the first
+    /// match is.**
+    ///
+    /// A query clears the anchor — a new search re-anchors from the reader's
+    /// own place rather than stepping from a match that belonged to a
+    /// different one — and only [`SpaceView::sync_find`] can put a new one
+    /// back, because the match list is a function of the frame's selected
+    /// path. So the moment the query changes there is nothing to reveal *yet*,
+    /// and revealing there could only ever find no current match: the reader
+    /// was told "1 of N" while match 1 sat off-screen until they stepped. The
+    /// intent is recorded instead, and discharged where the anchor is
+    /// established.
+    pub(crate) reveal_when_anchored: bool,
     /// The bar's own focus handle — the destination when ⌘F re-focuses an open
     /// bar, and the subtree containment is asked of when the bar closes.
     pub(crate) focus: gpui::FocusHandle,
@@ -301,9 +362,6 @@ pub(crate) struct FindSession {
     /// a freshly formatted message each render so the field is re-seeded
     /// exactly when the wording moves (the inspector title's shape).
     pub(crate) placeholder: SharedString,
-    /// Where the keyboard was when the bar opened, so closing it can put the
-    /// reader back rather than dropping focus on the floor.
-    pub(crate) returned_focus: Option<gpui::FocusHandle>,
 }
 
 impl FindSession {
@@ -461,9 +519,6 @@ impl SpaceView {
                 _ => {}
             },
         );
-        // Where the keyboard was, so closing puts the reader back rather than
-        // dropping focus on a handle nobody paints.
-        let returned = self.keyboard_home();
         self.find = Some(FindSession {
             input: input.clone(),
             _sub: sub,
@@ -473,9 +528,9 @@ impl SpaceView {
             anchor: None,
             projections: HashMap::new(),
             pending_reveal: None,
+            reveal_when_anchored: false,
             focus: cx.focus_handle(),
             placeholder,
-            returned_focus: Some(returned),
         });
         // The document grew a reserve at its top; move the page by the same
         // amount so the words under the reader's eye stay where they were.
@@ -496,11 +551,16 @@ impl SpaceView {
         // composing beside it never lent it (the handback rule every form in
         // this window owes).
         let held = session.focus.contains_focused(window, cx);
-        let back = session.returned_focus.clone();
         drop(session);
         self.set_page_scroll_y(self.page_scroll.offset().y.as_f32() + FIND_BAR_H);
         if held {
-            let back = back.unwrap_or_else(|| self.keyboard_home());
+            // Asked **now**, not recorded when the bar opened: a handle taken
+            // at open is a snapshot of a surface that may have been retired
+            // since, where `keyboard_home` names whatever is live at the
+            // moment of the question — including the composing session, which
+            // is the one destination that leaves a reader able to go on
+            // writing (see [`SpaceView::keyboard_home`]).
+            let back = self.keyboard_home(cx);
             window.focus(&back, cx);
         }
         // The match layers are cleared on the next `sync_references`, which now
@@ -518,7 +578,7 @@ impl SpaceView {
     }
 
     /// Apply a committed query. Never called from an observer or a render.
-    fn set_find_query(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_find_query(&mut self, text: String, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.find.as_mut() else {
             return;
         };
@@ -531,7 +591,11 @@ impl SpaceView {
         // stepping from the old match, which belonged to a different search.
         session.anchor = None;
         session.pending_reveal = None;
-        self.reveal_find_anchor(window, cx);
+        // The first match of the new search is owed a reveal, but nothing here
+        // knows which match that is — `sync_find` rebuilds the list against the
+        // frame's selected path and re-anchors. Record the debt; it is
+        // discharged there (see `reveal_when_anchored`).
+        session.reveal_when_anchored = true;
         cx.notify();
     }
 
@@ -616,7 +680,15 @@ impl SpaceView {
             }
         }
         session.reanchor(previous);
+        // **The new query's own reveal, discharged where the anchor exists.**
+        // The match list is final for this frame by now, so an armed debt is
+        // either paid or has nothing to pay: a query matching nothing leaves no
+        // anchor, and the readout says so instead.
+        let owed = std::mem::take(&mut session.reveal_when_anchored) && session.current().is_some();
         self.find = Some(session);
+        if owed {
+            self.reveal_current_match(tree, page_width, window, cx);
+        }
         self.correct_find_reveal(tree, page_width, window, cx);
     }
 
@@ -643,13 +715,14 @@ impl SpaceView {
                             r.snippet.clone()?,
                         ))
                     }));
+                    let (content, frozen) = self.post_scope_text(&node.id, post, cx);
                     seen.push(node.id.clone());
                     scope.push(ScopeNode {
                         node: node.id.clone(),
                         item_id: post.item_id.clone(),
-                        content: post.content.clone(),
+                        content,
                         embeds,
-                        frozen: false,
+                        frozen,
                     });
                 }
                 NodeSrc::Draft => {
@@ -671,6 +744,46 @@ impl SpaceView {
             scope.push(entry);
         }
         scope
+    }
+
+    /// The text to search one post's node, and whether it is frozen.
+    ///
+    /// **A post being edited is searched as the reader has it, not as the
+    /// database has it.** An inline edit session's body editor deliberately
+    /// keeps its unsaved buffer — `sync_bodies` skips the editing node, because
+    /// that divergence *is* the edit — while `PostData::content` stays the
+    /// generation the commit will replace. Searching the persisted text there
+    /// reports source ranges of a string nobody is looking at, and the
+    /// highlight layer paints them onto the modified buffer: insert or delete
+    /// anything ahead of a match and the count describes old text while the
+    /// wash lands on unrelated bytes.
+    ///
+    /// The editor is the same kind of live buffer a draft is, so it takes the
+    /// same composition guard: a post mid-IME-composition is not re-projected,
+    /// and the count keeps reporting the text the reader has committed (see
+    /// [`ScopeNode::frozen`]).
+    fn post_scope_text(
+        &self,
+        node: &SharedString,
+        post: &super::model::PostData,
+        cx: &gpui::App,
+    ) -> (SharedString, bool) {
+        let editing = self
+            .editing
+            .as_ref()
+            .is_some_and(|e| &e.node_id == node)
+            .then(|| self.bodies.get(node))
+            .flatten();
+        match editing {
+            Some(editor) => {
+                let editor = editor.read(cx);
+                (
+                    SharedString::from(editor.value().to_string()),
+                    editor.is_composing(),
+                )
+            }
+            None => (post.content.clone(), false),
+        }
     }
 
     fn draft_scope_node(&self, id: &SharedString, cx: &gpui::App) -> Option<ScopeNode> {
@@ -721,31 +834,58 @@ impl SpaceView {
             .collect()
     }
 
-    /// Phase 1 of the reveal: glide to where the current match is *estimated*
-    /// to be, and record the correction the second phase owes.
+    /// Phase 1 of the reveal, from a caller with no tree in hand (the step
+    /// verbs). Builds this frame's effective tree and delegates.
+    fn reveal_find_anchor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        self.reveal_current_match(&tree, page_width, window, cx);
+    }
+
+    /// Phase 1 of the reveal: take the reader to where the current match is
+    /// *estimated* to be, and record the correction the second phase owes.
     ///
     /// Estimated because only posts intersecting the viewport render a real
     /// editor; everything else is a sized placeholder with no shaped lines and
-    /// therefore no per-offset geometry. The branch never changes — every match
-    /// is already on the visible path — so this is a plain page scroll.
-    fn reveal_find_anchor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// therefore no per-offset geometry.
+    ///
+    /// **Which surface scrolls is the match's own question**, not a constant:
+    /// the branch never changes — that is what makes ⌘F safe in a tree — so a
+    /// match on the selected path is a plain page scroll, while a match in the
+    /// **off-branch active composer** is on no page the reader is looking at
+    /// and only the composer's own viewport can bring it into view. See
+    /// [`MatchReveal`].
+    fn reveal_current_match(
+        &mut self,
+        tree: &[TreeNode],
+        page_width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(m) = self.find.as_ref().and_then(|s| s.current().cloned()) else {
             return;
         };
-        let viewport = self.page_size(window);
-        let (page_width, window_h) = (viewport.width, viewport.height);
-        let turns = self.stream_overlays(cx);
-        let tree = self.effective_tree(page_width, &turns);
+        let window_h = self.page_size(window).height;
         let rem = window.rem_size();
-        let Some((top, bottom)) = self.match_doc_span(&tree, &m, page_width, window_h, rem, cx)
-        else {
-            return;
-        };
-        let y = self.find_reveal_offset(top, bottom, window_h);
-        // **After** the glide, which itself counts as the reader being taken
+        match self.match_reveal(tree, &m, page_width, window_h, rem, cx) {
+            Some(MatchReveal::Page { top, bottom }) => {
+                let y = self.find_reveal_offset(top, bottom, window_h);
+                self.glide_page_to(y, window, cx);
+            }
+            Some(MatchReveal::Composer {
+                top,
+                bottom,
+                natural,
+            }) => {
+                self.scroll_composer_to(top, bottom, natural, window_h);
+            }
+            // Nothing measured yet — the correction below is what lands it.
+            None => {}
+        }
+        // **After** the motion, which itself counts as the reader being taken
         // somewhere and so clears any reveal already pending
         // (`demote_tail_pin_for_reader`).
-        self.glide_page_to(y, window, cx);
         if let Some(session) = self.find.as_mut() {
             session.pending_reveal = Some(PendingReveal {
                 node: m.node.clone(),
@@ -770,14 +910,7 @@ impl SpaceView {
         };
         // Nothing to correct until the editor has painted.
         let answered = self
-            .bodies
-            .get(&pending.node)
-            .or_else(|| {
-                self.drafts
-                    .iter()
-                    .find(|d| d.id == pending.node)
-                    .map(|d| &d.editor)
-            })
+            .node_editor(&pending.node)
             .and_then(|e| e.read(cx).content_y_for_offset(pending.offset))
             .is_some();
         if !answered {
@@ -788,22 +921,87 @@ impl SpaceView {
         };
         let window_h = self.page_size(window).height;
         let rem = window.rem_size();
-        let Some((top, bottom)) = self.match_doc_span(tree, &m, page_width, window_h, rem, cx)
-        else {
+        let Some(reveal) = self.match_reveal(tree, &m, page_width, window_h, rem, cx) else {
             return;
         };
-        // A glide already in flight owns the page; correcting under it would be
-        // overwritten on its next frame, so the correction waits for it — and
-        // the reveal stays pending, or the frame after the glide would have
-        // nothing left to correct.
-        if self.page_glide.get().is_some() {
-            return;
+        match reveal {
+            MatchReveal::Page { top, bottom } => {
+                // A glide already in flight owns the page; correcting under it
+                // would be overwritten on its next frame, so the correction
+                // waits for it — and the reveal stays pending, or the frame
+                // after the glide would have nothing left to correct.
+                if self.page_glide.get().is_some() {
+                    return;
+                }
+                if let Some(session) = self.find.as_mut() {
+                    session.pending_reveal = None;
+                }
+                let y = self.find_reveal_offset(top, bottom, window_h);
+                self.set_page_scroll_y(y);
+            }
+            // A glide owns `page_scroll`, never the composer's own handle, so
+            // this correction has nothing to wait for.
+            MatchReveal::Composer {
+                top,
+                bottom,
+                natural,
+            } => {
+                if let Some(session) = self.find.as_mut() {
+                    session.pending_reveal = None;
+                }
+                self.scroll_composer_to(top, bottom, natural, window_h);
+            }
         }
-        if let Some(session) = self.find.as_mut() {
-            session.pending_reveal = None;
+    }
+
+    /// Scroll the **floating composer's own viewport** so an editor-content
+    /// span is in view, with the same minimal-motion rule and margin the page
+    /// reveal takes.
+    ///
+    /// The viewport is the editor's share of the floating bar: the bar less its
+    /// top chrome and, in the compact scheme, the bottom action bar. The
+    /// docked-byline inset is not a term — a composer whose match this reveals
+    /// is off-branch, and an off-branch draft always floats
+    /// (`layout::floating_pad`), where the dock reveal is zero.
+    fn scroll_composer_to(&mut self, top: f32, bottom: f32, natural: f32, window_h: Pixels) {
+        let body_h = (self.composer_float_bar_h(window_h)
+            - Self::composer_chrome()
+            - self.composer_gutters.get().bottom)
+            .max(0.0);
+        let scroll_max = (natural - body_h).max(0.0);
+        let cur = self.composer_scroll.offset().y.as_f32();
+        let next = super::composer::caret_scroll_offset(
+            top,
+            bottom,
+            body_h,
+            cur,
+            scroll_max,
+            FIND_REVEAL_MARGIN,
+        );
+        if (next - cur).abs() > 0.5 {
+            let off = self.composer_scroll.offset();
+            self.composer_scroll
+                .set_offset(gpui::point(off.x, px(next)));
+            // Keep the wheel handler's frozen-offset bookkeeping in step, so a
+            // following `ScrollOwner::Body` wheel does not snap the composer
+            // back to where it stood before the reveal (`caret_into_view`'s
+            // own rule, for the same reason).
+            self.composer_prev_off_y = next;
         }
-        let y = self.find_reveal_offset(top, bottom, window_h);
-        self.set_page_scroll_y(y);
+    }
+
+    /// The editor whose buffer a node's source offsets address — a post's body
+    /// or a draft's composer.
+    fn node_editor(
+        &self,
+        node: &SharedString,
+    ) -> Option<&gpui::Entity<gpui_markdown_editor::MarkdownEditorState>> {
+        self.bodies.get(node).or_else(|| {
+            self.drafts
+                .iter()
+                .find(|d| &d.id == node)
+                .map(|d| &d.editor)
+        })
     }
 
     /// The page offset that brings a document span into view with the same
@@ -828,17 +1026,28 @@ impl SpaceView {
         )
     }
 
-    /// A match's vertical span in document space.
+    /// Where a match is, and therefore **which surface has to move to show
+    /// it**.
     ///
-    /// Exact once the post's editor has painted (`content_y_for_offset`), an
-    /// honest estimate before that (the match's byte fraction of the node's
-    /// height). The editor's own top within the slot is `POST_PAD_Y`, plus the
-    /// stacked metadata row in the compact scheme — the same two terms the
-    /// docked composer's caret reveal folds in. **Accepted imprecision:** a
-    /// post whose reasoning disclosure is open carries that disclosure above
-    /// its body, so the exact arm lands a disclosure's height high; the reveal
-    /// margin absorbs it and the highlight is what the reader is looking for.
-    fn match_doc_span(
+    /// The page answers for everything on the selected path, which is every
+    /// match but one. The exception is the search scope's own deliberate
+    /// exception: the **active draft is in scope regardless of branch**,
+    /// because its composer floats over whatever is showing — and a node that
+    /// is not on the selected path has no document top, so the page reveal
+    /// could only ever decline. Stepping onto such a match then named it
+    /// current in the readout while its highlight stayed wherever the
+    /// composer's internal scroll had left it, out of the reader's sight in a
+    /// long draft.
+    ///
+    /// **Scrolling the composer, deliberately, rather than selecting its
+    /// branch.** Find never moves the reader's branch — that is the property
+    /// that makes ⌘F safe in a tree, and the one the whole "visible branch"
+    /// scope is built on. Selecting the draft's branch to reveal a match would
+    /// spend it on the one node whose surface can already do the job: the
+    /// floating composer has its own viewport and its own scroll handle, which
+    /// is exactly what `caret_into_view` scrolls when an edit puts the caret
+    /// below the fold.
+    fn match_reveal(
         &self,
         tree: &[TreeNode],
         m: &Match,
@@ -846,35 +1055,73 @@ impl SpaceView {
         window_h: Pixels,
         rem_size: Pixels,
         cx: &gpui::App,
-    ) -> Option<(f32, f32)> {
-        let top = self.selected_path_doc_top(tree, &m.node, page_width, window_h)?;
+    ) -> Option<MatchReveal> {
+        let editor = self.node_editor(&m.node);
+        let Some(top) = self.selected_path_doc_top(tree, &m.node, page_width, window_h) else {
+            // Off the selected path: the only node that can be there is the
+            // active floating draft (the scope admits no other), and its own
+            // viewport is what shows it.
+            if self.active_draft.as_ref() != Some(&m.node) {
+                return None;
+            }
+            let editor = editor?.read(cx);
+            let (t, b) = editor.content_y_for_offset(m.source.start)?;
+            return Some(MatchReveal::Composer {
+                top: t.as_f32(),
+                bottom: b.as_f32(),
+                natural: editor.content_height().as_f32(),
+            });
+        };
         let node = super::model::node_ref(tree, &m.node)?;
         let height = self.node_height(node, page_width, window_h);
         let pad = POST_PAD_Y.as_f32();
-        let editor = self.bodies.get(&m.node).or_else(|| {
-            self.drafts
-                .iter()
-                .find(|d| d.id == m.node)
-                .map(|d| &d.editor)
-        });
         let stacked = page_layout(page_width).gutters == GutterPlacement::Stacked;
         let metadata = if stacked {
             compact_gutter_occupancy(rem_size)
         } else {
             0.0
         };
+        // Exact once the post's editor has painted (`content_y_for_offset`), an
+        // honest estimate before that (the match's byte fraction of the node's
+        // height). The editor's own top within the slot is `POST_PAD_Y`, plus
+        // the stacked metadata row in the compact scheme — the same two terms
+        // the docked composer's caret reveal folds in. **Accepted
+        // imprecision:** a post whose reasoning disclosure is open carries that
+        // disclosure above its body, so the exact arm lands a disclosure's
+        // height high; the reveal margin absorbs it and the highlight is what
+        // the reader is looking for.
         match editor.and_then(|e| e.read(cx).content_y_for_offset(m.source.start)) {
             Some((t, b)) => {
                 let base = top + pad + metadata;
-                Some((base + t.as_f32(), base + b.as_f32()))
+                Some(MatchReveal::Page {
+                    top: base + t.as_f32(),
+                    bottom: base + b.as_f32(),
+                })
             }
             None => {
                 let body = (height - 2.0 * pad).max(1.0);
                 let y = top + pad + m.fraction * body;
-                Some((y, y + FIND_ESTIMATED_LINE_H))
+                Some(MatchReveal::Page {
+                    top: y,
+                    bottom: y + FIND_ESTIMATED_LINE_H,
+                })
             }
         }
     }
+}
+
+/// Which surface a reveal moves, and the span it has to bring into view.
+///
+/// Two, because the search scope has two kinds of node in it: everything on the
+/// selected path, which the page scrolls to, and the off-branch active draft,
+/// which floats over the page and scrolls itself.
+enum MatchReveal {
+    /// A span in **document** space, revealed by the page.
+    Page { top: f32, bottom: f32 },
+    /// A span in the composer editor's own **content** space, revealed by the
+    /// floating bar's internal scroll. `natural` is the editor's content
+    /// height, which is what bounds that scroll.
+    Composer { top: f32, bottom: f32, natural: f32 },
 }
 
 impl SpaceView {
@@ -1177,6 +1424,32 @@ mod tests {
     fn a_table_cell_is_searchable() {
         let source = "| Configuration | Performance |\n| --- | --- |\n| 1x B200 | Moderate |\n";
         assert_eq!(find(source, "performance"), vec!["Performance".to_string()],);
+    }
+
+    #[test]
+    fn a_query_never_matches_across_a_table_cell_boundary() {
+        // The grid's chrome is hidden but it is not *inline* markup: the reader
+        // sees two cells, so `leftright` is a phrase nobody can point at. Only
+        // the delimiters that really are inline (emphasis, a link's brackets)
+        // may close up.
+        let source = "| left | right |\n| --- | --- |\n| one | two |\n";
+        assert!(find(source, "leftright").is_empty(), "across a column");
+        assert!(find(source, "rightone").is_empty(), "across a row");
+        assert!(find(source, "onetwo").is_empty(), "and in the body too");
+        // The cells themselves are still ordinary searchable text.
+        assert_eq!(find(source, "right"), vec!["right".to_string()]);
+        assert_eq!(find(source, "two"), vec!["two".to_string()]);
+    }
+
+    #[test]
+    fn inline_markup_inside_a_cell_still_closes_up() {
+        // The other half of the same rule: a barrier is *structural* chrome,
+        // and emphasis inside a cell is not — a phrase crossing it matches
+        // exactly as it does in a paragraph.
+        let source = "| a **bold** claim | second |\n| --- | --- |\n| x | y |\n";
+        let hits = find(source, "bold claim");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].ends_with("claim"));
     }
 
     #[test]
