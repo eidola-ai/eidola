@@ -988,6 +988,7 @@ fn stale_row(id: &str) -> eidola_app_core::SpaceInfo {
         last_activity_at: ts,
         message_count: 2,
         archived_at: None,
+        parent: None,
     }
 }
 

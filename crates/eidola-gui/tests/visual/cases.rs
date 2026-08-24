@@ -104,6 +104,7 @@ fn register_space(s: &mut Snapshots) {
                     last_activity_at: 0,
                     message_count: 4,
                     archived_at: None,
+                    parent: None,
                 }];
                 s.space_settings = Some((
                     "demo".into(),
@@ -757,6 +758,7 @@ fn library_space(id: &str, title: Option<&str>, snippet: Option<&str>, days_ago:
         last_activity_at: ts,
         message_count: 4,
         archived_at: None,
+        parent: None,
     }
 }
 

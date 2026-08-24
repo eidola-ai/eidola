@@ -401,6 +401,7 @@ fn stub_space(id: &str, title: Option<&str>, snippet: Option<&str>, ts: i64) -> 
         last_activity_at: ts,
         message_count: 2,
         archived_at: None,
+        parent: None,
     }
 }
 
@@ -667,6 +668,56 @@ fn library_pencil_click_does_not_also_open_row(cx: &mut TestAppContext) {
             v.open_space_requests_for_test(),
             0,
             "clicking the pencil must NOT also open the row (the propagation/reshape race)"
+        );
+    });
+}
+
+/// The parent badge opens the conversation a delegated one was opened from —
+/// and, being a control inside a row that is itself a control, must not open
+/// its own row on the way (the rename pencil's propagation race, in the one
+/// other place a row now carries a click of its own).
+#[gpui::test]
+fn library_parent_badge_opens_the_parent_and_not_its_own_row(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![SpaceInfo {
+            parent: Some(eidola_app_core::SpaceParent {
+                space_id: "s0".into(),
+                title: Some("Tides and the moon".into()),
+            }),
+            ..stub_space("s1", Some("Check Friday's tide tables"), None, 1_000)
+        }];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+    cx.run_until_parked();
+
+    // The badge is a link only on the revealed row — the same gate the row's
+    // other verbs take, and what keeps the listing one tab stop.
+    view.update(cx, |v, _| v.set_hovered_for_test(Some(0)));
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(520.), px(620.)));
+    vcx.run_until_parked();
+    let bounds = vcx
+        .debug_bounds("parent-badge-0")
+        .expect("the revealed parent badge must be painted with its debug selector");
+    let center: Point<gpui::Pixels> = bounds.center();
+
+    vcx.simulate_click(center, Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.open_parent_requests_for_test(),
+            1,
+            "the badge opens the conversation this one was delegated from"
+        );
+        assert_eq!(
+            v.open_space_requests_for_test(),
+            0,
+            "and never the row it sits in"
         );
     });
 }

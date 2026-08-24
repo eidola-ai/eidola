@@ -353,6 +353,41 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_not_joined",
+                description: "Space view: a delegated conversation the reader has only been watching — the refusal that names posting as the way in (join-on-post)",
+                default_size: size(px(900.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    view.update(cx, |v, cx| {
+                        v.space().update(cx, |s, cx| {
+                            s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx);
+                            // What a reader who has only been watching meets
+                            // when they reach for a verb that acts on somebody
+                            // else's work. Posting is not in that set — it is
+                            // what joins them — so the copy names it.
+                            s.apply_turn_failure_for_test(
+                                "agent-b",
+                                "a2",
+                                eidola_app_core::error::AppError::NotJoined {
+                                    space_id: "demo".into(),
+                                },
+                                cx,
+                            );
+                        });
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_docked_composer",
                 description: "Space view: a populated conversation settled at the document floor with its active composer fully docked",
                 default_size: size(px(900.), px(720.)),
@@ -1332,6 +1367,7 @@ mod driver {
                 last_activity_at: 0,
                 message_count: 4,
                 archived_at: None,
+                parent: None,
             }];
             s.space_settings = Some((
                 "demo".into(),
@@ -2224,10 +2260,34 @@ mod driver {
                 last_activity_at: ts,
                 message_count: 4,
                 archived_at: None,
+                parent: None,
+            }
+        }
+        /// A conversation one of the reader's agents opened from another one —
+        /// what the parent badge is for.
+        fn delegated(
+            id: &str,
+            title: &str,
+            days_ago: i64,
+            parent: (&str, Option<&str>),
+        ) -> SpaceInfo {
+            SpaceInfo {
+                parent: Some(eidola_app_core::SpaceParent {
+                    space_id: parent.0.into(),
+                    title: parent.1.map(String::from),
+                }),
+                ..space(id, Some(title), None, days_ago)
             }
         }
         vec![
             space("s1", Some("Tides and the moon"), None, 0),
+            delegated(
+                "s1a",
+                "Check Friday's tide tables",
+                0,
+                ("s1", Some("Tides and the moon")),
+            ),
+            delegated("s1b", "Second opinion on the moon phase", 0, ("s1", None)),
             space(
                 "s2",
                 Some("Borrow checker, closures, and lifetimes"),

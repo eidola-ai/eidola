@@ -1164,6 +1164,7 @@ mod tests {
             last_activity_at: at,
             message_count: 0,
             archived_at: None,
+            parent: None,
         }
     }
 

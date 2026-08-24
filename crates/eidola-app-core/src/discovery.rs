@@ -217,6 +217,10 @@ mod tests {
             archived_at: None,
             last_activity_at: 1_000_000 - age_ms,
             message_count: posts,
+            // `db::participant_spaces` never fills this in, and this rendering
+            // never reads it: a listing bounded by membership must not name a
+            // conversation the asking agent may not be in.
+            parent: None,
         }
     }
 

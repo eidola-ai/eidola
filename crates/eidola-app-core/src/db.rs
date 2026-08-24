@@ -3988,6 +3988,12 @@ pub async fn participant_spaces(
             archived_at: row.get::<Option<i64>>(3).map_err(AppError::db)?,
             last_activity_at: row.get::<i64>(4).map_err(AppError::db)?,
             message_count: row.get::<i64>(5).map_err(AppError::db)?,
+            // **Deliberately never a parent here.** This read is model-facing
+            // (`list_my_spaces`), and membership is its whole boundary: naming
+            // the conversation a delegated room was opened from would report a
+            // space the asking agent may well not be in, from a listing that
+            // exists to report only the ones it is.
+            parent: None,
         });
     }
     Ok(out)
@@ -5295,12 +5301,31 @@ pub(crate) struct PostPlan<'a> {
     /// Quoted references at ordinals `1..=N` in supplied order — already
     /// validated by the caller, which is where a refusal belongs.
     pub references: &'a [crate::ReferenceSpec],
+    /// Join the author into this space as part of writing the post.
+    ///
+    /// Set for a **delegated room**, where the shared human has no membership
+    /// by construction: the first thing they say there joins them. The join
+    /// rides the post's own transaction because the roster the models are shown
+    /// has to be true of the transcript they read — a post by somebody the
+    /// roster omits is a lie about the room, and any gap between the two
+    /// writes is a window in which a turn can be planned over exactly that.
+    pub join_author: bool,
     pub created_at: i64,
 }
 
+/// What [`post_tx`] committed, beyond the post itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PostOutcome {
+    /// The space took a derived title from this post.
+    pub auto_titled: bool,
+    /// The author's membership was written (a fresh join or a revived one) —
+    /// what the caller announces on.
+    pub joined: bool,
+}
+
 /// Write one post — **the action, its text, its reply edge, its quoted
-/// references and any title it earns, in one `BEGIN IMMEDIATE` transaction.**
-/// Answers whether the space took a derived title.
+/// references, any title it earns and, where the plan asks for it, the author's
+/// own membership, in one `BEGIN IMMEDIATE` transaction.**
 ///
 /// **A post is not its action row.** Written as separate autocommitted
 /// statements, the row lands first and its text, its place in the thread and
@@ -5319,12 +5344,15 @@ pub(crate) struct PostPlan<'a> {
 /// adjacent, which is what makes them transaction-able at all — and the caller
 /// validates before it opens this, so a refusal still writes nothing and now
 /// cannot half-write either.
-pub(crate) async fn post_tx(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, AppError> {
+pub(crate) async fn post_tx(
+    conn: &Connection,
+    plan: &PostPlan<'_>,
+) -> Result<PostOutcome, AppError> {
     begin_write(conn).await?;
     match post_tx_body(conn, plan).await {
-        Ok(auto_titled) => {
+        Ok(outcome) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
-            Ok(auto_titled)
+            Ok(outcome)
         }
         Err(e) => {
             // Best-effort rollback; propagate the original error regardless.
@@ -5334,7 +5362,24 @@ pub(crate) async fn post_tx(conn: &Connection, plan: &PostPlan<'_>) -> Result<bo
     }
 }
 
-async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, AppError> {
+async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<PostOutcome, AppError> {
+    // The membership lands **before** the words, so no ordering inside the
+    // transaction can show a post whose author the roster does not carry.
+    // Insert-or-revive on the space's primary key: a live membership is left
+    // exactly as it stands, so this is a no-op for every ordinary space and
+    // for the second thing a reader says in a delegated one.
+    let joined = if plan.join_author {
+        ensure_space_participant(
+            conn,
+            plan.space_id,
+            plan.participant_id,
+            crate::MembershipRole::Member.as_str(),
+            plan.created_at,
+        )
+        .await?
+    } else {
+        false
+    };
     insert_action(
         conn,
         &ActionEntry {
@@ -5383,7 +5428,10 @@ async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, Ap
         )
         .await?;
     }
-    Ok(auto_titled)
+    Ok(PostOutcome {
+        auto_titled,
+        joined,
+    })
 }
 
 /// Everything an edit writes, validated by the caller before this is opened.
@@ -6928,6 +6976,24 @@ pub struct SpaceListRow {
     pub archived_at: Option<i64>,
     pub last_activity_at: i64,
     pub message_count: i64,
+    /// The conversation this one was delegated from, when it was — `None` for
+    /// an ordinary conversation.
+    pub parent: Option<ParentSpace>,
+}
+
+/// The conversation a delegated room was opened from: enough to name it and to
+/// open it, and nothing else.
+///
+/// **One value, not two nullable columns.** "Which conversation" and "what it
+/// is called" travel together or not at all — a title with no id names
+/// somewhere a reader cannot go, and an id with no title is a link with no
+/// words — so the pair is the unit and its absence is the ordinary case. The
+/// title stays optional inside it because a conversation genuinely need not
+/// have one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParentSpace {
+    pub space_id: String,
+    pub title: Option<String>,
 }
 
 pub async fn list_spaces(
@@ -6944,11 +7010,20 @@ pub async fn list_spaces(
     } else {
         "WHERE s.notebook_participant_id IS NULL AND s.archived_at IS NULL "
     };
+    // The parent join is a self-join on the navigational `parent_space_id`, and
+    // it answers in the **same read** as the listing rather than in a per-row
+    // lookup behind it: a listing is virtualized, so a second read per row
+    // would put a query inside a scroll. A delegated room's parent always
+    // exists (the FK says so) and is deliberately **not** filtered on archival
+    // or on being a notebook — a room can be opened from either, and naming
+    // where a row came from is not a door into it.
     let sql = format!(
         "SELECT s.id, s.title, s.created_at, s.archived_at, \
                 COALESCE(MAX(a.created_at), s.created_at) AS last_activity_at, \
-                COUNT(a.id) AS message_count \
+                COUNT(a.id) AS message_count, \
+                s.parent_space_id, p.title \
          FROM space s \
+         LEFT JOIN space p ON p.id = s.parent_space_id \
          LEFT JOIN action a ON a.space_id = s.id \
               AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
               AND a.status IN ('complete', 'cancelled') \
@@ -6956,7 +7031,7 @@ pub async fn list_spaces(
                   SELECT 1 FROM action sup WHERE sup.supersedes_action_id = a.id \
               ) \
          {filter}\
-         GROUP BY s.id, s.title, s.created_at, s.archived_at \
+         GROUP BY s.id, s.title, s.created_at, s.archived_at, s.parent_space_id, p.title \
          ORDER BY last_activity_at DESC"
     );
     let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
@@ -6970,6 +7045,13 @@ pub async fn list_spaces(
             archived_at: row.get::<Option<i64>>(3).map_err(AppError::db)?,
             last_activity_at: row.get::<i64>(4).map_err(AppError::db)?,
             message_count: row.get::<i64>(5).map_err(AppError::db)?,
+            parent: row
+                .get::<Option<String>>(6)
+                .map_err(AppError::db)?
+                .map(|space_id| ParentSpace {
+                    space_id,
+                    title: row.get::<Option<String>>(7).ok().flatten(),
+                }),
         });
     }
     Ok(results)
@@ -9226,6 +9308,7 @@ mod tests {
                     range_end: None,
                     annotation: None,
                 }],
+                join_author: false,
                 created_at: 3_000,
             },
         )
@@ -9266,11 +9349,13 @@ mod tests {
                     auto_title: Some("Named by its first post"),
                     reply_to: Some(&first),
                     references: &[],
+                    join_author: false,
                     created_at: 4_000,
                 },
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .auto_titled,
             "the space took the title"
         );
         assert!(

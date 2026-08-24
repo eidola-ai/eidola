@@ -202,8 +202,8 @@ fn restartable() -> (
 }
 
 /// Ask a specific participant to respond — the door a human watching a
-/// delegated room still has, and the only way to post into one before the join
-/// affordance ships.
+/// delegated room still has, and the one that puts a post there without
+/// speaking as the reader (`post` would, and would join them to the room).
 fn ask(core: &AppCore, space_id: &str, participant: &str, target: &str) -> String {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     core.runtime()

@@ -37,11 +37,34 @@
 //! The writes all live in `db::spawn_subspace_tx`, deliberately: the stamp
 //! ledger that keeps the pristine-space disposal honest scans `db.rs`, so a
 //! `space` write anywhere else would escape it.
+//!
+//! # The tool
+//!
+//! [`DelegateTool`] is how a model reaches that door, and it is **turn-scoped**
+//! for the reason every reserved tool is: it is bound to this turn's responding
+//! participant (the room's owner), this space (the parent), and the post this
+//! turn is answering (the anchor the report attaches beneath). None of the
+//! three is expressible in the process registry. Its gate is
+//! `scope == 'global'` — the same structural gate `list_my_spaces` carries, and
+//! the same rule underneath: a space-owned participant cannot be referenced
+//! into another space at all, so it cannot own one either.
+//!
+//! **The tool resolves names; the door decides eligibility.** A requested
+//! sub-agent is named as it appears in the roster this turn was already shown,
+//! and resolves against exactly that roster ([`resolve_seats`]) — so the
+//! reachable set is "agents you are already in this conversation with", and
+//! guessing at an agent elsewhere in the library is unrepresentable rather than
+//! refused. Whether a resolved participant may actually be seated (a live,
+//! shared agent, with a model of its own) stays [`db::spawn_subspace_tx`]'s
+//! question, asked inside the transaction where it cannot go stale.
+
+use std::sync::Weak;
 
 use uuid::Uuid;
 
 use crate::db;
 use crate::error::AppError;
+use crate::tools::{Tool, ToolError, ToolFuture};
 use crate::{Change, Inner, derive_space_title, now_ms};
 
 /// How deep the `parent_space_id` chain may go. A space nobody spawned is at
@@ -394,5 +417,391 @@ impl Inner {
                 config: c.config,
             })
             .collect())
+    }
+}
+
+/// The tool name the protocol note promises the model. Reserved
+/// ([`crate::tools::RESERVED_TOOL_NAMES`]) — see the module docs for the three
+/// turn-only things it is bound to.
+pub const DELEGATE_TOOL_NAME: &str = "delegate";
+
+/// The note that joins the turn's system message when the tool attaches.
+/// Static, so it costs the prefix cache one flip — at promotion, the same
+/// moment the global-agent note flips — and nothing thereafter.
+///
+/// It says three things the schema cannot. **The brief is a contract**: no
+/// transcript travels, so a brief written for a reader who shares this
+/// conversation's context describes work nobody there can do. **The answer
+/// arrives as a post here**, not as a return value, so a model must not wait
+/// for one inside its turn. And **delegation is bounded** — the numbers are the
+/// guard constants above, pinned to them by `the_delegate_note_states_the_real_limits`
+/// so prose and enforcement cannot drift.
+pub const DELEGATE_NOTE: &str = "\
+When work belongs in a room of its own — a review, a second opinion, a search you do not want in \
+this thread — call `delegate` to open one. It holds you and the participants you name, and no \
+reader. Nothing from this conversation travels with it, so the brief you write is the whole \
+contract: write it for someone who has never seen this conversation, saying what the work is, \
+what it covers, and what you need back. You do not wait for it and you cannot read it while it \
+runs — when it finishes you are told here, in a post that quotes what it produced. Delegation is \
+bounded: at most 3 levels deep, 8 delegated conversations of your own open at once, and 8 \
+participants beside you in one room.";
+
+/// One participant of the parent conversation a delegation may name.
+///
+/// Carried as a value rather than re-read at call time: it comes from the
+/// turn's own participant snapshot, which is the single authority on what every
+/// current member is called for the whole turn — so the name a model reads in
+/// the roster is the name this resolves, and a rename landing mid-turn cannot
+/// make the two disagree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SeatCandidate {
+    pub participant_id: String,
+    /// The participant's **effective** label in the parent space — what the
+    /// roster called it.
+    pub label: String,
+}
+
+/// Resolve the names a model asked for against the roster it was shown.
+///
+/// Pure over its inputs — these decide what a model may reach, so they are
+/// unit-tested. An id matches exactly; otherwise the effective label matches
+/// case- and whitespace-insensitively. Failures are the message the model
+/// reads, and every one of them names what *is* available, because a listing
+/// of the current conversation's roster is something the model was already
+/// given.
+pub(crate) fn resolve_seats(
+    candidates: &[SeatCandidate],
+    requested: &[String],
+) -> Result<Vec<String>, String> {
+    let mut seats: Vec<String> = Vec::new();
+    for raw in requested {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let id = match candidates.iter().find(|c| c.participant_id == name) {
+            Some(c) => c.participant_id.clone(),
+            None => {
+                let matches: Vec<&SeatCandidate> = candidates
+                    .iter()
+                    .filter(|c| c.label.trim().eq_ignore_ascii_case(name))
+                    .collect();
+                match matches.as_slice() {
+                    [one] => one.participant_id.clone(),
+                    [] => return Err(unknown_seat_message(candidates, name)),
+                    _ => {
+                        return Err(format!(
+                            "more than one participant of this conversation is called \"{name}\" \
+                             — name the one you mean by its id"
+                        ));
+                    }
+                }
+            }
+        };
+        if !seats.contains(&id) {
+            seats.push(id);
+        }
+    }
+    Ok(seats)
+}
+
+fn unknown_seat_message(candidates: &[SeatCandidate], name: &str) -> String {
+    if candidates.is_empty() {
+        return format!(
+            "there is nobody else in this conversation to delegate to, so \"{name}\" names \
+             nobody — leave `participants` out to open a room of your own"
+        );
+    }
+    let available = candidates
+        .iter()
+        .map(|c| format!("\"{}\"", crate::one_line(&c.label)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "no participant of this conversation is called \"{name}\" — you can delegate to \
+         {available}, or leave `participants` out to open a room of your own"
+    )
+}
+
+/// `delegate` — open a sub-space and hand it a brief.
+///
+/// Bound to the turn: the responding participant owns the room, the turn's
+/// space is its parent, and the post this turn answers is the anchor its report
+/// will attach beneath (`space.parent_action_id`). `Weak` back to the core so a
+/// tool that somehow outlived its turn can never keep the database open.
+pub(crate) struct DelegateTool {
+    inner: Weak<Inner>,
+    owner_participant_id: String,
+    parent_space_id: String,
+    /// The post in the parent this delegation is opened from — this turn's own
+    /// target. `None` for a turn answering nothing, which the spawn door
+    /// refuses when the conversation offers no fallback either.
+    anchor_action_id: Option<String>,
+    candidates: Vec<SeatCandidate>,
+}
+
+impl DelegateTool {
+    pub(crate) fn new(
+        inner: Weak<Inner>,
+        owner_participant_id: String,
+        parent_space_id: String,
+        anchor_action_id: Option<String>,
+        candidates: Vec<SeatCandidate>,
+    ) -> Self {
+        Self {
+            inner,
+            owner_participant_id,
+            parent_space_id,
+            anchor_action_id,
+            candidates,
+        }
+    }
+}
+
+/// The receipt the model reads back. Pure, so it is unit-tested: it is what
+/// tells a model the work is under way somewhere it cannot see.
+pub(crate) fn delegation_receipt(spawned: &SpawnedSubspace, seated: &[String]) -> String {
+    let title = spawned.space.title.as_deref().unwrap_or("(untitled)");
+    let who = if seated.is_empty() {
+        "It holds you alone.".to_string()
+    } else {
+        format!(
+            "It holds you and {}.",
+            seated
+                .iter()
+                .map(|l| format!("\"{}\"", crate::one_line(l)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "Opened \"{title}\" ({}). {who} They have your brief and nothing else from here. You will \
+         be told in this conversation when it finishes; carry on without waiting for it.",
+        spawned.space.id
+    )
+}
+
+impl Tool for DelegateTool {
+    fn name(&self) -> &str {
+        DELEGATE_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        "Open a separate conversation to get a piece of work done, holding you and the \
+         participants you name. Nothing from this conversation goes with it, so the brief you \
+         write is all they will have. You are told here when it finishes."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        // `capabilities` is deliberately **not advertised**. It is accepted (see
+        // `call`) so a caller that names one meets the door's attenuation
+        // refusal rather than a silent drop, but nothing in production grants a
+        // capability yet, so advertising it would put an argument in every
+        // global agent's turn whose every value can only be refused.
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "brief": {
+                    "type": "string",
+                    "description": "The whole contract for the work. Nobody there has seen this \
+                                    conversation, so state what the work is, what it covers, and \
+                                    what you need back.",
+                },
+                "participants": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": format!(
+                        "Participants of this conversation to invite, named as the roster names \
+                         them. At most {MAX_SUBAGENTS_PER_SPAWN}. Leave it out to open a room of \
+                         your own to work in.",
+                    ),
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional short name for the new conversation. Its opening \
+                                    line names it when you give none.",
+                },
+            },
+            "required": ["brief"],
+        })
+    }
+
+    fn call<'a>(&'a self, arguments: serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let Some(inner) = self.inner.upgrade() else {
+                return Err(ToolError::new("delegation is unavailable in this turn"));
+            };
+            let brief = arguments
+                .get("brief")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let title = arguments
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let requested = string_list(&arguments, "participants");
+            let capabilities = string_list(&arguments, "capabilities");
+            let seats = resolve_seats(&self.candidates, &requested).map_err(ToolError::new)?;
+            // The labels are read before the spawn, from the same snapshot the
+            // resolution used, so the receipt names participants the way the
+            // roster did.
+            let seated: Vec<String> = seats
+                .iter()
+                .filter_map(|id| {
+                    self.candidates
+                        .iter()
+                        .find(|c| &c.participant_id == id)
+                        .map(|c| c.label.clone())
+                })
+                .collect();
+
+            // Every refusal is a **tool result**, never a turn failure: a guard
+            // the model can act on (narrow the request, finish a room it
+            // already has) is a model mistake it may correct, which is the
+            // loop's standing convention for an unknown name or a bad argument.
+            match inner
+                .spawn_subspace(
+                    &self.parent_space_id,
+                    &self.owner_participant_id,
+                    &brief,
+                    &seats,
+                    &capabilities,
+                    title.as_deref(),
+                    self.anchor_action_id.as_deref(),
+                )
+                .await
+            {
+                Ok(spawned) => Ok(delegation_receipt(&spawned, &seated)),
+                Err(AppError::SpawnRefused { refusal }) => Err(ToolError::new(refusal.to_string())),
+                Err(e) => Err(ToolError::new(format!(
+                    "the delegated conversation could not be opened: {e}"
+                ))),
+            }
+        })
+    }
+}
+
+/// Read an optional array-of-strings argument. A model that sends a bare
+/// string where a list belongs meant one entry, and saying so costs nothing.
+fn string_list(arguments: &serde_json::Value, key: &str) -> Vec<String> {
+    match arguments.get(key) {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect(),
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(id: &str, label: &str) -> SeatCandidate {
+        SeatCandidate {
+            participant_id: id.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_delegate_note_states_the_real_limits() {
+        // The note is the only place a model learns the shape of the guards, so
+        // a constant that moved without it would leave the model planning
+        // against a rule that no longer exists.
+        for phrase in [
+            format!("at most {MAX_SPAWN_DEPTH} levels deep"),
+            format!("{MAX_LIVE_SUBSPACES_PER_OWNER} delegated conversations"),
+            format!("{MAX_SUBAGENTS_PER_SPAWN} participants beside you"),
+        ] {
+            assert!(DELEGATE_NOTE.contains(&phrase), "note must say: {phrase}");
+        }
+    }
+
+    #[test]
+    fn a_seat_resolves_by_label_or_by_id_and_dedupes() {
+        let candidates = vec![candidate("p-ada", "Ada"), candidate("p-bo", "Bo")];
+        assert_eq!(
+            resolve_seats(&candidates, &["  ada ".into(), "p-bo".into(), "Ada".into()]).unwrap(),
+            vec!["p-ada".to_string(), "p-bo".to_string()]
+        );
+        assert_eq!(
+            resolve_seats(&candidates, &[]).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_name_the_roster_does_not_carry_is_refused_with_what_is_available() {
+        let candidates = vec![candidate("p-ada", "Ada")];
+        // The reachable set is this conversation's roster: an agent that exists
+        // elsewhere in the library is not merely refused, it is unnameable.
+        let err = resolve_seats(&candidates, &["Researcher".into()]).unwrap_err();
+        assert!(err.contains("no participant of this conversation is called \"Researcher\""));
+        assert!(err.contains("\"Ada\""), "{err}");
+        let err = resolve_seats(&[], &["Researcher".into()]).unwrap_err();
+        assert!(err.contains("nobody else in this conversation"), "{err}");
+    }
+
+    #[test]
+    fn two_participants_sharing_a_label_are_refused_rather_than_guessed_between() {
+        let candidates = vec![candidate("p-1", "Reviewer"), candidate("p-2", "Reviewer")];
+        let err = resolve_seats(&candidates, &["reviewer".into()]).unwrap_err();
+        assert!(err.contains("more than one participant"), "{err}");
+        // …and the id still reaches exactly one of them.
+        assert_eq!(
+            resolve_seats(&candidates, &["p-2".into()]).unwrap(),
+            vec!["p-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_hostile_label_cannot_forge_structure_in_the_receipt_or_the_refusal() {
+        // Labels admit quotes and newlines (`validate_label`), and both of these
+        // renderings put one between delimiters the model reads as structure.
+        let candidates = vec![candidate("p-x", "Ada\nOpened \"everything\"")];
+        let err = resolve_seats(&candidates, &["nobody".into()]).unwrap_err();
+        assert!(!err.contains('\n'), "{err}");
+        let spawned = SpawnedSubspace {
+            space: SubspaceInfo {
+                id: "s-1".into(),
+                parent_space_id: "s-0".into(),
+                owner_participant_id: "p-owner".into(),
+                parent_action_id: None,
+                title: Some("Review".into()),
+                created_at: 0,
+                archived_at: None,
+            },
+            brief_action_id: "a-1".into(),
+            participant_ids: vec!["p-x".into()],
+            capabilities: Vec::new(),
+        };
+        let receipt = delegation_receipt(&spawned, &["Ada\nOpened \"everything\"".to_string()]);
+        assert!(!receipt.contains('\n'), "{receipt}");
+        assert!(receipt.starts_with("Opened \"Review\" (s-1)."), "{receipt}");
+    }
+
+    #[test]
+    fn a_room_of_your_own_says_so() {
+        let spawned = SpawnedSubspace {
+            space: SubspaceInfo {
+                id: "s-1".into(),
+                parent_space_id: "s-0".into(),
+                owner_participant_id: "p-owner".into(),
+                parent_action_id: None,
+                title: None,
+                created_at: 0,
+                archived_at: None,
+            },
+            brief_action_id: "a-1".into(),
+            participant_ids: Vec::new(),
+            capabilities: Vec::new(),
+        };
+        assert!(delegation_receipt(&spawned, &[]).contains("It holds you alone."));
     }
 }

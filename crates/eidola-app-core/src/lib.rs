@@ -923,6 +923,22 @@ pub struct SpaceInfo {
     /// When the space was archived, if it has been. Always `None` unless
     /// listing was asked to include archived spaces.
     pub archived_at: Option<i64>,
+    /// The conversation this one was delegated from (see [`subspaces`]) —
+    /// `None` for an ordinary conversation. A listing row is where a reader
+    /// meets a delegated room, and without this it is a conversation they never
+    /// started with no way to see what it belongs to.
+    pub parent: Option<SpaceParent>,
+}
+
+/// The conversation a delegated room was opened from, as a listing row carries
+/// it: enough to name it and to open it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceParent {
+    pub space_id: String,
+    /// `None` for a conversation that was never named — the presentation layer
+    /// chooses what to say instead, because this crate ships no user-facing
+    /// strings.
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -3151,6 +3167,10 @@ impl Inner {
                 last_activity_at: r.last_activity_at,
                 message_count: r.message_count,
                 archived_at: r.archived_at,
+                parent: r.parent.map(|p| SpaceParent {
+                    space_id: p.space_id,
+                    title: p.title,
+                }),
             });
         }
         Ok(spaces)
@@ -3967,15 +3987,22 @@ impl Inner {
     /// conversation they never joined. Oversight is looking; this is the line
     /// it stops at.
     ///
-    /// **Every door that acts *as the human* asks this**, and that is exactly
-    /// the set: `post` (and `chat`/`chat_stream`/`submit` through it), which
-    /// hard-codes the human as author, and `edit_post`, `regenerate` and
+    /// **Every door that acts *as the human* on something already here asks
+    /// this**, and that is exactly the set: `edit_post`, `regenerate` and
     /// `respond_stream`, which the human's own picker and per-post verbs drive.
-    /// `respond_stream_as` deliberately does **not** — it names the participant
-    /// it acts as, is already gated on *that* participant's membership
-    /// (`resolve_explicit_participant`), and is the door a turn driver uses, so
-    /// a human-membership test there would refuse the sub-space's own agents
-    /// working in their own room.
+    /// `post` is the one that is not gated but *satisfies* the rule instead —
+    /// speaking is how a reader joins, and the join rides the post's own
+    /// transaction (`db::PostPlan::join_author`), so the roster is true of the
+    /// transcript from that post onward rather than from a separate step
+    /// somebody has to take first. The distinction is not a softening: the
+    /// three doors that remain are the ones that act on *another* participant's
+    /// work or spend the reader's credits, and none of them is a way to say
+    /// something.
+    /// `respond_stream_as` deliberately does **not** ask — it names the
+    /// participant it acts as, is already gated on *that* participant's
+    /// membership (`resolve_explicit_participant`), and is the door a turn
+    /// driver uses, so a human-membership test there would refuse the
+    /// sub-space's own agents working in their own room.
     ///
     /// Asked before any write and before any spend, so a refusal is zero-trace.
     /// A **notebook** is deliberately untouched — the human has always been
@@ -3997,10 +4024,17 @@ impl Inner {
     }
 
     /// Combined post-and-turn (`chat` / `chat_stream`) is a cascade, and a
-    /// live sub-space's cascade belongs to the driver. Membership is asked
-    /// first so an unjoined reader still sees [`AppError::NotJoined`]; a
-    /// joined one is refused here before any write, rather than posting and
-    /// then driving the same notify-all seat the driver's arm will take.
+    /// live sub-space's cascade belongs to the driver. Refused here before any
+    /// write, rather than posting and then driving the same notify-all seat the
+    /// driver's arm will take.
+    ///
+    /// **The refusal is the same whoever asks.** It used to ask membership
+    /// first, so an unjoined reader read [`AppError::NotJoined`] — the honest
+    /// answer while posting meant joining first. Now that posting *is* joining,
+    /// a membership question in front of this one would demand a step for a
+    /// verb that is refused either way, and would name the wrong obstacle:
+    /// what stands in the way is the driver, not the roster. `post` remains,
+    /// and takes the reader in with it.
     async fn refuse_combined_ask_in_subspace(
         &self,
         space_id: Option<&str>,
@@ -4010,7 +4044,6 @@ impl Inner {
         };
         let conn = self.db_conn().await?;
         if db::is_live_subspace(&conn, space_id).await? {
-            self.require_human_joined(&conn, space_id).await?;
             return Err(AppError::DrivenConversation {
                 space_id: space_id.to_string(),
             });
@@ -5048,6 +5081,10 @@ impl Inner {
             last_activity_at: now,
             message_count: 0,
             archived_at: None,
+            // Every creation door here mints an ordinary conversation; the one
+            // that mints a delegated room is `spawn_subspace`, which answers
+            // with a `SubspaceInfo` of its own.
+            parent: None,
         })
     }
 
@@ -5080,6 +5117,10 @@ impl Inner {
             last_activity_at: now,
             message_count: 0,
             archived_at: None,
+            // Every creation door here mints an ordinary conversation; the one
+            // that mints a delegated room is `spawn_subspace`, which answers
+            // with a `SubspaceInfo` of its own.
+            parent: None,
         })
     }
 
@@ -5201,22 +5242,32 @@ impl Inner {
                 .await?;
         }
 
-        let (space_id, space_title, is_new_space) = if let Some(sid) = space_id {
+        // **Speaking in a delegated room joins you to it.** Those rooms have no
+        // human member by construction, and a post by somebody the roster omits
+        // makes that roster a lie to every model in the room — so the join is
+        // part of the post rather than a step in front of it (`PostPlan::
+        // join_author`, written in the post's own transaction). Reading it here
+        // races nothing: `parent_space_id` is written once, at creation, and
+        // there is no door that makes an ordinary conversation into a delegated
+        // one — the same fact the driver's negative cache rests on. The
+        // *membership* is deliberately **not** read here; the insert-or-revive
+        // decides that inside the transaction.
+        let (space_id, space_title, is_new_space, join_author) = if let Some(sid) = space_id {
             let row =
                 db::get_space(&db_conn, sid)
                     .await?
                     .ok_or_else(|| AppError::NotConfigured {
                         message: format!("space not found: {sid}"),
                     })?;
-            self.require_human_joined(&db_conn, sid).await?;
-            (sid.to_string(), row.title, false)
+            let subspace = db::subspace(&db_conn, sid).await?.is_some();
+            (sid.to_string(), row.title, false, subspace)
         } else {
             // A new space is instantiated from the default template, so it has
             // its participants (You + the template agents) from birth.
             let sid = new_space_id();
             self.instantiate_default_space(&db_conn, &sid, None, now)
                 .await?;
-            (sid, None, true)
+            (sid, None, true, false)
         };
 
         // No prior terminal action ⇒ this is the space's first post: eligible
@@ -5249,7 +5300,10 @@ impl Inner {
         // and billing a turn against an empty post. See `db::post_tx`. The
         // validations above stay in front of it, where a refusal belongs: they
         // are reads, and now they leave neither a trace nor a fragment.
-        let auto_titled = db::post_tx(
+        let db::PostOutcome {
+            auto_titled,
+            joined,
+        } = db::post_tx(
             &db_conn,
             &db::PostPlan {
                 space_id: &space_id,
@@ -5260,6 +5314,7 @@ impl Inner {
                 auto_title: auto_title.as_deref(),
                 reply_to: reply_ante.as_deref(),
                 references,
+                join_author,
                 created_at: now,
             },
         )
@@ -5268,6 +5323,12 @@ impl Inner {
         self.bus.emit(Change::Space(space_id.clone()));
         if is_new_space || auto_titled {
             self.bus.emit(Change::SpaceIndex);
+        }
+        // A roster changed, so every surface that renders one has to re-read.
+        // Only when the join actually wrote: saying it on every post into a
+        // room the reader is already in would be an invalidation about nothing.
+        if joined {
+            self.bus.emit(Change::Participants);
         }
         // The post is committed and emitted; anything a grown branch needs
         // summarized happens behind it, never in front of it.
@@ -6128,6 +6189,36 @@ impl Inner {
         // path resolves or mints one), so the scope is the whole test.
         let spaces_tool = model_participant_scope == "global" && backend_accepts_tools;
 
+        // ---- Delegation ---------------------------------------------------
+        //
+        // `delegate` opens a sub-space owned by the responding agent (see
+        // [`subspaces`]). Its gate is the **same structural one**, and that is
+        // not a coincidence: the rule that lets a global agent be referenced
+        // into another space is the rule that lets it own one, so a
+        // space-owned participant fails both for one reason rather than two.
+        // The guards themselves — depth, live rooms per owner, seats — are the
+        // spawn door's and are decided inside its transaction; the tool adds
+        // none of its own, so it cannot be a way around any of them.
+        let delegate_tool = model_participant_scope == "global" && backend_accepts_tools;
+        // The seats a delegation may name are exactly the agents this turn's
+        // roster carries — read off the same participant snapshot the roster
+        // renders from, so what a model can name is what it was shown, and no
+        // second query can disagree with the first. The human is not a
+        // candidate (a delegated room has no human member by construction) and
+        // neither is the responder, which the spawn seats itself.
+        let seat_candidates: Vec<subspaces::SeatCandidate> = if delegate_tool {
+            members
+                .iter()
+                .filter(|m| m.kind == "agent" && m.participant_id != model_participant_id)
+                .map(|m| subspaces::SeatCandidate {
+                    participant_id: m.participant_id.clone(),
+                    label: m.label.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Render the rows from the *responding participant's* point of view:
         // only its own prior posts are `assistant`, everyone else's are `user`,
         // and every message carries its uniform `#<handle> · <label>` header
@@ -6210,6 +6301,13 @@ impl Inner {
         // and is byte-stable thereafter.
         if spaces_tool {
             notes.push(discovery::GLOBAL_AGENT_NOTE);
+        }
+        // The delegation note flips at the same moment for the same reason,
+        // and says the three things the schema cannot: the brief is a
+        // contract, the answer comes back as a post rather than a return
+        // value, and the guards are bounded.
+        if delegate_tool {
+            notes.push(subspaces::DELEGATE_NOTE);
         }
         let mut system_content = match system_prompt
             .as_deref()
@@ -6345,7 +6443,7 @@ impl Inner {
         // vanish. Done at the snapshot, so the model never sees the schema and
         // `declined_reason` (which keys on the registry, not the name) cannot
         // fire even if it guesses the name.
-        let auto_tools = nav_tools || memory_tool || spaces_tool;
+        let auto_tools = nav_tools || memory_tool || spaces_tool || delegate_tool;
         let tool_registry = if auto_tools {
             let mut registry = (*consumer_tools).clone();
             if nav_tools {
@@ -6375,6 +6473,21 @@ impl Inner {
                     self.self_ref.clone(),
                     model_participant_id.clone(),
                     space_id.clone(),
+                )));
+            }
+            if delegate_tool {
+                // The anchor is this turn's own reply target — the post the
+                // work is being asked for on. Only the turn knows it, which is
+                // the whole reason the spawn door takes it from its caller: a
+                // delegation opened here reports back beneath this agent's
+                // answer to *this* post, rather than beneath wherever it
+                // happened to speak last.
+                registry.register(Arc::new(subspaces::DelegateTool::new(
+                    self.self_ref.clone(),
+                    model_participant_id.clone(),
+                    space_id.clone(),
+                    inf_reply_to.clone(),
+                    seat_candidates.clone(),
                 )));
             }
             Arc::new(registry)
