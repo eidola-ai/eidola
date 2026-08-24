@@ -8085,6 +8085,24 @@ impl Inner {
     /// → only when the post's author is human; `explicit` → never (only an
     /// explicit ask reaches them).
     ///
+    /// **A brief is never left unanswered** — the one floor under that set.
+    /// A `brief` is the opening post of a delegated room, written by the agent
+    /// that owns it, and it is the one post whose entire purpose is to be
+    /// worked on. The rules above would answer it with nobody in the room the
+    /// tool advertises most plainly: a delegation that seats no sub-agent
+    /// holds its owner alone, the owner authored the brief and an author is
+    /// excluded from its own post's notify set, so the driver would report an
+    /// untouched brief as a concluded delegation and the room would do no work
+    /// at all. So when the set over a brief comes back empty, the brief's
+    /// author takes the turn. It fires **only** when nobody else would, which
+    /// is what keeps a panel unchanged (its sub-agents are seated `all`, so
+    /// the set is never empty there, and the owner is deliberately quiet among
+    /// its helpers), and it is bounded by the shape of a brief rather than by
+    /// a counter: there is exactly one per room, written at the spawn, and
+    /// neither editable nor regenerable — so the floor can schedule at most
+    /// one turn per room, and the owner's own answer is an `inference` that
+    /// gets no floor of its own.
+    ///
     /// A **pure read** — no network, no commits, no emissions. Production
     /// callers go through [`Inner::plan_and_refine`], which additionally
     /// filters this set through the space's may-decline router.
@@ -8111,10 +8129,10 @@ impl Inner {
         // depth behind `ChatResult::response_action_id` being `None` on a
         // declined turn (see [`decline`]); the guard is cheap and the failure
         // it prevents is silent.
-        match db::action_type(&conn, post_action_id).await? {
-            Some(t) if db::is_post_action_type(&t) => {}
+        let action_type = match db::action_type(&conn, post_action_id).await? {
+            Some(t) if db::is_post_action_type(&t) => t,
             _ => return Ok(NotificationPlan::Turns(Vec::new())),
-        }
+        };
 
         // **An archived conversation plans no turns**, and the same read that
         // answers that carries the cascade budget — one statement for the
@@ -8143,18 +8161,19 @@ impl Inner {
             None => return Ok(NotificationPlan::Turns(Vec::new())),
         };
 
+        // An agent with no model can't respond — never plan a turn for it.
+        let can_respond = |m: &db::EffectiveParticipantRow| {
+            m.kind == "agent"
+                && m.model_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty())
+        };
+
+        let members = db::space_participants(&conn, space_id).await?;
         let mut turns = Vec::new();
-        for m in db::space_participants(&conn, space_id).await? {
-            if m.kind != "agent" || m.participant_id == author_id {
-                continue;
-            }
-            // An agent with no model can't respond — never plan a turn for it.
-            if m.model_ref
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none()
-            {
+        for m in &members {
+            if !can_respond(m) || m.participant_id == author_id {
                 continue;
             }
             let fires = match m.notify_policy.as_str() {
@@ -8164,7 +8183,28 @@ impl Inner {
             };
             if fires {
                 turns.push(PlannedTurn {
-                    participant_id: m.participant_id,
+                    participant_id: m.participant_id.clone(),
+                    target_action_id: post_action_id.to_string(),
+                    cascade_depth: depth + 1,
+                });
+            }
+        }
+
+        // **The floor: a brief is never left unanswered.** See this method's
+        // doc comment for why — a solo delegation is a room whose only agent
+        // wrote the post, and the author exclusion above would leave it with
+        // nothing to do. The owner's own notify policy is deliberately not
+        // consulted: `spawn_subspace_tx` writes it as `human` so the agent
+        // answerable for a delegation stays quiet among its helpers, and a
+        // floor that a policy could switch off would be no floor. Everything
+        // that makes a participant unable to answer still applies.
+        if turns.is_empty() && action_type == db::BRIEF_ACTION_TYPE {
+            if let Some(owner) = members
+                .iter()
+                .find(|m| m.participant_id == author_id && m.role == "owner" && can_respond(m))
+            {
+                turns.push(PlannedTurn {
+                    participant_id: owner.participant_id.clone(),
                     target_action_id: post_action_id.to_string(),
                     cascade_depth: depth + 1,
                 });

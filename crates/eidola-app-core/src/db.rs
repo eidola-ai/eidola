@@ -2515,7 +2515,7 @@ async fn spawn_subspace_tx_body(
             participant_id: plan.owner_participant_id.to_string(),
             item_id: plan.brief_item_id.to_string(),
             supersedes_action_id: None,
-            action_type: "brief".to_string(),
+            action_type: BRIEF_ACTION_TYPE.to_string(),
             status: "complete".to_string(),
             intent: None,
             model: None,
@@ -7387,13 +7387,21 @@ pub const POST_ACTION_TYPES_SQL: &str = "'user_input', 'inference', 'brief'";
 /// The same set, for the checks that happen in Rust rather than in SQL — the
 /// reference gate (what a quote may name) and the read-side filters that back
 /// it up. Kept beside [`POST_ACTION_TYPES_SQL`] so the two cannot drift.
-pub const POST_ACTION_TYPES: [&str; 3] = ["user_input", "inference", "brief"];
+pub const POST_ACTION_TYPES: [&str; 3] = ["user_input", "inference", BRIEF_ACTION_TYPE];
+
+/// The opening post of an agent-spawned sub-space — the only action type this
+/// module writes outside a turn, and written in exactly one place
+/// ([`spawn_subspace_tx`]). Named because planning asks about it by name (a
+/// brief is the one post that must schedule somebody; see
+/// `crate::Inner::mechanical_plan`), and a rule that spelled the type inline
+/// would be a rule that drifts from the writer.
+pub const BRIEF_ACTION_TYPE: &str = "brief";
 
 /// Action types an **agent** authors as a post. The role split that renders a
 /// transcript for a model is participant-derived (only the responder's own
 /// posts are `assistant`), but the display-side view has no responder to ask,
 /// so it reads this.
-pub const AGENT_POST_ACTION_TYPES: [&str; 2] = ["inference", "brief"];
+pub const AGENT_POST_ACTION_TYPES: [&str; 2] = ["inference", BRIEF_ACTION_TYPE];
 
 /// Whether an action type is a post an agent authored (see
 /// [`AGENT_POST_ACTION_TYPES`]).

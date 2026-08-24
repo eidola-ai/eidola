@@ -995,22 +995,7 @@ impl SpacesStore {
         self.write_then_reconcile(
             space_id,
             cx,
-            move |rows| {
-                let mut prior: Option<Option<String>> = None;
-                if let Some(row) = rows.iter_mut().find(|s| s.id == row_id) {
-                    prior = Some(row.title.clone());
-                    row.title = Some(optimistic_title);
-                }
-                // The inverse: this row's title, by id — the listing may have
-                // been re-ordered by a sibling's re-list in the meantime.
-                Box::new(move |rows: &mut Vec<SpaceInfo>| {
-                    if let Some(prior) = prior
-                        && let Some(row) = rows.iter_mut().find(|s| s.id == row_id)
-                    {
-                        row.title = prior;
-                    }
-                })
-            },
+            move |rows| rename_edit(rows, row_id, optimistic_title),
             move |core| {
                 Box::pin(async move {
                     bridge(
@@ -1088,6 +1073,56 @@ impl SpacesStore {
 /// touched, which is what lets one mutation take its edit back while a sibling's
 /// is still pending on the same shared listing.
 type UndoEdit = Box<dyn FnOnce(&mut Vec<SpaceInfo>)>;
+
+/// A rename's optimistic edit, and its inverse — the pair
+/// [`SpacesStore::rename`] hands `write_then_reconcile`.
+///
+/// **A title is cached in more than one row.** The renamed row holds it, and so
+/// does every delegated row that names this conversation as the one it was
+/// opened from: a listing row carries its parent's title (`SpaceInfo::parent`),
+/// because resolving one per row is exactly what virtualization refuses. So the
+/// edit reaches all of them, and so does the inverse — otherwise a child row
+/// goes on showing the old name until a re-list lands, and **indefinitely if
+/// that read fails**, since `Failed { prior }` then keeps whatever the
+/// optimistic edits left standing.
+///
+/// Shaped like the store's other optimistic edits: an inverse rather than a
+/// snapshot (siblings compose by delta), keyed by **id** with no position
+/// stored, so a re-list re-ordering the listing under it cannot make it stale.
+/// Extracted as a free function so the unit tests exercise the shipped edit
+/// rather than a copy of it.
+fn rename_edit(rows: &mut [SpaceInfo], row_id: String, title: String) -> UndoEdit {
+    let mut prior: Option<Option<String>> = None;
+    let mut prior_children: Vec<(String, Option<String>)> = Vec::new();
+    for row in rows.iter_mut() {
+        if row.id == row_id {
+            prior = Some(row.title.clone());
+            row.title = Some(title.clone());
+        }
+        if let Some(parent) = row.parent.as_mut()
+            && parent.space_id == row_id
+        {
+            prior_children.push((row.id.clone(), parent.title.clone()));
+            parent.title = Some(title.clone());
+        }
+    }
+    Box::new(move |rows: &mut Vec<SpaceInfo>| {
+        if let Some(prior) = prior
+            && let Some(row) = rows.iter_mut().find(|s| s.id == row_id)
+        {
+            row.title = prior;
+        }
+        for (child_id, title) in prior_children {
+            if let Some(parent) = rows
+                .iter_mut()
+                .find(|s| s.id == child_id)
+                .and_then(|s| s.parent.as_mut())
+            {
+                parent.title = title;
+            }
+        }
+    })
+}
 
 /// Settle an index mutation: the write's outcome, the re-list's outcome, the
 /// inverse of the edit this operation made, and whether this operation is the
@@ -1188,20 +1223,8 @@ mod tests {
     /// Apply a rename to the cell exactly as `SpacesStore::rename` does, and hand
     /// back its inverse — the pair under test.
     fn rename(cell: &mut Loadable<Vec<SpaceInfo>>, id: &'static str, title: &str) -> UndoEdit {
-        let title = title.to_string();
         let rows = cell.value_mut().expect("a cell with rows");
-        let mut prior: Option<Option<String>> = None;
-        if let Some(r) = rows.iter_mut().find(|s| s.id == id) {
-            prior = Some(r.title.clone());
-            r.title = Some(title);
-        }
-        Box::new(move |rows: &mut Vec<SpaceInfo>| {
-            if let Some(prior) = prior
-                && let Some(r) = rows.iter_mut().find(|s| s.id == id)
-            {
-                r.title = prior;
-            }
-        })
+        super::rename_edit(rows, id.to_string(), title.to_string())
     }
 
     /// Likewise for archive — the seat derived from the row's own sort key.
@@ -1225,6 +1248,78 @@ mod tests {
         result: Result<Vec<SpaceInfo>, AppError>,
     ) {
         *cell = std::mem::take(cell).to_loading().resolve(result);
+    }
+
+    /// A delegated row, carrying the conversation it was opened from.
+    fn child_of(id: &str, title: &str, parent: (&str, &str)) -> SpaceInfo {
+        SpaceInfo {
+            parent: Some(eidola_app_core::SpaceParent {
+                space_id: parent.0.into(),
+                title: Some(parent.1.into()),
+            }),
+            ..row(id, title)
+        }
+    }
+
+    fn parent_titles(cell: &Loadable<Vec<SpaceInfo>>) -> Vec<Option<String>> {
+        cell.value()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.parent.as_ref().map(|p| p.title.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // -- A rename reaches every row that caches the title --------------------
+
+    /// **A renamed conversation is renamed in its children's badges too.** A
+    /// delegated row names the conversation it came from, and it does so from a
+    /// *cached copy* of that title — so an optimistic edit touching only the
+    /// row whose own id matched left every child badge showing the old name
+    /// until a re-list landed, and for good if that read failed (`Failed
+    /// { prior }` keeps whatever the edits left standing).
+    #[test]
+    fn a_rename_reaches_the_rows_that_cache_the_renamed_title() {
+        let mut cell = Loadable::loaded(vec![
+            row("s1", "Tides"),
+            child_of("s2", "Survey", ("s1", "Tides")),
+            child_of("s3", "Second opinion", ("s1", "Tides")),
+            child_of("s4", "Elsewhere", ("s9", "Bergamot")),
+        ]);
+        let undo = rename(&mut cell, "s1", "Nile");
+        assert_eq!(
+            parent_titles(&cell),
+            vec![
+                Some("Nile".to_string()),
+                Some("Nile".to_string()),
+                Some("Bergamot".to_string()),
+            ],
+            "every badge naming the renamed conversation follows it, and no other"
+        );
+
+        // …and the inverse takes all of them back, in the quadrant where
+        // nothing else can: refused write, failed re-list.
+        settle_index_mutation(&mut cell, undo, Err("refused".into()));
+        resolving_read(&mut cell, Err(read_err()));
+        assert_eq!(
+            titles(&cell),
+            vec![
+                "Tides".to_string(),
+                "Survey".to_string(),
+                "Second opinion".to_string(),
+                "Elsewhere".to_string()
+            ]
+        );
+        assert_eq!(
+            parent_titles(&cell),
+            vec![
+                Some("Tides".to_string()),
+                Some("Tides".to_string()),
+                Some("Bergamot".to_string()),
+            ],
+            "a name the database refused must not stand in any badge either"
+        );
     }
 
     // -- The double-failure quadrant -----------------------------------------

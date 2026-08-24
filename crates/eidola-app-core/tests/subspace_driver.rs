@@ -251,6 +251,97 @@ fn a_delegated_room_takes_its_turns_with_nobody_watching() {
     });
 }
 
+/// **A delegation that seats nobody still does the work.** `delegate` says
+/// plainly that leaving `participants` out opens a room of the caller's own,
+/// so this is the mode a model reaches for first — and it is the one the
+/// ordinary rules would leave inert: the owner is the room's only agent, the
+/// owner wrote the brief, and an author is excluded from its own post's notify
+/// set. Without the plan's brief floor the driver walks a room in which
+/// nothing was ever planned and reports an untouched brief as a concluded
+/// delegation.
+#[test]
+fn a_solo_delegation_works_its_own_brief() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let out = spawn(&core, &parent, &owner, vec![]);
+
+        let requests_before = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let room = tree(&core, &out.space.id);
+        assert_eq!(
+            room.len(),
+            2,
+            "brief + the owner's own answer to it: {room:?}"
+        );
+        assert_eq!(room[0].action_type, "brief");
+        assert_eq!(room[1].action_type, "inference");
+        assert_eq!(
+            room[1].participant.label, "Navigator",
+            "the agent that opened the room is the one that works in it"
+        );
+        assert_eq!(
+            mock.chat_bodies().len() - requests_before,
+            2,
+            "one worked turn and one report"
+        );
+
+        // …and the room stops there: the owner's answer is an `inference`, so
+        // it gets no floor of its own and cannot answer itself forever.
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(report.references.len(), 1, "one attached passage");
+        assert_eq!(
+            report.references[0].antecedent_action_id, room[1].action_id,
+            "the report quotes the work, not the untouched brief"
+        );
+        assert_eq!(
+            report.references[0].delegation_end,
+            Some(DelegationEnd::Concluded { truncated: false })
+        );
+    });
+}
+
+/// The floor is a floor, not a widening: a room that seats helpers plans them
+/// and **not** its owner, whose deliberate `human` policy keeps it quiet among
+/// them until it writes the report.
+#[test]
+fn a_seated_delegation_still_leaves_its_owner_out_of_the_brief() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        let plan =
+            core.runtime()
+                .block_on(core.mechanical_notification_plan(
+                    out.space.id.clone(),
+                    out.brief_action_id.clone(),
+                ))
+                .expect("the brief plans");
+        let NotificationPlan::Turns(turns) = plan else {
+            panic!("the brief is not paused: {plan:?}");
+        };
+        let labels: Vec<String> = turns.iter().map(|t| t.participant_id.clone()).collect();
+        assert_eq!(
+            labels,
+            vec![helper_id(&out)],
+            "the seated helper answers the brief and the owner does not"
+        );
+    });
+}
+
+/// The one seat a spawn wrote beside the owner.
+fn helper_id(out: &SpawnedSubspace) -> String {
+    out.participant_ids
+        .first()
+        .cloned()
+        .expect("the spawn seated a helper")
+}
+
 /// The room's own cascade guard still governs it, and pausing there is a
 /// terminal outcome like any other — reported, not silently dropped.
 #[test]
@@ -3314,25 +3405,29 @@ fn a_long_finding_is_elided_in_the_prompt_and_whole_on_the_edge() {
         let (mock, core, _dir) = setup();
         let parent = parent_with_a_post(&core);
         let owner = shared_agent(&core, &parent, "Navigator");
-        // A brief long enough to be over any per-passage budget, with a
-        // distinctive head, middle and tail. Nobody is seated beside the owner,
-        // so the room concludes on its brief and the brief is the finding.
-        let brief = format!(
+        let out = spawn(&core, &parent, &owner, vec![]);
+        // Nobody is seated beside the owner, and the owner answers only when
+        // spoken to explicitly — so the post below is the room's last word,
+        // nothing follows it, and it is the walk's one finding.
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                out.space.id.clone(),
+                owner.clone(),
+                eidola_app_core::ParticipantOverride {
+                    notify_policy: Some(Some("explicit".into())),
+                    ..Default::default()
+                },
+            ))
+            .expect("the owner answers only an explicit ask");
+        // A finding long enough to be over any per-passage budget, with a
+        // distinctive head, middle and tail.
+        let finding = format!(
             "OPENING LINE.\n\n{}\n\nCLOSING LINE.",
             "middle padding that nobody needs to read. ".repeat(200)
         );
-        let out = core
-            .runtime()
-            .block_on(core.spawn_subspace(
-                parent.clone(),
-                owner.clone(),
-                brief.clone(),
-                vec![],
-                vec![],
-                None,
-                None,
-            ))
-            .expect("spawn");
+        core.runtime()
+            .block_on(core.post(finding.clone(), Some(out.space.id.clone())))
+            .expect("a post into the room");
 
         drive(&core, &out.space.id).expect("the room is driven");
 
@@ -3340,12 +3435,12 @@ fn a_long_finding_is_elided_in_the_prompt_and_whole_on_the_edge() {
         let quoted = &report.references[0];
         assert_eq!(
             quoted.range_end,
-            Some(brief.len() as i64),
+            Some(finding.len() as i64),
             "the edge names the whole passage"
         );
         assert_eq!(
             quoted.snippet.as_deref(),
-            Some(brief.as_str()),
+            Some(finding.as_str()),
             "and a reader's rail resolves it whole"
         );
 
@@ -3360,10 +3455,10 @@ fn a_long_finding_is_elided_in_the_prompt_and_whole_on_the_edge() {
             .map(|(_, c)| c)
             .expect("the attached block");
         assert!(
-            attached.len() < brief.len(),
+            attached.len() < finding.len(),
             "the prompt is not the whole passage: {} vs {}",
             attached.len(),
-            brief.len()
+            finding.len()
         );
         assert!(
             attached.contains("OPENING LINE.") && attached.contains("CLOSING LINE."),
