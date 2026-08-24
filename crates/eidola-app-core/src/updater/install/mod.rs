@@ -45,6 +45,15 @@
 
 mod archive;
 
+/// Unpack a container under the installer's rules — no symbolic links, no
+/// traversal, no duplicate members, bounded in members and in bytes.
+///
+/// Public because the release tooling reconstructs the same objects on the
+/// signing side, and two extractors would be two rule sets: what the
+/// release officer proves reconstructs must be unpacked exactly as the
+/// installer will unpack it.
+pub use archive::unpack_zip;
+
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
