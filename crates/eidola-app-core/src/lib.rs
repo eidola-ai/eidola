@@ -8198,17 +8198,17 @@ impl Inner {
         // answerable for a delegation stays quiet among its helpers, and a
         // floor that a policy could switch off would be no floor. Everything
         // that makes a participant unable to answer still applies.
-        if turns.is_empty() && action_type == db::BRIEF_ACTION_TYPE {
-            if let Some(owner) = members
+        if turns.is_empty()
+            && action_type == db::BRIEF_ACTION_TYPE
+            && let Some(owner) = members
                 .iter()
                 .find(|m| m.participant_id == author_id && m.role == "owner" && can_respond(m))
-            {
-                turns.push(PlannedTurn {
-                    participant_id: owner.participant_id.clone(),
-                    target_action_id: post_action_id.to_string(),
-                    cascade_depth: depth + 1,
-                });
-            }
+        {
+            turns.push(PlannedTurn {
+                participant_id: owner.participant_id.clone(),
+                target_action_id: post_action_id.to_string(),
+                cascade_depth: depth + 1,
+            });
         }
         Ok(NotificationPlan::Turns(turns))
     }
