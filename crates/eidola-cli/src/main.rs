@@ -1642,11 +1642,30 @@ fn print_indented(text: &str, indent: usize) {
 /// is a `warning:` rather than an error because nothing failed and the partial
 /// answer is real.
 ///
+/// **A declined turn is the same shape with even less to go on**: the agent saw
+/// the context and chose to bow out, so there is no answer at all — stdout is
+/// empty under a full, ordinary footer, which is exactly what a model that
+/// emitted nothing looks like. `ChatResult::declined` is the only thing that
+/// tells the two apart, and it says so first, ahead of anything about text that
+/// was never written. It is a `note:` rather than a `warning:`: nothing went
+/// wrong and nothing is degraded — the decline is the turn working as intended,
+/// and the only defect was never saying so. The stated reason is commentary an
+/// agent may omit, so its absence is reported as an absence rather than left to
+/// read as a missing sentence.
+///
 /// Pure, so what a finished turn says is assertable without taking one. It
 /// writes nothing itself for the same reason the streaming printer splits the
 /// streams: **stdout is the answer and nothing else.**
 fn chat_summary(result: &eidola_app_core::ChatResult) -> String {
     let mut out = String::new();
+    if let Some(declined) = &result.declined {
+        out.push_str("note: the agent declined this turn, so there is no answer above");
+        if declined.reason.is_empty() {
+            out.push_str(" — it gave no reason\n");
+        } else {
+            out.push_str(&format!(" — it said: {}\n", declined.reason));
+        }
+    }
     if result.truncated {
         out.push_str(
             "warning: this answer stopped at the model's length limit, not because the model \
@@ -1773,6 +1792,58 @@ mod tests {
         assert!(
             cut_off.contains("---\nspace: s1  model: kimi-k2  tokens: 11/4096  credits: 320"),
             "and the footer is unchanged beneath it: {cut_off:?}"
+        );
+    }
+
+    fn declined_turn(reason: &str) -> eidola_app_core::ChatResult {
+        eidola_app_core::ChatResult {
+            content: String::new(),
+            input_tokens: None,
+            output_tokens: None,
+            response_action_id: None,
+            declined: Some(eidola_app_core::DeclineOutcome {
+                reason: reason.into(),
+                action_id: "a3".into(),
+            }),
+            ..finished_turn(false)
+        }
+    }
+
+    #[test]
+    fn a_declined_turn_says_so() {
+        // The reported defect: an agent that bowed out printed an empty answer
+        // under a full, ordinary footer — indistinguishable at the terminal
+        // from a model that emitted nothing. `declined` is the only signal that
+        // separates them, and it leads for the same reason the truncation
+        // warning does: it is about the (absent) text, not about the run.
+        let declined = chat_summary(&declined_turn(
+            "that request is outside what I'll help with",
+        ));
+        assert!(
+            declined.starts_with(
+                "note: the agent declined this turn, so there is no answer above — it said: \
+                 that request is outside what I'll help with\n"
+            ),
+            "the decline leads, carrying the stated reason: {declined:?}"
+        );
+        assert!(
+            declined.contains("---\nspace: s1  model: kimi-k2  tokens: 0/0  credits: 320"),
+            "and the footer is unchanged beneath it: {declined:?}"
+        );
+    }
+
+    #[test]
+    fn a_declined_turn_with_no_reason_still_says_so() {
+        // The reason is commentary the agent may omit; the *act* of declining
+        // is the datum. A silent decline must not degrade into the empty answer
+        // this whole line exists to rule out, so the absence is stated.
+        let declined = chat_summary(&declined_turn(""));
+        assert!(
+            declined.starts_with(
+                "note: the agent declined this turn, so there is no answer above — it gave no \
+                 reason\n"
+            ),
+            "a reasonless decline is still announced: {declined:?}"
         );
     }
 
