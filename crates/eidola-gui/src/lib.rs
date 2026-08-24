@@ -45,10 +45,10 @@ use gpui_component_assets::Assets;
 
 use crate::about::AboutView;
 use crate::actions::{
-    About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
-    NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenRecord, OpenSettings, Quit, QuitApp, Quote,
-    QuoteElsewhere, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn,
-    ZoomOut,
+    About, ActualSize, CheckForUpdates, CloseWindow, FindInSpace, GetStarted, Hide, HideOthers,
+    Minimize, NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenRecord, OpenSettings, Quit, QuitApp,
+    Quote, QuoteElsewhere, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom,
+    ZoomIn, ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::lifecycle::LaunchOptions;
@@ -403,6 +403,11 @@ fn install_menus(cx: &mut App) {
                     OsAction::SelectAll,
                 ),
                 MenuItem::Separator,
+                // Find acts on the focused conversation, like the standard
+                // Edit-menu Find of any document app. Registered
+                // per-`SpaceView`, so macOS greys it with no space window.
+                MenuItem::action("Find in Conversation", FindInSpace),
+                MenuItem::Separator,
                 // Quoting is an Edit-menu verb because it acts on the
                 // *selection*, like Cut/Copy. Both handlers are registered
                 // per-`SpaceView` and only while a quotable post selection
@@ -511,6 +516,9 @@ pub fn install_keybindings(cx: &mut App) {
         // ⌥⌘I shows/hides the space window's inspector (Xcode/Finder); the
         // development overlay uses the shifted variant instead.
         KeyBinding::new("secondary-alt-i", ToggleInspector, None),
+        // ⌘F opens the conversation's find bar (unclaimed by the editor's own
+        // keymap, so nothing has to give it up).
+        KeyBinding::new("secondary-f", FindInSpace, None),
         KeyBinding::new("secondary-alt-shift-i", ToggleElementInspector, None),
         // View → type size. ⌘0 / Ctrl+0 resets; ⌘=/⌘+ zooms in (both the bare
         // `=` and the shifted `+` that shares the key, so either keypress

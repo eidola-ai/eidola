@@ -622,9 +622,10 @@ impl ChromeRoot {
 
     fn render_menu_panel(&self, _window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         use crate::actions::{
-            About, ActualSize, CheckForUpdates, NewSpace, NewSpaceFromTemplate, OpenLibrary,
-            OpenRecord, OpenSettings, Quit, Quote, QuoteElsewhere, QuoteInReply, ToggleInspector,
-            ZoomIn, ZoomOut, primary_alt_chord, primary_chord, primary_shift_chord,
+            About, ActualSize, CheckForUpdates, FindInSpace, NewSpace, NewSpaceFromTemplate,
+            OpenLibrary, OpenRecord, OpenSettings, Quit, Quote, QuoteElsewhere, QuoteInReply,
+            ToggleInspector, ZoomIn, ZoomOut, primary_alt_chord, primary_chord,
+            primary_shift_chord,
         };
         let theme = cx.theme();
 
@@ -695,6 +696,15 @@ impl ChromeRoot {
                 "Show/Hide Inspector",
                 Some(primary_alt_chord("I")),
                 |w, cx| w.dispatch_action(Box::new(ToggleInspector), cx),
+                cx,
+            ))
+            // Find in the focused conversation — the macOS Edit menu's Find,
+            // which Linux has no Edit menu for.
+            .child(menu_item(
+                "find",
+                "Find in Conversation",
+                Some(primary_chord("F")),
+                |w, cx| w.dispatch_action(Box::new(FindInSpace), cx),
                 cx,
             ))
             // The selection-scoped verbs (the macOS "Edit" menu's quote pair).

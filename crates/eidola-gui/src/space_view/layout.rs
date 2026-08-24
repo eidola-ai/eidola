@@ -348,19 +348,27 @@ impl SpaceView {
     }
 
     /// The document's top reserve: headroom that holds whatever leads the
-    /// document clear of the (transparent, overlaid) titlebar. It is
-    /// **unconditional** — a composer-only notebook is led by the composer, and
-    /// the words typed there have to sit exactly where they will sit once
-    /// they're a post, or posting moves them (task 40: the reserve appearing
-    /// with the first post shifted the whole document down by
+    /// document clear of the (transparent, overlaid) titlebar. The titlebar's
+    /// share is **unconditional** — a composer-only notebook is led by the
+    /// composer, and the words typed there have to sit exactly where they will
+    /// sit once they're a post, or posting moves them (previously, the reserve
+    /// appearing with the first post shifted the whole document down by
     /// [`TITLE_BAR_RESERVE`] at the submit moment). Every scrollable-document
     /// computation (the scroll range, the forest origin, the minimap, the dock
     /// math) reads this single value, so "what's interactive" and "what's
     /// visible" stay in lockstep. The titlebar's own visual height (the
     /// gradient overlay in `render_title_bar`) is the same constant and
     /// independent of this.
+    ///
+    /// **An open find bar adds its own row on top** ([`super::find::FIND_BAR_H`]):
+    /// the bar takes space rather than floating, because one that covered the
+    /// first post would hide the matches it is counting. Three subsystems
+    /// observe that through this one accessor — the document's top padding, the
+    /// minimap's `total_h` denominator, and the keyboard reveal's top inset —
+    /// and opening compensates the page scroll by the same delta so the
+    /// reader's content does not jump.
     pub(crate) fn doc_reserve(&self) -> f32 {
-        TITLE_BAR_RESERVE.as_f32()
+        TITLE_BAR_RESERVE.as_f32() + self.find_bar_h()
     }
 
     /// The height a slot that **stands alone** claims: one window *below* the

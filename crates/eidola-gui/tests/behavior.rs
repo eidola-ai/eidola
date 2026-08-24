@@ -18711,3 +18711,444 @@ fn space_a_regeneration_that_fails_elsewhere_still_ends_the_mark(cx: &mut TestAp
         "and the released claim ended the mark anyway: {after:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Find in the conversation (⌘F)
+// ---------------------------------------------------------------------------
+
+/// The conversation the find tests search: one word in three posts, once inside
+/// a link's URL where the reader can never see it.
+fn findable_posts() -> Vec<PostNode> {
+    let mut second = fixture_assistant_post(
+        "a2",
+        "The [survey](https://kestrel.example/data) says a kestrel hunts by hovering.",
+    );
+    second.parent_action_id = Some("a1".into());
+    let mut third = fixture_user_post("a3", "Does a kestrel hover in still air too?");
+    third.parent_action_id = Some("a2".into());
+    vec![
+        fixture_user_post("a1", "Tell me about the kestrel."),
+        second,
+        third,
+    ]
+}
+
+/// Open the bar and **type** the query, through the production keystroke path.
+///
+/// Typing rather than `set_value` for two reasons: `InputState::set_value`
+/// suppresses its own events, and the search is driven by `InputEvent::Change`
+/// — so a test that set the value silently would assert against a search that
+/// never ran. It also exercises the routing: a printable reaching the query
+/// field at all depends on the conversation's key handler yielding while the
+/// bar holds the keyboard, or type-to-compose would swallow every character.
+fn run_find(
+    view: &Entity<SpaceView>,
+    window: AnyWindowHandle,
+    vcx: &mut VisualTestContext,
+    query: &str,
+) {
+    dispatch_space_action(view, window, vcx, eidola_gui::actions::FindInSpace);
+    let keys: Vec<String> = query.chars().map(|c| c.to_string()).collect();
+    vcx.simulate_keystrokes(&keys.join(" "));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+}
+
+#[gpui::test]
+fn space_find_matches_what_the_reader_can_see_and_not_what_is_hidden(cx: &mut TestAppContext) {
+    // The projection's whole point, end to end: three posts carry the word,
+    // and a fourth occurrence sits inside a link's URL, which a read-only
+    // editor hides — so counting it would be a count the reader cannot check.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    view.read_with(&vcx, |v, _| {
+        let (matches, index) = v.find_matches_for_test();
+        let nodes: Vec<&str> = matches.iter().map(|(n, _)| n.as_ref()).collect();
+        assert_eq!(
+            nodes,
+            vec!["a1", "a2", "a3"],
+            "one visible match per post, in document order: {matches:?}"
+        );
+        assert_eq!(index, Some(1), "the readout starts at the first match");
+    });
+}
+
+#[gpui::test]
+fn space_find_steps_and_wraps_through_every_match(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    let step = |vcx: &mut VisualTestContext, forward: bool| {
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.find_step(forward, window, cx));
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |v, _| v.find_matches_for_test().1)
+    };
+
+    assert_eq!(step(&mut vcx, true), Some(2));
+    assert_eq!(step(&mut vcx, true), Some(3));
+    assert_eq!(step(&mut vcx, true), Some(1), "forward wraps at the end");
+    assert_eq!(
+        step(&mut vcx, false),
+        Some(3),
+        "and backward wraps at the start"
+    );
+}
+
+#[gpui::test]
+fn space_find_builds_no_projection_until_it_is_used(cx: &mut TestAppContext) {
+    // The lazy-activation invariant, pinned rather than assumed: a closed find
+    // bar costs nothing on an ordinary edit keystroke, and closing one drops
+    // every projection it built.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("h e l l o");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(v.has_active_draft_for_test(), "the reader is composing");
+        assert_eq!(
+            v.projections_built_for_test(),
+            0,
+            "typing into the composer builds no searchable projection"
+        );
+    });
+
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.projections_built_for_test() > 0,
+            "…and searching builds them"
+        );
+        assert!(
+            !v.find_projection_nodes_for_test().is_empty(),
+            "the session holds the cache"
+        );
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.close_find(window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let after_close = view.read_with(&vcx, |v, _| {
+        assert!(!v.find_open_for_test(), "the bar is closed");
+        v.projections_built_for_test()
+    });
+
+    // …and the cache went with it, which is only observable from the *builds*:
+    // asking the closed session for its projections would answer "none"
+    // whether they were dropped or never existed.
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.projections_built_for_test() > after_close,
+            "the same search over the same posts had to project them again"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_does_not_search_uncommitted_preedit(cx: &mut TestAppContext) {
+    // The IME rule, from the field's side. `InputState`'s preedit path notifies
+    // without emitting **any** `InputEvent`, and the search is driven by
+    // `Change` alone — so a reader composing in Chinese or Japanese never sees
+    // the count move against fragments they have not chosen. Driving the marked
+    // text directly is what makes that checkable.
+    //
+    // What this bites is the *render-time* `value()` read (and its twin, an
+    // observer on the state): `value()` returns the buffer with the preedit
+    // spliced in, so a search re-derived from it each frame searches text the
+    // reader has not chosen — teeth-checked, and it fails here with the match
+    // set emptied mid-composition. It deliberately does **not** bite a
+    // subscription that acts on every event rather than only `Change`: preedit
+    // emits none, so that shape is merely redundant rather than wrong.
+    use gpui::EntityInputHandler;
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    let before = view.read_with(&vcx, |v, _| v.find_matches_for_test().0.len());
+    assert_eq!(before, 3, "the committed query matches three posts");
+
+    let input = view
+        .read_with(&vcx, |v, _| v.find_input_for_test())
+        .expect("the bar is open");
+    // Preedit: the buffer now holds "kestrelhov", uncommitted.
+    vcx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            let end = s.value().len();
+            s.replace_and_mark_text_in_range(Some(end..end), "hov", None, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().0.len(),
+            before,
+            "the match set does not move while the preedit is uncommitted"
+        );
+    });
+
+    // Committing is what the search acts on.
+    vcx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            let range = s.marked_text_range(window, cx).expect("a live preedit");
+            s.replace_text_in_range(Some(range), "s hover", window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "…and the committed query is searched"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_closes_on_escape_only_from_its_own_field(cx: &mut TestAppContext) {
+    // The Escape rung is gated on focus being inside the find surface, so an
+    // Escape in the composer still deactivates the draft rather than closing a
+    // bar the reader was not in.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    // A reader steps away from the bar to write something.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a3".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(v.has_active_draft_for_test(), "the composer is open");
+        assert!(v.find_open_for_test(), "…beside the still-open bar");
+    });
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "Escape belongs to the composer while the reader is in it"
+        );
+        assert!(v.find_open_for_test(), "and the bar is untouched");
+    });
+
+    // Back in the field, Escape closes the bar.
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_open_for_test(), "…and there it closes the bar");
+    });
+}
+
+#[gpui::test]
+fn space_find_leaves_a_streaming_turn_alone_until_it_finalizes(cx: &mut TestAppContext) {
+    // A streaming body grows token by token, so matching it would make the
+    // count and the reader's index jitter under their hand mid-turn. It joins
+    // the search through the ordinary path once the turn lands.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            let seq = s.push_streaming_turn_for_test(
+                Some("agent".into()),
+                Some("a3".into()),
+                Default::default(),
+                cx,
+            );
+            s.push_content_delta_for_test(seq, "a kestrel again", cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    view.read_with(&vcx, |v, _| {
+        let nodes: Vec<String> = v
+            .find_matches_for_test()
+            .0
+            .into_iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
+        assert_eq!(
+            nodes,
+            vec!["a1", "a2", "a3"],
+            "the live turn's text is not searched: {nodes:?}"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_searches_a_draft_but_not_its_uncommitted_preedit(cx: &mut TestAppContext) {
+    // The rule that a visible draft matches like a post — and the IME
+    // rule from the *other* editor's side. `MarkdownEditorState` emits `Change`
+    // on every preedit keystroke and offers `is_composing()` to say so, so the
+    // draft is simply not re-projected while a composition is live.
+    use gpui::EntityInputHandler;
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    let draft = view
+        .read_with(&vcx, |v, _| v.tail_draft_state_for_test())
+        .expect("a docked tail draft");
+    draft.update(&mut vcx, |e, cx| {
+        e.set_value("a kestrel of my own".to_string(), cx)
+    });
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    let with_draft = view.read_with(&vcx, |v, _| v.find_matches_for_test().0.len());
+    assert_eq!(with_draft, 4, "the draft's own text is searched too");
+
+    // Now compose in the draft: the fragment must not join the count.
+    vcx.update(|window, cx| {
+        draft.update(cx, |e, cx| {
+            let end = e.value().len();
+            e.replace_and_mark_text_in_range(Some(end..end), " kestrel kestrel", None, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().0.len(),
+            with_draft,
+            "an uncommitted composition adds no matches"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_takes_space_and_keeps_the_readers_place(cx: &mut TestAppContext) {
+    // The bar takes room rather than floating — one that covered the first post
+    // would hide the matches it counts — and opening compensates the page
+    // scroll by exactly the reserve it added, so the words under the reader's
+    // eye do not jump.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let long = "a long paragraph that wraps several times over. ".repeat(24);
+    let mut posts = vec![fixture_user_post("a1", &long)];
+    for i in 2..6u32 {
+        let id = format!("a{i}");
+        let mut p = fixture_assistant_post(&id, &long);
+        p.parent_action_id = Some(format!("a{}", i - 1));
+        posts.push(p);
+    }
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        v.scroll_page_by_for_test(-400.0);
+    });
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let (reserve_before, scroll_before) = view.read_with(&vcx, |v, _| {
+        (v.doc_reserve_for_test(), v.page_scroll_offset_y_for_test())
+    });
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let reserve_after = v.doc_reserve_for_test();
+        let scroll_after = v.page_scroll_offset_y_for_test();
+        let grew = reserve_after - reserve_before;
+        assert!(grew > 0.0, "the bar adds to the document's top reserve");
+        assert!(
+            (scroll_after - (scroll_before - grew)).abs() < 0.5,
+            "…and the page moved by exactly that much: {scroll_before} → {scroll_after}"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_reveals_the_match_it_steps_to(cx: &mut TestAppContext) {
+    // Stepping takes the reader to the match, on the page they are already on —
+    // the search never moves the branch, which is what makes ⌘F safe in a tree.
+    // Under reduce-motion the glide lands instantly, which is what makes the
+    // destination assertable without pumping frame callbacks.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and one last kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel at the top"), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    let (matches, index) = view.read_with(&vcx, |v, _| v.find_matches_for_test());
+    assert_eq!(matches.len(), 2, "one in each end post");
+    assert_eq!(index, Some(1));
+    let at_first = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.find_step(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.find_matches_for_test().1, Some(2));
+        assert!(
+            v.page_scroll_offset_y_for_test() < at_first - 100.0,
+            "the page travelled down to the second match ({} → {})",
+            at_first,
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}

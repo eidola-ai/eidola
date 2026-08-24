@@ -1,0 +1,1308 @@
+//! **Find in the conversation** — ⌘F over the visible branch.
+//!
+//! Three pieces live here: the *searchable projection* of a post (what
+//! read-only rendering actually shows), the [`FindSession`] a window holds
+//! while the bar is open, and the bar itself.
+//!
+//! ## Why a projection at all
+//!
+//! A post's body is markdown **source**, and the editor's highlight plugin
+//! takes **source** byte offsets — so the obvious implementation, scanning the
+//! source, produces a count that lies. A read-only editor hides every
+//! delimiter, and bytes inside a hidden range contribute no display bytes at
+//! all: searching `performance` inside `[perf](https://performance.example)`
+//! would count a match the reader can never see, and paint it as a zero-width
+//! quad. In the other direction, a phrase crossing an emphasis delimiter
+//! (`very **important** thing` searched for `important thing`) plainly matches
+//! what the reader sees and does not match the source.
+//!
+//! So [`searchable_projection`] renders the post exactly as the transcript
+//! does (`render_readonly`) and appends what that render leaves visible,
+//! through [`eidola_app_core::search::ProjectionBuilder`] — which records each
+//! run's source and projected lengths separately, so every match maps back to
+//! a **source** range. The result: the count equals what is highlighted,
+//! matches cross inline markup, and matches inside hidden syntax neither count
+//! nor paint.
+//!
+//! What is deliberately not searchable, because it has no display bytes: a
+//! link's URL, math source, an image's markup and alt text, and an embed
+//! marker. Embedded quoted text is not searchable either — it is re-parsed
+//! standalone by the element layer and is not in the parent document's offset
+//! space, so no source range in this post could name it.
+//!
+//! ## Paying only when find is used
+//!
+//! Building a projection costs a parse and a render pass, so the cache lives
+//! **inside** [`FindSession`]: no session, no cache, and closing the bar drops
+//! every projection with it. That is an invariant rather than an observation,
+//! and it is structural — there is nowhere else for a projection to be kept.
+//! [`SpaceView::projections_built_for_test`] is what lets a test see that none
+//! was *built* either, which no amount of looking at the cache could show.
+
+use std::collections::HashMap;
+use std::ops::Range;
+
+use eidola_app_core::search::{Projection, ProjectionBuilder, Query};
+use gpui::{
+    AnyElement, AppContext, Context, InteractiveElement, IntoElement, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+};
+use gpui_component::{ActiveTheme, h_flex};
+use gpui_markdown_editor::EmbedMap;
+
+use super::layout::{GutterPlacement, compact_gutter_occupancy, page_layout};
+use super::model::{NodeSrc, TreeNode};
+use super::{POST_PAD_Y, SpaceView, TITLE_BAR_RESERVE};
+use crate::focus::TabRegion;
+use crate::overlay::{Contain, Overlay};
+use crate::probe::Probe;
+
+/// The searchable text of one post, with the map back to its markdown source.
+///
+/// Built from the same `render_readonly` pass the transcript paints with, so
+/// what is scanned is what the reader can see. Every span the render hides
+/// contributes nothing, and every span it substitutes (a backslash escape, an
+/// entity reference) is appended as its *displayed* text mapped to the whole
+/// source atom — a match on the `&` of a rendered `&amp;` reports all five
+/// source bytes.
+///
+/// The `embeds` argument matters: a `{{ embed N }}` marker is hidden wholesale
+/// only when its ordinal is **mapped**, and is ordinary literal text when it
+/// is not. Passing the post's own map is what keeps the projection agreeing
+/// with the post's own editor.
+pub(crate) fn searchable_projection(content: &str, embeds: &EmbedMap) -> Projection {
+    let mut state = gpui_markdown_editor::EditorState::with_markdown(content);
+    state.embeds = embeds.clone();
+    let tree = gpui_markdown_editor::parse(&state.markdown);
+    let spec = gpui_markdown_editor::render::render_readonly(&state, &tree);
+
+    let mut builder = ProjectionBuilder::new(content);
+    let mut prev_end: Option<usize> = None;
+    for block in &spec.blocks {
+        let block_range = clamp(&block.source_range, content.len());
+        if block_range.start >= block_range.end {
+            continue;
+        }
+        // **A barrier between blocks.** Two adjacent paragraphs are two
+        // separate things on the page, so a query must not match across the
+        // gap between them — but the gap's bytes are not a run of their own,
+        // and a fabricated separator would be projected text mapping to no
+        // source. So one real newline out of the gap is copied instead: it is
+        // a byte the source has, at a place the reader really does see a line
+        // break, and a find query typed into a one-line field can never
+        // contain one.
+        if let Some(prev) = prev_end
+            && prev <= block_range.start
+            && let Some(offset) = content[prev..block_range.start].find('\n')
+        {
+            builder.copy(prev + offset..prev + offset + 1);
+        }
+        append_block(&mut builder, content, block, block_range.clone());
+        prev_end = Some(block_range.end.max(prev_end.unwrap_or(0)));
+    }
+    builder.finish()
+}
+
+/// What the walk over one block's source finds at a given byte.
+enum Mark<'a> {
+    /// Bytes the render replaces with display text of its own.
+    Substitute(&'a str),
+    /// Bytes the render shows nothing for.
+    Skip,
+}
+
+fn append_block(
+    builder: &mut ProjectionBuilder<'_>,
+    content: &str,
+    block: &gpui_markdown_editor::RenderBlock,
+    block_range: Range<usize>,
+) {
+    let mut marks: Vec<(Range<usize>, Mark<'_>)> = Vec::new();
+    for sub in &block.substitutions {
+        let r = clamp(&sub.source_range, content.len());
+        if r.start < r.end {
+            marks.push((r, Mark::Substitute(sub.display.as_str())));
+        }
+    }
+    for hidden in &block.hidden_ranges {
+        let r = clamp(hidden, content.len());
+        if r.start < r.end {
+            marks.push((r, Mark::Skip));
+        }
+    }
+    // **Inline math and inline images carry no hidden range of their own.**
+    // The render layer deliberately leaves suppressing their source bytes to
+    // the element layer, which does it differently per typeset outcome (a
+    // width-matched substitution on success, the raw LaTeX shaped as a
+    // fallback on failure) — so a projection reading `hidden_ranges` alone
+    // would make a URL, an alt text and a `\frac` matchable. Only the
+    // *promoted block* forms (a sole-image paragraph, a `$$…$$` block) hide
+    // themselves.
+    for math in &block.math_overlays {
+        let r = clamp(&math.source_range, content.len());
+        if r.start < r.end {
+            marks.push((r, Mark::Skip));
+        }
+    }
+    for image in &block.image_overlays {
+        let r = clamp(&image.source_range, content.len());
+        if r.start < r.end {
+            marks.push((r, Mark::Skip));
+        }
+    }
+    // Substitutions before skips at the same start: an escape or an entity is
+    // recorded as both (hidden bytes, displayed replacement), and the
+    // replacement is what the reader sees.
+    marks.sort_by_key(|(r, mark)| (r.start, matches!(mark, Mark::Skip), r.end));
+
+    let mut pos = block_range.start;
+    let mut next = 0usize;
+    while pos < block_range.end {
+        // Drop marks the walk has already passed.
+        while next < marks.len() && marks[next].0.end <= pos {
+            next += 1;
+        }
+        let Some((range, mark)) = marks.get(next) else {
+            builder.copy(pos..block_range.end);
+            break;
+        };
+        if range.start >= block_range.end {
+            builder.copy(pos..block_range.end);
+            break;
+        }
+        if range.start > pos {
+            builder.copy(pos..range.start);
+            pos = range.start;
+            continue;
+        }
+        // The mark covers `pos`. A substitution is appended whole (its source
+        // span is one atom); a hidden span contributes nothing at all.
+        if let Mark::Substitute(display) = mark
+            && range.start == pos
+        {
+            builder.substitute(range.clone(), display);
+        }
+        pos = range.end.min(block_range.end).max(pos);
+        next += 1;
+    }
+}
+
+fn clamp(range: &Range<usize>, len: usize) -> Range<usize> {
+    range.start.min(len)..range.end.min(len)
+}
+
+/// One match: where it is, and the identity that lets the current-match anchor
+/// survive the transcript being replaced under it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Match {
+    /// The tree node the match is in — a post's action id, or a draft's
+    /// sentinel id. What keys the body editor whose highlight layer paints it.
+    pub(crate) node: SharedString,
+    /// The post's **item** id, which survives an edit or a regeneration where
+    /// the action id does not. `None` for a draft and for an optimistic row.
+    pub(crate) item_id: Option<SharedString>,
+    /// This match's index within its own node, in projection order — the half
+    /// of the anchor that says *which* match, once the item says which post.
+    pub(crate) ordinal: usize,
+    /// The byte range in the node's markdown source. What
+    /// `set_highlights_in` takes, and what `content_y_for_offset` resolves.
+    pub(crate) source: Range<usize>,
+    /// Where the match sits in the node's source, as a fraction of its length.
+    ///
+    /// The honest approximation two surfaces need before anything has been
+    /// laid out: the minimap tick's position within its cell, and the reveal's
+    /// first phase for a post that has not rendered for real. Both correct
+    /// themselves once the post is measured — the cell from the height cache,
+    /// the reveal from `content_y_for_offset`.
+    pub(crate) fraction: f32,
+}
+
+/// The anchor for "the current match": an identity, never an index into the
+/// match list.
+///
+/// A `Change::Space` fires on every post, turn, memory write and background
+/// summary pass; each one reloads the transcript and replaces `posts`, and an
+/// edit or regeneration mints a **new action id** for the same post. An index
+/// would then name a different match, and an action id would name nothing —
+/// the defect `retarget_tree_focus` and `rethread_drafts` already forward
+/// through item identity to avoid. So the anchor is `(item, ordinal)` where
+/// the node has an item, and falls back to the node id for a draft, which has
+/// no durable identity but also cannot be superseded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MatchAnchor {
+    pub(crate) key: SharedString,
+    pub(crate) ordinal: usize,
+}
+
+impl MatchAnchor {
+    fn of(m: &Match) -> Self {
+        Self {
+            key: m.item_id.clone().unwrap_or_else(|| m.node.clone()),
+            ordinal: m.ordinal,
+        }
+    }
+}
+
+/// A reveal waiting for the post it names to render for real.
+///
+/// Revealing a match is two-phase because only posts intersecting the viewport
+/// render a real `MarkdownEditor`: everything else is a sized placeholder with
+/// no shaped lines and therefore no per-offset geometry. Phase 1 glides to an
+/// estimate (the match's byte fraction of the post's height); phase 2 corrects
+/// it once `content_y_for_offset` answers. Like `PendingSelect` and the tail
+/// pin, the reader takes it back the moment they scroll, navigate or type.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingReveal {
+    pub(crate) node: SharedString,
+    pub(crate) offset: usize,
+}
+
+/// Everything one window holds while its find bar is open.
+///
+/// Window-local by the same rule the composer draft is: two windows on one
+/// space are two cursors, so they are two searches (`STATE.md`'s scoping
+/// table). The projection cache lives here rather than beside the body
+/// editors, which is what makes "no projection while no session is open"
+/// structural.
+pub(crate) struct FindSession {
+    /// The query field. A `gpui_component::Input`, whose preedit path emits no
+    /// `InputEvent::Change` — which is exactly why the search is driven by
+    /// that event and never by an observer or a render-time `value()` read
+    /// (both of which see uncommitted preedit, so a reader composing in
+    /// Chinese or Japanese would search fragments they have not chosen).
+    pub(crate) input: gpui::Entity<gpui_component::input::InputState>,
+    /// The field's subscription — `Change` re-runs the search, `PressEnter`
+    /// steps. Held so it dies with the session.
+    pub(crate) _sub: gpui::Subscription,
+    /// The last **committed** query text, as the search last ran it. Held so
+    /// the search can be re-run against a changed transcript without reading
+    /// the field (see above).
+    pub(crate) text: String,
+    /// The prepared query, or `None` while the field is empty.
+    pub(crate) query: Option<Query>,
+    /// Every match on the visible branch, in document order.
+    pub(crate) matches: Vec<Match>,
+    /// Which match the readout counts as current.
+    pub(crate) anchor: Option<MatchAnchor>,
+    /// Per-node searchable projections, keyed by node id, each remembered with
+    /// the content it was built from so a post whose text changed re-projects
+    /// and one that did not is free.
+    pub(crate) projections: HashMap<SharedString, (SharedString, Projection)>,
+    /// A reveal waiting for its post to render for real.
+    pub(crate) pending_reveal: Option<PendingReveal>,
+    /// The bar's own focus handle — the destination when ⌘F re-focuses an open
+    /// bar, and the subtree containment is asked of when the bar closes.
+    pub(crate) focus: gpui::FocusHandle,
+    /// The placeholder the field was last seeded with.
+    ///
+    /// A localized string held in state would be a cached render decision —
+    /// `i18n::apply` refreshes every window and the field would keep painting
+    /// the old language. This is not that: it is the *seed*, compared against
+    /// a freshly formatted message each render so the field is re-seeded
+    /// exactly when the wording moves (the inspector title's shape).
+    pub(crate) placeholder: SharedString,
+    /// Where the keyboard was when the bar opened, so closing it can put the
+    /// reader back rather than dropping focus on the floor.
+    pub(crate) returned_focus: Option<gpui::FocusHandle>,
+}
+
+impl FindSession {
+    /// The current match, if the anchor still names one.
+    pub(crate) fn current(&self) -> Option<&Match> {
+        current_match(&self.matches, &self.anchor)
+    }
+
+    /// The current match's position in the readout, 1-based.
+    pub(crate) fn current_index(&self) -> Option<usize> {
+        current_position(&self.matches, &self.anchor).map(|i| i + 1)
+    }
+
+    /// Re-anchor after the match list has been rebuilt.
+    pub(crate) fn reanchor(&mut self, previous: Option<(MatchAnchor, usize)>) {
+        reanchor(&self.matches, &mut self.anchor, previous);
+    }
+
+    /// Step the anchor by one match, wrapping at both ends.
+    pub(crate) fn step(&mut self, forward: bool) -> Option<Match> {
+        step_anchor(&self.matches, &mut self.anchor, forward)
+    }
+}
+
+fn current_position(matches: &[Match], anchor: &Option<MatchAnchor>) -> Option<usize> {
+    let anchor = anchor.as_ref()?;
+    matches.iter().position(|m| &MatchAnchor::of(m) == anchor)
+}
+
+fn current_match<'a>(matches: &'a [Match], anchor: &Option<MatchAnchor>) -> Option<&'a Match> {
+    current_position(matches, anchor).map(|i| &matches[i])
+}
+
+/// Re-anchor after the match list has been rebuilt: keep the same match if it
+/// is still there, else the same **item** clamped to its new count, else the
+/// nearest match at or after where the old one stood in document order.
+///
+/// This is `retarget_tree_focus`'s rule, applied to a different window-local
+/// reference to a post — and for the same reason: an edit or a regeneration
+/// replaces a post's action id while the post itself stays, so an anchor that
+/// could only be matched exactly would jump the reader back to the first match
+/// every time a background write landed. `Change::Space` fires on every post,
+/// turn, memory write and background summary pass, so that is often.
+fn reanchor(
+    matches: &[Match],
+    anchor: &mut Option<MatchAnchor>,
+    previous: Option<(MatchAnchor, usize)>,
+) {
+    if matches.is_empty() {
+        *anchor = None;
+        return;
+    }
+    let Some((was, position)) = previous else {
+        *anchor = Some(MatchAnchor::of(&matches[0]));
+        return;
+    };
+    let found = matches
+        .iter()
+        .find(|m| MatchAnchor::of(m) == was)
+        // The item survives; its match count may not. Clamp to the last match
+        // the item still has.
+        .or_else(|| matches.iter().rfind(|m| MatchAnchor::of(m).key == was.key));
+    *anchor = Some(MatchAnchor::of(match found {
+        Some(m) => m,
+        // The item is gone: the nearest match at or after where it stood.
+        None => &matches[position.min(matches.len() - 1)],
+    }));
+}
+
+/// Step the anchor by one match, wrapping at both ends — what makes the
+/// readout an index rather than a running total.
+fn step_anchor(
+    matches: &[Match],
+    anchor: &mut Option<MatchAnchor>,
+    forward: bool,
+) -> Option<Match> {
+    if matches.is_empty() {
+        *anchor = None;
+        return None;
+    }
+    let at = current_position(matches, anchor);
+    let next = match (at, forward) {
+        (None, true) => 0,
+        (None, false) => matches.len() - 1,
+        (Some(i), true) => (i + 1) % matches.len(),
+        (Some(i), false) => (i + matches.len() - 1) % matches.len(),
+    };
+    *anchor = Some(MatchAnchor::of(&matches[next]));
+    Some(matches[next].clone())
+}
+
+// ---------------------------------------------------------------------------
+// The view's half: the session's lifecycle, the bar, and the reveal.
+// ---------------------------------------------------------------------------
+
+/// The find bar's control row — the height it adds to `doc_reserve` while a
+/// session is open, *below* the window's drag band. The bar's surface spans
+/// from the window top so it reads as one panel behind the traffic lights; its
+/// controls sit under the band so the drag gesture keeps its strip.
+pub(crate) const FIND_BAR_H: f32 = 44.0;
+
+/// One node the search covers, in document order.
+struct ScopeNode {
+    node: SharedString,
+    item_id: Option<SharedString>,
+    content: SharedString,
+    embeds: EmbedMap,
+    /// A draft whose editor is mid-IME-composition. Its buffer holds preedit
+    /// the reader has not chosen, so a cached projection is reused and a
+    /// missing one is simply not built — the count never flickers against
+    /// fragments (`MarkdownEditorState::is_composing`).
+    frozen: bool,
+}
+
+impl SpaceView {
+    /// What the open find bar adds to the document's top reserve.
+    pub(crate) fn find_bar_h(&self) -> f32 {
+        if self.find.is_some() { FIND_BAR_H } else { 0.0 }
+    }
+
+    /// ⌘F — open the bar, or re-focus the field of one already open (the macOS
+    /// convention). Opening compensates the page scroll by the reserve it
+    /// adds, so the reader's content does not jump out from under them.
+    pub(crate) fn open_find(
+        &mut self,
+        _: &crate::actions::FindInSpace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.find.as_ref() {
+            let input = session.input.clone();
+            input.update(cx, |s, cx| s.focus(window, cx));
+            cx.notify();
+            return;
+        }
+        let placeholder = crate::i18n::msg::find_placeholder(cx);
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx).placeholder(placeholder.clone())
+        });
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, state, ev: &gpui_component::input::InputEvent, window, cx| match ev {
+                // **The one rule the search is driven by.** `InputState`'s
+                // preedit path notifies without emitting `Change`, so reading
+                // the value *here* reads committed text — where an observer or
+                // a render-time `value()` read would see the spliced preedit.
+                gpui_component::input::InputEvent::Change => {
+                    let text = state.read(cx).value().to_string();
+                    this.set_find_query(text, window, cx);
+                }
+                gpui_component::input::InputEvent::PressEnter { shift, .. } => {
+                    this.find_step(!shift, window, cx);
+                }
+                _ => {}
+            },
+        );
+        // Where the keyboard was, so closing puts the reader back rather than
+        // dropping focus on a handle nobody paints.
+        let returned = self.keyboard_home();
+        self.find = Some(FindSession {
+            input: input.clone(),
+            _sub: sub,
+            text: String::new(),
+            query: None,
+            matches: Vec::new(),
+            anchor: None,
+            projections: HashMap::new(),
+            pending_reveal: None,
+            focus: cx.focus_handle(),
+            placeholder,
+            returned_focus: Some(returned),
+        });
+        // The document grew a reserve at its top; move the page by the same
+        // amount so the words under the reader's eye stay where they were.
+        self.set_page_scroll_y(self.page_scroll.offset().y.as_f32() - FIND_BAR_H);
+        input.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Close the session: drop the projections, clear the match layers, and
+    /// hand the keyboard back. Returns whether there was one to close (the
+    /// Escape rung's answer).
+    #[doc(hidden)]
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.find.take() else {
+            return false;
+        };
+        // Only from a bar that is actually holding the keyboard — a reader
+        // composing beside it never lent it (the handback rule every form in
+        // this window owes).
+        let held = session.focus.contains_focused(window, cx);
+        let back = session.returned_focus.clone();
+        drop(session);
+        self.set_page_scroll_y(self.page_scroll.offset().y.as_f32() + FIND_BAR_H);
+        if held {
+            let back = back.unwrap_or_else(|| self.keyboard_home());
+            window.focus(&back, cx);
+        }
+        // The match layers are cleared on the next `sync_references`, which now
+        // sees no session and writes empty sets.
+        cx.notify();
+        true
+    }
+
+    /// Whether the find surface currently owns the keyboard — what gates the
+    /// Escape rung, so an Escape in the composer still deactivates the draft.
+    pub(crate) fn find_holds_focus(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.find
+            .as_ref()
+            .is_some_and(|s| s.focus.contains_focused(window, cx))
+    }
+
+    /// Apply a committed query. Never called from an observer or a render.
+    fn set_find_query(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.find.as_mut() else {
+            return;
+        };
+        if session.text == text {
+            return;
+        }
+        session.query = Query::new(&text);
+        session.text = text;
+        // A new query re-anchors from the reader's own place rather than
+        // stepping from the old match, which belonged to a different search.
+        session.anchor = None;
+        session.pending_reveal = None;
+        self.reveal_find_anchor(window, cx);
+        cx.notify();
+    }
+
+    /// Return / Shift-Return and the prev/next arrows: step the anchor and
+    /// reveal where it landed. Both wrap.
+    #[doc(hidden)]
+    pub fn find_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.find.as_mut() else {
+            return;
+        };
+        session.step(forward);
+        self.reveal_find_anchor(window, cx);
+        cx.notify();
+    }
+
+    /// Recompute the match set against this frame's visible branch.
+    ///
+    /// Run every frame a session is open rather than invalidated by hand: the
+    /// scope is a function of the *selected path*, which the branch scrollers
+    /// decide at render time, so there is no event a "recompute now" could
+    /// hang off that a wheel gesture would not miss. The cost is the scan, not
+    /// the projections — those are cached per node against the content they
+    /// were built from, so an unchanged post is a string comparison.
+    pub(crate) fn sync_find(
+        &mut self,
+        tree: &[TreeNode],
+        page_width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find.is_none() {
+            return;
+        }
+        let scope = self.find_scope(tree, page_width, cx);
+        let mut session = self.find.take().expect("checked above");
+        let previous = session.anchor.clone().map(|a| {
+            (
+                a,
+                current_position(&session.matches, &session.anchor).unwrap_or(0),
+            )
+        });
+        session.matches.clear();
+        session
+            .projections
+            .retain(|node, _| scope.iter().any(|s| &s.node == node));
+
+        if let Some(query) = session.query.clone() {
+            for entry in &scope {
+                // **A composing draft is never re-projected.** Its buffer holds
+                // preedit the reader has not chosen, so the projection it
+                // already has — of the text they *have* — is what the count
+                // keeps reporting until the composition commits. With nothing
+                // cached the draft is simply not searched yet; either way the
+                // count never moves against a fragment.
+                let cached = session
+                    .projections
+                    .get(&entry.node)
+                    .is_some_and(|(seed, _)| entry.frozen || seed == &entry.content);
+                if !cached {
+                    if entry.frozen {
+                        continue;
+                    }
+                    let projection = searchable_projection(&entry.content, &entry.embeds);
+                    self.projections_built.set(self.projections_built.get() + 1);
+                    session
+                        .projections
+                        .insert(entry.node.clone(), (entry.content.clone(), projection));
+                }
+                let Some((_, projection)) = session.projections.get(&entry.node) else {
+                    continue;
+                };
+                let len = entry.content.len().max(1) as f32;
+                for (ordinal, source) in projection.find(&query).into_iter().enumerate() {
+                    session.matches.push(Match {
+                        node: entry.node.clone(),
+                        item_id: entry.item_id.clone(),
+                        ordinal,
+                        fraction: (source.start as f32 / len).clamp(0.0, 1.0),
+                        source,
+                    });
+                }
+            }
+        }
+        session.reanchor(previous);
+        self.find = Some(session);
+        self.correct_find_reveal(tree, page_width, window, cx);
+    }
+
+    /// The nodes the search covers, in document order.
+    ///
+    /// Every post on the selected path, plus every draft that renders — a
+    /// draft on the path, and the **active** one regardless of branch, since it
+    /// floats over whatever is showing. A streaming leaf is deliberately out:
+    /// its body grows token by token, so matching it would make the count and
+    /// the reader's index jitter under their hand for no gain. It enters
+    /// through the ordinary path when the turn finalizes and the transcript
+    /// reloads.
+    fn find_scope(&self, tree: &[TreeNode], page_width: Pixels, cx: &gpui::App) -> Vec<ScopeNode> {
+        let mut scope: Vec<ScopeNode> = Vec::new();
+        let mut seen: Vec<SharedString> = Vec::new();
+        for (sibs, active) in self.selected_levels(tree, page_width) {
+            let node = sibs[active];
+            match node.src {
+                NodeSrc::Msg(i) => {
+                    let post = &self.posts[i];
+                    let embeds = EmbedMap::new(post.references.iter().filter_map(|r| {
+                        Some((
+                            u64::try_from(r.ordinal).ok().filter(|o| *o > 0)?,
+                            r.snippet.clone()?,
+                        ))
+                    }));
+                    seen.push(node.id.clone());
+                    scope.push(ScopeNode {
+                        node: node.id.clone(),
+                        item_id: post.item_id.clone(),
+                        content: post.content.clone(),
+                        embeds,
+                        frozen: false,
+                    });
+                }
+                NodeSrc::Draft => {
+                    if let Some(entry) = self.draft_scope_node(&node.id, cx) {
+                        seen.push(node.id.clone());
+                        scope.push(entry);
+                    }
+                }
+                NodeSrc::Streaming(_) => {}
+            }
+        }
+        // The active draft floats over whatever is showing, so it is in scope
+        // even when its own branch is not the selected one — an active
+        // composer for a draft belonging to another branch still matches.
+        if let Some(active) = self.active_draft.clone()
+            && !seen.contains(&active)
+            && let Some(entry) = self.draft_scope_node(&active, cx)
+        {
+            scope.push(entry);
+        }
+        scope
+    }
+
+    fn draft_scope_node(&self, id: &SharedString, cx: &gpui::App) -> Option<ScopeNode> {
+        let draft = self.drafts.iter().find(|d| &d.id == id)?;
+        let editor = draft.editor.read(cx);
+        Some(ScopeNode {
+            node: draft.id.clone(),
+            item_id: None,
+            content: SharedString::from(editor.value().to_string()),
+            embeds: EmbedMap::new(draft.embed_map()),
+            frozen: editor.is_composing(),
+        })
+    }
+
+    /// The match ranges to paint on one node: the ordinary matches, and the
+    /// current one on its own layer above them.
+    pub(crate) fn find_match_ranges(
+        &self,
+        node: &SharedString,
+    ) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+        let Some(session) = self.find.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        let current = session.current();
+        let mut all = Vec::new();
+        let mut active = Vec::new();
+        for m in session.matches.iter().filter(|m| &m.node == node) {
+            if Some(m) == current {
+                active.push(m.source.clone());
+            } else {
+                all.push(m.source.clone());
+            }
+        }
+        (all, active)
+    }
+
+    /// The minimap's tick positions for one node: `(fraction, is_current)`.
+    pub(crate) fn find_ticks(&self, node: &SharedString) -> Vec<(f32, bool)> {
+        let Some(session) = self.find.as_ref() else {
+            return Vec::new();
+        };
+        let current = session.current();
+        session
+            .matches
+            .iter()
+            .filter(|m| &m.node == node)
+            .map(|m| (m.fraction, Some(m) == current))
+            .collect()
+    }
+
+    /// Phase 1 of the reveal: glide to where the current match is *estimated*
+    /// to be, and record the correction the second phase owes.
+    ///
+    /// Estimated because only posts intersecting the viewport render a real
+    /// editor; everything else is a sized placeholder with no shaped lines and
+    /// therefore no per-offset geometry. The branch never changes — every match
+    /// is already on the visible path — so this is a plain page scroll.
+    fn reveal_find_anchor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = self.find.as_ref().and_then(|s| s.current().cloned()) else {
+            return;
+        };
+        let viewport = self.page_size(window);
+        let (page_width, window_h) = (viewport.width, viewport.height);
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let rem = window.rem_size();
+        let Some((top, bottom)) = self.match_doc_span(&tree, &m, page_width, window_h, rem, cx)
+        else {
+            return;
+        };
+        let y = self.find_reveal_offset(top, bottom, window_h);
+        // **After** the glide, which itself counts as the reader being taken
+        // somewhere and so clears any reveal already pending
+        // (`demote_tail_pin_for_reader`).
+        self.glide_page_to(y, window, cx);
+        if let Some(session) = self.find.as_mut() {
+            session.pending_reveal = Some(PendingReveal {
+                node: m.node.clone(),
+                offset: m.source.start,
+            });
+        }
+    }
+
+    /// Phase 2: once the target post has rendered for real,
+    /// `content_y_for_offset` answers and the position is corrected in place.
+    /// The reader takes it back the moment they scroll, navigate or type — the
+    /// pending reveal is dropped by the same seams that cancel a glide.
+    fn correct_find_reveal(
+        &mut self,
+        tree: &[TreeNode],
+        page_width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.find.as_ref().and_then(|s| s.pending_reveal.clone()) else {
+            return;
+        };
+        // Nothing to correct until the editor has painted.
+        let answered = self
+            .bodies
+            .get(&pending.node)
+            .or_else(|| {
+                self.drafts
+                    .iter()
+                    .find(|d| d.id == pending.node)
+                    .map(|d| &d.editor)
+            })
+            .and_then(|e| e.read(cx).content_y_for_offset(pending.offset))
+            .is_some();
+        if !answered {
+            return;
+        }
+        let Some(m) = self.find.as_ref().and_then(|s| s.current().cloned()) else {
+            return;
+        };
+        let window_h = self.page_size(window).height;
+        let rem = window.rem_size();
+        let Some((top, bottom)) = self.match_doc_span(tree, &m, page_width, window_h, rem, cx)
+        else {
+            return;
+        };
+        // A glide already in flight owns the page; correcting under it would be
+        // overwritten on its next frame, so the correction waits for it — and
+        // the reveal stays pending, or the frame after the glide would have
+        // nothing left to correct.
+        if self.page_glide.get().is_some() {
+            return;
+        }
+        if let Some(session) = self.find.as_mut() {
+            session.pending_reveal = None;
+        }
+        let y = self.find_reveal_offset(top, bottom, window_h);
+        self.set_page_scroll_y(y);
+    }
+
+    /// The page offset that brings a document span into view with the same
+    /// minimal-motion rule keyboard navigation uses.
+    fn find_reveal_offset(&self, top: f32, bottom: f32, window_h: Pixels) -> f32 {
+        super::keyboard::scroll_into_view(
+            top,
+            bottom,
+            super::keyboard::RevealViewport {
+                height: window_h.as_f32(),
+                // The find bar covers the document's top for its whole height.
+                top_inset: self.doc_reserve(),
+                bottom_inset: if self.active_draft.is_some() {
+                    self.composer_float_bar_h(window_h)
+                } else {
+                    0.0
+                },
+            },
+            self.page_scroll.offset().y.as_f32(),
+            self.scroll_min_y.get(),
+            FIND_REVEAL_MARGIN,
+        )
+    }
+
+    /// A match's vertical span in document space.
+    ///
+    /// Exact once the post's editor has painted (`content_y_for_offset`), an
+    /// honest estimate before that (the match's byte fraction of the node's
+    /// height). The editor's own top within the slot is `POST_PAD_Y`, plus the
+    /// stacked metadata row in the compact scheme — the same two terms the
+    /// docked composer's caret reveal folds in. **Accepted imprecision:** a
+    /// post whose reasoning disclosure is open carries that disclosure above
+    /// its body, so the exact arm lands a disclosure's height high; the reveal
+    /// margin absorbs it and the highlight is what the reader is looking for.
+    fn match_doc_span(
+        &self,
+        tree: &[TreeNode],
+        m: &Match,
+        page_width: Pixels,
+        window_h: Pixels,
+        rem_size: Pixels,
+        cx: &gpui::App,
+    ) -> Option<(f32, f32)> {
+        let top = self.selected_path_doc_top(tree, &m.node, page_width, window_h)?;
+        let node = super::model::node_ref(tree, &m.node)?;
+        let height = self.node_height(node, page_width, window_h);
+        let pad = POST_PAD_Y.as_f32();
+        let editor = self.bodies.get(&m.node).or_else(|| {
+            self.drafts
+                .iter()
+                .find(|d| d.id == m.node)
+                .map(|d| &d.editor)
+        });
+        let stacked = page_layout(page_width).gutters == GutterPlacement::Stacked;
+        let metadata = if stacked {
+            compact_gutter_occupancy(rem_size)
+        } else {
+            0.0
+        };
+        match editor.and_then(|e| e.read(cx).content_y_for_offset(m.source.start)) {
+            Some((t, b)) => {
+                let base = top + pad + metadata;
+                Some((base + t.as_f32(), base + b.as_f32()))
+            }
+            None => {
+                let body = (height - 2.0 * pad).max(1.0);
+                let y = top + pad + m.fraction * body;
+                Some((y, y + FIND_ESTIMATED_LINE_H))
+            }
+        }
+    }
+}
+
+impl SpaceView {
+    /// The floating bar.
+    ///
+    /// Its **surface** spans from the window top so it reads as one panel
+    /// behind the traffic lights; its **controls** sit below
+    /// [`TITLE_BAR_RESERVE`], where the drag band — registered after it, and so
+    /// winning the hitboxes it covers — leaves them alone. It takes space
+    /// rather than floating over the first post ([`SpaceView::doc_reserve`]
+    /// grows by [`FIND_BAR_H`]), because a bar that covered the matches it is
+    /// counting would be the one thing find must not do.
+    pub(crate) fn render_find_bar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        self.find.as_ref()?;
+        self.sync_find_placeholder(window, cx);
+        let (bg, border, muted) = {
+            let theme = cx.theme();
+            (theme.background, theme.border, theme.muted_foreground)
+        };
+        let (index, total) = {
+            let session = self.find.as_ref().expect("checked");
+            (session.current_index(), session.matches.len())
+        };
+        let has_query = self.find.as_ref().is_some_and(|s| s.query.is_some());
+        let input = self.find.as_ref().expect("checked").input.clone();
+        let focus = self.find.as_ref().expect("checked").focus.clone();
+
+        // The readout is a `Label` whose **label and value are the same short
+        // sentence** — the notices' shape, so it starts speaking the day gpui
+        // gains `aria_live` and is perceivable by review today.
+        let readout: SharedString = match (has_query, index) {
+            (false, _) => SharedString::default(),
+            (true, Some(i)) => crate::i18n::msg::find_count(cx, i, total),
+            (true, None) => crate::i18n::msg::find_no_results(cx),
+        };
+        let steppable = total > 0;
+
+        let controls = h_flex()
+            .absolute()
+            .top(TITLE_BAR_RESERVE)
+            .left_0()
+            .right_0()
+            .h(px(FIND_BAR_H))
+            .px_3()
+            .gap_2()
+            .items_center()
+            // The glyph a sighted reader sees and the sentence a screen reader
+            // hears are different things — the × says nothing on its own.
+            .child(crate::participants::ghost_button_labeled(
+                "space-find-close".into(),
+                "space/find/close".into(),
+                "✕",
+                crate::i18n::msg::find_close(cx),
+                false,
+                cx,
+                cx.listener(|this, _, window, cx| {
+                    this.close_find(window, cx);
+                }),
+            ))
+            .child(
+                div()
+                    .id("space-find-field-wrap")
+                    .flex_1()
+                    .min_w_0()
+                    // The `Input` owns the focus handle and is therefore the
+                    // accessible node (the two-regime rule); the wrapper is
+                    // bounds-only.
+                    .probe_bounds(
+                        "space/find/field",
+                        gpui::Role::TextInput,
+                        crate::i18n::msg::find_field_label(cx),
+                    )
+                    .child(
+                        gpui_component::input::Input::new(&input)
+                            .aria_label(crate::i18n::msg::find_field_label(cx)),
+                    ),
+            )
+            .child(self.find_step_button(
+                "space-find-prev",
+                "space/find/previous",
+                "‹",
+                crate::i18n::msg::find_previous(cx),
+                steppable,
+                false,
+                cx,
+            ))
+            .child(self.find_step_button(
+                "space-find-next",
+                "space/find/next",
+                "›",
+                crate::i18n::msg::find_next(cx),
+                steppable,
+                true,
+                cx,
+            ))
+            .child(
+                div()
+                    .id("space-find-count")
+                    .probe_value(
+                        "space/find/count",
+                        gpui::Role::Label,
+                        readout.clone(),
+                        readout.clone(),
+                    )
+                    .flex_none()
+                    .min_w(px(64.))
+                    .text_sm()
+                    .text_color(muted)
+                    .child(readout),
+            );
+
+        Some(
+            crate::chrome::round_top_client_corners(div(), window)
+                .id("space-find-bar")
+                .track_focus(&focus)
+                // Its own tab region, ahead of the conversation: the reader
+                // opened this over the page and is acting in it, so Tab should
+                // reach its verbs without walking the transcript first.
+                .tab_region(crate::focus::region::FIND)
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(TITLE_BAR_RESERVE.as_f32() + FIND_BAR_H))
+                .bg(bg)
+                .border_b_1()
+                .border_color(border)
+                // Opaque, with nothing of its own to scroll.
+                .contain_mouse(Overlay::Popover)
+                .child(controls)
+                .into_any_element(),
+        )
+    }
+
+    /// One of the two step arrows. **One predicate decides both tab-stopness
+    /// and activation**, so a bar that is focused when the last match
+    /// disappears cannot keep a live `on_click` for a step that does nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn find_step_button(
+        &self,
+        id: &'static str,
+        probe: &'static str,
+        glyph: &'static str,
+        aria: SharedString,
+        enabled: bool,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = cx.theme();
+        let el = div()
+            .id(id)
+            .probe(probe, gpui::Role::Button, aria)
+            .flex_none()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .text_sm();
+        if enabled {
+            el.cursor_pointer()
+                .text_color(theme.muted_foreground)
+                .hover(|s| {
+                    s.bg(theme.secondary.opacity(0.6))
+                        .text_color(theme.foreground)
+                })
+                .child(glyph)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.find_step(forward, window, cx);
+                }))
+        } else {
+            el.text_color(theme.muted_foreground.opacity(0.4))
+                .tab_stop(false)
+                .child(glyph)
+        }
+    }
+
+    /// Re-seed the field's placeholder when the wording moves — a locale change
+    /// refreshes every window, and the placeholder lives inside the field's
+    /// state rather than being chosen at render.
+    fn sync_find_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fresh = crate::i18n::msg::find_placeholder(cx);
+        let Some(session) = self.find.as_mut() else {
+            return;
+        };
+        if session.placeholder == fresh {
+            return;
+        }
+        session.placeholder = fresh.clone();
+        let input = session.input.clone();
+        input.update(cx, |s, cx| s.set_placeholder(fresh, window, cx));
+    }
+}
+
+/// How much of the viewport to keep clear around a revealed match — the
+/// keyboard reveal's margin, for the same reason: a match flush against the
+/// fold reads as cut off.
+const FIND_REVEAL_MARGIN: f32 = 24.0;
+
+/// The height an unmeasured match is assumed to occupy, for the estimated
+/// first phase only. One prose line is close enough to place the scroll; the
+/// correction replaces it as soon as the post paints.
+const FIND_ESTIMATED_LINE_H: f32 = 28.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project(source: &str) -> Projection {
+        searchable_projection(source, &EmbedMap::default())
+    }
+
+    fn find(source: &str, query: &str) -> Vec<String> {
+        let projection = project(source);
+        let query = Query::new(query).expect("non-empty");
+        projection
+            .find(&query)
+            .into_iter()
+            .map(|r| source[r].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_links_url_is_not_searchable_but_its_text_is() {
+        let source = "See [the report](https://performance.example/perf).";
+        assert!(!project(source).text().contains("performance.example"));
+        assert!(find(source, "performance").is_empty());
+        assert_eq!(find(source, "report"), vec!["report".to_string()]);
+    }
+
+    #[test]
+    fn a_phrase_crossing_an_emphasis_delimiter_matches_what_the_reader_sees() {
+        let source = "a very **important** thing";
+        // The naive source scan finds nothing here — the delimiters are in the
+        // way — while the reader plainly sees the phrase.
+        assert!(!source.contains("important thing"));
+        let hits = find(source, "important thing");
+        assert_eq!(hits.len(), 1);
+        // Mapped back through the projection the source range covers the
+        // delimiters it spans, which is the honest direction: it contains
+        // everything the reader was shown.
+        assert!(hits[0].contains("important"));
+        assert!(hits[0].ends_with("thing"));
+    }
+
+    #[test]
+    fn an_entity_matches_as_the_character_it_renders_as() {
+        let source = "Tom &amp; Jerry";
+        assert_eq!(project(source).text(), "Tom & Jerry");
+        assert_eq!(find(source, "m & j"), vec!["m &amp; J".to_string()]);
+    }
+
+    #[test]
+    fn inline_math_and_image_markup_are_not_searchable() {
+        // Neither carries a hidden range in the render spec — the element
+        // layer suppresses them — so a projection reading `hidden_ranges`
+        // alone would make both matchable. This is the arm that pins the
+        // projection excluding them itself.
+        let math = "before $\\alpha_{beta}$ after";
+        assert!(find(math, "beta").is_empty());
+        assert_eq!(find(math, "before"), vec!["before".to_string()]);
+
+        let image = "look ![a red kite](https://example/kite.png) here";
+        assert!(find(image, "kite").is_empty());
+        assert!(find(image, "red").is_empty());
+        assert_eq!(find(image, "look"), vec!["look".to_string()]);
+    }
+
+    #[test]
+    fn a_mapped_embed_marker_is_not_searchable_and_an_unmapped_one_is() {
+        let source = "{{ embed 1 }}";
+        let mapped = searchable_projection(source, &EmbedMap::new([(1, "quoted".to_string())]));
+        assert!(mapped.text().trim().is_empty());
+        // An ordinal with no reference behind it is ordinary text — which is
+        // also how a marker looks before its reference exists.
+        let unmapped = project(source);
+        assert!(unmapped.text().contains("embed"));
+    }
+
+    #[test]
+    fn a_query_never_matches_across_two_blocks() {
+        // Nothing separates two paragraphs in the projection but the barrier
+        // the builder copies out of the gap; without it `endstart` would be
+        // one match spanning a blank line.
+        let source = "the end\n\nstart of the next";
+        assert!(find(source, "endstart").is_empty());
+        assert_eq!(find(source, "the end"), vec!["the end".to_string()]);
+    }
+
+    #[test]
+    fn a_code_block_is_searchable_and_its_fence_is_not() {
+        let source = "```rust\nlet performance = 1;\n```";
+        assert_eq!(find(source, "performance"), vec!["performance".to_string()],);
+        assert!(find(source, "```").is_empty());
+    }
+
+    #[test]
+    fn a_table_cell_is_searchable() {
+        let source = "| Configuration | Performance |\n| --- | --- |\n| 1x B200 | Moderate |\n";
+        assert_eq!(find(source, "performance"), vec!["Performance".to_string()],);
+    }
+
+    #[test]
+    fn a_heading_matches_without_its_hashes() {
+        let source = "## Deployment Comparison Table";
+        assert!(find(source, "# Deployment").is_empty());
+        assert_eq!(find(source, "Deployment"), vec!["Deployment".to_string()],);
+    }
+
+    #[test]
+    fn a_list_item_matches_without_its_marker() {
+        let source = "- alpha\n- beta\n";
+        assert_eq!(find(source, "alpha"), vec!["alpha".to_string()]);
+        assert!(find(source, "- alpha").is_empty());
+    }
+
+    #[test]
+    fn every_reported_range_is_a_range_of_the_source() {
+        // The whole point of routing through the offset map: a reported range
+        // can always be sliced. A projection whose runs were recorded against
+        // stale spans would panic here.
+        let source = "# Title\n\nSee [x](https://e/y) and `code` and *em* and &amp; ok.\n\n\
+                      - one\n- two\n\n```\nfenced text\n```\n";
+        let projection = project(source);
+        for query in ["e", "o", "t", " "] {
+            let Some(query) = Query::new(query) else {
+                continue;
+            };
+            for range in projection.find(&query) {
+                assert!(range.end <= source.len(), "{range:?}");
+                let _ = &source[range];
+            }
+        }
+    }
+
+    /// One match, named by node/item/ordinal — the identity the anchor is
+    /// built from. The byte range is irrelevant to the anchoring rules.
+    fn m(node: &str, item: Option<&str>, ordinal: usize) -> Match {
+        Match {
+            node: node.into(),
+            item_id: item.map(SharedString::from),
+            ordinal,
+            source: 0..1,
+            fraction: 0.0,
+        }
+    }
+
+    #[test]
+    fn stepping_wraps_at_both_ends() {
+        let matches = vec![m("a", Some("i1"), 0), m("b", Some("i2"), 0)];
+        let mut anchor = None;
+        let node = |m: Option<Match>| m.map(|m| m.node.to_string());
+        assert_eq!(
+            node(step_anchor(&matches, &mut anchor, true)),
+            Some("a".into())
+        );
+        assert_eq!(
+            node(step_anchor(&matches, &mut anchor, true)),
+            Some("b".into())
+        );
+        assert_eq!(
+            node(step_anchor(&matches, &mut anchor, true)),
+            Some("a".into())
+        );
+        assert_eq!(
+            node(step_anchor(&matches, &mut anchor, false)),
+            Some("b".into())
+        );
+    }
+
+    #[test]
+    fn an_edited_post_keeps_the_readers_place_through_its_new_action_id() {
+        // The post keeps its item and gets a new action id — which is what an
+        // edit or a regeneration does on every commit. Anchored by action id
+        // the reader would be thrown back to match 1 of the conversation.
+        let before = vec![m("act-1", Some("item-1"), 0), m("act-1", Some("item-1"), 1)];
+        let mut anchor = None;
+        reanchor(&before, &mut anchor, None);
+        step_anchor(&before, &mut anchor, true);
+        let previous = (anchor.clone().expect("anchored"), 1);
+
+        let after = vec![m("act-2", Some("item-1"), 0), m("act-2", Some("item-1"), 1)];
+        reanchor(&after, &mut anchor, Some(previous));
+        assert_eq!(current_position(&after, &anchor), Some(1));
+    }
+
+    #[test]
+    fn a_post_that_lost_matches_clamps_within_itself() {
+        let before = [
+            m("a", Some("i"), 0),
+            m("a", Some("i"), 1),
+            m("a", Some("i"), 2),
+        ];
+        let mut anchor = Some(MatchAnchor::of(&before[2]));
+        let after = vec![m("a", Some("i"), 0)];
+        let previous = anchor.clone().expect("anchored");
+        reanchor(&after, &mut anchor, Some((previous, 2)));
+        assert_eq!(current_position(&after, &anchor), Some(0));
+    }
+
+    #[test]
+    fn a_post_that_left_falls_to_the_nearest_match_in_document_order() {
+        let before = [
+            m("a", Some("ia"), 0),
+            m("b", Some("ib"), 0),
+            m("c", Some("ic"), 0),
+        ];
+        let mut anchor = Some(MatchAnchor::of(&before[1]));
+        // `b` is gone; the reader's place was position 1.
+        let after = vec![m("a", Some("ia"), 0), m("c", Some("ic"), 0)];
+        let previous = anchor.clone().expect("anchored");
+        reanchor(&after, &mut anchor, Some((previous, 1)));
+        assert_eq!(
+            current_match(&after, &anchor).map(|m| m.node.to_string()),
+            Some("c".into())
+        );
+    }
+
+    #[test]
+    fn no_matches_leaves_no_anchor() {
+        let mut anchor = Some(MatchAnchor {
+            key: "a".into(),
+            ordinal: 0,
+        });
+        reanchor(&[], &mut anchor, None);
+        assert!(anchor.is_none());
+        assert!(step_anchor(&[], &mut anchor, true).is_none());
+    }
+}

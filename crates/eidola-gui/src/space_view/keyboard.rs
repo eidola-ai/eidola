@@ -305,7 +305,7 @@ impl SpaceView {
         }
         // Transient overlays speak before the tree does; the context menu's
         // Escape ownership is the view root's and is untouched by this.
-        if self.transient_overlay_open() {
+        if self.transient_overlay_open(window, cx) {
             return false;
         }
         // A focused inspector field owns the keyboard the way a composing
@@ -445,8 +445,17 @@ impl SpaceView {
     /// somewhere the reader cannot see. Sharing the predicate is what keeps the
     /// two from disagreeing about who owns the keyboard, which is the property
     /// [`Self::sync_tree_focus`]'s park-and-restore already depended on.
-    pub(crate) fn transient_overlay_open(&self) -> bool {
-        self.context_menu.is_some()
+    pub(crate) fn transient_overlay_open(&self, window: &Window, cx: &gpui::App) -> bool {
+        // **The find bar is a member only while it holds the keyboard**, which
+        // is why this predicate takes a window at all. Every other member is a
+        // popover that exists to be typed into and dismissed, so "open" and
+        // "owns the keyboard" are the same question; the bar deliberately
+        // outlives its own focus — a reader steps through matches, clicks back
+        // into the conversation, and goes on reading with it up. Asking
+        // "is it open" there would leave the arrows and every printable
+        // yielded to a field nobody is in.
+        self.find_holds_focus(window, cx)
+            || self.context_menu.is_some()
             || self.band_menu.is_some()
             || self.highlight_picker.is_some()
             // The quote-destination picker is one too, and for the sharper
@@ -923,7 +932,7 @@ impl SpaceView {
     /// restoring would yank focus out of the very thing the reader asked the
     /// menu for.
     pub(crate) fn sync_tree_focus(&mut self, window: &mut Window, cx: &mut App) {
-        let overlay = self.transient_overlay_open();
+        let overlay = self.transient_overlay_open(window, cx);
         if overlay {
             // Remember *who* the overlay left holding the keyboard, so the
             // falling edge can tell a borrow it never returned from a claim

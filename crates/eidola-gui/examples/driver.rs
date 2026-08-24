@@ -384,6 +384,28 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_find",
+                description: "Space view: a conversation with a phrase to find, for driving the ⌘F bar (secondary-f, then type)",
+                default_size: size(px(860.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_messages_for_test(findable_conversation(), cx)
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_long_post",
                 description: "Space view: a conversation whose assistant reply is far taller than the window (selection repro)",
                 default_size: size(px(760.), px(680.)),
@@ -1950,6 +1972,61 @@ mod driver {
                           the blue is scattered away entirely, and what survives to reach you \
                           is the warm red-orange of a low sun."
                     .into(),
+            },
+        ]
+    }
+
+    /// A conversation carrying one word several times over, in prose, a
+    /// heading, a list and a table — the shapes the searchable projection has
+    /// to see through (delimiters hidden, a link's URL not searchable, a table
+    /// cell searchable).
+    fn findable_conversation() -> Vec<SpaceMessage> {
+        // Written as lines joined at render time: a Rust string literal's line
+        // continuations keep whatever indentation rustfmt lands on, which turns
+        // a markdown table into indented prose.
+        let answer = [
+            "To optimize for value you must balance memory bandwidth and compute against",
+            "the overhead of inter-GPU communication.",
+            "",
+            "Here is the **performance** survey for different deployment configurations.",
+            "The [reference numbers](https://performance.example/runs) come from a single",
+            "week of sampling.",
+            "",
+            "## Deployment comparison",
+            "",
+            "| Configuration | Quantization | Parallelism | Performance |",
+            "| --- | --- | --- | --- |",
+            "| 1 card | INT4 | none | Moderate |",
+            "| 2 cards | FP8 | TP2 | High |",
+            "| 4 cards | BF16 | TP4 | Very high |",
+            "",
+            "- **Latency:** falls sharply up to two cards, then flattens.",
+            "- **Throughput:** climbs with every card, at falling efficiency.",
+            "",
+            "Past four cards the extra performance is not worth the money.",
+        ]
+        .join("\n");
+        vec![
+            SpaceMessage {
+                role: "user".into(),
+                content: "Do a quick survey and compare performance at different deployment sizes."
+                    .into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: answer,
+            },
+            SpaceMessage {
+                role: "user".into(),
+                content: "Which one would you pick for steady daily use?".into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: [
+                    "Two cards. It is the point where performance and cost cross, and the",
+                    "third card buys less than the second did.",
+                ]
+                .join(" "),
             },
         ]
     }

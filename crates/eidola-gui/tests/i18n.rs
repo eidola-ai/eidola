@@ -259,6 +259,8 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("space", "Tides and the moon");
                 args.set("label", "Sofia, in another space");
                 args.set("n", 2);
+                args.set("index", 1);
+                args.set("total", 3);
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),

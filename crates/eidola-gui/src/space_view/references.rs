@@ -646,10 +646,8 @@ impl SpaceView {
             let ranges = self.highlight_ranges(i, cx);
             let embeds = gpui_markdown_editor::EmbedMap::new(entries.clone());
             let highlights = gpui_markdown_editor::HighlightSet::new(ranges.clone());
-            let (embeds_stale, highlights_stale) = {
-                let e = editor.read(cx);
-                (*e.embeds() != embeds, *e.highlights() != highlights)
-            };
+            let embeds_stale = *editor.read(cx).embeds() != embeds;
+            let highlights_stale = *editor.read(cx).highlights() != highlights;
             if embeds_stale || highlights_stale {
                 editor.update(cx, |e, cx| {
                     if embeds_stale {
@@ -660,7 +658,56 @@ impl SpaceView {
                     }
                 });
             }
+            self.sync_match_layers(&id, &editor, cx);
         }
+        // A draft's editor carries no quoted-passage wash — nothing quotes an
+        // unsent draft — but it does carry find matches, and the visible
+        // drafts are in scope exactly as posts are.
+        for draft in &self.drafts {
+            let editor = draft.editor.clone();
+            self.sync_match_layers(&draft.id, &editor, cx);
+        }
+    }
+
+    /// Paint one node's find matches on the two upper highlight layers —
+    /// ordinary matches on `Overlay`, the current one on `Accent` above them.
+    ///
+    /// **Under the same compare-before-set guard the base layer takes**: the
+    /// setters notify unconditionally, so writing every frame would be an
+    /// infinite render loop. Layers keep the two washes apart from the base
+    /// layer's quoted-passage wash, which is the whole reason the plugin has
+    /// them: merged into one set the two would take one colour, coalesce into
+    /// one wash, and a click on a match would fire the reference navigation
+    /// the reader never asked for.
+    fn sync_match_layers(
+        &self,
+        node_id: &SharedString,
+        editor: &gpui::Entity<gpui_markdown_editor::MarkdownEditorState>,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_markdown_editor::{HighlightLayer, HighlightSet};
+        let (matches, current) = self.find_match_ranges(node_id);
+        // The key is unused: an upper layer is inert paint and never routes a
+        // click, so there is nothing for a key to index into.
+        let matches: Vec<(std::ops::Range<usize>, u64)> =
+            matches.into_iter().map(|r| (r, 0u64)).collect();
+        let current: Vec<(std::ops::Range<usize>, u64)> =
+            current.into_iter().map(|r| (r, 0u64)).collect();
+        let matches_stale = *editor.read(cx).highlights_in(HighlightLayer::Overlay)
+            != HighlightSet::new(matches.clone());
+        let current_stale = *editor.read(cx).highlights_in(HighlightLayer::Accent)
+            != HighlightSet::new(current.clone());
+        if !matches_stale && !current_stale {
+            return;
+        }
+        editor.update(cx, |e, cx| {
+            if matches_stale {
+                e.set_highlights_in(HighlightLayer::Overlay, matches, cx);
+            }
+            if current_stale {
+                e.set_highlights_in(HighlightLayer::Accent, current, cx);
+            }
+        });
     }
 
     /// Note that post `node_id` rendered for real this frame, so the next
