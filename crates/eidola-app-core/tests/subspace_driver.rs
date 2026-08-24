@@ -222,7 +222,7 @@ fn ask(core: &AppCore, space_id: &str, participant: &str, target: &str) -> Strin
 // Driving a room nobody is watching
 // ===========================================================================
 
-/// The whole point of the wave: a room with no human in it and no window on it
+/// The driver's whole point: a room with no human in it and no window on it
 /// takes its turns anyway, and stops when there is nothing left to plan.
 #[test]
 fn a_delegated_room_takes_its_turns_with_nobody_watching() {
