@@ -511,7 +511,7 @@ impl SpaceView {
                 // a render-time `value()` read would see the spliced preedit.
                 gpui_component::input::InputEvent::Change => {
                     let text = state.read(cx).value().to_string();
-                    this.set_find_query(text, window, cx);
+                    this.set_find_query(text, cx);
                 }
                 gpui_component::input::InputEvent::PressEnter { shift, .. } => {
                     this.find_step(!shift, window, cx);
@@ -578,7 +578,7 @@ impl SpaceView {
     }
 
     /// Apply a committed query. Never called from an observer or a render.
-    fn set_find_query(&mut self, text: String, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_find_query(&mut self, text: String, cx: &mut Context<Self>) {
         let Some(session) = self.find.as_mut() else {
             return;
         };
