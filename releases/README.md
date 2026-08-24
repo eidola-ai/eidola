@@ -73,6 +73,15 @@ This ordering is what prevents a coerced release from silently weakening a requi
 
 This rotation's emit side is not a separate decision, because it is welded to a template change. The claim `apple_signature_reconstructs` substitutes those fields, and the templates that bind are the *previous* release's — so `release-tool attest` emits schema `2` exactly when the templates it renders from declare that claim, which is the release after the one that commits it. That is the same release by which every client has had a build accepting schema `2`. Landing the two together in one release would be the failure both orderings exist to prevent, and the tool refuses the combination rather than relying on the operator: if the binding templates declare the claim, `attest` will not sign without the macOS signing outputs to check it against, and if they do not, it records no Apple fields even when those outputs are supplied.
 
+**A third ordering crosses these two, and it is why publishing and attesting are separate gates.** The claim names "the unsigned build recorded in `artifact-manifest.json`", and the row it means (`eidola-gui-macos-universal-zip`) arrives with *manifest* schema 3 — an accept-before-emit rotation with its own timetable, described above. So there are real releases that have signing outputs worth publishing and nothing yet to say about them. `release-tool attest` therefore asks two questions instead of one:
+
+| Question | What it gates | When it must hold |
+| --- | --- | --- |
+| Does the reconstruction hold? | whether the assets may be published at all | whenever the outputs are supplied |
+| Does the unsigned build match the manifest row? | whether the claim may be affirmed | only where the claim is affirmed |
+
+A present row is always checked — a mismatch is wrong whether or not anything is claimed about it — but an absent row is fatal only to the claim. Requiring it unconditionally would have meant the first release able to publish the signed macOS artifact could not publish it, waiting on a manifest flip that says nothing about whether the artifact is genuine. Publishing an unattested asset is the honest state during a transition, and it is the same state the `release.json` entry is in one paragraph above: the bytes are there, and nothing claims anything about them yet.
+
 Note the consequence a claim addition always has, this one included: from the release that signs under the new templates, a client older than the templates change rejects the attestation — it carries a claim that client's pinned template manifest does not declare, which is the anti-coercion rule in `verify_attestation_content` doing its job. Such a client reports the release as unverifiable rather than installing it, and its user updates by hand. That is the deliberate cost of pinning claim text by embedding.
 
 #### `artifact-manifest.json` — the same rotation, with no human in it

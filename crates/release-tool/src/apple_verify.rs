@@ -32,11 +32,11 @@ use sha2::{Digest, Sha256};
 /// The manifest row recording the reproducible unsigned macOS container.
 ///
 /// The claim says "the reproducible unsigned build recorded in
-/// artifact-manifest.json", so the input is bound to that row rather than
-/// to whatever file the operator happened to pass. The row arrives with
-/// manifest schema 3; until a release emits that schema there is nothing
-/// to bind to, and the claim is not offerable — which is the manifest's
-/// own accept-before-emit rotation doing the sequencing.
+/// artifact-manifest.json", so where the claim is affirmed the input is
+/// bound to that row rather than to whatever file the operator happened to
+/// pass. The row arrives with manifest schema 3; see [`AppleBinding`] for
+/// what that means for a release that publishes the assets before any
+/// claim about them exists.
 pub const MACOS_UNSIGNED_ZIP_KEY: &str = "eidola-gui-macos-universal-zip";
 
 /// The three published objects this check composes.
@@ -49,7 +49,8 @@ pub struct AppleAssets {
     pub shipped_artifact: PathBuf,
 }
 
-/// What the check established, in the form the attestation records it.
+/// What the check established, in the form the attestation records it —
+/// and the bytes it established it about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppleReconstruction {
     pub unsigned_artifact_sha256: String,
@@ -63,17 +64,59 @@ pub struct AppleReconstruction {
     pub team_id: Option<String>,
     pub signing_identifier: String,
     pub hardened_runtime: bool,
+    /// The two objects a release publishes, written out of the very bytes
+    /// that were hashed above.
+    ///
+    /// Private with accessors, because a caller that can name the
+    /// operator's original path can upload something else. Attestation is
+    /// interactive — key inspection, an affirmation per claim, a device
+    /// PIN — so minutes pass between the hash and the upload, and a path
+    /// re-read then is not the file that was checked. Holding an
+    /// `AppleReconstruction` is the evidence that these two files are the
+    /// ones the hashes describe.
+    staged_shipped_artifact: PathBuf,
+    staged_signature_bundle: PathBuf,
+}
+
+impl AppleReconstruction {
+    /// The signed container, staged from the verified bytes.
+    pub fn staged_shipped_artifact(&self) -> &Path {
+        &self.staged_shipped_artifact
+    }
+
+    /// The detached material, staged from the verified bytes.
+    pub fn staged_signature_bundle(&self) -> &Path {
+        &self.staged_signature_bundle
+    }
 }
 
 /// Reconstruct the signed bundle from the unsigned build plus the detached
 /// material, and require it to equal the shipped artifact's contents.
 ///
 /// `scratch` must be an empty directory the caller owns; this leaves its
-/// working trees there for the caller to drop.
+/// working trees and the staged publishable bytes there, so it must
+/// outlive the upload.
 pub fn verify_reconstruction(assets: &AppleAssets, scratch: &Path) -> Result<AppleReconstruction> {
-    let unsigned_bytes = read_file(&assets.unsigned_artifact)?;
-    let bundle_bytes = read_file(&assets.signature_bundle)?;
+    // The two containers a client fetches are bounded on the wire by the
+    // installer's own ceiling, so a release published above it verifies
+    // here and is refused by every client — the same "publishable in a
+    // shape clients reject" failure the attestant-key pre-flight exists to
+    // prevent. Checked against the installer's constant rather than a
+    // number repeated here. The shipped artifact is deliberately not
+    // bounded: no client fetches it, and inventing a limit a browser
+    // download does not have would refuse a release nothing would reject.
+    let unsigned_bytes = read_bounded(&assets.unsigned_artifact, "the unsigned build")?;
+    let bundle_bytes = read_bounded(&assets.signature_bundle, "the signature bundle")?;
     let shipped_bytes = read_file(&assets.shipped_artifact)?;
+
+    // Staged before anything else can fail, and from the bytes already in
+    // hand rather than by copying the path a second time.
+    let staged = scratch.join("publish");
+    std::fs::create_dir_all(&staged).with_context(|| format!("creating {}", staged.display()))?;
+    let staged_shipped_artifact = staged.join("shipped");
+    let staged_signature_bundle = staged.join("signature");
+    write_file(&staged_shipped_artifact, &shipped_bytes)?;
+    write_file(&staged_signature_bundle, &bundle_bytes)?;
 
     let reconstructed_root = scratch.join("reconstructed");
     let shipped_root = scratch.join("shipped");
@@ -117,30 +160,34 @@ pub fn verify_reconstruction(assets: &AppleAssets, scratch: &Path) -> Result<App
         team_id: facts.team_id,
         signing_identifier: facts.identifier,
         hardened_runtime: facts.hardened_runtime,
+        staged_shipped_artifact,
+        staged_signature_bundle,
     })
 }
 
 /// The `sha256:`-prefixed hash a manifest records for one artifact key, as
 /// a bare lowercase hex string.
-pub fn manifest_recorded_sha256(manifest_bytes: &[u8], key: &str) -> Result<String> {
+///
+/// `Ok(None)` means the manifest records no such row — a fact about the
+/// manifest's schema, and a decision for the caller ([`AppleBinding`]).
+/// `Err` is reserved for a row that exists and cannot be used, which is
+/// wrong under every schema.
+pub fn manifest_recorded_sha256(manifest_bytes: &[u8], key: &str) -> Result<Option<String>> {
     let manifest: serde_json::Value =
         serde_json::from_slice(manifest_bytes).context("parsing artifact-manifest.json")?;
-    let recorded = manifest
+    let Some(recorded) = manifest
         .get("artifacts")
         .and_then(|artifacts| artifacts.get(key))
         .and_then(|entry| entry.get("sha256"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "artifact-manifest.json records no `sha256` for `{key}`. That row arrives \
-                 with manifest schema 3; until a release emits it there is no recorded \
-                 unsigned build for the claim to name (releases/README.md, \"Rotating \
-                 document schema versions\")."
-            )
-        })?;
+    else {
+        return Ok(None);
+    };
+    let recorded = recorded.as_str().ok_or_else(|| {
+        anyhow::anyhow!("artifact-manifest.json records `{key}`'s `sha256` as a non-string")
+    })?;
     recorded
         .strip_prefix("sha256:")
-        .map(str::to_ascii_lowercase)
+        .map(|hex| Some(hex.to_ascii_lowercase()))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "artifact-manifest.json records `{key}` as `{recorded}`, not `sha256:…`"
@@ -148,8 +195,104 @@ pub fn manifest_recorded_sha256(manifest_bytes: &[u8], key: &str) -> Result<Stri
         })
 }
 
+/// What a release may say about its macOS signing outputs.
+///
+/// The two orderings this sits between move at different times, and the
+/// releases in between are real: the claim arrives in the *binding*
+/// templates one release after it is committed, while the manifest row
+/// naming the unsigned build arrives with manifest schema 3, whose own
+/// accept-before-emit rotation is independent. So a release can genuinely
+/// have signing outputs worth publishing and nothing yet to claim about
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppleBinding {
+    /// No signing outputs were supplied, and nothing asks for them.
+    Absent,
+    /// Published as data. The reconstruction was still checked — that is
+    /// what an operator gets for supplying the inputs — but no claim is
+    /// affirmed and no field is recorded, so nothing is bound to the
+    /// manifest.
+    PublishedOnly,
+    /// Published *and* attested: the claim is affirmed, so the unsigned
+    /// build must be the one the manifest records.
+    Attested,
+}
+
+/// Decide what this release may do with the signing outputs, and refuse
+/// every combination that would let a claim outrun its evidence.
+///
+/// The manifest binding is required **exactly where the claim is
+/// affirmed**, because that is the sentence that names the manifest.
+/// Requiring it unconditionally would mean the first release able to
+/// publish these assets could not publish them; skipping it where the row
+/// exists would ignore a check that costs nothing. So a present row is
+/// always honoured and an absent row is only fatal to a claim.
+pub fn apple_binding(
+    claim_binds: bool,
+    reconstruction: Option<&AppleReconstruction>,
+    manifest_row: Option<&str>,
+) -> Result<AppleBinding> {
+    if let (Some(reconstruction), Some(recorded)) = (reconstruction, manifest_row)
+        && reconstruction.unsigned_artifact_sha256 != recorded
+    {
+        bail!(
+            "the unsigned build hashes to {}, but artifact-manifest.json records {recorded} \
+             for `{MACOS_UNSIGNED_ZIP_KEY}` — the reconstruction was run against a build \
+             this release did not measure",
+            reconstruction.unsigned_artifact_sha256,
+        );
+    }
+
+    if !claim_binds {
+        return Ok(match reconstruction {
+            Some(_) => AppleBinding::PublishedOnly,
+            None => AppleBinding::Absent,
+        });
+    }
+
+    if reconstruction.is_none() {
+        bail!(
+            "the binding templates declare the macOS reconstruction claim, so this release \
+             cannot be attested without the signing outputs to check it against. Supply \
+             --apple-unsigned-artifact, --apple-signature-bundle, and \
+             --apple-shipped-artifact."
+        );
+    }
+    if manifest_row.is_none() {
+        bail!(
+            "the macOS reconstruction claim names the unsigned build recorded in \
+             artifact-manifest.json, but this manifest records no `{MACOS_UNSIGNED_ZIP_KEY}`. \
+             That row arrives with manifest schema 3; the claim cannot be affirmed until a \
+             release emits it (releases/README.md, \"Rotating document schema versions\")."
+        );
+    }
+    Ok(AppleBinding::Attested)
+}
+
 fn read_file(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// Read a file the installer will later fetch over the wire, refusing one
+/// larger than the installer's own ceiling.
+fn read_bounded(path: &Path, label: &str) -> Result<Vec<u8>> {
+    const MAX: u64 = eidola_app_core::updater::install::MAX_CONTAINER_BYTES;
+
+    let length = std::fs::metadata(path)
+        .with_context(|| format!("reading metadata for {}", path.display()))?
+        .len();
+    if length > MAX {
+        bail!(
+            "{label} is {length} bytes, more than the {MAX} an installed client will \
+             download — publishing it would produce a release every client refuses before \
+             it reconstructs anything"
+        );
+    }
+    read_file(path)
+}
+
+fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 fn unpack(bytes: &[u8], dest: &Path, label: &str) -> Result<()> {
@@ -461,11 +604,12 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_without_the_unsigned_row_offers_no_claim() {
+    fn an_unrecorded_row_is_a_fact_about_the_manifest_not_an_error() {
         let manifest = br#"{"schema_version": 2, "artifacts": {}}"#;
-        let error = manifest_recorded_sha256(manifest, MACOS_UNSIGNED_ZIP_KEY).unwrap_err();
-        let message = format!("{error}");
-        assert!(message.contains("manifest schema 3"), "got: {message}");
+        assert_eq!(
+            manifest_recorded_sha256(manifest, MACOS_UNSIGNED_ZIP_KEY).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -481,7 +625,158 @@ mod tests {
         }"#;
         assert_eq!(
             manifest_recorded_sha256(manifest, MACOS_UNSIGNED_ZIP_KEY).unwrap(),
-            "abcd"
+            Some("abcd".to_string())
+        );
+    }
+
+    #[test]
+    fn a_row_that_exists_and_cannot_be_used_is_loud() {
+        // Wrong under every schema, so it must not read as "absent".
+        for manifest in [
+            br#"{"artifacts": {"eidola-gui-macos-universal-zip": {"sha256": "abcd"}}}"#.as_slice(),
+            br#"{"artifacts": {"eidola-gui-macos-universal-zip": {"sha256": 7}}}"#.as_slice(),
+        ] {
+            assert!(manifest_recorded_sha256(manifest, MACOS_UNSIGNED_ZIP_KEY).is_err());
+        }
+    }
+
+    // ── What a release may say about its signing outputs ─────────────
+
+    const ROW: &str = "aaaa";
+
+    fn reconstruction_hashing(unsigned: &str) -> AppleReconstruction {
+        AppleReconstruction {
+            unsigned_artifact_sha256: unsigned.to_string(),
+            signature_bundle_sha256: "bbbb".into(),
+            shipped_artifact_sha256: "cccc".into(),
+            bundle_name: "Fixture.app".into(),
+            team_id: None,
+            signing_identifier: "ai.eidola.fixture".into(),
+            hardened_runtime: true,
+            staged_shipped_artifact: PathBuf::new(),
+            staged_signature_bundle: PathBuf::new(),
+        }
+    }
+
+    /// The transition release: signing outputs exist and are worth
+    /// publishing, but the binding templates declare no claim about them
+    /// *and* the emitted manifest predates the row that would bind the
+    /// unsigned build. Requiring the row here would mean the first release
+    /// able to publish these assets could not publish them.
+    #[test]
+    fn assets_publish_before_any_claim_or_manifest_row_exists() {
+        let reconstruction = reconstruction_hashing(ROW);
+        assert_eq!(
+            apple_binding(false, Some(&reconstruction), None).unwrap(),
+            AppleBinding::PublishedOnly
+        );
+    }
+
+    #[test]
+    fn a_present_row_is_honoured_even_with_no_claim_to_affirm() {
+        let reconstruction = reconstruction_hashing("dddd");
+        let error = apple_binding(false, Some(&reconstruction), Some(ROW)).unwrap_err();
+        assert!(
+            format!("{error}").contains("this release did not measure"),
+            "a row that exists is checked whether or not anything is claimed"
+        );
+    }
+
+    #[test]
+    fn an_affirmed_claim_requires_the_manifest_row() {
+        let reconstruction = reconstruction_hashing(ROW);
+        assert_eq!(
+            apple_binding(true, Some(&reconstruction), Some(ROW)).unwrap(),
+            AppleBinding::Attested
+        );
+
+        let error = apple_binding(true, Some(&reconstruction), None).unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("manifest schema 3"), "got: {message}");
+    }
+
+    #[test]
+    fn an_affirmed_claim_requires_something_to_have_been_checked() {
+        let error = apple_binding(true, None, Some(ROW)).unwrap_err();
+        assert!(
+            format!("{error}").contains("without the signing outputs"),
+            "the claim may never outrun its evidence"
+        );
+    }
+
+    #[test]
+    fn no_inputs_and_no_claim_is_the_ordinary_release() {
+        assert_eq!(
+            apple_binding(false, None, None).unwrap(),
+            AppleBinding::Absent
+        );
+        assert_eq!(
+            apple_binding(false, None, Some(ROW)).unwrap(),
+            AppleBinding::Absent
+        );
+    }
+
+    // ── The two ceilings a client will later apply ───────────────────
+
+    /// A container larger than the installer's wire bound would verify
+    /// here and then be refused by every client before it reconstructed
+    /// anything. Sparse: the refusal reads metadata, so no bytes are
+    /// written or read.
+    #[test]
+    fn a_container_larger_than_a_client_will_fetch_is_refused() {
+        let scratch = tempfile::tempdir().unwrap();
+        let oversized = scratch.path().join("oversized.zip");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(eidola_app_core::updater::install::MAX_CONTAINER_BYTES + 1)
+            .unwrap();
+        drop(file);
+
+        // Mapped to a length before unwrapping: a regression here means
+        // the bytes *were* read, and the failure message must not be half
+        // a gigabyte of them.
+        let error = read_bounded(&oversized, "the unsigned build")
+            .map(|bytes| bytes.len())
+            .unwrap_err();
+        let message = format!("{error}");
+        assert!(
+            message.contains("an installed client will download"),
+            "got: {message}"
+        );
+    }
+
+    /// The signed container is not bounded: no client fetches it, so a
+    /// limit here would refuse a release nothing would reject.
+    #[test]
+    fn the_browser_download_carries_no_client_ceiling() {
+        let case = case(|_, _, _| {});
+        let shipped = std::fs::metadata(&case.assets.shipped_artifact)
+            .unwrap()
+            .len();
+        assert!(shipped > 0);
+        // Nothing in the happy path consults a ceiling for it.
+        verify_reconstruction(&case.assets, &case.work).unwrap();
+    }
+
+    // ── The bytes that get published ─────────────────────────────────
+
+    /// Attestation is interactive, so minutes pass between the check and
+    /// the upload. Replacing the operator's files in that window must not
+    /// change what gets published.
+    #[test]
+    fn the_published_bytes_are_the_verified_ones_after_the_inputs_change() {
+        let case = case(|_, _, _| {});
+        let result = verify_reconstruction(&case.assets, &case.work).unwrap();
+
+        std::fs::write(&case.assets.shipped_artifact, b"swapped after the check").unwrap();
+        std::fs::write(&case.assets.signature_bundle, b"swapped after the check").unwrap();
+
+        assert_eq!(
+            sha256_hex(&std::fs::read(result.staged_shipped_artifact()).unwrap()),
+            result.shipped_artifact_sha256
+        );
+        assert_eq!(
+            sha256_hex(&std::fs::read(result.staged_signature_bundle()).unwrap()),
+            result.signature_bundle_sha256
         );
     }
 }

@@ -212,33 +212,20 @@ pub fn run(args: Args) -> Result<()> {
     // result to be the shipped artifact, entry for entry.
     let apple_scratch =
         tempfile::tempdir().context("creating a scratch dir for the Apple check")?;
+    let manifest_unsigned_row = apple_verify::manifest_recorded_sha256(
+        &manifest_bytes,
+        apple_verify::MACOS_UNSIGNED_ZIP_KEY,
+    )?;
     let apple = match &args.apple {
         Some(inputs) => {
             println!();
             println!("=== Reconstructing the signed macOS artifact ===");
-            let recorded = apple_verify::manifest_recorded_sha256(
-                &manifest_bytes,
-                apple_verify::MACOS_UNSIGNED_ZIP_KEY,
-            )?;
             let assets = apple_verify::AppleAssets {
                 unsigned_artifact: inputs.unsigned_artifact.clone(),
                 signature_bundle: inputs.signature_bundle.clone(),
                 shipped_artifact: inputs.shipped_artifact.clone(),
             };
             let result = apple_verify::verify_reconstruction(&assets, apple_scratch.path())?;
-            // The claim names the unsigned build *as the manifest records
-            // it*. Checking the reconstruction against some other unsigned
-            // input would be a true sentence about the wrong file.
-            if result.unsigned_artifact_sha256 != recorded {
-                bail!(
-                    "{} hashes to {}, but artifact-manifest.json records {} for `{}` — \
-                     the reconstruction was run against a build this release did not measure",
-                    inputs.unsigned_artifact.display(),
-                    result.unsigned_artifact_sha256,
-                    recorded,
-                    apple_verify::MACOS_UNSIGNED_ZIP_KEY,
-                );
-            }
             println!("  ✓ {} reconstructs exactly", result.bundle_name);
             println!("      signing identifier: {}", result.signing_identifier);
             println!(
@@ -264,25 +251,42 @@ pub fn run(args: Args) -> Result<()> {
     // substitutes may only appear in an attestation whose schema records
     // them, which every installed client accepts by then. Both halves
     // therefore key off the same question, and neither can move alone.
-    let attested_apple = if templates.claims.contains_key(APPLE_CLAIM_ID) {
-        Some(apple.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "the templates at {prev_tag} declare `{APPLE_CLAIM_ID}`, so this release \
-                 cannot be attested without the macOS signing outputs. Supply \
-                 --apple-unsigned-artifact, --apple-signature-bundle, and \
-                 --apple-shipped-artifact."
-            )
-        })?)
-    } else {
-        if apple.is_some() {
+    let binding = apple_verify::apple_binding(
+        templates.claims.contains_key(APPLE_CLAIM_ID),
+        apple.as_ref(),
+        manifest_unsigned_row.as_deref(),
+    )
+    .with_context(|| {
+        format!(
+            "deciding what {} may record about its macOS signing outputs",
+            args.tag
+        )
+    })?;
+    let attested_apple = match binding {
+        apple_verify::AppleBinding::Attested => {
+            println!("  ✓ the unsigned build is the one artifact-manifest.json records");
+            apple.clone()
+        }
+        apple_verify::AppleBinding::PublishedOnly => {
             println!();
             println!(
                 "Note: the templates at {prev_tag} do not declare `{APPLE_CLAIM_ID}`, so this \
                  attestation records no Apple fields — they take effect with the next release, \
-                 whose binding templates are this one's. The assets are still published."
+                 whose binding templates are this one's. The reconstruction above was still \
+                 checked, and the assets are still published; nothing is claimed about them \
+                 yet."
             );
+            if manifest_unsigned_row.is_none() {
+                println!(
+                    "      artifact-manifest.json records no `{}` row either (it arrives with \
+                     manifest schema 3), so the unsigned build is not yet bound to a measured \
+                     one.",
+                    apple_verify::MACOS_UNSIGNED_ZIP_KEY
+                );
+            }
+            None
         }
-        None
+        apple_verify::AppleBinding::Absent => None,
     };
 
     let spki_der = fetch_cosign_pubkey_spki_der(&args.cosign_key)?;
@@ -468,7 +472,15 @@ pub fn run(args: Args) -> Result<()> {
     // their bytes are a function of a key. Names are given here rather
     // than taken from whatever the operator's file was called, so a
     // download and the attestation line naming it can be matched by eye.
-    if let Some(inputs) = &args.apple {
+    //
+    // The bytes come from the reconstruction, never from the paths the
+    // operator named: everything between the check and here is
+    // interactive — key inspection, an affirmation per claim, a device PIN
+    // — so a re-read of those paths could publish a file the signed
+    // attestation does not describe. `AppleReconstruction` hands out only
+    // what it staged out of the bytes it hashed, which is what makes that
+    // mismatch unrepresentable rather than something to remember to check.
+    if let Some(apple) = &apple {
         println!();
         println!("=== Uploading the macOS signing outputs ===");
         let shipped = tmp
@@ -477,10 +489,10 @@ pub fn run(args: Args) -> Result<()> {
         let signature = tmp.path().join(format!(
             "eidola-gui-{release_version}-macos-universal.sigbundle.zip"
         ));
-        fs::copy(&inputs.shipped_artifact, &shipped)
-            .with_context(|| format!("staging {} for upload", inputs.shipped_artifact.display()))?;
-        fs::copy(&inputs.signature_bundle, &signature)
-            .with_context(|| format!("staging {} for upload", inputs.signature_bundle.display()))?;
+        fs::copy(apple.staged_shipped_artifact(), &shipped)
+            .context("staging the verified shipped artifact for upload")?;
+        fs::copy(apple.staged_signature_bundle(), &signature)
+            .context("staging the verified signature material for upload")?;
         gh_upload(
             &args.repo,
             &args.tag,
