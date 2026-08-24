@@ -24,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
+use crate::apple_verify;
 use crate::trust;
 
 pub struct Args {
@@ -43,7 +44,31 @@ pub struct Args {
     /// other than the previous release's templates will be rejected by
     /// every installed client.
     pub templates_override: Option<PathBuf>,
+    /// The macOS signing outputs, when this release has them. All three or
+    /// none: the claim is about a relationship between them, and two of
+    /// three is not a weaker claim, it is no claim.
+    pub apple: Option<AppleInputs>,
 }
+
+/// Local paths to the three objects the Apple layer publishes. The signed
+/// container and the detached material come off the signing job as
+/// workflow artifacts (`gh run download`); the unsigned build is a pure
+/// function of source, so it can equally come from `nix build`.
+pub struct AppleInputs {
+    pub unsigned_artifact: PathBuf,
+    pub signature_bundle: PathBuf,
+    pub shipped_artifact: PathBuf,
+}
+
+/// The claim whose text this tool must be able to check before it offers
+/// it. Its arrival in the *binding* templates — the previous release's
+/// copy — is also what turns on emission of the attestation schema that
+/// carries its fields.
+const APPLE_CLAIM_ID: &str = "apple_signature_reconstructs";
+
+/// The attestation schema that records the Apple block. Clients accept it
+/// one release before this tool emits it; see `releases/README.md`.
+const APPLE_FIELDS_SCHEMA_VERSION: u32 = 2;
 
 pub fn run(args: Args) -> Result<()> {
     require_tool("gh")?;
@@ -180,6 +205,86 @@ pub fn run(args: Args) -> Result<()> {
         ),
     };
 
+    // The engineer may not affirm what nothing checked. `manifest_reproduced`
+    // is backed by the byte-equality above; this is the same posture for the
+    // one other claim with a mechanical meaning — apply the published
+    // signature material to the recorded unsigned build and require the
+    // result to be the shipped artifact, entry for entry.
+    let apple_scratch =
+        tempfile::tempdir().context("creating a scratch dir for the Apple check")?;
+    let apple = match &args.apple {
+        Some(inputs) => {
+            println!();
+            println!("=== Reconstructing the signed macOS artifact ===");
+            let recorded = apple_verify::manifest_recorded_sha256(
+                &manifest_bytes,
+                apple_verify::MACOS_UNSIGNED_ZIP_KEY,
+            )?;
+            let assets = apple_verify::AppleAssets {
+                unsigned_artifact: inputs.unsigned_artifact.clone(),
+                signature_bundle: inputs.signature_bundle.clone(),
+                shipped_artifact: inputs.shipped_artifact.clone(),
+            };
+            let result = apple_verify::verify_reconstruction(&assets, apple_scratch.path())?;
+            // The claim names the unsigned build *as the manifest records
+            // it*. Checking the reconstruction against some other unsigned
+            // input would be a true sentence about the wrong file.
+            if result.unsigned_artifact_sha256 != recorded {
+                bail!(
+                    "{} hashes to {}, but artifact-manifest.json records {} for `{}` — \
+                     the reconstruction was run against a build this release did not measure",
+                    inputs.unsigned_artifact.display(),
+                    result.unsigned_artifact_sha256,
+                    recorded,
+                    apple_verify::MACOS_UNSIGNED_ZIP_KEY,
+                );
+            }
+            println!("  ✓ {} reconstructs exactly", result.bundle_name);
+            println!("      signing identifier: {}", result.signing_identifier);
+            println!(
+                "      Team ID:            {}",
+                result.team_id.as_deref().unwrap_or("none (ad-hoc)")
+            );
+            println!("      hardened runtime:   {}", result.hardened_runtime);
+            println!(
+                "      shipped sha256:     {}",
+                result.shipped_artifact_sha256
+            );
+            println!(
+                "      signature sha256:   {}",
+                result.signature_bundle_sha256
+            );
+            Some(result)
+        }
+        None => None,
+    };
+
+    // The templates that bind are the previous release's, so a claim
+    // committed here takes effect one release later — and the fields it
+    // substitutes may only appear in an attestation whose schema records
+    // them, which every installed client accepts by then. Both halves
+    // therefore key off the same question, and neither can move alone.
+    let attested_apple = if templates.claims.contains_key(APPLE_CLAIM_ID) {
+        Some(apple.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "the templates at {prev_tag} declare `{APPLE_CLAIM_ID}`, so this release \
+                 cannot be attested without the macOS signing outputs. Supply \
+                 --apple-unsigned-artifact, --apple-signature-bundle, and \
+                 --apple-shipped-artifact."
+            )
+        })?)
+    } else {
+        if apple.is_some() {
+            println!();
+            println!(
+                "Note: the templates at {prev_tag} do not declare `{APPLE_CLAIM_ID}`, so this \
+                 attestation records no Apple fields — they take effect with the next release, \
+                 whose binding templates are this one's. The assets are still published."
+            );
+        }
+        None
+    };
+
     let spki_der = fetch_cosign_pubkey_spki_der(&args.cosign_key)?;
     let key_fingerprint_sha256 = sha256_hex(&spki_der);
 
@@ -231,7 +336,7 @@ pub fn run(args: Args) -> Result<()> {
     // Build the bare attestation skeleton. We splice in attestant_statement
     // + claims after the engineer affirms them.
     let mut attestation = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": if attested_apple.is_some() { APPLE_FIELDS_SCHEMA_VERSION } else { 1 },
         "release_version": release_version,
         "git_commit": git_commit,
         "previous_release_git_commit": previous_release_git_commit,
@@ -245,6 +350,33 @@ pub fn run(args: Args) -> Result<()> {
         },
         "attested_at": attested_at,
     });
+
+    // The verifier holds an attestation to the shape its own schema
+    // declares, in both directions, so these keys are all present or all
+    // absent — `apple_team_id` explicitly `null` where a signature names
+    // no team, which is a fact rather than an omission.
+    if let Some(apple) = &attested_apple {
+        let object = attestation.as_object_mut().expect("skeleton is an object");
+        object.insert(
+            "apple_shipped_artifact_sha256".into(),
+            apple.shipped_artifact_sha256.clone().into(),
+        );
+        object.insert(
+            "apple_signature_bundle_sha256".into(),
+            apple.signature_bundle_sha256.clone().into(),
+        );
+        object.insert(
+            "apple_team_id".into(),
+            match &apple.team_id {
+                Some(team) => team.clone().into(),
+                None => serde_json::Value::Null,
+            },
+        );
+        object.insert(
+            "apple_signing_identifier".into(),
+            apple.signing_identifier.clone().into(),
+        );
+    }
 
     let attestation_clone = attestation.clone();
     let mut roots: BTreeMap<&str, &serde_json::Value> = BTreeMap::new();
@@ -330,6 +462,32 @@ pub fn run(args: Args) -> Result<()> {
     let bundle_str = bundle_path.to_str().unwrap();
     gh_upload(&args.repo, &args.tag, &[attestation_str, bundle_str])?;
 
+    // The Apple assets reach the release through this tool rather than
+    // through `scripts/release-assets.sh`, which publishes what the
+    // manifest measures — and neither of these may ever be measured there:
+    // their bytes are a function of a key. Names are given here rather
+    // than taken from whatever the operator's file was called, so a
+    // download and the attestation line naming it can be matched by eye.
+    if let Some(inputs) = &args.apple {
+        println!();
+        println!("=== Uploading the macOS signing outputs ===");
+        let shipped = tmp
+            .path()
+            .join(format!("Eidola-{release_version}-macos-universal.zip"));
+        let signature = tmp.path().join(format!(
+            "eidola-gui-{release_version}-macos-universal.sigbundle.zip"
+        ));
+        fs::copy(&inputs.shipped_artifact, &shipped)
+            .with_context(|| format!("staging {} for upload", inputs.shipped_artifact.display()))?;
+        fs::copy(&inputs.signature_bundle, &signature)
+            .with_context(|| format!("staging {} for upload", inputs.signature_bundle.display()))?;
+        gh_upload(
+            &args.repo,
+            &args.tag,
+            &[shipped.to_str().unwrap(), signature.to_str().unwrap()],
+        )?;
+    }
+
     println!();
     println!("=== Generating release.json ===");
     let assets = gh_list_assets(&args.repo, &args.tag)?;
@@ -349,7 +507,10 @@ pub fn run(args: Args) -> Result<()> {
     // half of that rotation, and it flips a release *after* the accepting
     // build is in the wild — `releases/README.md`, "Rotating document
     // schema versions". Emitting the index here before then would strand
-    // every installed client on a shape it refuses.
+    // every installed client on a shape it refuses — including the
+    // `apple_signature_bundle` entry that points at the material uploaded
+    // above, which is why that upload is published and indexed in
+    // different releases.
     let release_json = serde_json::json!({
         "schema_version": 1,
         "version": release_version,
