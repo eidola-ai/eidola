@@ -11,6 +11,11 @@ pub mod chrome;
 pub mod focus;
 pub mod general;
 pub mod i18n;
+/// The local control socket. Unix-only: the transport is a Unix domain socket,
+/// and the platforms this app ships on are macOS and Linux (a Windows port
+/// would answer on a named pipe with a DACL, which is a different door).
+#[cfg(unix)]
+pub mod ipc;
 pub mod library;
 pub mod lifecycle;
 pub mod loadable;
@@ -209,6 +214,15 @@ pub fn run_with(opts: LaunchOptions) {
         // point); the status menu's Quit and a windowless SIGTERM do. See
         // `lifecycle::install_engine_shutdown`.
         lifecycle::install_engine_shutdown(&stores, bus_bridge, cx);
+
+        // The door another process knocks on. Bound in both launch modes and
+        // deliberately not tied to windows: ⌘Q retires the app and keeps this
+        // socket answering, because a process that still holds the database
+        // lock is exactly the process a command-line invocation needs to
+        // reach. A bind failure is a diagnostic, not a startup failure — see
+        // `crate::ipc`.
+        #[cfg(unix)]
+        ipc::install(&stores, cx);
 
         // Order matters: `cx.set_menus` snapshots the keymap when it builds
         // NSMenuItems and attaches each item's `keyEquivalent` from

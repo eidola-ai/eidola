@@ -101,7 +101,9 @@ impl BackendKind {
 
 /// One configured backend, as surfaced to the CLI/GUI. The api key itself
 /// is never carried — only whether one is set (replacing it is write-only).
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackendInfo {
     pub id: String,
     pub kind: BackendKind,
