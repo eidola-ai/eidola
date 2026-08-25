@@ -734,9 +734,13 @@ impl Inner {
             .cloned()
     }
 
-    /// Drop the record for a delegation that is over. Called from the terminal
-    /// exits `drive_subspace` already takes, so the map is bounded by the rooms
-    /// this process has open rather than by everything it ever opened.
+    /// Drop the record for a delegation that is over — from the terminal exits
+    /// `drive_subspace` takes, **and from [`Inner::close_rooms`]**, which is
+    /// the archived room's only clearing: an archived room is not a live
+    /// delegated room, so the supervisor calls it ordinary and never arms it,
+    /// and the walk that would have cleared this is the walk that no longer
+    /// runs. Between them the map is bounded by the rooms this process has
+    /// open rather than by everything it ever opened.
     pub(crate) fn forget_spawning_answer_item(&self, space_id: &str) {
         self.spawning_answer_items
             .lock()
@@ -2099,9 +2103,25 @@ impl Inner {
     /// this; it then finds the room archived at its next hop or at the report
     /// gate and clears it there, which is the same one-walk cost that door
     /// always had. Ending it here is what removes the standing one.
+    ///
+    /// **Every per-room record this process holds is released here, for that
+    /// one reason.** The anchor wait was the first; the record of which turn
+    /// opened the room ([`Inner::note_spawning_answer_item`]) is the second,
+    /// and it leaks the same way and worse — its own clearing sits at
+    /// `drive_subspace`'s terminal exits, which is exactly the path an archived
+    /// room no longer takes, and unlike a wait nothing ever expires it. A
+    /// long-lived GUI opening and archiving delegations would grow the map
+    /// without bound. So this is where a room's in-memory state ends, and
+    /// anything added later belongs here too.
+    ///
+    /// **One door for all three archival paths**: a direct archival, a parent's
+    /// (`archive_space_tx` answers with the whole subtree it closed), and a
+    /// retirement's or a departure's set. Each hands its archived ids straight
+    /// here, so none of them has to know what a room keeps.
     pub(crate) fn close_rooms(&self, space_ids: &[String]) {
         for id in space_ids {
             self.end_anchor_wait(id);
+            self.forget_spawning_answer_item(id);
             self.bus.emit(Change::Space(id.clone()));
         }
     }
