@@ -43,6 +43,8 @@ Not every tool the release path uses is a Rust crate in `crates/devtools/`. **`s
 
 Runs on `v*` tags, two responsibilities: (1) generate `tinfoil-deployment.json` from `artifact-manifest.json`, attest it to Sigstore via `actions/attest`, and create the GitHub release — the artifact Tinfoil's verifier chain consumes; (2) sign `artifact-manifest.json` with `cosign sign-blob` (Fulcio keyless via the workflow's OIDC identity) and upload the manifest + Sigstore bundle as release assets for the client's self-update verifier. **The filename `tinfoil-build.yml` is mandated by Tinfoil's closed-source deployment system — do not rename.** The release is intentionally not marked `latest` here; the release officer's tooling does that once their human attestation is signed and uploaded.
 
+The macOS signing outputs — the signed container and the detached signature material — are the one class of release asset `scripts/release-assets.sh` does **not** publish, and cannot: it publishes what `artifact-manifest.json` measures, and neither of those may ever be measured there. They reach the release through `release-tool attest`, which is also the step that checks they reconstruct and records their hashes in the signed attestation.
+
 ## Image tagging
 
 `main` (rolling, updated per promotion), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Published to `ghcr.io/<owner>/eidola-{server,cli,postgres}`. The separate `ghcr.io/<owner>/eidola-buildcache` package (tags `server`/`cli`/`postgres`, each a single mutable ref overwritten in place) holds the BuildKit layer cache — not a release artifact.
