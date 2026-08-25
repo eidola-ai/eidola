@@ -987,7 +987,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ModelPricing, ScaledPrice};
+    use crate::types::{
+        Capability, Modality, ModelCapabilities, ModelPricing, OutputBudgetClass, ScaledPrice,
+    };
 
     /// A token-priced model with easy integer math at `PRICING_SCALE_FACTOR`:
     /// 1 credit per prompt token, 2 credits per completion token.
@@ -997,6 +999,14 @@ mod tests {
             name: "Test Model".to_string(),
             description: String::new(),
             context_length: 8192,
+            max_output_tokens: Some(4096),
+            output_budget_class: OutputBudgetClass::Standard,
+            capabilities: ModelCapabilities {
+                tool_calling: Capability::new(true),
+                reasoning: Capability::new(false),
+                input_modalities: vec![Modality::Text],
+                output_modalities: vec![Modality::Text],
+            },
             pricing: ModelPricing {
                 per_prompt_token: ScaledPrice {
                     value: PRICING_SCALE_FACTOR,

@@ -12,8 +12,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AttestationInfo, BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
-    PriceInfo, RequestInfo, SpendTrailEntry,
+    AttestationInfo, BalancesResult, ConfigState, ModelCapabilities, ModelInfo, PostBlock,
+    PostNode, PostParticipant, PriceInfo, RequestInfo, SpendTrailEntry,
 };
 use eidola_app_core::{
     ParticipantInfo, ParticipantReference, SpaceTemplateInfo, TemplateParticipantInfo,
@@ -1084,6 +1084,9 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
             ModelInfo {
                 id: "gemma4-31b".into(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 0.53,
                 completion_credits_per_token: 1.5,
                 request_credits: None,
@@ -1091,6 +1094,9 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
             ModelInfo {
                 id: "kimi-k2-6".into(),
                 context_length: 262_144,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 3.0,
                 completion_credits_per_token: 9.0,
                 request_credits: None,
@@ -1098,6 +1104,9 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 1.05,
                 completion_credits_per_token: 5.25,
                 request_credits: None,

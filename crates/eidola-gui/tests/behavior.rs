@@ -2617,6 +2617,9 @@ fn inspector_participants_render_with_scroll_indicator(cx: &mut TestAppContext) 
             .map(|i| eidola_app_core::ModelInfo {
                 id: format!("model-{i:02}"),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: eidola_app_core::ModelCapabilities::default(),
                 prompt_credits_per_token: 1.0,
                 completion_credits_per_token: 2.0,
                 request_credits: None,

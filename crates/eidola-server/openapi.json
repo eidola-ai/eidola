@@ -954,6 +954,19 @@
           }
         }
       },
+      "Capability": {
+        "type": "object",
+        "description": "One capability leaf.\n\nAn object rather than a bare boolean, so a capability can grow a sibling\nkey later — an effort ladder, a weights measurement — without a type change\nbreaking a client already deployed against this shape.",
+        "required": [
+          "supported"
+        ],
+        "properties": {
+          "supported": {
+            "type": "boolean",
+            "description": "Whether the model supports it."
+          }
+        }
+      },
       "ChatCompletionChunk": {
         "type": "object",
         "description": "A streaming chat completion chunk.",
@@ -1795,6 +1808,15 @@
         ],
         "description": "Message content can be a simple string or array of content parts (for multimodal)."
       },
+      "Modality": {
+        "type": "string",
+        "description": "A kind of content a model accepts or produces.",
+        "enum": [
+          "text",
+          "image",
+          "audio"
+        ]
+      },
       "Model": {
         "type": "object",
         "description": "A model descriptor.",
@@ -1803,9 +1825,15 @@
           "name",
           "description",
           "context_length",
+          "output_budget_class",
+          "capabilities",
           "pricing"
         ],
         "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/ModelCapabilities",
+            "description": "What this model can do."
+          },
           "context_length": {
             "type": "integer",
             "format": "int64",
@@ -1820,13 +1848,60 @@
             "type": "string",
             "description": "The model identifier (e.g. \"openai/gpt-4o\")."
           },
+          "max_output_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The largest completion this model may be asked for.\n\nSeparate from `context_length` on purpose: a context window is what a\nrequest may *contain*, not what one response may *be*. `null` means\nundeclared — a client must treat that as \"unknown\" and keep whatever\ndefault it already applies, never as zero.",
+            "minimum": 0
+          },
           "name": {
             "type": "string",
             "description": "Human-readable display name."
           },
+          "output_budget_class": {
+            "$ref": "#/components/schemas/OutputBudgetClass",
+            "description": "Which public output-budget ladder this model draws from."
+          },
           "pricing": {
             "$ref": "#/components/schemas/ModelPricing",
             "description": "Pricing in integer credits per 1k tokens."
+          }
+        }
+      },
+      "ModelCapabilities": {
+        "type": "object",
+        "description": "What a model can do, as the catalog declares it.\n\nOnly axes that actually vary across the models this server sells are\ncarried. An axis every model shares tells a client nothing and is one more\nassertion that has to stay true.",
+        "required": [
+          "tool_calling",
+          "reasoning",
+          "input_modalities",
+          "output_modalities"
+        ],
+        "properties": {
+          "input_modalities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Modality"
+            },
+            "description": "The content kinds the model accepts."
+          },
+          "output_modalities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Modality"
+            },
+            "description": "The content kinds the model produces."
+          },
+          "reasoning": {
+            "$ref": "#/components/schemas/Capability",
+            "description": "Whether the model produces reasoning content before its answer."
+          },
+          "tool_calling": {
+            "$ref": "#/components/schemas/Capability",
+            "description": "Whether the model accepts a `tools` request field.\n\nNamed after the wire rather than after an adjective: the question a\nclient actually has is \"will this request be accepted\", and a field\nname answers it where \"supports tool use\" does not."
           }
         }
       },
@@ -1872,6 +1947,14 @@
             "description": "The list of models."
           }
         }
+      },
+      "OutputBudgetClass": {
+        "type": "string",
+        "description": "Which public output-budget ladder a model draws from.\n\nA *class*, not a number: the ladder's rungs are policy that can move\nwithout the catalog moving, and keeping the selection public and\nper-model is what keeps an output budget from becoming a per-user value.",
+        "enum": [
+          "standard",
+          "reasoning"
+        ]
       },
       "PortalResponse": {
         "type": "object",
