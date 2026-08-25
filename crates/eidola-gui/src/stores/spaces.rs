@@ -1009,9 +1009,11 @@ impl SpacesStore {
         );
     }
 
-    /// Archive a space: drop the cached row immediately (so the Library
-    /// responds without a backend round trip — and so stub tests exercise the
-    /// local path), then archive core-side and re-list. Owning the write here
+    /// Archive a space: drop the cached row **and every delegated row beneath
+    /// it** immediately (so the Library responds without a backend round trip —
+    /// and so stub tests exercise the local path), then archive core-side and
+    /// re-list. The subtree is what app-core closes, so it is what the optimism
+    /// has to claim; see [`archive_edit`]. Owning the write here
     /// is what makes it safe to start from a closing window: the core write
     /// completes regardless, and the bus reconciles every other window.
     pub fn archive(&mut self, space_id: String, cx: &mut Context<Self>) {
@@ -1070,7 +1072,7 @@ type UndoEdit = Box<dyn FnOnce(&mut Vec<SpaceInfo>)>;
 ///
 /// Optimistic local removal — an edit of whatever value is present, so the
 /// cell's state is unchanged (a stale or failed-with-prior listing stays what
-/// it is; only its rows move). Its inverse puts the row back where the
+/// it is; only its rows move). Its inverse puts each row back where the
 /// *listing's own order* puts it.
 ///
 /// **The position is derived, never stored.** A recorded slot is stale the
@@ -1095,12 +1097,43 @@ type UndoEdit = Box<dyn FnOnce(&mut Vec<SpaceInfo>)>;
 /// or gone) leaves the carried copy standing, which is the best answer
 /// available.
 fn archive_edit(rows: &mut Vec<SpaceInfo>, row_id: String) -> UndoEdit {
-    let removed = rows
-        .iter()
-        .position(|s| s.id == row_id)
-        .map(|at| rows.remove(at));
+    // **The edit is the whole subtree, because the write is.** `archive_space`
+    // closes every live delegation beneath the space it names — a delegation
+    // exists to serve the conversation it was opened from, so closing that one
+    // closes them — and an optimistic edit that removed only the clicked row
+    // left its delegated children on screen until the re-list, and *for good*
+    // if that read failed: `Failed { prior }` keeps them, and the Library goes
+    // on offering conversations every turn will refuse.
+    //
+    // The closure is derived from the rows, not carried: a delegated row names
+    // the conversation it came from, so "everything under this one" is a
+    // question the listing answers about itself — the same instinct as the seat
+    // and the parent title below. Breadth-first, so a parent is always taken
+    // before anything beneath it.
+    let mut closing: Vec<String> = vec![row_id];
+    let mut seen = 0;
+    while seen < closing.len() {
+        let parent_id = closing[seen].clone();
+        for row in rows.iter() {
+            if row.parent.as_ref().is_some_and(|p| p.space_id == parent_id)
+                && !closing.contains(&row.id)
+            {
+                closing.push(row.id.clone());
+            }
+        }
+        seen += 1;
+    }
+    // Taken in that order, so the inverse restores each row *after* the row it
+    // reads its badge from. A descendant a sibling operation already removed is
+    // simply not here, and stays that operation's to put back.
+    let mut removed: Vec<SpaceInfo> = Vec::new();
+    for id in &closing {
+        if let Some(at) = rows.iter().position(|s| &s.id == id) {
+            removed.push(rows.remove(at));
+        }
+    }
     Box::new(move |rows: &mut Vec<SpaceInfo>| {
-        if let Some(mut row) = removed {
+        for mut row in removed {
             if let Some(parent) = row.parent.as_mut()
                 && let Some(current) = rows.iter().find(|r| r.id == parent.space_id)
             {
@@ -1377,6 +1410,114 @@ mod tests {
                  (archive first: {archive_settles_first})"
             );
         }
+    }
+
+    /// **Archiving a conversation archives the rooms delegated from it, so the
+    /// optimism has to claim the same set.** `archive_space` closes every live
+    /// delegation beneath the space it names; removing only the clicked row
+    /// left its children on screen until the re-list, and for good if that read
+    /// failed — a Library going on offering conversations every turn would
+    /// refuse. And a refused write puts the whole set back, in the listing's
+    /// own order.
+    #[test]
+    fn archiving_a_parent_takes_its_delegated_rooms_with_it() {
+        let seed = || {
+            Loadable::loaded(vec![
+                row_at("s1", "Tides", 400),
+                SpaceInfo {
+                    last_activity_at: 300,
+                    ..child_of("s2", "Survey", ("s1", "Tides"))
+                },
+                SpaceInfo {
+                    last_activity_at: 200,
+                    ..child_of("s3", "Second opinion", ("s2", "Survey"))
+                },
+                row_at("s4", "Bergamot", 100),
+            ])
+        };
+
+        // The whole subtree goes, to any depth, and nothing else does.
+        let mut cell = seed();
+        let undo = archive(&mut cell, "s1");
+        assert_eq!(
+            titles(&cell),
+            vec!["Bergamot".to_string()],
+            "the room, its delegation, and that delegation's own room"
+        );
+
+        // …and a refusal puts every one of them back where the listing's order
+        // seats it.
+        settle_index_mutation(&mut cell, undo, Err("refused".into()));
+        resolving_read(&mut cell, Err(read_err()));
+        assert_eq!(
+            titles(&cell),
+            vec![
+                "Tides".to_string(),
+                "Survey".to_string(),
+                "Second opinion".to_string(),
+                "Bergamot".to_string()
+            ]
+        );
+        assert_eq!(
+            parent_titles(&cell),
+            vec![Some("Tides".to_string()), Some("Survey".to_string())],
+            "each restored badge reads its parent row, which is back by then"
+        );
+
+        // Archiving a leaf is still just the leaf.
+        let mut cell = seed();
+        archive(&mut cell, "s3");
+        assert_eq!(
+            titles(&cell),
+            vec![
+                "Tides".to_string(),
+                "Survey".to_string(),
+                "Bergamot".to_string()
+            ]
+        );
+    }
+
+    /// The subtree removal composes with the cross-row rename edit rather than
+    /// working around it. The reachable interleaving is a rename of a parent
+    /// beside an archive of something *beneath* it — a rename and an archive of
+    /// one row share a mutation key, so the second supersedes the first and
+    /// undoes its edit before applying its own. Both refused, and every badge
+    /// lands on the name the database holds.
+    #[test]
+    fn a_refused_rename_survives_a_refused_subtree_archive() {
+        let mut cell = Loadable::loaded(vec![
+            row_at("s1", "Tides", 400),
+            SpaceInfo {
+                last_activity_at: 300,
+                ..child_of("s2", "Survey", ("s1", "Tides"))
+            },
+            SpaceInfo {
+                last_activity_at: 200,
+                ..child_of("s3", "Second opinion", ("s2", "Survey"))
+            },
+        ]);
+        let undo_rename = rename(&mut cell, "s1", "Nile");
+        // The archive is of the delegation, so it takes the room beneath it too
+        // — and both carry the parent title the rename has not yet earned.
+        let undo_archive = archive(&mut cell, "s2");
+        assert_eq!(titles(&cell), vec!["Nile".to_string()]);
+
+        settle_index_mutation(&mut cell, undo_rename, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo_archive, Err("refused".into()));
+        resolving_read(&mut cell, Err(read_err()));
+        assert_eq!(
+            titles(&cell),
+            vec![
+                "Tides".to_string(),
+                "Survey".to_string(),
+                "Second opinion".to_string()
+            ]
+        );
+        assert_eq!(
+            parent_titles(&cell),
+            vec![Some("Tides".to_string()), Some("Survey".to_string())],
+            "no badge comes back wearing the refused name"
+        );
     }
 
     // -- The double-failure quadrant -----------------------------------------
