@@ -909,7 +909,7 @@ impl SpacesStore {
         optimistic: impl FnOnce(&mut Vec<SpaceInfo>) -> UndoEdit,
         op: F,
     ) where
-        F: FnOnce(Arc<AppCore>) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        F: FnOnce(Arc<AppCore>) -> Pin<Box<dyn Future<Output = WriteVerdict> + Send>>
             + Send
             + 'static,
     {
@@ -998,12 +998,15 @@ impl SpacesStore {
             move |rows| rename_edit(rows, row_id, optimistic_title),
             move |core| {
                 Box::pin(async move {
-                    bridge(
+                    match bridge(
                         core,
                         move |c| async move { c.rename_space(id, title).await },
                     )
                     .await
-                    .map_err(|e| format!("Couldn't rename this space: {e}"))
+                    {
+                        Ok(()) => WriteVerdict::Applied,
+                        Err(e) => WriteVerdict::Refused(format!("Couldn't rename this space: {e}")),
+                    }
                 })
             },
         );
@@ -1026,17 +1029,22 @@ impl SpacesStore {
             move |core| {
                 Box::pin(async move {
                     match bridge(core, move |c| async move { c.archive_space(id).await }).await {
-                        Ok(true) => Ok(()),
+                        Ok(true) => WriteVerdict::Applied,
                         // The row was dropped on the assumption the write would
-                        // take. `false` says it did not (the space was already
-                        // archived, or is not there at all), so the removal was
-                        // not this operation's to claim — say so, and let the
-                        // re-list put the truth back.
-                        Ok(false) => Err(
+                        // take. `false` says it did not — the space was already
+                        // archived, or is not there at all — so the removal was
+                        // not this operation's to *claim*, and is right all the
+                        // same: the row does not belong in the Library either
+                        // way. Reported, therefore, and not undone. The sentence
+                        // says exactly that, and putting the row back
+                        // contradicted it (see [`WriteVerdict`]).
+                        Ok(false) => WriteVerdict::AlreadySo(
                             "Couldn't archive this space — it is no longer in your library."
                                 .to_string(),
                         ),
-                        Err(e) => Err(format!("Couldn't archive this space: {e}")),
+                        Err(e) => {
+                            WriteVerdict::Refused(format!("Couldn't archive this space: {e}"))
+                        }
                     }
                 })
             },
@@ -1178,6 +1186,38 @@ fn rename_edit(rows: &mut [SpaceInfo], row_id: String, title: String) -> UndoEdi
     })
 }
 
+/// What a mutation's write answered, as the settle needs it — three states,
+/// because "the write did not do it" and "the edit was wrong" are different
+/// facts and only one of them takes an optimistic edit back.
+///
+/// The middle one is the whole reason this is not a `Result`. `AppCore::
+/// archive_space` answers `Ok(false)` when it changed nothing, which for an
+/// archive means the space was **already archived, or already gone** — so the
+/// row genuinely does not belong in the Library and the optimistic removal was
+/// *right*, merely not this operation's doing. Read as a refusal it put the row
+/// back, which is how a child's archive could undo a parent's successful
+/// subtree archive: the parent's transaction closes both rows, the child's then
+/// answers `false`, and its inverse reinserts a conversation the database has
+/// closed — standing for good behind a failed batch-end read, offering a
+/// conversation every turn would refuse.
+///
+/// Keying on the database's own verdict rather than on the shape of the tree is
+/// what makes that structural: no operation has to know which other operation
+/// closed the row, or whether it was an ancestor, another window, or a
+/// retirement.
+#[derive(Debug)]
+enum WriteVerdict {
+    /// This write made the change. The edit stands and nothing is owed.
+    Applied,
+    /// The write changed nothing because the world already agreed with the
+    /// edit. The edit stands — but the reader asked for something this
+    /// operation did not do, so it is still told.
+    AlreadySo(String),
+    /// The write was refused. The edit was a promise this operation cannot
+    /// keep, so it takes it back and says why.
+    Refused(String),
+}
+
 /// Settle an index mutation: the write's outcome, the re-list's outcome, the
 /// inverse of the edit this operation made, and whether this operation is the
 /// last one in flight and may therefore resolve the shared cell.
@@ -1210,7 +1250,8 @@ fn rename_edit(rows: &mut [SpaceInfo], row_id: String, title: String) -> UndoEdi
 /// supersedes it wholesale; the undo only ever shapes the `prior` that a failed
 /// re-list keeps showing. And it is gated on the write being *refused*: a write
 /// that landed durably is honest to keep on screen even when the read behind it
-/// failed.
+/// failed — and so is one that changed nothing because the world had already
+/// changed (see [`WriteVerdict::AlreadySo`]), which is a report without an undo.
 ///
 /// **Settling never resolves the cell.** This function carries no listing, by
 /// construction: any listing an operation could hand it was read before the
@@ -1224,20 +1265,26 @@ fn rename_edit(rows: &mut [SpaceInfo], row_id: String, title: String) -> UndoEdi
 fn settle_index_mutation(
     index: &mut Loadable<Vec<SpaceInfo>>,
     undo: UndoEdit,
-    op: Result<(), String>,
+    verdict: WriteVerdict,
 ) -> Option<String> {
-    if op.is_err()
-        && let Some(rows) = index.value_mut()
-    {
-        // Only where a value is present to be wrong: a cell holding no rows is
-        // showing no optimistic edit either.
-        undo(rows);
+    match verdict {
+        WriteVerdict::Applied => None,
+        // The edit was right and stays; only the report is owed. See
+        // [`WriteVerdict`] for why this is not an undo.
+        WriteVerdict::AlreadySo(message) => Some(message),
+        WriteVerdict::Refused(message) => {
+            // Only where a value is present to be wrong: a cell holding no rows
+            // is showing no optimistic edit either.
+            if let Some(rows) = index.value_mut() {
+                undo(rows);
+            }
+            Some(message)
+        }
     }
-    op.err()
 }
 #[cfg(test)]
 mod tests {
-    use super::{SpaceInfo, UndoEdit, settle_index_mutation};
+    use super::{SpaceInfo, UndoEdit, WriteVerdict, settle_index_mutation};
     use crate::loadable::Loadable;
     use eidola_app_core::error::AppError;
 
@@ -1345,7 +1392,7 @@ mod tests {
 
         // …and the inverse takes all of them back, in the quadrant where
         // nothing else can: refused write, failed re-list.
-        settle_index_mutation(&mut cell, undo, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo, WriteVerdict::Refused("refused".into()));
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1393,8 +1440,8 @@ mod tests {
             } else {
                 (undo_rename, undo_archive)
             };
-            settle_index_mutation(&mut cell, first, Err("refused".into()));
-            settle_index_mutation(&mut cell, second, Err("refused".into()));
+            settle_index_mutation(&mut cell, first, WriteVerdict::Refused("refused".into()));
+            settle_index_mutation(&mut cell, second, WriteVerdict::Refused("refused".into()));
             resolving_read(&mut cell, Err(read_err()));
 
             assert_eq!(
@@ -1447,7 +1494,7 @@ mod tests {
 
         // …and a refusal puts every one of them back where the listing's order
         // seats it.
-        settle_index_mutation(&mut cell, undo, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo, WriteVerdict::Refused("refused".into()));
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1502,8 +1549,16 @@ mod tests {
         let undo_archive = archive(&mut cell, "s2");
         assert_eq!(titles(&cell), vec!["Nile".to_string()]);
 
-        settle_index_mutation(&mut cell, undo_rename, Err("refused".into()));
-        settle_index_mutation(&mut cell, undo_archive, Err("refused".into()));
+        settle_index_mutation(
+            &mut cell,
+            undo_rename,
+            WriteVerdict::Refused("refused".into()),
+        );
+        settle_index_mutation(
+            &mut cell,
+            undo_archive,
+            WriteVerdict::Refused("refused".into()),
+        );
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1520,6 +1575,91 @@ mod tests {
         );
     }
 
+    /// **A refused child archive must not undo a parent's successful subtree
+    /// archive.** Archiving a delegation and then the conversation above it are
+    /// two operations on two keys, so both are in flight: the child's edit
+    /// removes the child, the parent's then snapshots only the parent, and if
+    /// the parent's transaction commits first it closes *both* rows. The
+    /// child's call then answers `Ok(false)` — already archived — which read as
+    /// a refusal put the child back, and a failed batch-end read kept it there
+    /// for good: a Library offering a conversation the database has closed.
+    ///
+    /// `Ok(false)` is the database's verdict that the row does not belong in
+    /// the listing, not a verdict that the edit was wrong, so it is reported
+    /// without being undone — and no operation has to know which other one
+    /// closed the row.
+    #[test]
+    fn a_child_archive_that_changed_nothing_does_not_undo_the_parents() {
+        for child_settles_first in [false, true] {
+            let mut cell = Loadable::loaded(vec![
+                row_at("s1", "Tides", 300),
+                SpaceInfo {
+                    last_activity_at: 200,
+                    ..child_of("s2", "Survey", ("s1", "Tides"))
+                },
+                row_at("s3", "Bergamot", 100),
+            ]);
+            // The delegation goes first, so the parent's edit snapshots only
+            // itself — the child is already out of the listing.
+            let undo_child = archive(&mut cell, "s2");
+            let undo_parent = archive(&mut cell, "s1");
+            assert_eq!(titles(&cell), vec!["Bergamot".to_string()]);
+
+            // The parent's transaction commits and closes both rows; the
+            // child's then finds nothing left to close.
+            let already = || {
+                WriteVerdict::AlreadySo(
+                    "Couldn't archive this space — it is no longer in your library.".to_string(),
+                )
+            };
+            let (first, first_verdict, second, second_verdict) = if child_settles_first {
+                (undo_child, already(), undo_parent, WriteVerdict::Applied)
+            } else {
+                (undo_parent, WriteVerdict::Applied, undo_child, already())
+            };
+            let a = settle_index_mutation(&mut cell, first, first_verdict);
+            let b = settle_index_mutation(&mut cell, second, second_verdict);
+            resolving_read(&mut cell, Err(read_err()));
+
+            assert_eq!(
+                titles(&cell),
+                vec!["Bergamot".to_string()],
+                "the closed conversation and its delegation both stay closed \
+                 (child first: {child_settles_first})"
+            );
+            assert!(
+                a.is_some() || b.is_some(),
+                "and the reader is still told the archive was not this operation's"
+            );
+        }
+    }
+
+    /// The distinction is the *verdict*, not the archive verb: a write that
+    /// genuinely failed still takes its edit back, because nothing then says
+    /// the row does not belong.
+    #[test]
+    fn an_archive_that_really_failed_still_puts_its_rows_back() {
+        let mut cell = Loadable::loaded(vec![
+            row_at("s1", "Tides", 300),
+            SpaceInfo {
+                last_activity_at: 200,
+                ..child_of("s2", "Survey", ("s1", "Tides"))
+            },
+        ]);
+        let undo = archive(&mut cell, "s1");
+        settle_index_mutation(
+            &mut cell,
+            undo,
+            WriteVerdict::Refused("Couldn't archive this space: disk on fire".into()),
+        );
+        resolving_read(&mut cell, Err(read_err()));
+        assert_eq!(
+            titles(&cell),
+            vec!["Tides".to_string(), "Survey".to_string()],
+            "a failure is not a verdict about where the rows belong"
+        );
+    }
+
     // -- The double-failure quadrant -----------------------------------------
 
     /// The write was refused *and* the read that would have taken the optimistic
@@ -1533,7 +1673,7 @@ mod tests {
         let recorded = settle_index_mutation(
             &mut cell,
             undo,
-            Err("Couldn't rename this space: space not found: s1".into()),
+            WriteVerdict::Refused("Couldn't rename this space: space not found: s1".into()),
         );
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
@@ -1560,7 +1700,7 @@ mod tests {
             row_at("s2", "Bergamot", 200),
         ]);
         let undo = archive(&mut cell, "s1");
-        settle_index_mutation(&mut cell, undo, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo, WriteVerdict::Refused("refused".into()));
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1589,8 +1729,8 @@ mod tests {
         let undo_b = archive(&mut cell, "b");
         assert_eq!(titles(&cell), vec!["C".to_string()], "both rows are gone");
 
-        settle_index_mutation(&mut cell, undo_a, Err("refused".into()));
-        settle_index_mutation(&mut cell, undo_b, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo_a, WriteVerdict::Refused("refused".into()));
+        settle_index_mutation(&mut cell, undo_b, WriteVerdict::Refused("refused".into()));
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1611,8 +1751,8 @@ mod tests {
         let undo_a = archive(&mut cell, "a");
         let undo_b = archive(&mut cell, "b");
 
-        settle_index_mutation(&mut cell, undo_b, Err("refused".into()));
-        settle_index_mutation(&mut cell, undo_a, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo_b, WriteVerdict::Refused("refused".into()));
+        settle_index_mutation(&mut cell, undo_a, WriteVerdict::Refused("refused".into()));
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1634,8 +1774,8 @@ mod tests {
         let undo_a = archive(&mut cell, "a");
         let undo_b = rename(&mut cell, "b", "Bergamot");
 
-        settle_index_mutation(&mut cell, undo_b, Err("refused".into()));
-        settle_index_mutation(&mut cell, undo_a, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo_b, WriteVerdict::Refused("refused".into()));
+        settle_index_mutation(&mut cell, undo_a, WriteVerdict::Refused("refused".into()));
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1651,7 +1791,7 @@ mod tests {
     fn the_resolving_read_supersedes_the_undo() {
         let mut cell = Loadable::loaded(vec![row("s1", "Tides")]);
         let undo = rename(&mut cell, "s1", "Nile");
-        settle_index_mutation(&mut cell, undo, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo, WriteVerdict::Refused("refused".into()));
         resolving_read(&mut cell, Ok(vec![row("s1", "Renamed in another window")]));
         assert_eq!(
             titles(&cell),
@@ -1667,7 +1807,7 @@ mod tests {
     fn an_accepted_write_whose_read_fails_keeps_its_edit() {
         let mut cell = Loadable::loaded(vec![row("s1", "Tides")]);
         let undo = rename(&mut cell, "s1", "Nile");
-        let recorded = settle_index_mutation(&mut cell, undo, Ok(()));
+        let recorded = settle_index_mutation(&mut cell, undo, WriteVerdict::Applied);
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1692,7 +1832,7 @@ mod tests {
         let undo_b = rename(&mut cell, "b", "Bergamot");
 
         // A settles first, with B still in flight. It resolves nothing.
-        settle_index_mutation(&mut cell, undo_a, Ok(()));
+        settle_index_mutation(&mut cell, undo_a, WriteVerdict::Applied);
         assert_eq!(
             titles(&cell),
             vec!["Anemone".to_string(), "Bergamot".to_string()],
@@ -1700,7 +1840,7 @@ mod tests {
         );
 
         // B settles last; the batch-end read is the only resolution, and it fails.
-        settle_index_mutation(&mut cell, undo_b, Ok(()));
+        settle_index_mutation(&mut cell, undo_b, WriteVerdict::Applied);
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1719,14 +1859,14 @@ mod tests {
         let undo_a = rename(&mut cell, "a", "Anemone");
         let undo_b = rename(&mut cell, "b", "Bergamot");
 
-        settle_index_mutation(&mut cell, undo_a, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo_a, WriteVerdict::Refused("refused".into()));
         assert_eq!(
             titles(&cell),
             vec!["A".to_string(), "Bergamot".to_string()],
             "A's refusal is undone; B's pending edit is untouched"
         );
 
-        settle_index_mutation(&mut cell, undo_b, Ok(()));
+        settle_index_mutation(&mut cell, undo_b, WriteVerdict::Applied);
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1745,8 +1885,8 @@ mod tests {
         let undo_a = rename(&mut cell, "a", "Anemone");
         let undo_b = rename(&mut cell, "b", "Bergamot");
 
-        settle_index_mutation(&mut cell, undo_a, Err("refused".into()));
-        settle_index_mutation(&mut cell, undo_b, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo_a, WriteVerdict::Refused("refused".into()));
+        settle_index_mutation(&mut cell, undo_b, WriteVerdict::Refused("refused".into()));
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
@@ -1762,7 +1902,8 @@ mod tests {
     fn every_settle_reports_its_refusal() {
         let mut cell = Loadable::loaded(vec![row("s1", "Tides")]);
         let undo = rename(&mut cell, "s1", "Nile");
-        let recorded = settle_index_mutation(&mut cell, undo, Err("refused".into()));
+        let recorded =
+            settle_index_mutation(&mut cell, undo, WriteVerdict::Refused("refused".into()));
         assert_eq!(recorded.as_deref(), Some("refused"));
     }
 }
