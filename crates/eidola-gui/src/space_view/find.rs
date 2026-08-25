@@ -138,13 +138,47 @@ fn append_block(
     block: &gpui_markdown_editor::RenderBlock,
     block_range: Range<usize>,
 ) {
+    // **A sole-image paragraph is the promoted block form, and it hides
+    // itself one layer further down than every other hide.** The render
+    // layer emits `BlockKind::Image` with no `hidden_ranges` and no overlay
+    // at all; the element layer pushes the hide over the whole block once the
+    // image is loading or loaded — every case that paints a picture. Reading
+    // the render spec alone therefore found nothing to exclude and copied the
+    // entire `![alt](url)`, reporting matches on an alt text and a URL that
+    // stand behind the image rather than on the page.
+    //
+    // **Load state is deliberately not consulted**, which is the one place
+    // this differs from the math rule beside it. A failed load is the single
+    // case that leaves the markup shaped, but whether an image loads is not a
+    // function of the post's source: it is asynchronous, external, and can
+    // change with no edit behind it. Consulting it would put an input in the
+    // projection cache's validity key that no `ProjectionSeed` could honestly
+    // carry, and would need a `Window` the projection does not have. So both
+    // image forms take the same verdict the inline overlay already took, and
+    // the admitted cost is that a broken image's visible markup is not
+    // searchable.
+    if matches!(
+        block.kind,
+        gpui_markdown_editor::BlockKind::Image {
+            edit_mode: false,
+            ..
+        }
+    ) {
+        return;
+    }
+
     let mut marks: Vec<(Range<usize>, Mark<'_>)> = Vec::new();
+    // Every substitution's start, in order — the boundaries a hidden range
+    // has to be interrupted at. See [`push_hide`].
+    let mut sub_starts: Vec<usize> = Vec::new();
     for sub in &block.substitutions {
         let r = clamp(&sub.source_range, content.len());
         if r.start < r.end {
+            sub_starts.push(r.start);
             marks.push((r, Mark::Substitute(sub.display.as_str())));
         }
     }
+    sub_starts.sort_unstable();
     // **Which hidden bytes are a barrier rather than a deletion**, decided by
     // where they fall rather than by re-deriving the render's own chrome
     // arithmetic: a table's cell content ranges come out of the same
@@ -167,10 +201,10 @@ fn append_block(
             continue;
         }
         if cells.is_empty() {
-            marks.push((r, Mark::Skip));
+            push_hide(r, &sub_starts, &mut marks);
             continue;
         }
-        split_at_cell_edges(r, &cells, &mut marks);
+        split_at_cell_edges(r, &cells, &sub_starts, &mut marks);
     }
     // **Inline math and inline images carry no hidden range of their own.**
     // The render layer deliberately leaves suppressing their source bytes to
@@ -243,6 +277,44 @@ fn clamp(range: &Range<usize>, len: usize) -> Range<usize> {
     range.start.min(len)..range.end.min(len)
 }
 
+/// Push one hidden range as [`Mark::Skip`], split at every substitution that
+/// begins strictly inside it so that substitution still gets its turn.
+///
+/// **This is the display walker's rule, not a new one.** `build_display_line`
+/// clamps a covering hide's jump to the earliest in-span substitution start,
+/// so the reader of `**&amp;**` sees `&` even though `merge_hidden_ranges`
+/// coalesced the emphasis delimiters and the entity into a single hide
+/// starting at byte 0. The walk below applies a substitution only where it
+/// lands on the start exactly, so an un-split covering hide consumed the whole
+/// span first and that `&` projected as nothing — invisible to a search over
+/// text plainly on the page. Splitting at the start is enough: the piece that
+/// begins there sorts after the substitution, which takes the byte and hands
+/// the rest of the hide back.
+///
+/// Splitting rather than teaching the walk a special case keeps the per-byte
+/// philosophy the cell-edge rule already states — each piece of a merged hide
+/// carries the verdict its own bytes earn — and it composes with that rule
+/// instead of racing it, since a cell-edge piece is pushed through here too.
+///
+/// This says nothing about the *overlay* skips, and must not: a math or image
+/// overlay is replaced wholesale by the element layer, so a substitution
+/// inside one (an entity in an image's alt text) never reaches the page and
+/// must stay unsearchable.
+fn push_hide<'a>(
+    range: Range<usize>,
+    sub_starts: &[usize],
+    out: &mut Vec<(Range<usize>, Mark<'a>)>,
+) {
+    let mut pos = range.start;
+    for &start in sub_starts {
+        if start > pos && start < range.end {
+            out.push((pos..start, Mark::Skip));
+            pos = start;
+        }
+    }
+    out.push((pos..range.end, Mark::Skip));
+}
+
 /// Split one hidden range of a table block at the cell edges it crosses,
 /// pushing each piece with the verdict its own bytes earn: inside a cell it is
 /// inline markup and contributes nothing, outside every cell it is grid chrome
@@ -254,6 +326,7 @@ fn clamp(range: &Range<usize>, len: usize) -> Range<usize> {
 fn split_at_cell_edges<'a>(
     range: Range<usize>,
     cells: &[Range<usize>],
+    sub_starts: &[usize],
     out: &mut Vec<(Range<usize>, Mark<'a>)>,
 ) {
     let mut pos = range.start;
@@ -262,7 +335,7 @@ fn split_at_cell_edges<'a>(
             // Inside a cell — inline markup, up to that cell's end.
             Some(cell) => {
                 let end = cell.end.min(range.end);
-                out.push((pos..end, Mark::Skip));
+                push_hide(pos..end, sub_starts, out);
                 pos = end;
             }
             // Between cells — the grid, up to wherever the next cell begins.
@@ -1576,6 +1649,51 @@ mod tests {
         assert!(overlay_count(typeset) == 1);
         assert!(!project(typeset).text().contains('$'));
         assert!(find(typeset, "beta").is_empty());
+    }
+
+    #[test]
+    fn a_sole_image_paragraph_is_not_searchable() {
+        // The promotion carries neither a hidden range nor an overlay — the
+        // element layer hides it once the image loads — so the render spec
+        // offers nothing to exclude and the whole markup was copied.
+        let source = "![a red kite](https://example/kite.png)";
+        assert!(project(source).text().trim().is_empty());
+        assert!(find(source, "kite").is_empty());
+        assert!(find(source, "example").is_empty());
+
+        // A paragraph that merely *contains* an image keeps its prose, and
+        // the image is excluded by the inline-overlay arm as before.
+        let inline = "look ![a red kite](https://example/kite.png) here";
+        assert_eq!(find(inline, "look"), vec!["look".to_string()]);
+        assert!(find(inline, "kite").is_empty());
+    }
+
+    #[test]
+    fn a_substitution_inside_a_merged_hide_is_still_searchable() {
+        // `merge_hidden_ranges` coalesces the emphasis delimiters with the
+        // entity's own hide into one range starting at byte 0, and
+        // `build_display_line` interrupts that hide at the substitution — so
+        // the reader sees `&`, and a hide taken whole made it unsearchable.
+        let source = "**&amp;**";
+        assert_eq!(project(source).text(), "&");
+        assert_eq!(find(source, "&"), vec!["&amp;".to_string()]);
+
+        let embedded = "a **&amp;** b";
+        assert_eq!(project(embedded).text(), "a & b");
+        assert_eq!(find(embedded, "a & b"), vec![embedded.to_string()]);
+
+        // The same merge at a table cell's edge, where the hide is split by
+        // the cell rule first: the two rules compose rather than race.
+        let table = "| a `x`&amp;y | b |\n| --- | --- |\n| 1 | 2 |";
+        assert!(project(table).text().contains("x&y"));
+
+        // **But an overlay is atomic.** An entity in an image's alt text is a
+        // substitution inside a range the element layer replaces wholesale,
+        // so it never reaches the page and must stay unsearchable — the hide
+        // rule above must not reach into an overlay.
+        let alt = "look ![a &amp; b](https://e/k.png) here";
+        assert_eq!(project(alt).text(), "look  here");
+        assert!(find(alt, "&").is_empty());
     }
 
     #[test]
