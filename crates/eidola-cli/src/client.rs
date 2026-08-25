@@ -21,7 +21,18 @@
 //! socket that exists with nothing behind it and the one case the selection
 //! rule must never turn into a silent wait. After that, a verb takes as long
 //! as the work takes: a turn is minutes, and a client that gave up on it would
-//! abandon a turn the account has already paid for.
+//! walk away from an answer the account has already paid for — the app would
+//! finish and persist that turn regardless, so giving up buys nothing and
+//! loses the delivery.
+//!
+//! ## Two ceilings, and this side reads the larger one
+//!
+//! Requests are bounded by [`eidola_app_core::ipc::MAX_FRAME_BYTES`]; answers
+//! are bounded by [`eidola_app_core::ipc::MAX_RESPONSE_BYTES`], which is far
+//! larger because a result grows with the profile while a request does not.
+//! The reader here is built with [`FrameReader::for_responses`] for exactly
+//! that reason: reading answers under the request ceiling would refuse a
+//! legitimate listing as though the app had malfunctioned.
 
 use std::io;
 use std::path::Path;
@@ -161,7 +172,10 @@ impl Client {
         };
         let (reader, writer) = stream.into_split();
         let mut client = Client {
-            reader: FrameReader::new(tokio::io::BufReader::new(reader)),
+            // Answers, not requests: a listing grows with the profile, and
+            // holding one to the request ceiling would refuse a legitimate
+            // result as though the app had malfunctioned.
+            reader: FrameReader::for_responses(tokio::io::BufReader::new(reader)),
             writer,
             next_id: 1,
             app_version: String::new(),
@@ -218,9 +232,16 @@ impl Client {
 
     /// Run a turn, feeding its chunks to `events`, and decode its result.
     ///
-    /// Dropping this future — Ctrl-C, or the process exiting — drops the
-    /// connection, and the app ends the turn with it. That is deliberately the
-    /// same thing Ctrl-C does to an embedded turn.
+    /// **Dropping this future — Ctrl-C, or the process exiting — costs the
+    /// delivery, not the turn.** The app runs the turn on its own runtime, so
+    /// losing the connection detaches it rather than cancelling it: the answer
+    /// is written, the credential settles, and the post is in the space when
+    /// the caller comes back to it. Stating that backwards would be
+    /// billing-relevant, since the tokens are spent the moment the request goes
+    /// upstream. `crates/eidola-app-core/src/ipc/serve.rs` → What a lost caller
+    /// costs carries the whole rule, including the one racy edge (a caller that
+    /// vanishes before the turn is handed to the runtime, where nothing runs
+    /// and nothing is spent).
     pub async fn chat_stream(
         &mut self,
         call: &Call,
@@ -470,6 +491,54 @@ mod tests {
             }))) => assert_eq!(supported, 7),
             other => panic!("unexpected: {:?}", other.map(|_| ())),
         }
+    }
+
+    #[tokio::test]
+    async fn an_answer_larger_than_the_request_ceiling_still_arrives() {
+        use eidola_app_core::ipc::{MAX_FRAME_BYTES, WalletRecoverResult};
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A listing that grew with the profile: past the *request* ceiling,
+        // well inside the answer one. Requests do not grow like this and
+        // answers do, which is the whole reason the two bounds differ.
+        let recovered: Vec<String> = (0..50_000).map(|i| format!("nonce-{i:026}")).collect();
+        let expected = recovered.len();
+        assert!(
+            encode_line(&Response::end(
+                1,
+                &WalletRecoverResult {
+                    recovered: recovered.clone()
+                }
+            ))
+            .len()
+                > MAX_FRAME_BYTES,
+            "the fixture has to actually exceed the request bound to prove anything"
+        );
+
+        serve(dir.path(), move |request| match request.verb.as_str() {
+            "hello" => vec![Response::end(
+                request.id,
+                &HelloResult {
+                    protocol: PROTOCOL_VERSION,
+                    app_version: "9.9.9".into(),
+                },
+            )],
+            _ => vec![Response::end(
+                request.id,
+                &WalletRecoverResult {
+                    recovered: recovered.clone(),
+                },
+            )],
+        });
+        let mut client = Client::connect(dir.path()).await.expect("connect");
+        let listing: WalletRecoverResult = client
+            .call(&Call::WalletRecover)
+            .await
+            .expect("a large listing is an answer, not a malfunction");
+        assert_eq!(listing.recovered.len(), expected);
+        assert_eq!(
+            listing.recovered[expected - 1],
+            format!("nonce-{:026}", expected - 1)
+        );
     }
 
     #[tokio::test]
