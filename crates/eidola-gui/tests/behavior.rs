@@ -19415,3 +19415,125 @@ fn space_find_reprojects_a_post_whose_embed_map_moved_under_it(cx: &mut TestAppC
         );
     });
 }
+
+#[gpui::test]
+fn space_find_carries_a_pending_reveal_onto_the_posts_new_generation(cx: &mut TestAppContext) {
+    // `reanchor` forwards the reader's place through *item* identity, because
+    // an edit or a regeneration mints a new action id for the same post and
+    // `Change::Space` fires on every background write. A reveal already in
+    // flight records the **node** — an action id — and `sync_bodies` prunes the
+    // editor of the id that just went, so a reveal left naming it could never
+    // obtain geometry: the estimate stood as the final answer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let tail = "and the one kestrel, far down the page";
+    let posts = |suffix: &str| {
+        let mut out = Vec::new();
+        for i in 1..=4u32 {
+            let id = format!("a{i}{suffix}");
+            let text = if i == 4 { tail } else { filler.as_str() };
+            let mut p = if i % 2 == 1 {
+                fixture_user_post(&id, text)
+            } else {
+                fixture_assistant_post(&id, text)
+            };
+            // The item is what survives a new generation; the action id is not.
+            p.item_id = format!("item-{i}");
+            if i > 1 {
+                p.parent_action_id = Some(format!("a{}{suffix}", i - 1));
+            }
+            out.push(p);
+        }
+        out
+    };
+    seed_quotable_space(&view, window, cx, posts(""));
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "the reveal is a multi-frame glide, so the correction is still owed"
+        );
+        assert_eq!(
+            v.find_pending_reveal_for_test().map(|(n, _)| n.to_string()),
+            Some("a4".to_string()),
+        );
+    });
+
+    // A background write lands mid-reveal: same items, new action ids.
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(posts("b"), cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let (matches, index) = v.find_matches_for_test();
+        assert_eq!(index, Some(1), "the reader kept their place");
+        assert_eq!(matches[0].0.as_ref(), "a4b", "…on the new generation");
+        assert_eq!(
+            v.find_pending_reveal_for_test().map(|(n, _)| n.to_string()),
+            Some("a4b".to_string()),
+            "and the reveal it is still owed names the post that exists"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_stops_the_old_reveal_when_the_query_stops_matching(cx: &mut TestAppContext) {
+    // A reveal is a multi-frame glide, and clearing the anchor does not stop
+    // one: narrowing a query to nothing left the page still travelling towards
+    // a match of the search before it while the bar read "No results".
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "the off-screen match is being glided to"
+        );
+    });
+
+    // Keep typing until the query matches nothing.
+    vcx.simulate_keystrokes("z z z");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "the bar now says there are no results"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…so the page is not still travelling to a match of the old query"
+        );
+    });
+}

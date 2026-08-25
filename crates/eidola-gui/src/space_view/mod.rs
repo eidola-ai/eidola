@@ -1504,6 +1504,18 @@ impl SpaceView {
         )
     }
 
+    /// The node and source offset a two-phase reveal is still waiting to
+    /// correct, if one is pending — what pins that it follows the anchor
+    /// through an edit or a regeneration.
+    #[doc(hidden)]
+    pub fn find_pending_reveal_for_test(&self) -> Option<(SharedString, usize)> {
+        self.find
+            .as_ref()?
+            .pending_reveal
+            .as_ref()
+            .map(|p| (p.node.clone(), p.offset))
+    }
+
     /// The projections this window is currently holding, by node id.
     #[doc(hidden)]
     pub fn find_projection_nodes_for_test(&self) -> Vec<SharedString> {

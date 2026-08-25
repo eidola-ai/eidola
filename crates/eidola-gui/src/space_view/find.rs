@@ -428,6 +428,32 @@ impl FindSession {
     pub(crate) fn step(&mut self, forward: bool) -> Option<Match> {
         step_anchor(&self.matches, &mut self.anchor, forward)
     }
+
+    /// **A pending reveal is a promise about the current match**, so it moves
+    /// wherever re-anchoring moved that match.
+    ///
+    /// [`reanchor`] forwards through *item* identity, which is the whole point
+    /// of it: an edit or a regeneration mints a new action id for the same
+    /// post, and the reader's place survives. But a reveal already in flight
+    /// records the **node** — an action id — and `sync_bodies` prunes the
+    /// editor of the id that just went away, so the correction could never
+    /// obtain geometry for it. The estimate then stood as the final answer and
+    /// nothing ever landed on the match. Called right after every re-anchor,
+    /// so the two cannot disagree for a frame.
+    pub(crate) fn refollow_pending_reveal(&mut self) {
+        if self.pending_reveal.is_none() {
+            return;
+        }
+        let Some(m) = current_match(&self.matches, &self.anchor) else {
+            // Nothing is current any more; there is nothing left to reveal.
+            self.pending_reveal = None;
+            return;
+        };
+        self.pending_reveal = Some(PendingReveal {
+            node: m.node.clone(),
+            offset: m.source.start,
+        });
+    }
 }
 
 fn current_position(matches: &[Match], anchor: &Option<MatchAnchor>) -> Option<usize> {
@@ -667,6 +693,13 @@ impl SpaceView {
         // frame's selected path and re-anchors. Record the debt; it is
         // discharged there (see `reveal_when_anchored`).
         session.reveal_when_anchored = true;
+        // **And the motion the old query started ends with it.** A reveal is a
+        // multi-frame `PageGlide`, and clearing the anchor does not stop one:
+        // a query narrowed to nothing left the page still travelling towards a
+        // match of the search before it while the bar read "No results". A new
+        // query that *does* match glides again from wherever this stopped, so
+        // cancelling is right either way.
+        self.cancel_page_glide();
         cx.notify();
     }
 
@@ -752,6 +785,7 @@ impl SpaceView {
             }
         }
         session.reanchor(previous);
+        session.refollow_pending_reveal();
         // **The new query's own reveal, discharged where the anchor exists.**
         // The match list is final for this frame by now, so an armed debt is
         // either paid or has nothing to pay: a query matching nothing leaves no
