@@ -1,0 +1,640 @@
+//! Who answers this run's commands — this process, or the Eidola already
+//! running.
+//!
+//! ## The selection rule
+//!
+//! Dial the control socket first.
+//!
+//! - **It answers** ⇒ client mode. The app holds the profile and does the
+//!   work; this process renders it.
+//! - **Nothing is listening** (no socket file, or one nobody answers on) ⇒
+//!   embedded mode: open the profile here, exactly as before the socket
+//!   existed. This is the ordinary case for a machine with no app running.
+//! - **The profile is held but nothing answered for it** ⇒ say so. This is the
+//!   case that must never become a silent wait: an older Eidola, or one whose
+//!   listener stopped, holds the lock this process cannot take and serves no
+//!   socket to ask instead. It arrives two ways — no socket plus
+//!   [`AppError::DatabaseInUse`], and a socket that accepted a connection and
+//!   never greeted it — and both say the same actionable thing.
+//!
+//! `--embedded` skips the dial entirely, which is the debugging escape hatch;
+//! it does not weaken anything, since the lock still decides who may open the
+//! profile.
+//!
+//! ## Why the two modes share one surface
+//!
+//! Every method here answers with the same type in both modes, and failures
+//! arrive as the same typed [`Failure`], because the wire carries
+//! [`AppError`]'s variants rather than prose. So the commands themselves are
+//! written once: what changes between modes is who ran the work, never how the
+//! answer is rendered or which hint a failure earns.
+//!
+//! ## What client mode cannot do
+//!
+//! The socket has no verb for the trust bundle, and deliberately never will
+//! until there is a per-client consent layer — so `configure`, and the bare
+//! invocation that reads the bundle back, need the profile in *this* process.
+//! The account's own identity and consent (`account create`, `accept-terms`,
+//! `reset`, `configure`, `allocate`) and the backend registry's membership
+//! (`backend add`, `backend remove`) are held to the same line: they decide
+//! what this installation *is* and where its prompts may go, which is exactly
+//! what a consent layer would gate. Each is refused by name, with the remedy,
+//! rather than half-working.
+
+use std::path::PathBuf;
+
+use eidola_app_core::backends::BackendInfo;
+use eidola_app_core::error::AppError;
+use eidola_app_core::ipc::{
+    AccountCheckoutResult, AccountPricesResult, BackendModelsResult, Call, DefaultModelResult,
+    Done, ModelDownloadResult, ModelListResult, SpacesArchiveResult, SpacesListResult,
+    WalletCredentialsResult, WalletRecoverResult, WalletSpendingResult,
+};
+use eidola_app_core::updates::UpdateCheckSnapshot;
+use eidola_app_core::{
+    AccountShowResult, AppCore, BalancesResult, ChatResult, ChatStreamEvent, CredentialInfo,
+    InFlightCredentialInfo, ModelInfo, PriceInfo, SpaceInfo,
+};
+
+use crate::client::{Client, Dial, Failure};
+
+/// Who is answering.
+enum Mode {
+    /// This process holds the profile.
+    Embedded(AppCore),
+    /// A running Eidola holds it, and we are asking it.
+    Client {
+        /// The client's I/O is bound to the runtime that created it, so the
+        /// two live and die together.
+        runtime: tokio::runtime::Runtime,
+        /// One request at a time — a command is one operation, and the lock
+        /// is what makes that a fact rather than a convention.
+        client: tokio::sync::Mutex<Client>,
+    },
+}
+
+/// The session a command runs against.
+pub struct Session {
+    mode: Mode,
+}
+
+/// Why no session could be opened.
+#[derive(Debug)]
+pub enum Startup {
+    /// Opening the profile in this process failed.
+    Core(AppError),
+    /// The profile is held by a process that does not answer for it.
+    NotAccepting { pid: Option<u32> },
+    /// The conversation with the running app failed before it began.
+    Dial(Failure),
+}
+
+impl std::fmt::Display for Startup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Startup::Core(e) => write!(f, "{e}"),
+            Startup::NotAccepting { pid } => {
+                write!(f, "Eidola is running")?;
+                if let Some(pid) = pid {
+                    write!(f, " (pid {pid})")?;
+                }
+                write!(f, " but is not accepting local connections")
+            }
+            Startup::Dial(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// What a failure to open the profile means, given that nothing answered the
+/// control socket.
+///
+/// [`AppError::DatabaseInUse`] is the one that changes meaning here. On its
+/// own it says another Eidola holds the profile — quit it. Reached *through*
+/// an unanswered socket it says something more specific and more useful: the
+/// holder is not serving the socket that exists to make this very command
+/// work, which is what an Eidola older than the socket looks like.
+pub fn unanswered(e: AppError) -> Startup {
+    match e {
+        AppError::DatabaseInUse { pid, .. } => Startup::NotAccepting { pid },
+        other => Startup::Core(other),
+    }
+}
+
+impl Session {
+    /// Choose who answers, following the selection rule.
+    pub fn open(
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        embedded: bool,
+    ) -> Result<Session, Startup> {
+        if embedded {
+            return AppCore::new(config_dir, data_dir)
+                .map(Session::from_core)
+                .map_err(Startup::Core);
+        }
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                return Err(Startup::Core(AppError::Internal {
+                    message: format!("could not start a runtime: {e}"),
+                }));
+            }
+        };
+        match runtime.block_on(Client::connect(&data_dir)) {
+            Ok(client) => Ok(Session {
+                mode: Mode::Client {
+                    runtime,
+                    client: tokio::sync::Mutex::new(client),
+                },
+            }),
+            Err(Dial::NoListener) => {
+                // Nothing to ask, so open the profile here — which is also how
+                // we learn whether anything is holding it.
+                drop(runtime);
+                AppCore::new(config_dir, data_dir)
+                    .map(Session::from_core)
+                    .map_err(unanswered)
+            }
+            Err(Dial::NotAccepting) => Err(Startup::NotAccepting { pid: None }),
+            Err(Dial::Failed(e)) => Err(Startup::Dial(e)),
+        }
+    }
+
+    /// Embedded mode: this process opens the profile.
+    ///
+    /// **The sub-space turn driver is deliberately not started here**, and the
+    /// GUI deliberately does start it (`stores::open_app_core`). A delegated
+    /// conversation is driven by a loop that plans, takes a turn, and plans
+    /// again until the room stops — work measured in model round trips, with
+    /// no window waiting on it. This process exits when its command does, so
+    /// starting that loop would mean beginning walks it cannot finish and
+    /// turns whose answers nobody would be told about.
+    ///
+    /// The consequence is stated rather than hidden: a command here **can**
+    /// open a delegated conversation through the API, and that room simply
+    /// does not run until the app is next open, at which point its startup
+    /// sweep picks it up exactly as it picks up any room a previous run left
+    /// mid-delegation. In client mode the room is driven immediately, because
+    /// the process answering is the one running the driver.
+    fn from_core(core: AppCore) -> Session {
+        Session {
+            mode: Mode::Embedded(core),
+        }
+    }
+
+    /// The runtime this session's work runs on.
+    pub fn runtime(&self) -> &tokio::runtime::Runtime {
+        match &self.mode {
+            Mode::Embedded(core) => core.runtime(),
+            Mode::Client { runtime, .. } => runtime,
+        }
+    }
+
+    /// Whether the work is happening in another process.
+    pub fn is_client(&self) -> bool {
+        matches!(self.mode, Mode::Client { .. })
+    }
+
+    /// The version of the app answering, in client mode.
+    pub async fn app_version(&self) -> Option<String> {
+        match &self.mode {
+            Mode::Embedded(_) => None,
+            Mode::Client { client, .. } => Some(client.lock().await.app_version().to_string()),
+        }
+    }
+
+    /// How many streamed events this build could not read (see
+    /// [`Client::unread_events`]). Always zero in embedded mode, where there
+    /// is no wire to be newer than us.
+    pub async fn unread_events(&self) -> u32 {
+        match &self.mode {
+            Mode::Embedded(_) => 0,
+            Mode::Client { client, .. } => client.lock().await.unread_events(),
+        }
+    }
+
+    /// The core, for work that must run against the profile in this process.
+    /// `what` names what was refused, so the reader is told which part of the
+    /// command could not happen rather than that something could not.
+    pub fn local(&self, what: &'static str) -> Result<&AppCore, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core),
+            Mode::Client { .. } => Err(Failure::EmbeddedOnly { what }),
+        }
+    }
+
+    // -- verbs ------------------------------------------------------------
+
+    pub async fn default_model(&self) -> Result<String, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.default_model().await?),
+            Mode::Client { client, .. } => {
+                let r: DefaultModelResult =
+                    client.lock().await.call(&Call::ChatDefaultModel).await?;
+                Ok(r.model)
+            }
+        }
+    }
+
+    pub async fn list_spaces(&self, include_archived: bool) -> Result<Vec<SpaceInfo>, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.list_spaces(include_archived).await?),
+            Mode::Client { client, .. } => {
+                let r: SpacesListResult = client
+                    .lock()
+                    .await
+                    .call(&Call::SpacesList { include_archived })
+                    .await?;
+                Ok(r.spaces)
+            }
+        }
+    }
+
+    pub async fn archive_space(&self, space_id: String) -> Result<bool, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.archive_space(space_id).await?),
+            Mode::Client { client, .. } => {
+                let r: SpacesArchiveResult = client
+                    .lock()
+                    .await
+                    .call(&Call::SpacesArchive { space_id })
+                    .await?;
+                Ok(r.archived)
+            }
+        }
+    }
+
+    pub async fn rename_space(&self, space_id: String, title: String) -> Result<(), Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.rename_space(space_id, title).await?),
+            Mode::Client { client, .. } => {
+                let _: Done = client
+                    .lock()
+                    .await
+                    .call(&Call::SpacesRename { space_id, title })
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn account_show(&self) -> Result<AccountShowResult, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.account_show().await?),
+            Mode::Client { client, .. } => Ok(client.lock().await.call(&Call::AccountShow).await?),
+        }
+    }
+
+    pub async fn account_prices(&self) -> Result<Vec<PriceInfo>, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.account_prices().await?),
+            Mode::Client { client, .. } => {
+                let r: AccountPricesResult = client.lock().await.call(&Call::AccountPrices).await?;
+                Ok(r.prices)
+            }
+        }
+    }
+
+    pub async fn account_balances(&self) -> Result<BalancesResult, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.account_balances().await?),
+            Mode::Client { client, .. } => {
+                Ok(client.lock().await.call(&Call::AccountBalances).await?)
+            }
+        }
+    }
+
+    pub async fn account_checkout(&self, price_id: String) -> Result<String, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.account_checkout(price_id).await?),
+            Mode::Client { client, .. } => {
+                let r: AccountCheckoutResult = client
+                    .lock()
+                    .await
+                    .call(&Call::AccountCheckout { price_id })
+                    .await?;
+                Ok(r.url)
+            }
+        }
+    }
+
+    pub async fn wallet_credentials(&self) -> Result<Vec<CredentialInfo>, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.wallet_credentials().await?),
+            Mode::Client { client, .. } => {
+                let r: WalletCredentialsResult =
+                    client.lock().await.call(&Call::WalletCredentials).await?;
+                Ok(r.credentials)
+            }
+        }
+    }
+
+    pub async fn wallet_spending_credentials(
+        &self,
+    ) -> Result<Vec<InFlightCredentialInfo>, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.wallet_spending_credentials().await?),
+            Mode::Client { client, .. } => {
+                let r: WalletSpendingResult =
+                    client.lock().await.call(&Call::WalletSpending).await?;
+                Ok(r.credentials)
+            }
+        }
+    }
+
+    pub async fn recover_spending_credentials(&self) -> Result<Vec<String>, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.recover_spending_credentials().await?),
+            Mode::Client { client, .. } => {
+                let r: WalletRecoverResult = client.lock().await.call(&Call::WalletRecover).await?;
+                Ok(r.recovered)
+            }
+        }
+    }
+
+    pub async fn list_backends(&self) -> Result<Vec<BackendInfo>, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.list_backends().await?),
+            Mode::Client { client, .. } => {
+                let r: eidola_app_core::ipc::BackendListResult =
+                    client.lock().await.call(&Call::BackendList).await?;
+                Ok(r.backends)
+            }
+        }
+    }
+
+    pub async fn set_backend_enabled(&self, id: String, enabled: bool) -> Result<(), Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.set_backend_enabled(id, enabled).await?),
+            Mode::Client { client, .. } => {
+                let _: Done = client
+                    .lock()
+                    .await
+                    .call(&Call::BackendSetEnabled { id, enabled })
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn backend_models(&self, id: String) -> Result<Vec<ModelInfo>, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.backend_models(id).await?),
+            Mode::Client { client, .. } => {
+                let r: BackendModelsResult = client
+                    .lock()
+                    .await
+                    .call(&Call::BackendModels { id })
+                    .await?;
+                Ok(r.models)
+            }
+        }
+    }
+
+    /// The local-model scan and the engine registry, from one moment.
+    ///
+    /// They travel together because they only answer the question between
+    /// them: the scan is what is on disk, the registry is what is running, and
+    /// reconciling the two is the caller's whole job here.
+    pub async fn models(&self) -> Result<ModelListResult, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => {
+                let state = core.local_models_state().await?;
+                let running = core.running_engines();
+                Ok(ModelListResult { state, running })
+            }
+            Mode::Client { client, .. } => Ok(client.lock().await.call(&Call::ModelList).await?),
+        }
+    }
+
+    pub async fn download_local_model(&self, url: String) -> Result<String, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.download_local_model(url).await?),
+            Mode::Client { client, .. } => {
+                let r: ModelDownloadResult = client
+                    .lock()
+                    .await
+                    .call(&Call::ModelDownload { url })
+                    .await?;
+                Ok(r.id)
+            }
+        }
+    }
+
+    pub async fn delete_local_model(&self, id: String) -> Result<(), Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.delete_local_model(id).await?),
+            Mode::Client { client, .. } => {
+                let _: Done = client.lock().await.call(&Call::ModelDelete { id }).await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn load_local_model(&self, id: String) -> Result<(), Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.load_local_model(id).await?),
+            Mode::Client { client, .. } => {
+                let _: Done = client.lock().await.call(&Call::ModelLoad { id }).await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn unload_local_model(&self, id: String) -> Result<(), Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.unload_local_model(id).await?),
+            Mode::Client { client, .. } => {
+                let _: Done = client.lock().await.call(&Call::ModelUnload { id }).await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn set_local_model_pinned(&self, id: String, pinned: bool) -> Result<(), Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.set_local_model_pinned(id, pinned).await?),
+            Mode::Client { client, .. } => {
+                let _: Done = client
+                    .lock()
+                    .await
+                    .call(&Call::ModelSetPinned { id, pinned })
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn update_check(&self) -> Result<UpdateCheckSnapshot, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.update_check().await),
+            Mode::Client { client, .. } => Ok(client.lock().await.call(&Call::UpdateCheck).await?),
+        }
+    }
+
+    /// Take a turn, streaming its events to `tx`.
+    pub async fn chat_stream(
+        &self,
+        prompt: String,
+        model: String,
+        space_id: Option<String>,
+        tx: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.chat_stream(prompt, model, space_id, tx).await?),
+            Mode::Client { client, .. } => {
+                let call = Call::ChatStream {
+                    prompt,
+                    model: Some(model),
+                    space_id,
+                };
+                client.lock().await.chat_stream(&call, &tx).await
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eidola_app_core::ipc::{
+        HelloResult, PROTOCOL_VERSION, Response, decode_request, encode_line, socket_path,
+    };
+
+    /// Answer `hello` on one connection, then read until the caller leaves.
+    /// Runs on its own runtime in its own thread, because the thing under test
+    /// blocks the one it is called on.
+    fn greeter(dir: &std::path::Path) -> std::thread::JoinHandle<()> {
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket_path(dir)).expect("bind the socket");
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let listener = tokio::net::UnixListener::from_std(listener).expect("adopt");
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (reader, mut writer) = stream.into_split();
+                let mut frames =
+                    eidola_app_core::ipc::FrameReader::new(tokio::io::BufReader::new(reader));
+                while let Ok(Some(line)) = frames.next_line().await {
+                    let request = decode_request(line).expect("a frame");
+                    let answer = Response::end(
+                        request.id,
+                        &HelloResult {
+                            protocol: PROTOCOL_VERSION,
+                            app_version: "9.9.9".into(),
+                        },
+                    );
+                    use tokio::io::AsyncWriteExt;
+                    if writer.write_all(&encode_line(&answer)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        })
+    }
+
+    #[test]
+    fn a_held_profile_nothing_answered_for_is_named_as_that() {
+        let held = AppError::DatabaseInUse {
+            pid: Some(4321),
+            message: "held".into(),
+        };
+        match unanswered(held) {
+            Startup::NotAccepting { pid } => assert_eq!(pid, Some(4321)),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_other_way_of_failing_to_open_stays_itself() {
+        let broken = AppError::Database {
+            message: "corrupt".into(),
+        };
+        match unanswered(broken) {
+            Startup::Core(AppError::Database { .. }) => {}
+            other => panic!("only the held profile changes meaning: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_refusal_says_what_to_do_about_it() {
+        let rendered = Startup::NotAccepting { pid: Some(77) }.to_string();
+        assert!(rendered.contains("running"), "{rendered}");
+        assert!(rendered.contains("not accepting"), "{rendered}");
+        assert!(rendered.contains("77"), "the holder is named: {rendered}");
+        let anonymous = Startup::NotAccepting { pid: None }.to_string();
+        assert!(!anonymous.contains("pid"), "{anonymous}");
+    }
+
+    #[test]
+    fn a_socket_that_answers_takes_the_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = greeter(dir.path());
+        let session = Session::open(dir.path().into(), dir.path().into(), false)
+            .expect("the socket answered");
+        assert!(
+            session.is_client(),
+            "an app that answers is the one that does the work"
+        );
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn a_profile_held_with_no_socket_to_ask_is_the_honest_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The profile is held and there is no socket beside it — an Eidola
+        // older than the socket, from this side of the glass.
+        let holder = AppCore::new(dir.path().into(), dir.path().into()).expect("first open");
+        match Session::open(dir.path().into(), dir.path().into(), false) {
+            Err(Startup::NotAccepting { .. }) => {}
+            other => panic!(
+                "a held profile with nothing answering must say so: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        drop(holder);
+    }
+
+    #[test]
+    fn a_command_that_needs_the_profile_here_is_refused_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _server = greeter(dir.path());
+        let session =
+            Session::open(dir.path().into(), dir.path().into(), false).expect("client mode");
+        match session.local("`eidola configure`") {
+            Err(Failure::EmbeddedOnly { what }) => assert_eq!(
+                what, "`eidola configure`",
+                "the refusal names the command, not just the condition"
+            ),
+            Ok(_) => panic!("client mode has no core to hand out"),
+            Err(other) => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embedded_mode_hands_the_core_straight_over() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = Session::open(dir.path().into(), dir.path().into(), true).expect("embedded");
+        assert!(session.local("`eidola configure`").is_ok());
+    }
+
+    #[test]
+    fn embedded_skips_the_socket_even_when_it_answers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _server = greeter(dir.path());
+        let session = Session::open(dir.path().into(), dir.path().into(), true)
+            .expect("the profile is free to open");
+        assert!(
+            !session.is_client(),
+            "--embedded forces the mode; the socket is not even dialled"
+        );
+    }
+}

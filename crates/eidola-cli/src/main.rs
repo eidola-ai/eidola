@@ -1,16 +1,28 @@
+mod client;
 mod service;
+mod session;
 
 use std::io::{IsTerminal, Write};
 
 use clap::{Parser, Subcommand};
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ChatStreamEvent, TermsAcceptance, TermsDocument, config};
+use eidola_app_core::ipc::ProtocolError;
+use eidola_app_core::{ChatStreamEvent, TermsAcceptance, TermsDocument, config};
+
+use client::Failure;
+use session::{Session, Startup};
 
 #[derive(Parser)]
 #[command(name = "eidola", about = "Eidola CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Open the local profile in this process instead of asking a running
+    /// Eidola over its control socket. For debugging: it forces the mode, it
+    /// does not bypass the lock, so it fails while another Eidola holds the
+    /// profile.
+    #[arg(long, global = true)]
+    embedded: bool,
 }
 
 #[derive(Subcommand)]
@@ -351,26 +363,13 @@ enum SpacesCommand {
     },
 }
 
-/// Build this process's `AppCore`.
-///
-/// **The sub-space turn driver is deliberately not started here**, and the GUI
-/// deliberately does start it (`stores::open_app_core`). A delegated
-/// conversation is driven by a loop that plans, takes a turn, and plans again
-/// until the room stops — work measured in model round trips, with no window
-/// waiting on it. This process exits when its command does, so starting that
-/// loop would mean beginning walks it cannot finish and turns whose answers
-/// nobody would be told about.
-///
-/// The consequence is stated rather than hidden: a command here **can** open a
-/// delegated conversation through the API, and that room simply does not run
-/// until the app is next open, at which point its startup sweep picks it up
-/// exactly as it picks up any room a previous run left mid-delegation.
-fn build_core() -> Result<AppCore, AppError> {
+/// This machine's profile directories.
+fn profile_dirs() -> (std::path::PathBuf, std::path::PathBuf) {
     let config_dir = config::default_config_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .expect("could not determine config directory");
     let data_dir = config::default_data_dir().expect("could not determine data directory");
-    AppCore::new(config_dir, data_dir)
+    (config_dir, data_dir)
 }
 
 /// Read a hardware-CA PEM from disk and check that it parses — the two
@@ -404,9 +403,76 @@ fn read_ca_pem(path: Option<&str>, field_name: &str) -> Result<Option<String>, A
     Ok(Some(pem))
 }
 
-/// Print an error plus, for the typed variants a user can act on, a hint.
-fn report(e: &AppError) {
+/// Print a failure plus, for the ones a user can act on, a hint.
+fn report(e: &Failure) {
     eprintln!("error: {e}");
+    failure_hint(e);
+}
+
+/// Print why no session could be opened, plus its hint.
+///
+/// Separate from [`report`] because the selection rule can fail in ways a
+/// command cannot: nothing was attempted, and what the reader needs to know is
+/// which Eidola should be running, not which argument was wrong.
+fn report_startup(e: &Startup) {
+    eprintln!("error: {e}");
+    match e {
+        Startup::Core(e) => app_hint(e),
+        Startup::NotAccepting { .. } => {
+            eprintln!(
+                "hint: something holds the local profile without answering its \
+                 control socket — an Eidola older than this one, or one whose \
+                 listener stopped. Quit it and run this again"
+            );
+        }
+        Startup::Dial(e) => failure_hint(e),
+    }
+}
+
+/// The actionable hint for anything a command can fail with.
+fn failure_hint(e: &Failure) {
+    match e {
+        Failure::App(e) => app_hint(e),
+        // A verb the running app has never heard of is what an app older than
+        // this `eidola` looks like from here — the protocol matched, the
+        // vocabulary did not.
+        Failure::Protocol(ProtocolError::UnknownVerb { verb }) => {
+            eprintln!(
+                "hint: the running Eidola has no `{verb}` — it is older than \
+                 this `eidola`; quit it and run this again"
+            );
+        }
+        Failure::Protocol(ProtocolError::UnsupportedProtocol {
+            supported,
+            requested,
+        }) => {
+            eprintln!(
+                "hint: the running Eidola speaks control protocol {supported} \
+                 and this `eidola` speaks {requested} — run the `eidola` that \
+                 came with it, or quit it and run this again"
+            );
+        }
+        // A variant name this build has never heard of. The app's own
+        // rendering is already on the error line; naming the variant is what
+        // makes the report actionable to whoever reads it next.
+        Failure::Unrecognized { kind, .. } => {
+            eprintln!(
+                "hint: the running Eidola reported `{kind}`, a failure this \
+                 `eidola` has no type for — it is newer than this one"
+            );
+        }
+        Failure::EmbeddedOnly { .. } => {
+            eprintln!(
+                "hint: quit Eidola (`eidola service stop` for the background \
+                 service) and run this again"
+            );
+        }
+        _ => {}
+    }
+}
+
+/// The actionable hint for a typed app failure, in either mode.
+fn app_hint(e: &AppError) {
     // The typed onboarding errors get actionable hints. (Chat
     // auto-provisions credentials from the account balance, so these
     // only fire when the account itself is missing or unfunded.)
@@ -439,7 +505,7 @@ fn report(e: &AppError) {
 
 fn main() {
     // Parse first: `--help`, `--version`, and argument errors must work even
-    // when the local database is held by another Eidola (building the core
+    // when the local database is held by another Eidola (opening the profile
     // takes its exclusive lock and can fail with `DatabaseInUse`).
     let cli = Cli::parse();
 
@@ -453,27 +519,29 @@ fn main() {
             ServiceCommand::Stop => service::stop(),
         };
         if let Err(e) = result {
-            report(&e);
+            report(&Failure::App(e));
             std::process::exit(1);
         }
         return;
     }
 
-    // Build the core (and its tokio runtime) outside any async context so it
+    // Decide who answers — the running Eidola, or this process. Either way the
+    // session (and its tokio runtime) is built outside any async context so it
     // can be dropped cleanly when main returns.
-    let core = match build_core() {
-        Ok(core) => core,
+    let (config_dir, data_dir) = profile_dirs();
+    let session = match Session::open(config_dir, data_dir, cli.embedded) {
+        Ok(session) => session,
         Err(e) => {
-            report(&e);
+            report_startup(&e);
             std::process::exit(1);
         }
     };
 
-    // Use the core's own runtime to drive the CLI commands.
-    let result = core.runtime().block_on(run(&core, cli));
+    let result = session.runtime().block_on(run(&session, cli));
 
-    // Drop core before exiting so its runtime shuts down outside async context.
-    drop(core);
+    // Drop the session before exiting so its runtime shuts down outside async
+    // context.
+    drop(session);
 
     if let Err(e) = result {
         report(&e);
@@ -481,9 +549,13 @@ fn main() {
     }
 }
 
-async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
+async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
     match cli.command {
         None => {
+            // The trust bundle is the one surface the control socket has no
+            // verb for, in either direction — reading it back is the other
+            // half of `configure`.
+            let core = session.local("reading the trust bundle")?;
             let state = core.config_state();
             let default_model = core.default_model().await?;
             let trust = core.eidola_trust().await?;
@@ -557,6 +629,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             clear_hardware_root_ca,
             clear_hardware_intermediate_ca,
         }) => {
+            let core = session.local("`eidola configure`")?;
             if base_url.is_none()
                 && hardware_root_ca.is_none()
                 && hardware_intermediate_ca.is_none()
@@ -569,7 +642,8 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             {
                 return Err(AppError::Config {
                     message: "specify at least one option (see --help)".into(),
-                });
+                }
+                .into());
             }
             // ── Resolve and validate every input before applying any of
             // them. `configure` writes the trust bundle one column at a
@@ -657,7 +731,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
         }
         Some(Command::Account { command }) => match command {
             None => {
-                let info = core.account_show().await?;
+                let info = session.account_show().await?;
                 println!("id: {}", info.id);
                 if let Some(customer_id) = &info.stripe_customer_id {
                     println!("stripe_customer_id: {customer_id}");
@@ -666,6 +740,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             Some(AccountCommand::Create { accept_terms }) => {
+                let core = session.local("`eidola account create`")?;
                 // Consent is captured here, not in app-core: creating an
                 // account records acceptance of the terms/privacy versions,
                 // so the documents must be surfaced first. This exact
@@ -697,6 +772,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             Some(AccountCommand::AcceptTerms { yes }) => {
+                let core = session.local("`eidola account accept-terms`")?;
                 let docs = core.current_terms().await?;
                 if docs.is_empty() {
                     println!("the server requires no terms acceptance");
@@ -736,17 +812,19 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             Some(AccountCommand::Reset) => {
-                core.reset_account()?;
+                session.local("`eidola account reset`")?.reset_account()?;
                 println!("account credentials removed");
                 Ok(())
             }
             Some(AccountCommand::Configure { id, secret }) => {
-                core.set_account_credentials(id, secret)?;
+                session
+                    .local("`eidola account configure`")?
+                    .set_account_credentials(id, secret)?;
                 println!("account configured");
                 Ok(())
             }
             Some(AccountCommand::Prices) => {
-                let prices = core.account_prices().await?;
+                let prices = session.account_prices().await?;
                 if prices.is_empty() {
                     println!("no prices available");
                     return Ok(());
@@ -766,7 +844,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 price_id,
                 no_browser,
             }) => {
-                let url = core.account_checkout(price_id).await?;
+                let url = session.account_checkout(price_id).await?;
                 let should_open = !no_browser && std::io::stdout().is_terminal();
                 println!("{url}");
                 if should_open {
@@ -775,7 +853,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             Some(AccountCommand::Balances) => {
-                let balances = core.account_balances().await?;
+                let balances = session.account_balances().await?;
                 println!("available: {} credits", balances.available);
                 for pool in &balances.pools {
                     let expires = pool
@@ -787,7 +865,10 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             Some(AccountCommand::Allocate { credits }) => {
-                let result = core.account_allocate(credits).await?;
+                let result = session
+                    .local("`eidola account allocate`")?
+                    .account_allocate(credits)
+                    .await?;
                 println!("credential allocated: {}", result.nonce);
                 println!("credits: {}", result.credits);
                 println!("issuer_key_id: {}", result.issuer_key_id);
@@ -797,7 +878,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
         Some(Command::Wallet { command }) => match command {
             WalletCommand::Credentials { command } => match command {
                 CredentialsCommand::List => {
-                    let spending = core.wallet_spending_credentials().await?;
+                    let spending = session.wallet_spending_credentials().await?;
                     if !spending.is_empty() {
                         println!("in-flight credentials:");
                         for c in &spending {
@@ -808,7 +889,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                         }
                         println!();
                     }
-                    let credentials = core.wallet_credentials().await?;
+                    let credentials = session.wallet_credentials().await?;
                     if credentials.is_empty() && spending.is_empty() {
                         println!("no credentials");
                         return Ok(());
@@ -825,13 +906,13 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     Ok(())
                 }
                 CredentialsCommand::Recover => {
-                    let spending = core.wallet_spending_credentials().await?;
+                    let spending = session.wallet_spending_credentials().await?;
                     if spending.is_empty() {
                         println!("no in-flight credentials");
                         return Ok(());
                     }
                     println!("attempting to recover {} credential(s)...", spending.len());
-                    let recovered = core.recover_spending_credentials().await?;
+                    let recovered = session.recover_spending_credentials().await?;
                     if recovered.is_empty() {
                         println!("no credentials could be recovered");
                     } else {
@@ -854,7 +935,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             // Transitional until wave 2 makes turns participant-aware.
             let model = match model {
                 Some(m) => m,
-                None => core.default_model().await?,
+                None => session.default_model().await?,
             };
 
             // Engine-served models load on demand inside the request path
@@ -863,7 +944,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             // are owned by *this* process, so they die with the run.
             let mref = eidola_app_core::parse_model_ref(&model);
             let engine_backed = mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
-                || core.list_backends().await?.iter().any(|b| {
+                || session.list_backends().await?.iter().any(|b| {
                     b.id == mref.backend_id
                         && b.kind == eidola_app_core::BackendKind::LlamaCpp
                         && b.auto_start
@@ -876,7 +957,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             // (dim, prefixed with "thinking: ") so a piped stdout still
             // captures only the final answer text.
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
-            let chat_fut = core.chat_stream(prompt, model.clone(), space, tx);
+            let chat_fut = session.chat_stream(prompt, model.clone(), space, tx);
 
             // Pump events while chat_fut runs. We `tokio::join!` the two
             // halves so events drain in real time rather than only after
@@ -921,12 +1002,25 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
 
             let (result, ()) = tokio::join!(chat_fut, printer);
             let result = result?;
+            // Only ever non-zero against an app newer than this binary, and
+            // said out loud because those events were part of the answer: an
+            // unreadable delta that vanished quietly would leave a turn
+            // looking whole when it is not.
+            let unread = session.unread_events().await;
+            if unread > 0 {
+                let theirs = session.app_version().await.unwrap_or_default();
+                let ours = env!("CARGO_PKG_VERSION");
+                eprintln!(
+                    "warning: {unread} streamed event(s) this build could not read — \
+                     the running Eidola ({theirs}) is newer than this `eidola` ({ours})"
+                );
+            }
             eprintln!("{}", chat_summary(&result));
             Ok(())
         }
         Some(Command::Spaces { command }) => match command {
             SpacesCommand::List { archived } => {
-                let spaces = core.list_spaces(archived).await?;
+                let spaces = session.list_spaces(archived).await?;
                 if spaces.is_empty() {
                     println!("no active spaces");
                     return Ok(());
@@ -947,7 +1041,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             SpacesCommand::Archive { id } => {
-                let archived = core.archive_space(id.clone()).await?;
+                let archived = session.archive_space(id.clone()).await?;
                 if archived {
                     println!("archived space {id}");
                 } else {
@@ -956,14 +1050,17 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             SpacesCommand::Rename { id, title } => {
-                core.rename_space(id.clone(), title).await?;
+                session.rename_space(id.clone(), title).await?;
                 println!("renamed space {id}");
                 Ok(())
             }
         },
         Some(Command::Model { command }) => match command {
             ModelCommand::List => {
-                let state = core.local_models_state().await?;
+                // The scan and the registry, from one moment — see
+                // `Session::models`.
+                let snapshot = session.models().await?;
+                let state = &snapshot.state;
                 match &state.engine_path {
                     Some(p) => println!("engine: {p}"),
                     None => println!(
@@ -1008,7 +1105,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 // The table above is a *scan*: an engine whose backing file
                 // went away mid-session has no row there while it still holds
                 // a port and its memory. The registry is the honest answer.
-                let unaccounted = unaccounted_engines(&core.running_engines(), &state);
+                let unaccounted = unaccounted_engines(&snapshot.running, state);
                 if !unaccounted.is_empty() {
                     println!("\nrunning engines not listed above:");
                     for engine in &unaccounted {
@@ -1019,7 +1116,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     }
                 }
                 println!("\ncatalog (download with `eidola model download <id>`):");
-                for entry in core.local_model_catalog() {
+                for entry in eidola_app_core::LOCAL_MODEL_CATALOG {
                     let installed = catalog_installed(&state.models, entry.file_name);
                     println!(
                         "{:<18} {:>9}  {}{}",
@@ -1033,24 +1130,31 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             ModelCommand::Download { source } => {
                 // A catalog id resolves to its URL; anything else is a URL.
-                let url = core
-                    .local_model_catalog()
+                let url = eidola_app_core::LOCAL_MODEL_CATALOG
                     .iter()
                     .find(|c| c.id == source)
                     .map(|c| c.url.to_string())
                     .unwrap_or(source);
-                let id = core.download_local_model(url).await?;
+                let id = session.download_local_model(url).await?;
                 println!("downloading {id}…");
-                // The transfer task dies with this process, so wait for it,
-                // rendering a progress line.
+                if session.is_client() {
+                    // Whoever runs the transfer owns it. In client mode that
+                    // is the app, so this loop is watching, not driving.
+                    println!(
+                        "the running Eidola owns this transfer — it continues if you stop watching"
+                    );
+                }
+                // In embedded mode the transfer task dies with this process,
+                // so wait for it, rendering a progress line.
                 let slug = eidola_app_core::parse_model_ref(&id).model;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    let state = core.local_models_state().await?;
+                    let state = session.models().await?.state;
                     let Some(m) = state.models.iter().find(|m| m.slug == slug) else {
                         return Err(AppError::LocalModel {
                             message: "model disappeared during download".into(),
-                        });
+                        }
+                        .into());
                     };
                     match &m.status {
                         eidola_app_core::LocalModelStatus::Downloading { received, total } => {
@@ -1071,7 +1175,8 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                                 Some(err) => {
                                     return Err(AppError::LocalModel {
                                         message: format!("download failed: {err}"),
-                                    });
+                                    }
+                                    .into());
                                 }
                                 None => println!("downloaded {id}"),
                             }
@@ -1082,14 +1187,14 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             ModelCommand::Delete { id } => {
-                core.delete_local_model(id.clone()).await?;
+                session.delete_local_model(id.clone()).await?;
                 println!("deleted {id}");
                 Ok(())
             }
             ModelCommand::Load { id } => {
                 println!("loading {id} (this can take a while for large models)…");
-                core.load_local_model(id.clone()).await?;
-                let state = core.local_models_state().await?;
+                session.load_local_model(id.clone()).await?;
+                let state = session.models().await?.state;
                 let mref = eidola_app_core::parse_model_ref(&id);
                 let in_backend: Vec<&eidola_app_core::LocalModelInfo> = if mref.backend_id
                     == eidola_app_core::EIDOLA_BACKEND_ID
@@ -1113,34 +1218,43 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     }
                     println!("chat with it: `eidola chat \"hi\" --model {}`", m.id);
                 }
-                // The engine is a child of *this* process, so exiting would
-                // kill it. Keep serving until Ctrl-C (the GUI, by contrast,
-                // holds engines for its whole app lifetime).
+                // The engine belongs to whichever process loaded it. In
+                // embedded mode that is this one, so exiting would kill it —
+                // keep serving until Ctrl-C. In client mode it is the app's,
+                // which holds engines for its whole lifetime, so there is
+                // nothing here to wait for and unloading on the way out would
+                // take away what was just asked for.
+                if session.is_client() {
+                    println!(
+                        "the running Eidola holds this engine — `eidola model unload {id}` stops it"
+                    );
+                    return Ok(());
+                }
                 println!("serving — press Ctrl-C to stop");
                 let _ = tokio::signal::ctrl_c().await;
-                core.unload_local_model(id.clone()).await.ok();
+                session.unload_local_model(id.clone()).await.ok();
                 println!("\nunloaded {id}");
                 Ok(())
             }
             ModelCommand::Unload { id } => {
-                core.unload_local_model(id.clone()).await?;
+                session.unload_local_model(id.clone()).await?;
                 println!("unloaded {id}");
                 Ok(())
             }
             ModelCommand::Pin { id } => {
-                core.set_local_model_pinned(id.clone(), true).await?;
+                session.set_local_model_pinned(id.clone(), true).await?;
                 println!("pinned {id} — protected from automatic unloading");
                 Ok(())
             }
             ModelCommand::Unpin { id } => {
-                core.set_local_model_pinned(id.clone(), false).await?;
+                session.set_local_model_pinned(id.clone(), false).await?;
                 println!("unpinned {id}");
                 Ok(())
             }
         },
         Some(Command::Backend { command }) => match command {
             BackendCommand::List => {
-                let backends = core.list_backends().await?;
+                let backends = session.list_backends().await?;
                 for b in &backends {
                     let state = if b.enabled { "enabled" } else { "disabled" };
                     println!(
@@ -1176,6 +1290,11 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             BackendCommand::Add { kind } => {
+                // Adding a backend chooses a new destination for prompts and
+                // stores the credential for it, which is the same class of
+                // decision the trust bundle is — off the socket until there is
+                // a consent layer to gate it.
+                let core = session.local("`eidola backend add`")?;
                 let new = match kind {
                     BackendAddCommand::Openai {
                         id,
@@ -1221,12 +1340,12 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             BackendCommand::Enable { id } => {
-                core.set_backend_enabled(id.clone(), true).await?;
+                session.set_backend_enabled(id.clone(), true).await?;
                 println!("enabled backend `{id}`");
                 Ok(())
             }
             BackendCommand::Disable { id } => {
-                core.set_backend_enabled(id.clone(), false).await?;
+                session.set_backend_enabled(id.clone(), false).await?;
                 println!("disabled backend `{id}`");
                 if id == "eidola" {
                     println!(
@@ -1236,12 +1355,15 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             BackendCommand::Remove { id } => {
-                core.remove_backend(id.clone()).await?;
+                session
+                    .local("`eidola backend remove`")?
+                    .remove_backend(id.clone())
+                    .await?;
                 println!("removed backend `{id}`");
                 Ok(())
             }
             BackendCommand::Models { id } => {
-                let models = core.backend_models(id.clone()).await?;
+                let models = session.backend_models(id.clone()).await?;
                 if models.is_empty() {
                     println!("no models offered (for engine-backed backends, load one first)");
                     return Ok(());
@@ -1259,7 +1381,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
         Some(Command::Update {
             command: UpdateCommand::Check,
         }) => {
-            let snapshot = core.update_check().await;
+            let snapshot = session.update_check().await?;
             print_update_check(&snapshot);
             match snapshot.result {
                 // Distinct exit codes so scripts can route on the two
