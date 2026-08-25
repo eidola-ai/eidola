@@ -5772,9 +5772,69 @@ fn a_partial_answer_at_the_ceiling_is_kept_and_reported_as_truncated() {
         // Both answers are in the transcript.
         let messages = core
             .runtime()
-            .block_on(core.get_space_messages(blocking.space_id))
+            .block_on(core.get_space_messages(blocking.space_id.clone()))
             .expect("messages");
         assert_eq!(messages.len(), 4, "two questions, two partial answers");
+
+        // And the verdict is on the answers' own rows, not only on the result
+        // the caller happened to be holding — one classification, two readers.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(blocking.space_id))
+            .expect("tree");
+        for post in &tree {
+            let expected = post.action_type == "inference";
+            assert_eq!(
+                post.truncated, expected,
+                "{} ({}) recorded the wrong ceiling verdict",
+                post.action_id, post.action_type
+            );
+        }
+    });
+}
+
+/// The mark is **durable**, which only a second process can prove: a reopened
+/// profile has none of the first one's memory, so a mark that survives the
+/// restart survives because the answer's own row carries it.
+#[test]
+fn a_cut_off_answer_still_says_so_after_a_restart() {
+    run(|| {
+        let (mock, core, dir) = setup(MockConfig {
+            chat: ChatBehavior::PartialAnswerLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let res = core
+            .runtime()
+            .block_on(core.chat("go on".into(), MODEL.into(), None))
+            .expect("a partial answer is still a turn");
+        assert!(res.truncated, "the live turn reported the ceiling");
+        let space_id = res.space_id.clone();
+        let answer = res.response_action_id.clone().expect("the text is kept");
+        let base_url = mock.base_url.clone();
+
+        // The mock runs on the core's runtime, so it goes with it; nothing
+        // below needs an upstream, only the database left on disk.
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &base_url);
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space_id))
+            .expect("tree");
+        let post = tree
+            .iter()
+            .find(|p| p.action_id == answer)
+            .expect("the answer survived the restart");
+        assert!(
+            post.truncated,
+            "the reopened profile shows the answer with nothing saying it stopped short"
+        );
+        assert!(
+            tree.iter().all(|p| p.truncated == (p.action_id == answer)),
+            "only the cut-off answer carries the mark; got {tree:#?}"
+        );
     });
 }
 
@@ -5790,6 +5850,14 @@ fn an_ordinary_turn_is_not_reported_as_truncated() {
             .block_on(core.chat("hello".into(), MODEL.into(), None))
             .expect("chat");
         assert!(!res.truncated);
+
+        // Nor is the durable flag set on anything the turn wrote — "nobody set
+        // it" and "it is false" have to be the same state on disk too.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id))
+            .expect("tree");
+        assert!(tree.iter().all(|p| !p.truncated), "got {tree:#?}");
     });
 }
 

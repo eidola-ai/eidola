@@ -1184,6 +1184,18 @@ impl Inner {
         // things to say, and a room resting on an answer that stopped
         // mid-thought did not. Walk-wide rather than per-branch, because the
         // report speaks for the whole room.
+        //
+        // **Not read from `action.truncated`, though that column now exists.**
+        // The column is a fact about one answer, for a reader looking at that
+        // post; this is a claim about the ending, and its subject is the walk —
+        // any turn in it, including endings (`Paused`, `BudgetSpent`) whose last
+        // act is not an inference at all, so there is no one row to read. The
+        // ending is also written down as a *token* and parsed back long
+        // afterwards: re-deriving it from rows would let a later regeneration of
+        // a finding change what a delivered report says it found. Both come from
+        // the same single classification (`ChatResult::truncated`, the value
+        // that column is written from), so the two layers cannot disagree about
+        // a turn they both saw.
         let mut truncated_any = false;
         // Every post this walk has planned off. It is what tells the walk's own
         // work apart from a stranger's, and there is nothing durable that could:

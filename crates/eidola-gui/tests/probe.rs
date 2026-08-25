@@ -1527,6 +1527,7 @@ fn probe_post(action_id: &str, text: &str) -> PostNode {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     }
 }
 

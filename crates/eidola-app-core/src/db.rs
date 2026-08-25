@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 9;
+const LATEST_VERSION: i64 = 10;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -2522,6 +2522,7 @@ async fn spawn_subspace_tx_body(
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
             created_at: plan.now,
         },
     )
@@ -5259,6 +5260,10 @@ pub struct ActionEntry {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub credits_consumed: Option<i64>,
+    /// The upstream stopped this generation at the completion ceiling rather
+    /// than because the model was done. Only an `inference` may set it (the
+    /// schema CHECKs that); every other writer passes `false`.
+    pub truncated: bool,
     pub created_at: i64,
 }
 
@@ -5350,6 +5355,7 @@ async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, Ap
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
             created_at: plan.created_at,
         },
     )
@@ -5451,6 +5457,7 @@ async fn edit_post_tx_body(conn: &Connection, plan: &EditPostPlan<'_>) -> Result
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
             created_at: plan.created_at,
         },
     )
@@ -5487,9 +5494,10 @@ pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(),
     conn.execute(
         "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
          supersedes_action_id, supersedes_item_id, action_type, status, \
-         intent, model, input_tokens, output_tokens, credits_consumed, created_at) \
+         intent, model, input_tokens, output_tokens, credits_consumed, truncated, \
+         created_at) \
          VALUES (?1, ?2, ?3, (SELECT scope FROM participant WHERE id = ?3), \
-                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         (
             Value::Text(entry.id.clone()),
             Value::Text(entry.space_id.clone()),
@@ -5519,6 +5527,7 @@ pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(),
                 Some(c) => Value::Integer(c),
                 None => Value::Null,
             },
+            Value::Integer(i64::from(entry.truncated)),
             Value::Integer(entry.created_at),
         ),
     )
@@ -7347,6 +7356,11 @@ pub struct PostActionRow {
     pub action_type: String,
     pub model: Option<String>,
     pub credits_consumed: Option<i64>,
+    /// The upstream stopped this generation at its completion ceiling — the
+    /// durable fact behind the render's "this answer reached its length limit"
+    /// mark, which is why it is read here and not only carried on the live
+    /// turn's result.
+    pub truncated: bool,
     /// Derived 0-based generation number of this (tip) action. The item's total
     /// generation count is `generation + 1`.
     pub generation: i64,
@@ -7424,7 +7438,8 @@ pub async fn get_space_tree_data(
     let action_sql = format!(
         "SELECT ar.action_id, ar.item_id, p.kind, \
                 COALESCE(sp.override_label, p.label), ar.action_type, \
-                ar.model, ar.credits_consumed, ar.generation, ar.created_at \
+                ar.model, ar.credits_consumed, ar.truncated, ar.generation, \
+                ar.created_at \
          FROM action_resolved ar \
          JOIN participant p ON p.id = ar.participant_id \
          LEFT JOIN space_participant sp \
@@ -7454,8 +7469,9 @@ pub async fn get_space_tree_data(
             action_type: row.get::<String>(4).map_err(AppError::db)?,
             model: row.get::<Option<String>>(5).map_err(AppError::db)?,
             credits_consumed: row.get::<Option<i64>>(6).map_err(AppError::db)?,
-            generation: row.get::<i64>(7).map_err(AppError::db)?,
-            created_at: row.get::<i64>(8).map_err(AppError::db)?,
+            truncated: row.get::<i64>(7).map_err(AppError::db)? != 0,
+            generation: row.get::<i64>(8).map_err(AppError::db)?,
+            created_at: row.get::<i64>(9).map_err(AppError::db)?,
         });
     }
 
@@ -8842,6 +8858,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at,
             },
         )
@@ -9115,6 +9132,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at,
             },
         )
@@ -9163,6 +9181,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at,
             },
         )
@@ -9465,6 +9484,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at: 4_000,
             },
         )
@@ -9657,6 +9677,7 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     credits_consumed: credits,
+                    truncated: false,
                     created_at: at,
                 },
             )
@@ -9808,6 +9829,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
             created_at: 1_000,
         };
 
@@ -9898,6 +9920,7 @@ mod tests {
                 input_tokens: Some(120),
                 output_tokens: Some(480),
                 credits_consumed: Some(700),
+                truncated: false,
                 created_at: 2_200,
             },
         )

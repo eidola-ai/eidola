@@ -1386,6 +1386,10 @@ pub struct PostNode {
     pub is_current: bool,
     pub model: Option<String>,
     pub credits_consumed: Option<i64>,
+    /// This generation stopped at the model's completion ceiling rather than
+    /// because it was done — the durable fact a render marks the post with.
+    /// Never true for a post that was not inferred.
+    pub truncated: bool,
     /// Edge relation to the structural parent (`reply`); `None` for a root.
     pub relation: Option<String>,
     /// Indent level: `0` is the spine; `> 0` is an indented branch.
@@ -7332,6 +7336,16 @@ impl Inner {
             }
         }
 
+        // The turn's ceiling verdict, read once. Reaching here means tool
+        // assembly is behind us — a round that requested tools returned above —
+        // so this is the point where the ceiling, the content and the absence
+        // of tool calls are all known and the ending can be classified. The one
+        // value answers both readers: it is written onto the `inference` row
+        // (so a reopened space still shows the mark) and returned on
+        // `ChatResult` (so the window marking the live turn cannot disagree
+        // with the row it will reload).
+        let truncated = stopped_at_ceiling(finish_reason.as_deref());
+
         if status.is_success()
             && truncated_before_any_answer(finish_reason.as_deref(), &response_content)
         {
@@ -7359,6 +7373,7 @@ impl Inner {
                 } else {
                     "error"
                 },
+                truncated,
                 input_tokens,
                 output_tokens,
                 &response_reasoning,
@@ -7384,7 +7399,7 @@ impl Inner {
                 credits_charged: prep.total_credits as i64,
                 response_action_id: None,
                 declined: None,
-                truncated: stopped_at_ceiling(finish_reason.as_deref()),
+                truncated,
             }));
         }
 
@@ -7427,7 +7442,7 @@ impl Inner {
             credits_charged: prep.total_credits as i64,
             response_action_id,
             declined: None,
-            truncated: stopped_at_ceiling(finish_reason.as_deref()),
+            truncated,
         }))
     }
 
@@ -7980,12 +7995,14 @@ impl Inner {
         // one.** `Revise` supersedes an intact answer with what it writes, so
         // keeping transport-cut text there destroys a real answer and puts a
         // severed one in its place. An ordinary turn could in principle keep
-        // the text behind a marker — but the only marker available is
-        // session-scoped by construction (`ChatResult::truncated`), so a
-        // reopened window would show severed text with nothing saying so,
-        // which is exactly the lie `ResponseTruncated` exists to make
-        // unrepresentable. Two rules would also mean the classification
-        // depended on who asked rather than on what happened.
+        // the text behind a marker, and one is now durable (`action.truncated`)
+        // — but it is not this ending's to set. That flag records the
+        // *upstream's own* ceiling verdict, and a connection that died issued
+        // no verdict at all; writing it here would say "the model reached its
+        // length limit" about a dropped socket, which is a different lie told
+        // in the same place `ResponseTruncated` exists to keep empty. Two rules
+        // would also mean the classification depended on who asked rather than
+        // on what happened.
         //
         // Reported as `Network` because that is what it is, which also puts it
         // in `DelegationFailure::Upstream` for a delegated room and leaves it
@@ -8077,6 +8094,16 @@ impl Inner {
         }
 
         // --- the final round ---------------------------------------------
+        // The turn's ceiling verdict, read once. Reaching here means tool
+        // assembly is behind us — a round that requested tools returned above —
+        // so this is the point where the ceiling, the content and the absence
+        // of tool calls are all known and the ending can be classified. The one
+        // value answers both readers: it is written onto the `inference` row
+        // (so a reopened space still shows the mark) and returned on
+        // `ChatResult` (so the window marking the live turn cannot disagree
+        // with the row it will reload).
+        let truncated = stopped_at_ceiling(finish_reason.as_deref());
+
         if truncated_before_any_answer(finish_reason.as_deref(), &full_content) {
             return self
                 .end_round_truncated(
@@ -8098,6 +8125,7 @@ impl Inner {
         let response_action_id = prep
             .persist_turn(
                 "complete",
+                truncated,
                 input_tokens,
                 output_tokens,
                 &full_reasoning,
@@ -8120,7 +8148,7 @@ impl Inner {
                 credits_charged: prep.total_credits as i64,
                 response_action_id: None,
                 declined: None,
-                truncated: stopped_at_ceiling(finish_reason.as_deref()),
+                truncated,
             }));
         }
 
@@ -8142,7 +8170,7 @@ impl Inner {
             credits_charged: prep.total_credits as i64,
             response_action_id,
             declined: None,
-            truncated: stopped_at_ceiling(finish_reason.as_deref()),
+            truncated,
         }))
     }
 
@@ -11917,6 +11945,7 @@ impl TurnPrep {
                 // This round's own hold — each round is a separate priced
                 // request, so each round's action carries its own charge.
                 credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                truncated: false,
                 created_at: now_ms(),
             },
         )
@@ -12050,6 +12079,7 @@ impl TurnPrep {
                 output_tokens: None,
                 // Tools run locally — no inference was purchased.
                 credits_consumed: None,
+                truncated: false,
                 created_at: now_ms(),
             },
         )
@@ -12153,6 +12183,7 @@ impl TurnPrep {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at: now_ms(),
             },
         )
@@ -12224,6 +12255,7 @@ impl TurnPrep {
     async fn persist_turn(
         &mut self,
         action_status: &str,
+        truncated: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
@@ -12238,6 +12270,7 @@ impl TurnPrep {
         let persisted = self
             .persist_turn_body(
                 action_status,
+                truncated,
                 input_tokens,
                 output_tokens,
                 reasoning,
@@ -12302,6 +12335,7 @@ impl TurnPrep {
     async fn persist_turn_body(
         &mut self,
         action_status: &str,
+        truncated: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
@@ -12347,6 +12381,7 @@ impl TurnPrep {
                 output_tokens,
                 // Local turns record no charge (`None`), not a fake zero.
                 credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                truncated,
                 created_at: now_ms(),
             },
         )
@@ -14345,6 +14380,7 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
             is_current: true,
             model: row.model.clone(),
             credits_consumed: row.credits_consumed,
+            truncated: row.truncated,
             relation: reply_parent.get(&action_id).map(|_| "reply".to_string()),
             depth,
             is_branch,
@@ -15928,6 +15964,7 @@ mod tests {
                 data: None,
             }],
             references: Vec::new(),
+            truncated: false,
             created_at: TEST_AT,
         }
     }
@@ -16378,6 +16415,7 @@ mod tests {
             model: None,
             credits_consumed: None,
             generation: 0,
+            truncated: false,
             created_at,
         }
     }
