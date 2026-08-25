@@ -211,6 +211,7 @@ fn fixture_user_post(action_id: &str, text: &str) -> PostNode {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     }
 }
 
@@ -2807,6 +2808,7 @@ fn open_floating_composer_scene(
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -3033,6 +3035,7 @@ fn space_composer_dock_shadow_is_stable_cold(cx: &mut TestAppContext) {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     };
     let mut nodes = Vec::new();
     for i in 0..12 {
@@ -3120,6 +3123,7 @@ fn space_resize_above_column_cap_does_not_churn_height_cache(cx: &mut TestAppCon
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     };
     let mut nodes = Vec::new();
     for i in 0..12 {
@@ -5237,6 +5241,7 @@ fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -5349,6 +5354,7 @@ fn space_scrolled_floating_composer_glides_to_its_top_by_the_dock(cx: &mut TestA
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -17947,6 +17953,59 @@ fn space_marks_an_answer_that_stopped_at_its_length_limit(cx: &mut TestAppContex
     assert!(
         names.iter().any(|n| n.ends_with("/cut-off")),
         "the answer says where it stopped: {names:?}"
+    );
+}
+
+#[gpui::test]
+fn space_marks_a_reloaded_answer_that_stopped_at_its_length_limit(cx: &mut TestAppContext) {
+    // The durable half. This window watched no turn — it is the window a
+    // reader opens afterwards — so nothing has told it anything; the only
+    // source of the mark is the post's own row. A `truncated` post is
+    // therefore seeded and the mark asserted with no event delivered at all,
+    // and the sibling that is not truncated pins that the mark is per-post
+    // rather than a property of the space.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = fixture_assistant_post("a2", "the reply that ran out of room");
+    a2.parent_action_id = Some("a1".into());
+    a2.truncated = true;
+    let mut a3 = fixture_assistant_post("a3", "a whole answer");
+    a3.parent_action_id = Some("a2".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "original text"), a2, a3], cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.truncated_posts_for_test().is_empty(),
+            "this window watched no turn, so it remembers nothing"
+        );
+    });
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let cut_off: Vec<&String> = names.iter().filter(|n| n.ends_with("/cut-off")).collect();
+    assert_eq!(
+        cut_off.len(),
+        1,
+        "exactly the reloaded post that stopped short says so: {names:?}"
+    );
+    assert!(
+        cut_off[0].starts_with("space/post/1/"),
+        "and it is the second post, not its sibling: {cut_off:?}"
     );
 }
 

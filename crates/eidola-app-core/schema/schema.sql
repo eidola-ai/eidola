@@ -541,6 +541,29 @@ CREATE TABLE action (
                         'error'
                     )) DEFAULT 'complete',
 
+    -- The upstream stopped this generation at the completion ceiling
+    -- (`finish_reason: "length"`) rather than because the model was
+    -- done — the durable half of "this answer reached its length
+    -- limit", so a reader who reopens the space still sees the mark
+    -- under an answer that stops mid-thought.
+    --
+    -- A COLUMN, not a `status` value, and the distinction is load
+    -- bearing. `status` is the lifecycle slot: one value at a time,
+    -- and the reads that mean "durable and renderable" spell it
+    -- `status IN ('complete', 'cancelled')` in a dozen places (the
+    -- tree, the transcript, context assembly, search, the record). A
+    -- truncated answer IS complete in exactly that sense — it
+    -- committed, it renders, it is context for the next turn — so a
+    -- 'truncated' status would drop it out of every one of those
+    -- reads until each was widened, and the cost of missing one is a
+    -- real answer vanishing from a conversation. How generation
+    -- stopped is an orthogonal fact about a completed action, so it
+    -- gets its own field.
+    --
+    -- Only an inference has a `finish_reason` to read, so only an
+    -- inference may carry the flag.
+    truncated       INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
+
     intent          TEXT,
     model           TEXT,
 
@@ -554,6 +577,7 @@ CREATE TABLE action (
     -- supersedes is item-scoped: both halves present together, the item
     -- is this row's own, and the referenced (action, item) pair must
     -- really exist — so a generation chain cannot hop items.
+    CHECK (truncated = 0 OR action_type = 'inference'),
     CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
     CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
     FOREIGN KEY (supersedes_action_id, supersedes_item_id)
@@ -946,6 +970,7 @@ SELECT
     a.input_tokens,
     a.output_tokens,
     a.credits_consumed,
+    a.truncated,
     a.created_at,
     (SELECT COUNT(*) FROM action b
      WHERE b.item_id = a.item_id
