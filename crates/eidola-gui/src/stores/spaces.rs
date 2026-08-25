@@ -1020,33 +1020,7 @@ impl SpacesStore {
         self.write_then_reconcile(
             space_id,
             cx,
-            // Optimistic local removal — an edit of whatever value is present,
-            // so the cell's state is unchanged (a stale or failed-with-prior
-            // listing stays what it is; only its rows move). Its inverse puts
-            // the row back where the *listing's own order* puts it.
-            //
-            // **The position is derived, never stored.** A recorded slot is
-            // stale the moment another optimistic removal shifts the list under
-            // it: two archives of `[A, B, C]` record slot 0 apiece (B's after
-            // A's removal), and undoing them in the order they settle can seat
-            // them as `[B, A, C]` — an order the database never held, left
-            // standing as `Failed { prior }` when the batch-end read fails too.
-            // `list_spaces` orders by `last_activity_at DESC` and every row
-            // carries that key, so the seat is a question the row answers about
-            // itself, in any order, however many siblings moved meanwhile.
-            move |rows| {
-                let removed = rows
-                    .iter()
-                    .position(|s| s.id == row_id)
-                    .map(|at| rows.remove(at));
-                Box::new(move |rows: &mut Vec<SpaceInfo>| {
-                    if let Some(row) = removed {
-                        let at =
-                            rows.partition_point(|r| r.last_activity_at >= row.last_activity_at);
-                        rows.insert(at, row);
-                    }
-                })
-            },
+            move |rows| archive_edit(rows, row_id),
             move |core| {
                 Box::pin(async move {
                     match bridge(core, move |c| async move { c.archive_space(id).await }).await {
@@ -1091,6 +1065,53 @@ type UndoEdit = Box<dyn FnOnce(&mut Vec<SpaceInfo>)>;
 /// stored, so a re-list re-ordering the listing under it cannot make it stale.
 /// Extracted as a free function so the unit tests exercise the shipped edit
 /// rather than a copy of it.
+/// An archive's optimistic edit, and its inverse — the pair
+/// [`SpacesStore::archive`] hands `write_then_reconcile`.
+///
+/// Optimistic local removal — an edit of whatever value is present, so the
+/// cell's state is unchanged (a stale or failed-with-prior listing stays what
+/// it is; only its rows move). Its inverse puts the row back where the
+/// *listing's own order* puts it.
+///
+/// **The position is derived, never stored.** A recorded slot is stale the
+/// moment another optimistic removal shifts the list under it: two archives of
+/// `[A, B, C]` record slot 0 apiece (B's after A's removal), and undoing them in
+/// the order they settle can seat them as `[B, A, C]` — an order the database
+/// never held, left standing as `Failed { prior }` when the batch-end read fails
+/// too. `list_spaces` orders by `last_activity_at DESC` and every row carries
+/// that key, so the seat is a question the row answers about itself, in any
+/// order, however many siblings moved meanwhile.
+///
+/// **And so is the parent's title, for the same reason.** Removing a row has to
+/// snapshot it — that is the only way to put it back — but a snapshot taken
+/// while a *sibling* operation's optimistic edit is standing carries that edit,
+/// and restoring it later resurrects a value the database may since have
+/// refused: rename a parent, archive its delegated child, refuse the rename
+/// (whose inverse cannot reach a row that is no longer there), then refuse the
+/// archive, and the row comes back wearing the rejected name — for good, if the
+/// batch-end read also fails. So the re-insert asks the parent row for its
+/// title rather than trusting the copy it took, and the two inverses then
+/// compose in either settle order. A parent the listing does not hold (archived,
+/// or gone) leaves the carried copy standing, which is the best answer
+/// available.
+fn archive_edit(rows: &mut Vec<SpaceInfo>, row_id: String) -> UndoEdit {
+    let removed = rows
+        .iter()
+        .position(|s| s.id == row_id)
+        .map(|at| rows.remove(at));
+    Box::new(move |rows: &mut Vec<SpaceInfo>| {
+        if let Some(mut row) = removed {
+            if let Some(parent) = row.parent.as_mut()
+                && let Some(current) = rows.iter().find(|r| r.id == parent.space_id)
+            {
+                parent.title.clone_from(&current.title);
+            }
+            let at = rows.partition_point(|r| r.last_activity_at >= row.last_activity_at);
+            rows.insert(at, row);
+        }
+    })
+}
+
 fn rename_edit(rows: &mut [SpaceInfo], row_id: String, title: String) -> UndoEdit {
     let mut prior: Option<Option<String>> = None;
     let mut prior_children: Vec<(String, Option<String>)> = Vec::new();
@@ -1227,19 +1248,10 @@ mod tests {
         super::rename_edit(rows, id.to_string(), title.to_string())
     }
 
-    /// Likewise for archive — the seat derived from the row's own sort key.
+    /// Likewise for archive — the shipped edit, not a copy of it.
     fn archive(cell: &mut Loadable<Vec<SpaceInfo>>, id: &'static str) -> UndoEdit {
         let rows = cell.value_mut().expect("a cell with rows");
-        let removed = rows
-            .iter()
-            .position(|s| s.id == id)
-            .map(|at| rows.remove(at));
-        Box::new(move |rows: &mut Vec<SpaceInfo>| {
-            if let Some(r) = removed {
-                let at = rows.partition_point(|x| x.last_activity_at >= r.last_activity_at);
-                rows.insert(at, r);
-            }
-        })
+        super::archive_edit(rows, id.to_string())
     }
 
     /// The batch-end read landing, as `refresh` applies it.
@@ -1320,6 +1332,51 @@ mod tests {
             ],
             "a name the database refused must not stand in any badge either"
         );
+    }
+
+    /// **A refused rename and a refused archive compose, even though one of
+    /// them removed the row the other has to correct.** Renaming a parent edits
+    /// its delegated children's cached badge titles; archiving one of those
+    /// children then snapshots a row wearing that not-yet-accepted name. If the
+    /// rename settles first its inverse cannot find the removed row, and the
+    /// archive's inverse would put it back carrying the name the database
+    /// refused — standing for good behind a failed batch-end read. The
+    /// re-insert therefore asks the parent row for its title instead of
+    /// trusting the copy it took, the same "derived, never stored" rule the
+    /// seat already follows.
+    #[test]
+    fn a_refused_rename_and_a_refused_archive_of_its_child_both_land_honestly() {
+        for archive_settles_first in [false, true] {
+            let mut cell = Loadable::loaded(vec![
+                row_at("s1", "Tides", 300),
+                child_of("s2", "Survey", ("s1", "Tides")),
+            ]);
+            let undo_rename = rename(&mut cell, "s1", "Nile");
+            let undo_archive = archive(&mut cell, "s2");
+            assert_eq!(titles(&cell), vec!["Nile".to_string()], "one row, renamed");
+
+            let (first, second) = if archive_settles_first {
+                (undo_archive, undo_rename)
+            } else {
+                (undo_rename, undo_archive)
+            };
+            settle_index_mutation(&mut cell, first, Err("refused".into()));
+            settle_index_mutation(&mut cell, second, Err("refused".into()));
+            resolving_read(&mut cell, Err(read_err()));
+
+            assert_eq!(
+                titles(&cell),
+                vec!["Tides".to_string(), "Survey".to_string()],
+                "both rows are back under the names the database holds \
+                 (archive first: {archive_settles_first})"
+            );
+            assert_eq!(
+                parent_titles(&cell),
+                vec![Some("Tides".to_string())],
+                "and the child's badge does not wear the refused name \
+                 (archive first: {archive_settles_first})"
+            );
+        }
     }
 
     // -- The double-failure quadrant -----------------------------------------
