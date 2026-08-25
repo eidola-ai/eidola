@@ -594,3 +594,113 @@ fn a_slow_turn_does_not_hold_the_connection_shut() {
         });
     });
 }
+
+#[test]
+fn the_reserved_request_id_is_refused_before_anything_is_dispatched() {
+    run(|| {
+        let (_mock, core, _dir) = served(MockConfig::default());
+        core.runtime().block_on(async {
+            let mut client = Client::connect(&core);
+            // Otherwise perfectly valid — the id is the whole problem. Accepting
+            // it would put a legitimate answer and an uncorrelated refusal on
+            // the same id, and nothing downstream could tell them apart.
+            client
+                .send_raw(br#"{"v":1,"id":0,"verb":"hello","params":{}}"#)
+                .await;
+            client.send_raw(b"\n").await;
+            let frame = client.expect_frame().await;
+            assert_eq!(frame.id, NO_REQUEST);
+            match frame.body {
+                ResponseBody::Err { error } => match error.to_remote() {
+                    RemoteError::Protocol(ProtocolError::ReservedRequestId { reserved }) => {
+                        assert_eq!(reserved, NO_REQUEST);
+                    }
+                    other => panic!("unexpected: {other:?}"),
+                },
+                other => panic!("unexpected: {other:?}"),
+            }
+            // Refused before dispatch, so it is not a handshake either.
+            let refusal = client
+                .refused(&Call::SpacesList {
+                    include_archived: false,
+                })
+                .await;
+            assert_eq!(
+                refusal,
+                ProtocolError::HandshakeRequired,
+                "the reserved id was never allowed to greet"
+            );
+            client.hello().await;
+        });
+    });
+}
+
+#[test]
+fn a_turn_already_upstream_outlives_the_caller_that_asked_for_it() {
+    run(|| {
+        // The tokens are spent the moment the request reaches the upstream, so
+        // a turn already under way finishes and persists whatever happens to
+        // the connection: the caller loses the delivery, never the work it paid
+        // for. Aborting it part-way would be cancellation landing inside a
+        // spend, which is what the atomicity rules refuse — and it would bill
+        // for an answer nobody ever gets.
+        let (mock, core, _dir) = served(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            // Long enough that the caller can leave while the request is
+            // demonstrably upstream and not yet answered.
+            chat_delay_ms: 1_500,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime().block_on(async {
+            let mut client = Client::connect(&core);
+            client.hello().await;
+            client
+                .send(&Call::ChatStream {
+                    prompt: "asked and abandoned".into(),
+                    model: Some(MODEL.into()),
+                    space_id: None,
+                })
+                .await;
+            // Wait for the request to actually be upstream — that is the moment
+            // the turn stops being free to discard. Dropping earlier would race
+            // the dispatch and prove nothing.
+            for _ in 0..600 {
+                if mock.chat_hits() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(mock.chat_hits() > 0, "the turn never reached the upstream");
+            drop(client);
+        });
+
+        // The turn lands anyway: a space with the answer in it.
+        let mut persisted = None;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let spaces = core
+                .runtime()
+                .block_on(core.list_spaces(false))
+                .expect("list spaces");
+            if let Some(space) = spaces.first() {
+                let messages = core
+                    .runtime()
+                    .block_on(core.get_space_messages(space.id.clone()))
+                    .expect("messages");
+                if messages.iter().any(|m| m.role == "assistant") {
+                    persisted = Some(messages);
+                    break;
+                }
+            }
+        }
+        let messages = persisted.expect("the abandoned turn still persisted its answer");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content.contains("Hello from the stream.")),
+            "the answer the caller paid for is in the space: {messages:?}"
+        );
+    });
+}

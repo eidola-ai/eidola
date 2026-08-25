@@ -19,9 +19,41 @@
 //! - **A request's terminal frame is always sent.** Every path through
 //!   [`answer`] ends in exactly one `end` or `err`, so a caller waiting on an
 //!   id is never left waiting on a request that quietly evaporated.
-//! - **The connection ends the requests.** In-flight tasks are aborted when the
-//!   reader stops, because their only consumer is gone; a turn cancelled that
-//!   way is exactly what pressing Ctrl-C on an embedded caller does.
+//! - **The connection ends the *answers*, not the work.** In-flight tasks are
+//!   aborted when the reader stops, because their only consumer is gone. That
+//!   stops frames being written; it does **not** stop a turn. See "What a lost
+//!   caller costs" below — the distinction is billing-relevant and easy to
+//!   state backwards.
+//!
+//! ## What a lost caller costs
+//!
+//! **A turn already under way finishes and persists, whatever happens to the
+//! connection that asked for it.** `AppCore::chat_stream` runs the turn on the
+//! core's own runtime and awaits it; dropping that await detaches the turn
+//! rather than cancelling it, so the answer is written, the credential settles,
+//! and the post is in the space when the caller comes back.
+//!
+//! That is the house rule, not an accident of this module — `crates/eidola-gui/STATE.md`
+//! → Atomicity & cancellation: *cancellation may only ever land between durable
+//! operations, never inside one*. A turn is a saga across the database, the
+//! upstream and the wallet; aborting it part-way is precisely the in-memory
+//! rollback that doctrine refuses, and it would land inside a spend. The GUI
+//! behaves the same way — closing a window mid-turn abandons the receiver and
+//! the turn completes (`bridge::bridge`).
+//!
+//! It is also the honest outcome on its own terms: the tokens were spent the
+//! moment the request went upstream, so discarding the answer would bill for
+//! nothing. What the caller loses is the *delivery* — the `end` frame it was
+//! waiting for — never the work it paid for.
+//!
+//! **The one thing that is racy is whether the turn started at all.** A caller
+//! that vanishes in the same breath as its request can be gone before
+//! `chat_stream` has handed the turn to the runtime, and then nothing runs and
+//! nothing is spent. So the two outcomes are *never started* and *finished* —
+//! there is no third one where a caller is charged for half a turn. Regression:
+//! `a_turn_already_upstream_outlives_the_caller_that_asked_for_it`, which waits
+//! for the request to reach the upstream before leaving, because that is the
+//! moment the turn stops being free to discard.
 //!
 //! ## What a bad frame costs
 //!
@@ -38,8 +70,9 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use super::{
-    Call, FrameReader, HelloResult, NO_REQUEST, PROTOCOL_VERSION, ProtocolError, Request, Response,
-    SpacesListResult, WalletCredentialsResult, WireError, decode_request, encode_line,
+    Call, FrameReader, HelloResult, MAX_RESPONSE_BYTES, NO_REQUEST, PROTOCOL_VERSION,
+    ProtocolError, Request, Response, SpacesListResult, WalletCredentialsResult, WireError,
+    decode_request, encode_line, terminal_line,
 };
 use crate::AppCore;
 use crate::error::AppError;
@@ -159,17 +192,17 @@ async fn read_frames<R: AsyncRead + Unpin>(
         let app_version = app_version.clone();
         let out = out.clone();
         let id = request.id;
+        let verb = call.verb();
         tasks.spawn(async move {
             let _permit = permit;
-            let terminal = match answer(&core, &app_version, id, call, &out).await {
-                Ok(data) => Response {
-                    v: PROTOCOL_VERSION,
-                    id,
-                    body: super::ResponseBody::End { data },
-                },
-                Err(error) => Response::err(id, error),
+            let line = match answer(&core, &app_version, id, call, &out).await {
+                // Not `encode_line` directly: a result is the one payload that
+                // grows with the profile, and `terminal_line` is what keeps the
+                // app from writing a line its own reader would refuse.
+                Ok(data) => terminal_line(id, verb, data, MAX_RESPONSE_BYTES),
+                Err(error) => encode_line(&Response::err(id, error)),
             };
-            let _ = out.send(encode_line(&terminal));
+            let _ = out.send(line);
         });
 
         // Reap finished tasks so the set does not grow across a long-lived
@@ -177,13 +210,22 @@ async fn read_frames<R: AsyncRead + Unpin>(
         while tasks.try_join_next().is_some() {}
     }
 
-    // The peer is gone: nothing is left to receive an answer, so anything
-    // still running is work with no reader. `JoinSet`'s drop aborts it.
+    // The peer is gone, so nothing is left to receive an answer. Aborting stops
+    // the frames; it does not stop a turn already running on the core's runtime
+    // (see "What a lost caller costs" above), and it must not — that would be
+    // cancellation landing inside a durable operation.
     tasks.abort_all();
 }
 
-/// The two refusals that are decided before a verb is even parsed.
+/// The refusals that are decided before a verb is even parsed.
 fn gate(request: &Request, greeted: bool) -> Option<ProtocolError> {
+    // First, because every refusal below is answered *on the caller's id*, and
+    // this is the one id that cannot mean "yours".
+    if request.id == NO_REQUEST {
+        return Some(ProtocolError::ReservedRequestId {
+            reserved: request.id,
+        });
+    }
     if request.v != PROTOCOL_VERSION {
         return Some(ProtocolError::UnsupportedProtocol {
             supported: PROTOCOL_VERSION,
@@ -260,6 +302,10 @@ async fn answer(
                     let _ = chunks.send(encode_line(&Response::chunk(id, data)));
                 }
             });
+            // Detached by construction: `chat_stream` spawns the turn on the
+            // core's runtime, so a caller that disappears mid-turn stops being
+            // written to and the turn still lands. That is deliberate — see
+            // the module docs.
             let result = core.chat_stream(prompt, model, space_id, tx).await;
             // `chat_stream` drops the sender as it returns, so this completes
             // once the last chunk has been queued — which is what puts every
