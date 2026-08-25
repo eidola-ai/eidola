@@ -406,6 +406,28 @@ pub(crate) struct FindSession {
     /// a freshly formatted message each render so the field is re-seeded
     /// exactly when the wording moves (the inspector title's shape).
     pub(crate) placeholder: SharedString,
+    /// **The inspector field the keyboard came from**, weakly.
+    ///
+    /// [`SpaceView::keyboard_home`] answers for the conversation — the
+    /// reader's tree level, or the composing session that owns the keyboard —
+    /// and those it can *derive* at the moment of the question. An inspector
+    /// text field it cannot: which of the panel's fields a reader stood in is
+    /// not recoverable once the bar has taken the keyboard, and handing it to
+    /// the view root instead is not a dead window (the panel's own predicate
+    /// is focus-derived, so it stops yielding) but a **wrong** one: the next
+    /// character is then type-to-compose, and a reader mid-way through a
+    /// system prompt gets a draft.
+    ///
+    /// So the *lender* is remembered, and it is remembered as the **entity**
+    /// rather than its focus handle. That is the whole difference: a
+    /// `FocusHandle` recorded here would be the dead slot this window's focus
+    /// doctrine is built around — tracked on no element, still reporting
+    /// itself focused — where an `InputState` dies with the form that owns it,
+    /// so a participant editor closed while the bar stood open simply fails to
+    /// upgrade and the handback falls through to `keyboard_home`. Derived at
+    /// the moment of use, exactly like the composing arm; only the *identity*
+    /// is carried, never the answer.
+    pub(crate) returned_input: Option<gpui::WeakEntity<gpui_component::input::InputState>>,
 }
 
 impl FindSession {
@@ -628,6 +650,7 @@ impl SpaceView {
             reveal_when_anchored: false,
             focus: cx.focus_handle(),
             placeholder,
+            returned_input: self.inspector_focused_input(window, cx),
         });
         // The document grew a reserve at its top; move the page by the same
         // amount so the words under the reader's eye stay where they were.
@@ -648,16 +671,21 @@ impl SpaceView {
         // composing beside it never lent it (the handback rule every form in
         // this window owes).
         let held = session.focus.contains_focused(window, cx);
+        let lender = session.returned_input.clone();
         drop(session);
         self.set_page_scroll_y(self.page_scroll.offset().y.as_f32() + FIND_BAR_H);
         if held {
-            // Asked **now**, not recorded when the bar opened: a handle taken
-            // at open is a snapshot of a surface that may have been retired
-            // since, where `keyboard_home` names whatever is live at the
-            // moment of the question — including the composing session, which
-            // is the one destination that leaves a reader able to go on
-            // writing (see [`SpaceView::keyboard_home`]).
-            let back = self.keyboard_home(cx);
+            // The inspector field the bar borrowed from, **if it is still
+            // there** — the weak reference is what answers that (see
+            // `FindSession::returned_input`). Everything else is derived now
+            // rather than recorded then: `keyboard_home` names whatever is
+            // live at the moment of the question, including the composing
+            // session, which is the one destination that leaves a reader able
+            // to go on writing.
+            let back = lender
+                .and_then(|input| input.upgrade())
+                .map(|input| gpui::Focusable::focus_handle(input.read(cx), cx))
+                .unwrap_or_else(|| self.keyboard_home(cx));
             window.focus(&back, cx);
         }
         // The match layers are cleared on the next `sync_references`, which now

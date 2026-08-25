@@ -19537,3 +19537,166 @@ fn space_find_stops_the_old_reveal_when_the_query_stops_matching(cx: &mut TestAp
         );
     });
 }
+
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_to_the_inspector_field(cx: &mut TestAppContext) {
+    // `keyboard_home` answers for the *conversation*, and it cannot derive
+    // which of the panel's fields a reader stood in. Handing the keyboard to
+    // the view root there is not a dead window — the panel's own predicate is
+    // focus-derived, so it stops yielding — but a wrong one: the next
+    // character becomes type-to-compose and a reader mid-way through a
+    // setting gets a draft instead.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let title = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("title field");
+    cx.update_window(window, |_, window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+
+    let field = title.read_with(&vcx, |s, cx| s.focus_handle(cx));
+    vcx.update(|window, _| {
+        assert!(
+            field.is_focused(window),
+            "the keyboard went back to the field the bar borrowed it from"
+        );
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "…so nothing started composing in the conversation behind it"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_paints_nothing_on_a_buffer_it_is_not_describing(cx: &mut TestAppContext) {
+    // The other half of the IME rule. `sync_find` deliberately keeps the
+    // projection of the text the reader has *committed*, so while a
+    // composition is live the match ranges are offsets into one document and
+    // the editor's buffer — preedit spliced in at the caret — is another.
+    // Applied anyway they slide onto unrelated bytes and the wash crawls as
+    // the reader types. The count is the honest side to keep; the paint is not.
+    use gpui::EntityInputHandler;
+    use gpui_markdown_editor::HighlightLayer;
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    let draft = view
+        .read_with(&vcx, |v, _| v.tail_draft_state_for_test())
+        .expect("a docked tail draft");
+    draft.update(&mut vcx, |e, cx| {
+        e.set_value("a kestrel of my own".to_string(), cx)
+    });
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    let painted = |vcx: &mut VisualTestContext| {
+        draft.read_with(vcx, |e, _| {
+            !e.highlights_in(HighlightLayer::Accent).is_empty()
+                || !e.highlights_in(HighlightLayer::Overlay).is_empty()
+        })
+    };
+    assert!(painted(&mut vcx), "the draft's match is washed");
+
+    // Compose **before** the match: the live buffer now says something the
+    // committed projection's offsets do not describe.
+    vcx.update(|window, cx| {
+        draft.update(cx, |e, cx| {
+            e.replace_and_mark_text_in_range(Some(0..0), "ありがとう", None, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().0.len(),
+            4,
+            "the count still describes the text the reader has chosen"
+        );
+    });
+    assert!(
+        !painted(&mut vcx),
+        "…and nothing is painted onto the buffer those offsets do not describe"
+    );
+}
+
+#[gpui::test]
+fn space_find_does_not_push_a_followed_reference_under_its_own_bar(cx: &mut TestAppContext) {
+    // Following a footnote leaves the bar open, so the navigation has to clear
+    // whatever chrome covers the document's top — the one accessor that knows,
+    // not the title band's share of it. The post lands the same distance below
+    // that chrome either way, which is the property that cannot be true of a
+    // constant.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut posts = vec![fixture_user_post("a1", &filler)];
+    for i in 2..=4u32 {
+        let mut p = fixture_assistant_post(&format!("a{i}"), &filler);
+        p.parent_action_id = Some(format!("a{}", i - 1));
+        posts.push(p);
+    }
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    let follow = |vcx: &mut VisualTestContext| {
+        view.read_with(vcx, |v, _| v.scroll_page_to_top_for_test());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.navigate_to_action("a4".into(), window, cx));
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |v, _| v.page_glide_target_for_test())
+            .expect("the follow glides to the post")
+    };
+
+    let closed = follow(&mut vcx);
+    let reserve_closed = view.read_with(&vcx, |v, _| v.doc_reserve_for_test());
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let open = follow(&mut vcx);
+    let reserve_open = view.read_with(&vcx, |v, _| v.doc_reserve_for_test());
+
+    assert!(
+        reserve_open > reserve_closed,
+        "precondition: the bar grew the document's top reserve"
+    );
+    assert!(
+        (open - closed).abs() < 0.5,
+        "the followed post rests the same distance below the chrome either \
+         way ({closed} closed, {open} open)"
+    );
+}
