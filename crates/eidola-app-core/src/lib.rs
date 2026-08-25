@@ -14016,7 +14016,22 @@ fn render_messages(
             continue; // skip tool_call, tool_result, etc. for now
         }
         let role = match responder_participant_id {
-            // Upstream: only the responder's own posts are its words.
+            // Upstream: only the responder's own posts are its words — with
+            // **one exception, and it is the brief**. A brief is not a
+            // contribution to the conversation, it is the conversation's
+            // premise: the contract the room was opened to act on, addressed to
+            // everyone in it. Rendered as the author's own words it reached the
+            // one participant who wrote it — the owner, which is exactly who
+            // the brief floor schedules for a delegation that seats nobody — as
+            // its own prior output, at the end of a room with no roster block
+            // and no thread map behind it (both live in the system message, and
+            // neither exists for a single unbranched member). A model handed
+            // its own text as the last thing said has been asked to continue
+            // it, not to carry it out, and the delegation would then produce
+            // more brief. As `user` it is what it always was to every other
+            // participant: the request. Nothing is misattributed — the message
+            // header still names its author.
+            Some(_) if row.action_type == db::BRIEF_ACTION_TYPE => "user",
             Some(responder) => {
                 if row.participant_id == responder {
                     "assistant"

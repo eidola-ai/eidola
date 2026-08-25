@@ -504,8 +504,10 @@ fn fold_name(name: &str) -> String {
 /// Resolve the names a model asked for against the roster it was shown.
 ///
 /// Pure over its inputs — these decide what a model may reach, so they are
-/// unit-tested. An id matches exactly; otherwise the effective label matches
-/// case- and whitespace-insensitively ([`fold_name`]). Failures are the message
+/// unit-tested. A name is matched against **both** namespaces at once — an id
+/// exactly, an effective label case- and whitespace-insensitively
+/// ([`fold_name`]) — and the union, deduped by participant, is what decides:
+/// one match seats it, several are refused rather than guessed between. Failures are the message
 /// the model reads, and every one of them names what *is* available, because a
 /// listing of the current conversation's roster is something the model was
 /// already given.
@@ -516,32 +518,40 @@ pub(crate) fn resolve_seats(
     let mut seats: Vec<String> = Vec::new();
     for raw in requested {
         let name = raw.trim();
-        let id = match candidates.iter().find(|c| c.participant_id == name) {
-            Some(c) => c.participant_id.clone(),
-            None => {
-                let asked = fold_name(name);
-                let matches: Vec<&SeatCandidate> = candidates
-                    .iter()
-                    .filter(|c| fold_name(&c.label) == asked)
-                    .collect();
-                match matches.as_slice() {
-                    [one] => one.participant_id.clone(),
-                    // **A blank entry is noise only where nothing answers to
-                    // it.** An empty label is supported state — on an override
-                    // column `NULL` means inherit and `''` means "override to
-                    // empty" — so the roster really can show a participant
-                    // with no name, and a model copying that name back was
-                    // silently dropped: the tool opened a solo room instead of
-                    // seating the agent, with no refusal to correct. Matching
-                    // is therefore tried first, and the skip is what is left
-                    // when the request names nobody *and* names nothing: a
-                    // stray "" or "  " in the list, which is a model's
-                    // punctuation rather than a request.
-                    [] if name.is_empty() => continue,
-                    [] => return Err(unknown_seat_message(candidates, name)),
-                    _ => return Err(ambiguous_seat_message(&matches, name)),
-                }
+        // **Both namespaces are searched, and neither wins by default.** An id
+        // is exposed to the model (the ambiguity refusal hands them out) and a
+        // label is arbitrary text a person chose, so one participant's label
+        // can be another's id — and giving ids unconditional precedence there
+        // seated the agent the model did *not* name, silently. Matching both
+        // and deduping by participant turns that into the one thing it can
+        // honestly be: two candidates answering to one name, which is the
+        // refusal that already exists. A participant whose label happens to be
+        // its own id is one candidate, not two.
+        let asked = fold_name(name);
+        let mut matches: Vec<&SeatCandidate> = Vec::new();
+        for c in candidates
+            .iter()
+            .filter(|c| c.participant_id == name || fold_name(&c.label) == asked)
+        {
+            if !matches.iter().any(|m| m.participant_id == c.participant_id) {
+                matches.push(c);
             }
+        }
+        let id = match matches.as_slice() {
+            [one] => one.participant_id.clone(),
+            // **A blank entry is noise only where nothing answers to it.** An
+            // empty label is supported state — on an override column `NULL`
+            // means inherit and `''` means "override to empty" — so the roster
+            // really can show a participant with no name, and a model copying
+            // that name back was silently dropped: the tool opened a solo room
+            // instead of seating the agent, with no refusal to correct.
+            // Matching is therefore tried first, and the skip is what is left
+            // when the request names nobody *and* names nothing: a stray "" or
+            // "  " in the list, which is a model's punctuation rather than a
+            // request.
+            [] if name.is_empty() => continue,
+            [] => return Err(unknown_seat_message(candidates, name)),
+            _ => return Err(ambiguous_seat_message(&matches, name)),
         };
         if !seats.contains(&id) {
             seats.push(id);
@@ -924,6 +934,36 @@ mod tests {
             participant_ids: vec!["p-x".into()],
             capabilities: Vec::new(),
         }
+    }
+
+    /// **An id that is also somebody's label names two people, not one.** Ids
+    /// are handed to the model by the ambiguity refusal and labels are
+    /// arbitrary text a person chose, so the two namespaces can meet — and
+    /// resolving ids first meant a model copying a *label* off the roster
+    /// silently seated a different agent. Both are searched, and a collision is
+    /// refused rather than guessed between.
+    #[test]
+    fn an_id_that_is_also_a_label_is_refused_rather_than_preferred() {
+        let candidates = vec![candidate("p-1", "Ada"), candidate("p-2", "p-1")];
+        let err = resolve_seats(&candidates, &["p-1".into()]).unwrap_err();
+        assert!(err.contains("more than one participant"), "{err}");
+        assert!(err.contains("p-1, p-2"), "{err}");
+        // Each is still reachable by a name nothing else answers to.
+        assert_eq!(
+            resolve_seats(&candidates, &["Ada".into()]).unwrap(),
+            vec!["p-1".to_string()]
+        );
+        assert_eq!(
+            resolve_seats(&candidates, &["p-2".into()]).unwrap(),
+            vec!["p-2".to_string()]
+        );
+        // A participant whose label happens to be its own id is one candidate,
+        // not a collision with itself.
+        let selfnamed = vec![candidate("p-9", "p-9")];
+        assert_eq!(
+            resolve_seats(&selfnamed, &["p-9".into()]).unwrap(),
+            vec!["p-9".to_string()]
+        );
     }
 
     /// **A participant with no name is still addressable.** An empty *override*

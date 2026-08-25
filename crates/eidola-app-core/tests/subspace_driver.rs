@@ -303,6 +303,51 @@ fn a_solo_delegation_works_its_own_brief() {
     });
 }
 
+/// **A solo brief reaches its owner as a request, not as its own prior
+/// output.** The floor schedules the brief's author, and the role split renders
+/// a responder's own posts as `assistant` — so the one turn the room exists for
+/// used to end on the model's own words, in a room with no roster block and no
+/// thread map behind it (both live in the system message, and a single
+/// unbranched member has neither). That is a prompt to continue the brief
+/// rather than to carry it out. A brief is the room's premise, so it renders as
+/// the request to everyone in the room, its author included.
+#[test]
+fn a_solo_brief_is_put_to_its_owner_as_the_request() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let out = spawn(&core, &parent, &owner, vec![]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        // The first request the room made is the worked turn (the report comes
+        // after it, in the parent).
+        let body = mock
+            .chat_bodies()
+            .into_iter()
+            .find(|b| {
+                flat_messages(b)
+                    .iter()
+                    .any(|(_, c)| c.contains("Check the tide tables for Friday."))
+            })
+            .expect("the worked turn's request");
+        let messages = flat_messages(&body);
+        let (role, content) = messages.last().cloned().expect("a message");
+        assert_eq!(
+            role, "user",
+            "the brief is the standing request, not the model's own last word: {messages:?}"
+        );
+        assert!(content.contains("Check the tide tables for Friday."));
+        assert!(
+            !messages.iter().any(|(r, _)| r == "assistant"),
+            "nothing in this room is the model's own prior output yet: {messages:?}"
+        );
+        // Attribution is not lost — the header still names who wrote it.
+        assert!(content.contains("Navigator"), "{content}");
+    });
+}
+
 /// **A router cannot empty a brief either.** A delegated room inherits its
 /// parent's `router_model`, and a room that seats helpers has a non-empty
 /// mechanical set over its brief — so the floor stands aside and the router is
