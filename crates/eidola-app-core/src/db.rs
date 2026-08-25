@@ -5928,6 +5928,57 @@ async fn is_visible_post_in_space(
 /// The post `action_id`'s item currently shows, or `None` if that item has no
 /// visible tip — superseded wording, a hidden `error` generation, a missing
 /// row. The walk asks this of every frontier id before planning it, so an
+/// The post an **item** currently shows in `space_id`, or `None` when it shows
+/// none — the item-keyed twin of [`visible_tip_of_action`], through the same
+/// transcript predicate (current generation, terminal status, post type).
+///
+/// It exists for the one question an action id cannot answer: *has the turn
+/// that opened this delegated room written its answer yet?* A turn mints the
+/// item its answer will be written under before it makes a single request
+/// (`TurnPrep::inf_item_id`), and that item is the only thing that identifies
+/// one turn among several the same agent may be running against the same post
+/// — the answer's own action id does not exist until the turn ends, and a
+/// capped or budget-stopped turn never writes one at all.
+///
+/// **`after_row` is still required, and the two rules are not redundant.** An
+/// item names the turn but not the *generation*: a regeneration's
+/// `inf_item_id` is the item it is revising, whose visible post until the turn
+/// lands is the answer being replaced. So the item rules out an answer from
+/// **another** turn, and the watermark rules out an answer that predates the
+/// room; each covers exactly what the other cannot. See
+/// [`last_reply_by_participant`] for the watermark's own argument.
+pub async fn visible_post_of_item(
+    conn: &Connection,
+    space_id: &str,
+    item_id: &str,
+    after_row: Option<i64>,
+) -> Result<Option<String>, AppError> {
+    let sql = format!(
+        "SELECT tip.id FROM item_current ic \
+         JOIN action tip ON tip.id = ic.current_action_id \
+         WHERE ic.item_id = ?1 AND ic.space_id = ?2 \
+           AND tip.rowid > ?3 \
+           AND tip.status IN ('complete', 'cancelled') \
+           AND tip.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         LIMIT 1"
+    );
+    let mut rows = conn
+        .query(
+            &sql,
+            (
+                Value::Text(item_id.to_string()),
+                Value::Text(space_id.to_string()),
+                Value::Integer(after_row.unwrap_or(0)),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
 /// edit or regeneration that landed while a sibling branch was walking is
 /// one wording, not two.
 pub async fn visible_tip_of_action(

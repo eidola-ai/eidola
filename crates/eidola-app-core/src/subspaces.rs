@@ -289,6 +289,7 @@ impl Inner {
         capabilities: &[String],
         title: Option<&str>,
         parent_action_id: Option<&str>,
+        answer_item_id: Option<&str>,
     ) -> Result<SpawnedSubspace, AppError> {
         let brief = brief.trim();
         if brief.is_empty() {
@@ -360,6 +361,14 @@ impl Inner {
         // window in which the row is enumerable and unrecorded, which is the
         // whole hazard; a refused spawn just leaves an id naming nothing.
         self.note_room_spawned_here(&space_id);
+        // **And which answer this room's report belongs under**, recorded on
+        // the same line and ahead of the same transaction, for the same
+        // reason: the spawn's own emissions can arm the driver, so a record
+        // written after the room exists leaves a window in which the driver
+        // can ask this question and be told nothing.
+        if let Some(item) = answer_item_id {
+            self.note_spawning_answer_item(&space_id, item);
+        }
         let title = match db::spawn_subspace_tx(&conn, &plan).await? {
             Ok(title) => title,
             Err(refusal) => return Err(AppError::SpawnRefused { refusal }),
@@ -613,6 +622,12 @@ pub(crate) struct DelegateTool {
     /// target. `None` for a turn answering nothing, which the spawn door
     /// refuses when the conversation offers no fallback either.
     anchor_action_id: Option<String>,
+    /// The **item** this turn's own answer will be written under — the turn's
+    /// identity, minted by `prepare_turn` before its first request. The room's
+    /// report attaches beneath *that* answer, and nothing else distinguishes
+    /// it from another answer the same agent is writing to the same post at
+    /// the same time.
+    answer_item_id: String,
     candidates: Vec<SeatCandidate>,
 }
 
@@ -622,6 +637,7 @@ impl DelegateTool {
         owner_participant_id: String,
         parent_space_id: String,
         anchor_action_id: Option<String>,
+        answer_item_id: String,
         candidates: Vec<SeatCandidate>,
     ) -> Self {
         Self {
@@ -629,6 +645,7 @@ impl DelegateTool {
             owner_participant_id,
             parent_space_id,
             anchor_action_id,
+            answer_item_id,
             candidates,
         }
     }
@@ -747,6 +764,7 @@ impl Tool for DelegateTool {
                     &capabilities,
                     title.as_deref(),
                     self.anchor_action_id.as_deref(),
+                    Some(self.answer_item_id.as_str()),
                 )
                 .await
             {

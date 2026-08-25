@@ -1591,6 +1591,71 @@ fn a_report_does_not_settle_on_an_answer_older_than_its_room() {
     });
 }
 
+/// **Nor on an answer from a different turn.** The watermark rules out answers
+/// that predate the room; what it cannot rule out is an answer by the same
+/// owner to the same post that commits *after* the room opened and belongs to
+/// another turn — nothing serializes two turns of one agent against one post
+/// (two explicit asks, or a regeneration running beside a reply). So the room
+/// records the **item** the spawning turn will answer under, and only that
+/// item's post ends the wait. The two rules are not redundant: a regeneration's
+/// item is the one it is revising, whose visible post until the turn lands is
+/// the answer being replaced, which is what the watermark is for.
+#[test]
+fn a_report_waits_for_its_own_turns_answer_and_not_a_siblings() {
+    run(|| {
+        // Both transports: the asks stream, the regeneration is blocking.
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+
+        // The owner's first answer to the post. The delegation is opened from a
+        // *regeneration* of it, so the spawning turn's item is this one.
+        let first = ask(&core, &parent, &owner, &asked);
+        let item = tree(&core, &parent)
+            .into_iter()
+            .find(|n| n.action_id == first)
+            .expect("the answer is in the parent")
+            .item_id;
+
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        core.test_note_spawning_answer_item(&out.space.id, &item);
+
+        // A second, unrelated answer by the same owner to the same post lands
+        // while that regeneration is still running. It is newer than the room,
+        // so the watermark alone would take it.
+        let sibling = ask(&core, &parent, &owner, &asked);
+        drive(&core, &out.space.id).expect("the room is driven");
+        assert!(
+            report(&core, &parent).is_none(),
+            "a sibling turn's answer is not the answer this room came from"
+        );
+
+        // The spawning turn lands, and the report goes under its answer.
+        core.runtime()
+            .block_on(core.regenerate(first.clone(), MODEL.to_string()))
+            .expect("the spawning turn writes its answer");
+        drive(&core, &out.space.id).expect("the room is driven again");
+        let report = report(&core, &parent).expect("the delegation is reported");
+        let landed = report.parent_action_id.clone().expect("it attached");
+        assert_ne!(landed, sibling, "not beneath the sibling turn's answer");
+        assert_eq!(
+            tree(&core, &parent)
+                .into_iter()
+                .find(|n| n.action_id == landed)
+                .expect("the target is in the parent")
+                .item_id,
+            item,
+            "beneath the answer of the turn that opened the room"
+        );
+    });
+}
+
 /// The wait is not unbounded by this: a spawning turn that died leaves no
 /// answer newer than the room, and the arms that claim a licence still end it —
 /// against the anchor, which is the honest attachment when there is nothing of

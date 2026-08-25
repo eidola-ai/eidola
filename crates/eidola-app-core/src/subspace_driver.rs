@@ -630,6 +630,56 @@ impl Inner {
         }
     }
 
+    /// Record the **item** the turn that is opening `space_id` will write its
+    /// answer under — the answer this room's report attaches beneath.
+    ///
+    /// **Why an item and not an action.** A turn's rounds chain off the post it
+    /// answers, never off its own inference, because a capped or budget-stopped
+    /// turn writes no inference at all — so at the moment `delegate` runs there
+    /// is no answer id to record. What does exist is the item that answer will
+    /// be written under: `prepare_turn` mints it before the first request, and
+    /// a regeneration reuses the item it revises. That makes it exactly "which
+    /// turn asked for this room", which is the question `last_reply_by_participant`
+    /// cannot answer: its watermark rules out answers that predate the room,
+    /// and the case left over is an answer by the same owner to the same post
+    /// that commits *after* the room opened and belongs to a different turn —
+    /// a second explicit ask, or a regeneration running beside a reply.
+    ///
+    /// **In memory, deliberately, and that is not a gap.** The record is only
+    /// ever consulted while the turn that made it could still be running, and a
+    /// turn cannot outlive its process: after a restart the spawning turn is
+    /// gone, no answer of its item will ever appear, and the room's wait ends
+    /// the way it already did — at [`Arm::Sweep`], against the anchor. So the
+    /// durable rule stays the fallback, and this refines it exactly where a
+    /// refinement is meaningful. It is the same lifetime argument the sweep's
+    /// own licence rests on.
+    pub(crate) fn note_spawning_answer_item(&self, space_id: &str, item_id: &str) {
+        self.spawning_answer_items
+            .lock()
+            .expect("spawning answer record poisoned")
+            .insert(space_id.to_string(), item_id.to_string());
+    }
+
+    /// The item the turn that opened `space_id` answers under, if this process
+    /// opened it — see [`Inner::note_spawning_answer_item`].
+    fn spawning_answer_item(&self, space_id: &str) -> Option<String> {
+        self.spawning_answer_items
+            .lock()
+            .expect("spawning answer record poisoned")
+            .get(space_id)
+            .cloned()
+    }
+
+    /// Drop the record for a delegation that is over. Called from the terminal
+    /// exits `drive_subspace` already takes, so the map is bounded by the rooms
+    /// this process has open rather than by everything it ever opened.
+    fn forget_spawning_answer_item(&self, space_id: &str) {
+        self.spawning_answer_items
+            .lock()
+            .expect("spawning answer record poisoned")
+            .remove(space_id);
+    }
+
     /// The rooms this process opened, and the end of the record — see
     /// [`Inner::note_room_spawned_here`].
     fn take_rooms_spawned_here(&self) -> std::collections::HashSet<String> {
@@ -989,14 +1039,17 @@ impl Inner {
         // long as the process lives. Each terminal exit below clears it.
         let Some(sub) = db::subspace(&conn, &space_id).await? else {
             self.end_anchor_wait(&space_id);
+            self.forget_spawning_answer_item(&space_id);
             return Ok(Report::Settled); // not a delegated room
         };
         if sub.archived_at.is_some() {
             self.end_anchor_wait(&space_id);
+            self.forget_spawning_answer_item(&space_id);
             return Ok(Report::Settled); // archival stops new work, here as everywhere
         }
         let Some(tail) = db::last_action_in_space(&conn, &space_id).await? else {
             self.end_anchor_wait(&space_id);
+            self.forget_spawning_answer_item(&space_id);
             return Ok(Report::Settled); // a room with no posts — unreachable, a brief opens every one
         };
         // The entry window is a caller-controlled pause. A turn must not hold
@@ -1122,7 +1175,13 @@ impl Inner {
             }
             // Delivered, or there was nothing to deliver to. Either way this
             // ending is done with.
-            Ok(Report::Settled) => self.forget_ending(&space_id),
+            // Settled: the report is delivered, or there was nothing to
+            // deliver it to. Either way this delegation is over, so the
+            // record of which turn opened it can go with the ending.
+            Ok(Report::Settled) => {
+                self.forget_ending(&space_id);
+                self.forget_spawning_answer_item(&space_id);
+            }
             // The delivery itself failed. Forgetting is what keeps a decided
             // ending from being retried past the work that earned it.
             Err(_) => self.forget_ending(&space_id),
@@ -1643,16 +1702,43 @@ impl Inner {
                     // somehow cannot be read leaves the line unset, which is
                     // the pre-existing rule rather than a refusal: a delegation
                     // must still be able to report.
+                    // **The turn's own answer, when this process knows which
+                    // turn it was.** The watermark below rules out answers that
+                    // predate the room; what it cannot rule out is an answer by
+                    // the same owner to the same post that commits *after* the
+                    // room opened and belongs to a different turn — a second
+                    // explicit ask, or a regeneration running beside a reply,
+                    // neither of which app-core serializes. The item the
+                    // spawning turn will answer under is the one thing that
+                    // tells them apart (see
+                    // [`Inner::note_spawning_answer_item`]), so where it is
+                    // known the question is asked of that item alone: no
+                    // visible post of it yet means *this* turn has not
+                    // answered, whatever else has landed on the anchor.
                     let opened_at = db::subspace_opened_at_row(&conn, &sub.id).await?;
-                    match db::last_reply_by_participant(
-                        &conn,
-                        &sub.parent_space_id,
-                        &sub.owner_participant_id,
-                        anchor,
-                        opened_at,
-                    )
-                    .await?
-                    {
+                    let answered = match self.spawning_answer_item(&sub.id) {
+                        // The item names the turn; the watermark names the
+                        // generation. A regeneration's item is the one it is
+                        // revising, whose visible post until the turn lands is
+                        // the answer being replaced — so both rules apply.
+                        Some(item) => {
+                            db::visible_post_of_item(&conn, &sub.parent_space_id, &item, opened_at)
+                                .await?
+                        }
+                        // No turn identity: a direct caller, or a room this
+                        // process did not open. The durable rule stands alone.
+                        None => {
+                            db::last_reply_by_participant(
+                                &conn,
+                                &sub.parent_space_id,
+                                &sub.owner_participant_id,
+                                anchor,
+                                opened_at,
+                            )
+                            .await?
+                        }
+                    };
+                    match answered {
                         Some(answer) => {
                             self.end_anchor_wait(&sub.id);
                             Some(answer)
