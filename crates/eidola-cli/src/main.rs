@@ -1073,24 +1073,7 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                     println!("no local models yet");
                 } else {
                     for m in &state.models {
-                        let status = match &m.status {
-                            eidola_app_core::LocalModelStatus::Downloading { received, total } => {
-                                match total {
-                                    Some(t) if *t > 0 => {
-                                        format!("downloading {}%", received * 100 / t)
-                                    }
-                                    _ => "downloading".to_string(),
-                                }
-                            }
-                            eidola_app_core::LocalModelStatus::Available => "available".into(),
-                            eidola_app_core::LocalModelStatus::Loading => "loading".into(),
-                            eidola_app_core::LocalModelStatus::Loaded { port, pinned, .. } => {
-                                format!(
-                                    "loaded (127.0.0.1:{port}{})",
-                                    if *pinned { ", pinned" } else { "" }
-                                )
-                            }
-                        };
+                        let status = status_cell(m, &snapshot.running);
                         println!(
                             "{:<40} {:>9}  {}",
                             m.id,
@@ -1503,6 +1486,75 @@ impl UnlistedEngine {
                 ""
             }
         )
+    }
+}
+
+/// The status cell `eidola model list` prints for one scanned row.
+///
+/// The reconciliation lives *inside* the renderer rather than beside it, so
+/// there is no way to render a cell that skipped it — which is the shape of
+/// the defect this cures: the authoritative answer was in the same response
+/// and the table printed the other one.
+fn status_cell(
+    row: &eidola_app_core::LocalModelInfo,
+    running: &[eidola_app_core::RunningEngine],
+) -> String {
+    use eidola_app_core::LocalModelStatus;
+    match reconciled_status(row, running) {
+        LocalModelStatus::Downloading { received, total } => match total {
+            Some(t) if t > 0 => format!("downloading {}%", received * 100 / t),
+            _ => "downloading".to_string(),
+        },
+        LocalModelStatus::Available => "available".into(),
+        LocalModelStatus::Loading => "loading".into(),
+        LocalModelStatus::Loaded { port, pinned, .. } => format!(
+            "loaded (127.0.0.1:{port}{})",
+            if pinned { ", pinned" } else { "" }
+        ),
+    }
+}
+
+/// The status to print for one scanned row, reconciled against the registry.
+///
+/// **The registry wins, and not as a matter of preference.** A row's
+/// `Loaded`/`Loading` comes from the very same engine map
+/// [`eidola_app_core::AppCore::running_engines`] reports: the scan takes that
+/// lock once per directory entry it walks, and the registry is read after the
+/// whole walk, so where the two disagree the registry is simply the later read
+/// of one map. A row claiming an engine the registry no longer carries is
+/// describing a subprocess that has since exited or been unloaded — and
+/// printing it as running would have the table contradict, in the same
+/// payload, the authority [`unaccounted_engines`] below already treats as
+/// final.
+///
+/// A row the registry *does* carry takes its details from that later read too,
+/// so a port or a pin that moved is not printed stale.
+///
+/// **Only a claim of running is reconciled.** A `Downloading` row is left
+/// alone even when an engine for its id exists, because that pair is a real
+/// state — re-downloading a slug whose engine is still up — and promoting it
+/// would hide the transfer the row exists to report. That engine earns its own
+/// line below instead, which is the other direction of the same reconciliation.
+fn reconciled_status(
+    row: &eidola_app_core::LocalModelInfo,
+    running: &[eidola_app_core::RunningEngine],
+) -> eidola_app_core::LocalModelStatus {
+    use eidola_app_core::LocalModelStatus;
+    if !matches!(
+        row.status,
+        LocalModelStatus::Loaded { .. } | LocalModelStatus::Loading
+    ) {
+        return row.status.clone();
+    }
+    match running.iter().find(|e| e.id == row.id) {
+        Some(e) if e.ready => LocalModelStatus::Loaded {
+            port: e.port,
+            context_tokens: e.context_tokens,
+            pinned: e.pinned,
+        },
+        Some(_) => LocalModelStatus::Loading,
+        // The engine is gone; the file on disk is what is left of it.
+        None => LocalModelStatus::Available,
     }
 }
 
@@ -2034,6 +2086,128 @@ mod tests {
         assert!(lines[0].contains("v4"));
         assert!(lines[0].contains(&doc.url));
         assert!(lines[0].contains(&doc.sha256));
+    }
+
+    #[test]
+    fn the_table_prints_a_stopped_engine_as_stopped() {
+        let row = model(
+            "gemma@local",
+            LocalModelStatus::Loaded {
+                port: 8080,
+                context_tokens: 4096,
+                pinned: false,
+            },
+        );
+        assert_eq!(
+            status_cell(&row, &[]),
+            "available",
+            "the cell a reader sees, not just the decision behind it"
+        );
+        assert_eq!(
+            status_cell(&row, &[engine("gemma@local", 8080, true)]),
+            "loaded (127.0.0.1:8080)",
+            "and an engine the registry still carries is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_row_claiming_an_engine_the_registry_lost_is_not_printed_as_running() {
+        let row = model(
+            "gemma@local",
+            LocalModelStatus::Loaded {
+                port: 8080,
+                context_tokens: 4096,
+                pinned: false,
+            },
+        );
+        assert_eq!(
+            reconciled_status(&row, &[]),
+            LocalModelStatus::Available,
+            "the engine exited or was unloaded; the file on disk is what is left"
+        );
+        // And the section below adds nothing for it either — an engine in no
+        // registry is spoken for by nobody. The table tells one story.
+        assert!(unaccounted_engines(&[], &state(vec![row], vec![])).is_empty());
+    }
+
+    #[test]
+    fn a_warming_row_the_registry_lost_is_not_printed_as_loading_either() {
+        let row = model("gemma@local", LocalModelStatus::Loading);
+        assert_eq!(
+            reconciled_status(&row, &[]),
+            LocalModelStatus::Available,
+            "a load that died before it finished is not still loading"
+        );
+    }
+
+    #[test]
+    fn a_row_the_registry_still_carries_takes_its_details_from_the_later_read() {
+        let row = model(
+            "gemma@local",
+            LocalModelStatus::Loaded {
+                port: 8080,
+                context_tokens: 4096,
+                pinned: false,
+            },
+        );
+        let mut live = engine("gemma@local", 9090, true);
+        live.pinned = true;
+        assert_eq!(
+            reconciled_status(&row, std::slice::from_ref(&live)),
+            LocalModelStatus::Loaded {
+                port: 9090,
+                context_tokens: 4096,
+                pinned: true,
+            },
+            "the port and the pin come from the read that happened last"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_engine_is_still_warming_says_so() {
+        let row = model(
+            "gemma@local",
+            LocalModelStatus::Loaded {
+                port: 8080,
+                context_tokens: 4096,
+                pinned: false,
+            },
+        );
+        assert_eq!(
+            reconciled_status(&row, &[engine("gemma@local", 8080, false)]),
+            LocalModelStatus::Loading
+        );
+    }
+
+    #[test]
+    fn a_download_is_never_talked_into_being_an_engine() {
+        // Re-downloading a slug whose engine is still up is a real pair, and
+        // the transfer is what this row exists to report.
+        let row = synthetic(
+            "gemma@local",
+            LocalModelStatus::Downloading {
+                received: 5,
+                total: Some(10),
+            },
+            None,
+        );
+        assert_eq!(
+            reconciled_status(&row, &[engine("gemma@local", 8080, true)]),
+            LocalModelStatus::Downloading {
+                received: 5,
+                total: Some(10)
+            }
+        );
+    }
+
+    #[test]
+    fn a_row_that_claims_nothing_is_left_exactly_as_it_is() {
+        let row = model("gemma@local", LocalModelStatus::Available);
+        assert_eq!(
+            reconciled_status(&row, &[]),
+            LocalModelStatus::Available,
+            "the common case must stay byte-identical"
+        );
     }
 
     fn engine(id: &str, port: u16, ready: bool) -> RunningEngine {
