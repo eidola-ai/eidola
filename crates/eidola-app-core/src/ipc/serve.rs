@@ -25,6 +25,32 @@
 //!   caller costs" below — the distinction is billing-relevant and easy to
 //!   state backwards.
 //!
+//! ## Backpressure, and who waits on whom
+//!
+//! The outbox is **bounded** ([`WRITER_QUEUE_FRAMES`]) and every send is
+//! awaited, so a caller that stops reading stops being served rather than being
+//! buffered at. Without that, the concurrency limit bounds nothing that matters:
+//! a request releases its permit as soon as its answer is *enqueued*, so a
+//! caller pipelining valid requests and never reading would have the app
+//! holding every answer it had produced, each of which can be tens of megabytes.
+//!
+//! The waiting is a chain, not a cycle, which is what makes it safe: the writer
+//! waits on the socket, a finished request waits on the writer **while holding
+//! its permit**, and the read loop waits on a permit. Pressure therefore travels
+//! outward to the one place that can relieve it — the caller reading its socket
+//! — and nothing in the chain waits on anything behind it. A turn's chunk
+//! forwarder joins the same chain: it waits on the writer, and the request
+//! awaiting it holds its permit meanwhile. That stalls *this* connection's
+//! other requests, which is the intended answer to "you are not reading".
+//!
+//! **It always terminates.** If the caller never reads, it eventually goes
+//! away; the writer's socket write then fails, it drops the receiver, and every
+//! blocked send fails immediately rather than waiting — tasks unwind, permits
+//! release, the reader sees end-of-stream. The one thing that keeps growing
+//! meanwhile is the turn's own event channel (`chat_stream`'s sender is
+//! unbounded and belongs to app-core), and that is bounded by one answer's
+//! length rather than by the caller's appetite.
+//!
 //! ## What a lost caller costs
 //!
 //! **A turn already under way finishes and persists, whatever happens to the
@@ -85,6 +111,21 @@ use crate::error::AppError;
 /// a turn) and low enough that a runaway peer cannot spawn without bound.
 pub const MAX_IN_FLIGHT_REQUESTS: usize = 16;
 
+/// How many finished frames may sit waiting for the socket at once.
+///
+/// **The queue has to be bounded or the concurrency limit means nothing.** A
+/// request releases its permit as soon as its answer is *enqueued*, so with an
+/// unbounded queue a caller that pipelines valid requests and simply never
+/// reads makes the app hold every answer it has produced — and a result can be
+/// tens of megabytes. Sixteen requests at a time then bounds nothing but the
+/// number of threads doing the allocating.
+///
+/// One slot per permitted request is the natural pairing: no request can queue
+/// a second answer without first releasing and re-acquiring a permit, so what a
+/// connection can hold is bounded by the concurrency limit rather than by how
+/// fast the caller can type.
+const WRITER_QUEUE_FRAMES: usize = MAX_IN_FLIGHT_REQUESTS;
+
 /// Serve one connection until the peer goes away.
 ///
 /// `app_version` is the version of the process answering — the socket's owner
@@ -94,7 +135,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (out, outbox) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (out, outbox) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE_FRAMES);
     let pen = tokio::spawn(write_frames(writer, outbox));
     read_frames(core, app_version, reader, out).await;
     // Dropping the last sender ends the writer once it has drained — which is
@@ -103,10 +144,7 @@ where
 }
 
 /// Drain the outbox onto the wire, in order, until the connection ends.
-async fn write_frames<W: AsyncWrite + Unpin>(
-    mut writer: W,
-    mut outbox: mpsc::UnboundedReceiver<Vec<u8>>,
-) {
+async fn write_frames<W: AsyncWrite + Unpin>(mut writer: W, mut outbox: mpsc::Receiver<Vec<u8>>) {
     while let Some(line) = outbox.recv().await {
         if writer.write_all(&line).await.is_err() {
             break;
@@ -122,7 +160,7 @@ async fn read_frames<R: AsyncRead + Unpin>(
     core: Arc<AppCore>,
     app_version: String,
     reader: R,
-    out: mpsc::UnboundedSender<Vec<u8>>,
+    out: mpsc::Sender<Vec<u8>>,
 ) {
     let mut frames = FrameReader::new(tokio::io::BufReader::new(reader));
     let mut tasks = tokio::task::JoinSet::new();
@@ -131,16 +169,32 @@ async fn read_frames<R: AsyncRead + Unpin>(
     // there is no window in which a racing verb slips past a `hello` that has
     // not been answered yet.
     let mut greeted = false;
+    let active = ActiveIds::default();
+
+    // Every refusal below is awaited, and a writer that has gone away ends the
+    // loop rather than being ignored: with a bounded outbox a send is where a
+    // stalled connection is felt, so swallowing its failure would spin.
+    macro_rules! refuse {
+        ($id:expr, $err:expr) => {
+            if out
+                .send(encode_line(&Response::err(
+                    $id,
+                    WireError::from_protocol(&$err),
+                )))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        };
+    }
 
     loop {
         let line = match frames.next_line().await {
             Ok(Some(line)) => line.to_vec(),
             Ok(None) => break,
             Err(e) => {
-                let _ = out.send(encode_line(&Response::err(
-                    NO_REQUEST,
-                    WireError::from_protocol(&e),
-                )));
+                refuse!(NO_REQUEST, e);
                 if e.is_fatal() {
                     break;
                 }
@@ -152,31 +206,37 @@ async fn read_frames<R: AsyncRead + Unpin>(
             Ok(request) => request,
             Err(e) => {
                 // No readable id, so this answers no request in particular.
-                let _ = out.send(encode_line(&Response::err(
-                    NO_REQUEST,
-                    WireError::from_protocol(&e),
-                )));
+                refuse!(NO_REQUEST, e);
                 continue;
             }
         };
 
         if let Some(refusal) = gate(&request, greeted) {
-            let _ = out.send(encode_line(&Response::err(
-                request.id,
-                WireError::from_protocol(&refusal),
-            )));
+            refuse!(request.id, refusal);
             continue;
         }
 
         let call = match Call::parse(&request.verb, &request.params) {
             Ok(call) => call,
             Err(e) => {
-                let _ = out.send(encode_line(&Response::err(
-                    request.id,
-                    WireError::from_protocol(&e),
-                )));
+                refuse!(request.id, e);
                 continue;
             }
+        };
+
+        // Claimed before the handshake is recorded and before any dispatch, so
+        // a duplicate can neither greet nor run. The refusal answers on
+        // `NO_REQUEST`: the id it names is still going to be answered by the
+        // request that holds it, and a refusal wearing it would be the second
+        // terminal frame this exists to prevent.
+        let Some(in_flight) = active.claim(request.id) else {
+            refuse!(
+                NO_REQUEST,
+                ProtocolError::DuplicateRequestId {
+                    duplicate: request.id,
+                }
+            );
+            continue;
         };
 
         if matches!(call, Call::Hello) {
@@ -194,6 +254,9 @@ async fn read_frames<R: AsyncRead + Unpin>(
         let id = request.id;
         let verb = call.verb();
         tasks.spawn(async move {
+            // Released when this task ends, however it ends — including an
+            // abort — so an id is never stranded by a connection tearing down.
+            let _in_flight = in_flight;
             let _permit = permit;
             let line = match answer(&core, &app_version, id, call, &out).await {
                 // Not `encode_line` directly: a result is the one payload that
@@ -202,7 +265,9 @@ async fn read_frames<R: AsyncRead + Unpin>(
                 Ok(data) => terminal_line(id, verb, data, MAX_RESPONSE_BYTES),
                 Err(error) => encode_line(&Response::err(id, error)),
             };
-            let _ = out.send(line);
+            // Awaited, and the permit is still held: that is how a caller who
+            // stops reading stops being served instead of being buffered.
+            let _ = out.send(line).await;
         });
 
         // Reap finished tasks so the set does not grow across a long-lived
@@ -215,6 +280,47 @@ async fn read_frames<R: AsyncRead + Unpin>(
     // (see "What a lost caller costs" above), and it must not — that would be
     // cancellation landing inside a durable operation.
     tasks.abort_all();
+}
+
+/// The request ids currently in flight on one connection.
+///
+/// Exactly one terminal frame answers an id. Two live requests wearing the same
+/// one would put two terminal frames on it, and nothing downstream could say
+/// which result belonged to which ask — so the second is refused before it is
+/// dispatched. An id becomes free again the moment its request ends, because
+/// reuse after a terminal frame is ordinary: a long-lived connection counting
+/// from one would otherwise have to remember forever.
+#[derive(Clone, Default)]
+struct ActiveIds(Arc<std::sync::Mutex<std::collections::HashSet<u64>>>);
+
+impl ActiveIds {
+    /// Claim `id` for a request about to be dispatched. `None` when it is
+    /// already in flight.
+    fn claim(&self, id: u64) -> Option<InFlight> {
+        let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        held.insert(id).then(|| InFlight {
+            ids: self.clone(),
+            id,
+        })
+    }
+}
+
+/// Holds one id for the life of its request and frees it on the way out —
+/// through `Drop`, so a task that is aborted with the connection releases its
+/// id exactly like one that answered.
+struct InFlight {
+    ids: ActiveIds,
+    id: u64,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.ids
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
 }
 
 /// The refusals that are decided before a verb is even parsed.
@@ -245,7 +351,7 @@ async fn answer(
     app_version: &str,
     id: u64,
     call: Call,
-    out: &mpsc::UnboundedSender<Vec<u8>>,
+    out: &mpsc::Sender<Vec<u8>>,
 ) -> Result<serde_json::Value, WireError> {
     fn ok<T: serde::Serialize>(value: T) -> Result<serde_json::Value, WireError> {
         serde_json::to_value(value).map_err(|e| {
@@ -372,7 +478,17 @@ async fn answer(
             let pump = tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
                     let data = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
-                    let _ = chunks.send(encode_line(&Response::chunk(id, data)));
+                    // Awaited, so a reader that has fallen behind slows the
+                    // turn's delivery instead of being queued at. A writer that
+                    // has gone away ends the pump: there is nobody to deliver
+                    // to, and the turn itself is unaffected either way.
+                    if chunks
+                        .send(encode_line(&Response::chunk(id, data)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             });
             // Detached by construction: `chat_stream` spawns the turn on the

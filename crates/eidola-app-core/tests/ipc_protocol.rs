@@ -81,8 +81,14 @@ impl Client {
     /// Open a connection to a served core. Must be called inside the core's
     /// runtime.
     fn connect(core: &Arc<AppCore>) -> Client {
-        let (client_writes, server_reads) = tokio::io::duplex(PIPE_BUFFER);
-        let (server_writes, client_reads) = tokio::io::duplex(PIPE_BUFFER);
+        Client::connect_sized(core, PIPE_BUFFER)
+    }
+
+    /// The same, with an explicit pipe size — a small one is how a test plays
+    /// a caller whose socket buffer fills.
+    fn connect_sized(core: &Arc<AppCore>, pipe: usize) -> Client {
+        let (client_writes, server_reads) = tokio::io::duplex(pipe);
+        let (server_writes, client_reads) = tokio::io::duplex(pipe);
         tokio::spawn(serve_connection(
             Arc::clone(core),
             APP_VERSION.to_string(),
@@ -102,6 +108,11 @@ impl Client {
         self.next_id += 1;
         self.send_raw(&encode_line(&Request::new(id, call))).await;
         id
+    }
+
+    /// Send a typed call under an id the caller chooses.
+    async fn send_with_id(&mut self, id: u64, call: &Call) {
+        self.send_raw(&encode_line(&Request::new(id, call))).await;
     }
 
     /// Send bytes exactly as given — the door every malformed case comes in by.
@@ -823,5 +834,131 @@ fn a_turn_already_upstream_outlives_the_caller_that_asked_for_it() {
                 .any(|m| m.role == "assistant" && m.content.contains("Hello from the stream.")),
             "the answer the caller paid for is in the space: {messages:?}"
         );
+    });
+}
+
+#[test]
+fn an_id_already_in_flight_is_refused_and_freed_again_when_it_ends() {
+    run(|| {
+        let (mock, core, _dir) = served(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            chat_delay_ms: 1_500,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime().block_on(async {
+            let mut client = Client::connect(&core);
+            client.hello().await;
+            client
+                .send_with_id(
+                    5,
+                    &Call::ChatStream {
+                        prompt: "the slow one".into(),
+                        model: Some(MODEL.into()),
+                        space_id: None,
+                    },
+                )
+                .await;
+            for _ in 0..600 {
+                if mock.chat_hits() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(mock.chat_hits() > 0, "the turn never started");
+
+            // Same id, while the first is demonstrably still running.
+            client
+                .send_with_id(
+                    5,
+                    &Call::SpacesList {
+                        include_archived: false,
+                    },
+                )
+                .await;
+
+            // The refusal answers on NO_REQUEST, deliberately: id 5 still
+            // belongs to the turn, and a refusal wearing it would be the second
+            // terminal frame the rule exists to prevent.
+            let mut terminals_for_five = 0;
+            let mut refused = false;
+            loop {
+                let frame = client.expect_frame().await;
+                match (frame.id, &frame.body) {
+                    (NO_REQUEST, ResponseBody::Err { error }) => match error.to_remote() {
+                        RemoteError::Protocol(ProtocolError::DuplicateRequestId { duplicate }) => {
+                            assert_eq!(duplicate, 5, "the refusal names the id that was reused");
+                            refused = true;
+                        }
+                        other => panic!("unexpected: {other:?}"),
+                    },
+                    (5, ResponseBody::End { .. }) => {
+                        terminals_for_five += 1;
+                        break;
+                    }
+                    (5, ResponseBody::Err { error }) => panic!("the turn failed: {error:?}"),
+                    _ => {}
+                }
+            }
+            assert!(refused, "the duplicate was served instead of refused");
+            assert_eq!(
+                terminals_for_five, 1,
+                "exactly one terminal frame answers an id"
+            );
+
+            // Ended, so the id is ordinary again.
+            client
+                .send_with_id(
+                    5,
+                    &Call::SpacesList {
+                        include_archived: false,
+                    },
+                )
+                .await;
+            let frame = client.expect_frame().await;
+            assert_eq!(frame.id, 5);
+            assert!(
+                matches!(frame.body, ResponseBody::End { .. }),
+                "reuse after a terminal frame is allowed"
+            );
+        });
+    });
+}
+
+#[test]
+fn a_caller_that_stops_reading_stops_being_served() {
+    run(|| {
+        let (_mock, core, _dir) = served(MockConfig::default());
+        core.runtime().block_on(async {
+            // A small pipe stands in for a socket buffer that fills.
+            let mut client = Client::connect_sized(&core, 4096);
+            client.hello().await;
+
+            // …and from here the caller never reads another byte, while
+            // pipelining perfectly valid requests. With an unbounded outbox the
+            // app would take every one of them and hold every answer; the queue
+            // is bounded so that a request's permit is still held while its
+            // answer waits, and the pressure reaches the read loop.
+            let flood: Vec<u8> = (2..800u64)
+                .flat_map(|id| {
+                    encode_line(&Request::new(
+                        id,
+                        &Call::SpacesList {
+                            include_archived: false,
+                        },
+                    ))
+                })
+                .collect();
+            let wrote = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client.writer.write_all(&flood),
+            )
+            .await;
+            assert!(
+                wrote.is_err(),
+                "the app kept taking work from a caller that had stopped reading"
+            );
+        });
     });
 }
