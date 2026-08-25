@@ -427,6 +427,20 @@ pub enum ProtocolError {
     #[error("say hello first: this connection has not completed the handshake")]
     HandshakeRequired,
 
+    /// The caller reused a request id that is still in flight. Exactly one
+    /// terminal frame answers an id, so a second request wearing a live one
+    /// would put two terminal frames on it and leave the caller unable to say
+    /// which result was which.
+    ///
+    /// **Answered on [`NO_REQUEST`], not on the duplicate**, and that is the
+    /// point rather than an inconvenience: the id named here already belongs to
+    /// a request that is still going to answer on it, so a refusal wearing it
+    /// would be the second frame this exists to prevent. The id travels as data
+    /// instead, so the caller still learns which one it reused. Reusing an id
+    /// *after* its request has terminated is ordinary and allowed.
+    #[error("request id {duplicate} is already in flight on this connection")]
+    DuplicateRequestId { duplicate: u64 },
+
     /// The caller used [`NO_REQUEST`] as its request id. That id is reserved
     /// for a refusal that answers no request, so a call carrying it would be
     /// indistinguishable from one — and a connection that also produced a
@@ -474,6 +488,7 @@ impl ProtocolError {
             ProtocolError::FrameTooLarge { .. } => "FrameTooLarge",
             ProtocolError::UnsupportedProtocol { .. } => "UnsupportedProtocol",
             ProtocolError::HandshakeRequired => "HandshakeRequired",
+            ProtocolError::DuplicateRequestId { .. } => "DuplicateRequestId",
             ProtocolError::ReservedRequestId { .. } => "ReservedRequestId",
             ProtocolError::ResultTooLarge { .. } => "ResultTooLarge",
             ProtocolError::UnknownVerb { .. } => "UnknownVerb",
@@ -1056,6 +1071,7 @@ mod tests {
                 requested: 2,
             },
             ProtocolError::HandshakeRequired,
+            ProtocolError::DuplicateRequestId { duplicate: 7 },
             ProtocolError::ReservedRequestId {
                 reserved: NO_REQUEST,
             },
