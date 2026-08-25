@@ -63,6 +63,9 @@ pub struct AppleReconstruction {
     /// fact a reader is entitled to.
     pub team_id: Option<String>,
     pub signing_identifier: String,
+    /// Always `true`: [`require_signing_recipe`] refuses anything else.
+    /// Kept as a field because it is read back off the reconstructed
+    /// artifact rather than assumed, and printed as the receipt for that.
     pub hardened_runtime: bool,
     /// The two objects a release publishes, written out of the very bytes
     /// that were hashed above.
@@ -151,6 +154,7 @@ pub fn verify_reconstruction(assets: &AppleAssets, scratch: &Path) -> Result<App
 
     let facts = eidola_apple::inspect(&reconstructed)
         .context("reading back what the reconstructed bundle claims about its signature")?;
+    require_signing_recipe(&facts)?;
 
     Ok(AppleReconstruction {
         unsigned_artifact_sha256: sha256_hex(&unsigned_bytes),
@@ -163,6 +167,37 @@ pub fn verify_reconstruction(assets: &AppleAssets, scratch: &Path) -> Result<App
         staged_shipped_artifact,
         staged_signature_bundle,
     })
+}
+
+/// The one signing-recipe property an installed client asserts rather
+/// than reads.
+///
+/// Every Eidola macOS signature is made with `--options runtime`, so the
+/// installer's plan states the hardened runtime as a fixed fact instead of
+/// taking it from a document a coerced signer writes
+/// (`crates/eidola-app-core/AGENTS.md`). Asserting on the client is only
+/// safe if the release side cannot publish something that contradicts it —
+/// and an artifact signed without the flag is invisible to every other
+/// check here: it reconstructs perfectly and compares equal to what
+/// shipped. Publishing it would leave a browser download without the
+/// protection for good, and every self-update refused at staging. So this
+/// is where the recipe is enforced, before publication is possible.
+///
+/// Deliberately just the one property, because it is exactly what
+/// `install::ExpectedSignature` compares. Entitlements and the
+/// notarization ticket are not in that comparison — the round-trip fixture
+/// carries entitlements and no ticket — and refusing on them here would
+/// invent a requirement no client applies.
+fn require_signing_recipe(facts: &eidola_apple::SignatureFacts) -> Result<()> {
+    if !facts.hardened_runtime {
+        bail!(
+            "the reconstructed bundle does not carry the hardened runtime, which every \
+             Eidola macOS signature is made with and every installed client asserts \
+             rather than reads. Publishing it would ship a browser download without that \
+             protection and a self-update every client refuses at staging."
+        );
+    }
+    Ok(())
 }
 
 /// The `sha256:`-prefixed hash a manifest records for one artifact key, as
@@ -755,6 +790,66 @@ mod tests {
         assert!(shipped > 0);
         // Nothing in the happy path consults a ceiling for it.
         verify_reconstruction(&case.assets, &case.work).unwrap();
+    }
+
+    // ── The recipe a client asserts rather than reads ────────────────
+
+    /// The fixture's *unsigned input* is itself an ad-hoc signed bundle
+    /// made without `--options runtime`, so detaching it against itself
+    /// yields genuinely valid material whose reconstruction is missing
+    /// exactly one thing. Everything else about this release is correct:
+    /// the material applies cleanly and the result equals what shipped.
+    #[test]
+    fn a_reconstruction_without_the_hardened_runtime_is_refused() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+
+        let unsigned = root.join("unsigned-tree");
+        let shipped = root.join("signed-tree");
+        copy_tree(&fixtures().join("settled"), &unsigned);
+        copy_tree(&fixtures().join("settled"), &shipped);
+
+        let detached = root.join("detached-tree");
+        eidola_apple::detach(
+            &shipped.join("Fixture.app"),
+            &unsigned.join("Fixture.app"),
+            &detached,
+        )
+        .unwrap();
+
+        let assets = AppleAssets {
+            unsigned_artifact: root.join("unsigned.zip"),
+            signature_bundle: root.join("sigbundle.zip"),
+            shipped_artifact: root.join("shipped.zip"),
+        };
+        std::fs::write(&assets.unsigned_artifact, zip_tree(&unsigned)).unwrap();
+        std::fs::write(&assets.signature_bundle, zip_tree(&detached)).unwrap();
+        std::fs::write(&assets.shipped_artifact, zip_tree(&shipped)).unwrap();
+
+        let work = root.join("work");
+        std::fs::create_dir(&work).unwrap();
+
+        let error = verify_reconstruction(&assets, &work)
+            .expect_err("a release the updater would refuse at staging must not be publishable");
+        let message = format!("{error:?}");
+        assert!(message.contains("hardened runtime"), "got: {message}");
+    }
+
+    #[test]
+    fn the_recipe_check_is_scoped_to_what_a_client_compares() {
+        let recipe = |hardened| eidola_apple::SignatureFacts {
+            team_id: None,
+            identifier: "ai.eidola.fixture".into(),
+            hardened_runtime: hardened,
+            // Neither of these is in `install::ExpectedSignature`, so
+            // neither may be a reason to refuse: the round-trip fixture
+            // carries entitlements and no ticket, and it is a valid
+            // artifact.
+            entitlements_sha256: Some("00".repeat(32)),
+            has_notarization_ticket: false,
+        };
+        require_signing_recipe(&recipe(true)).unwrap();
+        assert!(require_signing_recipe(&recipe(false)).is_err());
     }
 
     // ── The bytes that get published ─────────────────────────────────
