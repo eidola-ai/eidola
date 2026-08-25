@@ -549,33 +549,16 @@ fn augment_block_with_math(
     let mut paint_specs: Vec<InlineMathPaintSpec> = Vec::new();
 
     for overlay in &block.math_overlays {
-        let Some(latex) = source.get(overlay.content_range.clone()) else {
-            // Source bounds got out from under us — fall back to
-            // raw shaping (no substitution, no overlay). Treat it
-            // the same as a typeset failure so the user at least
-            // sees the construct.
+        let Some(math_layout) = typeset_math_overlay(block, source, overlay) else {
+            // No layout — render the raw `$..$` source dimmed
+            // (delimiters) + mono (content) so the user can see and
+            // correct the bad LaTeX. This is the same visual
+            // treatment used when the cursor sits strictly inside a
+            // (well-formed) math construct, so the failure mode
+            // reads as "still markdown, just hasn't been typeset
+            // yet."
             push_failed_overlay_fallback(&mut augmented, overlay);
             continue;
-        };
-        let mode = if overlay.display_style {
-            crate::math::MathMode::Display
-        } else {
-            crate::math::MathMode::Inline
-        };
-        let sanitized_latex = sanitize_latex(latex, &block.containers);
-        let math_layout = match crate::math::typeset(&sanitized_latex, mode) {
-            Ok(l) => l,
-            Err(_) => {
-                // Typeset failed — render the raw `$..$` source
-                // dimmed (delimiters) + mono (content) so the user
-                // can see and correct the bad LaTeX. This is the
-                // same visual treatment used when the cursor sits
-                // strictly inside a (well-formed) math construct,
-                // so the failure mode reads as "still markdown,
-                // just hasn't been typeset yet."
-                push_failed_overlay_fallback(&mut augmented, overlay);
-                continue;
-            }
         };
         let math_width = math_layout.size(em_px).width;
         // Round up so the math has a tiny bit of trailing slack
@@ -1008,6 +991,49 @@ fn combined_row_extra(math: MathRowExtra, image: MathRowExtra) -> MathRowExtra {
         top: math.top.max(image.top),
         bottom: math.bottom.max(image.bottom),
     }
+}
+
+/// Typeset one [`MathOverlay`] the way the paint path does: slice
+/// the content range out of `source`, sanitize it against the
+/// block's containers, and hand it to RaTeX in the overlay's own
+/// mode. `None` means no typeset math exists for this overlay —
+/// either the source bounds got out from under us or RaTeX rejected
+/// the LaTeX — and every caller treats those the same way.
+///
+/// Pure: the outcome is a function of the source bytes, the
+/// containers, and the mode. Nothing here touches the text system
+/// (font registration is a paint-time concern), so a caller with no
+/// `Window` — the searchable projection, which must know whether a
+/// construct shows typeset math or raw source — can ask the same
+/// question and get the same answer.
+fn typeset_math_overlay(
+    block: &RenderBlock,
+    source: &str,
+    overlay: &MathOverlay,
+) -> Option<crate::math::MathLayout> {
+    let latex = source.get(overlay.content_range.clone())?;
+    let mode = if overlay.display_style {
+        crate::math::MathMode::Display
+    } else {
+        crate::math::MathMode::Inline
+    };
+    let sanitized_latex = sanitize_latex(latex, &block.containers);
+    crate::math::typeset(&sanitized_latex, mode).ok()
+}
+
+/// Whether `overlay` renders as typeset math rather than as its own
+/// raw `$..$` source.
+///
+/// **The two outcomes look nothing alike to a reader**, and callers
+/// outside the paint path need to tell them apart: on success the
+/// element layer substitutes a width-matched pad run and paints the
+/// math over it, so no source byte is visible; on failure
+/// [`push_failed_overlay_fallback`] styles the source bytes and they
+/// shape as themselves — dim delimiters, mono content — every one of
+/// them on screen. Deciding through [`typeset_math_overlay`] is what
+/// keeps that answer identical to the one the paint path acts on.
+pub fn math_overlay_typesets(block: &RenderBlock, source: &str, overlay: &MathOverlay) -> bool {
+    typeset_math_overlay(block, source, overlay).is_some()
 }
 
 /// Append fallback inline runs for a math overlay whose typeset

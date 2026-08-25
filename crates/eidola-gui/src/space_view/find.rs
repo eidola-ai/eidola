@@ -25,8 +25,12 @@
 //! nor paint.
 //!
 //! What is deliberately not searchable, because it has no display bytes: a
-//! link's URL, math source, an image's markup and alt text, and an embed
-//! marker. Embedded quoted text is not searchable either — it is re-parsed
+//! link's URL, the source of math that typesets, an image's markup and alt
+//! text, and an embed marker. Math whose LaTeX *fails* to typeset is the
+//! exception that proves the rule — the reader is shown its raw `$…$` bytes,
+//! so those bytes are searchable, and matching them needs nothing special
+//! because they are already the source. Embedded quoted text is not
+//! searchable either — it is re-parsed
 //! standalone by the element layer and is not in the parent document's offset
 //! space, so no source range in this post could name it.
 //!
@@ -170,15 +174,25 @@ fn append_block(
     }
     // **Inline math and inline images carry no hidden range of their own.**
     // The render layer deliberately leaves suppressing their source bytes to
-    // the element layer, which does it differently per typeset outcome (a
-    // width-matched substitution on success, the raw LaTeX shaped as a
-    // fallback on failure) — so a projection reading `hidden_ranges` alone
-    // would make a URL, an alt text and a `\frac` matchable. Only the
-    // *promoted block* forms (a sole-image paragraph, a `$$…$$` block) hide
-    // themselves.
+    // the element layer, which does it differently per typeset outcome — so a
+    // projection reading `hidden_ranges` alone would make a URL, an alt text
+    // and a `\frac` matchable. Only the *promoted block* forms (a sole-image
+    // paragraph, a `$$…$$` block) hide themselves.
+    //
+    // **Math is skipped only where math is what the reader gets.** The
+    // element layer substitutes a width-matched pad run and paints typeset
+    // math over it *when the LaTeX typesets*; when it does not, the raw
+    // `$…$` shapes as itself — dim delimiters, mono content — and the reader
+    // is looking at the source bytes. Skipping those would report no match
+    // and paint no highlight on text plainly on screen, so the overlay is
+    // excluded only when [`gpui_markdown_editor::math_overlay_typesets`]
+    // agrees the math exists. Leaving a failed one unmarked is all the
+    // projection has to do: its bytes are the visible glyphs, so the walk
+    // copies them like any other run and the source-range rule holds without
+    // a substitution.
     for math in &block.math_overlays {
         let r = clamp(&math.source_range, content.len());
-        if r.start < r.end {
+        if r.start < r.end && gpui_markdown_editor::math_overlay_typesets(block, content, math) {
             marks.push((r, Mark::Skip));
         }
     }
@@ -1470,6 +1484,18 @@ mod tests {
         searchable_projection(source, &EmbedMap::default())
     }
 
+    /// How many math overlays the read-only render puts on this source.
+    ///
+    /// Asserted beside the projection because "no match here" is also what an
+    /// input that never parsed as math produces — the two are only told apart
+    /// by whether an overlay exists for the projection to judge.
+    fn overlay_count(source: &str) -> usize {
+        let state = gpui_markdown_editor::EditorState::with_markdown(source);
+        let tree = gpui_markdown_editor::parse(&state.markdown);
+        let spec = gpui_markdown_editor::render::render_readonly(&state, &tree);
+        spec.blocks.iter().map(|b| b.math_overlays.len()).sum()
+    }
+
     fn find(source: &str, query: &str) -> Vec<String> {
         let projection = project(source);
         let query = Query::new(query).expect("non-empty");
@@ -1524,6 +1550,32 @@ mod tests {
         assert!(find(image, "kite").is_empty());
         assert!(find(image, "red").is_empty());
         assert_eq!(find(image, "look"), vec!["look".to_string()]);
+    }
+
+    #[test]
+    fn math_that_does_not_typeset_is_searchable_as_the_source_the_reader_sees() {
+        // The element layer suppresses a math construct's source bytes only by
+        // substituting a pad run for typeset math. When the LaTeX does not
+        // typeset it shapes the raw `$…$` instead — dim delimiters, mono
+        // content — so every one of those bytes is on screen, and excluding
+        // them reported no match on text plainly visible.
+        // `\\frac` takes two arguments, so RaTeX rejects this — while the
+        // construct still parses as math, which is what puts an overlay on the
+        // block for the projection to judge.
+        let malformed = "before $\\frac{beta}$ after";
+        assert!(overlay_count(malformed) == 1);
+        assert!(project(malformed).text().contains("$\\frac{beta}$"));
+        assert_eq!(find(malformed, "beta"), vec!["beta".to_string()]);
+        // The delimiters are shown too, and the projection maps a match back
+        // to the source bytes it copied — no substitution is involved.
+        assert_eq!(find(malformed, "$\\frac"), vec!["$\\frac".to_string()]);
+        assert_eq!(find(malformed, "before"), vec!["before".to_string()]);
+
+        // Math that typesets still shows nothing of its source.
+        let typeset = "before $\\alpha_{beta}$ after";
+        assert!(overlay_count(typeset) == 1);
+        assert!(!project(typeset).text().contains('$'));
+        assert!(find(typeset, "beta").is_empty());
     }
 
     #[test]
