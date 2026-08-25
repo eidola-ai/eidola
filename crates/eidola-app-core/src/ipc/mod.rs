@@ -76,13 +76,32 @@ pub use serve::serve_connection;
 /// frames or to an existing verb's shape; new verbs are additive.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The largest single frame either side will read, in bytes.
+/// The largest **request** line the app will read, in bytes.
 ///
 /// A line is buffered until its newline arrives, so without a ceiling a peer
 /// that never sends one is an unbounded allocation. 1 MiB is far above any
-/// legitimate frame (a chat prompt is the largest, and the chunk frames going
-/// the other way are deltas) and far below anything that hurts.
+/// legitimate request (a chat prompt is the largest) and far below anything
+/// that hurts.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// The largest **response** line a caller should be willing to read, in bytes.
+///
+/// **The two ceilings are deliberately different, and the asymmetry is the
+/// point.** The request limit bounds what an arbitrary process on the machine
+/// can make the app allocate — that is where the exposure is. A response comes
+/// from the app the caller chose to dial, which is already holding that
+/// caller's entire profile open; a tight limit there buys nothing and costs
+/// something real, because a *legitimate* answer grows with the profile. A
+/// listing of every conversation is the case that grows without bound, and at
+/// roughly 250 bytes a row the old shared 1 MiB ceiling turned a few thousand
+/// conversations into an answer a conforming reader would reject as malformed
+/// and hang up on — a working profile, refused by its own client.
+///
+/// 64 MiB is chosen so that reaching it means something is wrong rather than
+/// merely large (it is hundreds of thousands of rows), and
+/// [`ProtocolError::ResultTooLarge`] is the honest backstop for that case:
+/// **the app never emits a line its own reader would refuse.**
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The control socket's name inside a profile's data directory.
 ///
@@ -96,6 +115,12 @@ pub const SOCKET_NAME: &str = "eidola.sock";
 pub fn socket_path(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join(SOCKET_NAME)
 }
+
+/// A result grows with the profile where a request does not, so holding answers
+/// to the request ceiling is what would refuse a working profile. Asserted at
+/// compile time rather than in a test: the ordering is the whole reason there
+/// are two constants, and a build that inverted it should not exist.
+const _: () = assert!(MAX_RESPONSE_BYTES > MAX_FRAME_BYTES);
 
 /// The request id used when a refusal cannot be correlated with a request —
 /// a line that did not parse as a frame at all, so no id was recoverable.
@@ -694,6 +719,28 @@ pub enum ProtocolError {
     #[error("say hello first: this connection has not completed the handshake")]
     HandshakeRequired,
 
+    /// The caller used [`NO_REQUEST`] as its request id. That id is reserved
+    /// for a refusal that answers no request, so a call carrying it would be
+    /// indistinguishable from one — and a connection that also produced a
+    /// malformed line would have two different answers wearing the same id,
+    /// with no way for the caller to tell them apart. Refused before anything
+    /// is dispatched, so the ambiguity never reaches the wire.
+    #[error("request id {reserved} is reserved for refusals that answer no request")]
+    ReservedRequestId { reserved: u64 },
+
+    /// The verb succeeded, and its result does not fit in a response line
+    /// ([`MAX_RESPONSE_BYTES`]). Sent **instead of** the oversized frame: a
+    /// reader applying the protocol's own limit would refuse that line and
+    /// close the connection, reporting a malformed app rather than a large
+    /// answer. Nothing was written and nothing is wrong with the profile — the
+    /// request has to ask for less.
+    #[error("the result of `{verb}` is {bytes} bytes, past the {limit}-byte response limit")]
+    ResultTooLarge {
+        verb: String,
+        bytes: usize,
+        limit: usize,
+    },
+
     /// No such verb in this build. What a newer caller's additive verb looks
     /// like from here, which is why it is a refusal of one request rather than
     /// of the connection.
@@ -719,6 +766,8 @@ impl ProtocolError {
             ProtocolError::FrameTooLarge { .. } => "FrameTooLarge",
             ProtocolError::UnsupportedProtocol { .. } => "UnsupportedProtocol",
             ProtocolError::HandshakeRequired => "HandshakeRequired",
+            ProtocolError::ReservedRequestId { .. } => "ReservedRequestId",
+            ProtocolError::ResultTooLarge { .. } => "ResultTooLarge",
             ProtocolError::UnknownVerb { .. } => "UnknownVerb",
             ProtocolError::BadParams { .. } => "BadParams",
             ProtocolError::Unavailable => "Unavailable",
@@ -1008,6 +1057,37 @@ pub fn decode_response(line: &[u8]) -> Result<Response, ProtocolError> {
     })
 }
 
+/// The encoded terminal line for a verb that succeeded.
+///
+/// Encodes the `end` frame and, when that line is past `limit`, answers with
+/// [`ProtocolError::ResultTooLarge`] instead. **This is the one place a
+/// successful result becomes bytes**, which is what makes the guarantee hold
+/// for every verb at once rather than for whichever list somebody remembered:
+/// the app never writes a line its own reader would reject.
+///
+/// Chunk frames are deliberately not measured here. A chunk is one incremental
+/// delta from an upstream that framed it, not an accumulation, so it does not
+/// grow with the profile the way a result does — and a chunk replaced by a
+/// refusal would be a truncated answer with a second terminal frame behind it.
+pub fn terminal_line(id: u64, verb: &str, data: serde_json::Value, limit: usize) -> Vec<u8> {
+    let line = encode_line(&Response {
+        v: PROTOCOL_VERSION,
+        id,
+        body: ResponseBody::End { data },
+    });
+    if line.len() <= limit {
+        return line;
+    }
+    encode_line(&Response::err(
+        id,
+        WireError::from_protocol(&ProtocolError::ResultTooLarge {
+            verb: verb.to_string(),
+            bytes: line.len(),
+            limit,
+        }),
+    ))
+}
+
 /// A bounded NDJSON line reader.
 ///
 /// Reads whole lines from any async source, refusing one that grows past
@@ -1024,6 +1104,16 @@ impl<R: tokio::io::AsyncBufRead + Unpin> FrameReader<R> {
     /// A reader over `inner`, bounded at [`MAX_FRAME_BYTES`].
     pub fn new(inner: R) -> Self {
         Self::with_limit(inner, MAX_FRAME_BYTES)
+    }
+
+    /// A reader for the **answers** side of the conversation, bounded at
+    /// [`MAX_RESPONSE_BYTES`].
+    ///
+    /// Whoever dials uses this rather than [`Self::new`]: a result grows with
+    /// the profile, and holding an answer to the request ceiling would refuse
+    /// a legitimate listing as though the app had malfunctioned.
+    pub fn for_responses(inner: R) -> Self {
+        Self::with_limit(inner, MAX_RESPONSE_BYTES)
     }
 
     /// A reader with an explicit ceiling (the tests use a small one; nothing
@@ -1298,6 +1388,14 @@ mod tests {
                 requested: 2,
             },
             ProtocolError::HandshakeRequired,
+            ProtocolError::ReservedRequestId {
+                reserved: NO_REQUEST,
+            },
+            ProtocolError::ResultTooLarge {
+                verb: "spaces.list".into(),
+                bytes: 2,
+                limit: 1,
+            },
             ProtocolError::UnknownVerb {
                 verb: String::new(),
             },
@@ -1432,6 +1530,55 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_result_that_fits_is_sent_as_it_is() {
+        let line = terminal_line(3, "spaces.list", serde_json::json!({"spaces": []}), 1024);
+        let frame = decode_response(&line[..line.len() - 1]).expect("decode");
+        assert_eq!(frame.id, 3);
+        assert!(matches!(frame.body, ResponseBody::End { .. }));
+    }
+
+    #[test]
+    fn a_result_too_big_to_read_is_refused_instead_of_written() {
+        // The failure this prevents: a legitimate answer emitted as a line the
+        // protocol's own reader rejects, which a caller reports as a broken app
+        // and answers by closing the connection.
+        let big = serde_json::json!({ "spaces": vec!["x"; 100] });
+        let limit = 64;
+        let line = terminal_line(5, "spaces.list", big, limit);
+        assert!(
+            line.len() <= MAX_FRAME_BYTES,
+            "the refusal itself has to be readable"
+        );
+        let frame = decode_response(&line[..line.len() - 1]).expect("decode");
+        assert_eq!(frame.id, 5, "the refusal answers the request that asked");
+        match frame.body {
+            ResponseBody::Err { error } => match error.to_remote() {
+                RemoteError::Protocol(ProtocolError::ResultTooLarge {
+                    verb,
+                    bytes,
+                    limit: reported,
+                }) => {
+                    assert_eq!(verb, "spaces.list", "the refusal names what was asked");
+                    assert!(bytes > reported);
+                    assert_eq!(reported, limit);
+                }
+                other => panic!("unexpected: {other:?}"),
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_response_reader_carries_a_line_the_request_reader_would_refuse() {
+        let mut oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+        oversized.push(b'\n');
+        let leaked: &'static [u8] = Box::leak(oversized.into_boxed_slice());
+        let mut reader = FrameReader::for_responses(tokio::io::BufReader::new(leaked));
+        let line = reader.next_line().await.expect("read").expect("a line");
+        assert_eq!(line.len(), MAX_FRAME_BYTES + 1);
     }
 
     async fn lines(input: &'static [u8], limit: usize) -> Vec<Result<Vec<u8>, ProtocolError>> {
