@@ -428,8 +428,90 @@ pub struct Model {
     /// Maximum context window size in tokens.
     pub context_length: u64,
 
+    /// The largest completion this model may be asked for.
+    ///
+    /// Separate from `context_length` on purpose: a context window is what a
+    /// request may *contain*, not what one response may *be*. `null` means
+    /// undeclared — a client must treat that as "unknown" and keep whatever
+    /// default it already applies, never as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+
+    /// Which public output-budget ladder this model draws from.
+    pub output_budget_class: OutputBudgetClass,
+
+    /// What this model can do.
+    pub capabilities: ModelCapabilities,
+
     /// Pricing in integer credits per 1k tokens.
     pub pricing: ModelPricing,
+}
+
+/// One capability leaf.
+///
+/// An object rather than a bare boolean, so a capability can grow a sibling
+/// key later — an effort ladder, a weights measurement — without a type change
+/// breaking a client already deployed against this shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Capability {
+    /// Whether the model supports it.
+    pub supported: bool,
+}
+
+impl Capability {
+    /// A leaf carrying `supported`.
+    pub const fn new(supported: bool) -> Self {
+        Self { supported }
+    }
+}
+
+/// A kind of content a model accepts or produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Modality {
+    Text,
+    Image,
+    Audio,
+}
+
+/// Which public output-budget ladder a model draws from.
+///
+/// A *class*, not a number: the ladder's rungs are policy that can move
+/// without the catalog moving, and keeping the selection public and
+/// per-model is what keeps an output budget from becoming a per-user value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputBudgetClass {
+    /// A model that answers directly; the budget covers the answer alone.
+    Standard,
+    /// A model that thinks before it answers, so the same answer needs a
+    /// materially larger budget — spend the whole of a standard one on
+    /// reasoning and the response carries no answer at all.
+    Reasoning,
+}
+
+/// What a model can do, as the catalog declares it.
+///
+/// Only axes that actually vary across the models this server sells are
+/// carried. An axis every model shares tells a client nothing and is one more
+/// assertion that has to stay true.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ModelCapabilities {
+    /// Whether the model accepts a `tools` request field.
+    ///
+    /// Named after the wire rather than after an adjective: the question a
+    /// client actually has is "will this request be accepted", and a field
+    /// name answers it where "supports tool use" does not.
+    pub tool_calling: Capability,
+
+    /// Whether the model produces reasoning content before its answer.
+    pub reasoning: Capability,
+
+    /// The content kinds the model accepts.
+    pub input_modalities: Vec<Modality>,
+
+    /// The content kinds the model produces.
+    pub output_modalities: Vec<Modality>,
 }
 
 /// Pricing for a model in scaled integer credits per token (or per request).
