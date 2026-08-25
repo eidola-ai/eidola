@@ -1053,7 +1053,7 @@ impl SpacesStore {
 }
 
 /// The inverse of one optimistic edit, built by the edit itself (see
-/// [`SpacesStore::write_then_relist`]). It touches only the row its edit
+/// [`SpacesStore::write_then_reconcile`]). It touches only the row its edit
 /// touched, which is what lets one mutation take its edit back while a sibling's
 /// is still pending on the same shared listing.
 type UndoEdit = Box<dyn FnOnce(&mut Vec<SpaceInfo>)>;
