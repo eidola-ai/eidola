@@ -141,26 +141,32 @@ fn append_block(
             marks.push((r, Mark::Substitute(sub.display.as_str())));
         }
     }
-    // **Which hidden ranges are a barrier rather than a deletion**, decided
-    // by where they fall rather than by re-deriving the render's own chrome
+    // **Which hidden bytes are a barrier rather than a deletion**, decided by
+    // where they fall rather than by re-deriving the render's own chrome
     // arithmetic: a table's cell content ranges come out of the same
-    // `geometry` the render laid the grid from, so a hidden range *inside* a
+    // `geometry` the render laid the grid from, so a hidden byte *inside* a
     // cell is inline markup (a link's brackets, an emphasis run) and one
     // outside every cell is the grid itself — the leading `| `, each ` | `,
     // the trailing ` |`, the whole delimiter row. Non-table blocks have no
     // cells and take the ordinary path unchanged.
+    //
+    // **Per byte, not per range**, because a hidden range can straddle a cell
+    // edge: `merge_hidden_ranges` joins an entity's own hidden bytes to the
+    // chrome beside them, and one verdict over the whole of that either drops
+    // the `&` the reader sees or drops the boundary between two cells.
+    // Splitting at the cell edges is what makes the two questions independent
+    // again, and it is the same rule stated at the granularity it is true at.
     let cells = table_cells(block);
     for hidden in &block.hidden_ranges {
         let r = clamp(hidden, content.len());
         if r.start >= r.end {
             continue;
         }
-        let inline = cells.iter().any(|c| c.start <= r.start && r.end <= c.end);
-        if !cells.is_empty() && !inline {
-            marks.push((r, Mark::Substitute(TABLE_CELL_BARRIER)));
-        } else {
+        if cells.is_empty() {
             marks.push((r, Mark::Skip));
+            continue;
         }
+        split_at_cell_edges(r, &cells, &mut marks);
     }
     // **Inline math and inline images carry no hidden range of their own.**
     // The render layer deliberately leaves suppressing their source bytes to
@@ -221,6 +227,44 @@ fn append_block(
 
 fn clamp(range: &Range<usize>, len: usize) -> Range<usize> {
     range.start.min(len)..range.end.min(len)
+}
+
+/// Split one hidden range of a table block at the cell edges it crosses,
+/// pushing each piece with the verdict its own bytes earn: inside a cell it is
+/// inline markup and contributes nothing, outside every cell it is grid chrome
+/// and contributes a barrier.
+///
+/// `cells` is in source order and non-overlapping (the render's own geometry),
+/// and every edge is a character boundary of the source, so each piece is a
+/// range [`ProjectionBuilder`] will accept.
+fn split_at_cell_edges<'a>(
+    range: Range<usize>,
+    cells: &[Range<usize>],
+    out: &mut Vec<(Range<usize>, Mark<'a>)>,
+) {
+    let mut pos = range.start;
+    while pos < range.end {
+        match cells.iter().find(|c| c.start <= pos && pos < c.end) {
+            // Inside a cell — inline markup, up to that cell's end.
+            Some(cell) => {
+                let end = cell.end.min(range.end);
+                out.push((pos..end, Mark::Skip));
+                pos = end;
+            }
+            // Between cells — the grid, up to wherever the next cell begins.
+            None => {
+                let end = cells
+                    .iter()
+                    .map(|c| c.start)
+                    .filter(|start| *start > pos)
+                    .min()
+                    .unwrap_or(range.end)
+                    .min(range.end);
+                out.push((pos..end, Mark::Substitute(TABLE_CELL_BARRIER)));
+                pos = end;
+            }
+        }
+    }
 }
 
 /// The content ranges of every cell a table block carries, or an empty vec for
@@ -335,7 +379,7 @@ pub(crate) struct FindSession {
     /// Per-node searchable projections, keyed by node id, each remembered with
     /// the content it was built from so a post whose text changed re-projects
     /// and one that did not is free.
-    pub(crate) projections: HashMap<SharedString, (SharedString, Projection)>,
+    pub(crate) projections: HashMap<SharedString, (ProjectionSeed, Projection)>,
     /// A reveal waiting for its post to render for real.
     pub(crate) pending_reveal: Option<PendingReveal>,
     /// **A reveal a new query is owed, once the search has said what the first
@@ -463,6 +507,24 @@ fn step_anchor(
 /// controls sit under the band so the drag gesture keeps its strip.
 pub(crate) const FIND_BAR_H: f32 = 44.0;
 
+/// **What a cached projection was built from** — every input
+/// [`searchable_projection`] takes, so "is the cache still good" is one
+/// comparison against the scope entry rather than a list of fields a later
+/// change can forget to extend.
+///
+/// The embed map is in here because it really is an input: a marker is hidden
+/// wholesale only when its ordinal is *mapped*, and a stored quote's range can
+/// stop resolving (its source edited) while the quoting post's own content
+/// never moves — flipping the marker between hidden and literal text with
+/// nothing about `content` to show for it. `sync_references` re-seeds the
+/// editor's map on that frame, so a projection keyed on content alone is a
+/// count that disagrees with the post the reader is looking at.
+#[derive(PartialEq)]
+pub(crate) struct ProjectionSeed {
+    content: SharedString,
+    embeds: EmbedMap,
+}
+
 /// One node the search covers, in document order.
 struct ScopeNode {
     node: SharedString,
@@ -474,6 +536,15 @@ struct ScopeNode {
     /// missing one is simply not built — the count never flickers against
     /// fragments (`MarkdownEditorState::is_composing`).
     frozen: bool,
+}
+
+impl ScopeNode {
+    fn seed(&self) -> ProjectionSeed {
+        ProjectionSeed {
+            content: self.content.clone(),
+            embeds: self.embeds.clone(),
+        }
+    }
 }
 
 impl SpaceView {
@@ -650,10 +721,11 @@ impl SpaceView {
                 // keeps reporting until the composition commits. With nothing
                 // cached the draft is simply not searched yet; either way the
                 // count never moves against a fragment.
+                let seed = entry.seed();
                 let cached = session
                     .projections
                     .get(&entry.node)
-                    .is_some_and(|(seed, _)| entry.frozen || seed == &entry.content);
+                    .is_some_and(|(built_from, _)| entry.frozen || built_from == &seed);
                 if !cached {
                     if entry.frozen {
                         continue;
@@ -662,7 +734,7 @@ impl SpaceView {
                     self.projections_built.set(self.projections_built.get() + 1);
                     session
                         .projections
-                        .insert(entry.node.clone(), (entry.content.clone(), projection));
+                        .insert(entry.node.clone(), (seed, projection));
                 }
                 let Some((_, projection)) = session.projections.get(&entry.node) else {
                     continue;
@@ -1439,6 +1511,32 @@ mod tests {
         // The cells themselves are still ordinary searchable text.
         assert_eq!(find(source, "right"), vec!["right".to_string()]);
         assert_eq!(find(source, "two"), vec!["two".to_string()]);
+    }
+
+    #[test]
+    fn a_barrier_survives_a_substitution_merged_into_it_at_the_cell_edge() {
+        // `merge_hidden_ranges` joins an entity's own hidden bytes to the
+        // chrome beside it, so one hidden range straddles the cell edge:
+        // classified whole it is either all barrier (losing the `&` the reader
+        // sees) or all deletion (losing the boundary). Both halves are checked
+        // here, at both edges of a cell.
+        let trailing = "| left&amp; | right |\n| --- | --- |\n| a | b |\n";
+        assert!(
+            find(trailing, "left&right").is_empty(),
+            "the barrier survives the entity merged into it"
+        );
+        assert_eq!(
+            find(trailing, "left&"),
+            vec!["left&amp;".to_string()],
+            "…and the entity still displays as the character it renders as"
+        );
+
+        let leading = "| left | &amp;right |\n| --- | --- |\n| a | b |\n";
+        assert!(
+            find(leading, "left&right").is_empty(),
+            "and at the other edge, where the chrome comes first"
+        );
+        assert_eq!(find(leading, "&right"), vec!["&amp;right".to_string()]);
     }
 
     #[test]

@@ -19355,3 +19355,63 @@ fn space_find_reveals_a_match_in_the_off_branch_composer(cx: &mut TestAppContext
         );
     });
 }
+
+/// One post carrying an `{{ embed 1 }}` marker, with its ordinal-1 reference
+/// resolving to `snippet` — `None` for a stored range that no longer maps.
+fn post_with_embed(action_id: &str, snippet: Option<&str>) -> PostNode {
+    let mut post = fixture_assistant_post(action_id, "before\n\n{{ embed 1 }}\n\nafter");
+    post.references = vec![eidola_app_core::PostReference {
+        antecedent_action_id: "x1".into(),
+        ordinal: 1,
+        content_block_id: Some("bx".into()),
+        range_start: Some(0),
+        range_end: Some(4),
+        annotation: None,
+        delegation_end: None,
+        snippet: snippet.map(Into::into),
+        antecedent_author_label: "Ada".into(),
+        antecedent_author_kind: "agent".into(),
+    }];
+    post
+}
+
+#[gpui::test]
+fn space_find_reprojects_a_post_whose_embed_map_moved_under_it(cx: &mut TestAppContext) {
+    // A marker is hidden only when its ordinal is *mapped*, so a stored quote
+    // that stops resolving — its source edited — flips the marker between
+    // hidden and literal text with the quoting post's own content unchanged.
+    // A cache keyed on content alone then keeps counting a marker the reader
+    // can no longer see, which is the one failure the whole projection exists
+    // to prevent.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![post_with_embed("a1", None)]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    run_find(&view, window, &mut vcx, "embed");
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().0.len(),
+            1,
+            "an unmapped marker is ordinary literal text, and matches"
+        );
+    });
+
+    // The reference resolves now: same content, same node, different map.
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![post_with_embed("a1", Some("a passage"))], cx)
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "…and once it is mapped the marker is hidden, so nothing matches"
+        );
+    });
+}
