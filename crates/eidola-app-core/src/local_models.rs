@@ -147,7 +147,9 @@ pub const LOCAL_MODEL_CATALOG: &[LocalCatalogEntry] = &[
 
 /// Lifecycle state of one local model, merged from the filesystem and the
 /// runtime maps.
-#[derive(Clone, Debug, PartialEq)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum LocalModelStatus {
     /// A download task is streaming this model to disk.
     Downloading { received: u64, total: Option<u64> },
@@ -166,7 +168,9 @@ pub enum LocalModelStatus {
 
 /// One engine-served model as shown in Settings → Backends and (when
 /// loaded) the model picker.
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LocalModelInfo {
     /// The chat-routable selection id: `<slug>@<backend-id>` (the managed
     /// store's backend id is `local`).
@@ -197,7 +201,9 @@ pub struct LocalModelInfo {
 
 /// Snapshot of the whole local-inference domain: the managed `local`
 /// singleton plus every configured `llamacpp` backend's scanned directory.
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LocalModelsState {
     /// The resolved **bundled** `local` engine (config override,
     /// `EIDOLA_LLAMA_SERVER`, or the exe-relative sidecar). `None` ⇒ this
@@ -221,7 +227,9 @@ pub struct LocalModelsState {
 /// whole point of this type is to describe an engine whose file may be gone.
 /// A caller that wants a nice name joins this to
 /// [`LocalModelsState`] on `id` and falls back to `slug`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningEngine {
     /// The chat-routable selection id, `<slug>@<backend-id>` — the join key
     /// against [`LocalModelInfo::id`].
@@ -239,7 +247,9 @@ pub struct RunningEngine {
 }
 
 /// One `llamacpp` backend's scanned models.
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExternalEngineBackend {
     pub backend_id: String,
     pub display_name: String,

@@ -597,7 +597,9 @@ pub struct AccountShowResult {
     pub created_at: i64,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PriceInfo {
     pub id: String,
     pub product_name: String,
@@ -641,13 +643,17 @@ pub struct SubscriptionInfo {
     pub current_period_end: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BalancesResult {
     pub available: i64,
     pub pools: Vec<BalancePoolInfo>,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BalancePoolInfo {
     pub amount: i64,
     pub source: String,
@@ -663,7 +669,9 @@ pub struct CredentialInfo {
     pub generation: i64,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InFlightCredentialInfo {
     pub nonce: String,
     pub credits: i64,
@@ -1445,7 +1453,9 @@ pub fn quote_snippet(block_text: &str, range_start: i64, range_end: i64) -> Opti
     Some(&block_text[start..end])
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub context_length: u64,

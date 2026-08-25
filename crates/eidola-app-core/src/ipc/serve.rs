@@ -233,9 +233,82 @@ async fn answer(
             let credentials = core.wallet_credentials().await.map_err(failed)?;
             ok(WalletCredentialsResult { credentials })
         }
+        Call::SpacesArchive { space_id } => {
+            let archived = core.archive_space(space_id).await.map_err(failed)?;
+            ok(super::SpacesArchiveResult { archived })
+        }
+        Call::SpacesRename { space_id, title } => {
+            core.rename_space(space_id, title).await.map_err(failed)?;
+            ok(super::Done {})
+        }
+        Call::AccountPrices => {
+            let prices = core.account_prices().await.map_err(failed)?;
+            ok(super::AccountPricesResult { prices })
+        }
+        Call::AccountBalances => {
+            let balances = core.account_balances().await.map_err(failed)?;
+            ok(balances)
+        }
+        Call::AccountCheckout { price_id } => {
+            let url = core.account_checkout(price_id).await.map_err(failed)?;
+            ok(super::AccountCheckoutResult { url })
+        }
+        Call::WalletSpending => {
+            let credentials = core.wallet_spending_credentials().await.map_err(failed)?;
+            ok(super::WalletSpendingResult { credentials })
+        }
+        Call::WalletRecover => {
+            let recovered = core.recover_spending_credentials().await.map_err(failed)?;
+            ok(super::WalletRecoverResult { recovered })
+        }
         Call::BackendList => {
             let backends = core.list_backends().await.map_err(failed)?;
             ok(super::BackendListResult { backends })
+        }
+        Call::BackendSetEnabled { id, enabled } => {
+            core.set_backend_enabled(id, enabled)
+                .await
+                .map_err(failed)?;
+            ok(super::Done {})
+        }
+        Call::BackendModels { id } => {
+            let models = core.backend_models(id).await.map_err(failed)?;
+            ok(super::BackendModelsResult { models })
+        }
+        Call::ModelList => {
+            let state = core.local_models_state().await.map_err(failed)?;
+            // Read after the scan, deliberately: the caller reconciles the two,
+            // and an engine that started during the scan is better reported as
+            // running-but-unlisted than as listed-but-not-running.
+            let running = core.running_engines();
+            ok(super::ModelListResult { state, running })
+        }
+        Call::ModelDownload { url } => {
+            let id = core.download_local_model(url).await.map_err(failed)?;
+            ok(super::ModelDownloadResult { id })
+        }
+        Call::ModelDelete { id } => {
+            core.delete_local_model(id).await.map_err(failed)?;
+            ok(super::Done {})
+        }
+        Call::ModelLoad { id } => {
+            core.load_local_model(id).await.map_err(failed)?;
+            ok(super::Done {})
+        }
+        Call::ModelUnload { id } => {
+            core.unload_local_model(id).await.map_err(failed)?;
+            ok(super::Done {})
+        }
+        Call::ModelSetPinned { id, pinned } => {
+            core.set_local_model_pinned(id, pinned)
+                .await
+                .map_err(failed)?;
+            ok(super::Done {})
+        }
+        Call::UpdateCheck => ok(core.update_check().await),
+        Call::ChatDefaultModel => {
+            let model = core.default_model().await.map_err(failed)?;
+            ok(super::DefaultModelResult { model })
         }
         Call::ChatStream {
             prompt,

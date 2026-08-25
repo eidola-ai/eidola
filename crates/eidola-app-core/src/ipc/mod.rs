@@ -204,12 +204,59 @@ pub enum Call {
     Hello,
     /// `AppCore::list_spaces`.
     SpacesList { include_archived: bool },
+    /// `AppCore::archive_space`.
+    SpacesArchive { space_id: String },
+    /// `AppCore::rename_space`.
+    SpacesRename { space_id: String, title: String },
     /// `AppCore::account_show`.
     AccountShow,
+    /// `AppCore::account_prices`.
+    AccountPrices,
+    /// `AppCore::account_balances`.
+    AccountBalances,
+    /// `AppCore::account_checkout` — the payment link. Opening it is the
+    /// caller's business; a browser belongs to whoever the human is looking at.
+    AccountCheckout { price_id: String },
     /// `AppCore::wallet_credentials`.
     WalletCredentials,
+    /// `AppCore::wallet_spending_credentials`.
+    WalletSpending,
+    /// `AppCore::recover_spending_credentials`.
+    WalletRecover,
     /// `AppCore::list_backends`.
     BackendList,
+    /// `AppCore::set_backend_enabled`.
+    BackendSetEnabled { id: String, enabled: bool },
+    /// `AppCore::backend_models`.
+    BackendModels { id: String },
+    /// `AppCore::local_models_state`, beside `AppCore::running_engines`.
+    ///
+    /// The two travel together because they answer one question between them
+    /// and disagree apart: the state is a directory *scan*, while the registry
+    /// is what is actually running. Reading them over two round trips would
+    /// let an engine start or die between the halves, and the caller's whole
+    /// job with this pair is to reconcile them.
+    ModelList,
+    /// `AppCore::download_local_model`. Returns as soon as the transfer is
+    /// under way; the transfer belongs to the answering process, so it
+    /// outlives the connection.
+    ModelDownload { url: String },
+    /// `AppCore::delete_local_model`.
+    ModelDelete { id: String },
+    /// `AppCore::load_local_model`.
+    ModelLoad { id: String },
+    /// `AppCore::unload_local_model`.
+    ModelUnload { id: String },
+    /// `AppCore::set_local_model_pinned`.
+    ModelSetPinned { id: String, pinned: bool },
+    /// `AppCore::update_check`.
+    UpdateCheck,
+    /// `AppCore::default_model` — which model a turn that names none will use.
+    ///
+    /// Resolving it needs the database, so a caller without one cannot say the
+    /// name of the model it is about to use; `chat.stream` accepts `None` for
+    /// the same reason. This verb is how a caller *narrates* that choice.
+    ChatDefaultModel,
     /// `AppCore::chat_stream` — a turn, streamed as `chunk` frames with the
     /// finished [`crate::ChatResult`] as its `end`.
     ChatStream {
@@ -228,9 +275,26 @@ pub enum Call {
 pub const VERBS: &[&str] = &[
     "hello",
     "spaces.list",
+    "spaces.archive",
+    "spaces.rename",
     "account.show",
+    "account.prices",
+    "account.balances",
+    "account.checkout",
     "wallet.credentials",
+    "wallet.spending",
+    "wallet.recover",
     "backend.list",
+    "backend.set_enabled",
+    "backend.models",
+    "model.list",
+    "model.download",
+    "model.delete",
+    "model.load",
+    "model.unload",
+    "model.set_pinned",
+    "update.check",
+    "chat.default_model",
     "chat.stream",
 ];
 
@@ -252,15 +316,88 @@ pub struct ChatStreamParams {
     pub space_id: Option<String>,
 }
 
+/// Parameters of `spaces.archive`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpaceIdParams {
+    pub space_id: String,
+}
+
+/// Parameters of `spaces.rename`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpacesRenameParams {
+    pub space_id: String,
+    pub title: String,
+}
+
+/// Parameters of `account.checkout`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccountCheckoutParams {
+    pub price_id: String,
+}
+
+/// Parameters of `backend.set_enabled`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendSetEnabledParams {
+    pub id: String,
+    pub enabled: bool,
+}
+
+/// Parameters of the verbs that name one backend (`backend.models`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendIdParams {
+    pub id: String,
+}
+
+/// Parameters of `model.download`.
+///
+/// A URL, never a catalog id: resolving an id is a lookup in a table compiled
+/// into both builds, and doing it on the caller's side keeps what was asked
+/// for and what will be fetched the same sentence.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelDownloadParams {
+    pub url: String,
+}
+
+/// Parameters of the verbs that name one model (`model.delete`, `model.load`,
+/// `model.unload`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelIdParams {
+    pub id: String,
+}
+
+/// Parameters of `model.set_pinned`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelSetPinnedParams {
+    pub id: String,
+    pub pinned: bool,
+}
+
 impl Call {
     /// The verb this call names.
     pub fn verb(&self) -> &'static str {
         match self {
             Call::Hello => "hello",
             Call::SpacesList { .. } => "spaces.list",
+            Call::SpacesArchive { .. } => "spaces.archive",
+            Call::SpacesRename { .. } => "spaces.rename",
             Call::AccountShow => "account.show",
+            Call::AccountPrices => "account.prices",
+            Call::AccountBalances => "account.balances",
+            Call::AccountCheckout { .. } => "account.checkout",
             Call::WalletCredentials => "wallet.credentials",
+            Call::WalletSpending => "wallet.spending",
+            Call::WalletRecover => "wallet.recover",
             Call::BackendList => "backend.list",
+            Call::BackendSetEnabled { .. } => "backend.set_enabled",
+            Call::BackendModels { .. } => "backend.models",
+            Call::ModelList => "model.list",
+            Call::ModelDownload { .. } => "model.download",
+            Call::ModelDelete { .. } => "model.delete",
+            Call::ModelLoad { .. } => "model.load",
+            Call::ModelUnload { .. } => "model.unload",
+            Call::ModelSetPinned { .. } => "model.set_pinned",
+            Call::UpdateCheck => "update.check",
+            Call::ChatDefaultModel => "chat.default_model",
             Call::ChatStream { .. } => "chat.stream",
         }
     }
@@ -268,11 +405,35 @@ impl Call {
     /// The call's parameters, as the frame carries them.
     pub fn params(&self) -> serde_json::Value {
         match self {
-            Call::Hello | Call::AccountShow | Call::WalletCredentials | Call::BackendList => {
-                serde_json::json!({})
-            }
+            Call::Hello
+            | Call::AccountShow
+            | Call::AccountPrices
+            | Call::AccountBalances
+            | Call::WalletCredentials
+            | Call::WalletSpending
+            | Call::WalletRecover
+            | Call::BackendList
+            | Call::ModelList
+            | Call::UpdateCheck
+            | Call::ChatDefaultModel => serde_json::json!({}),
             Call::SpacesList { include_archived } => {
                 serde_json::json!({ "include_archived": include_archived })
+            }
+            Call::SpacesArchive { space_id } => serde_json::json!({ "space_id": space_id }),
+            Call::SpacesRename { space_id, title } => {
+                serde_json::json!({ "space_id": space_id, "title": title })
+            }
+            Call::AccountCheckout { price_id } => serde_json::json!({ "price_id": price_id }),
+            Call::BackendSetEnabled { id, enabled } => {
+                serde_json::json!({ "id": id, "enabled": enabled })
+            }
+            Call::BackendModels { id }
+            | Call::ModelDelete { id }
+            | Call::ModelLoad { id }
+            | Call::ModelUnload { id } => serde_json::json!({ "id": id }),
+            Call::ModelDownload { url } => serde_json::json!({ "url": url }),
+            Call::ModelSetPinned { id, pinned } => {
+                serde_json::json!({ "id": id, "pinned": pinned })
             }
             Call::ChatStream {
                 prompt,
@@ -316,9 +477,69 @@ impl Call {
                     include_archived: p.include_archived,
                 })
             }
+            "spaces.archive" => {
+                let p: SpaceIdParams = of(verb, params)?;
+                Ok(Call::SpacesArchive {
+                    space_id: p.space_id,
+                })
+            }
+            "spaces.rename" => {
+                let p: SpacesRenameParams = of(verb, params)?;
+                Ok(Call::SpacesRename {
+                    space_id: p.space_id,
+                    title: p.title,
+                })
+            }
             "account.show" => Ok(Call::AccountShow),
+            "account.prices" => Ok(Call::AccountPrices),
+            "account.balances" => Ok(Call::AccountBalances),
+            "account.checkout" => {
+                let p: AccountCheckoutParams = of(verb, params)?;
+                Ok(Call::AccountCheckout {
+                    price_id: p.price_id,
+                })
+            }
             "wallet.credentials" => Ok(Call::WalletCredentials),
+            "wallet.spending" => Ok(Call::WalletSpending),
+            "wallet.recover" => Ok(Call::WalletRecover),
             "backend.list" => Ok(Call::BackendList),
+            "backend.set_enabled" => {
+                let p: BackendSetEnabledParams = of(verb, params)?;
+                Ok(Call::BackendSetEnabled {
+                    id: p.id,
+                    enabled: p.enabled,
+                })
+            }
+            "backend.models" => {
+                let p: BackendIdParams = of(verb, params)?;
+                Ok(Call::BackendModels { id: p.id })
+            }
+            "model.list" => Ok(Call::ModelList),
+            "model.download" => {
+                let p: ModelDownloadParams = of(verb, params)?;
+                Ok(Call::ModelDownload { url: p.url })
+            }
+            "model.delete" => {
+                let p: ModelIdParams = of(verb, params)?;
+                Ok(Call::ModelDelete { id: p.id })
+            }
+            "model.load" => {
+                let p: ModelIdParams = of(verb, params)?;
+                Ok(Call::ModelLoad { id: p.id })
+            }
+            "model.unload" => {
+                let p: ModelIdParams = of(verb, params)?;
+                Ok(Call::ModelUnload { id: p.id })
+            }
+            "model.set_pinned" => {
+                let p: ModelSetPinnedParams = of(verb, params)?;
+                Ok(Call::ModelSetPinned {
+                    id: p.id,
+                    pinned: p.pinned,
+                })
+            }
+            "update.check" => Ok(Call::UpdateCheck),
+            "chat.default_model" => Ok(Call::ChatDefaultModel),
             "chat.stream" => {
                 let p: ChatStreamParams = of(verb, params)?;
                 Ok(Call::ChatStream {
@@ -367,6 +588,77 @@ pub struct WalletCredentialsResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackendListResult {
     pub backends: Vec<crate::backends::BackendInfo>,
+}
+
+/// The `end` payload of a verb whose whole answer is that it happened.
+///
+/// An object rather than `null`, for the same reason the listings are
+/// objects: whatever such a verb later has to say is then additive.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Done {}
+
+/// The `end` payload of `spaces.archive`.
+///
+/// `false` is not a failure — it is the answer for a space that was already
+/// archived or was never there, exactly as the in-process call reports it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpacesArchiveResult {
+    pub archived: bool,
+}
+
+/// The `end` payload of `account.prices`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccountPricesResult {
+    pub prices: Vec<crate::PriceInfo>,
+}
+
+/// The `end` payload of `account.checkout`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccountCheckoutResult {
+    pub url: String,
+}
+
+/// The `end` payload of `wallet.spending`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletSpendingResult {
+    pub credentials: Vec<crate::InFlightCredentialInfo>,
+}
+
+/// The `end` payload of `wallet.recover`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletRecoverResult {
+    /// The nonce of every credential that came back. Empty means none did.
+    pub recovered: Vec<String>,
+}
+
+/// The `end` payload of `backend.models`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendModelsResult {
+    pub models: Vec<crate::ModelInfo>,
+}
+
+/// The `end` payload of `model.list`: the scan and the registry, from one
+/// moment.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelListResult {
+    pub state: crate::LocalModelsState,
+    /// Every engine the answering process is actually running — which is the
+    /// process that owns them, so this is the only place a caller without the
+    /// profile can learn what is loaded.
+    pub running: Vec<crate::RunningEngine>,
+}
+
+/// The `end` payload of `model.download`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelDownloadResult {
+    /// The `<slug>@local` id the transfer is filling.
+    pub id: String,
+}
+
+/// The `end` payload of `chat.default_model`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DefaultModelResult {
+    pub model: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -880,9 +1172,49 @@ mod tests {
             Call::SpacesList {
                 include_archived: true,
             },
+            Call::SpacesArchive {
+                space_id: "sp".into(),
+            },
+            Call::SpacesRename {
+                space_id: "sp".into(),
+                title: "a title".into(),
+            },
             Call::AccountShow,
+            Call::AccountPrices,
+            Call::AccountBalances,
+            Call::AccountCheckout {
+                price_id: "price_1".into(),
+            },
             Call::WalletCredentials,
+            Call::WalletSpending,
+            Call::WalletRecover,
             Call::BackendList,
+            Call::BackendSetEnabled {
+                id: "eidola".into(),
+                enabled: false,
+            },
+            Call::BackendModels {
+                id: "eidola".into(),
+            },
+            Call::ModelList,
+            Call::ModelDownload {
+                url: "https://example.invalid/m.gguf".into(),
+            },
+            Call::ModelDelete {
+                id: "m@local".into(),
+            },
+            Call::ModelLoad {
+                id: "m@local".into(),
+            },
+            Call::ModelUnload {
+                id: "m@local".into(),
+            },
+            Call::ModelSetPinned {
+                id: "m@local".into(),
+                pinned: true,
+            },
+            Call::UpdateCheck,
+            Call::ChatDefaultModel,
             Call::ChatStream {
                 prompt: "hello".into(),
                 model: Some("m@b".into()),
