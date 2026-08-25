@@ -722,6 +722,98 @@ fn library_parent_badge_opens_the_parent_and_not_its_own_row(cx: &mut TestAppCon
     });
 }
 
+/// **The parent link is a tab stop, and it comes before the row's verbs.** The
+/// Library is one tab stop with a roving cursor whose row reveals its
+/// affordances, so making the badge a `Link` added a stop to that order —
+/// list → Parent → Rename → Archive → out — and a documented order nothing
+/// checks is a contract the next accessibility pass can quietly drop.
+///
+/// Two halves, because the harness can measure two different things. **That it
+/// is a stop** is measured by walking Tab until the focus wraps: a delegated
+/// row's listing has exactly one more stop than the same listing without a
+/// parent. **Where it is** follows from paint order, which is what orders stops
+/// within one tab region (`crate::focus::TabRegion`), so the badge painting to
+/// the left of the rename pencil is the same fact as its coming first.
+#[gpui::test]
+fn library_tab_order_reaches_a_parent_before_the_row_verbs(cx: &mut TestAppContext) {
+    /// Tab from the top until focus comes back where it started; the count is
+    /// the number of stops the window offers.
+    fn stops(cx: &mut TestAppContext, window: gpui::AnyWindowHandle) -> usize {
+        let focused = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.focused(cx).map(|h| format!("{h:?}"))
+            })
+            .unwrap()
+        };
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..50 {
+            cx.update_window(window, |_, window, cx| window.focus_next(cx))
+                .unwrap();
+            cx.update_window(window, |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+            let Some(id) = focused(cx) else { break };
+            if seen.contains(&id) {
+                break;
+            }
+            seen.push(id);
+        }
+        seen.len()
+    }
+
+    let ordinary = stub_space("s1", Some("Check Friday's tide tables"), None, 1_000);
+    let delegated = SpaceInfo {
+        parent: Some(eidola_app_core::SpaceParent {
+            space_id: "s0".into(),
+            title: Some("Tides and the moon".into()),
+        }),
+        ..ordinary.clone()
+    };
+
+    let plain_stores = stub_stores(cx, |s| s.spaces = vec![ordinary]);
+    let (plain_window, _) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(plain_stores, window, cx))
+    });
+    cx.run_until_parked();
+    let plain = stops(cx, plain_window);
+
+    let stores = stub_stores(cx, |s| s.spaces = vec![delegated]);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        stops(cx, window),
+        plain + 1,
+        "a delegated row puts one more stop in the Library's order"
+    );
+
+    // And the cursor row really is what reveals it — the badge is a `Link`
+    // where the verbs are live, not a stop that outlives its own reveal.
+    let seen = cx
+        .update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, cx| v.cursor_and_reveal_for_test(window, cx))
+        })
+        .unwrap();
+    assert_eq!(seen.1, Some(0), "the row whose verbs are revealed");
+
+    // Position: stops within one tab region follow paint order, so this is the
+    // order Tab reads.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(520.), px(620.)));
+    vcx.run_until_parked();
+    let badge = vcx
+        .debug_bounds("parent-badge-0")
+        .expect("the revealed parent badge is painted");
+    let pencil = vcx
+        .debug_bounds("rename-pencil-0")
+        .expect("the revealed rename pencil is painted");
+    assert!(
+        badge.origin.x < pencil.origin.x,
+        "Parent is painted — and so reached — before Rename: {badge:?} vs {pencil:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Onboarding state machine
 // ---------------------------------------------------------------------------

@@ -1037,11 +1037,12 @@ fn a_regeneration_of_a_finding_is_quoted_at_its_visible_tip() {
         let asked = tree(&core, &parent)[0].action_id.clone();
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
-        // The owner has already answered, so the report can attach after the
-        // pause rather than waiting. The pause is still taken — that is the
-        // window a finding can change in.
-        ask(&core, &parent, &owner, &asked);
+        // The owner answers the anchor once the room is open — an answer newer
+        // than the room, which is the one a report attaches under — so the
+        // report can attach after the pause rather than waiting. The pause is
+        // still taken: that is the window a finding can change in.
         let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], Some(&asked));
+        ask(&core, &parent, &owner, &asked);
         let room = out.space.id.clone();
         core.runtime()
             .block_on(core.add_global_participant(
@@ -1121,8 +1122,8 @@ fn a_regeneration_during_the_report_is_quoted_at_its_visible_tip() {
         let asked = tree(&core, &parent)[0].action_id.clone();
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
-        ask(&core, &parent, &owner, &asked);
         let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], Some(&asked));
+        ask(&core, &parent, &owner, &asked);
         let room = out.space.id.clone();
         core.runtime()
             .block_on(core.add_global_participant(
@@ -1202,8 +1203,8 @@ fn a_regeneration_of_the_answer_during_the_report_reattaches() {
         let asked = tree(&core, &parent)[0].action_id.clone();
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
-        let answer = ask(&core, &parent, &owner, &asked);
         let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        let answer = ask(&core, &parent, &owner, &asked);
         let room = out.space.id.clone();
 
         let mut window = core.test_open_report_persist_window();
@@ -1279,8 +1280,8 @@ fn a_failed_regeneration_of_the_answer_during_the_report_waits() {
         let asked = tree(&core, &parent)[0].action_id.clone();
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
-        let answer = ask(&core, &parent, &owner, &asked);
         let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        let answer = ask(&core, &parent, &owner, &asked);
         let room = out.space.id.clone();
 
         let mut window = core.test_open_report_persist_window();
@@ -1331,8 +1332,8 @@ fn closing_the_delegated_room_during_its_report_writes_nothing() {
         let asked = tree(&core, &parent)[0].action_id.clone();
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
-        ask(&core, &parent, &owner, &asked);
         let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        ask(&core, &parent, &owner, &asked);
         let room = out.space.id.clone();
 
         let mut window = core.test_open_report_persist_window();
@@ -1427,8 +1428,12 @@ fn a_report_attaches_beneath_the_owners_answer_to_the_post_it_was_asked_on() {
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
 
-        // The post the work is asked for on, and the owner's answer to it.
+        // The post the work is asked for on. The room is opened from it first,
+        // as a turn-scoped spawn always is — the owner's answer to it is what
+        // that turn is still to write, and only an answer newer than the room
+        // is the one the report belongs under.
         let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
         let answer = ask(&core, &parent, &owner, &asked);
         // …and then the owner says something else, elsewhere in the parent,
         // *after* that answer. This is the post the old rule would have picked.
@@ -1437,8 +1442,6 @@ fn a_report_attaches_beneath_the_owners_answer_to_the_post_it_was_asked_on() {
             .block_on(core.post("Meanwhile:".into(), Some(parent.clone())))
             .expect("post");
         let later = ask(&core, &parent, &owner, &aside.action_id);
-
-        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
         drive(&core, &out.space.id).expect("the room is driven");
 
         let report = report(&core, &parent).expect("the delegation is reported");
@@ -1486,6 +1489,76 @@ fn a_report_waits_for_the_answer_it_belongs_under() {
         drive(&core, &out.space.id).expect("the room is driven again");
         let report = report(&core, &parent).expect("the delegation is reported");
         assert_eq!(report.parent_action_id.as_deref(), Some(answer.as_str()));
+    });
+}
+
+/// **An answer that was already there is not this delegation's answer.** A
+/// spawn that names an anchor happens inside the owner's turn, so the answer
+/// the report belongs under is the one that turn has yet to write. An answer of
+/// the same owner to the same anchor that predates the room is a different
+/// answer — an earlier reply to the same post, or the generation a
+/// regeneration is in the middle of replacing — and accepting it ends the wait
+/// against the wrong word while the right one is still on the wire.
+#[test]
+fn a_report_does_not_settle_on_an_answer_older_than_its_room() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        // The owner has answered this post once already — an explicit ask, the
+        // reachable way to get a second answer to one post out of one agent.
+        let earlier = ask(&core, &parent, &owner, &asked);
+
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        drive(&core, &out.space.id).expect("the room is driven");
+        assert!(
+            report(&core, &parent).is_none(),
+            "the older answer must not end the wait: the answer this room came \
+             from is still in flight"
+        );
+
+        // The answer this delegation was opened from lands, and the report goes
+        // under *it*.
+        let answer = ask(&core, &parent, &owner, &asked);
+        drive(&core, &out.space.id).expect("the room is driven again");
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(answer.as_str()),
+            "beneath the answer that opened it"
+        );
+        assert_ne!(
+            report.parent_action_id.as_deref(),
+            Some(earlier.as_str()),
+            "and not beneath the one that was already there"
+        );
+    });
+}
+
+/// The wait is not unbounded by this: a spawning turn that died leaves no
+/// answer newer than the room, and the arms that claim a licence still end it —
+/// against the anchor, which is the honest attachment when there is nothing of
+/// this delegation's own to sit beneath.
+#[test]
+fn an_older_answer_does_not_hold_a_room_past_its_licence() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        ask(&core, &parent, &owner, &asked);
+
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        drive_as_sweep(&core, &out.space.id).expect("the room is driven");
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(asked.as_str()),
+            "the anchor itself, not an answer this room never came from"
+        );
     });
 }
 

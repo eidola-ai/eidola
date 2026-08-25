@@ -1956,31 +1956,33 @@ pub async fn has_reference_from(
 /// answer and wait out the grace alarm, attaching the report to the anchor as
 /// a sibling of a word the parent already shows.
 ///
-/// **This resolves an answer, not *the* answer, and the gap is recorded rather
-/// than closed.** If the same owner answers the same post twice without one
-/// superseding the other — two concurrent explicit asks on one target, which is
-/// the only way to get there — the report attaches beneath the newer of the
-/// two, which may not be the turn the spawn happened inside. Nothing durable
-/// distinguishes them: a turn's rounds chain off *the post it answers*,
-/// deliberately never off its own inference (which a capped or budget-stopped
-/// turn never writes), so there is no edge from a spawning round to that turn's
-/// own answer. The one durable trace that relates them at all is
-/// `context_assembly`, and it is not one-to-one — a later turn replaying a
-/// trace records the same round in its own assembly, so the join answers a set.
-/// Recording the spawning round on the room would need a caller that could
-/// supply it, and there is none: nothing exposes the spawn door as a tool, and
-/// `tools::Tool::call` receives parsed arguments and no turn identity at all.
-/// So the residual is exactly this: **same owner, same anchor, two live answers
-/// — the report lands under the newer.** No report is lost, and the inversion
-/// the wait exists to prevent cannot happen either way, because both candidates
-/// are answers *of that owner to that anchor*: the report still sits beneath
-/// one of them rather than above it. Building for it before a caller exists
-/// would be machinery for a shape that has not been designed yet.
+/// **`after_row` is the line that says *which* answer.** An anchored spawn
+/// happens inside the owning agent's turn, so the answer the report belongs
+/// under is the one that turn is still to write — and any answer of that owner
+/// to that anchor which is already committed is a *different* answer: the
+/// generation a regeneration is in the middle of replacing, or a prior reply to
+/// the same post. Accepting one of those ends the wait at once and reports
+/// beneath an answer the delegation did not come from, while the answer it did
+/// come from is still on the wire; if the regeneration in flight then fails,
+/// its item's tip is a hidden `error` and the report is left hanging under a
+/// generation the parent no longer shows. So a caller that knows a turn is
+/// behind the delegation passes the commit-order line the room was opened at
+/// ([`subspace_opened_at_row`]) and only answers committed after it are
+/// candidates. `None` keeps the unrestricted rule, which is the honest one for
+/// a caller with no turn behind it: the newest answer is then the best guess
+/// available.
+///
+/// **It is a `rowid` and not a clock** for the reason [`action_watermark`]
+/// gives: every writer samples `now_ms()` above its own transaction, so a
+/// timestamp cannot order two writes that raced, while `rowid` is assigned at
+/// insert under serialized writers and `action` is append-only — nothing here
+/// ever deletes a row, so the sequence cannot be reused.
 pub async fn last_reply_by_participant(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
     antecedent_action_id: &str,
+    after_row: Option<i64>,
 ) -> Result<Option<String>, AppError> {
     let sql = format!(
         "SELECT a.id FROM action a \
@@ -1991,6 +1993,7 @@ pub async fn last_reply_by_participant(
            AND origin.supersedes_action_id IS NULL \
          WHERE a.space_id = ?1 AND origin.participant_id = ?2 \
            AND aa.antecedent_action_id = ?3 \
+           AND a.rowid > ?4 \
            AND a.status IN ('complete', 'cancelled') \
            AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
          ORDER BY a.rowid DESC LIMIT 1"
@@ -2001,12 +2004,43 @@ pub async fn last_reply_by_participant(
             Value::Text(space_id.to_string()),
             Value::Text(participant_id.to_string()),
             Value::Text(antecedent_action_id.to_string()),
+            // No line means every row is after it. `rowid` starts at 1.
+            Value::Integer(after_row.unwrap_or(0)),
         ])
         .await
         .map_err(AppError::db)?;
     match rows.next().await.map_err(AppError::db)? {
         None => Ok(None),
         Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// The commit-order line a delegated room was opened at: the `rowid` of its
+/// **brief**, which [`spawn_subspace_tx`] writes in the same transaction as the
+/// room itself and which is therefore the first action the room has.
+///
+/// **No new state records this** — the fact was already durable. Every action
+/// committed before the spawn has a lower `rowid` and every action committed
+/// after it a higher one (writers are serialized and `action` is append-only),
+/// so the brief *is* the pre-spawn watermark, and it reads the same after a
+/// restart as before one because it reads rows. `MIN` rather than a stored
+/// brief id for the same reason: the room's own first action is the brief by
+/// construction, so there is nothing to keep in step.
+pub async fn subspace_opened_at_row(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<i64>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT MIN(rowid) FROM action WHERE space_id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(space_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => row.get::<Option<i64>>(0).map_err(AppError::db),
     }
 }
 
@@ -9128,7 +9162,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            last_reply_by_participant(&conn, "parent", &owner, &asked)
+            last_reply_by_participant(&conn, "parent", &owner, &asked, None)
                 .await
                 .unwrap()
                 .as_deref(),
@@ -9148,7 +9182,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            last_reply_by_participant(&conn, "parent", &owner, &asked)
+            last_reply_by_participant(&conn, "parent", &owner, &asked, None)
                 .await
                 .unwrap()
                 .as_deref(),

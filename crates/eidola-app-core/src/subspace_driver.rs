@@ -1627,11 +1627,29 @@ impl Inner {
                         });
                     }
                     let conn = self.db_conn().await?;
+                    // **Only an answer newer than this room.** A spawn that
+                    // named an anchor happened inside the owner's turn (the
+                    // `space.parent_action_id` column says so: it is written
+                    // only by the spawn door, which is reached from inside a
+                    // turn), so the answer this report belongs under is the one
+                    // that turn has yet to persist. An answer of the same owner
+                    // to the same anchor that is *already* there is a different
+                    // answer — the generation a regeneration is replacing, or
+                    // an earlier reply to the same post — and accepting it ends
+                    // the wait against the wrong word while the right one is
+                    // still on the wire. The room's brief is that line and
+                    // needs no new state to record it (see
+                    // [`db::subspace_opened_at_row`]). A room whose brief
+                    // somehow cannot be read leaves the line unset, which is
+                    // the pre-existing rule rather than a refusal: a delegation
+                    // must still be able to report.
+                    let opened_at = db::subspace_opened_at_row(&conn, &sub.id).await?;
                     match db::last_reply_by_participant(
                         &conn,
                         &sub.parent_space_id,
                         &sub.owner_participant_id,
                         anchor,
+                        opened_at,
                     )
                     .await?
                     {
