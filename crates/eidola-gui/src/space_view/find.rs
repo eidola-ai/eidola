@@ -52,7 +52,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::{ActiveTheme, h_flex};
-use gpui_markdown_editor::EmbedMap;
+use gpui_markdown_editor::{EmbedMap, Selection};
 
 use super::layout::{GutterPlacement, compact_gutter_occupancy, page_layout};
 use super::model::{NodeSrc, TreeNode};
@@ -74,11 +74,29 @@ use crate::probe::Probe;
 /// only when its ordinal is **mapped**, and is ordinary literal text when it
 /// is not. Passing the post's own map is what keeps the projection agreeing
 /// with the post's own editor.
-pub(crate) fn searchable_projection(content: &str, embeds: &EmbedMap) -> Projection {
+pub(crate) fn searchable_projection(
+    content: &str,
+    embeds: &EmbedMap,
+    cursor: Option<Selection>,
+) -> Projection {
     let mut state = gpui_markdown_editor::EditorState::with_markdown(content);
     state.embeds = embeds.clone();
     let tree = gpui_markdown_editor::parse(&state.markdown);
-    let spec = gpui_markdown_editor::render::render_readonly(&state, &tree);
+    // **The render mode is the node's, not a constant.** A node the reader is
+    // *editing* — an inline edit, any draft — keeps an enabled editor, and an
+    // enabled editor renders cursor-aware: the delimiters and the link URL its
+    // cursor sits on are revealed, on the page, in front of them. Projecting
+    // that node read-only searched a different document than the one being
+    // shown, in both directions — the exposed `https://…` could not match, and
+    // a phrase that only closes up once the delimiters hide matched text that
+    // no longer reads that way.
+    let spec = match cursor {
+        Some(selection) => {
+            state.selection = selection;
+            gpui_markdown_editor::render::render(&state, &tree)
+        }
+        None => gpui_markdown_editor::render::render_readonly(&state, &tree),
+    };
 
     let mut builder = ProjectionBuilder::new(content);
     let mut prev_end: Option<usize> = None;
@@ -654,10 +672,17 @@ pub(crate) const FIND_BAR_H: f32 = 44.0;
 /// nothing about `content` to show for it. `sync_references` re-seeds the
 /// editor's map on that frame, so a projection keyed on content alone is a
 /// count that disagrees with the post the reader is looking at.
+/// The render cursor is an input for the same reason: an *enabled* editor
+/// renders cursor-aware, so moving the caret into a construct reveals its
+/// delimiters with the content and the embed map both unmoved. Keyed on
+/// content alone, the cache would hand back a projection of the published
+/// render while the reader looks at the raw markdown. `None` is the published
+/// render — every node that is not being edited.
 #[derive(PartialEq)]
 pub(crate) struct ProjectionSeed {
     content: SharedString,
     embeds: EmbedMap,
+    render_cursor: Option<Selection>,
 }
 
 /// One node the search covers, in document order.
@@ -671,6 +696,11 @@ struct ScopeNode {
     /// missing one is simply not built — the count never flickers against
     /// fragments (`MarkdownEditorState::is_composing`).
     frozen: bool,
+    /// The cursor the node's own editor renders with, straight from
+    /// `MarkdownEditorState::render_cursor` — `None` for a node with no live
+    /// editor, and for one whose editor is disabled, which is the published
+    /// render either way.
+    render_cursor: Option<Selection>,
 }
 
 impl ScopeNode {
@@ -678,6 +708,7 @@ impl ScopeNode {
         ProjectionSeed {
             content: self.content.clone(),
             embeds: self.embeds.clone(),
+            render_cursor: self.render_cursor,
         }
     }
 }
@@ -878,7 +909,8 @@ impl SpaceView {
                     if entry.frozen {
                         continue;
                     }
-                    let projection = searchable_projection(&entry.content, &entry.embeds);
+                    let projection =
+                        searchable_projection(&entry.content, &entry.embeds, entry.render_cursor);
                     self.projections_built.set(self.projections_built.get() + 1);
                     session
                         .projections
@@ -936,7 +968,7 @@ impl SpaceView {
                             r.snippet.clone()?,
                         ))
                     }));
-                    let (content, frozen) = self.post_scope_text(&node.id, post, cx);
+                    let (content, frozen, render_cursor) = self.post_scope_text(&node.id, post, cx);
                     seen.push(node.id.clone());
                     scope.push(ScopeNode {
                         node: node.id.clone(),
@@ -944,6 +976,7 @@ impl SpaceView {
                         content,
                         embeds,
                         frozen,
+                        render_cursor,
                     });
                 }
                 NodeSrc::Draft => {
@@ -988,7 +1021,7 @@ impl SpaceView {
         node: &SharedString,
         post: &super::model::PostData,
         cx: &gpui::App,
-    ) -> (SharedString, bool) {
+    ) -> (SharedString, bool, Option<Selection>) {
         let editing = self
             .editing
             .as_ref()
@@ -1001,9 +1034,10 @@ impl SpaceView {
                 (
                     SharedString::from(editor.value().to_string()),
                     editor.is_composing(),
+                    editor.render_cursor(),
                 )
             }
-            None => (post.content.clone(), false),
+            None => (post.content.clone(), false, None),
         }
     }
 
@@ -1016,6 +1050,7 @@ impl SpaceView {
             content: SharedString::from(editor.value().to_string()),
             embeds: EmbedMap::new(draft.embed_map()),
             frozen: editor.is_composing(),
+            render_cursor: editor.render_cursor(),
         })
     }
 
@@ -1554,7 +1589,14 @@ mod tests {
     use super::*;
 
     fn project(source: &str) -> Projection {
-        searchable_projection(source, &EmbedMap::default())
+        searchable_projection(source, &EmbedMap::default(), None)
+    }
+
+    /// The projection of a node whose editor is *enabled* with its cursor at
+    /// `at` — an inline edit or a draft, which is what the reader is looking
+    /// at when they search one.
+    fn project_editing(source: &str, at: usize) -> Projection {
+        searchable_projection(source, &EmbedMap::default(), Some(Selection::Cursor(at)))
     }
 
     /// How many math overlays the read-only render puts on this source.
@@ -1567,6 +1609,16 @@ mod tests {
         let tree = gpui_markdown_editor::parse(&state.markdown);
         let spec = gpui_markdown_editor::render::render_readonly(&state, &tree);
         spec.blocks.iter().map(|b| b.math_overlays.len()).sum()
+    }
+
+    fn find_editing(source: &str, at: usize, query: &str) -> Vec<String> {
+        let projection = project_editing(source, at);
+        let query = Query::new(query).expect("non-empty");
+        projection
+            .find(&query)
+            .into_iter()
+            .map(|r| source[r].to_string())
+            .collect()
     }
 
     fn find(source: &str, query: &str) -> Vec<String> {
@@ -1697,9 +1749,37 @@ mod tests {
     }
 
     #[test]
+    fn an_editable_node_is_projected_with_the_render_mode_it_shows() {
+        // A node the reader is editing keeps an *enabled* editor, and an
+        // enabled editor renders cursor-aware — so both directions of the
+        // read-only/live divergence are visible on the page.
+        let link = "The [survey](https://kestrel.example/data) says so.";
+        // Published: the URL is hidden, and deliberately unmatchable.
+        assert!(find(link, "kestrel.example").is_empty());
+        // Editing, caret in the link text: the reader plainly sees the URL.
+        assert!(
+            project_editing(link, 6)
+                .text()
+                .contains("https://kestrel.example/data")
+        );
+        assert_eq!(
+            find_editing(link, 6, "kestrel.example"),
+            vec!["kestrel.example".to_string()]
+        );
+
+        // The other direction: a phrase that only closes up once the
+        // delimiters hide must stop matching when they are revealed.
+        let emph = "a very **important** thing";
+        assert_eq!(find(emph, "important thing").len(), 1);
+        assert!(find_editing(emph, 10, "important thing").is_empty());
+        assert!(project_editing(emph, 10).text().contains("**important**"));
+    }
+
+    #[test]
     fn a_mapped_embed_marker_is_not_searchable_and_an_unmapped_one_is() {
         let source = "{{ embed 1 }}";
-        let mapped = searchable_projection(source, &EmbedMap::new([(1, "quoted".to_string())]));
+        let mapped =
+            searchable_projection(source, &EmbedMap::new([(1, "quoted".to_string())]), None);
         assert!(mapped.text().trim().is_empty());
         // An ordinal with no reference behind it is ordinary text — which is
         // also how a marker looks before its reference exists.

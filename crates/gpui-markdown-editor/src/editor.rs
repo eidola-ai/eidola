@@ -498,6 +498,23 @@ impl MarkdownEditorState {
         self.state.selection
     }
 
+    /// The cursor input this editor's own [`Self::render_spec`] will use:
+    /// `None` when it is disabled — the published render, where every WYSIWYG
+    /// delimiter hides — and the live selection when it is not.
+    ///
+    /// **Exposed because a consumer deciding what the reader can see has to
+    /// ask the question `render_spec` answers, not re-derive it.** `disabled`
+    /// is synced from the element's prop each frame, so it is not something a
+    /// caller can know from the outside, and the difference is not cosmetic:
+    /// an enabled editor reveals the delimiters and the link URL its cursor
+    /// sits on. Nothing here consults focus, because `render_spec` does not
+    /// either — an enabled editor renders cursor-aware whether or not the
+    /// window has given it the keyboard, and `Selection`'s default puts that
+    /// cursor at offset 0 rather than nowhere.
+    pub fn render_cursor(&self) -> Option<Selection> {
+        (!self.disabled).then_some(self.state.selection)
+    }
+
     /// Whether a pointer selection drag is currently in progress (mouse held
     /// down after a press on the editor). A host that owns the scroll — the
     /// editor has no internal vertical scroll — reads this to drive
