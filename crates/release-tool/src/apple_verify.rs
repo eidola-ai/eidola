@@ -311,19 +311,64 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 /// Read a file the installer will later fetch over the wire, refusing one
 /// larger than the installer's own ceiling.
 fn read_bounded(path: &Path, label: &str) -> Result<Vec<u8>> {
-    const MAX: u64 = eidola_app_core::updater::install::MAX_CONTAINER_BYTES;
+    read_within(
+        path,
+        label,
+        eidola_app_core::updater::install::MAX_CONTAINER_BYTES,
+    )
+}
 
-    let length = std::fs::metadata(path)
-        .with_context(|| format!("reading metadata for {}", path.display()))?
-        .len();
-    if length > MAX {
-        bail!(
-            "{label} is {length} bytes, more than the {MAX} an installed client will \
-             download — publishing it would produce a release every client refuses before \
-             it reconstructs anything"
-        );
+/// The ceiling, applied the way the installer applies it: in two tiers,
+/// with the authoritative one over the bytes actually in hand.
+///
+/// The installer refuses an oversized `Content-Length` early and *then*
+/// bounds the body with a running count, because a claimed length is a
+/// claim and the bytes are the fact. A stat is this side's claimed length:
+/// it is sampled before the read, and the read is what gets staged and
+/// published. Trusting it would leave the two sides applying the same
+/// number under different rules, which is exactly what sharing the
+/// constant was meant to prevent.
+///
+/// The difference is reachable without anyone being adversarial — the
+/// operator owns this filesystem and races nobody. A file another process
+/// is still writing (a signing job's artifact download that has not
+/// finished) reports one length and yields another; a stream-like path
+/// reports zero and yields everything it is fed. Refusing on a number that
+/// is not a property of the release is the defect, not the race.
+///
+/// So the stat stays as the cheap early refusal it is good at, and the
+/// count of bytes returned is what decides. One byte past the ceiling is
+/// enough to know a file is over it, and is also the most this will ever
+/// hold.
+fn read_within(path: &Path, label: &str, max: u64) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+
+    if let Ok(metadata) = file.metadata()
+        && metadata.len() > max
+    {
+        bail!(oversized(label, max));
     }
-    read_file(path)
+
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() as u64 > max {
+        bail!(oversized(label, max));
+    }
+    Ok(bytes)
+}
+
+fn oversized(label: &str, max: u64) -> String {
+    format!(
+        "{label} is larger than the {max} bytes an installed client will download — \
+         publishing it would produce a release every client refuses before it \
+         reconstructs anything"
+    )
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -776,6 +821,75 @@ mod tests {
         assert!(
             message.contains("an installed client will download"),
             "got: {message}"
+        );
+    }
+
+    /// The tier that matters: a path whose stat and whose bytes disagree.
+    ///
+    /// A named pipe reports a length of zero and yields whatever is
+    /// written through it, so it is the disagreement without a race to
+    /// arrange — the same shape as a file another process is still
+    /// writing, which is the realistic case.
+    #[cfg(unix)]
+    #[test]
+    fn the_ceiling_is_applied_to_the_bytes_not_to_a_sampled_length() {
+        use std::io::Write as _;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let pipe = scratch.path().join("pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // Small enough to fit the pipe buffer, so the writer never blocks
+        // and the reader's early exit cannot deadlock it.
+        let writer = std::thread::spawn({
+            let pipe = pipe.clone();
+            move || {
+                let mut handle = std::fs::OpenOptions::new().write(true).open(&pipe).unwrap();
+                let _ = handle.write_all(&[0u8; 64]);
+            }
+        });
+
+        assert_eq!(
+            std::fs::metadata(&pipe).unwrap().len(),
+            0,
+            "the stat must understate, or this proves nothing"
+        );
+        let error = read_within(&pipe, "the unsigned build", 8)
+            .map(|bytes| bytes.len())
+            .unwrap_err();
+        let _ = writer.join();
+
+        let message = format!("{error}");
+        assert!(
+            message.contains("an installed client will download"),
+            "got: {message}"
+        );
+    }
+
+    /// The boundary the installer draws: it refuses only once a body has
+    /// *exceeded* the ceiling, so exactly the ceiling is publishable.
+    #[test]
+    fn exactly_the_ceiling_is_allowed_and_one_byte_more_is_not() {
+        let scratch = tempfile::tempdir().unwrap();
+        let file = scratch.path().join("container");
+
+        std::fs::write(&file, vec![0u8; 8]).unwrap();
+        assert_eq!(
+            read_within(&file, "the unsigned build", 8).unwrap().len(),
+            8
+        );
+
+        std::fs::write(&file, vec![0u8; 9]).unwrap();
+        assert!(
+            read_within(&file, "the unsigned build", 8)
+                .map(|bytes| bytes.len())
+                .is_err()
         );
     }
 
