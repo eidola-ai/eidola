@@ -1466,7 +1466,7 @@ mod tests {
 
         // Archiving a leaf is still just the leaf.
         let mut cell = seed();
-        archive(&mut cell, "s3");
+        drop(archive(&mut cell, "s3"));
         assert_eq!(
             titles(&cell),
             vec![
