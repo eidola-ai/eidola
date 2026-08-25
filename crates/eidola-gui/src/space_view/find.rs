@@ -728,8 +728,35 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.find.as_ref() {
-            let input = session.input.clone();
+        let open = self.find.as_ref().map(|session| {
+            (
+                session.input.clone(),
+                session.focus.contains_focused(window, cx),
+            )
+        });
+        if let Some((input, holds)) = open {
+            // **A re-borrow is still a borrow, so the lender is refreshed to
+            // match.** The bar is opened once and re-focused many times, and
+            // the keyboard it takes on the second ⌘F comes from wherever the
+            // reader actually is — an inspector field they stepped into after
+            // opening it. Recording the lender only on the creation path left
+            // the session pointing at whatever held focus that first time (for
+            // a bar opened from the conversation, nothing), so closing handed
+            // the keyboard to `keyboard_home` and the reader's next character
+            // became a draft instead of returning to the field they were in.
+            //
+            // **Unless the bar already holds the keyboard**, which is the ⌘F
+            // pressed inside the find field itself: nothing new is borrowed
+            // there, and the focus query would answer `None` and clobber a
+            // good lender with it. Every other case *replaces* the lender —
+            // `None` included, since a reader who moved back into the
+            // conversation is owed `keyboard_home`, not the field they left.
+            if !holds {
+                let lender = self.inspector_focused_input(window, cx);
+                if let Some(session) = self.find.as_mut() {
+                    session.returned_input = lender;
+                }
+            }
             input.update(cx, |s, cx| s.focus(window, cx));
             cx.notify();
             return;

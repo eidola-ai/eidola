@@ -19593,6 +19593,65 @@ fn space_find_hands_the_keyboard_back_to_the_inspector_field(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn space_find_refreshes_the_field_it_borrowed_from_when_it_is_refocused(cx: &mut TestAppContext) {
+    // The bar is opened once and re-focused many times. Opening it from the
+    // conversation records no lender — correctly, nothing lent it — but a
+    // reader then steps into a panel field and presses the shortcut again, and
+    // *that* press borrows the keyboard from the field. Recording the lender
+    // only where the session is created left the second borrow unrecorded, so
+    // closing handed the keyboard to `keyboard_home` and the next character
+    // became a draft in the conversation behind the panel.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Opened from the conversation: no field lent the keyboard.
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    // The reader steps into a panel field, then presses the shortcut again.
+    let title = view
+        .read_with(&vcx, |v, _| v.inspector_title_state_for_test())
+        .expect("title field");
+    vcx.update(|window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    });
+    vcx.run_until_parked();
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+
+    let field = title.read_with(&vcx, |s, cx| s.focus_handle(cx));
+    vcx.update(|window, _| {
+        assert!(
+            field.is_focused(window),
+            "the keyboard went back to the field the *second* press borrowed it from"
+        );
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "…so nothing started composing in the conversation behind the panel"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_paints_nothing_on_a_buffer_it_is_not_describing(cx: &mut TestAppContext) {
     // The other half of the IME rule. `sync_find` deliberately keeps the
     // projection of the text the reader has *committed*, so while a
