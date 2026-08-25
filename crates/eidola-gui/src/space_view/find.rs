@@ -696,10 +696,14 @@ struct ScopeNode {
     /// missing one is simply not built — the count never flickers against
     /// fragments (`MarkdownEditorState::is_composing`).
     frozen: bool,
-    /// The cursor the node's own editor renders with, straight from
-    /// `MarkdownEditorState::render_cursor` — `None` for a node with no live
-    /// editor, and for one whose editor is disabled, which is the published
-    /// render either way.
+    /// The cursor the node is about to be *rendered* with: `Some` for a node
+    /// whose editor this frame paints enabled — an inline edit, any draft —
+    /// and `None` for a published one, which is the read-only render.
+    ///
+    /// Derived from the view's own edit state, never read back off the
+    /// editor: `disabled` is the element prop echoed during the child's
+    /// render, one pass later than the parent's, so the child cannot answer
+    /// for a frame that has not painted yet.
     render_cursor: Option<Selection>,
 }
 
@@ -1061,7 +1065,21 @@ impl SpaceView {
                 (
                     SharedString::from(editor.value().to_string()),
                     editor.is_composing(),
-                    editor.render_cursor(),
+                    // **The mode is the one this render is about to paint,
+                    // asked of the parent rather than of the child.** The
+                    // editor's own `disabled` is an echo of the element prop,
+                    // written when the child renders — which is *after*
+                    // `sync_find` runs in the parent's own render, and without
+                    // a notify behind it. On the frame an edit begins, asking
+                    // the editor answered with the previous read-only frame,
+                    // so the node was projected as published text while the
+                    // reader looked at a cursor-aware editor, and nothing
+                    // invalidated that until the caret or buffer moved. This
+                    // branch is reached on exactly the predicate `post.rs`
+                    // passes to `.disabled(!editing)`, so the node is enabled
+                    // this frame by construction and its live selection is the
+                    // cursor the render will use.
+                    Some(editor.selection()),
                 )
             }
             None => (post.content.clone(), false, None),
@@ -1077,7 +1095,11 @@ impl SpaceView {
             content: SharedString::from(editor.value().to_string()),
             embeds: EmbedMap::new(draft.embed_map()),
             frozen: editor.is_composing(),
-            render_cursor: editor.render_cursor(),
+            // Every draft renders enabled — the active composer and each
+            // in-flow tail draft are built with no `.disabled(..)` at all —
+            // so a draft in scope is always cursor-aware, and asking the
+            // editor would take the same frame-late answer for no gain.
+            render_cursor: Some(editor.selection()),
         })
     }
 

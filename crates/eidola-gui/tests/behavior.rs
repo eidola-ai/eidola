@@ -19289,6 +19289,64 @@ fn space_find_searches_an_edit_in_progress_not_the_post_it_will_replace(cx: &mut
 }
 
 #[gpui::test]
+fn space_find_projects_an_edit_started_under_an_open_bar(cx: &mut TestAppContext) {
+    // The bar is already open when the reader starts an inline edit, and they
+    // touch neither caret nor buffer afterwards. `sync_find` runs in the
+    // parent's own render, *before* the post's editor child renders and
+    // records the enabled prop — and that record carries no notify — so a
+    // projection that asked the editor what mode it was in got the previous
+    // read-only frame's answer and kept it.
+    //
+    // Only a *user* post is editable, and the link leads the line so the
+    // caret an edit opens with sits on the construct's boundary and reveals
+    // it, without the test touching the caret at all.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "It hunts by hovering.");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![
+            fixture_user_post(
+                "a1",
+                "[survey](https://kestrel.example/data) leads the line.",
+            ),
+            second,
+        ],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel.example");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "published, the URL is hidden and unmatchable"
+        );
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        let (matches, _) = v.find_matches_for_test();
+        assert_eq!(
+            matches.iter().map(|(n, _)| n.as_ref()).collect::<Vec<_>>(),
+            vec!["a1"],
+            "the edit renders cursor-aware, so the URL it exposes is searched \
+             (editor={:?} sel={:?} built={})",
+            v.post_body_editor_for_test("a1").is_some(),
+            v.post_body_editor_for_test("a1")
+                .map(|e| e.read(cx).selection()),
+            v.projections_built_for_test(),
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_reveals_a_match_in_the_off_branch_composer(cx: &mut TestAppContext) {
     // The scope deliberately admits the active draft whatever branch it belongs
     // to, because its composer floats over whatever is showing — so a match in
