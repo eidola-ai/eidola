@@ -75,6 +75,64 @@ use crate::{
 /// and the delegation waits until the process restarts.
 pub(crate) type DriverRegistry = HashMap<String, Option<Arm>>;
 
+/// Delegated room → the **item** the turn that opened it answers under,
+/// process-wide. See [`Inner::note_spawning_answer_item`].
+pub(crate) type SpawningAnswerRegistry = Arc<std::sync::Mutex<HashMap<String, String>>>;
+
+/// One room's record of which turn opened it, **kept only once the spawn has
+/// committed** — released on drop for the reason a regeneration's claim is: an
+/// early `?`, a guard refusal and a panic all release it, and nothing has to
+/// remember to.
+///
+/// The record has to be written *before* the spawning transaction (the spawn's
+/// own emissions can arm the driver, so a record written after the room exists
+/// leaves a window in which the driver asks and is told nothing) — which means
+/// every way that transaction can fail is a way to leave a record naming a room
+/// that was never created. Nothing would ever remove it: the driver's own
+/// `forget_spawning_answer_item` runs from a walk, and there is no room to
+/// walk. That is not a rounding error either — the live-rooms ceiling is a
+/// standing refusal, so an owner that has reached it leaks one entry per
+/// delegation it goes on attempting.
+///
+/// `rooms_spawned_here` needs no such guard and says so: it stops recording
+/// once the startup sweep has read it, so it is bounded by construction.
+pub(crate) struct SpawningAnswerGuard {
+    rooms: SpawningAnswerRegistry,
+    space_id: String,
+    kept: bool,
+}
+
+impl SpawningAnswerGuard {
+    pub(crate) fn note(rooms: &SpawningAnswerRegistry, space_id: &str, item_id: &str) -> Self {
+        rooms
+            .lock()
+            .expect("spawning answer record poisoned")
+            .insert(space_id.to_string(), item_id.to_string());
+        Self {
+            rooms: rooms.clone(),
+            space_id: space_id.to_string(),
+            kept: false,
+        }
+    }
+
+    /// The room exists, so the record is the driver's to drop when the
+    /// delegation ends.
+    pub(crate) fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for SpawningAnswerGuard {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        if let Ok(mut rooms) = self.rooms.lock() {
+            rooms.remove(&self.space_id);
+        }
+    }
+}
+
 /// Why a room is being armed, which decides one thing: whether it may wait for
 /// its anchor to be answered (see [`Inner::report_delegation`]).
 ///
@@ -653,11 +711,17 @@ impl Inner {
     /// durable rule stays the fallback, and this refines it exactly where a
     /// refinement is meaningful. It is the same lifetime argument the sweep's
     /// own licence rests on.
+    /// Kept unconditionally — the caller is a test seam standing in for a
+    /// spawn that has already committed. The **spawn door** takes
+    /// [`SpawningAnswerGuard::note`] instead, so a refusal cannot leave a
+    /// record behind.
     pub(crate) fn note_spawning_answer_item(&self, space_id: &str, item_id: &str) {
-        self.spawning_answer_items
-            .lock()
-            .expect("spawning answer record poisoned")
-            .insert(space_id.to_string(), item_id.to_string());
+        SpawningAnswerGuard::note(&self.spawning_answer_items, space_id, item_id).keep();
+    }
+
+    /// The registry itself, for the spawn door's guard.
+    pub(crate) fn spawning_answers(&self) -> &SpawningAnswerRegistry {
+        &self.spawning_answer_items
     }
 
     /// The item the turn that opened `space_id` answers under, if this process
@@ -673,7 +737,7 @@ impl Inner {
     /// Drop the record for a delegation that is over. Called from the terminal
     /// exits `drive_subspace` already takes, so the map is bounded by the rooms
     /// this process has open rather than by everything it ever opened.
-    fn forget_spawning_answer_item(&self, space_id: &str) {
+    pub(crate) fn forget_spawning_answer_item(&self, space_id: &str) {
         self.spawning_answer_items
             .lock()
             .expect("spawning answer record poisoned")

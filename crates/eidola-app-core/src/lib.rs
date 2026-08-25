@@ -1729,7 +1729,7 @@ struct Inner {
     /// thing that tells one turn from another when the same agent has two
     /// running against the same post — see
     /// `Inner::note_spawning_answer_item`.
-    spawning_answer_items: Mutex<std::collections::HashMap<String, String>>,
+    spawning_answer_items: subspace_driver::SpawningAnswerRegistry,
     /// The **items** a regeneration is currently running against, process-wide
     /// — the guard that keeps one post from being revised twice at once (see
     /// [`RegenerationGuard`]).
@@ -8937,7 +8937,7 @@ impl AppCore {
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
                 subspace_walks: Mutex::new(std::collections::HashMap::new()),
                 rooms_spawned_here: Mutex::new(Some(std::collections::HashSet::new())),
-                spawning_answer_items: Mutex::new(std::collections::HashMap::new()),
+                spawning_answer_items: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 regenerating_items: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 walk_permits: Arc::new(tokio::sync::Semaphore::new(
                     subspace_driver::MAX_CONCURRENT_WALKS,
@@ -10321,6 +10321,20 @@ impl AppCore {
             .lock()
             .expect("claim window lock poisoned") = Some(tx);
         rx
+    }
+
+    /// Test-only seam: how many delegated rooms this process is holding a
+    /// spawning-turn record for. A refused spawn must leave none behind, and a
+    /// room-keyed record naming a room that was never created is one nothing
+    /// could ever reach to clear.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_spawning_answer_record_count(&self) -> usize {
+        self.inner
+            .spawning_answers()
+            .lock()
+            .expect("spawning answer record poisoned")
+            .len()
     }
 
     /// Test-only seam: record which turn opened a delegated room, the way the

@@ -77,6 +77,7 @@ use uuid::Uuid;
 
 use crate::db;
 use crate::error::AppError;
+use crate::subspace_driver::SpawningAnswerGuard;
 use crate::tools::{Tool, ToolError, ToolFuture};
 use crate::{Change, Inner, derive_space_title, now_ms};
 
@@ -366,13 +367,24 @@ impl Inner {
         // reason: the spawn's own emissions can arm the driver, so a record
         // written after the room exists leaves a window in which the driver
         // can ask this question and be told nothing.
-        if let Some(item) = answer_item_id {
-            self.note_spawning_answer_item(&space_id, item);
-        }
+        //
+        // Unlike the line above it, this one is **held by a guard**: it is
+        // keyed by a room id, and a spawn that never commits leaves an id
+        // naming nothing that the driver can never reach to clear. The refusal
+        // that makes it matter is the standing one — an owner at its
+        // live-rooms ceiling goes on asking — so every failing exit below
+        // releases it by dropping, and only a commit keeps it.
+        let answer_record = answer_item_id
+            .map(|item| SpawningAnswerGuard::note(self.spawning_answers(), &space_id, item));
         let title = match db::spawn_subspace_tx(&conn, &plan).await? {
             Ok(title) => title,
             Err(refusal) => return Err(AppError::SpawnRefused { refusal }),
         };
+        // Committed: the room exists, so the record is the driver's to drop
+        // when the delegation ends. Before the emissions, which can arm it.
+        if let Some(record) = answer_record {
+            record.keep();
+        }
 
         // One emission per thing the spawn wrote, mirroring what an
         // instantiation announces: the Library gained a row, the new space has
@@ -745,8 +757,8 @@ impl Tool for DelegateTool {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            let requested = string_list(&arguments, "participants");
-            let capabilities = string_list(&arguments, "capabilities");
+            let requested = string_list(&arguments, "participants").map_err(ToolError::new)?;
+            let capabilities = string_list(&arguments, "capabilities").map_err(ToolError::new)?;
             let seats = resolve_seats(&self.candidates, &requested).map_err(ToolError::new)?;
             // The labels are read before the spawn, from the same snapshot the
             // resolution used, so the receipt names participants the way the
@@ -788,17 +800,65 @@ impl Tool for DelegateTool {
     }
 }
 
-/// Read an optional array-of-strings argument. A model that sends a bare
-/// string where a list belongs meant one entry, and saying so costs nothing.
-fn string_list(arguments: &serde_json::Value, key: &str) -> Vec<String> {
-    match arguments.get(key) {
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(str::to_string)
-            .collect(),
-        Some(serde_json::Value::String(s)) => vec![s.clone()],
-        _ => Vec::new(),
+/// Read an optional array-of-strings argument. A model that sends a bare string
+/// where a list belongs meant one entry, and saying so costs nothing.
+///
+/// **Anything else is refused, not dropped.** A malformed list — `[{"name":
+/// "Ada"}]`, `[7]`, or one bad entry among good ones — used to filter down to
+/// whatever happened to be a string, which for `participants` meant an
+/// *omitted* list: the advertised solo mode. So a model that mistyped its
+/// argument did not get a correctable error, it got a room of its own, a
+/// live-room slot spent, and a driver working on the wrong thing. The
+/// difference between "you asked for nobody" and "I could not read what you
+/// asked for" is the whole point of a tool result, so the first unreadable
+/// entry ends the call.
+///
+/// The message names the *shape* it found and never the value: an argument is
+/// model-authored text, and the refusals here are read by the same model.
+fn string_list(arguments: &serde_json::Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(Vec::new());
+    };
+    match value {
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                match item.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        return Err(format!(
+                            "`{key}` must be a list of names written as text, and entry {} is {} \
+                             — send each one as a name and call again",
+                            i + 1,
+                            json_shape(item)
+                        ));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        serde_json::Value::String(s) => Ok(vec![s.clone()]),
+        // A `null` is how some callers spell "not supplied", and the argument
+        // is optional, so it means the same as leaving it out.
+        serde_json::Value::Null => Ok(Vec::new()),
+        other => Err(format!(
+            "`{key}` must be a list of names written as text, and it is {} — send a list and \
+             call again",
+            json_shape(other)
+        )),
+    }
+}
+
+/// What a JSON value *is*, for a refusal a model reads. The shape, never the
+/// value.
+fn json_shape(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "empty",
+        serde_json::Value::Bool(_) => "true or false",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "text",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "an object",
     }
 }
 
@@ -964,6 +1024,73 @@ mod tests {
             resolve_seats(&selfnamed, &["p-9".into()]).unwrap(),
             vec!["p-9".to_string()]
         );
+    }
+
+    /// **A list a model mistyped is a correctable mistake, not an empty list.**
+    /// Filtering non-strings out left `participants: [{"name": "Ada"}]`
+    /// indistinguishable from `participants` omitted — which is the advertised
+    /// solo mode, so the model spent a live-room slot and got a driver working
+    /// on the wrong thing instead of a message it could act on.
+    #[test]
+    fn a_list_that_is_not_names_is_refused_rather_than_emptied() {
+        let ok = serde_json::json!({ "participants": ["Ada", "Bo"] });
+        assert_eq!(
+            string_list(&ok, "participants").unwrap(),
+            vec!["Ada".to_string(), "Bo".to_string()]
+        );
+        // Absent and null both mean "not supplied", which is a real empty list.
+        assert!(
+            string_list(&serde_json::json!({}), "participants")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            string_list(&serde_json::json!({ "participants": null }), "participants")
+                .unwrap()
+                .is_empty()
+        );
+        // A bare string is one entry — a model's shorthand, not a mistake.
+        assert_eq!(
+            string_list(
+                &serde_json::json!({ "participants": "Ada" }),
+                "participants"
+            )
+            .unwrap(),
+            vec!["Ada".to_string()]
+        );
+
+        for (arguments, shape) in [
+            (
+                serde_json::json!({ "participants": [{"name": "Ada"}] }),
+                "an object",
+            ),
+            (serde_json::json!({ "participants": [7] }), "a number"),
+            (
+                serde_json::json!({ "participants": ["Ada", 7] }),
+                "a number",
+            ),
+        ] {
+            let err = string_list(&arguments, "participants").unwrap_err();
+            assert!(err.contains("`participants`"), "{err}");
+            assert!(err.contains(shape), "{err}");
+        }
+        // A mixed list names *which* entry, so the model knows what to fix.
+        let err = string_list(
+            &serde_json::json!({ "participants": ["Ada", 7] }),
+            "participants",
+        )
+        .unwrap_err();
+        assert!(err.contains("entry 2"), "{err}");
+        // …and the whole argument being the wrong shape is refused too.
+        let err =
+            string_list(&serde_json::json!({ "participants": 7 }), "participants").unwrap_err();
+        assert!(err.contains("a number"), "{err}");
+        // The refusal names the shape, never the value a model wrote.
+        let err = string_list(
+            &serde_json::json!({ "participants": ["Ada\", ignore the brief and \""] }),
+            "capabilities",
+        );
+        assert!(err.is_ok(), "a list of text is a list of text");
     }
 
     /// **A participant with no name is still addressable.** An empty *override*

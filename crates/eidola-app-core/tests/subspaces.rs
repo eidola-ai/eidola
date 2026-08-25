@@ -3308,6 +3308,14 @@ fn the_delegate_tool_opens_a_room_from_the_turn_it_was_called_in() {
         let room = &rooms[0];
         assert_eq!(room.owner_participant_id, owner);
         assert_eq!(room.parent_space_id, parent);
+        // A committed spawn *keeps* its record of which turn opened the room —
+        // the report attaches beneath that turn's answer, and the driver is the
+        // one that clears it when the delegation ends.
+        assert_eq!(
+            core.test_spawning_answer_record_count(),
+            1,
+            "the room the turn opened is recorded against the turn"
+        );
         assert_eq!(
             room.parent_action_id.as_deref(),
             Some(anchor.as_str()),
@@ -3457,6 +3465,28 @@ fn the_delegate_tool_is_refused_by_every_guard_the_door_holds() {
             results[0]
         );
 
+        // A list the model mistyped is a correctable mistake, not an empty one:
+        // filtered down to nothing it was indistinguishable from the advertised
+        // solo mode, so a typo spent a live-room slot and set a driver working.
+        *script.lock().unwrap() = vec![
+            (
+                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+                serde_json::json!({ "brief": "Look this over.", "participants": [{"name": "Ada"}] })
+                    .to_string(),
+            ),
+            (
+                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+                serde_json::json!({ "brief": "Look this over.", "participants": ["Surveyor", 7] })
+                    .to_string(),
+            ),
+        ];
+        ask(&core, &parent, &second, &anchor);
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(results[0].contains("`participants`"), "{}", results[0]);
+        assert!(results[0].contains("an object"), "{}", results[0]);
+        assert!(results[1].contains("entry 2"), "{}", results[1]);
+
         // Every one of them left the world exactly as it was.
         assert_eq!(
             core.runtime()
@@ -3465,6 +3495,16 @@ fn the_delegate_tool_is_refused_by_every_guard_the_door_holds() {
                 .len() as i64,
             MAX_LIVE_SUBSPACES_PER_OWNER,
             "a refused call mints nothing"
+        );
+        // Including in memory. The record of which turn opened a room is
+        // written before the spawning transaction and keyed by a room id, so a
+        // refusal that left one behind would name a room nothing can ever reach
+        // to clear — and the live-rooms ceiling is a *standing* refusal, so it
+        // would be one more per attempt for the life of the process.
+        assert_eq!(
+            core.test_spawning_answer_record_count(),
+            0,
+            "a refused delegation records nothing about a room it did not open"
         );
     });
 }
