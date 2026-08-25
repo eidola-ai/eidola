@@ -507,9 +507,6 @@ pub(crate) fn resolve_seats(
     let mut seats: Vec<String> = Vec::new();
     for raw in requested {
         let name = raw.trim();
-        if name.is_empty() {
-            continue;
-        }
         let id = match candidates.iter().find(|c| c.participant_id == name) {
             Some(c) => c.participant_id.clone(),
             None => {
@@ -520,6 +517,18 @@ pub(crate) fn resolve_seats(
                     .collect();
                 match matches.as_slice() {
                     [one] => one.participant_id.clone(),
+                    // **A blank entry is noise only where nothing answers to
+                    // it.** An empty label is supported state — on an override
+                    // column `NULL` means inherit and `''` means "override to
+                    // empty" — so the roster really can show a participant
+                    // with no name, and a model copying that name back was
+                    // silently dropped: the tool opened a solo room instead of
+                    // seating the agent, with no refusal to correct. Matching
+                    // is therefore tried first, and the skip is what is left
+                    // when the request names nobody *and* names nothing: a
+                    // stray "" or "  " in the list, which is a model's
+                    // punctuation rather than a request.
+                    [] if name.is_empty() => continue,
                     [] => return Err(unknown_seat_message(candidates, name)),
                     _ => return Err(ambiguous_seat_message(&matches, name)),
                 }
@@ -530,6 +539,20 @@ pub(crate) fn resolve_seats(
         }
     }
     Ok(seats)
+}
+
+/// How a candidate is named *to the model* in a listing it is expected to act
+/// on: its quoted label, or — for a participant whose effective label is blank
+/// — its id, which is the only thing left that can be typed back.
+///
+/// The same rule the ambiguity refusal already follows one case along: where a
+/// name cannot pick a participant out, the listing carries the thing that can.
+fn addressable(candidate: &SeatCandidate) -> String {
+    if candidate.label.trim().is_empty() {
+        candidate.participant_id.clone()
+    } else {
+        crate::quoted_label(&candidate.label)
+    }
 }
 
 /// Two participants answer to one name, so the label cannot pick between them
@@ -567,7 +590,7 @@ fn unknown_seat_message(candidates: &[SeatCandidate], name: &str) -> String {
     }
     let available = candidates
         .iter()
-        .map(|c| crate::quoted_label(&c.label))
+        .map(addressable)
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -613,7 +636,7 @@ impl DelegateTool {
 
 /// The receipt the model reads back. Pure, so it is unit-tested: it is what
 /// tells a model the work is under way somewhere it cannot see.
-pub(crate) fn delegation_receipt(spawned: &SpawnedSubspace, seated: &[String]) -> String {
+pub(crate) fn delegation_receipt(spawned: &SpawnedSubspace, seated: &[SeatCandidate]) -> String {
     let title = crate::quoted_label(spawned.space.title.as_deref().unwrap_or("(untitled)"));
     let who = if seated.is_empty() {
         "It holds you alone.".to_string()
@@ -622,7 +645,7 @@ pub(crate) fn delegation_receipt(spawned: &SpawnedSubspace, seated: &[String]) -
             "It holds you and {}.",
             seated
                 .iter()
-                .map(|l| crate::quoted_label(l))
+                .map(addressable)
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -701,13 +724,13 @@ impl Tool for DelegateTool {
             // The labels are read before the spawn, from the same snapshot the
             // resolution used, so the receipt names participants the way the
             // roster did.
-            let seated: Vec<String> = seats
+            let seated: Vec<SeatCandidate> = seats
                 .iter()
                 .filter_map(|id| {
                     self.candidates
                         .iter()
                         .find(|c| &c.participant_id == id)
-                        .map(|c| c.label.clone())
+                        .cloned()
                 })
                 .collect();
 
@@ -835,7 +858,7 @@ mod tests {
                 "two frames, four delimiters, none of them the label's: {err}"
             );
             // …and so does the receipt's roster.
-            let receipt = delegation_receipt(&spawned("Review"), &[hostile.to_string()]);
+            let receipt = delegation_receipt(&spawned("Review"), &[candidate("p-x", hostile)]);
             assert!(!receipt.contains('\n'), "{receipt}");
             assert!(receipt.starts_with("Opened \"Review\" (s-1)."), "{receipt}");
             assert_eq!(
@@ -883,6 +906,55 @@ mod tests {
             participant_ids: vec!["p-x".into()],
             capabilities: Vec::new(),
         }
+    }
+
+    /// **A participant with no name is still addressable.** An empty *override*
+    /// label is supported state — on an override column `NULL` means inherit
+    /// and `''` means "override to empty" — so the roster can show a
+    /// participant called nothing at all. Copying that name back used to be
+    /// discarded with the stray whitespace, so the tool opened a solo room
+    /// instead of seating the agent and said nothing about it, and no refusal
+    /// ever exposed an id to use instead.
+    #[test]
+    fn a_participant_with_a_blank_label_can_still_be_seated() {
+        let candidates = vec![candidate("p-blank", ""), candidate("p-ada", "Ada")];
+        // The name the roster showed resolves to the participant that wears it.
+        assert_eq!(
+            resolve_seats(&candidates, &["".into()]).unwrap(),
+            vec!["p-blank".to_string()]
+        );
+        // …and so does the id, which is what a listing has to offer for a
+        // participant whose name cannot be typed usefully.
+        assert_eq!(
+            resolve_seats(&candidates, &["p-blank".into()]).unwrap(),
+            vec!["p-blank".to_string()]
+        );
+        // A listing the model is expected to act on names it by that id rather
+        // than by an empty pair of quotes.
+        let err = resolve_seats(&candidates, &["Nobody".into()]).unwrap_err();
+        assert!(err.contains("p-blank"), "{err}");
+        assert!(err.contains("\"Ada\""), "{err}");
+        // So does the receipt.
+        let receipt = delegation_receipt(&spawned("Review"), &[candidate("p-blank", "  ")]);
+        assert!(receipt.contains("It holds you and p-blank."), "{receipt}");
+
+        // Two of them cannot be told apart by name, which is the refusal that
+        // already carries ids.
+        let tied = vec![candidate("p-1", ""), candidate("p-2", " ")];
+        let err = resolve_seats(&tied, &["".into()]).unwrap_err();
+        assert!(err.contains("more than one participant"), "{err}");
+        assert!(err.contains("p-1, p-2"), "{err}");
+    }
+
+    /// …while a blank entry in a list of real names is still punctuation. The
+    /// skip is what is left when a request names nobody *and* names nothing.
+    #[test]
+    fn a_blank_entry_is_ignored_when_nobody_answers_to_it() {
+        let candidates = vec![candidate("p-ada", "Ada")];
+        assert_eq!(
+            resolve_seats(&candidates, &["".into(), "  ".into(), "Ada".into()]).unwrap(),
+            vec!["p-ada".to_string()]
+        );
     }
 
     /// **A label that leaves ASCII is still a name.** `eq_ignore_ascii_case`

@@ -303,6 +303,60 @@ fn a_solo_delegation_works_its_own_brief() {
     });
 }
 
+/// **A router cannot empty a brief either.** A delegated room inherits its
+/// parent's `router_model`, and a room that seats helpers has a non-empty
+/// mechanical set over its brief — so the floor stands aside and the router is
+/// handed a real choice. `{"notify": []}` is a valid answer from it, and over a
+/// brief that answer is the room taking no turn at all: the driver would walk a
+/// room where nothing happened and report the untouched brief as a concluded
+/// delegation. That is the same silent no-work delegation the floor exists to
+/// prevent, arriving through the one door a floor inside the *mechanical* set
+/// did not cover — which is why the floor binds the refined plan too.
+#[test]
+fn a_router_that_selects_nobody_cannot_empty_a_brief() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            router: RouterBehavior::Reply(r#"{"notify": []}"#.into()),
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let a = shared_agent(&core, &parent, "Surveyor");
+        let b = shared_agent(&core, &parent, "Pilot");
+        // Two helpers, so the brief's mechanical set is non-empty and the floor
+        // does not fire on its own.
+        let out = spawn(&core, &parent, &owner, vec![a, b]);
+        let room = out.space.id.clone();
+        core.test_register_loaded_local_model("local", ROUTER_SLUG, mock.port());
+        core.runtime()
+            .block_on(core.set_space_router_model(room.clone(), Some(ROUTER_MODEL.into())))
+            .expect("the room routes, exactly as one inheriting a routed parent does");
+
+        drive(&core, &room).expect("the room is driven");
+
+        let room_tree = tree(&core, &room);
+        assert_eq!(room_tree.len(), 2, "brief + a worked turn: {room_tree:?}");
+        assert_eq!(room_tree[1].action_type, "inference");
+        assert_eq!(
+            room_tree[1].participant.label, "Navigator",
+            "the agent answerable for the delegation takes the turn the router emptied"
+        );
+        assert!(
+            mock.chat_bodies()
+                .iter()
+                .any(|b| b["model"] == ROUTER_MODEL),
+            "the router really was consulted — the floor is not a bypass"
+        );
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.references[0].antecedent_action_id, room_tree[1].action_id,
+            "the report quotes the work, not an untouched brief"
+        );
+    });
+}
+
 /// The floor is a floor, not a widening: a room that seats helpers plans them
 /// and **not** its owner, whose deliberate `human` policy keeps it quiet among
 /// them until it writes the report.
@@ -3624,8 +3678,11 @@ fn empty_router_hops_still_spend_the_delegation_budget() {
                 .runtime()
                 .block_on(window.recv())
                 .expect("the walk reaches its window");
-            // Armed *inside* the window: a router on the brief that selects
-            // nobody would drive no turn, and this window would never open.
+            // Armed *inside* the window, so the walk's opening hop is the
+            // unrouted one this test wants to count from. (A router on the
+            // brief that selects nobody no longer silences the room — the
+            // brief floor gives the owner that turn — but it would still be a
+            // different first hop than the one measured here.)
             core.test_register_loaded_local_model("local", ROUTER_SLUG, mock.port());
             core.runtime()
                 .block_on(core.set_space_router_model(room.clone(), Some(ROUTER_MODEL.into())))

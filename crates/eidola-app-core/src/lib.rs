@@ -1869,6 +1869,58 @@ struct Inner {
 
 // --- Config helpers (sync) ---------------------------------------------------
 
+/// The mechanical notify set, with the **brief floor kept separable**.
+///
+/// Two things want the same computation and want different halves of it. The
+/// mechanical door ([`Inner::mechanical_plan`], and `AppCore`'s inspection
+/// seam over it) wants the set the rule answers with — floor folded in. The
+/// door that actually drives turns ([`Inner::plan_and_refine`]) wants the floor
+/// *after* the may-decline router has spoken, because the router legitimately
+/// answers "nobody" and over a `brief` that answer is the delegated room doing
+/// no work at all and reporting its own untouched brief as concluded — the
+/// silent no-work delegation the floor exists to make unrepresentable.
+///
+/// Carrying the floor beside the plan is what lets one derivation serve both:
+/// the reads happen once, `applied()` is the mechanical answer, and the
+/// refining door still holds the turn the router is not allowed to erase.
+struct MechanicalOutcome {
+    /// The set the notify policies produced, before the floor.
+    plan: NotificationPlan,
+    /// The turn a `brief` falls back to when nothing else answers it — the
+    /// room's owner, which is its author. `None` for any other post, for an
+    /// owner that cannot respond, and for a plan that never got that far.
+    floor: Option<PlannedTurn>,
+}
+
+impl MechanicalOutcome {
+    /// Nothing to notify and no floor — the shape every early exit takes.
+    fn nothing() -> Self {
+        Self {
+            plan: NotificationPlan::Turns(Vec::new()),
+            floor: None,
+        }
+    }
+
+    /// The cascade guard spoke. It is not a set the floor may fill: a pause is
+    /// the room being told to stop, and the report says so.
+    fn paused(depth: i64, limit: i64) -> Self {
+        Self {
+            plan: NotificationPlan::Paused { depth, limit },
+            floor: None,
+        }
+    }
+
+    /// The mechanical answer: the floor applies exactly when nothing else does.
+    fn applied(self) -> NotificationPlan {
+        match (self.plan, self.floor) {
+            (NotificationPlan::Turns(t), Some(floor)) if t.is_empty() => {
+                NotificationPlan::Turns(vec![floor])
+            }
+            (plan, _) => plan,
+        }
+    }
+}
+
 impl Inner {
     fn load_config(&self) -> Config {
         Config::load_from(&self.config_path)
@@ -8106,11 +8158,11 @@ impl Inner {
     /// A **pure read** — no network, no commits, no emissions. Production
     /// callers go through [`Inner::plan_and_refine`], which additionally
     /// filters this set through the space's may-decline router.
-    async fn mechanical_plan(
+    async fn mechanical_outcome(
         &self,
         space_id: &str,
         post_action_id: &str,
-    ) -> Result<NotificationPlan, AppError> {
+    ) -> Result<MechanicalOutcome, AppError> {
         let conn = self.db_conn().await?;
 
         // The post must belong to this space: the notify set + cascade limit come
@@ -8131,7 +8183,7 @@ impl Inner {
         // it prevents is silent.
         let action_type = match db::action_type(&conn, post_action_id).await? {
             Some(t) if db::is_post_action_type(&t) => t,
-            _ => return Ok(NotificationPlan::Turns(Vec::new())),
+            _ => return Ok(MechanicalOutcome::nothing()),
         };
 
         // **An archived conversation plans no turns**, and the same read that
@@ -8144,21 +8196,21 @@ impl Inner {
         // hidden or refused a reader — it is the end of new work.
         let space = db::get_space(&conn, space_id).await?;
         if space.as_ref().is_some_and(|s| s.archived_at.is_some()) {
-            return Ok(NotificationPlan::Turns(Vec::new()));
+            return Ok(MechanicalOutcome::nothing());
         }
         let limit = space
             .map(|s| s.cascade_limit)
             .unwrap_or(DEFAULT_CASCADE_LIMIT);
         let depth = db::agent_cascade_depth(&conn, post_action_id).await?;
         if depth >= limit {
-            return Ok(NotificationPlan::Paused { depth, limit });
+            return Ok(MechanicalOutcome::paused(depth, limit));
         }
 
         // The post's author (excluded from the notify set; its kind resolves the
         // `human` predicate).
         let (author_id, author_kind) = match db::action_author(&conn, post_action_id).await? {
             Some((id, _scope, kind)) => (id, kind),
-            None => return Ok(NotificationPlan::Turns(Vec::new())),
+            None => return Ok(MechanicalOutcome::nothing()),
         };
 
         // An agent with no model can't respond — never plan a turn for it.
@@ -8198,19 +8250,42 @@ impl Inner {
         // answerable for a delegation stays quiet among its helpers, and a
         // floor that a policy could switch off would be no floor. Everything
         // that makes a participant unable to answer still applies.
-        if turns.is_empty()
-            && action_type == db::BRIEF_ACTION_TYPE
-            && let Some(owner) = members
-                .iter()
-                .find(|m| m.participant_id == author_id && m.role == "owner" && can_respond(m))
-        {
-            turns.push(PlannedTurn {
+        //
+        // **Computed whether or not it fires**, because the set it stands aside
+        // for is not the last word: the may-decline router runs after this,
+        // "nobody" is a valid answer from it, and over a brief that answer is
+        // the room doing no work at all. So the floor travels beside the plan
+        // rather than only inside it — see [`MechanicalOutcome`].
+        let floor = (action_type == db::BRIEF_ACTION_TYPE)
+            .then(|| {
+                members
+                    .iter()
+                    .find(|m| m.participant_id == author_id && m.role == "owner" && can_respond(m))
+            })
+            .flatten()
+            .map(|owner| PlannedTurn {
                 participant_id: owner.participant_id.clone(),
                 target_action_id: post_action_id.to_string(),
                 cascade_depth: depth + 1,
             });
-        }
-        Ok(NotificationPlan::Turns(turns))
+        Ok(MechanicalOutcome {
+            plan: NotificationPlan::Turns(turns),
+            floor,
+        })
+    }
+
+    /// The mechanical notify set as the rule answers it, floor folded in — see
+    /// [`Inner::mechanical_outcome`], the same computation with the floor still
+    /// separable.
+    async fn mechanical_plan(
+        &self,
+        space_id: &str,
+        post_action_id: &str,
+    ) -> Result<NotificationPlan, AppError> {
+        Ok(self
+            .mechanical_outcome(space_id, post_action_id)
+            .await?
+            .applied())
     }
 
     /// The notification plan production drives: the mechanical set
@@ -8266,10 +8341,34 @@ impl Inner {
                 return Ok(NotificationPlan::Turns(Vec::new()));
             }
         }
-        let plan = self.mechanical_plan(space_id, post_action_id).await?;
-        Ok(self
-            .refine_notifications(space_id, post_action_id, plan)
-            .await)
+        // **The brief floor is re-asserted after refinement, because the
+        // router can empty what the floor stood aside for.** A delegated room
+        // inherits its parent's `router_model`, and a room that seats helpers
+        // has a non-empty mechanical set — so the floor does not fire, and the
+        // router is then handed a real choice. `{"notify": []}` is a *valid*
+        // answer from it ("nobody responds"), and over a `brief` that answer is
+        // the room taking no turn at all: the driver walks a room where nothing
+        // happened and reports the untouched brief as a concluded delegation.
+        // That is precisely the silent no-work delegation the floor exists to
+        // make unrepresentable, arriving by the one door the floor did not
+        // cover.
+        //
+        // So the floor binds the *refined* plan too. It is still a floor and
+        // not a veto: the router's selection stands whenever it selected
+        // anybody, and this only replaces "nobody" with the one agent
+        // answerable for the delegation. A router cannot switch it off for the
+        // same reason a notify policy cannot.
+        let outcome = self.mechanical_outcome(space_id, post_action_id).await?;
+        let floor = outcome.floor.clone();
+        let refined = self
+            .refine_notifications(space_id, post_action_id, outcome.applied())
+            .await;
+        Ok(match (refined, floor) {
+            (NotificationPlan::Turns(t), Some(floor)) if t.is_empty() => {
+                NotificationPlan::Turns(vec![floor])
+            }
+            (refined, _) => refined,
+        })
     }
 
     /// The composer CTA path: save a post (`post`), then plan + refine over it
