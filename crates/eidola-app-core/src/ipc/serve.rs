@@ -211,6 +211,39 @@ async fn read_frames<R: AsyncRead + Unpin>(
             }
         };
 
+        // The reserved id is judged before the claim, because it is the one id
+        // that is never anybody's to hold. Its refusal is already uncorrelated:
+        // `request.id` *is* `NO_REQUEST` here.
+        if request.id == NO_REQUEST {
+            refuse!(
+                NO_REQUEST,
+                ProtocolError::ReservedRequestId {
+                    reserved: request.id,
+                }
+            );
+            continue;
+        }
+
+        // **Claimed before any refusal that would echo the id**, which is what
+        // keeps "exactly one frame ever wears an id" true for refusals and not
+        // just for results. A frame whose id is already live gets none of the
+        // judgements below — there is nothing this connection can say *about
+        // that id* while it belongs to a request still going to answer on it —
+        // so the refusal goes on `NO_REQUEST` and carries the id as data.
+        //
+        // Everything after this point holds the claim, so the refusals that do
+        // echo `request.id` are provably unambiguous; dropping `in_flight` on
+        // the way out of the iteration frees it again.
+        let Some(in_flight) = active.claim(request.id) else {
+            refuse!(
+                NO_REQUEST,
+                ProtocolError::DuplicateRequestId {
+                    duplicate: request.id,
+                }
+            );
+            continue;
+        };
+
         if let Some(refusal) = gate(&request, greeted) {
             refuse!(request.id, refusal);
             continue;
@@ -222,21 +255,6 @@ async fn read_frames<R: AsyncRead + Unpin>(
                 refuse!(request.id, e);
                 continue;
             }
-        };
-
-        // Claimed before the handshake is recorded and before any dispatch, so
-        // a duplicate can neither greet nor run. The refusal answers on
-        // `NO_REQUEST`: the id it names is still going to be answered by the
-        // request that holds it, and a refusal wearing it would be the second
-        // terminal frame this exists to prevent.
-        let Some(in_flight) = active.claim(request.id) else {
-            refuse!(
-                NO_REQUEST,
-                ProtocolError::DuplicateRequestId {
-                    duplicate: request.id,
-                }
-            );
-            continue;
         };
 
         if matches!(call, Call::Hello) {
@@ -324,14 +342,12 @@ impl Drop for InFlight {
 }
 
 /// The refusals that are decided before a verb is even parsed.
+///
+/// Both answer **on the caller's id**, which is only sound because the caller
+/// reaches here holding a claim on it: an id another request is still going to
+/// answer on never gets this far (see the read loop). The reserved id is judged
+/// before the claim rather than here, since it is nobody's to hold.
 fn gate(request: &Request, greeted: bool) -> Option<ProtocolError> {
-    // First, because every refusal below is answered *on the caller's id*, and
-    // this is the one id that cannot mean "yours".
-    if request.id == NO_REQUEST {
-        return Some(ProtocolError::ReservedRequestId {
-            reserved: request.id,
-        });
-    }
     if request.v != PROTOCOL_VERSION {
         return Some(ProtocolError::UnsupportedProtocol {
             supported: PROTOCOL_VERSION,
