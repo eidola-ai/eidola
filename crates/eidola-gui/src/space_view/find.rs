@@ -628,6 +628,40 @@ fn reanchor(
     }));
 }
 
+/// Drop everything the *previous* query established, so only [`SpaceView::sync_find`]
+/// can establish an anchor for the new one.
+///
+/// The anchor goes because a new query re-anchors from the reader's own place
+/// rather than stepping from a match that belonged to a different search.
+/// **The match set goes with it, and that is the part that is easy to miss**:
+/// the set is rebuilt only by the next render's `sync_find`, so a Return,
+/// Shift-Return or arrow handled between `InputEvent::Change` and that render
+/// stepped through the *previous* query's matches and left an anchor naming
+/// one of them. `sync_find` then read that anchor as where the reader stood
+/// and forwarded it into the new results by identity, so a fast
+/// query-and-step selected and revealed a match the new search never chose.
+/// Emptied here, [`step_anchor`] has nothing to walk and leaves the anchor
+/// `None` — which is exactly the state [`reanchor`] turns into "the new
+/// query's first match".
+///
+/// A free function over the three fields, like [`step_anchor`] and
+/// [`reanchor`] beside it, because the sequence it guards cannot be driven
+/// through a window: gpui's test harness draws every dirty window inside each
+/// effect flush (`App::flush_effects`, under `cfg(test)`), which fuses the
+/// notified render onto the `Change` that triggered it. Production draws from
+/// the platform's frame callback instead, so two events really can be handled
+/// between two draws. The rule is asserted here, where that fusion cannot
+/// reach it.
+fn invalidate_for_new_query(
+    matches: &mut Vec<Match>,
+    anchor: &mut Option<MatchAnchor>,
+    pending_reveal: &mut Option<PendingReveal>,
+) {
+    matches.clear();
+    *anchor = None;
+    *pending_reveal = None;
+}
+
 /// Step the anchor by one match, wrapping at both ends — what makes the
 /// readout an index rather than a running total.
 fn step_anchor(
@@ -861,10 +895,11 @@ impl SpaceView {
         }
         session.query = Query::new(&text);
         session.text = text;
-        // A new query re-anchors from the reader's own place rather than
-        // stepping from the old match, which belonged to a different search.
-        session.anchor = None;
-        session.pending_reveal = None;
+        invalidate_for_new_query(
+            &mut session.matches,
+            &mut session.anchor,
+            &mut session.pending_reveal,
+        );
         // The first match of the new search is owed a reveal, but nothing here
         // knows which match that is — `sync_find` rebuilds the list against the
         // frame's selected path and re-anchors. Record the debt; it is
@@ -1954,6 +1989,45 @@ mod tests {
             source: 0..1,
             fraction: 0.0,
         }
+    }
+
+    #[test]
+    fn a_new_query_leaves_no_old_results_for_a_step_to_anchor_in() {
+        // A replay of the production sequence: `InputEvent::Change`
+        // invalidates the session, a Return is handled before the notified
+        // render, and only then does `sync_find` rebuild and re-anchor. The
+        // step must find nothing to walk — otherwise it anchors in the
+        // previous query's results and the rebuild honours that as the
+        // reader's place.
+        let mut matches = vec![m("a3", Some("i3"), 0)];
+        let mut anchor = Some(MatchAnchor::of(&matches[0]));
+        let mut pending: Option<PendingReveal> = None;
+
+        invalidate_for_new_query(&mut matches, &mut anchor, &mut pending);
+        assert!(matches.is_empty(), "the old results go with the old query");
+
+        // The Return that beats the render.
+        step_anchor(&matches, &mut anchor, true);
+        assert_eq!(anchor, None, "nothing to step through, nothing anchored");
+
+        // The render: `sync_find` reads the previous position, rebuilds the
+        // set against the new query, and re-anchors.
+        let previous = anchor
+            .clone()
+            .map(|a| (a, current_position(&matches, &anchor).unwrap_or(0)));
+        matches = vec![
+            m("a1", Some("i1"), 0),
+            m("a2", Some("i2"), 0),
+            m("a3", Some("i3"), 0),
+        ];
+        reanchor(&matches, &mut anchor, previous);
+
+        assert_eq!(
+            anchor,
+            Some(MatchAnchor::of(&matches[0])),
+            "the new query starts at its own first match, not forwarded onto \
+             the post the old query's anchor named"
+        );
     }
 
     #[test]
