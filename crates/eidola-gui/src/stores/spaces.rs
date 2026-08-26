@@ -1778,14 +1778,13 @@ mod tests {
             assert_eq!(titles(&cell), vec!["Bergamot".to_string()]);
 
             let mut owed: Vec<UndoEdit> = Vec::new();
-            let mut settle =
-                |cell: &mut Loadable<Vec<SpaceInfo>>, undo, owed: &mut Vec<UndoEdit>| {
-                    let settled =
-                        settle_index_mutation(cell, undo, WriteVerdict::Refused("refused".into()));
-                    if let Some(unapplied) = settled.unapplied {
-                        owed.push(unapplied);
-                    }
-                };
+            let settle = |cell: &mut Loadable<Vec<SpaceInfo>>, undo, owed: &mut Vec<UndoEdit>| {
+                let settled =
+                    settle_index_mutation(cell, undo, WriteVerdict::Refused("refused".into()));
+                if let Some(unapplied) = settled.unapplied {
+                    owed.push(unapplied);
+                }
+            };
             if rename_settles_first {
                 settle(&mut cell, undo_rename, &mut owed);
                 settle(&mut cell, undo_archive, &mut owed);
