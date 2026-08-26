@@ -48,12 +48,12 @@ use eidola_app_core::error::AppError;
 use eidola_app_core::ipc::{
     AccountCheckoutResult, AccountPricesResult, BackendModelsResult, Call, DefaultModelResult,
     Done, ModelDownloadResult, ModelListResult, SpacesArchiveResult, SpacesListResult,
-    WalletCredentialsResult, WalletRecoverResult, WalletSpendingResult,
+    WalletLifecycleResult, WalletRecoverResult, WalletSpendingResult,
 };
 use eidola_app_core::updates::UpdateCheckSnapshot;
 use eidola_app_core::{
-    AccountShowResult, AppCore, BalancesResult, ChatResult, ChatStreamEvent, CredentialInfo,
-    InFlightCredentialInfo, ModelInfo, PriceInfo, SpaceInfo,
+    AccountShowResult, AppCore, BalancesResult, ChatResult, ChatStreamEvent,
+    CredentialLifecycleInfo, InFlightCredentialInfo, ModelInfo, PriceInfo, SpaceInfo,
 };
 
 use crate::client::{Client, Dial, Failure};
@@ -321,12 +321,23 @@ impl Session {
         }
     }
 
-    pub async fn wallet_credentials(&self) -> Result<Vec<CredentialInfo>, Failure> {
+    /// Every credential with its lifecycle state, from one read.
+    ///
+    /// The listing's two sections are split out of this rather than fetched
+    /// one each: settlement removes a `spending` credential and creates its
+    /// `active` successor atomically, so two reads either side of it can show
+    /// a credential in flight *beside* the successor it already became. That
+    /// pair never existed, and one snapshot cannot claim it. **Embedded mode
+    /// reads it the same way** — it had the same two-read shape and was
+    /// coherent only because nothing else holds the profile to write during a
+    /// one-shot command, which is a fact about deployment rather than a
+    /// property of the code.
+    pub async fn wallet_lifecycle(&self) -> Result<Vec<CredentialLifecycleInfo>, Failure> {
         match &self.mode {
-            Mode::Embedded(core) => Ok(core.wallet_credentials().await?),
+            Mode::Embedded(core) => Ok(core.wallet_lifecycle().await?),
             Mode::Client { client, .. } => {
-                let r: WalletCredentialsResult =
-                    client.lock().await.call(&Call::WalletCredentials).await?;
+                let r: WalletLifecycleResult =
+                    client.lock().await.call(&Call::WalletLifecycle).await?;
                 Ok(r.credentials)
             }
         }
@@ -538,6 +549,131 @@ mod tests {
                 }
             });
         })
+    }
+
+    /// An app whose wallet **settled between** the moments a two-read listing
+    /// would have sampled it.
+    ///
+    /// Asked for the sections separately it answers exactly as such an app
+    /// honestly would either side of a settlement: the credential still in
+    /// flight, and the successor it has already become — the pair that never
+    /// coexisted. Asked for the lifecycle it answers from one view read, where
+    /// only the successor is there. Every verb it is asked is recorded, so a
+    /// listing that takes more than one read is visible rather than merely
+    /// wrong.
+    fn wallet_app(
+        dir: &std::path::Path,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> std::thread::JoinHandle<()> {
+        use eidola_app_core::ipc::{WalletCredentialsResult, WalletLifecycleResult};
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket_path(dir)).expect("bind the socket");
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let listener = tokio::net::UnixListener::from_std(listener).expect("adopt");
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (reader, mut writer) = stream.into_split();
+                let mut frames =
+                    eidola_app_core::ipc::FrameReader::new(tokio::io::BufReader::new(reader));
+                while let Ok(Some(line)) = frames.next_line().await {
+                    let request = decode_request(line).expect("a frame");
+                    seen.lock().expect("seen").push(request.verb.clone());
+                    let answer = match request.verb.as_str() {
+                        "hello" => Response::end(
+                            request.id,
+                            &HelloResult {
+                                protocol: PROTOCOL_VERSION,
+                                app_version: "9.9.9".into(),
+                            },
+                        ),
+                        "wallet.lifecycle" => Response::end(
+                            request.id,
+                            &WalletLifecycleResult {
+                                credentials: vec![lifecycle_row("successor", 2, "active", None)],
+                            },
+                        ),
+                        // The stale halves a second read could still return.
+                        "wallet.spending" => Response::end(
+                            request.id,
+                            &eidola_app_core::ipc::WalletSpendingResult {
+                                credentials: vec![InFlightCredentialInfo {
+                                    nonce: "predecessor".into(),
+                                    credits: 100,
+                                    generation: 1,
+                                    spend_amount: 40,
+                                }],
+                            },
+                        ),
+                        "wallet.credentials" => Response::end(
+                            request.id,
+                            &WalletCredentialsResult {
+                                credentials: vec![eidola_app_core::CredentialInfo {
+                                    nonce: "successor".into(),
+                                    credits: 60,
+                                    generation: 2,
+                                }],
+                            },
+                        ),
+                        other => panic!("unexpected verb {other}"),
+                    };
+                    use tokio::io::AsyncWriteExt;
+                    if writer.write_all(&encode_line(&answer)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        })
+    }
+
+    fn lifecycle_row(
+        nonce: &str,
+        generation: i64,
+        state: &str,
+        spend_amount: Option<i64>,
+    ) -> CredentialLifecycleInfo {
+        CredentialLifecycleInfo {
+            nonce: nonce.to_string(),
+            credits: 60,
+            generation,
+            created_at: 1_000 + generation,
+            state: state.to_string(),
+            spend_amount,
+        }
+    }
+
+    #[test]
+    fn the_wallet_listing_reads_one_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = wallet_app(dir.path(), std::sync::Arc::clone(&seen));
+        let session =
+            Session::open(dir.path().into(), dir.path().into(), false).expect("client mode");
+
+        let wallet = session
+            .runtime()
+            .block_on(crate::wallet_listing(&session))
+            .expect("the listing reads");
+        let (spending, active) = crate::wallet_sections(&wallet);
+        assert!(
+            spending.is_empty(),
+            "the settle already happened; nothing is in flight"
+        );
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].nonce, "successor");
+
+        drop(session);
+        server.join().expect("the server ends with the connection");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec!["hello".to_string(), "wallet.lifecycle".to_string()],
+            "the listing takes one read — a second one is what lets the wallet \
+             settle underneath it"
+        );
     }
 
     #[test]

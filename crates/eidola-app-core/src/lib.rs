@@ -1475,7 +1475,9 @@ pub struct ModelInfo {
 /// `credential_lifecycle` view: `active` (spendable), `spending` (a spend
 /// proof is in flight / unsettled), `spent` (settled into a successor), or
 /// `expired` (issuer key past its expiry).
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CredentialLifecycleInfo {
     pub nonce: String,
     pub credits: i64,

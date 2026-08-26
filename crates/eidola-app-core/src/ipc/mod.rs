@@ -246,6 +246,16 @@ pub enum Call {
     WalletCredentials,
     /// `AppCore::wallet_spending_credentials`.
     WalletSpending,
+    /// `AppCore::wallet_lifecycle` — every credential with its lifecycle
+    /// state, from **one** read of the `credential_lifecycle` view.
+    ///
+    /// This is the verb for a caller that needs more than one of those states,
+    /// and it exists because reading them separately cannot be made coherent:
+    /// settlement removes a `spending` credential and creates its `active`
+    /// successor atomically, so two reads either side of it can show a
+    /// credential in flight *and* the successor it turned into — a pair that
+    /// never existed. One view, one read, one answer.
+    WalletLifecycle,
     /// `AppCore::recover_spending_credentials`.
     WalletRecover,
     /// `AppCore::list_backends`.
@@ -308,6 +318,7 @@ pub const VERBS: &[&str] = &[
     "account.checkout",
     "wallet.credentials",
     "wallet.spending",
+    "wallet.lifecycle",
     "wallet.recover",
     "backend.list",
     "backend.set_enabled",
@@ -411,6 +422,7 @@ impl Call {
             Call::AccountCheckout { .. } => "account.checkout",
             Call::WalletCredentials => "wallet.credentials",
             Call::WalletSpending => "wallet.spending",
+            Call::WalletLifecycle => "wallet.lifecycle",
             Call::WalletRecover => "wallet.recover",
             Call::BackendList => "backend.list",
             Call::BackendSetEnabled { .. } => "backend.set_enabled",
@@ -436,6 +448,7 @@ impl Call {
             | Call::AccountBalances
             | Call::WalletCredentials
             | Call::WalletSpending
+            | Call::WalletLifecycle
             | Call::WalletRecover
             | Call::BackendList
             | Call::ModelList
@@ -526,6 +539,7 @@ impl Call {
             }
             "wallet.credentials" => Ok(Call::WalletCredentials),
             "wallet.spending" => Ok(Call::WalletSpending),
+            "wallet.lifecycle" => Ok(Call::WalletLifecycle),
             "wallet.recover" => Ok(Call::WalletRecover),
             "backend.list" => Ok(Call::BackendList),
             "backend.set_enabled" => {
@@ -647,6 +661,14 @@ pub struct AccountCheckoutResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WalletSpendingResult {
     pub credentials: Vec<crate::InFlightCredentialInfo>,
+}
+
+/// The `end` payload of `wallet.lifecycle`: every credential and its state,
+/// from one read, so the states a caller sorts them into are states that
+/// actually coexisted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletLifecycleResult {
+    pub credentials: Vec<crate::CredentialLifecycleInfo>,
 }
 
 /// The `end` payload of `wallet.recover`.
@@ -1292,6 +1314,7 @@ mod tests {
             },
             Call::WalletCredentials,
             Call::WalletSpending,
+            Call::WalletLifecycle,
             Call::WalletRecover,
             Call::BackendList,
             Call::BackendSetEnabled {

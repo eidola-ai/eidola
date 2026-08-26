@@ -883,18 +883,15 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
         Some(Command::Wallet { command }) => match command {
             WalletCommand::Credentials { command } => match command {
                 CredentialsCommand::List => {
-                    let spending = session.wallet_spending_credentials().await?;
+                    let wallet = wallet_listing(session).await?;
+                    let (spending, credentials) = wallet_sections(&wallet);
                     if !spending.is_empty() {
                         println!("in-flight credentials:");
                         for c in &spending {
-                            println!(
-                                "  {}: {} credits, {} charged",
-                                c.nonce, c.credits, c.spend_amount
-                            );
+                            println!("  {}", in_flight_line(c));
                         }
                         println!();
                     }
-                    let credentials = session.wallet_credentials().await?;
                     if credentials.is_empty() && spending.is_empty() {
                         println!("no credentials");
                         return Ok(());
@@ -1432,6 +1429,64 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
         // Handled in `main` before the core is built — `service stop` has to
         // work while the running service holds the database lock.
         Some(Command::Service { .. }) => Ok(()),
+    }
+}
+
+/// The wallet listing's data: **one** read of the credential lifecycle.
+///
+/// A named seam rather than a call at the use site, so what the listing is
+/// allowed to read is one decision in one place — see [`wallet_sections`] for
+/// why more than one read cannot be made coherent.
+async fn wallet_listing(
+    session: &Session,
+) -> Result<Vec<eidola_app_core::CredentialLifecycleInfo>, Failure> {
+    session.wallet_lifecycle().await
+}
+
+/// The two sections `eidola wallet credentials list` prints, split out of one
+/// lifecycle snapshot.
+///
+/// **Both sections come from one read, and that is the whole point.**
+/// Settlement removes a `spending` credential and creates its `active`
+/// successor atomically, so reading the two states separately can show a
+/// credential still in flight beside the successor it already became — a pair
+/// that never coexisted. The states are computed by one SQL view, so a single
+/// read of it cannot say that; two reads either side of a settling turn can.
+///
+/// Ordering is restored to oldest-first, which is what the per-state queries
+/// gave the reader before; the snapshot itself arrives newest-first because
+/// that is what a whole-wallet listing wants. `nonce` breaks ties, so the order
+/// is stable rather than merely sorted.
+fn wallet_sections(
+    lifecycle: &[eidola_app_core::CredentialLifecycleInfo],
+) -> (
+    Vec<&eidola_app_core::CredentialLifecycleInfo>,
+    Vec<&eidola_app_core::CredentialLifecycleInfo>,
+) {
+    let of = |state: &str| {
+        let mut rows: Vec<&eidola_app_core::CredentialLifecycleInfo> =
+            lifecycle.iter().filter(|c| c.state == state).collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.nonce.cmp(&b.nonce))
+        });
+        rows
+    };
+    (of("spending"), of("active"))
+}
+
+/// One in-flight credential's line.
+///
+/// `spend_amount` is `Option` on the lifecycle row while the old per-state
+/// query typed it as always present. A `spending` row carries one by the
+/// view's own definition, so the absent case is not reachable through a
+/// healthy profile — which is exactly why it is said out loud rather than
+/// rendered as `0 charged`, a number that would read as a fact.
+fn in_flight_line(c: &eidola_app_core::CredentialLifecycleInfo) -> String {
+    match c.spend_amount {
+        Some(amount) => format!("{}: {} credits, {} charged", c.nonce, c.credits, amount),
+        None => format!("{}: {} credits, charge not recorded", c.nonce, c.credits),
     }
 }
 
@@ -2212,6 +2267,68 @@ mod tests {
             reconciled_status(&row, &[]),
             LocalModelStatus::Available,
             "the common case must stay byte-identical"
+        );
+    }
+
+    fn credential(
+        nonce: &str,
+        created_at: i64,
+        state: &str,
+        spend_amount: Option<i64>,
+    ) -> eidola_app_core::CredentialLifecycleInfo {
+        eidola_app_core::CredentialLifecycleInfo {
+            nonce: nonce.to_string(),
+            credits: 60,
+            generation: 2,
+            created_at,
+            state: state.to_string(),
+            spend_amount,
+        }
+    }
+
+    #[test]
+    fn the_two_sections_are_one_snapshot_split_in_two() {
+        let wallet = vec![
+            credential("c", 300, "active", None),
+            credential("a", 100, "spending", Some(40)),
+            credential("b", 200, "active", None),
+            // Neither section shows these, exactly as before.
+            credential("old", 50, "spent", Some(10)),
+            credential("stale", 60, "expired", None),
+        ];
+        let (spending, active) = wallet_sections(&wallet);
+        assert_eq!(
+            spending
+                .iter()
+                .map(|c| c.nonce.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(
+            active.iter().map(|c| c.nonce.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c"],
+            "oldest first, the order the per-state queries gave"
+        );
+        // The impossible pair, stated as the invariant it is: one credential
+        // is in exactly one state, because one read computed all of them.
+        for s in &spending {
+            assert!(
+                !active.iter().any(|a| a.nonce == s.nonce),
+                "{} cannot be in flight and settled at once",
+                s.nonce
+            );
+        }
+    }
+
+    #[test]
+    fn an_in_flight_line_never_invents_a_charge() {
+        let charged = credential("a", 100, "spending", Some(40));
+        assert_eq!(in_flight_line(&charged), "a: 60 credits, 40 charged");
+        let unrecorded = credential("a", 100, "spending", None);
+        assert_eq!(
+            in_flight_line(&unrecorded),
+            "a: 60 credits, charge not recorded",
+            "an absent amount is said, not rendered as a zero that reads as a fact"
         );
     }
 

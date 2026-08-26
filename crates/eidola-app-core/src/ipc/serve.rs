@@ -405,6 +405,10 @@ async fn answer(
             let credentials = core.wallet_spending_credentials().await.map_err(failed)?;
             ok(super::WalletSpendingResult { credentials })
         }
+        Call::WalletLifecycle => {
+            let credentials = core.wallet_lifecycle().await.map_err(failed)?;
+            ok(super::WalletLifecycleResult { credentials })
+        }
         Call::WalletRecover => {
             let recovered = core.recover_spending_credentials().await.map_err(failed)?;
             ok(super::WalletRecoverResult { recovered })
