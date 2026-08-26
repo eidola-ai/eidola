@@ -1936,7 +1936,22 @@ pub async fn has_reference_from(
 ///
 /// A direct reply rather than any descendant, because the relationship is
 /// exact: a spawn happens inside a turn, and that turn persists its answer as a
-/// reply to the very post it was answering. Newest — by **commit order**, the
+/// reply to the very post it was answering.
+///
+/// **"The same post" is the item, not the generation.** A reply edge records
+/// the generation that was current when it was written and is never remapped
+/// (causality is action ids), while everything that *renders* or *attaches*
+/// resolves an edge to its antecedent's item — so an anchor and an answer can
+/// name one post through two different generations and still be about it. That
+/// is not hypothetical here: a delegation resolves its anchor to the generation
+/// the parent currently shows, while the answer of the very turn that opened it
+/// keeps the raw antecedent the turn was prepared with, so an edit landing
+/// between preparation and the tool put the two in different namespaces.
+/// Matching on `aa.antecedent_action_id` missed the answer entirely, and the
+/// report then attached to the anchor as that answer's sibling. Joining through
+/// the item is the same identity rule the transcript already threads by, and it
+/// is what keeps this one rule rather than a second record of which answer
+/// belongs to which delegation. Newest — by **commit order**, the
 /// one ordering a writer's clock cannot contradict (see [`action_watermark`])
 /// — and **a generation the parent shows** (current, terminal status, post
 /// type — the transcript's predicate, as settlement reads it): an answer
@@ -1988,11 +2003,13 @@ pub async fn last_reply_by_participant(
         "SELECT a.id FROM action a \
          JOIN action_antecedent aa \
            ON aa.action_id = a.id AND aa.relation = 'reply' \
+         JOIN action ante ON ante.id = aa.antecedent_action_id \
+         JOIN action anchored ON anchored.id = ?3 \
          JOIN item_current ic ON ic.current_action_id = a.id \
          JOIN action origin ON origin.item_id = a.item_id \
            AND origin.supersedes_action_id IS NULL \
          WHERE a.space_id = ?1 AND origin.participant_id = ?2 \
-           AND aa.antecedent_action_id = ?3 \
+           AND ante.item_id = anchored.item_id \
            AND a.rowid > ?4 \
            AND a.status IN ('complete', 'cancelled') \
            AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \

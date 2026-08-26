@@ -1701,6 +1701,60 @@ fn a_report_waits_for_its_own_turns_answer_and_not_a_siblings() {
     });
 }
 
+/// **An anchor and an answer can name one post through two generations.** A
+/// delegation resolves its anchor to the generation the parent currently shows,
+/// while the answer of the very turn that opened it keeps the raw antecedent
+/// that turn was prepared with — so a reader rewording the post between
+/// preparation and the tool leaves the two in different generations of one
+/// item. Across a restart the in-memory record of which turn opened the room is
+/// gone and the durable fallback is all there is, and matching edges by
+/// generation missed the answer entirely: the sweep then attached the report to
+/// the anchor as that answer's *sibling*. "The same post" is the item, which is
+/// the identity the transcript already threads by.
+#[test]
+fn a_report_finds_its_turns_answer_across_a_restart_and_an_edit() {
+    run(|| {
+        let (mock_rt, mock, core, dir) = restartable();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+
+        // The reader rewords the post the turn was prepared against.
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(asked.clone(), "What about Friday's tides?".into()))
+            .expect("edit the post")
+            .action_id;
+        assert_ne!(edited, asked, "the edit is a new generation of one item");
+
+        // The delegation anchors on what the parent shows…
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&edited));
+        // …and the turn's own answer still replies to the generation it was
+        // prepared with.
+        let answer = ask(&core, &parent, &owner, &asked);
+
+        // The process goes away before the report lands, taking the record of
+        // which turn opened the room with it.
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &mock.base_url);
+        drive_as_sweep(&core, &out.space.id).expect("the room is driven after the restart");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(answer.as_str()),
+            "beneath the answer of the turn that opened the room"
+        );
+        assert_ne!(
+            report.parent_action_id.as_deref(),
+            Some(edited.as_str()),
+            "not on the anchor, as that answer's sibling"
+        );
+        drop(mock_rt);
+    });
+}
+
 /// The wait is not unbounded by this: a spawning turn that died leaves no
 /// answer newer than the room, and the arms that claim a licence still end it —
 /// against the anchor, which is the honest attachment when there is nothing of
