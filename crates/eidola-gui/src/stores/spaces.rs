@@ -109,6 +109,15 @@ pub struct SpacesStore {
     /// write whose re-list also failed could put back a name the database never
     /// held. Each settle takes its own entry out.
     op_undos: HashMap<String, UndoEdit>,
+    /// Inverses that were owed and could not land, because a sibling operation
+    /// had the row optimistically out of the listing when they ran — an
+    /// ancestor's archive holding a delegated child while that child's own
+    /// rename settles. They are retried at the end of the batch, which is the
+    /// first moment every refused removal has put its rows back and the last
+    /// moment before the resolving read (see [`UndoEdit`]). A retry whose row
+    /// is *still* gone is a row the database really did close, and the inverse
+    /// is dropped with the batch either way.
+    deferred_undos: Vec<UndoEdit>,
     /// A refresh signalled while any mutation held the read: deferred to the
     /// **last** one's completion, where it can only be fresher.
     refresh_pending: bool,
@@ -170,6 +179,7 @@ impl SpacesStore {
             task: None,
             op_tasks: HashMap::new(),
             op_undos: HashMap::new(),
+            deferred_undos: Vec::new(),
             refresh_pending: false,
             registry: HashMap::new(),
             instantiations: HashMap::new(),
@@ -194,6 +204,7 @@ impl SpacesStore {
             task: None,
             op_tasks: HashMap::new(),
             op_undos: HashMap::new(),
+            deferred_undos: Vec::new(),
             refresh_pending: false,
             registry: HashMap::new(),
             instantiations: HashMap::new(),
@@ -920,7 +931,10 @@ impl SpacesStore {
         if let Some(superseded) = self.op_undos.remove(&space_id)
             && let Some(rows) = self.index.value_mut()
         {
-            superseded(rows);
+            // Whether it found its row does not matter here: this write is
+            // about to edit the same row anyway, and a loser's inverse has no
+            // claim on the batch's end.
+            let _ = superseded(rows);
         }
         // The edit and its inverse, built together and with nothing between
         // them: this is what a refused write takes back.
@@ -928,7 +942,7 @@ impl SpacesStore {
             .index
             .value_mut()
             .map(optimistic)
-            .unwrap_or_else(|| -> UndoEdit { Box::new(|_| {}) });
+            .unwrap_or_else(|| -> UndoEdit { Box::new(|_| true) });
         cx.notify();
 
         let Some(core) = self.app_core.clone() else {
@@ -952,9 +966,13 @@ impl SpacesStore {
                     let undo = this
                         .op_undos
                         .remove(&key)
-                        .unwrap_or_else(|| -> UndoEdit { Box::new(|_| {}) });
-                    if let Some(message) = settle_index_mutation(&mut this.index, undo, op_result) {
+                        .unwrap_or_else(|| -> UndoEdit { Box::new(|_| true) });
+                    let settled = settle_index_mutation(&mut this.index, undo, op_result);
+                    if let Some(message) = settled.message {
                         this.record_op_error(Some(space_id), message);
+                    }
+                    if let Some(unapplied) = settled.unapplied {
+                        this.deferred_undos.push(unapplied);
                     }
                     // **The resolving read is taken here, not carried here.**
                     // It is issued only once no write is in flight, so it is
@@ -969,6 +987,17 @@ impl SpacesStore {
                     // read drops it and owes the next one — so the batch always
                     // ends on the newest read, and never on an older one.
                     if this.op_tasks.is_empty() {
+                        // **Owed inverses get their retry here**, after every
+                        // refused removal in this batch has put its rows back
+                        // and before the read that supersedes all of it. An
+                        // inverse whose row a sibling had removed could not
+                        // land when it ran; this is the one moment it can.
+                        let owed = std::mem::take(&mut this.deferred_undos);
+                        if let Some(rows) = this.index.value_mut() {
+                            for undo in owed {
+                                let _ = undo(rows);
+                            }
+                        }
                         this.refresh_pending = false;
                         this.refresh(cx);
                     }
@@ -1056,7 +1085,22 @@ impl SpacesStore {
 /// [`SpacesStore::write_then_reconcile`]). It touches only the row its edit
 /// touched, which is what lets one mutation take its edit back while a sibling's
 /// is still pending on the same shared listing.
-type UndoEdit = Box<dyn FnOnce(&mut Vec<SpaceInfo>)>;
+///
+/// **It answers whether it landed, and it may be run again.** A sibling can
+/// take the very row an inverse has to correct out of the listing — an archive
+/// of an ancestor removes a delegated child while that child's own rename is
+/// still in flight — and the row comes back only if that archive is itself
+/// refused, which may be *after* this inverse has already run and found
+/// nothing. An inverse that found nothing to touch is therefore not done: it is
+/// retried once the batch has finished, the moment every refused removal has
+/// put its rows back and the last thing before the resolving read. `false` is
+/// how it says so.
+///
+/// That is why it is `Fn` rather than `FnOnce`, and why it must be
+/// **idempotent**: every one addresses rows by id and sets values rather than
+/// applying deltas, so a retry that finds its work already done changes
+/// nothing.
+type UndoEdit = Box<dyn Fn(&mut Vec<SpaceInfo>) -> bool>;
 
 /// A rename's optimistic edit, and its inverse — the pair
 /// [`SpacesStore::rename`] hands `write_then_reconcile`.
@@ -1141,7 +1185,12 @@ fn archive_edit(rows: &mut Vec<SpaceInfo>, row_id: String) -> UndoEdit {
         }
     }
     Box::new(move |rows: &mut Vec<SpaceInfo>| {
-        for mut row in removed {
+        for row in removed.iter() {
+            // Idempotent: a row already back is a row this has restored.
+            if rows.iter().any(|r| r.id == row.id) {
+                continue;
+            }
+            let mut row = row.clone();
             if let Some(parent) = row.parent.as_mut()
                 && let Some(current) = rows.iter().find(|r| r.id == parent.space_id)
             {
@@ -1150,6 +1199,8 @@ fn archive_edit(rows: &mut Vec<SpaceInfo>, row_id: String) -> UndoEdit {
             let at = rows.partition_point(|r| r.last_activity_at >= row.last_activity_at);
             rows.insert(at, row);
         }
+        // A restore always lands: it puts rows *in*, so nothing can be missing.
+        true
     })
 }
 
@@ -1169,20 +1220,26 @@ fn rename_edit(rows: &mut [SpaceInfo], row_id: String, title: String) -> UndoEdi
         }
     }
     Box::new(move |rows: &mut Vec<SpaceInfo>| {
-        if let Some(prior) = prior
-            && let Some(row) = rows.iter_mut().find(|s| s.id == row_id)
-        {
-            row.title = prior;
-        }
-        for (child_id, title) in prior_children {
-            if let Some(parent) = rows
-                .iter_mut()
-                .find(|s| s.id == child_id)
-                .and_then(|s| s.parent.as_mut())
-            {
-                parent.title = title;
+        let mut landed = true;
+        if let Some(prior) = prior.clone() {
+            match rows.iter_mut().find(|s| s.id == row_id) {
+                Some(row) => row.title = prior,
+                // A sibling has the row in hand — an ancestor's archive, say.
+                // Not done; ask again when the batch ends.
+                None => landed = false,
             }
         }
+        for (child_id, title) in prior_children.iter() {
+            match rows
+                .iter_mut()
+                .find(|s| &s.id == child_id)
+                .and_then(|s| s.parent.as_mut())
+            {
+                Some(parent) => parent.title.clone_from(title),
+                None => landed = false,
+            }
+        }
+        landed
     })
 }
 
@@ -1266,21 +1323,37 @@ fn settle_index_mutation(
     index: &mut Loadable<Vec<SpaceInfo>>,
     undo: UndoEdit,
     verdict: WriteVerdict,
-) -> Option<String> {
+) -> Settled {
     match verdict {
-        WriteVerdict::Applied => None,
+        WriteVerdict::Applied => Settled::default(),
         // The edit was right and stays; only the report is owed. See
         // [`WriteVerdict`] for why this is not an undo.
-        WriteVerdict::AlreadySo(message) => Some(message),
+        WriteVerdict::AlreadySo(message) => Settled {
+            message: Some(message),
+            unapplied: None,
+        },
         WriteVerdict::Refused(message) => {
             // Only where a value is present to be wrong: a cell holding no rows
             // is showing no optimistic edit either.
-            if let Some(rows) = index.value_mut() {
-                undo(rows);
+            let landed = match index.value_mut() {
+                Some(rows) => undo(rows),
+                None => true,
+            };
+            Settled {
+                message: Some(message),
+                unapplied: (!landed).then_some(undo),
             }
-            Some(message)
         }
     }
+}
+
+/// What one operation's settle leaves behind: the refusal to report, and the
+/// inverse that could not land because a sibling had its row in hand (see
+/// [`UndoEdit`]). Both are optional and independent of each other.
+#[derive(Default)]
+struct Settled {
+    message: Option<String>,
+    unapplied: Option<UndoEdit>,
 }
 #[cfg(test)]
 mod tests {
@@ -1628,7 +1701,7 @@ mod tests {
                  (child first: {child_settles_first})"
             );
             assert!(
-                a.is_some() || b.is_some(),
+                a.message.is_some() || b.message.is_some(),
                 "and the reader is still told the archive was not this operation's"
             );
         }
@@ -1660,6 +1733,126 @@ mod tests {
         );
     }
 
+    /// The batch's end, as `write_then_reconcile` runs it: every inverse that
+    /// could not land gets its one retry, then the resolving read.
+    fn finish_batch(cell: &mut Loadable<Vec<SpaceInfo>>, owed: Vec<UndoEdit>) {
+        if let Some(rows) = cell.value_mut() {
+            for undo in owed {
+                let _ = undo(rows);
+            }
+        }
+    }
+
+    /// **A refused rename is taken back even when a sibling had the row.** An
+    /// ancestor's archive removes a delegated child, snapshotting it with the
+    /// rename its own operation has not earned yet; the rename settles first
+    /// and its inverse finds nothing; the archive is then refused too and puts
+    /// the row back wearing the rejected name, which a failed batch-end read
+    /// keeps for good. The two are different mutation keys, so neither
+    /// supersedes the other — an inverse that found nothing is simply not done,
+    /// and the end of the batch is where every refused removal has already put
+    /// its rows back.
+    #[test]
+    fn a_refused_child_rename_is_taken_back_after_an_ancestors_archive_restores_it() {
+        for rename_settles_first in [true, false] {
+            let mut cell = Loadable::loaded(vec![
+                row_at("s1", "Tides", 400),
+                SpaceInfo {
+                    last_activity_at: 300,
+                    ..child_of("s2", "Survey", ("s1", "Tides"))
+                },
+                row_at("s3", "Bergamot", 100),
+            ]);
+            let undo_rename = rename(&mut cell, "s2", "Soundings");
+            assert_eq!(
+                titles(&cell),
+                vec![
+                    "Tides".to_string(),
+                    "Soundings".to_string(),
+                    "Bergamot".to_string()
+                ]
+            );
+            // The ancestor's archive takes the child with it — carrying the
+            // name the database has not agreed to.
+            let undo_archive = archive(&mut cell, "s1");
+            assert_eq!(titles(&cell), vec!["Bergamot".to_string()]);
+
+            let mut owed: Vec<UndoEdit> = Vec::new();
+            let mut settle =
+                |cell: &mut Loadable<Vec<SpaceInfo>>, undo, owed: &mut Vec<UndoEdit>| {
+                    let settled =
+                        settle_index_mutation(cell, undo, WriteVerdict::Refused("refused".into()));
+                    if let Some(unapplied) = settled.unapplied {
+                        owed.push(unapplied);
+                    }
+                };
+            if rename_settles_first {
+                settle(&mut cell, undo_rename, &mut owed);
+                settle(&mut cell, undo_archive, &mut owed);
+            } else {
+                settle(&mut cell, undo_archive, &mut owed);
+                settle(&mut cell, undo_rename, &mut owed);
+            }
+            finish_batch(&mut cell, owed);
+            resolving_read(&mut cell, Err(read_err()));
+
+            assert_eq!(
+                titles(&cell),
+                vec![
+                    "Tides".to_string(),
+                    "Survey".to_string(),
+                    "Bergamot".to_string()
+                ],
+                "the child's own refused rename is taken back too \
+                 (rename first: {rename_settles_first})"
+            );
+            assert_eq!(
+                parent_titles(&cell),
+                vec![Some("Tides".to_string())],
+                "and its badge still reads the row that owns it"
+            );
+        }
+    }
+
+    /// A retry is owed only where the row was *held*, not where it was really
+    /// closed: an ancestor archive that **succeeds** leaves the child out, and
+    /// the deferred inverse changes nothing when it runs.
+    #[test]
+    fn a_deferred_inverse_does_not_resurrect_a_row_the_archive_really_closed() {
+        let mut cell = Loadable::loaded(vec![
+            row_at("s1", "Tides", 400),
+            SpaceInfo {
+                last_activity_at: 300,
+                ..child_of("s2", "Survey", ("s1", "Tides"))
+            },
+            row_at("s3", "Bergamot", 100),
+        ]);
+        let undo_rename = rename(&mut cell, "s2", "Soundings");
+        let undo_archive = archive(&mut cell, "s1");
+
+        let mut owed: Vec<UndoEdit> = Vec::new();
+        let settled = settle_index_mutation(
+            &mut cell,
+            undo_rename,
+            WriteVerdict::Refused("refused".into()),
+        );
+        if let Some(unapplied) = settled.unapplied {
+            owed.push(unapplied);
+        }
+        assert_eq!(owed.len(), 1, "the rename could not land, so it is owed");
+        // The archive took, so its edit stands and nothing is restored.
+        let settled = settle_index_mutation(&mut cell, undo_archive, WriteVerdict::Applied);
+        assert!(settled.unapplied.is_none());
+
+        finish_batch(&mut cell, owed);
+        resolving_read(&mut cell, Err(read_err()));
+        assert_eq!(
+            titles(&cell),
+            vec!["Bergamot".to_string()],
+            "the closed conversation and its delegation stay closed"
+        );
+    }
+
     // -- The double-failure quadrant -----------------------------------------
 
     /// The write was refused *and* the read that would have taken the optimistic
@@ -1686,7 +1879,7 @@ mod tests {
             "the read's failure still resolves the cell"
         );
         assert!(
-            recorded.is_some(),
+            recorded.message.is_some(),
             "and the write's refusal still gets reported"
         );
     }
@@ -1814,7 +2007,7 @@ mod tests {
             vec!["Nile".to_string()],
             "the rename persisted — showing it is the truth, not optimism"
         );
-        assert_eq!(recorded, None);
+        assert_eq!(recorded.message, None);
     }
 
     // -- Sibling mutations over the one shared cell --------------------------
@@ -1904,6 +2097,6 @@ mod tests {
         let undo = rename(&mut cell, "s1", "Nile");
         let recorded =
             settle_index_mutation(&mut cell, undo, WriteVerdict::Refused("refused".into()));
-        assert_eq!(recorded.as_deref(), Some("refused"));
+        assert_eq!(recorded.message.as_deref(), Some("refused"));
     }
 }

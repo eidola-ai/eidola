@@ -410,6 +410,19 @@ impl Inner {
         })
     }
 
+    /// The generation the transcript currently shows for `action_id`'s item,
+    /// or `None` when it shows none — the resolution a delegation's anchor
+    /// takes before it reaches the spawn door.
+    ///
+    /// The same `db::visible_tip_of_action` the sub-space driver puts every
+    /// stored action id through before planning off it, replying beneath it or
+    /// quoting it: an action id names a generation, and every use of one for
+    /// *attachment* follows the item to what a reader can see.
+    pub(crate) async fn visible_anchor(&self, action_id: &str) -> Result<Option<String>, AppError> {
+        let conn = self.db_conn().await?;
+        db::visible_tip_of_action(&conn, action_id).await
+    }
+
     pub(crate) async fn subspaces_of(
         &self,
         parent_space_id: &str,
@@ -641,8 +654,10 @@ pub(crate) struct DelegateTool {
     owner_participant_id: String,
     parent_space_id: String,
     /// The post in the parent this delegation is opened from — this turn's own
-    /// target. `None` for a turn answering nothing, which the spawn door
-    /// refuses when the conversation offers no fallback either.
+    /// target, **as a generation**, resolved to the one the parent shows when
+    /// the tool is called (see [`DelegateTool::call`]). `None` for a turn
+    /// answering nothing, which the spawn door refuses when the conversation
+    /// offers no fallback either.
     anchor_action_id: Option<String>,
     /// The **item** this turn's own answer will be written under — the turn's
     /// identity, minted by `prepare_turn` before its first request. The room's
@@ -757,6 +772,39 @@ impl Tool for DelegateTool {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            // **The anchor is a generation, so it is resolved to the one the
+            // parent shows.** A turn answering a post carries that post's id
+            // raw: for a regeneration it is the antecedent copied off the
+            // answer's reply edge, which names the generation that was current
+            // when the answer was written — and threading resolves that edge to
+            // the item's tip, so a user post edited since leaves the turn
+            // holding an id the transcript no longer shows. Handed to the spawn
+            // door it meets `AnchorNotInParent`, correctly (the report attaches
+            // there, and an unshowable anchor would land at the conversation
+            // root) — but the model never chose that id and cannot correct it,
+            // which makes it the one refusal this loop must not produce.
+            //
+            // **At call time, not at preparation**, and the difference from the
+            // seat roster above is not an inconsistency: the snapshot rule
+            // exists so the name a model *reads* is the name the tool resolves.
+            // The anchor is machinery — the model neither reads nor names it —
+            // so nothing it was shown goes stale by reading this afresh, and an
+            // edit landing mid-turn is exactly the case a snapshot would get
+            // wrong. Resolution follows the item, never a guess: an item with
+            // no visible post at all keeps the raw id, so the door still says
+            // so rather than this inventing an anchor.
+            let anchor = match self.anchor_action_id.as_deref() {
+                None => None,
+                Some(raw) => Some(match inner.visible_anchor(raw).await {
+                    Ok(Some(visible)) => visible,
+                    Ok(None) => raw.to_string(),
+                    Err(e) => {
+                        return Err(ToolError::new(format!(
+                            "the delegated conversation could not be opened: {e}"
+                        )));
+                    }
+                }),
+            };
             let requested = string_list(&arguments, "participants").map_err(ToolError::new)?;
             let capabilities = string_list(&arguments, "capabilities").map_err(ToolError::new)?;
             let seats = resolve_seats(&self.candidates, &requested).map_err(ToolError::new)?;
@@ -785,7 +833,7 @@ impl Tool for DelegateTool {
                     &seats,
                     &capabilities,
                     title.as_deref(),
-                    self.anchor_action_id.as_deref(),
+                    anchor.as_deref(),
                     Some(self.answer_item_id.as_str()),
                 )
                 .await

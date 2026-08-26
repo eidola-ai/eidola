@@ -3260,6 +3260,67 @@ fn last_action(core: &AppCore, space_id: &str) -> String {
         .action_id
 }
 
+/// **A delegation's anchor is a generation, so it follows the edit.**
+///
+/// A turn answering a post carries that post's id raw, and for a regeneration
+/// that id comes off the answer's reply edge — the generation that was current
+/// when the answer was written. Edit the post since and threading shows the
+/// edit while the edge still names what it always named, so every `delegate`
+/// call in that regeneration handed the door a generation the parent no longer
+/// shows. The door was right to refuse it (an unshowable anchor would put the
+/// report at the conversation root); what was wrong was the id, and the model
+/// neither chose it nor could correct it.
+#[test]
+fn a_delegation_anchors_on_the_generation_the_parent_shows() {
+    run(|| {
+        let (mock, core, _dir, script) = tool_setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+
+        // The post, and the agent's answer to it.
+        let asked = last_action(&core, &parent);
+        ask(&core, &parent, &owner, &asked);
+        let answer = last_action(&core, &parent);
+
+        // The reader rewords the post. Its item now shows a new generation; the
+        // answer's reply edge still names the old one.
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(asked.clone(), "What do Friday's tide tables say?".into()))
+            .expect("edit the post")
+            .action_id;
+        assert_ne!(edited, asked, "the edit is a new generation");
+
+        // Regenerate the answer, and let that turn delegate.
+        *script.lock().unwrap() = vec![(
+            eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+            serde_json::json!({ "brief": "Check the tables and report back." }).to_string(),
+        )];
+        core.runtime()
+            .block_on(core.regenerate(answer, MODEL.to_string()))
+            .expect("the regeneration runs");
+
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(
+            results[0].starts_with("Opened "),
+            "the room opens instead of meeting a refusal nobody can act on: {}",
+            results[0]
+        );
+
+        let rooms = core
+            .runtime()
+            .block_on(core.subspaces_of(parent.clone()))
+            .expect("rooms");
+        assert_eq!(rooms.len(), 1, "{rooms:?}");
+        assert_eq!(
+            rooms[0].parent_action_id.as_deref(),
+            Some(edited.as_str()),
+            "anchored on the generation the parent shows, not the one the edge names"
+        );
+    });
+}
+
 /// **The tool is the spawn door, reached from inside a turn.**
 ///
 /// What only the turn knows is what it supplies: the room's owner is the
