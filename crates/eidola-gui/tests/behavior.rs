@@ -19347,6 +19347,56 @@ fn space_find_projects_an_edit_started_under_an_open_bar(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn space_find_does_not_search_an_answer_being_regenerated(cx: &mut TestAppContext) {
+    // While a regeneration is in flight the post's own body is not on screen:
+    // `render_post` swaps in `render_revision_body` for the whole value. The
+    // persisted text is still in `posts`, though, and a revising turn is
+    // filtered out of the stream overlays rather than represented as a
+    // streaming leaf — so the scope's `NodeSrc::Msg` arm kept projecting an
+    // answer the reader cannot see, counted matches in it, and pointed its
+    // highlight layers at an editor that is no longer mounted.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        let (matches, _) = v.find_matches_for_test();
+        assert_eq!(
+            matches.iter().map(|(n, _)| n.as_ref()).collect::<Vec<_>>(),
+            vec!["a1", "a2"],
+            "both posts carry the word to begin with"
+        );
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        assert!(
+            v.space().read(cx).revising_seq("a2").is_some(),
+            "the regeneration is pending on the post it replaces"
+        );
+        let (matches, _) = v.find_matches_for_test();
+        assert_eq!(
+            matches.iter().map(|(n, _)| n.as_ref()).collect::<Vec<_>>(),
+            vec!["a1"],
+            "the answer being replaced is off screen, so it is not searched"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_reveals_a_match_in_the_off_branch_composer(cx: &mut TestAppContext) {
     // The scope deliberately admits the active draft whatever branch it belongs
     // to, because its composer floats over whatever is showing — so a match in

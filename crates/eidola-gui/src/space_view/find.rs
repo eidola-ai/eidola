@@ -1020,6 +1020,11 @@ impl SpaceView {
     /// the reader's index jitter under their hand for no gain. It enters
     /// through the ordinary path when the turn finalizes and the transcript
     /// reloads.
+    ///
+    /// A post being **regenerated** is out on the same rule, and has to be
+    /// said separately: that turn is the same thing wearing the other shape,
+    /// rendering *in place of* the answer it replaces rather than as a leaf
+    /// beneath it, so it never reaches the streaming arm below.
     fn find_scope(&self, tree: &[TreeNode], page_width: Pixels, cx: &gpui::App) -> Vec<ScopeNode> {
         let mut scope: Vec<ScopeNode> = Vec::new();
         let mut seen: Vec<SharedString> = Vec::new();
@@ -1028,6 +1033,33 @@ impl SpaceView {
             match node.src {
                 NodeSrc::Msg(i) => {
                     let post = &self.posts[i];
+                    // **A post being regenerated is out for the same reason a
+                    // streaming leaf is, and it needs saying separately.** A
+                    // revising turn is filtered out of the stream overlays
+                    // rather than attached as a `NodeSrc::Streaming` leaf —
+                    // the pending state renders *in place of* the answer it
+                    // replaces, never as a child — so the exclusion below
+                    // never covers it, and this arm went on projecting
+                    // `post.content`. That text is not on screen at all while
+                    // the revision runs: `render_post` swaps the whole value
+                    // for `render_revision_body`. Searching it counted matches
+                    // in an answer the reader cannot see and aimed the
+                    // highlight layers at an editor that is no longer mounted,
+                    // while the revision actually on screen went unsearched.
+                    //
+                    // **Not projected from the stream either**, which is the
+                    // streaming rule itself: a body that grows token by token
+                    // makes the count and the reader's index jitter under
+                    // their hand for no gain. It comes back through the
+                    // ordinary path when the turn finalizes and the transcript
+                    // reloads.
+                    if post
+                        .action_id
+                        .as_deref()
+                        .is_some_and(|id| self.space.read(cx).revising_seq(id).is_some())
+                    {
+                        continue;
+                    }
                     let embeds = EmbedMap::new(post.references.iter().filter_map(|r| {
                         Some((
                             u64::try_from(r.ordinal).ok().filter(|o| *o > 0)?,
