@@ -962,3 +962,114 @@ fn a_caller_that_stops_reading_stops_being_served() {
         });
     });
 }
+
+#[test]
+fn no_refusal_ever_wears_an_id_a_live_request_holds() {
+    run(|| {
+        // The one-terminal-frame-per-id rule has to survive frames that are
+        // *also* wrong in some other way. A bad version, bad parameters and an
+        // unknown verb are each refused on the caller's own id — correlating a
+        // refusal is the protocol's norm — but not when that id belongs to a
+        // request still going to answer on it, or the caller gets two terminal
+        // frames wearing one id and can correlate neither.
+        let (mock, core, _dir) = served(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            chat_delay_ms: 1_500,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime().block_on(async {
+            let mut client = Client::connect(&core);
+            client.hello().await;
+            client
+                .send_with_id(
+                    5,
+                    &Call::ChatStream {
+                        prompt: "the slow one".into(),
+                        model: Some(MODEL.into()),
+                        space_id: None,
+                    },
+                )
+                .await;
+            for _ in 0..600 {
+                if mock.chat_hits() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(mock.chat_hits() > 0, "the turn never started");
+
+            // Every gate that would otherwise echo the id, while 5 is live.
+            let offending = [
+                format!(
+                    r#"{{"v":{},"id":5,"verb":"hello","params":{{}}}}"#,
+                    PROTOCOL_VERSION + 1
+                ),
+                r#"{"v":1,"id":5,"verb":"chat.stream","params":{"prompt":5}}"#.to_string(),
+                r#"{"v":1,"id":5,"verb":"db.query","params":{}}"#.to_string(),
+            ];
+            for frame in &offending {
+                client.send_raw(format!("{frame}\n").as_bytes()).await;
+            }
+
+            let mut terminals_for_five = 0;
+            let mut refusals = 0;
+            loop {
+                let frame = client.expect_frame().await;
+                match (frame.id, &frame.body) {
+                    (NO_REQUEST, ResponseBody::Err { error }) => match error.to_remote() {
+                        RemoteError::Protocol(ProtocolError::DuplicateRequestId { duplicate }) => {
+                            assert_eq!(duplicate, 5, "the refusal names the id it could not use");
+                            refusals += 1;
+                        }
+                        other => panic!("unexpected uncorrelated refusal: {other:?}"),
+                    },
+                    (5, ResponseBody::End { .. }) => {
+                        terminals_for_five += 1;
+                        break;
+                    }
+                    (5, ResponseBody::Err { error }) => {
+                        // The exact defect: a gate refusal answering on an id
+                        // whose request is still running.
+                        panic!("a refusal wore the live id 5: {error:?}");
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                refusals,
+                offending.len(),
+                "each offending frame is refused, uncorrelated, exactly once"
+            );
+            assert_eq!(
+                terminals_for_five, 1,
+                "exactly one terminal frame ever wears id 5"
+            );
+
+            // The judgements themselves are unchanged where the id is free: a
+            // bad version on an id nobody holds is still correlated to it.
+            client
+                .send_raw(
+                    format!(
+                        "{{\"v\":{},\"id\":9,\"verb\":\"hello\",\"params\":{{}}}}\n",
+                        PROTOCOL_VERSION + 1
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let frame = client.expect_frame().await;
+            assert_eq!(frame.id, 9, "an unambiguous refusal stays correlated");
+            match &frame.body {
+                ResponseBody::Err { error } => assert!(
+                    matches!(
+                        error.to_remote(),
+                        RemoteError::Protocol(ProtocolError::UnsupportedProtocol { .. })
+                    ),
+                    "unexpected: {error:?}"
+                ),
+                other => panic!("unexpected: {other:?}"),
+            }
+        });
+    });
+}
