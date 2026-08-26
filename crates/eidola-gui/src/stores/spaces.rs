@@ -2022,7 +2022,7 @@ mod tests {
 
             let mut undos: Vec<UndoEdit> = Vec::new();
             let mut redos: Vec<RedoEdit> = Vec::new();
-            let mut settle_rename =
+            let settle_rename =
                 |cell: &mut Loadable<Vec<SpaceInfo>>, op: Optimism, redos: &mut Vec<RedoEdit>| {
                     let settled = settle_index_mutation(cell, op.undo, WriteVerdict::Applied);
                     assert!(settled.unapplied.is_none());
@@ -2030,7 +2030,7 @@ mod tests {
                         redos.push(owed);
                     }
                 };
-            let mut settle_archive =
+            let settle_archive =
                 |cell: &mut Loadable<Vec<SpaceInfo>>, undo, undos: &mut Vec<UndoEdit>| {
                     let settled =
                         settle_index_mutation(cell, undo, WriteVerdict::Refused("refused".into()));
