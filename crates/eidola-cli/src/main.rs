@@ -467,6 +467,11 @@ fn failure_hint(e: &Failure) {
                  service) and run this again"
             );
         }
+        // Deliberately unhinted: the pipelining refusals
+        // (`DuplicateRequestId`, `ReservedRequestId`) reconstruct typed and
+        // render their own sentence, but this client is strictly
+        // request/response and cannot provoke either, so advice here would be
+        // guidance for a state it has no way to reach.
         _ => {}
     }
 }

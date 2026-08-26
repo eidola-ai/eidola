@@ -25,6 +25,23 @@
 //! finish and persist that turn regardless, so giving up buys nothing and
 //! loses the delivery.
 //!
+//! ## Pipelining, for whoever writes the next consumer
+//!
+//! This client sends one request and reads to its terminal frame, so neither
+//! rule below can bite it. They are the protocol's, not this module's, and a
+//! caller that does pipeline has to keep them:
+//!
+//! - **An id may not be reused until its request has terminated.** Exactly one
+//!   terminal frame answers an id; a second request wearing a live one is
+//!   refused with [`ProtocolError::DuplicateRequestId`], carrying the id as
+//!   *data* and answered on [`NO_REQUEST`] — because a refusal wearing the
+//!   duplicate would itself be the second terminal frame the rule exists to
+//!   prevent. Reusing an id after its request has ended is ordinary.
+//! - **A caller that stops reading is stalled, not served.** The app's writer
+//!   queue is bounded, so a peer that stops draining its socket applies
+//!   backpressure to its own answers rather than growing a queue in the app.
+//!   Read your answers if you want more of them.
+//!
 //! ## Two ceilings, and this side reads the larger one
 //!
 //! Requests are bounded by [`eidola_app_core::ipc::MAX_FRAME_BYTES`]; answers
@@ -558,6 +575,61 @@ mod tests {
         // The connection is still good: one refusal is one request's.
         let model: DefaultModelResult = client.call(&Call::ChatDefaultModel).await.expect("still");
         assert_eq!(model.model, "m@local");
+    }
+
+    #[tokio::test]
+    async fn a_pipelining_refusal_arrives_typed_on_no_request() {
+        // These travel on `NO_REQUEST` rather than on the id they are about,
+        // so this covers two things at once: that the variant reconstructs
+        // typed rather than degrading to `Unrecognized`, and that a refusal
+        // wearing no id still terminates the request in flight.
+        for (refusal, expected) in [
+            (
+                ProtocolError::DuplicateRequestId { duplicate: 7 },
+                "DuplicateRequestId",
+            ),
+            (
+                ProtocolError::ReservedRequestId {
+                    reserved: NO_REQUEST,
+                },
+                "ReservedRequestId",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let refusal = refusal.clone();
+            serve(dir.path(), move |request| match request.verb.as_str() {
+                "hello" => vec![Response::end(
+                    request.id,
+                    &HelloResult {
+                        protocol: PROTOCOL_VERSION,
+                        app_version: "9.9.9".into(),
+                    },
+                )],
+                _ => vec![Response::err(
+                    NO_REQUEST,
+                    WireError::from_protocol(&refusal),
+                )],
+            });
+            let mut client = Client::connect(dir.path()).await.expect("connect");
+            match client
+                .call::<DefaultModelResult>(&Call::ChatDefaultModel)
+                .await
+            {
+                Err(Failure::Protocol(e)) => {
+                    assert_eq!(e.kind(), expected, "the variant survives, fields and all");
+                    match e {
+                        ProtocolError::DuplicateRequestId { duplicate } => {
+                            assert_eq!(duplicate, 7, "the id it names is data, not the frame's id")
+                        }
+                        ProtocolError::ReservedRequestId { reserved } => {
+                            assert_eq!(reserved, NO_REQUEST)
+                        }
+                        other => panic!("unexpected variant: {other:?}"),
+                    }
+                }
+                other => panic!("expected a typed refusal: {:?}", other.map(|_| ())),
+            }
+        }
     }
 
     #[tokio::test]
