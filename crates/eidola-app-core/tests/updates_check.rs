@@ -23,7 +23,8 @@
 //! crypto.
 
 use eidola_app_core::updates::{
-    AcceptedClaims, CheckContext, Claim, UpdateCheckResult, check_for_update, expected_claims,
+    AcceptedClaims, CheckContext, Claim, UpdateCheckResult, UpdateCheckSnapshot, UpdateState,
+    check_for_update, check_outcome, classify, expected_claims,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -608,6 +609,87 @@ async fn acceptance_of_a_different_manifest_does_not_carry_over() {
     assert!(
         matches!(result, UpdateCheckResult::ClaimsChanged { .. }),
         "expected ClaimsChanged, got: {result:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acceptance_landing_during_a_check_is_not_undone_by_it() {
+    // "Treat as update" is one keystroke, and a check is a network round trip
+    // — so the acceptance can land while the request that will report on that
+    // very manifest is still in the air. A check that decided acceptance when
+    // it *started* answers about a moment the user has moved on from: it
+    // reports `ClaimsChanged` for a manifest now on record as accepted, and
+    // `absorb` installs it over the `UpdateAvailable` the acceptance just
+    // wrote. The warning and the button come straight back, with the
+    // acceptance still sitting in the state beside them.
+    //
+    // So the round trip ends in a `CheckOutcome` that has decided nothing,
+    // and one and the same completed check reads either way depending on what
+    // is on record when it lands.
+    let server = MockServer::start().await;
+    mount_release(&server, FIXTURE_TAG, FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
+    let mut ctx = ctx(&server, OLD_INSTALLED);
+    ctx.expected_claims = divergent_expected_claims();
+
+    let outcome = check_outcome(&http_client(), &ctx).await;
+
+    // What the in-flight check would have concluded, had it been asked before
+    // the user acted.
+    let before = classify(outcome.clone(), None);
+    let UpdateCheckResult::ClaimsChanged { release, .. } = &before else {
+        panic!("expected ClaimsChanged with nothing accepted, got: {before:#?}");
+    };
+
+    // The acceptance lands mid-flight, and rewrites the standing snapshot.
+    let mut state = UpdateState::default();
+    state.absorb(UpdateCheckSnapshot {
+        checked_at_ms: 1,
+        result: before.clone(),
+    });
+    let accepted = AcceptedClaims {
+        version: release.version.clone(),
+        manifest_sha256: release.manifest_sha256.clone(),
+        accepted_at_ms: 2,
+    };
+    state.accepted = Some(accepted.clone());
+
+    // Now the check lands, and is classified against the state as it is.
+    let after = classify(outcome.clone(), state.accepted.as_ref());
+    state.absorb(UpdateCheckSnapshot {
+        checked_at_ms: 3,
+        result: after,
+    });
+
+    let Some(UpdateCheckSnapshot {
+        result: UpdateCheckResult::UpdateAvailable { release },
+        ..
+    }) = &state.last
+    else {
+        panic!(
+            "the completing check must not resurrect a warning the user has \
+             already answered, got: {:#?}",
+            state.last
+        );
+    };
+    assert!(release.claims_accepted, "and it says why it is an update");
+    assert_eq!(
+        state.accepted.as_ref().map(|a| &a.manifest_sha256),
+        Some(&accepted.manifest_sha256),
+        "the acceptance itself is untouched"
+    );
+
+    // The other direction, from the same completed check: an acceptance that
+    // names a different manifest tolerates nothing here.
+    let elsewhere = AcceptedClaims {
+        manifest_sha256: "00".repeat(32),
+        ..accepted
+    };
+    assert!(
+        matches!(
+            classify(outcome, Some(&elsewhere)),
+            UpdateCheckResult::ClaimsChanged { .. }
+        ),
+        "acceptance is bound to one exact manifest"
     );
 }
 
