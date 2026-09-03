@@ -1704,6 +1704,10 @@ struct Inner {
     /// pool), or waits bounded for an in-flight refund. Held only around the
     /// provisioning step in `prepare_turn`; the HTTP request runs outside it.
     spend_gate: tokio::sync::Mutex<()>,
+    /// The holds this process has a request in flight for — see
+    /// [`LiveSpends`]. Recovery consults it so it never refunds a credential
+    /// that is `spending` because it is *being spent right now*.
+    live_spends: LiveSpends,
     /// Serializes each backend's configuration writes with the cleanup that
     /// belongs to them (`backends::Inner::lock_backend_config`). Keyed by
     /// backend id, so unrelated backends never wait on each other.
@@ -3111,7 +3115,26 @@ impl Inner {
         let rows = db::list_spending_credentials(&db_conn).await?;
         let mut recovered = Vec::new();
 
+        // **A hold a request is still flying with is not a stranded hold.**
+        // Recovery asks the server to refund a spend it has no record of, and
+        // the server takes an unrecorded nullifier as proof the request never
+        // arrived: it records it and refunds. Do that to a turn that is about
+        // to arrive and the turn's own request is then refused as a replay —
+        // the answer lost, and lost *because* somebody asked for their money
+        // back on its behalf. Embedded, this could not happen: the profile's
+        // one writer is this process and it is not taking a turn. Answering
+        // for the profile removes that accident, so the exclusion is stated
+        // rather than inherited from who happens to be running.
+        let live = self
+            .live_spends
+            .lock()
+            .expect("live spends lock poisoned")
+            .clone();
+
         for row in rows {
+            if live.contains(&row.pre_credential_id) {
+                continue;
+            }
             let spend_proof_cbor = row.spend_proof_data;
 
             let spend_proof = match SpendProof::<128>::from_cbor(&spend_proof_cbor) {
@@ -6637,6 +6660,19 @@ impl Inner {
             message: format!("failed to encode spend proof: {e}"),
         })?;
         let pre_cred_id = Uuid::now_v7().to_string();
+        // Claimed **before** the row that makes this credential `spending`,
+        // so there is no instant where the database says "in flight" and this
+        // process has not yet said whose flight it is. Recovery reads the two
+        // in the other order, so the overlap can only ever protect a live
+        // hold, never expose one.
+        self.live_spends
+            .lock()
+            .expect("live spends lock poisoned")
+            .insert(pre_cred_id.clone());
+        let live = LiveSpend {
+            set: Arc::clone(&self.live_spends),
+            pre_cred_id: pre_cred_id.clone(),
+        };
         db::insert_pre_credential_refund(
             db_conn,
             &pre_cred_id,
@@ -6672,6 +6708,7 @@ impl Inner {
                 spend_proof,
                 pre_refund,
                 pre_cred_id,
+                _live: live,
             },
             auth_value,
         ))
@@ -8747,6 +8784,7 @@ impl AppCore {
                 bus,
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
+                live_spends: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 backend_config_gates: Mutex::new(std::collections::HashMap::new()),
                 #[cfg(feature = "test-support")]
                 backend_config_pause: Mutex::new(None),
@@ -11432,6 +11470,38 @@ struct TurnPrep {
     bus: BroadcastSource,
 }
 
+/// The pre-credential ids this process is spending **right now**.
+///
+/// A credential is `spending` in the database from the instant its
+/// pending-refund row is written until its successor is minted, and that
+/// covers two very different situations: a request in flight, and a hold
+/// stranded by a process that died mid-turn. Only the second is recoverable,
+/// and the database cannot tell them apart — the difference is whether some
+/// process still has the request going, which is knowledge only that process
+/// has. This is that knowledge, written down.
+type LiveSpends = Arc<Mutex<std::collections::HashSet<String>>>;
+
+/// One entry in [`LiveSpends`], held for exactly as long as the spend it
+/// names.
+///
+/// Removed on drop rather than at any particular success or failure, because
+/// every way a turn can end has to remove it: a hold whose turn was abandoned
+/// **is** stranded and must become recoverable again, and a hold whose turn is
+/// still running must not. Dropping is the one event both share.
+struct LiveSpend {
+    set: LiveSpends,
+    pre_cred_id: String,
+}
+
+impl Drop for LiveSpend {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .expect("live spends lock poisoned")
+            .remove(&self.pre_cred_id);
+    }
+}
+
 /// The credential-spend half of a prepared (remote) turn: the spendable
 /// credential, the proof materials, and the pending-refund row id.
 struct SpendPrep {
@@ -11441,6 +11511,10 @@ struct SpendPrep {
     spend_proof: SpendProof<128>,
     pre_refund: PreRefund,
     pre_cred_id: String,
+    /// Marks this hold as one a request is in flight for, for as long as
+    /// these materials exist. `SpendPrep` is the only in-memory handle to a
+    /// hold, so its lifetime *is* the window recovery must stay out of.
+    _live: LiveSpend,
 }
 
 /// Persist-time verdict for a mechanical report. Ordinary turns skip the
