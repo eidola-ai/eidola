@@ -1684,9 +1684,14 @@ struct Inner {
     config_path: PathBuf,
     data_dir: PathBuf,
     db: tokio::sync::OnceCell<turso::Database>,
-    /// Cached update-check state (last result + accepted-claims choice),
-    /// lazily loaded from `<data_dir>/update-state.json` on first access.
-    update_state: Mutex<Option<updates::UpdateState>>,
+    /// Cached update-check state and the ordering that governs writes to it
+    /// (see [`UpdateStateCell`]), lazily loaded from
+    /// `<data_dir>/update-state.json` on first access.
+    update_state: Mutex<UpdateStateCell>,
+    /// Hands each check a number as it **starts**, so a completion can tell
+    /// whether a check begun after it has already answered. Process-local and
+    /// meaningless anywhere else, which is why it is not persisted.
+    update_checks_started: std::sync::atomic::AtomicU64,
     /// Latch so `start_update_polling` spawns at most one poll loop.
     update_polling: std::sync::atomic::AtomicBool,
     /// Invalidation bus — emits a [`Change`] after every durable commit.
@@ -1937,11 +1942,30 @@ impl Inner {
 
 // --- Update checking ----------------------------------------------------------
 
+/// The update state, and the one fact that decides who may write it.
+///
+/// `applied_check` is not part of the persisted state and never travels with
+/// it: it numbers *this process's* checks, and a number from another process
+/// or another run would be a comparison between two things that were never
+/// ordered. It lives here rather than beside here because it is read and
+/// written in the same breath as the state it orders, under the same lock —
+/// an ordering rule kept in a second lock is an ordering rule waiting to be
+/// taken in the wrong order.
+#[derive(Default)]
+struct UpdateStateCell {
+    /// Lazily loaded from disk on first access.
+    state: Option<updates::UpdateState>,
+    /// The newest check, by start order, whose completion has been recorded.
+    /// `0` before any check has completed.
+    applied_check: u64,
+}
+
 impl Inner {
     /// Cached-or-loaded copy of the persisted update state.
     fn update_state_snapshot(&self) -> updates::UpdateState {
         let mut guard = self.update_state.lock().expect("update_state lock");
         guard
+            .state
             .get_or_insert_with(|| updates::load_state(&self.data_dir))
             .clone()
     }
@@ -1965,11 +1989,14 @@ impl Inner {
     /// [`Change::UpdateState`] is emitted after the lock is released, so a
     /// subscriber that reads back cannot deadlock against the write that
     /// woke it.
-    fn update_state_with<T>(&self, f: impl FnOnce(&mut updates::UpdateState) -> T) -> T {
+    fn update_state_with<T>(&self, f: impl FnOnce(&mut updates::UpdateState, &mut u64) -> T) -> T {
         let answer = {
             let mut guard = self.update_state.lock().expect("update_state lock");
-            let state = guard.get_or_insert_with(|| updates::load_state(&self.data_dir));
-            let answer = f(state);
+            let cell = &mut *guard;
+            let state = cell
+                .state
+                .get_or_insert_with(|| updates::load_state(&self.data_dir));
+            let answer = f(state, &mut cell.applied_check);
             if let Err(e) = updates::save_state(&self.data_dir, state) {
                 eprintln!("warning: failed to persist update-check state: {e}");
             }
@@ -1984,6 +2011,15 @@ impl Inner {
     /// [`updates::UpdateState::absorb`]). Returns the *effective* snapshot:
     /// what the UI should now show.
     ///
+    /// **A verdict applies only if no check begun after it has already
+    /// answered.** Completion order is not start order — two checks can
+    /// observe genuinely different, genuinely valid feed states, and the
+    /// slower request's picture is the older one. [`updates::UpdateState::absorb`]
+    /// holds an alert against a later *failure*; it cannot hold one against a
+    /// stale `UpToDate`, which is not wrong, merely from before. So each check
+    /// takes a number as it starts and the completion is ignored outright if a
+    /// higher one has landed.
+    ///
     /// **Nothing about the state crosses the network wait — not even one
     /// field of it.** The round trip ends in a decision-free
     /// [`updates::CheckOutcome`], and both decisions that depend on state are
@@ -1995,6 +2031,10 @@ impl Inner {
     /// while the request reporting on that very manifest is in the air is one
     /// keystroke, and the reward used to be the warning coming straight back.
     async fn run_update_check(&self) -> updates::UpdateCheckSnapshot {
+        let started = self
+            .update_checks_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         let feed_url = self.load_config().update_feed_url();
 
         let outcome = match updater::build_http_client() {
@@ -2008,7 +2048,22 @@ impl Inner {
         };
 
         let checked_at_ms = now_ms();
-        self.update_state_with(|state| {
+        self.update_state_with(|state, applied| {
+            if started < *applied {
+                // A check begun after this one has already answered, so this
+                // one is describing the feed as it was before that. Not a
+                // failure and not wrong — just superseded, and the caller is
+                // told what stands rather than what it happened to see.
+                return state
+                    .last
+                    .clone()
+                    .expect("a check has applied, so a snapshot stands");
+            }
+            // Recorded even when `absorb` declines below: what this fixes is
+            // an older observation landing last, and a newer check having
+            // *completed* is the fact that makes the older one old — whether
+            // or not its verdict was the one worth keeping.
+            *applied = started;
             let result = updates::classify(outcome, state.accepted.as_ref());
             state.absorb(updates::UpdateCheckSnapshot {
                 checked_at_ms,
@@ -2024,7 +2079,7 @@ impl Inner {
         manifest_sha256: String,
     ) -> Result<(), AppError> {
         let accepted_at_ms = now_ms();
-        self.update_state_with(|state| {
+        self.update_state_with(|state, _applied| {
             state.accepted = Some(updates::AcceptedClaims {
                 version: version.clone(),
                 manifest_sha256: manifest_sha256.clone(),
@@ -8783,7 +8838,8 @@ impl AppCore {
                 config_path: config_dir.join("config.toml"),
                 data_dir,
                 db: tokio::sync::OnceCell::new(),
-                update_state: Mutex::new(None),
+                update_state: Mutex::new(UpdateStateCell::default()),
+                update_checks_started: std::sync::atomic::AtomicU64::new(0),
                 update_polling: std::sync::atomic::AtomicBool::new(false),
                 bus,
                 local: Arc::new(local_models::LocalRuntime::default()),

@@ -822,6 +822,81 @@ fn a_standing_alert_survives_a_check_that_started_before_it() {
     );
 }
 
+#[test]
+fn a_newer_alert_is_not_replaced_by_an_older_check_that_finished_after_it() {
+    // The sibling of the standing-alert case, and the one `absorb` cannot
+    // reach: this older check does not *fail*, it succeeds with a perfectly
+    // valid `UpToDate` — a cached feed answer, or simply the state of the
+    // world before the release that raised the alarm was marked latest.
+    // `absorb` holds an alert against a later failure; nothing about an
+    // `UpToDate` says it is stale. Only start order does.
+    let config_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let core = eidola_app_core::AppCore::new(
+        config_dir.path().to_path_buf(),
+        data_dir.path().to_path_buf(),
+    )
+    .expect("open core");
+
+    let feed = |uri: &str| {
+        std::fs::write(
+            config_dir.path().join("config.toml"),
+            format!("update_feed = \"{uri}\"\n"),
+        )
+        .unwrap();
+    };
+
+    core.runtime().block_on(async {
+        // Started first, finishes last, and answers honestly: this build is
+        // newer than the release the feed still calls latest.
+        let slow = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/releases/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(latest_release_json(&slow.uri(), FIXTURE_TAG, &[]))
+                    .set_delay(std::time::Duration::from_secs(3)),
+            )
+            .mount(&slow)
+            .await;
+        // Started second, finishes first, and finds a genuine alert.
+        let alerting = MockServer::start().await;
+        mount_release(&alerting, "v9.9.9", FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
+
+        feed(&slow.uri());
+        let slow_check = core.update_check();
+        tokio::pin!(slow_check);
+        tokio::select! {
+            _ = &mut slow_check => panic!("the slow feed answered too early to prove anything"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+
+        feed(&alerting.uri());
+        let alert = core.update_check().await;
+        assert!(
+            matches!(alert.result, UpdateCheckResult::Unverifiable { .. }),
+            "the fixture has to raise a real alert: {:#?}",
+            alert.result
+        );
+
+        let stale = slow_check.await;
+        assert!(
+            matches!(stale.result, UpdateCheckResult::Unverifiable { .. }),
+            "a check that started earlier must not undo a newer one's alert with \
+             a picture from before it — and is told what stands: {:#?}",
+            stale.result
+        );
+    });
+
+    assert!(
+        matches!(
+            core.last_update_check().map(|s| s.result),
+            Some(UpdateCheckResult::Unverifiable { .. })
+        ),
+        "and the alert is what persists"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Feed anomalies that are neither crypto verdicts nor offline blips
 // ---------------------------------------------------------------------------
