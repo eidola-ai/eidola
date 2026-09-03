@@ -19776,7 +19776,7 @@ fn space_find_stops_its_reveal_when_the_reader_resumes_composing(cx: &mut TestAp
     let draft = view
         .read_with(&vcx, |v, _| v.composer_state_for_test())
         .expect("the tail draft is the active composer");
-    let editor = draft.read_with(&vcx, |e, cx| gpui::Focusable::focus_handle(e, cx));
+    let editor = draft.read_with(&vcx, gpui::Focusable::focus_handle);
     vcx.update(|window, cx| window.focus(&editor, cx));
     vcx.run_until_parked();
     view.read_with(&vcx, |v, _| {
