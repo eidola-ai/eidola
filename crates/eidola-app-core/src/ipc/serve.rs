@@ -156,11 +156,60 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (out, outbox) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE_FRAMES);
-    let pen = tokio::spawn(write_frames(writer, outbox));
+    // Guarded, not merely held: whoever cancels this future is cancelling the
+    // connection, and a bare `JoinHandle` dropped on that path would *detach*
+    // the writer rather than end it — leaving the socket's write half open and
+    // still delivering (see `AbortOnDrop`).
+    let mut pen = AbortOnDrop::new(tokio::spawn(write_frames(writer, outbox)));
     read_frames(core, app_version, reader, out).await;
     // Dropping the last sender ends the writer once it has drained — which is
-    // what flushes the final terminal frame before the socket closes.
-    let _ = pen.await;
+    // what flushes the final terminal frame before the socket closes. Awaited
+    // with the guard still standing, so a cancellation landing mid-drain takes
+    // the writer with it.
+    pen.join().await;
+}
+
+/// A spawned task that ends with whoever holds this.
+///
+/// **Dropping a `JoinHandle` detaches its task; it does not stop it.** That is
+/// the whole reason this type exists: `serve_connection` and its request tasks
+/// each spawn a helper, and on a cancellation — the socket closing on a full
+/// shutdown, a connection torn down — the future holding the handle is dropped
+/// at its next await point. Bare handles left the writer and a turn's chunk
+/// forwarder running, still holding the socket and still queueing frames, so a
+/// connection that had been "ended" went on delivering until its turn finished.
+///
+/// A `JoinSet` already behaves this way (its `Drop` aborts), which is why the
+/// request tasks need nothing; this is the same guarantee for the two helpers
+/// spawned outside one.
+///
+/// **What it cancels is delivery, never work.** A turn runs on the core's own
+/// runtime and is detached by construction, so ending its forwarder stops the
+/// frames and leaves the turn to finish and persist — the rule the module docs
+/// state at length.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Wait for the task to end on its own — **with the guard still armed**, so
+    /// a cancellation arriving during the wait ends it rather than detaching it.
+    async fn join(&mut self) {
+        if let Some(handle) = self.0.as_mut() {
+            let _ = handle.await;
+        }
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
 }
 
 /// Drain the outbox onto the wire, in order, until the connection ends.
@@ -173,6 +222,41 @@ async fn write_frames<W: AsyncWrite + Unpin>(mut writer: W, mut outbox: mpsc::Re
             break;
         }
     }
+}
+
+/// What the read loop got, or why it is stopping.
+enum Next {
+    /// A whole frame's bytes.
+    Line(Vec<u8>),
+    /// A line that was not a frame this build can read.
+    Bad(ProtocolError),
+    /// Nothing more will be read.
+    Ends(Ending),
+}
+
+/// Why the read loop stopped — **which is what decides what happens to the
+/// requests still running.**
+///
+/// The three are not interchangeable, and collapsing them is what cost a polite
+/// caller its answers: "the peer stopped asking" and "the peer stopped
+/// listening" both arrived as an end of stream and both aborted everything.
+#[derive(Clone, Copy)]
+enum Ending {
+    /// **A clean end of the request stream, which is not the end of the
+    /// conversation.** `shutdown(SHUT_WR)` and then read to completion is the
+    /// classic polite client: it has said everything it means to say and is
+    /// waiting on the answers it already asked for. Its read half is open and
+    /// every one of those answers is still deliverable, so the in-flight
+    /// requests are **awaited** and the writer drains behind them.
+    PeerDone,
+    /// The outbox closed: the writer is gone and nothing can reach the caller.
+    /// Frames are what abort stops, and there is nobody left to receive one.
+    WriterGone,
+    /// A frame error the protocol calls fatal — the reader abandoned a line
+    /// part-way and no longer knows where the next one begins. The byte stream
+    /// is desynchronized and the caller is not keeping to the protocol, so this
+    /// tears down rather than drains.
+    Fatal,
 }
 
 /// The reader loop: parse, gate, dispatch.
@@ -209,12 +293,15 @@ async fn read_frames<R: AsyncRead + Unpin>(
                 .await
                 .is_err()
             {
-                break;
+                break Ending::WriterGone;
             }
         };
     }
 
-    loop {
+    // **How the loop ends decides what happens to what is still running**, so
+    // the reason is what it evaluates to rather than something inferred from
+    // the fact that it ended.
+    let ending = loop {
         // **Nothing is read while there is nowhere to put the answer.** The
         // writer drops the outbox receiver when the socket stops taking bytes,
         // and a peer that closed only its read half goes on sending perfectly
@@ -223,25 +310,27 @@ async fn read_frames<R: AsyncRead + Unpin>(
         // and `chat.stream` is billed work. Raced against the read rather than
         // checked after it, so a caller already blocked on `next_line` is let
         // go the moment the writer dies instead of at its next frame.
-        let next: Option<Result<Vec<u8>, ProtocolError>> = tokio::select! {
+        let next = tokio::select! {
             biased;
-            () = out.closed() => None,
+            () = out.closed() => Next::Ends(Ending::WriterGone),
             read = frames.next_line() => match read {
-                Ok(Some(line)) => Some(Ok(line.to_vec())),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
+                Ok(Some(line)) => Next::Line(line.to_vec()),
+                // A clean end of the *request* stream, which is not the end of
+                // the conversation — see `Ending::PeerDone`.
+                Ok(None) => Next::Ends(Ending::PeerDone),
+                Err(e) => Next::Bad(e),
             },
         };
         let line = match next {
-            Some(Ok(line)) => line,
-            Some(Err(e)) => {
+            Next::Line(line) => line,
+            Next::Bad(e) => {
                 refuse!(NO_REQUEST, e);
                 if e.is_fatal() {
-                    break;
+                    break Ending::Fatal;
                 }
                 continue;
             }
-            None => break,
+            Next::Ends(reason) => break reason,
         };
 
         let request = match decode_request(&line) {
@@ -327,7 +416,7 @@ async fn read_frames<R: AsyncRead + Unpin>(
                 Err(error) => terminal_error_line(request.id, error, MAX_RESPONSE_BYTES),
             };
             if out.send(line).await.is_err() {
-                break;
+                break Ending::WriterGone;
             }
             // Queued before the next line is read, and one writer drains the
             // outbox in order — so the handshake's answer is on the wire ahead
@@ -339,13 +428,13 @@ async fn read_frames<R: AsyncRead + Unpin>(
         // Waiting here is the backpressure: a caller that has saturated the
         // connection simply stops being read from until a slot frees.
         let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
-            break;
+            break Ending::WriterGone;
         };
         // Asked again on the last line before the work starts, because the wait
         // above can be long: the answer to "can this still be delivered" has to
         // be as fresh as the decision it gates.
         if out.is_closed() {
-            break;
+            break Ending::WriterGone;
         }
         let core = Arc::clone(&core);
         let app_version = app_version.clone();
@@ -374,13 +463,23 @@ async fn read_frames<R: AsyncRead + Unpin>(
         // Reap finished tasks so the set does not grow across a long-lived
         // connection. `try_join_next` never blocks the read loop.
         while tasks.try_join_next().is_some() {}
-    }
+    };
 
-    // The peer is gone, so nothing is left to receive an answer. Aborting stops
-    // the frames; it does not stop a turn already running on the core's runtime
-    // (see "What a lost caller costs" above), and it must not — that would be
-    // cancellation landing inside a durable operation.
-    tasks.abort_all();
+    match ending {
+        // The caller stopped *asking*, not listening. Its read half is open and
+        // it is owed the answers it already asked for, so they are awaited —
+        // and the writer then drains behind them, since every task's outbox
+        // sender drops as it ends. It terminates on its own: a caller that goes
+        // away entirely fails the writer's next write, which drops the outbox
+        // receiver, which fails every blocked send, which ends the tasks.
+        Ending::PeerDone => while tasks.join_next().await.is_some() {},
+        // Nothing is left to receive an answer, or the byte stream can no
+        // longer be trusted to be frames. Aborting stops the frames; it does
+        // not stop a turn already running on the core's runtime (see "What a
+        // lost caller costs" above), and it must not — that would be
+        // cancellation landing inside a durable operation.
+        Ending::WriterGone | Ending::Fatal => tasks.abort_all(),
+    }
 }
 
 /// The request ids currently in flight on one connection.
@@ -501,7 +600,7 @@ async fn answer(
             // Drains to the end even when the peer has stopped listening: the
             // turn is running and paid for either way, and a receiver dropped
             // under it would only turn a finished turn into a torn one.
-            let pump = tokio::spawn(async move {
+            let mut pump = AbortOnDrop::new(tokio::spawn(async move {
                 'events: while let Some(event) = rx.recv().await {
                     // A delta's size is the backend's decision, not this app's,
                     // so it goes out through `chunk_lines` — which splits an
@@ -520,7 +619,7 @@ async fn answer(
                         }
                     }
                 }
-            });
+            }));
             // Detached by construction: `chat_stream` spawns the turn on the
             // core's runtime, so a caller that disappears mid-turn stops being
             // written to and the turn still lands. That is deliberate — see
@@ -528,8 +627,10 @@ async fn answer(
             let result = core.chat_stream(prompt, model, space_id, tx).await;
             // `chat_stream` drops the sender as it returns, so this completes
             // once the last chunk has been queued — which is what puts every
-            // `chunk` ahead of the `end` on the wire.
-            let _ = pump.await;
+            // `chunk` ahead of the `end` on the wire. Guarded, so a request
+            // task cancelled mid-turn takes its forwarder rather than leaving
+            // it queueing frames at a connection that has ended.
+            pump.join().await;
             ok(result.map_err(failed)?)
         }
     }
