@@ -76,6 +76,11 @@ enum Mode {
 /// The session a command runs against.
 pub struct Session {
     mode: Mode,
+    /// This profile's `config.toml`. Held in both modes, because in client
+    /// mode it is the *same file* the answering app reads — the handshake
+    /// refuses an app composed from another config root, so whoever answers
+    /// this session shares this path.
+    config_path: PathBuf,
 }
 
 /// Why no session could be opened.
@@ -85,6 +90,10 @@ pub enum Startup {
     Core(AppError),
     /// The profile is held by a process that does not answer for it.
     NotAccepting { pid: Option<u32> },
+    /// The app answering for this data directory composes its profile from a
+    /// different config root, so it speaks for another account, another
+    /// default template and another update feed than this command was given.
+    OtherProfile { ours: PathBuf, theirs: String },
     /// The conversation with the running app failed before it began.
     Dial(Failure),
 }
@@ -100,6 +109,12 @@ impl std::fmt::Display for Startup {
                 }
                 write!(f, " but is not accepting local connections")
             }
+            Startup::OtherProfile { ours, theirs } => write!(
+                f,
+                "the Eidola running for this data directory reads its config from \
+                 {theirs}, not {} — it speaks for a different profile",
+                ours.display()
+            ),
             Startup::Dial(e) => write!(f, "{e}"),
         }
     }
@@ -127,9 +142,10 @@ impl Session {
         data_dir: PathBuf,
         embedded: bool,
     ) -> Result<Session, Startup> {
+        let config_path = config_dir.join("config.toml");
         if embedded {
             return AppCore::new(config_dir, data_dir)
-                .map(Session::from_core)
+                .map(|core| Session::from_core(core, config_path))
                 .map_err(Startup::Core);
         }
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -143,22 +159,26 @@ impl Session {
                 }));
             }
         };
-        match runtime.block_on(Client::connect(&data_dir)) {
+        match runtime.block_on(Client::connect(&config_dir, &data_dir)) {
             Ok(client) => Ok(Session {
                 mode: Mode::Client {
                     runtime,
                     client: tokio::sync::Mutex::new(client),
                 },
+                config_path,
             }),
             Err(Dial::NoListener) => {
                 // Nothing to ask, so open the profile here — which is also how
                 // we learn whether anything is holding it.
                 drop(runtime);
                 AppCore::new(config_dir, data_dir)
-                    .map(Session::from_core)
+                    .map(|core| Session::from_core(core, config_path))
                     .map_err(unanswered)
             }
             Err(Dial::NotAccepting) => Err(Startup::NotAccepting { pid: None }),
+            // Refused during the handshake, so no verb was ever dispatched at
+            // it: the app answering is not serving this command's profile.
+            Err(Dial::OtherProfile { ours, theirs }) => Err(Startup::OtherProfile { ours, theirs }),
             Err(Dial::Failed(e)) => Err(Startup::Dial(e)),
         }
     }
@@ -179,10 +199,28 @@ impl Session {
     /// sweep picks it up exactly as it picks up any room a previous run left
     /// mid-delegation. In client mode the room is driven immediately, because
     /// the process answering is the one running the driver.
-    fn from_core(core: AppCore) -> Session {
+    fn from_core(core: AppCore, config_path: PathBuf) -> Session {
         Session {
             mode: Mode::Embedded(core),
+            config_path,
         }
+    }
+
+    /// The account this profile speaks for **right now**.
+    ///
+    /// Read from `config.toml` on every call, in both modes, because the
+    /// question it answers is about *now* rather than about when the session
+    /// opened. It needs no lock — the file is the same one `AppCore` itself
+    /// re-reads per call, and reading it is what the app does too — and in
+    /// client mode it is authoritative precisely because the handshake
+    /// refuses an app composed from another config root.
+    ///
+    /// `None` is a real answer (no account configured), and so is the answer
+    /// after a torn write, which decodes as a default config: either way the
+    /// identity on record is not the one a caller captured, which is the
+    /// conservative direction for the one thing this is used for.
+    pub fn account_identity(&self) -> Option<String> {
+        eidola_app_core::config::Config::load_from(&self.config_path).account_id
     }
 
     /// The runtime this session's work runs on.
@@ -487,19 +525,36 @@ impl Session {
     }
 
     /// Take a turn, streaming its events to `tx`.
+    ///
+    /// **An unnamed model stays unnamed all the way to the turn.** `None` is
+    /// not "we have not looked it up yet" — it is the request that the
+    /// process taking the turn resolve the default at the moment it starts
+    /// one. Resolving it here and sending the answer would serialize a value
+    /// the app can change between the lookup and the turn (the default
+    /// template, or that template's agent model), and the app would then be
+    /// unable to tell a stale default from a deliberate choice, because on
+    /// the wire they are the same field.
     pub async fn chat_stream(
         &self,
         prompt: String,
-        model: String,
+        model: Option<String>,
         space_id: Option<String>,
         tx: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<ChatResult, Failure> {
         match &self.mode {
-            Mode::Embedded(core) => Ok(core.chat_stream(prompt, model, space_id, tx).await?),
+            Mode::Embedded(core) => {
+                // This process owns the profile for the whole command, so
+                // resolving here is resolving at turn start.
+                let model = match model {
+                    Some(m) => m,
+                    None => core.default_model().await?,
+                };
+                Ok(core.chat_stream(prompt, model, space_id, tx).await?)
+            }
             Mode::Client { client, .. } => {
                 let call = Call::ChatStream {
                     prompt,
-                    model: Some(model),
+                    model,
                     space_id,
                 };
                 client.lock().await.chat_stream(&call, &tx).await
@@ -540,6 +595,7 @@ mod tests {
                         &HelloResult {
                             protocol: PROTOCOL_VERSION,
                             app_version: "9.9.9".into(),
+                            config_dir: None,
                         },
                     );
                     use tokio::io::AsyncWriteExt;
@@ -589,6 +645,7 @@ mod tests {
                             &HelloResult {
                                 protocol: PROTOCOL_VERSION,
                                 app_version: "9.9.9".into(),
+                                config_dir: None,
                             },
                         ),
                         "wallet.lifecycle" => Response::end(

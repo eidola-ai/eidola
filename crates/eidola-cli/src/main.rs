@@ -425,6 +425,13 @@ fn report_startup(e: &Startup) {
                  listener stopped. Quit it and run this again"
             );
         }
+        Startup::OtherProfile { .. } => {
+            eprintln!(
+                "hint: a profile is both roots, and only the data one is shared \
+                 here — point this command's config root at the running Eidola's \
+                 (XDG_CONFIG_HOME on Linux), or quit that Eidola and run this again"
+            );
+        }
         Startup::Dial(e) => failure_hint(e),
     }
 }
@@ -465,6 +472,13 @@ fn failure_hint(e: &Failure) {
             eprintln!(
                 "hint: quit Eidola (`eidola service stop` for the background \
                  service) and run this again"
+            );
+        }
+        Failure::AccountReplaced { .. } => {
+            eprintln!(
+                "hint: that link funds the account this machine held when the \
+                 request went out, and it now holds another one — check \
+                 `eidola account show` and run this again"
             );
         }
         // Deliberately unhinted: the pipelining refusals
@@ -849,7 +863,23 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                 price_id,
                 no_browser,
             }) => {
+                // The link is minted against the credentials held when the
+                // request goes out, and that round trip is long enough for the
+                // account to be replaced under it — reset or reconfigured in
+                // the running app, which owns the profile in client mode.
+                // Printing it then would put a checkout that funds an account
+                // this machine no longer holds the secret for in front of the
+                // reader under the current account's name. So the identity it
+                // was minted for is captured here and re-checked where the
+                // answer is still knowable, before a single character of the
+                // URL is exposed.
+                let minted_for = session.account_identity();
                 let url = session.account_checkout(price_id).await?;
+                if session.account_identity() != minted_for {
+                    return Err(Failure::AccountReplaced {
+                        what: "that checkout link",
+                    });
+                }
                 let should_open = !no_browser && std::io::stdout().is_terminal();
                 println!("{url}");
                 if should_open {
@@ -932,34 +962,45 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             model,
             space,
         }) => {
-            // No --model flag → the default template's agent model (async
-            // `AppCore::default_model`, falling back to the embedded default).
-            // Transitional until wave 2 makes turns participant-aware.
+            // No --model flag → the default template's agent model, resolved
+            // by **whichever process takes the turn**, at the moment it takes
+            // it. Embedded, that is this one: it owns the profile for the
+            // whole command, so resolving here *is* resolving at turn start.
+            // In client mode the app owns it, and the default template — or
+            // that template's agent model — can be changed between this
+            // lookup and the turn; a resolved default is indistinguishable on
+            // the wire from a model the reader named, so sending one would
+            // leave the app unable to apply its own current answer. It
+            // therefore travels unnamed.
             let model = match model {
-                Some(m) => m,
-                None => session.default_model().await?,
+                Some(m) => Some(m),
+                None if session.is_client() => None,
+                None => Some(session.default_model().await?),
             };
 
             // Engine-served models load on demand inside the request path
             // (app-core evicts LRU idle engines to make room); this block
-            // only narrates the potentially-long first-load wait. Engines
-            // are owned by *this* process, so they die with the run.
-            let mref = eidola_app_core::parse_model_ref(&model);
-            let engine_backed = mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
-                || session.list_backends().await?.iter().any(|b| {
-                    b.id == mref.backend_id
-                        && b.kind == eidola_app_core::BackendKind::LlamaCpp
-                        && b.auto_start
-                });
-            if engine_backed {
-                eprintln!("loading {model}… (a request loads the engine on demand)");
+            // only narrates the potentially-long first-load wait, and can do
+            // so only for a model this process can name before the turn
+            // starts. The turn's closing report names the one that answered.
+            if let Some(named) = model.as_deref() {
+                let mref = eidola_app_core::parse_model_ref(named);
+                let engine_backed = mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
+                    || session.list_backends().await?.iter().any(|b| {
+                        b.id == mref.backend_id
+                            && b.kind == eidola_app_core::BackendKind::LlamaCpp
+                            && b.auto_start
+                    });
+                if engine_backed {
+                    eprintln!("loading {named}… (a request loads the engine on demand)");
+                }
             }
 
             // Stream chunks straight to stdout. Reasoning goes to stderr
             // (dim, prefixed with "thinking: ") so a piped stdout still
             // captures only the final answer text.
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
-            let chat_fut = session.chat_stream(prompt, model.clone(), space, tx);
+            let chat_fut = session.chat_stream(prompt, model, space, tx);
 
             // Pump events while chat_fut runs. We `tokio::join!` the two
             // halves so events drain in real time rather than only after
@@ -1366,8 +1407,16 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
         Some(Command::Update {
             command: UpdateCommand::Check,
         }) => {
+            // The check compares the *running* build — its version, and the
+            // claim expectations compiled into it — against the feed, and in
+            // client mode the process that ran it is the app. Say whose
+            // verdict this is before printing it.
+            let checked_by = session.app_version().await;
             let snapshot = session.update_check().await?;
-            print_update_check(&snapshot);
+            if let Some(note) = update_check_attribution(checked_by.as_deref()) {
+                eprintln!("{note}");
+            }
+            print_update_check(&snapshot, checked_by.as_deref());
             match snapshot.result {
                 // Distinct exit codes so scripts can route on the two
                 // states that need a human decision.
@@ -1695,12 +1744,41 @@ fn catalog_installed(models: &[eidola_app_core::LocalModelInfo], file_name: &str
 
 /// Print one `update check` outcome — the same five states the GUI's
 /// Updates window renders, sharing the core types.
-fn print_update_check(snapshot: &eidola_app_core::updates::UpdateCheckSnapshot) {
+/// The line that says whose build an update verdict is about, when that is
+/// not this one's.
+///
+/// `checked_by` is the answering app's version in client mode and `None`
+/// embedded. The verdict is a comparison against the *running* build — its
+/// version and the claim expectations compiled into it — so in client mode it
+/// is the app's answer, not this `eidola`'s. Where the two builds are the same
+/// release there is nothing to disclose: the version names the release, and
+/// the expectations come from that release's trust root, so the app reached
+/// the answer this binary would have. Where they differ, saying so is the
+/// whole point — the same command can report a different availability or
+/// security state merely because the app is running.
+fn update_check_attribution(checked_by: Option<&str>) -> Option<String> {
+    let theirs = checked_by?;
+    let ours = env!("CARGO_PKG_VERSION");
+    if theirs == ours {
+        return None;
+    }
+    Some(format!(
+        "note: the running Eidola ({theirs}) ran this check, so the verdict below \
+         is about its build and its expected claims — not this `eidola` ({ours})"
+    ))
+}
+
+fn print_update_check(
+    snapshot: &eidola_app_core::updates::UpdateCheckSnapshot,
+    checked_by: Option<&str>,
+) {
     use eidola_app_core::updates::UpdateCheckResult;
 
+    // Whichever build ran the check is the one "up to date" is about.
+    let installed = checked_by.unwrap_or(env!("CARGO_PKG_VERSION"));
     match &snapshot.result {
         UpdateCheckResult::UpToDate { latest_version } => {
-            println!("Eidola {} is up to date.", env!("CARGO_PKG_VERSION"));
+            println!("Eidola {installed} is up to date.");
             match latest_version {
                 Some(v) => println!("latest release: v{v}"),
                 None => println!("no release is marked latest yet"),

@@ -95,6 +95,12 @@ pub enum Failure {
     /// nothing was attempted and the remedy is about which process should be
     /// running, not about the command's arguments.
     EmbeddedOnly { what: &'static str },
+    /// The account was replaced while something was being minted against it,
+    /// so what came back belongs to an account this machine no longer speaks
+    /// for. Its own variant because nothing failed — the work succeeded, for
+    /// somebody else — and the only correct thing to do with the result is
+    /// not use it.
+    AccountReplaced { what: &'static str },
 }
 
 impl std::fmt::Display for Failure {
@@ -107,6 +113,10 @@ impl std::fmt::Display for Failure {
             Failure::EmbeddedOnly { what } => write!(
                 f,
                 "{what} needs the local profile in this process, and Eidola is running"
+            ),
+            Failure::AccountReplaced { what } => write!(
+                f,
+                "the account changed while {what} was being prepared, so nothing was opened"
             ),
         }
     }
@@ -145,6 +155,13 @@ pub enum Dial {
     /// The socket exists and accepted a connection, but the handshake went
     /// unanswered. Something is holding the path without serving it.
     NotAccepting,
+    /// The app answering composes its profile from a different config root,
+    /// so it is not this command's profile. Carries both roots, because the
+    /// only useful thing to say is which two disagree.
+    OtherProfile {
+        ours: std::path::PathBuf,
+        theirs: String,
+    },
     /// The conversation started and failed.
     Failed(Failure),
 }
@@ -165,6 +182,22 @@ pub fn no_listener(e: &io::Error) -> bool {
     )
 }
 
+/// Whether two config roots name the same profile.
+///
+/// Resolved with `canonicalize` where the path exists, because a symlinked
+/// home, a trailing slash and a relative spelling are the same directory by
+/// any measure the filesystem would agree with, and refusing over one of
+/// those would be refusing over punctuation. A path that cannot be resolved
+/// (it does not exist yet, which is ordinary for a config root on a fresh
+/// machine) falls back to its literal spelling, which is the only thing left
+/// to compare.
+pub fn same_config_root(ours: &Path, theirs: &Path) -> bool {
+    fn resolve(p: &Path) -> std::path::PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    }
+    resolve(ours) == resolve(theirs)
+}
+
 /// A conversation with the app that holds the profile.
 pub struct Client {
     reader: FrameReader<tokio::io::BufReader<OwnedReadHalf>>,
@@ -176,7 +209,15 @@ pub struct Client {
 
 impl Client {
     /// Dial the control socket for a profile and complete the handshake.
-    pub async fn connect(data_dir: &Path) -> Result<Client, Dial> {
+    ///
+    /// **A profile is both roots.** The socket lives in the data directory,
+    /// but the account, the default template and the update feed come from
+    /// `config.toml` in the config directory, and the two are resolved from
+    /// independent environment variables. So finding a listener here is not
+    /// yet grounds to hand it this command: the app answering states the
+    /// config root it composes its profile from, and one that is not ours is
+    /// refused before a single verb is sent.
+    pub async fn connect(config_dir: &Path, data_dir: &Path) -> Result<Client, Dial> {
         let path = socket_path(data_dir);
         let stream = match UnixStream::connect(&path).await {
             Ok(stream) => stream,
@@ -214,6 +255,20 @@ impl Client {
                     requested: PROTOCOL_VERSION,
                 },
             )));
+        }
+        // Whose profile is it? An app that states another config root is
+        // serving another account, another default template and another
+        // update feed, and every verb after this would quietly be about that
+        // one. An app that states *none* is older than the field; that is a
+        // thing this build cannot check rather than a mismatch it may invent,
+        // so it is left alone.
+        if let Some(theirs) = &hello.config_dir
+            && !same_config_root(config_dir, Path::new(theirs))
+        {
+            return Err(Dial::OtherProfile {
+                ours: config_dir.to_path_buf(),
+                theirs: theirs.clone(),
+            });
         }
         client.app_version = hello.app_version;
         Ok(client)
@@ -379,6 +434,7 @@ mod tests {
                 &HelloResult {
                     protocol: PROTOCOL_VERSION,
                     app_version: "9.9.9".into(),
+                    config_dir: None,
                 },
             )],
             "chat.default_model" => vec![Response::end(
@@ -416,7 +472,7 @@ mod tests {
     #[tokio::test]
     async fn no_socket_file_is_no_listener() {
         let dir = tempfile::tempdir().expect("tempdir");
-        match Client::connect(dir.path()).await {
+        match Client::connect(dir.path(), dir.path()).await {
             Err(Dial::NoListener) => {}
             other => panic!("unexpected: {:?}", other.map(|_| ())),
         }
@@ -427,7 +483,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let stale = std::os::unix::net::UnixListener::bind(socket_path(dir.path())).expect("bind");
         drop(stale);
-        match Client::connect(dir.path()).await {
+        match Client::connect(dir.path(), dir.path()).await {
             Err(Dial::NoListener) => {}
             other => panic!("the file outlived its listener: {:?}", other.map(|_| ())),
         }
@@ -437,7 +493,9 @@ mod tests {
     async fn the_handshake_names_the_app_and_the_verbs_answer() {
         let dir = tempfile::tempdir().expect("tempdir");
         serve(dir.path(), ordinary);
-        let mut client = Client::connect(dir.path()).await.expect("connect");
+        let mut client = Client::connect(dir.path(), dir.path())
+            .await
+            .expect("connect");
         assert_eq!(client.app_version(), "9.9.9");
         let model: DefaultModelResult = client
             .call(&Call::ChatDefaultModel)
@@ -456,7 +514,7 @@ mod tests {
             // takes the call and never answers it.
             std::future::pending::<()>().await;
         });
-        match Client::connect(dir.path()).await {
+        match Client::connect(dir.path(), dir.path()).await {
             Err(Dial::NotAccepting) => {}
             other => panic!(
                 "a silent app must never be a silent wait: {:?}",
@@ -474,10 +532,11 @@ mod tests {
                 &HelloResult {
                     protocol: PROTOCOL_VERSION + 1,
                     app_version: "9.9.9".into(),
+                    config_dir: None,
                 },
             )]
         });
-        match Client::connect(dir.path()).await {
+        match Client::connect(dir.path(), dir.path()).await {
             Err(Dial::Failed(Failure::Protocol(ProtocolError::UnsupportedProtocol {
                 supported,
                 requested,
@@ -501,7 +560,7 @@ mod tests {
                 }),
             )]
         });
-        match Client::connect(dir.path()).await {
+        match Client::connect(dir.path(), dir.path()).await {
             Err(Dial::Failed(Failure::Protocol(ProtocolError::UnsupportedProtocol {
                 supported,
                 ..
@@ -537,6 +596,7 @@ mod tests {
                 &HelloResult {
                     protocol: PROTOCOL_VERSION,
                     app_version: "9.9.9".into(),
+                    config_dir: None,
                 },
             )],
             _ => vec![Response::end(
@@ -546,7 +606,9 @@ mod tests {
                 },
             )],
         });
-        let mut client = Client::connect(dir.path()).await.expect("connect");
+        let mut client = Client::connect(dir.path(), dir.path())
+            .await
+            .expect("connect");
         let listing: WalletRecoverResult = client
             .call(&Call::WalletRecover)
             .await
@@ -562,7 +624,9 @@ mod tests {
     async fn a_verb_the_app_does_not_have_costs_one_command() {
         let dir = tempfile::tempdir().expect("tempdir");
         serve(dir.path(), ordinary);
-        let mut client = Client::connect(dir.path()).await.expect("connect");
+        let mut client = Client::connect(dir.path(), dir.path())
+            .await
+            .expect("connect");
         let refused = client
             .call::<AccountPricesResult>(&Call::AccountPrices)
             .await;
@@ -603,6 +667,7 @@ mod tests {
                     &HelloResult {
                         protocol: PROTOCOL_VERSION,
                         app_version: "9.9.9".into(),
+                        config_dir: None,
                     },
                 )],
                 _ => vec![Response::err(
@@ -610,7 +675,9 @@ mod tests {
                     WireError::from_protocol(&refusal),
                 )],
             });
-            let mut client = Client::connect(dir.path()).await.expect("connect");
+            let mut client = Client::connect(dir.path(), dir.path())
+                .await
+                .expect("connect");
             match client
                 .call::<DefaultModelResult>(&Call::ChatDefaultModel)
                 .await
@@ -641,6 +708,7 @@ mod tests {
                 &HelloResult {
                     protocol: PROTOCOL_VERSION,
                     app_version: "9.9.9".into(),
+                    config_dir: None,
                 },
             )],
             _ => vec![Response::err(
@@ -651,7 +719,9 @@ mod tests {
                 }),
             )],
         });
-        let mut client = Client::connect(dir.path()).await.expect("connect");
+        let mut client = Client::connect(dir.path(), dir.path())
+            .await
+            .expect("connect");
         match client
             .call::<AccountPricesResult>(&Call::AccountPrices)
             .await
@@ -675,6 +745,7 @@ mod tests {
                 &HelloResult {
                     protocol: PROTOCOL_VERSION,
                     app_version: "9.9.9".into(),
+                    config_dir: None,
                 },
             )],
             _ => vec![
@@ -709,7 +780,9 @@ mod tests {
                 ),
             ],
         });
-        let mut client = Client::connect(dir.path()).await.expect("connect");
+        let mut client = Client::connect(dir.path(), dir.path())
+            .await
+            .expect("connect");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let call = Call::ChatStream {
             prompt: "hi".into(),
