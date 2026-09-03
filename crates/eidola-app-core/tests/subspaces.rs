@@ -3588,7 +3588,6 @@ fn a_space_owned_agent_is_offered_no_delegation() {
 /// **The tool is no way around a guard.** Every refusal the spawn door decides
 /// inside its transaction arrives at the model as a *tool result* — correctable
 /// — and leaves no room behind, which is what stops a model turning a refusal
-
 /// into a retry loop that mints anything.
 #[test]
 fn the_delegate_tool_is_refused_by_every_guard_the_door_holds() {

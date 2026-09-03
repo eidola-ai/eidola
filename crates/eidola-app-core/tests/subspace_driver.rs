@@ -1740,11 +1740,11 @@ fn a_report_waits_for_its_own_turns_answer_and_not_a_siblings() {
 /// while the answer of the very turn that opened it keeps the raw antecedent
 /// that turn was prepared with — so a reader rewording the post between
 /// preparation and the tool leaves the two in different generations of one
-/// item. Across a restart the in-memory record of which turn opened the room is
-/// gone and the durable fallback is all there is, and matching edges by
-/// generation missed the answer entirely: the sweep then attached the report to
-/// the anchor as that answer's *sibling*. "The same post" is the item, which is
-/// the identity the transcript already threads by.
+/// item. A spawn with no turn behind it is decided by the newest-answer rule
+/// alone, and matching edges by generation missed the answer entirely: the
+/// sweep then attached the report to the anchor as that answer's *sibling*.
+/// "The same post" is the item, which is the identity the transcript already
+/// threads by.
 #[test]
 fn a_report_finds_its_turns_answer_across_a_restart_and_an_edit() {
     run(|| {
@@ -1768,8 +1768,8 @@ fn a_report_finds_its_turns_answer_across_a_restart_and_an_edit() {
         // prepared with.
         let answer = ask(&core, &parent, &owner, &asked);
 
-        // The process goes away before the report lands, taking the record of
-        // which turn opened the room with it.
+        // The process goes away before the report lands; this room names no
+        // turn, so the sweep decides on the newest answer alone.
         drop(core);
         let core = chat_harness::reopen_core(&dir, &mock.base_url);
         drive_as_sweep(&core, &out.space.id).expect("the room is driven after the restart");
