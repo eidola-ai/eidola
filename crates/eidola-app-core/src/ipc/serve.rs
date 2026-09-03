@@ -16,6 +16,11 @@
 //!   bounded by [`MAX_IN_FLIGHT_REQUESTS`] — the read loop waits for a permit
 //!   rather than refusing, which is backpressure a caller feels as slowness
 //!   instead of as an error it has to handle.
+//! - **`hello` is the one verb answered in the loop**, before the next line is
+//!   read. It is what establishes that both sides speak the same protocol, so
+//!   nothing a caller pipelines behind it may start first — and a dispatched
+//!   verb is only *started* before the next line, never finished. It reads no
+//!   database and makes no request, so serialising it costs nothing.
 //! - **A request's terminal frame is always sent.** Every path through
 //!   [`answer`] ends in exactly one `end` or `err`, so a caller waiting on an
 //!   id is never left waiting on a request that quietly evaporated.
@@ -36,12 +41,14 @@
 //!
 //! The waiting is a chain, not a cycle, which is what makes it safe: the writer
 //! waits on the socket, a finished request waits on the writer **while holding
-//! its permit**, and the read loop waits on a permit. Pressure therefore travels
-//! outward to the one place that can relieve it — the caller reading its socket
-//! — and nothing in the chain waits on anything behind it. A turn's chunk
-//! forwarder joins the same chain: it waits on the writer, and the request
-//! awaiting it holds its permit meanwhile. That stalls *this* connection's
-//! other requests, which is the intended answer to "you are not reading".
+//! its permit**, and the read loop waits on a permit — or, for the one verb it
+//! answers itself, on the writer directly, which is the same chain one link
+//! shorter. Pressure therefore travels outward to the one place that can
+//! relieve it — the caller reading its socket — and nothing in the chain waits
+//! on anything behind it. A turn's chunk forwarder joins the same chain: it
+//! waits on the writer, and the request awaiting it holds its permit meanwhile.
+//! That stalls *this* connection's other requests, which is the intended answer
+//! to "you are not reading".
 //!
 //! **It always terminates.** If the caller never reads, it eventually goes
 //! away; the writer's socket write then fails, it drops the receiver, and every
@@ -174,9 +181,10 @@ async fn read_frames<R: AsyncRead + Unpin>(
     let mut frames = FrameReader::new(tokio::io::BufReader::new(reader));
     let mut tasks = tokio::task::JoinSet::new();
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
-    // The handshake gate. Checked here rather than inside a request task so
-    // there is no window in which a racing verb slips past a `hello` that has
-    // not been answered yet.
+    // The handshake gate. Checked here rather than inside a request task, and
+    // raised only once `hello`'s own answer is on the outbox — see the inline
+    // answer below, which is what makes "not before the handshake" mean the
+    // handshake was *answered* rather than merely recognised.
     let mut greeted = false;
     let active = ActiveIds::default();
 
@@ -287,8 +295,41 @@ async fn read_frames<R: AsyncRead + Unpin>(
             }
         };
 
+        let verb = call.verb();
+
+        // **`hello` is answered here rather than dispatched**, so the gate above
+        // rises on an answer that exists.
+        //
+        // A dispatched verb is only *started* before the next line is read, and
+        // `hello`'s result was produced in its own task — so the flag went up
+        // while the answer was still being made, and a caller that pipelines
+        // `hello` with a turn had that turn go upstream, billed, before it had
+        // been told what it was talking to. The single ordered outbox does not
+        // cover it either: it preserves the order frames are *queued* in, and
+        // nothing ordered a spawned task against the read loop that carried on
+        // without it — a refusal the loop writes itself could reach the caller
+        // ahead of the handshake it was refused for.
+        //
+        // Answering in the loop costs nothing worth having: `hello` reads no
+        // database and makes no request, so there was never a reason for it to
+        // be concurrent, and it takes no concurrency permit because it occupies
+        // nothing. Everything above still applies to it — it is decoded,
+        // version-gated, parsed, and holds its id claim while it answers — so
+        // the refusal ordering is unchanged; only where the answer is produced
+        // has moved.
         if matches!(call, Call::Hello) {
+            let line = match answer(&core, &app_version, request.id, call, &out).await {
+                Ok(data) => terminal_line(request.id, verb, data, MAX_RESPONSE_BYTES),
+                Err(error) => terminal_error_line(request.id, error, MAX_RESPONSE_BYTES),
+            };
+            if out.send(line).await.is_err() {
+                break;
+            }
+            // Queued before the next line is read, and one writer drains the
+            // outbox in order — so the handshake's answer is on the wire ahead
+            // of any frame belonging to anything that followed it.
             greeted = true;
+            continue;
         }
 
         // Waiting here is the backpressure: a caller that has saturated the
@@ -306,7 +347,6 @@ async fn read_frames<R: AsyncRead + Unpin>(
         let app_version = app_version.clone();
         let out = out.clone();
         let id = request.id;
-        let verb = call.verb();
         tasks.spawn(async move {
             // Released when this task ends, however it ends — including an
             // abort — so an id is never stranded by a connection tearing down.

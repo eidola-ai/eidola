@@ -964,6 +964,75 @@ fn a_caller_that_stops_reading_stops_being_served() {
 }
 
 #[test]
+fn a_pipelined_hello_is_answered_before_anything_sent_behind_it() {
+    run(|| {
+        // A caller may write its whole opening in one go, and one of the frames
+        // behind `hello` can be a turn — billed work that must not go upstream
+        // before the caller has been told what it is talking to.
+        //
+        // Dispatched, `hello` was only *started* before the next line was read,
+        // and the flag rose there: everything behind it ran against a handshake
+        // whose answer did not exist yet. The single ordered writer does not
+        // cover it, because ordering is decided where a frame is *queued* and
+        // nothing sequenced a spawned task against the read loop — which is why
+        // the frame chosen here is one the loop answers itself, without ever
+        // yielding, and so reliably beat the handshake it followed.
+        let (mock, core, _dir) = served(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            chat_delay_ms: 1_500,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime().block_on(async {
+            let mut client = Client::connect(&core);
+            let mut opening = encode_line(&Request::new(1, &Call::Hello));
+            // A version this build does not speak: refused by the read loop
+            // itself, in the iteration straight after `hello`'s.
+            opening.extend(encode_line(&serde_json::json!({
+                "v": PROTOCOL_VERSION + 1,
+                "id": 2u64,
+                "verb": "spaces.list",
+                "params": {},
+            })));
+            // …and a turn, which is what makes the ordering cost money.
+            opening.extend(encode_line(&Request::new(
+                3,
+                &Call::ChatStream {
+                    prompt: "pipelined behind the handshake".into(),
+                    model: Some(MODEL.into()),
+                    space_id: None,
+                },
+            )));
+            client.send_raw(&opening).await;
+
+            let first = client.expect_frame().await;
+            assert_eq!(first.id, 1, "the handshake is answered first");
+            let hello: HelloResult =
+                serde_json::from_value(end_of(&first)).expect("a hello result");
+            assert_eq!(hello.protocol, PROTOCOL_VERSION);
+
+            // The refusal the read loop wrote for itself comes after it, not
+            // before — an answer to a frame sent behind a handshake cannot
+            // reach the caller ahead of the handshake's own.
+            let second = client.expect_frame().await;
+            assert_eq!(second.id, 2, "the refusal follows the handshake");
+            assert!(matches!(second.body, ResponseBody::Err { .. }));
+
+            // And the turn, which the mock holds open, was started only after
+            // all of that.
+            for _ in 0..600 {
+                if mock.chat_hits() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(mock.chat_hits() > 0, "the pipelined turn never ran at all");
+        });
+    });
+}
+
+#[test]
 fn a_caller_that_will_never_read_again_is_asked_for_nothing_more() {
     run(|| {
         // The half-close, which the previous test cannot reach: a peer that
