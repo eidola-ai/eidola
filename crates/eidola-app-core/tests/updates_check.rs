@@ -668,6 +668,79 @@ fn app_core_resolves_feed_override_and_persists_result() {
     assert_eq!(core2.last_update_check(), Some(snapshot));
 }
 
+#[test]
+fn a_standing_alert_survives_a_check_that_started_before_it() {
+    // Two checks overlap — an app's poll and a command-line client's, or a
+    // poll and a manual one. The slower started first, so anything it copied
+    // up front is a picture of the state *before* the other check found a
+    // security alert; writing that picture back is how the alert disappears.
+    // Only one thing may cross a network wait, and it is not the state.
+    let config_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let core = eidola_app_core::AppCore::new(
+        config_dir.path().to_path_buf(),
+        data_dir.path().to_path_buf(),
+    )
+    .expect("open core");
+
+    let feed = |uri: &str| {
+        std::fs::write(
+            config_dir.path().join("config.toml"),
+            format!("update_feed = \"{uri}\"\n"),
+        )
+        .unwrap();
+    };
+
+    core.runtime().block_on(async {
+        // The check that finishes last: a feed that fails, slowly.
+        let slow = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/releases/latest"))
+            .respond_with(ResponseTemplate::new(500).set_delay(std::time::Duration::from_secs(3)))
+            .mount(&slow)
+            .await;
+        // The check that finishes first: the genuine bundle replayed under a
+        // release newer than this build, whose Fulcio identity names another
+        // tag — a real `Unverifiable`, which is exactly the state that must
+        // outlive a later failure.
+        let alerting = MockServer::start().await;
+        mount_release(&alerting, "v9.9.9", FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
+
+        feed(&slow.uri());
+        let slow_check = core.update_check();
+        tokio::pin!(slow_check);
+        // Let it read the feed and get its request out, then leave it waiting.
+        tokio::select! {
+            _ = &mut slow_check => panic!("the slow feed answered too early to prove anything"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+
+        feed(&alerting.uri());
+        let alert = core.update_check().await;
+        assert!(
+            matches!(alert.result, UpdateCheckResult::Unverifiable { .. }),
+            "the fixture has to raise a real alert: {:#?}",
+            alert.result
+        );
+
+        let failed = slow_check.await;
+        assert!(
+            matches!(failed.result, UpdateCheckResult::Unverifiable { .. }),
+            "the later-finishing check must fold into the state as it is now, \
+             where the alert stands — not into the copy it started from: {:#?}",
+            failed.result
+        );
+    });
+
+    assert!(
+        matches!(
+            core.last_update_check().map(|s| s.result),
+            Some(UpdateCheckResult::Unverifiable { .. })
+        ),
+        "and the alert is what persists"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Feed anomalies that are neither crypto verdicts nor offline blips
 // ---------------------------------------------------------------------------

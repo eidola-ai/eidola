@@ -1942,29 +1942,57 @@ impl Inner {
             .clone()
     }
 
-    /// Replace the cached state and persist it. A disk write failure is
-    /// logged, not fatal — the in-memory state stays authoritative for the
-    /// rest of the run.  Emits [`Change::UpdateState`] after the write.
-    fn store_update_state(&self, state: updates::UpdateState) {
-        if let Err(e) = updates::save_state(&self.data_dir, &state) {
-            eprintln!("warning: failed to persist update-check state: {e}");
-        }
-        *self.update_state.lock().expect("update_state lock") = Some(state);
+    /// Change the persisted update state, **under the lock, in place**.
+    ///
+    /// The one way this state is written, and that is the point rather than
+    /// tidiness. Every interesting mutation here is a read-modify-write, and
+    /// the rule the state exists to keep — *a standing security alert
+    /// survives later failures* ([`updates::UpdateState::absorb`]) — is a
+    /// decision about what is there **now**. Read a copy, do slow work, write
+    /// the copy back, and that decision is made against a past that another
+    /// writer has already moved on from: the alert it could not see is the
+    /// alert it silently clears. So `f` is handed the current state and its
+    /// answer is persisted before the lock is released, and no caller
+    /// topology — a poll and a manual check, an app and a command-line
+    /// client, an acceptance landing mid-check — can interleave into a lost
+    /// write. A disk failure is logged, not fatal: the in-memory state stays
+    /// authoritative for the rest of the run.
+    ///
+    /// [`Change::UpdateState`] is emitted after the lock is released, so a
+    /// subscriber that reads back cannot deadlock against the write that
+    /// woke it.
+    fn update_state_with<T>(&self, f: impl FnOnce(&mut updates::UpdateState) -> T) -> T {
+        let answer = {
+            let mut guard = self.update_state.lock().expect("update_state lock");
+            let state = guard.get_or_insert_with(|| updates::load_state(&self.data_dir));
+            let answer = f(state);
+            if let Err(e) = updates::save_state(&self.data_dir, state) {
+                eprintln!("warning: failed to persist update-check state: {e}");
+            }
+            answer
+        };
         self.bus.emit(Change::UpdateState);
+        answer
     }
 
     /// Run one check and fold it into the persisted state (a `CheckFailed`
     /// never clears a standing security state — see
     /// [`updates::UpdateState::absorb`]). Returns the *effective* snapshot:
     /// what the UI should now show.
+    ///
+    /// **Only what the check needs crosses the network wait.** The accepted-
+    /// claims choice is read up front because the comparison is made against
+    /// it; the state itself is not, because a check that carried the whole
+    /// thing across its round trip would write back a past — see
+    /// [`Inner::update_state_with`].
     async fn run_update_check(&self) -> updates::UpdateCheckSnapshot {
-        let mut state = self.update_state_snapshot();
+        let accepted = self.update_state_snapshot().accepted;
         let feed_url = self.load_config().update_feed_url();
 
         let result = match updater::build_http_client() {
             Ok(client) => {
                 let mut ctx = updates::CheckContext::new(feed_url, env!("CARGO_PKG_VERSION"));
-                ctx.accepted = state.accepted.clone();
+                ctx.accepted = accepted;
                 updates::check_for_update(&client, &ctx).await
             }
             Err(e) => updates::UpdateCheckResult::CheckFailed {
@@ -1972,13 +2000,14 @@ impl Inner {
             },
         };
 
-        state.absorb(updates::UpdateCheckSnapshot {
-            checked_at_ms: now_ms(),
-            result,
-        });
-        let effective = state.last.clone().expect("absorb always leaves a snapshot");
-        self.store_update_state(state);
-        effective
+        let checked_at_ms = now_ms();
+        self.update_state_with(|state| {
+            state.absorb(updates::UpdateCheckSnapshot {
+                checked_at_ms,
+                result,
+            });
+            state.last.clone().expect("absorb always leaves a snapshot")
+        })
     }
 
     fn accept_changed_claims(
@@ -1986,29 +2015,29 @@ impl Inner {
         version: String,
         manifest_sha256: String,
     ) -> Result<(), AppError> {
-        let mut state = self.update_state_snapshot();
-        state.accepted = Some(updates::AcceptedClaims {
-            version: version.clone(),
-            manifest_sha256: manifest_sha256.clone(),
-            accepted_at_ms: now_ms(),
+        let accepted_at_ms = now_ms();
+        self.update_state_with(|state| {
+            state.accepted = Some(updates::AcceptedClaims {
+                version: version.clone(),
+                manifest_sha256: manifest_sha256.clone(),
+                accepted_at_ms,
+            });
+
+            // If the standing result is the claims-changed release being
+            // accepted, rewrite it as an available update so UIs reflect the
+            // choice without waiting for the next poll.
+            if let Some(snapshot) = state.last.as_mut()
+                && let updates::UpdateCheckResult::ClaimsChanged { release, .. } = &snapshot.result
+                && release.version == version
+                && release
+                    .manifest_sha256
+                    .eq_ignore_ascii_case(&manifest_sha256)
+            {
+                let mut release = release.clone();
+                release.claims_accepted = true;
+                snapshot.result = updates::UpdateCheckResult::UpdateAvailable { release };
+            }
         });
-
-        // If the standing result is the claims-changed release being
-        // accepted, rewrite it as an available update so UIs reflect the
-        // choice without waiting for the next poll.
-        if let Some(snapshot) = state.last.as_mut()
-            && let updates::UpdateCheckResult::ClaimsChanged { release, .. } = &snapshot.result
-            && release.version == version
-            && release
-                .manifest_sha256
-                .eq_ignore_ascii_case(&manifest_sha256)
-        {
-            let mut release = release.clone();
-            release.claims_accepted = true;
-            snapshot.result = updates::UpdateCheckResult::UpdateAvailable { release };
-        }
-
-        self.store_update_state(state);
         Ok(())
     }
 }
