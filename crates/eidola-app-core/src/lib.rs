@@ -1984,28 +1984,32 @@ impl Inner {
     /// [`updates::UpdateState::absorb`]). Returns the *effective* snapshot:
     /// what the UI should now show.
     ///
-    /// **Only what the check needs crosses the network wait.** The accepted-
-    /// claims choice is read up front because the comparison is made against
-    /// it; the state itself is not, because a check that carried the whole
-    /// thing across its round trip would write back a past — see
-    /// [`Inner::update_state_with`].
+    /// **Nothing about the state crosses the network wait — not even one
+    /// field of it.** The round trip ends in a decision-free
+    /// [`updates::CheckOutcome`], and both decisions that depend on state are
+    /// made under the lock at the end: whether the release's claims count as
+    /// accepted ([`updates::classify`]) and whether this verdict may replace
+    /// the standing one ([`updates::UpdateState::absorb`]). A check that
+    /// carried either answer across its round trip would be answering about a
+    /// moment the user has since moved on from — accepting "treat as update"
+    /// while the request reporting on that very manifest is in the air is one
+    /// keystroke, and the reward used to be the warning coming straight back.
     async fn run_update_check(&self) -> updates::UpdateCheckSnapshot {
-        let accepted = self.update_state_snapshot().accepted;
         let feed_url = self.load_config().update_feed_url();
 
-        let result = match updater::build_http_client() {
+        let outcome = match updater::build_http_client() {
             Ok(client) => {
-                let mut ctx = updates::CheckContext::new(feed_url, env!("CARGO_PKG_VERSION"));
-                ctx.accepted = accepted;
-                updates::check_for_update(&client, &ctx).await
+                let ctx = updates::CheckContext::new(feed_url, env!("CARGO_PKG_VERSION"));
+                updates::check_outcome(&client, &ctx).await
             }
-            Err(e) => updates::UpdateCheckResult::CheckFailed {
+            Err(e) => updates::CheckOutcome::Settled(updates::UpdateCheckResult::CheckFailed {
                 message: format!("constructing HTTPS client: {e}"),
-            },
+            }),
         };
 
         let checked_at_ms = now_ms();
         self.update_state_with(|state| {
+            let result = updates::classify(outcome, state.accepted.as_ref());
             state.absorb(updates::UpdateCheckSnapshot {
                 checked_at_ms,
                 result,

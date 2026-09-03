@@ -130,7 +130,7 @@ async fn verified_update_available() {
     let server = MockServer::start().await;
     mount_release(&server, FIXTURE_TAG, FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
 
     let UpdateCheckResult::UpdateAvailable { release } = result else {
         panic!("expected UpdateAvailable, got: {result:#?}");
@@ -161,7 +161,7 @@ async fn up_to_date_when_latest_equals_installed() {
     let server = MockServer::start().await;
     mount_release(&server, FIXTURE_TAG, FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, "0.0.8")).await;
+    let result = check_for_update(&http_client(), &ctx(&server, "0.0.8"), None).await;
     assert_eq!(
         result,
         UpdateCheckResult::UpToDate {
@@ -180,7 +180,7 @@ async fn newer_non_latest_tags_do_not_count() {
     let server = MockServer::start().await;
     mount_release(&server, FIXTURE_TAG, FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, "0.0.8")).await;
+    let result = check_for_update(&http_client(), &ctx(&server, "0.0.8"), None).await;
     assert_eq!(
         result,
         UpdateCheckResult::UpToDate {
@@ -200,7 +200,7 @@ async fn no_release_marked_latest_is_up_to_date() {
         .mount(&server)
         .await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     assert_eq!(
         result,
         UpdateCheckResult::UpToDate {
@@ -223,7 +223,7 @@ async fn unreachable_feed_is_check_failed() {
         "http://feed.invalid/releases/latest".to_string(),
         OLD_INSTALLED,
     );
-    let result = check_for_update(&http_client(), &ctx).await;
+    let result = check_for_update(&http_client(), &ctx, None).await;
     assert!(
         matches!(result, UpdateCheckResult::CheckFailed { .. }),
         "expected CheckFailed, got: {result:#?}"
@@ -239,7 +239,7 @@ async fn server_error_is_check_failed() {
         .mount(&server)
         .await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     assert!(
         matches!(result, UpdateCheckResult::CheckFailed { .. }),
         "expected CheckFailed, got: {result:#?}"
@@ -255,7 +255,7 @@ async fn malformed_feed_json_is_check_failed() {
         .mount(&server)
         .await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     assert!(
         matches!(result, UpdateCheckResult::CheckFailed { .. }),
         "expected CheckFailed, got: {result:#?}"
@@ -284,7 +284,7 @@ async fn transient_asset_server_error_is_check_failed() {
         .mount(&server)
         .await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     assert!(
         matches!(result, UpdateCheckResult::CheckFailed { .. }),
         "expected CheckFailed, got: {result:#?}"
@@ -327,7 +327,7 @@ async fn missing_manifest_asset_is_unverifiable() {
         .mount(&server)
         .await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     assert_unverifiable(&result, "no `artifact-manifest.json` asset");
 }
 
@@ -351,7 +351,7 @@ async fn missing_bundle_asset_is_unverifiable() {
         .mount(&server)
         .await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     assert_unverifiable(&result, "no `artifact-manifest.json.sigstore` asset");
 }
 
@@ -377,7 +377,7 @@ async fn listed_but_404_asset_is_unverifiable() {
         .mount(&server)
         .await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     assert_unverifiable(&result, "gone");
 }
 
@@ -392,7 +392,7 @@ async fn malformed_bundle_is_unverifiable() {
     )
     .await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     assert_unverifiable(&result, "parsing CI Sigstore bundle");
 }
 
@@ -405,7 +405,7 @@ async fn tampered_manifest_is_unverifiable() {
     let server = MockServer::start().await;
     mount_release(&server, FIXTURE_TAG, &tampered, FIXTURE_BUNDLE).await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     assert_unverifiable(&result, "does not match");
 }
 
@@ -432,7 +432,7 @@ async fn tampered_bundle_signature_is_unverifiable() {
     let server = MockServer::start().await;
     mount_release(&server, FIXTURE_TAG, FIXTURE_MANIFEST, &tampered_bundle).await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     let UpdateCheckResult::Unverifiable { .. } = &result else {
         panic!("expected Unverifiable, got: {result:#?}");
     };
@@ -452,7 +452,7 @@ async fn wrong_identity_is_unverifiable() {
     ctx.ci_identity_pattern =
         "https://github.com/someone-else/repo/.github/workflows/release.yml@refs/tags/v*".into();
 
-    let result = check_for_update(&http_client(), &ctx).await;
+    let result = check_for_update(&http_client(), &ctx, None).await;
     assert_unverifiable(&result, "not from the pinned release identity");
 }
 
@@ -464,7 +464,7 @@ async fn wrong_issuer_is_unverifiable() {
     let mut ctx = ctx(&server, OLD_INSTALLED);
     ctx.ci_issuer = "https://issuer.evil.example".into();
 
-    let result = check_for_update(&http_client(), &ctx).await;
+    let result = check_for_update(&http_client(), &ctx, None).await;
     assert_unverifiable(&result, "OIDC issuer");
 }
 
@@ -476,7 +476,7 @@ async fn authentic_manifest_under_wrong_tag_is_unverifiable() {
     let server = MockServer::start().await;
     mount_release(&server, "v9.9.9", FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     let UpdateCheckResult::Unverifiable {
         version, reason, ..
     } = &result
@@ -524,7 +524,7 @@ async fn changed_claims_surface_side_by_side() {
     let mut ctx = ctx(&server, OLD_INSTALLED);
     ctx.expected_claims = divergent_expected_claims();
 
-    let result = check_for_update(&http_client(), &ctx).await;
+    let result = check_for_update(&http_client(), &ctx, None).await;
     let UpdateCheckResult::ClaimsChanged {
         release,
         comparison,
@@ -571,19 +571,18 @@ async fn accepted_claims_change_becomes_update_available() {
     // First check: claims changed; capture the manifest hash.
     let mut ctx1 = ctx(&server, OLD_INSTALLED);
     ctx1.expected_claims = divergent_expected_claims();
-    let first = check_for_update(&http_client(), &ctx1).await;
+    let first = check_for_update(&http_client(), &ctx1, None).await;
     let UpdateCheckResult::ClaimsChanged { release, .. } = first else {
         panic!("expected ClaimsChanged, got: {first:#?}");
     };
 
     // Re-check with the user's recorded "treat as update" choice.
-    let mut ctx2 = ctx1.clone();
-    ctx2.accepted = Some(AcceptedClaims {
+    let accepted = AcceptedClaims {
         version: release.version.clone(),
         manifest_sha256: release.manifest_sha256.clone(),
         accepted_at_ms: 1,
-    });
-    let second = check_for_update(&http_client(), &ctx2).await;
+    };
+    let second = check_for_update(&http_client(), &ctx1, Some(&accepted)).await;
     let UpdateCheckResult::UpdateAvailable { release } = second else {
         panic!("expected UpdateAvailable after acceptance, got: {second:#?}");
     };
@@ -599,13 +598,13 @@ async fn acceptance_of_a_different_manifest_does_not_carry_over() {
 
     let mut ctx = ctx(&server, OLD_INSTALLED);
     ctx.expected_claims = divergent_expected_claims();
-    ctx.accepted = Some(AcceptedClaims {
+    let elsewhere = AcceptedClaims {
         version: "0.0.8".into(),
         manifest_sha256: "00".repeat(32), // not this manifest
         accepted_at_ms: 1,
-    });
+    };
 
-    let result = check_for_update(&http_client(), &ctx).await;
+    let result = check_for_update(&http_client(), &ctx, Some(&elsewhere)).await;
     assert!(
         matches!(result, UpdateCheckResult::ClaimsChanged { .. }),
         "expected ClaimsChanged, got: {result:#?}"
@@ -762,7 +761,7 @@ async fn non_semver_tag_is_check_failed() {
         .mount(&server)
         .await;
 
-    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED)).await;
+    let result = check_for_update(&http_client(), &ctx(&server, OLD_INSTALLED), None).await;
     assert!(
         matches!(result, UpdateCheckResult::CheckFailed { .. }),
         "expected CheckFailed, got: {result:#?}"
