@@ -489,6 +489,89 @@ mod tests {
         }
     }
 
+    /// An app that greets with `config_dir` as the config root it composes
+    /// its profile from, and answers nothing else — reaching a verb at all
+    /// would mean the gate did not hold.
+    fn serve_profile(dir: &std::path::Path, config_dir: Option<String>) {
+        serve(dir, move |request| {
+            assert_eq!(
+                request.verb, "hello",
+                "the profile gate has to refuse before any verb is dispatched"
+            );
+            vec![Response::end(
+                request.id,
+                &HelloResult {
+                    protocol: PROTOCOL_VERSION,
+                    app_version: "9.9.9".into(),
+                    config_dir: config_dir.clone(),
+                },
+            )]
+        });
+    }
+
+    #[test]
+    fn a_config_root_is_the_directory_it_resolves_to() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(same_config_root(dir.path(), dir.path()));
+        assert!(
+            same_config_root(dir.path(), &dir.path().join(".")),
+            "a spelling that resolves to the same directory is the same profile"
+        );
+        assert!(
+            !same_config_root(dir.path(), &dir.path().join("elsewhere")),
+            "a different directory is a different profile"
+        );
+        let gone = dir.path().join("never-created");
+        assert!(
+            same_config_root(&gone, &gone),
+            "a root that does not exist yet still compares as itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_app_composed_from_another_config_root_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let theirs = dir.path().join("another-profile");
+        std::fs::create_dir(&theirs).expect("their config root");
+        serve_profile(dir.path(), Some(theirs.display().to_string()));
+        // The socket is found through the data root, which both share; the
+        // config root is what says whose account and default template the
+        // answering app speaks for.
+        match Client::connect(dir.path(), dir.path()).await {
+            Err(Dial::OtherProfile { ours, theirs: t }) => {
+                assert_eq!(ours, dir.path());
+                assert_eq!(t, theirs.display().to_string());
+            }
+            other => panic!(
+                "a shared data root is not a shared profile: {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_app_composed_from_this_config_root_is_ours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Spelled differently, resolving to the same directory: the same
+        // profile by any measure the filesystem would agree with.
+        serve_profile(dir.path(), Some(dir.path().join(".").display().to_string()));
+        Client::connect(dir.path(), dir.path())
+            .await
+            .expect("the same profile, spelled another way");
+    }
+
+    #[tokio::test]
+    async fn an_app_that_states_no_config_root_is_not_refused_for_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // An app older than the field. Unknown is not a mismatch, and
+        // inventing one would refuse every such app for a check it cannot
+        // make.
+        serve_profile(dir.path(), None);
+        Client::connect(dir.path(), dir.path())
+            .await
+            .expect("an app that says nothing is not an app that disagrees");
+    }
+
     #[tokio::test]
     async fn the_handshake_names_the_app_and_the_verbs_answer() {
         let dir = tempfile::tempdir().expect("tempdir");

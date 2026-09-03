@@ -733,6 +733,113 @@ mod tests {
         );
     }
 
+    /// An app serving `config_dir` as its config root, recording every verb
+    /// it is asked so a refusal that arrived too late is visible.
+    fn profile_greeter(
+        dir: &std::path::Path,
+        config_dir: Option<String>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> std::thread::JoinHandle<()> {
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket_path(dir)).expect("bind the socket");
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let listener = tokio::net::UnixListener::from_std(listener).expect("adopt");
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (reader, mut writer) = stream.into_split();
+                let mut frames =
+                    eidola_app_core::ipc::FrameReader::new(tokio::io::BufReader::new(reader));
+                while let Ok(Some(line)) = frames.next_line().await {
+                    let request = decode_request(line).expect("a frame");
+                    seen.lock().expect("seen").push(request.verb.clone());
+                    let answer = Response::end(
+                        request.id,
+                        &HelloResult {
+                            protocol: PROTOCOL_VERSION,
+                            app_version: "9.9.9".into(),
+                            config_dir: config_dir.clone(),
+                        },
+                    );
+                    use tokio::io::AsyncWriteExt;
+                    if writer.write_all(&encode_line(&answer)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        })
+    }
+
+    #[test]
+    fn an_app_serving_another_profile_is_refused_before_any_verb() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // One data root, two config roots — the state the selection rule
+        // could not see before, because the socket is found through the data
+        // root alone.
+        let ours = dir.path().join("ours");
+        let theirs = dir.path().join("theirs");
+        std::fs::create_dir(&ours).expect("our config root");
+        std::fs::create_dir(&theirs).expect("their config root");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = profile_greeter(
+            dir.path(),
+            Some(theirs.display().to_string()),
+            std::sync::Arc::clone(&seen),
+        );
+
+        match Session::open(ours.clone(), dir.path().into(), false) {
+            Err(Startup::OtherProfile { ours: o, theirs: t }) => {
+                assert_eq!(o, ours);
+                assert_eq!(t, theirs.display().to_string());
+            }
+            other => panic!(
+                "an app serving another config root must not take this command: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        server.join().expect("the server ends with the connection");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec!["hello".to_string()],
+            "the refusal lands in the handshake — nothing was dispatched at it"
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_both_roots_and_what_to_do() {
+        let rendered = Startup::OtherProfile {
+            ours: "/here/eidola".into(),
+            theirs: "/there/eidola".to_string(),
+        }
+        .to_string();
+        assert!(rendered.contains("/here/eidola"), "{rendered}");
+        assert!(rendered.contains("/there/eidola"), "{rendered}");
+        assert!(rendered.contains("different profile"), "{rendered}");
+    }
+
+    #[test]
+    fn the_account_identity_is_read_fresh_every_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _server = greeter(dir.path());
+        let session =
+            Session::open(dir.path().into(), dir.path().into(), false).expect("client mode");
+        assert_eq!(session.account_identity(), None, "nothing configured yet");
+
+        // The app owns the profile in client mode, so the answer has to come
+        // off disk each time it is asked rather than from anything captured
+        // when the session opened.
+        std::fs::write(dir.path().join("config.toml"), "account_id = \"first\"\n")
+            .expect("write config");
+        assert_eq!(session.account_identity(), Some("first".to_string()));
+        std::fs::write(dir.path().join("config.toml"), "account_id = \"second\"\n")
+            .expect("rewrite config");
+        assert_eq!(session.account_identity(), Some("second".to_string()));
+    }
+
     #[test]
     fn a_held_profile_nothing_answered_for_is_named_as_that() {
         let held = AppError::DatabaseInUse {
