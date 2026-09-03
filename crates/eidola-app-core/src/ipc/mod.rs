@@ -70,7 +70,7 @@ use crate::error::AppError;
 
 pub mod serve;
 
-pub use serve::serve_connection;
+pub use serve::{Shutdown, serve_connection, serve_connection_with_shutdown};
 
 /// The protocol this build speaks. Bumped only for a breaking change to the
 /// frames or to an existing verb's shape; new verbs are additive.
@@ -548,6 +548,17 @@ pub enum ProtocolError {
     /// attempted.
     #[error("the app is running but has no open profile to answer with")]
     Unavailable,
+
+    /// The app is shutting down and will not begin new work. Nothing was
+    /// attempted, so retrying against the next process that holds the profile
+    /// is the whole recovery.
+    ///
+    /// Answered rather than left as a hang-up because the writer is still
+    /// alive at the moment it is decided, and "the app is going away" is a
+    /// thing a caller can say out loud where a closed socket is a thing it can
+    /// only guess at.
+    #[error("the app is shutting down and is not starting new work")]
+    ShuttingDown,
 }
 
 impl ProtocolError {
@@ -565,6 +576,7 @@ impl ProtocolError {
             ProtocolError::UnknownVerb { .. } => "UnknownVerb",
             ProtocolError::BadParams { .. } => "BadParams",
             ProtocolError::Unavailable => "Unavailable",
+            ProtocolError::ShuttingDown => "ShuttingDown",
         }
     }
 
