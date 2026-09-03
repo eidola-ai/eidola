@@ -19728,6 +19728,102 @@ fn space_find_stops_the_old_reveal_when_the_query_stops_matching(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn space_find_stops_its_reveal_when_the_reader_resumes_composing(cx: &mut TestAppContext) {
+    // A reveal at an off-screen match is a two-phase motion: a glide to the
+    // byte-fraction estimate, then a correction once the post is measured.
+    // Every reader-driven motion takes the page from it — except, until now,
+    // the one that consists of writing. A reader who clicked back into an
+    // already-active composer (so no activation ran) and typed left the glide
+    // travelling and the reveal pending, and the correction landed frames
+    // later, pulling the page onto the search match and away from the caret.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "the off-screen match is being glided to"
+        );
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "…with the correction owed once that post is measured"
+        );
+    });
+
+    // The reader goes back to the composer that was already active — the case
+    // no activation covers, since nothing changes about which draft is live.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.activate_draft_for_test(0, cx));
+    });
+    vcx.run_until_parked();
+    let draft = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the tail draft is the active composer");
+    let editor = draft.read_with(&vcx, |e, cx| gpui::Focusable::focus_handle(e, cx));
+    vcx.update(|window, cx| window.focus(&editor, cx));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "returning to the composer has not moved the page by itself — the \
+             typing below is what the assertions are about"
+        );
+    });
+
+    vcx.simulate_keystrokes("h i");
+    vcx.run_until_parked();
+    assert_eq!(
+        draft.read_with(&vcx, |e, _| e.value().to_string()),
+        "hi",
+        "the keystrokes reached the composer"
+    );
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_pending_reveal_for_test(),
+            None,
+            "the reveal the reader superseded is not still owed"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…and neither is the motion it was phase 1 of"
+        );
+    });
+
+    // The page therefore cannot travel back to the match: there is no
+    // trajectory left for a frame to land.
+    let resting = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.drive_page_glide_for_test(1.0));
+    });
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_scroll_offset_y_for_test(),
+            resting,
+            "the page stayed where the reader is writing"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_hands_the_keyboard_back_to_the_inspector_field(cx: &mut TestAppContext) {
     // `keyboard_home` answers for the *conversation*, and it cannot derive
     // which of the panel's fields a reader stood in. Handing the keyboard to
@@ -19902,6 +19998,79 @@ fn space_find_refreshes_the_field_it_borrowed_from_when_it_is_refocused(cx: &mut
         assert!(
             !v.has_active_draft_for_test(),
             "…so nothing started composing in the conversation behind the panel"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_does_not_hand_the_keyboard_to_a_hidden_panels_field(cx: &mut TestAppContext) {
+    // The lender is weak so a form retired under the bar cannot be focused —
+    // but the title field is a *view* field that survives its panel, and
+    // closing the inspector while the bar holds the keyboard leaves it
+    // upgradable with its element unmounted. Handing the keyboard back to it
+    // is the dead slot this window's focus doctrine is about: the handle still
+    // reports itself focused, so the conversation goes on yielding every
+    // printable to a field nobody paints and the window is silent.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let title = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("title field");
+    cx.update_window(window, |_, window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    // The panel goes while the bar holds the keyboard, so nothing hands it
+    // back at the close (the reader is in the bar, not in the field).
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.inspector_title_state_for_test().is_some()),
+        "the field itself is kept across the close — which is why the weak \
+         reference alone cannot answer this"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+
+    let field = title.read_with(&vcx, |s, cx| s.focus_handle(cx));
+    vcx.update(|window, _| {
+        assert!(
+            !field.is_focused(window),
+            "the keyboard did not go to a field the panel is no longer painting"
+        );
+    });
+
+    // …and it went somewhere live: the proof is the only honest one, that
+    // typing reaches the conversation again.
+    vcx.simulate_keystrokes("h");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.has_active_draft_for_test(),
+            "the window's keyboard is live — the keystroke reached the conversation"
         );
     });
 }
