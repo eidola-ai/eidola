@@ -31,7 +31,7 @@
 //!   200ms) from AppKit's `applicationWillTerminate:`. It is the only hook
 //!   that runs on the macOS quit path at all: `[NSApp terminate:]` ends in
 //!   `exit()`, so no Rust destructor downstream of `main` ever runs. That is
-//!   what [`install_engine_shutdown`] exists for.
+//!   what [`install_shutdown`] exists for.
 //! - **`App::on_window_closed`** is an observer, not a policy hook — it fires
 //!   *before* gpui's own quit-on-empty check. We used to hang the Linux
 //!   "quit with the last window" rule off it; that is now the `QuitMode`,
@@ -217,7 +217,7 @@ pub fn abandon_pending_opens(cx: &mut App) {
 /// The window half of ⌘Q's retire-to-the-background (task 17 wave 3b;
 /// `status_item::quit_or_retire` pairs it with the `Accessory` flip). It is
 /// deliberately *not* `cx.quit()`: nothing on the quit path runs, so
-/// [`install_engine_shutdown`] never fires and the loaded engines survive.
+/// [`install_shutdown`] never fires and the loaded engines survive.
 ///
 /// gpui drops a window as its own `update_window` unwinds (`Window::removed`
 /// is read there), so the registry is genuinely empty when this returns — and
@@ -241,7 +241,14 @@ pub fn close_all_windows(cx: &mut App) {
     }
 }
 
-/// Best-effort teardown of local inference engines when the app quits.
+/// Best-effort teardown when the app quits — **the whole sequence, in order**.
+///
+/// One hook rather than several, because the order between its steps is a
+/// correctness property and gpui invokes quit observers in *registration*
+/// order: split across two `on_app_quit` calls, that property would live in
+/// the sequence of two lines in `run()` and break silently the day one moved.
+/// The body below is the order, and `close_door` is passed in rather than
+/// registered separately for exactly that reason.
 ///
 /// The *full* shutdown is a full shutdown — engines, everything — and on
 /// macOS nothing else delivers it. (⌘Q no longer reaches here: it retires the
@@ -281,7 +288,17 @@ pub fn close_all_windows(cx: &mut App) {
 /// from being reaped. 50ms is imperceptible on a quit and well inside the
 /// budget; paying it on a no-engine quit is the cheaper mistake by far.
 ///
-/// **The bus bridge is stopped first, before anything else.** During the grace
+/// **The control socket closes before any of it.** Everything here is
+/// teardown, and a caller still being served can dispatch a verb while it
+/// runs — `chat.stream` is billed remote work started after the process has
+/// decided to go, or local work against an engine registry already latched
+/// shut. Closing first shuts the door before the lights go out. What that
+/// cannot do is stop a request already dispatched: `close` aborts the
+/// connection tasks, and an abort lands at the task's next await point rather
+/// than instantly. The window shrinks from the whole length of engine teardown
+/// to that, which is the honest limit of a cure at this layer.
+///
+/// **The bus bridge is stopped next.** During the grace
 /// window below gpui keeps driving foreground tasks — including the
 /// app-lifetime bridge that dispatches every `Change` into the stores — while
 /// `App::shutdown` has already set `quitting`, so *any* dispatch lands in
@@ -298,10 +315,32 @@ pub fn close_all_windows(cx: &mut App) {
 /// hard guarantee wants the OS to enforce it (`PR_SET_PDEATHSIG` on Linux;
 /// macOS has no equivalent and would need an explicit synchronous reap in
 /// app-core) — a follow-up, not wave 2.
-pub fn install_engine_shutdown(stores: &Stores, bridge: BusBridge, cx: &mut App) {
+pub fn install_shutdown(
+    stores: &Stores,
+    bridge: BusBridge,
+    close_door: impl Fn() + 'static,
+    cx: &mut App,
+) {
     let core = stores.app_core();
     cx.on_app_quit(move |cx: &mut App| {
-        // Order is load-bearing: close the door before anything can knock.
+        // **One hook, because the order is the point.** gpui invokes quit
+        // observers in registration order, so splitting these across two would
+        // make a correctness property depend on the sequence of two calls in
+        // `run()` — silently wrong the day somebody moves one. Here the
+        // sequence *is* the body:
+        //
+        // 1. **The control socket, first.** Everything below is teardown, and
+        //    a caller still being served can dispatch `chat.stream` while it
+        //    runs — billed remote work started after the process decided to
+        //    go, or local work against an engine registry already latched shut.
+        //    Closing first is what makes the door shut before the lights go
+        //    out (`crate::ipc::ControlSocket::close`).
+        // 2. **The bus bridge**, so no `Change` reaches a store's `refresh`
+        //    after gpui has set `quitting`.
+        // 3. **The engines**, signalled from the live registry.
+        //
+        // Then the returned future yields, because signalling is not reaping.
+        close_door();
         bridge.quiesce();
         let timer = cx.background_executor().timer(ENGINE_TEARDOWN_GRACE);
         let had_core = core.is_some();

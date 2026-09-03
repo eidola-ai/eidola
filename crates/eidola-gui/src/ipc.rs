@@ -50,6 +50,15 @@
 //! full shutdown closes the door, from the same `on_app_quit` hook that drains
 //! the engines.
 //!
+//! **The socket is bound here and closed from the shutdown hook that drains
+//! the engines** (`lifecycle::install_shutdown`), which takes `close` as its
+//! first step rather than registering a second quit observer. gpui runs quit
+//! observers in registration order, so two hooks would put a correctness
+//! property — the door shuts before teardown begins — in the sequence of two
+//! calls at the launch site; one hook makes it the order of two lines in one
+//! body. ⌘Q's retire never reaches that hook, which is what keeps a retired
+//! app answering.
+//!
 //! **Closing means closed to everyone, not just to newcomers.** Aborting the
 //! accept loop stops the *next* peer; the ones already connected are tasks of
 //! their own, and a task nobody holds would go on being served through the
@@ -69,7 +78,6 @@ use std::sync::Arc;
 
 use eidola_app_core::AppCore;
 use eidola_app_core::ipc::socket_path;
-use gpui::App;
 
 use crate::stores::Stores;
 
@@ -283,22 +291,6 @@ pub fn serve(core: &Arc<AppCore>) -> Option<ControlSocket> {
         accepting,
         connections,
     })
-}
-
-/// Bind the control socket and arrange for a full shutdown to remove it.
-///
-/// The hook is registered on the same quit path that drains the engines: ⌘Q's
-/// retire never reaches it, so the retired app keeps answering — which is the
-/// state this socket exists to make reachable.
-pub fn install(stores: &Stores, cx: &mut App) {
-    let Some(socket) = bind(stores) else {
-        return;
-    };
-    cx.on_app_quit(move |_: &mut App| {
-        socket.close();
-        async {}
-    })
-    .detach();
 }
 
 /// Create the listening socket, replacing a stale one.
