@@ -19464,6 +19464,87 @@ fn space_find_reveals_a_match_in_the_off_branch_composer(cx: &mut TestAppContext
     });
 }
 
+#[gpui::test]
+fn space_find_stops_the_page_when_the_next_match_is_in_the_composer(cx: &mut TestAppContext) {
+    // Only the page arm of the reveal replaces a glide; a step onto a match in
+    // the off-branch composer scrolls a different surface entirely. The glide
+    // toward the previous match owns `page_scroll` for its whole duration, so
+    // left running it carried the conversation on toward a result the reader
+    // had already stepped past — and phase 2 stands aside for a glide in
+    // flight, so the correction was stranded behind it too.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut left = fixture_assistant_post("a2", "and one kestrel, far down the page");
+    left.parent_action_id = Some("a1".into());
+    let mut right = fixture_assistant_post("a3", "the right branch, off to one side");
+    right.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), left, right],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    let right_index = view
+        .read_with(&vcx, |v, _| v.draft_parents_for_test())
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a3"))
+        .expect("the right branch has a tail draft");
+    // The page stays on the left branch — activating a draft does not select
+    // its branch, which is what puts the second match on another surface.
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(right_index, cx));
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the off-branch draft is the active composer");
+    let mut long: String = "a line of the tangent draft that says nothing much\n".repeat(60);
+    long.push_str("and one kestrel at the very bottom of it\n");
+    editor.update(&mut vcx, |e, cx| e.set_value(long, cx));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        let (matches, index) = v.find_matches_for_test();
+        assert_eq!(matches.len(), 2, "one on the page, one in the composer");
+        assert_eq!(index, Some(1), "the page match is current first");
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "…and it is off screen, so the page is travelling to it"
+        );
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.find_step(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().1,
+            Some(2),
+            "the composer's match is current now"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…so the conversation behind it stopped travelling to the last one"
+        );
+        assert!(
+            v.composer_scroll_offset_y_for_test() < -1.0,
+            "and the composer scrolled its own viewport to the match (offset {})",
+            v.composer_scroll_offset_y_for_test()
+        );
+    });
+}
+
 /// One post carrying an `{{ embed 1 }}` marker, with its ordinal-1 reference
 /// resolving to `snippet` — `None` for a stored range that no longer maps.
 fn post_with_embed(action_id: &str, snippet: Option<&str>) -> PostNode {
