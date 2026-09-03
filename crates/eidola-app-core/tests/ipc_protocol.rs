@@ -918,6 +918,56 @@ fn a_pipelined_hello_is_answered_before_anything_sent_behind_it() {
 }
 
 #[test]
+fn a_malformed_hello_does_not_complete_the_handshake() {
+    run(|| {
+        // A verb that reads no fields is not a verb with nothing to check.
+        // `hello` built its call without looking at `params`, so a frame
+        // carrying a bare string succeeded — and the handshake it establishes
+        // is the one exchange whose whole job is agreeing on the protocol.
+        let (_mock, core, _dir) = served(MockConfig::default());
+        core.runtime().block_on(async {
+            let mut client = Client::connect(&core);
+
+            client
+                .send_raw(&encode_line(&serde_json::json!({
+                    "v": PROTOCOL_VERSION,
+                    "id": 1u64,
+                    "verb": "hello",
+                    "params": "not-an-object",
+                })))
+                .await;
+            let frame = client.expect_frame().await;
+            assert_eq!(frame.id, 1, "the refusal answers the frame that asked");
+            match frame.body {
+                ResponseBody::Err { error } => match error.to_remote() {
+                    RemoteError::Protocol(ProtocolError::BadParams { verb, .. }) => {
+                        assert_eq!(verb, "hello");
+                    }
+                    other => panic!("unexpected: {other:?}"),
+                },
+                other => panic!("the malformed handshake was served: {other:?}"),
+            }
+
+            // The sharp end: it established nothing.
+            let refusal = client
+                .refused(&Call::SpacesList {
+                    include_archived: false,
+                })
+                .await;
+            assert_eq!(
+                refusal,
+                ProtocolError::HandshakeRequired,
+                "a refused handshake left the connection greeted"
+            );
+
+            // …and the connection survives it, like every other bad frame.
+            let hello = client.hello().await;
+            assert_eq!(hello.protocol, PROTOCOL_VERSION);
+        });
+    });
+}
+
+#[test]
 fn a_reused_id_never_overlaps_the_exchange_it_reuses() {
     run(|| {
         // The id claim is released once the terminal frame is *queued*, not

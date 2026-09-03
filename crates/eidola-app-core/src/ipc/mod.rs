@@ -333,17 +333,62 @@ impl Call {
                 message: e.to_string(),
             })
         }
+        /// The check a verb that takes no parameters still owes.
+        ///
+        /// **A verb with no fields to read is not a verb with nothing to
+        /// check.** Constructing the call directly let anything at all through
+        /// as `params` — `"hello"` with a bare string succeeded and *completed
+        /// the handshake*, which is the one exchange whose whole job is
+        /// establishing that both sides agree on the protocol.
+        ///
+        /// Accepted: **absent (`null`) or any object**. That is the same shape
+        /// the parameterized verbs accept, since `of` folds `null` into `{}`
+        /// and serde ignores fields a struct does not name — so a newer caller
+        /// adding a field to a verb this build reads as parameterless keeps
+        /// working, which is how this protocol grows. What is refused is a
+        /// `params` that is not an object at all: a string, a number, a
+        /// boolean, an array. None of those is a parameter set under any
+        /// version, so refusing them forecloses nothing.
+        fn none(verb: &str, params: &serde_json::Value) -> Result<(), ProtocolError> {
+            if params.is_null() || params.is_object() {
+                return Ok(());
+            }
+            let found = match params {
+                serde_json::Value::Bool(_) => "a boolean",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Array(_) => "an array",
+                // Both answered `Ok` above.
+                serde_json::Value::Null | serde_json::Value::Object(_) => unreachable!(),
+            };
+            Err(ProtocolError::BadParams {
+                verb: verb.to_string(),
+                message: format!("expected an object or no parameters, found {found}"),
+            })
+        }
         match verb {
-            "hello" => Ok(Call::Hello),
+            "hello" => {
+                none(verb, params)?;
+                Ok(Call::Hello)
+            }
             "spaces.list" => {
                 let p: SpacesListParams = of(verb, params)?;
                 Ok(Call::SpacesList {
                     include_archived: p.include_archived,
                 })
             }
-            "account.show" => Ok(Call::AccountShow),
-            "wallet.credentials" => Ok(Call::WalletCredentials),
-            "backend.list" => Ok(Call::BackendList),
+            "account.show" => {
+                none(verb, params)?;
+                Ok(Call::AccountShow)
+            }
+            "wallet.credentials" => {
+                none(verb, params)?;
+                Ok(Call::WalletCredentials)
+            }
+            "backend.list" => {
+                none(verb, params)?;
+                Ok(Call::BackendList)
+            }
             "chat.stream" => {
                 let p: ChatStreamParams = of(verb, params)?;
                 Ok(Call::ChatStream {
@@ -1481,6 +1526,47 @@ mod tests {
                 other => panic!("unexpected: {other:?}"),
             },
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parameterless_verb_still_checks_the_shape_of_its_params() {
+        // Every verb that reads no fields — the four of them — used to build
+        // its call without looking at `params` at all, so anything whatsoever
+        // rode through. `hello` is the sharp one: a malformed frame completed
+        // the handshake, which is the exchange whose entire job is agreeing on
+        // the protocol.
+        for verb in [
+            "hello",
+            "account.show",
+            "wallet.credentials",
+            "backend.list",
+        ] {
+            for accepted in [
+                serde_json::Value::Null,
+                serde_json::json!({}),
+                // A field this build does not name is how the protocol grows,
+                // and is what the parameterized verbs already tolerate.
+                serde_json::json!({ "added_later": 1 }),
+            ] {
+                assert!(
+                    Call::parse(verb, &accepted).is_ok(),
+                    "`{verb}` refused {accepted}, which is a parameter set"
+                );
+            }
+            for refused in [
+                serde_json::json!("not-an-object"),
+                serde_json::json!(7),
+                serde_json::json!(true),
+                serde_json::json!([]),
+            ] {
+                match Call::parse(verb, &refused) {
+                    Err(ProtocolError::BadParams { verb: named, .. }) => {
+                        assert_eq!(named, verb, "the refusal names the verb");
+                    }
+                    other => panic!("`{verb}` accepted {refused}: {other:?}"),
+                }
+            }
         }
     }
 
