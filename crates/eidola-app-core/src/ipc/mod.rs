@@ -790,6 +790,31 @@ pub enum ProtocolError {
         limit: usize,
     },
 
+    /// The verb *failed*, and the failure itself does not fit in a response
+    /// line ([`MAX_RESPONSE_BYTES`]) — so this stands in for it, naming the
+    /// variant that could not be delivered.
+    ///
+    /// The twin of [`ProtocolError::ResultTooLarge`], and needed for the same
+    /// reason: an `err` frame is a terminal frame too, and its text is not this
+    /// app's to bound. A failure's `message` is whatever rendered it, and an
+    /// upstream's own error body travels inside several [`AppError`] variants
+    /// uncapped — so the one frame that says "something went wrong" could
+    /// itself be the line the caller's reader refuses, turning a typed failure
+    /// into a closed connection.
+    ///
+    /// **Fixed shape, so the error about the error always fits**: the variant
+    /// name is a compile-time constant in every case, and the two unbounded
+    /// halves — the rendered sentence and the variant's own fields — are the
+    /// ones dropped. What the caller loses is the wording; what it keeps is
+    /// that the verb failed, which variant it failed with, and why the rest is
+    /// missing.
+    #[error("the `{kind}` failure is {bytes} bytes, past the {limit}-byte response limit")]
+    ErrorTooLarge {
+        kind: String,
+        bytes: usize,
+        limit: usize,
+    },
+
     /// No such verb in this build. What a newer caller's additive verb looks
     /// like from here, which is why it is a refusal of one request rather than
     /// of the connection.
@@ -818,6 +843,7 @@ impl ProtocolError {
             ProtocolError::DuplicateRequestId { .. } => "DuplicateRequestId",
             ProtocolError::ReservedRequestId { .. } => "ReservedRequestId",
             ProtocolError::ResultTooLarge { .. } => "ResultTooLarge",
+            ProtocolError::ErrorTooLarge { .. } => "ErrorTooLarge",
             ProtocolError::UnknownVerb { .. } => "UnknownVerb",
             ProtocolError::BadParams { .. } => "BadParams",
             ProtocolError::Unavailable => "Unavailable",
@@ -1110,10 +1136,11 @@ pub fn decode_response(line: &[u8]) -> Result<Response, ProtocolError> {
 /// The encoded terminal line for a verb that succeeded.
 ///
 /// Encodes the `end` frame and, when that line is past `limit`, answers with
-/// [`ProtocolError::ResultTooLarge`] instead. **This is the one place a
-/// successful result becomes bytes**, which is what makes the guarantee hold
-/// for every verb at once rather than for whichever list somebody remembered:
-/// the app never writes a line its own reader would reject.
+/// [`ProtocolError::ResultTooLarge`] instead. **Together with
+/// [`terminal_error_line`] this is the whole of where a terminal frame becomes
+/// bytes**, which is what makes the guarantee hold for every verb at once
+/// rather than for whichever list somebody remembered: the app never writes a
+/// line its own reader would reject.
 ///
 /// Chunk frames are deliberately not measured here. A chunk is one incremental
 /// delta from an upstream that framed it, not an accumulation, so it does not
@@ -1128,10 +1155,50 @@ pub fn terminal_line(id: u64, verb: &str, data: serde_json::Value, limit: usize)
     if line.len() <= limit {
         return line;
     }
+    // Encoded rather than measured, and that is the base case rather than an
+    // omission: the substitute is of fixed shape over a verb name this build
+    // spells as a constant, so it fits any ceiling worth having. Measuring it
+    // would only be asking what to substitute for the substitute.
     encode_line(&Response::err(
         id,
         WireError::from_protocol(&ProtocolError::ResultTooLarge {
             verb: verb.to_string(),
+            bytes: line.len(),
+            limit,
+        }),
+    ))
+}
+
+/// The encoded terminal line for a verb that failed — and for every refusal,
+/// which is the same frame arriving by a shorter road.
+///
+/// The `err` half of [`terminal_line`], and it exists because an `err` frame is
+/// a terminal frame with the same ceiling and *less* control over its own size:
+/// a result is this app's own rendering of its own data, while a failure's
+/// `message` can be an upstream's error body travelling uncapped inside an
+/// [`AppError`]. Encoded directly, one of those is a line the caller's reader
+/// refuses — so the typed failure the protocol exists to deliver arrives as a
+/// closed connection instead.
+///
+/// Past `limit` it answers with [`ProtocolError::ErrorTooLarge`], which is of
+/// fixed shape and therefore always fits: an error about an error that could
+/// itself be too large would be no backstop at all.
+pub fn terminal_error_line(id: u64, error: WireError, limit: usize) -> Vec<u8> {
+    // Only the variant name is kept back, because only the variant name is
+    // needed if the frame turns out not to fit — copying the whole error to
+    // measure it would double the very allocation being judged.
+    let kind = error.kind.clone();
+    let line = encode_line(&Response::err(id, error));
+    if line.len() <= limit {
+        return line;
+    }
+    // The base case, for the same reason `terminal_line`'s substitute is: the
+    // variant name is a constant in every build of this enum, so the frame that
+    // says the failure did not fit is one that always does.
+    encode_line(&Response::err(
+        id,
+        WireError::from_protocol(&ProtocolError::ErrorTooLarge {
+            kind,
             bytes: line.len(),
             limit,
         }),
@@ -1615,6 +1682,63 @@ mod tests {
                     limit: reported,
                 }) => {
                     assert_eq!(verb, "spaces.list", "the refusal names what was asked");
+                    assert!(bytes > reported);
+                    assert_eq!(reported, limit);
+                }
+                other => panic!("unexpected: {other:?}"),
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failure_that_fits_travels_whole() {
+        let error = WireError::from_app_error(&AppError::Server {
+            status: 503,
+            message: "upstream said no".into(),
+        });
+        let line = terminal_error_line(9, error, 4096);
+        let frame = decode_response(&line[..line.len() - 1]).expect("decode");
+        assert_eq!(frame.id, 9);
+        match frame.body {
+            ResponseBody::Err { error } => match error.to_remote() {
+                RemoteError::App(AppError::Server { status, message }) => {
+                    assert_eq!(status, 503);
+                    assert_eq!(message, "upstream said no", "the typed failure is intact");
+                }
+                other => panic!("unexpected: {other:?}"),
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failure_too_big_to_read_is_named_rather_than_written() {
+        // The `err` twin of the result ceiling, and reachable where the result
+        // one is not: a failure's `message` is whoever rendered it, and an
+        // upstream's own error body travels uncapped inside `AppError::Server`.
+        // Written whole, that frame is the line the caller's reader refuses —
+        // so a typed failure would arrive as a closed connection instead.
+        let error = WireError::from_app_error(&AppError::Server {
+            status: 500,
+            message: "x".repeat(4096),
+        });
+        let limit = 256;
+        let line = terminal_error_line(11, error, limit);
+        assert!(
+            line.len() <= limit,
+            "the error about the error has to fit where the error did not"
+        );
+        let frame = decode_response(&line[..line.len() - 1]).expect("decode");
+        assert_eq!(frame.id, 11, "it still answers the request that asked");
+        match frame.body {
+            ResponseBody::Err { error } => match error.to_remote() {
+                RemoteError::Protocol(ProtocolError::ErrorTooLarge {
+                    kind,
+                    bytes,
+                    limit: reported,
+                }) => {
+                    assert_eq!(kind, "Server", "the caller still learns what failed");
                     assert!(bytes > reported);
                     assert_eq!(reported, limit);
                 }

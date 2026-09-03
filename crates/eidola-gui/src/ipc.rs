@@ -45,11 +45,19 @@
 //! Bound once at launch, in **both** launch modes — a windowless service is
 //! precisely the process this is for, and a windowed app is one ⌘Q away from
 //! being the same thing. It is deliberately **not** tied to windows or to the
-//! retire: ⌘Q keeps the process, the engines and this socket, which is the
-//! point of the app outliving its windows. Only a full shutdown removes the
-//! file, from the same `on_app_quit` hook that drains the engines — and even
-//! that is best-effort tidiness rather than correctness, since the next bind
-//! replaces whatever it finds.
+//! retire: ⌘Q keeps the process, the engines, this socket **and the connections
+//! already on it**, which is the point of the app outliving its windows. Only a
+//! full shutdown closes the door, from the same `on_app_quit` hook that drains
+//! the engines.
+//!
+//! **Closing means closed to everyone, not just to newcomers.** Aborting the
+//! accept loop stops the *next* peer; the ones already connected are tasks of
+//! their own, and a task nobody holds would go on being served through the
+//! whole asynchronous shutdown grace — long enough for a preconnected peer to
+//! start a billed turn moments before the process ends. So the accepted
+//! connections are tracked and ended with the listener. Removing the file is
+//! the one part that is best-effort tidiness rather than correctness, since the
+//! next bind replaces whatever it finds.
 
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -106,10 +114,25 @@ pub fn admit(peer_uid: Option<u32>, our_uid: u32) -> Admission {
     }
 }
 
+/// The connections currently being served, so a shutdown can end them.
+///
+/// **A door that is closed has to stop admitting *and* stop serving.** Each
+/// accepted connection runs as its own task, and a task nobody holds outlives
+/// the listener that spawned it: a peer already connected when the app began
+/// quitting would go on dispatching — starting a billed turn moments before the
+/// process ends, for an answer it will never receive. Closing the socket is the
+/// app saying it is going away, so it says so to everyone already inside.
+///
+/// A `std` mutex, held only across `spawn` / `try_join_next` / `abort_all` and
+/// never across an `await`, because [`ControlSocket::close`] runs on the quit
+/// path — off any runtime — and has to be able to take it.
+type Connections = Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>;
+
 /// A bound socket, held for as long as the process serves it.
 pub struct ControlSocket {
     path: PathBuf,
     accepting: tokio::task::JoinHandle<()>,
+    connections: Connections,
 }
 
 impl ControlSocket {
@@ -120,10 +143,22 @@ impl ControlSocket {
 
     /// Stop serving and remove the socket file.
     ///
+    /// Ends the accept loop, the connections it accepted, and the file — in
+    /// that order, so nothing can be admitted into the gap. **Only a full
+    /// shutdown gets here**: ⌘Q's retire never reaches the quit hook that calls
+    /// this, which is what keeps a retired app answering (see the module docs).
+    ///
     /// Best-effort by design: a bind replaces whatever it finds, so a process
-    /// that dies without getting here costs the next launch nothing.
+    /// that dies without getting here costs the next launch nothing. Ending a
+    /// connection is the same event a peer that hung up produces, so it costs
+    /// the frames and never the work — a turn already upstream still lands
+    /// (`eidola_app_core::ipc::serve`).
     pub fn close(&self) {
         self.accepting.abort();
+        self.connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .abort_all();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -154,10 +189,17 @@ pub fn serve(core: &Arc<AppCore>) -> Option<ControlSocket> {
             return None;
         }
     };
-    let accepting = core
-        .runtime()
-        .spawn(accept_loop(Arc::clone(core), listener));
-    Some(ControlSocket { path, accepting })
+    let connections: Connections = Default::default();
+    let accepting = core.runtime().spawn(accept_loop(
+        Arc::clone(core),
+        listener,
+        Arc::clone(&connections),
+    ));
+    Some(ControlSocket {
+        path,
+        accepting,
+        connections,
+    })
 }
 
 /// Bind the control socket and arrange for a full shutdown to remove it.
@@ -208,7 +250,11 @@ fn bind_listener(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
 }
 
 /// Accept connections until the process ends.
-async fn accept_loop(core: Arc<AppCore>, listener: std::os::unix::net::UnixListener) {
+async fn accept_loop(
+    core: Arc<AppCore>,
+    listener: std::os::unix::net::UnixListener,
+    connections: Connections,
+) {
     let listener = match tokio::net::UnixListener::from_std(listener) {
         Ok(listener) => listener,
         Err(e) => {
@@ -253,7 +299,8 @@ async fn accept_loop(core: Arc<AppCore>, listener: std::os::unix::net::UnixListe
         }
 
         let core = Arc::clone(&core);
-        tokio::spawn(async move {
+        let mut held = connections.lock().unwrap_or_else(|e| e.into_inner());
+        held.spawn(async move {
             let (reader, writer) = stream.into_split();
             eidola_app_core::ipc::serve_connection(
                 core,
@@ -263,6 +310,9 @@ async fn accept_loop(core: Arc<AppCore>, listener: std::os::unix::net::UnixListe
             )
             .await;
         });
+        // Reap the ones that have hung up, so the set tracks who is actually
+        // here rather than everyone who ever was. Never blocks the accept loop.
+        while held.try_join_next().is_some() {}
     }
 }
 

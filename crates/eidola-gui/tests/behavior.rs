@@ -13682,6 +13682,70 @@ fn retiring_closes_every_window_and_leaves_the_app_standing(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn retiring_leaves_the_control_socket_and_the_callers_on_it_answering(cx: &mut TestAppContext) {
+    // The socket's side of the same retire. ⌘Q is not a shutdown, so the door
+    // another process knocks on stays open with the process, the stores and the
+    // engines — and so do the peers already through it, which is the half a
+    // shutdown that ends established connections has to be careful not to take
+    // with it. Only `on_app_quit` closes the socket, and a retire never reaches
+    // it; what closing then costs is pinned beside the socket (`tests/ipc.rs`).
+    use std::io::{BufRead, Write};
+
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    let path = eidola_app_core::ipc::socket_path(core.data_dir());
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    cx.update(|cx| eidola_gui::ipc::install(&stores, cx));
+    assert!(path.exists(), "the door is open to begin with");
+
+    // A peer that was already connected when the retire happened.
+    let mut stream = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+    let mut ask = |stream: &mut std::os::unix::net::UnixStream, id: u64, call| {
+        stream
+            .write_all(&eidola_app_core::ipc::encode_line(
+                &eidola_app_core::ipc::Request::new(id, &call),
+            ))
+            .expect("write");
+        stream.flush().expect("flush");
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).expect("read");
+        assert!(read > 0, "the connection was ended");
+        eidola_app_core::ipc::decode_response(line.trim_end().as_bytes()).expect("a frame")
+    };
+    let hello = ask(&mut stream, 1, eidola_app_core::ipc::Call::Hello);
+    assert!(matches!(
+        hello.body,
+        eidola_app_core::ipc::ResponseBody::End { .. }
+    ));
+
+    // The retire: every window goes, nothing on the quit path runs.
+    cx.update(eidola_gui::lifecycle::close_all_windows);
+    cx.run_until_parked();
+
+    assert!(path.exists(), "the retire took the door with the windows");
+    let answer = ask(
+        &mut stream,
+        2,
+        eidola_app_core::ipc::Call::SpacesList {
+            include_archived: false,
+        },
+    );
+    assert!(
+        matches!(answer.body, eidola_app_core::ipc::ResponseBody::End { .. }),
+        "a retired app stopped answering a caller it had already admitted"
+    );
+}
+
+#[gpui::test]
 fn retiring_from_a_windows_own_update_still_closes_that_window(cx: &mut TestAppContext) {
     // ⌘Q arrives with a window key, and `App::dispatch_action` routes an
     // action *through* the active window — so the Quit handler runs inside
