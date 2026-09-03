@@ -1250,10 +1250,21 @@ impl SpaceView {
                 bottom,
                 natural,
             }) => {
+                // **A reveal on another surface ends the page's motion.** Only
+                // the page arm replaces a glide (`glide_page_to` writes the
+                // new trajectory over the old one); every other arm leaves one
+                // in flight, and a glide owns `page_scroll` for its whole
+                // duration — so the conversation behind the composer went on
+                // travelling toward a match that is no longer current while
+                // the readout and the highlight had already moved to this one.
+                self.cancel_page_glide();
                 self.scroll_composer_to(top, bottom, natural, window_h);
             }
-            // Nothing measured yet — the correction below is what lands it.
-            None => {}
+            // Nothing measured yet — the correction below is what lands it,
+            // and the old motion still ends here: the page is travelling to
+            // the *previous* match, and phase 2 stands aside for a glide in
+            // flight, so leaving it would strand the correction behind it.
+            None => self.cancel_page_glide(),
         }
         // **After** the motion, which itself counts as the reader being taken
         // somewhere and so clears any reveal already pending
