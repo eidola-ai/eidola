@@ -2428,12 +2428,30 @@ async fn spawn_subspace_tx_body(
         });
     }
 
-    // (7) the sub-agents themselves — the same base-config rule as the owner:
-    // an agent with no model of its own is skipped by every planner, so
+    // (7) the sub-agents themselves — the same three rules as the owner, in
+    // the same order and for the same reasons. **Eligible**: a space-owned or
+    // retired participant cannot be referenced into another space at all.
+    // **Still in the parent**: the seats a delegation names are resolved
+    // against the roster its turn was prepared from, which is deliberate (the
+    // name a model reads is the name that resolves) and is a *snapshot* — so
+    // a departure landing between that snapshot and this write leaves a
+    // candidate that still resolves to somebody who has left. Asked here, at
+    // the write, because that is the only place it cannot be raced: seating a
+    // departed member would put an agent in a room opened from a conversation
+    // it is not in, and hand its backend a brief drawn from that conversation.
+    // The owner's own membership is asked one guard up for the same reason,
+    // and this is that rule applied to the other side of the roster.
+    // **Modelled**: the sub-space sees each participant's base configuration,
+    // and an agent with no model of its own is skipped by every planner, so
     // seating one would report a spawn that scheduled nothing.
     for id in plan.participant_ids {
         match get_participant(conn, id).await? {
             Some(p) if p.scope == "global" && p.kind == "agent" && p.removed_at.is_none() => {
+                if !is_space_member(conn, plan.parent_space_id, id).await? {
+                    refuse!(SpawnRefusal::ParticipantHasLeft {
+                        label: p.label.clone(),
+                    });
+                }
                 if !has_model(&p) {
                     refuse!(SpawnRefusal::NoModelConfigured {
                         label: p.label.clone(),

@@ -143,6 +143,15 @@ pub enum SpawnRefusal {
     CapabilityNotHeld { name: String },
     /// A requested sub-agent is not a live shared agent.
     ParticipantNotEligible { participant_id: String },
+    /// A requested sub-agent is no longer taking part in the parent
+    /// conversation. The seats a delegation names resolve against the roster
+    /// the turn was prepared from — deliberately, so the name a model reads is
+    /// the name that resolves — and a departure landing after that snapshot
+    /// leaves a candidate that still resolves to somebody the reader has
+    /// already taken out of the conversation. Seating them would put an agent
+    /// in a room opened from a conversation they are not in, and send their
+    /// backend a brief drawn from it.
+    ParticipantHasLeft { label: String },
     /// The post the delegation says it is being opened from is not a post
     /// the parent currently shows — wrong conversation, a superseded
     /// generation, or a hidden tip. The report attaches there, so an
@@ -205,6 +214,13 @@ impl std::fmt::Display for SpawnRefusal {
                 f,
                 "{participant_id} is not a shared agent that can be invited into another \
                  conversation"
+            ),
+            Self::ParticipantHasLeft { label } => write!(
+                f,
+                "{} is no longer taking part in this conversation, so it cannot be invited into \
+                 one opened from it — name someone who is, or leave `participants` out to open a \
+                 room of your own",
+                crate::quoted_label(label)
             ),
             Self::AnchorNotInParent { action_id } => write!(
                 f,
