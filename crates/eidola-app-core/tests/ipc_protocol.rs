@@ -918,6 +918,75 @@ fn a_pipelined_hello_is_answered_before_anything_sent_behind_it() {
 }
 
 #[test]
+fn a_reused_id_never_overlaps_the_exchange_it_reuses() {
+    run(|| {
+        // The id claim is released once the terminal frame is *queued*, not
+        // once the writer has put it on the wire — so a pipelined reuse can be
+        // accepted while the first answer is still in the outbox.
+        //
+        // That is not an overlap the caller can see, and this pins why: the
+        // outbox is one queue with one writer, the claim is held across the
+        // send, and the reuse is not even dispatched until that send returned.
+        // So the wire is strictly sequential, and the property to hold is that
+        // every frame of the second exchange follows the first's terminal.
+        let (_mock, core, _dir) = served(MockConfig::default());
+        core.runtime().block_on(async {
+            let mut client = Client::connect(&core);
+            client.hello().await;
+
+            // Both under one id, written together so the second is already
+            // buffered when the first releases its claim. Either outcome is
+            // legal — the reuse is refused while the claim is live, and served
+            // once it is not — and the property under test is what they share.
+            let ask = Call::SpacesList {
+                include_archived: false,
+            };
+            let mut pipelined = encode_line(&Request::new(9, &ask));
+            pipelined.extend(encode_line(&Request::new(9, &ask)));
+            client.send_raw(&pipelined).await;
+
+            let mut answered = 0;
+            let mut refused = 0;
+            while answered + refused < 2 {
+                let frame = client.expect_frame().await;
+                match (frame.id, frame.body) {
+                    // A refusal for the reuse deliberately wears no id — it is
+                    // the rule holding, not a second answer on a live one.
+                    (NO_REQUEST, ResponseBody::Err { error }) => {
+                        assert!(
+                            matches!(
+                                error.to_remote(),
+                                RemoteError::Protocol(ProtocolError::DuplicateRequestId {
+                                    duplicate: 9
+                                })
+                            ),
+                            "unexpected: {error:?}"
+                        );
+                        refused += 1;
+                    }
+                    (9, ResponseBody::End { .. }) => answered += 1,
+                    // The claim exists so that nothing else can wear this id
+                    // while an exchange on it is open: no second terminal, and
+                    // no half of one interleaved with another's.
+                    (id, body) => panic!("a frame nobody may write: id {id}, {body:?}"),
+                }
+            }
+            assert_eq!(
+                answered + refused,
+                2,
+                "each ask was answered exactly once, on its own id or on none"
+            );
+
+            // Reuse after the terminal frame is ordinary, which is the other
+            // half of holding the claim only until the answer is queued.
+            let reused: SpacesListResult = client.ok(&ask).await;
+            let _ = reused;
+            client.hello().await;
+        });
+    });
+}
+
+#[test]
 fn cancelling_the_connection_ends_its_writer_and_its_forwarder_too() {
     run(|| {
         // Whoever owns the connection cancels it by dropping this future — the

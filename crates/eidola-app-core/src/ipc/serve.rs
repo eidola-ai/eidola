@@ -28,11 +28,19 @@
 //!   terminal frame is measured and every chunk is split — see the ceilings in
 //!   [`crate::ipc`], and `chunk_lines` for why a chunk is split where a result
 //!   is refused.
-//! - **The connection ends the *answers*, not the work.** In-flight tasks are
-//!   aborted when the reader stops, because their only consumer is gone. That
-//!   stops frames being written; it does **not** stop a turn. See "What a lost
-//!   caller costs" below — the distinction is billing-relevant and easy to
-//!   state backwards.
+//! - **The connection ends the *answers*, not the work.** A teardown stops
+//!   frames being written; it does **not** stop a turn. See "What a lost caller
+//!   costs" below — the distinction is billing-relevant and easy to state
+//!   backwards.
+//! - **How the loop ends decides what happens to what is still running**
+//!   ([`Ending`]). A clean end of the *request* stream is a caller that stopped
+//!   asking, not one that stopped listening, so its in-flight requests are
+//!   awaited and the writer drains; a dead writer or a fatal frame error tears
+//!   down instead.
+//! - **The connection owns its whole task tree** ([`AbortOnDrop`]), because a
+//!   dropped `JoinHandle` detaches its task rather than ending it — so the
+//!   writer and a turn's chunk forwarder would otherwise outlive the connection
+//!   they belong to.
 //!
 //! ## Backpressure, and who waits on whom
 //!
@@ -490,6 +498,20 @@ async fn read_frames<R: AsyncRead + Unpin>(
 /// dispatched. An id becomes free again the moment its request ends, because
 /// reuse after a terminal frame is ordinary: a long-lived connection counting
 /// from one would otherwise have to remember forever.
+///
+/// **The claim is held until the terminal frame is *queued*, and queued is
+/// enough** — which is worth stating, because "released before the writer put
+/// it on the wire" reads like a hole and is not one. A request task drops its
+/// claim at the end of its body, after the send it awaits, so the terminal
+/// frame is in the outbox before the id can be reclaimed; the read loop cannot
+/// accept a reuse until then, and the reuse's own frames are therefore queued
+/// strictly behind it. One writer drains that queue in order, so the caller's
+/// read stream is `chunks… terminal(N)` then `chunks… terminal(N)` — a
+/// sequential exchange with no position at which a reuse's frame has arrived
+/// and the first terminal has not. Waiting for the writer to *acknowledge* the
+/// write would buy nothing a caller can observe, and would put the read loop
+/// behind the socket rather than behind the queue. Regression:
+/// `a_reused_id_never_overlaps_the_exchange_it_reuses`.
 #[derive(Clone, Default)]
 struct ActiveIds(Arc<std::sync::Mutex<std::collections::HashSet<u64>>>);
 
