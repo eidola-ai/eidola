@@ -1168,10 +1168,9 @@ pub fn decode_response(line: &[u8]) -> Result<Response, ProtocolError> {
 /// rather than for whichever list somebody remembered: the app never writes a
 /// line its own reader would reject.
 ///
-/// Chunk frames are deliberately not measured here. A chunk is one incremental
-/// delta from an upstream that framed it, not an accumulation, so it does not
-/// grow with the profile the way a result does — and a chunk replaced by a
-/// refusal would be a truncated answer with a second terminal frame behind it.
+/// Chunk frames are held to the same ceiling by [`chunk_lines`], which **splits**
+/// rather than refuses: a chunk is a piece of an answer, so replacing one with a
+/// refusal would truncate that answer and put a second terminal frame behind it.
 pub fn terminal_line(id: u64, verb: &str, data: serde_json::Value, limit: usize) -> Vec<u8> {
     let line = encode_line(&Response {
         v: PROTOCOL_VERSION,
@@ -1229,6 +1228,112 @@ pub fn terminal_error_line(id: u64, error: WireError, limit: usize) -> Vec<u8> {
             limit,
         }),
     ))
+}
+
+/// The most bytes JSON escaping can make of one input byte: a control
+/// character becomes ` `, six for one.
+///
+/// Used as an upper bound rather than measured per piece, which is what lets
+/// [`chunk_lines`] size a split without encoding a candidate and retrying. It
+/// over-splits pathological text and never under-splits, and the case it costs
+/// anything in is already the case nothing sensible produced.
+const JSON_ESCAPE_WORST_CASE: usize = 6;
+
+/// The encoded `chunk` lines for one streamed event — one where it fits, and
+/// **several where it does not**.
+///
+/// A chunk is under the same ceiling as a terminal frame, for the same reason:
+/// the app must never write a line its own reader would refuse. But a chunk is
+/// not a terminal frame, and the answer that works for those is wrong here —
+/// replacing an oversized chunk with a refusal would truncate an answer and
+/// then put a second terminal frame behind it. **Splitting costs nothing at
+/// all**, because a chunk is a piece of text a reader is already appending to a
+/// buffer: several frames concatenate to exactly what one would have said, in
+/// order, through the one writer that drains the outbox.
+///
+/// This is not a hypothetical ceiling. A chunk's size is decided by whatever
+/// backend the profile is pointed at, not by this app — the SSE reader buffers
+/// an event until its boundary with no cap of its own — so a single delta past
+/// the limit is representable on the wire, and unsplit it makes a conforming
+/// reader report [`ProtocolError::FrameTooLarge`] and hang up on a turn that
+/// then finishes and persists perfectly well.
+///
+/// **The match over the event is exhaustive on purpose.** Every variant that
+/// reaches a chunk today carries text and nothing else, which is what makes
+/// splitting honest — bytes of a string concatenate; a structural payload
+/// (a tool-call delta, say) would not, and must decide what it does here rather
+/// than inherit an answer written for prose. Tool rounds are invisible to this
+/// protocol in v1, so no such variant exists yet.
+///
+/// Pieces end on character boundaries, so every frame is a valid JSON string
+/// and a reader never sees half a character.
+pub fn chunk_lines(id: u64, event: &crate::ChatStreamEvent, limit: usize) -> Vec<Vec<u8>> {
+    let whole = chunk_line(id, event);
+    if whole.len() <= limit {
+        return vec![whole];
+    }
+    // Measured rather than counted: the scaffolding is the frame plus the
+    // variant's own tag, and asking for it with an empty text is the one way
+    // that cannot drift from what the encoder actually writes.
+    let overhead = chunk_line(id, &with_text(event, "")).len();
+    let budget = limit.saturating_sub(overhead) / JSON_ESCAPE_WORST_CASE;
+
+    let mut rest = text_of(event);
+    let mut lines = Vec::new();
+    while !rest.is_empty() {
+        let (head, tail) = rest.split_at(prefix_within(rest, budget));
+        lines.push(chunk_line(id, &with_text(event, head)));
+        rest = tail;
+    }
+    lines
+}
+
+/// One `chunk` frame's bytes, whatever its size.
+fn chunk_line(id: u64, event: &crate::ChatStreamEvent) -> Vec<u8> {
+    let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+    encode_line(&Response::chunk(id, data))
+}
+
+/// The text a streamed event carries.
+fn text_of(event: &crate::ChatStreamEvent) -> &str {
+    match event {
+        crate::ChatStreamEvent::ReasoningDelta(text)
+        | crate::ChatStreamEvent::ContentDelta(text) => text,
+    }
+}
+
+/// The same kind of event, saying something shorter.
+fn with_text(event: &crate::ChatStreamEvent, text: &str) -> crate::ChatStreamEvent {
+    match event {
+        crate::ChatStreamEvent::ReasoningDelta(_) => {
+            crate::ChatStreamEvent::ReasoningDelta(text.to_string())
+        }
+        crate::ChatStreamEvent::ContentDelta(_) => {
+            crate::ChatStreamEvent::ContentDelta(text.to_string())
+        }
+    }
+}
+
+/// How much of `s` fits in `budget` bytes, ending on a character boundary.
+///
+/// **Never zero for a non-empty string.** A budget too small to hold even one
+/// character still has to make progress or the split cannot terminate; the
+/// frame that produces may exceed the limit, which is the honest outcome when
+/// nothing at all can fit under it. Unreachable at the real ceiling, where the
+/// budget is megabytes.
+fn prefix_within(s: &str, budget: usize) -> usize {
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        let next = i + c.len_utf8();
+        if next > budget {
+            break;
+        }
+        end = next;
+    }
+    if end == 0 {
+        end = s.chars().next().map_or(0, char::len_utf8);
+    }
+    end
 }
 
 /// A bounded NDJSON line reader.
@@ -1772,6 +1877,119 @@ mod tests {
             },
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_ordinary_delta_is_one_frame() {
+        let event = crate::ChatStreamEvent::ContentDelta("a token".into());
+        let lines = chunk_lines(2, &event, MAX_RESPONSE_BYTES);
+        assert_eq!(lines.len(), 1, "nothing is split that already fits");
+        let line = &lines[0];
+        let frame = decode_response(&line[..line.len() - 1]).expect("decode");
+        assert_eq!(frame.id, 2);
+        assert!(matches!(frame.body, ResponseBody::Chunk { .. }));
+    }
+
+    /// The split, read back the way whoever dials reads.
+    ///
+    /// `for_responses` is `with_limit(MAX_RESPONSE_BYTES)`, and the serving
+    /// side passes that same constant — so scaling both ends together is the
+    /// same reader under the same rule, without allocating 64 MiB to say so.
+    async fn split_round_trip(event: crate::ChatStreamEvent, limit: usize) -> String {
+        let lines = chunk_lines(7, &event, limit);
+        assert!(lines.len() > 1, "an oversized delta has to be split at all");
+        for line in &lines {
+            assert!(
+                line.len() <= limit,
+                "a split piece is still a line the reader would refuse: {} > {limit}",
+                line.len()
+            );
+        }
+
+        let joined: &'static [u8] = Box::leak(lines.concat().into_boxed_slice());
+        let mut reader = FrameReader::with_limit(tokio::io::BufReader::new(joined), limit);
+        let mut rebuilt = String::new();
+        let mut frames = 0;
+        while let Some(line) = reader
+            .next_line()
+            .await
+            .expect("every frame is one the reader accepts")
+        {
+            let frame = decode_response(line).expect("decode");
+            assert_eq!(frame.id, 7, "every piece answers the request that asked");
+            match frame.body {
+                ResponseBody::Chunk { data } => {
+                    let piece: crate::ChatStreamEvent =
+                        serde_json::from_value(data).expect("a chunk event");
+                    assert_eq!(
+                        std::mem::discriminant(&piece),
+                        std::mem::discriminant(&event),
+                        "a piece never changes what kind of delta it is"
+                    );
+                    rebuilt.push_str(text_of(&piece));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+            frames += 1;
+        }
+        assert_eq!(frames, lines.len(), "every piece was readable");
+        rebuilt
+    }
+
+    #[tokio::test]
+    async fn a_delta_past_the_ceiling_arrives_whole_across_several_frames() {
+        // The defect this prevents: a backend the profile is pointed at emits
+        // one enormous delta, the app writes it as one line, and a conforming
+        // reader reports `FrameTooLarge` and hangs up — on a turn that then
+        // finishes and persists perfectly well.
+        //
+        // The text is adversarial on both axes the split has to respect:
+        // multi-byte characters it must not cut through, and control
+        // characters whose JSON escape is six bytes for one.
+        let text = "héllo\u{0}wörld — ✂\u{1f}".repeat(400);
+        let rebuilt =
+            split_round_trip(crate::ChatStreamEvent::ContentDelta(text.clone()), 512).await;
+        assert_eq!(
+            rebuilt, text,
+            "the pieces concatenate to exactly what the model said"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reasoning_delta_splits_the_same_way() {
+        // Both variants carry text and nothing else, which is what makes
+        // splitting honest for the whole vocabulary rather than for one arm.
+        let text = "thinking ".repeat(400);
+        let rebuilt =
+            split_round_trip(crate::ChatStreamEvent::ReasoningDelta(text.clone()), 512).await;
+        assert_eq!(rebuilt, text);
+    }
+
+    #[test]
+    fn a_split_never_cuts_a_character_in_half() {
+        // Every piece is decodable UTF-8 by construction — a `String` that
+        // came back through serde proves it — so the assertion is that the
+        // pieces are *characters*, not bytes: joined they equal the original
+        // and each one alone is well formed.
+        let text = "✂".repeat(300);
+        let lines = chunk_lines(1, &crate::ChatStreamEvent::ContentDelta(text.clone()), 256);
+        assert!(lines.len() > 1);
+        let mut rebuilt = String::new();
+        for line in &lines {
+            let frame = decode_response(&line[..line.len() - 1]).expect("decode");
+            let ResponseBody::Chunk { data } = frame.body else {
+                panic!("not a chunk");
+            };
+            let piece: crate::ChatStreamEvent = serde_json::from_value(data).expect("event");
+            let piece = text_of(&piece);
+            assert!(
+                !piece.is_empty(),
+                "a piece that says nothing makes no progress"
+            );
+            assert_eq!(piece.len() % "✂".len(), 0, "a character was cut in half");
+            rebuilt.push_str(piece);
+        }
+        assert_eq!(rebuilt, text);
     }
 
     #[tokio::test]

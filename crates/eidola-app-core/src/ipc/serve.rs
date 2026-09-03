@@ -24,6 +24,10 @@
 //! - **A request's terminal frame is always sent.** Every path through
 //!   [`answer`] ends in exactly one `end` or `err`, so a caller waiting on an
 //!   id is never left waiting on a request that quietly evaporated.
+//! - **No frame this module writes is one its own reader would refuse.** Every
+//!   terminal frame is measured and every chunk is split — see the ceilings in
+//!   [`crate::ipc`], and `chunk_lines` for why a chunk is split where a result
+//!   is refused.
 //! - **The connection ends the *answers*, not the work.** In-flight tasks are
 //!   aborted when the reader stops, because their only consumer is gone. That
 //!   stops frames being written; it does **not** stop a turn. See "What a lost
@@ -113,8 +117,8 @@ use tokio::sync::mpsc;
 
 use super::{
     Call, FrameReader, HelloResult, MAX_RESPONSE_BYTES, NO_REQUEST, PROTOCOL_VERSION,
-    ProtocolError, Request, Response, SpacesListResult, WalletCredentialsResult, WireError,
-    decode_request, encode_line, path_bytes, terminal_error_line, terminal_line,
+    ProtocolError, Request, SpacesListResult, WalletCredentialsResult, WireError, chunk_lines,
+    decode_request, path_bytes, terminal_error_line, terminal_line,
 };
 use crate::AppCore;
 use crate::error::AppError;
@@ -580,18 +584,22 @@ async fn answer(
             // turn is running and paid for either way, and a receiver dropped
             // under it would only turn a finished turn into a torn one.
             let pump = tokio::spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    let data = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
-                    // Awaited, so a reader that has fallen behind slows the
-                    // turn's delivery instead of being queued at. A writer that
-                    // has gone away ends the pump: there is nobody to deliver
-                    // to, and the turn itself is unaffected either way.
-                    if chunks
-                        .send(encode_line(&Response::chunk(id, data)))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                'events: while let Some(event) = rx.recv().await {
+                    // A delta's size is the backend's decision, not this app's,
+                    // so it goes out through `chunk_lines` — which splits an
+                    // oversized one into frames that fit rather than refusing
+                    // it. Several frames concatenate to exactly what one would
+                    // have said, and they leave in order through this one
+                    // outbox.
+                    for line in chunk_lines(id, &event, MAX_RESPONSE_BYTES) {
+                        // Awaited, so a reader that has fallen behind slows the
+                        // turn's delivery instead of being queued at. A writer
+                        // that has gone away ends the pump: there is nobody to
+                        // deliver to, and the turn itself is unaffected either
+                        // way.
+                        if chunks.send(line).await.is_err() {
+                            break 'events;
+                        }
                     }
                 }
             });
