@@ -13682,6 +13682,47 @@ fn retiring_closes_every_window_and_leaves_the_app_standing(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn the_full_shutdown_closes_the_control_socket(cx: &mut TestAppContext) {
+    // gpui invokes quit observers in **registration order**, so a socket close
+    // registered as its own hook ran *after* the engine teardown registered
+    // before it — and the core's runtime keeps serving connections across that
+    // gap, long enough for a caller to start a billed `chat.stream` after the
+    // process had decided to go, or reach for an engine registry already
+    // latched shut.
+    //
+    // One hook owns the whole sequence now, so the order is two adjacent lines
+    // in one body rather than two calls at the launch site — nothing a test can
+    // guard better than reading it. What is worth pinning is the half that
+    // *could* silently rot: that closing the door is a step of the quit path at
+    // all, rather than a closure nobody calls.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let stores = stub_stores_with_config(cx);
+    let closed = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = closed.clone();
+    cx.update(|cx| {
+        let bridge = eidola_gui::stores::install_bus_bridge(&stores, cx);
+        eidola_gui::lifecycle::install_shutdown(
+            &stores,
+            bridge,
+            move || flag.store(true, Ordering::SeqCst),
+            cx,
+        );
+    });
+    assert!(
+        !closed.load(Ordering::SeqCst),
+        "nothing is torn down before the quit"
+    );
+
+    cx.update(|cx| cx.shutdown());
+
+    assert!(
+        closed.load(Ordering::SeqCst),
+        "the full shutdown left the door open"
+    );
+}
+
+#[gpui::test]
 fn retiring_leaves_the_control_socket_and_the_callers_on_it_answering(cx: &mut TestAppContext) {
     // The socket's side of the same retire. ⌘Q is not a shutdown, so the door
     // another process knocks on stays open with the process, the stores and the
@@ -13700,7 +13741,9 @@ fn retiring_leaves_the_control_socket_and_the_callers_on_it_answering(cx: &mut T
     );
     let path = eidola_app_core::ipc::socket_path(core.data_dir());
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
-    cx.update(|cx| eidola_gui::ipc::install(&stores, cx));
+    // Held for the test's duration exactly as the shutdown hook holds it in
+    // production; closing is that hook's first step, and a retire never runs it.
+    let _socket = eidola_gui::ipc::bind(&stores).expect("bind");
     assert!(path.exists(), "the door is open to begin with");
 
     // A peer that was already connected when the retire happened.

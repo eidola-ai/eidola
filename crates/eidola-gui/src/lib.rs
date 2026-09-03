@@ -208,21 +208,35 @@ pub fn run_with(opts: LaunchOptions) {
         // the next time one opens — no banners in chat windows.
         stores.update.read(cx).start_polling();
 
-        // The *full* shutdown drains the engines — and on macOS this hook
-        // is the only thing that delivers it. ⌘Q no longer reaches it (it
-        // retires the app instead, keeping the engines up, which is the
-        // point); the status menu's Quit and a windowless SIGTERM do. See
-        // `lifecycle::install_engine_shutdown`.
-        lifecycle::install_engine_shutdown(&stores, bus_bridge, cx);
-
         // The door another process knocks on. Bound in both launch modes and
         // deliberately not tied to windows: ⌘Q retires the app and keeps this
         // socket answering, because a process that still holds the database
         // lock is exactly the process a command-line invocation needs to
         // reach. A bind failure is a diagnostic, not a startup failure — see
         // `crate::ipc`.
+        //
+        // **Closing it is not registered here.** It is the first step of the
+        // full shutdown, and the order between it and the engine teardown is a
+        // correctness property, so both live in one hook rather than in the
+        // sequence of two calls on this page (`lifecycle::install_shutdown`).
         #[cfg(unix)]
-        ipc::install(&stores, cx);
+        let close_door = {
+            let socket = ipc::bind(&stores);
+            move || {
+                if let Some(socket) = &socket {
+                    socket.close();
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let close_door = || {};
+
+        // The *full* shutdown drains the engines — and on macOS this hook
+        // is the only thing that delivers it. ⌘Q no longer reaches it (it
+        // retires the app instead, keeping the engines up, which is the
+        // point); the status menu's Quit and a windowless SIGTERM do. See
+        // `lifecycle::install_shutdown`.
+        lifecycle::install_shutdown(&stores, bus_bridge, close_door, cx);
 
         // Order matters: `cx.set_menus` snapshots the keymap when it builds
         // NSMenuItems and attaches each item's `keyEquivalent` from

@@ -254,7 +254,7 @@ pub fn window_will_open(cx: &mut App) {
 /// ⌘Q. Either park the app behind its status item, or end it.
 ///
 /// **Retiring must not run the quit path at all** — no `cx.quit()`, so
-/// `on_app_quit` never fires and `lifecycle::install_engine_shutdown` never
+/// `on_app_quit` never fires and `lifecycle::install_shutdown` never
 /// drains the engines. Keeping them loaded is the entire point of the
 /// background state; the bus bridge and the stores keep running with them, so
 /// the status menu's engine lines stay live while the app has no face.
