@@ -212,6 +212,10 @@ pub struct ChatMessageView {
     /// is the affordance lying about what it does, so the fact travels from
     /// where the action type is known and the gutter reads it.
     pub regenerable: bool,
+    /// This generation stopped at the model's completion ceiling — the durable
+    /// half of the cut-off mark, carried from the post's own row so a space
+    /// that was closed and reopened still says it.
+    pub truncated: bool,
 }
 
 impl ChatMessageView {
@@ -237,6 +241,8 @@ impl ChatMessageView {
             reasoning_expanded: false,
             // A synthetic row has no persisted action to regenerate.
             regenerable: false,
+            // …and no persisted row that could have recorded a ceiling.
+            truncated: false,
         }
     }
 
@@ -305,6 +311,7 @@ impl ChatMessageView {
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
             reasoning_expanded: false,
             regenerable,
+            truncated: node.truncated,
         }
     }
 }

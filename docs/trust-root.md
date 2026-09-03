@@ -48,7 +48,7 @@ Each document's shape is owned by the Rust `serde` types shared between the rele
 | `artifact-manifest.json` | format owned by `scripts/artifact-manifest.sh` | Emitted at `schema_version: 2`, accepted at `2` or `3` (`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`; schema 3 adds the macOS unsigned shipping zip and the Debian packages as `file` rows and renames the Nix Linux row, all accepted before they are emitted). Records OCI `digest`s (the archive identity of each image), Nix desktop `narHash` (store-path checkpoint) plus `archiveSha256` (flake-built `.tar.gz` of the payload), and a denormalized copy of the enclave block. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). Apple envelope / installable hashes never appear here — they live in the human attestation, and `scripts/check-manifest-determinism.sh` makes that structural. Vocabulary: [verification.md](verification.md). |
 | `releases/trust/server-enclave.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs` | `schema_version: 1`. Holds just the enclave block (snp/tdx measurement + cmdline) so the cli build doesn't drag its own digest into its build context. |
 | `release.json` | `eidola_attestation::ReleaseIndex` — `crates/eidola-attestation/src/trust_shapes.rs` | Unsigned URL-only index; cross-checked via referenced documents (see caveat below). Emitted at `schema_version: 1`, accepted at `1` or `2`; schema 2 adds the artifact index the installer downloads from, still URLs only — an unsigned document may say where bytes are, never what they must hash to |
-| `attestation.json` | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via `cosign sign-blob` (local PEM, PKCS#11 URI, or any KMS URI cosign supports), logged to Rekor as a `hashedrekord` v0.0.1 entry with a PKIX SubjectPublicKeyInfo (ECDSA-P256/P384 or Ed25519) in `signature.publicKey.content` |
+| `attestation.json` | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via `cosign sign-blob` (local PEM, PKCS#11 URI, or any KMS URI cosign supports), logged to Rekor as a `hashedrekord` v0.0.1 entry with a PKIX SubjectPublicKeyInfo (ECDSA-P256/P384 or Ed25519) in `signature.publicKey.content`. Emitted at `schema_version: 1`, accepted at `1` or `2`; schema 2 adds the macOS signing block — `apple_shipped_artifact_sha256`, `apple_signature_bundle_sha256`, `apple_team_id`, `apple_signing_identifier` — which is where every key-dependent value about a release lives |
 | `trust-constants.json` | `eidola_attestation::TrustConstants` — `crates/eidola-attestation/src/trust_shapes.rs` | Pinned trust values baked into the verifier at build time |
 | Templates | `releases/schema/attestation-templates.json` (data, not a schema) | Pinned claim templates the verifier re-renders during equality checks |
 
@@ -79,6 +79,24 @@ The engineer side uses `cosign sign-blob` with a hardware-held key because:
 - The verifier shares the bulk of its code path with the CI side: both parse the same `hashedrekord` body shape and the same Sigstore Bundle v0.3 wrapper; only the trust-pinning step differs (fingerprint for human, Fulcio chain + OIDC identity for CI).
 
 Both paths ride the same Sigstore Rekor transparency log via the same entry kind (`hashedrekord` v0.0.1). On the CI side the public key in the body is a Fulcio leaf certificate; on the human side it's a PKIX SubjectPublicKeyInfo (the attestant's own key). The verifier shares its body parsing, Rekor SET signature verification, and Merkle inclusion-proof verification between the two paths — see [`crates/eidola-app-core/src/updater/rekor_verify.rs`](../crates/eidola-app-core/src/updater/rekor_verify.rs).
+
+## Which layer carries which fact
+
+A macOS release publishes three objects, and only two of them are a function of source. Where each hash lives is therefore not a filing decision — it is what keeps `artifact-manifest.json` reproducible by anyone, with no key in sight:
+
+| Layer | Carries | Determinism | Written by | Verified by |
+| --- | --- | --- | --- | --- |
+| `artifact-manifest.json` | `narHash` of the unsigned payload, `archiveSha256` of its archive, the `sha256` of the unsigned macOS container, OCI digests, the enclave block | fully deterministic — no key-dependent value may enter it | `scripts/artifact-manifest.sh` | CI's Sigstore bundle; `release-tool verify`'s byte-equality; `scripts/check-manifest-determinism.sh` |
+| `attestation-<id>.json` | `apple_signature_bundle_sha256`, `apple_shipped_artifact_sha256`, `apple_team_id`, `apple_signing_identifier`, and the `apple_signature_reconstructs` claim binding them | inherently non-deterministic — a signature is a function of a key | `release-tool attest`, which reconstructs and compares before offering the claim | `updater::human_attestation` |
+| `release.json` | URLs for both Apple objects | unsigned index | `release-tool attest` | cross-checked via the signed documents it points at |
+
+The chain a verifier walks, each layer doing what it is good at:
+
+1. `nix build` reproduces the unsigned payload; its hashes match the manifest. Deterministic, any platform, no keys.
+2. Verify the attestation against the pinned attestant fingerprint. It names the detached material's hash and the shipped artifact's hash.
+3. Apply the detached material to the unsigned build (`just verify-apple`, or the updater's own install path) and confirm the result is the shipped artifact, reporting the Team ID and identifier the attestation named.
+
+What `artifact-manifest.json` must therefore **never** contain: any hash of the signed artifact or the detached material, the Team ID, the signing identifier, an entitlements hash, or a notarization ticket. That is enforced structurally rather than by convention — `scripts/check-manifest-determinism.sh` refuses key-dependent material and asserts, on the workflow graph itself, that no signing job can feed the manifest.
 
 ## Unsigned `release.json` — known caveat, with mitigation
 

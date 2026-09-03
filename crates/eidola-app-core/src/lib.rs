@@ -1402,6 +1402,10 @@ pub struct PostNode {
     pub is_current: bool,
     pub model: Option<String>,
     pub credits_consumed: Option<i64>,
+    /// This generation stopped at the model's completion ceiling rather than
+    /// because it was done — the durable fact a render marks the post with.
+    /// Never true for a post that was not inferred.
+    pub truncated: bool,
     /// Edge relation to the structural parent (`reply`); `None` for a root.
     pub relation: Option<String>,
     /// Indent level: `0` is the spine; `> 0` is an indented branch.
@@ -1455,6 +1459,15 @@ pub fn quote_snippet(block_text: &str, range_start: i64, range_end: i64) -> Opti
 pub struct ModelInfo {
     pub id: String,
     pub context_length: u64,
+    /// The largest completion the backend says this model may be asked for.
+    /// `None` when nothing was declared — see [`ModelCapabilities`] for why
+    /// that is never read as a zero.
+    pub max_output_tokens: Option<u64>,
+    /// Which public output-budget ladder the model draws from, if the backend
+    /// names one.
+    pub output_budget_class: Option<OutputBudgetClass>,
+    /// What the backend declares this model can do.
+    pub capabilities: ModelCapabilities,
     /// Credits charged per prompt token. Credits are micro-USD-denominated,
     /// so this is numerically the same as USD per million prompt tokens.
     /// Zero for per-request-priced models.
@@ -1465,6 +1478,81 @@ pub struct ModelInfo {
     /// Flat per-request price for models that charge per request rather
     /// than per token (e.g. transcription); `None` for token-priced models.
     pub request_credits: Option<f64>,
+}
+
+/// What a backend declares a model can do.
+///
+/// **Every field is three-state, and absence is never `false`.** Most backends
+/// this client talks to declare nothing at all and structurally cannot: a
+/// local model is an arbitrary `.gguf` a person supplied, whose tool support
+/// is a property of the chat template inside that file, and a generic
+/// OpenAI-compatible listing publishes only ids. Undeclared is therefore the
+/// *common* case rather than an edge, and reading it as "no" would take tools
+/// away from every model on every such backend at once — a metadata rollout
+/// that looks exactly like a fleet-wide outage. `unwrap_or(false)` on any of
+/// these is a bug, not a shortcut.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    /// Whether the model accepts a `tools` request field.
+    pub tool_calling: Option<bool>,
+    /// Whether the model produces reasoning content before its answer.
+    pub reasoning: Option<bool>,
+    /// The content kinds the model accepts.
+    pub input_modalities: Option<Vec<Modality>>,
+    /// The content kinds the model produces.
+    pub output_modalities: Option<Vec<Modality>>,
+}
+
+/// A kind of content a model accepts or produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Modality {
+    Text,
+    Image,
+    Audio,
+    /// A modality this build does not know. Kept rather than refused: the
+    /// model list is parsed on every turn, so a backend that grows a new
+    /// modality name must not be able to fail the parse and with it every
+    /// conversation on the machine.
+    Unknown,
+}
+
+impl Modality {
+    fn from_wire(name: &str) -> Self {
+        match name {
+            "text" => Modality::Text,
+            "image" => Modality::Image,
+            "audio" => Modality::Audio,
+            _ => Modality::Unknown,
+        }
+    }
+}
+
+/// Which public output-budget ladder a model draws from.
+///
+/// A *class* rather than a number, and public per model rather than chosen per
+/// person: what a request asks for must be a function of the model and the
+/// turn's own structure, never of anything this installation happens to know
+/// about its user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputBudgetClass {
+    /// A model that answers directly.
+    Standard,
+    /// A model that thinks before it answers, and so needs a materially
+    /// larger budget to produce the same answer.
+    Reasoning,
+}
+
+impl OutputBudgetClass {
+    /// A class name this build does not know reads as *undeclared*, which is
+    /// the same thing the field's absence means — a consumer falls back to
+    /// whatever default it already applies either way.
+    fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "standard" => Some(OutputBudgetClass::Standard),
+            "reasoning" => Some(OutputBudgetClass::Reasoning),
+            _ => None,
+        }
+    }
 }
 
 /// One credential row with its lifecycle state, as computed by the local
@@ -1656,6 +1744,63 @@ impl ToolEndpoint {
             backend_id: backend_id.to_string(),
             wire_model: wire_model.to_string(),
         }
+    }
+}
+
+/// On whose authority this turn decides whether its endpoint can carry a
+/// `tools` field.
+///
+/// **Declaration where a declaration can exist; discovery where it cannot.**
+/// The two are not alternatives to pick between — they cover disjoint ground:
+///
+/// * A backend that publishes per-model capabilities, reached at the trust
+///   root this binary was built with, has already answered the question. Its
+///   answer is [`ToolPolicy::Declared`], and it is believed in both
+///   directions: a declared *no* withholds the field without paying for a
+///   round that can only fail, and a declared *yes* means a failure is a
+///   failure.
+/// * Everywhere else there is no fact in this build to consult, and not for
+///   want of effort. A local model is an arbitrary `.gguf` a person supplied,
+///   and whether it does tools is a property of the chat template inside that
+///   file — "llama.cpp supports tools" is false as a blanket claim, since it
+///   answers 500 without `--jinja` and, with it, still 500s on templates whose
+///   filters it lacks. A generic OpenAI-compatible endpoint publishes only
+///   ids. Those are [`ToolPolicy::Learned`]: offer, and remember a rejection.
+///
+/// The line is drawn by **provenance, not by backend kind**. An eidola backend
+/// reached through a base-URL or measurement override is not the catalog this
+/// binary pinned — it may be a development stack mid-iteration, or someone
+/// else's server whose catalog we cannot vouch for — so its declaration is
+/// only a hint and the learned path stays armed, exactly as it is today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolPolicy {
+    /// The pinned backend declares the answer.
+    Declared(bool),
+    /// Nothing authoritative to consult: offer, and learn from a rejection.
+    Learned,
+}
+
+impl ToolPolicy {
+    /// The policy for an endpoint whose declaration this client may act on:
+    /// a stated capability is [`ToolPolicy::Declared`]; a silent one falls
+    /// back to discovery, which is the safe floor rather than a "no".
+    fn from_declaration(declared: Option<bool>) -> Self {
+        match declared {
+            Some(supported) => ToolPolicy::Declared(supported),
+            None => ToolPolicy::Learned,
+        }
+    }
+
+    /// May a round-1 failure be retried with the turn's own tools withdrawn?
+    ///
+    /// Only where the answer was never declared. A declared-capable model
+    /// answers the question the probe existed to ask, so a 500 from one is a
+    /// genuine failure and must surface as one — treating it as a capability
+    /// verdict is how a transient upstream error silently costs a model its
+    /// tools for the rest of the process, after charging twice for the
+    /// privilege.
+    fn probes_on_failure(self) -> bool {
+        matches!(self, ToolPolicy::Learned)
     }
 }
 
@@ -1858,6 +2003,19 @@ struct Inner {
     /// builds contain no bypass path at all.
     #[cfg(feature = "test-support")]
     http_override: Option<reqwest::Client>,
+    /// **Test-only seam.** Makes the eidola backend's declarations count as
+    /// authoritative even though the harness reaches it through a base-URL
+    /// override.
+    ///
+    /// The compiled-in pin is an `https://` origin with a fixed enclave
+    /// measurement, which no in-process mock can be reached at — so without
+    /// this the declared-capability half of [`ToolPolicy`] would be
+    /// unreachable from any test, and only the override half could be
+    /// exercised. Same shape and same justification as `http_override`: it
+    /// exists only under the non-default `test-support` feature, so a release
+    /// build contains no path that widens what counts as our own catalog.
+    #[cfg(feature = "test-support")]
+    trust_declared_capabilities: std::sync::atomic::AtomicBool,
     /// The process-lifetime exclusive advisory lock on the local database
     /// (`<data_dir>/eidola.db.lock`). Taken in [`AppCore::build`] — a second
     /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
@@ -2286,6 +2444,31 @@ impl Inner {
             return Ok(client.clone());
         }
         local_models::plain_http_client()
+    }
+
+    /// Is what this eidola connection says about its models a fact this
+    /// client may act on, or merely a hint?
+    ///
+    /// **Provenance, not backend kind.** A declaration is authoritative when —
+    /// and only when — the client is talking to the trust root it was built
+    /// with: no base-URL override, no measurement override. Anything reached
+    /// through an override is, for capability purposes, an unknown external
+    /// endpoint. It may be a development stack being iterated on, or another
+    /// operator's server whose catalog is theirs and not ours; either way a
+    /// wrong `true` there would suppress the fallback that recovers from it
+    /// and turn every branched turn into an unrecoverable failure.
+    ///
+    /// Both predicates are already computed on the path a turn takes, so the
+    /// rule costs no new state.
+    fn declarations_are_authoritative(&self, eidola: &EidolaResolved) -> bool {
+        #[cfg(feature = "test-support")]
+        if self
+            .trust_declared_capabilities
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        !eidola.base_url_is_override && !eidola.measurements_are_override
     }
 }
 
@@ -3189,8 +3372,10 @@ impl Inner {
             .data
             .into_iter()
             .map(|m| ModelInfo {
-                id: m.id,
                 context_length: m.context_length,
+                max_output_tokens: m.max_output_tokens,
+                output_budget_class: m.declared_budget_class(),
+                capabilities: m.declared_capabilities(),
                 prompt_credits_per_token: m.pricing.per_prompt_token.credits_per_unit(),
                 completion_credits_per_token: m.pricing.per_completion_token.credits_per_unit(),
                 request_credits: m
@@ -3198,6 +3383,7 @@ impl Inner {
                     .per_request
                     .as_ref()
                     .map(ScaledPriceInfo::credits_per_unit),
+                id: m.id,
             })
             .collect())
     }
@@ -5775,44 +5961,6 @@ impl Inner {
         };
         let model = canonical_model.as_str();
 
-        // Whether this turn's endpoint can be offered a `tools` field at all.
-        //
-        // **Capability is *learned*, never assumed from the backend's kind.**
-        // Nothing about a kind establishes tool-calling support, and this is
-        // not hypothetical: llama.cpp returns HTTP 500 `tools param requires
-        // --jinja flag` without `--jinja`, and *with* `--jinja` still 500s with
-        // a template-render crash when the model's tool block uses Jinja
-        // filters it lacks (a mainstream case — Qwen3 Coder does exactly
-        // this). A generic OpenAI-compatible endpoint may reject the field
-        // outright, and a deployed enclave older than the server's tool wire
-        // types refuses it as an unknown member. Since this turn attaches tools
-        // *automatically* the moment a space branches, assuming capability
-        // would mean "branching your conversation breaks every turn on this
-        // model", with no opt-out and triggered by a core UX action. So an
-        // endpoint that has rejected a `tools` field this process is remembered
-        // and simply not offered them again (the turn that discovered it
-        // degraded and carried on — see the round loop).
-        //
-        // **The memo is per (backend, wire model)**, because one backend serves
-        // many models: eidola's catalog and a llama.cpp install both do. A
-        // single tool-incapable model must cost only itself its tools, not
-        // every sibling on the same host.
-        //
-        // Deliberately in-process and not persisted: it is an *observation*,
-        // not configuration. No column, no setting to get wrong, nothing to
-        // migrate, and an endpoint that gains tool support (a rebuilt engine, a
-        // redeployed enclave, an upgraded proxy) is re-probed on the next
-        // restart rather than being written off forever. The real per-model
-        // capability metadata stays genuinely deferred.
-        //
-        // Note this gates only the tools *this turn attaches*. A consumer's own
-        // `AppCore::register_tool` registrations are untouched — that surface's
-        // wire compatibility is the consumer's call, exactly as task 20 left it.
-        // The **map** rides the messages array and is never gated by any of
-        // this, so a branched space keeps its whole structural view even where
-        // the descend-further affordance is withdrawn.
-        let backend_accepts_tools = !self.model_rejects_tools(&backend.id, &wire_model);
-
         let mut engine_lease: Option<local_models::EngineLease> = None;
         let (
             provider_id,
@@ -5822,6 +5970,7 @@ impl Inner {
             context_length,
             remote_pricing,
             external_auth,
+            tool_policy,
         ) = match backend_kind {
             BackendKind::Local | BackendKind::LlamaCpp => {
                 // A request *is* the load trigger: an unloaded engine is
@@ -5872,6 +6021,7 @@ impl Inner {
                     context_tokens as u64,
                     None,
                     None,
+                    ToolPolicy::Learned,
                 )
             }
             BackendKind::OpenAi => {
@@ -5887,7 +6037,16 @@ impl Inner {
                 let auth = backend.api_key.as_ref().map(|k| format!("Bearer {k}"));
                 // Context length is unknown for a generic server — 0
                 // resolves to the 4096 completion default below.
-                (provider_id, client, base_url, None, 0u64, None, auth)
+                (
+                    provider_id,
+                    client,
+                    base_url,
+                    None,
+                    0u64,
+                    None,
+                    auth,
+                    ToolPolicy::Learned,
+                )
             }
             BackendKind::Eidola => {
                 // The eidola row was already fetched by `require_backend`
@@ -5925,6 +6084,18 @@ impl Inner {
                     model_entry.pricing.per_completion_token.value as u128,
                     model_entry.pricing.per_prompt_token.scale_factor as u128,
                 );
+                // Whose catalog is this? Declarations are acted on only when
+                // the client is talking to the trust root it was built with:
+                // an overridden base URL or measurement set means some other
+                // server, whose catalog this binary cannot vouch for, and
+                // there the declaration is a hint and discovery stays armed.
+                // The two predicates are already computed on the path this
+                // turn took, so the rule costs nothing.
+                let tool_policy = if self.declarations_are_authoritative(&eidola) {
+                    ToolPolicy::from_declaration(model_entry.declared_capabilities().tool_calling)
+                } else {
+                    ToolPolicy::Learned
+                };
                 (
                     provider_id,
                     client,
@@ -5933,8 +6104,42 @@ impl Inner {
                     model_entry.context_length,
                     Some(pricing),
                     None,
+                    tool_policy,
                 )
             }
+        };
+
+        // Whether this turn's endpoint can be offered a `tools` field at all.
+        //
+        // Two mechanisms, over disjoint ground — see [`ToolPolicy`] for why a
+        // declaration cannot exist for a local `.gguf` and why discovery must
+        // therefore survive. A declared answer is believed; an undeclared one
+        // falls back to the memo of endpoints that have rejected a
+        // `tools`-bearing request during this process's lifetime.
+        //
+        // **The memo is per (backend, wire model)**, because one backend serves
+        // many models: eidola's catalog and a llama.cpp install both do. A
+        // single tool-incapable model must cost only itself its tools, not
+        // every sibling on the same host.
+        //
+        // Deliberately in-process and not persisted: it is an *observation*,
+        // not configuration. No column, no setting to get wrong, nothing to
+        // migrate, and an endpoint that gains tool support (a rebuilt engine,
+        // an upgraded proxy) is re-probed on the next restart rather than
+        // being written off forever. Persisting it would also make the shape
+        // of a request a function of *this device's history*, so a fresh
+        // install and a long-lived one would send structurally different
+        // requests for the same model.
+        //
+        // Note this gates only the tools *this turn attaches*. A consumer's own
+        // `AppCore::register_tool` registrations are untouched — that surface's
+        // wire compatibility is the consumer's call, exactly as task 20 left it.
+        // The **map** rides the messages array and is never gated by any of
+        // this, so a branched space keeps its whole structural view even where
+        // the descend-further affordance is withdrawn.
+        let backend_accepts_tools = match tool_policy {
+            ToolPolicy::Declared(supported) => supported,
+            ToolPolicy::Learned => !self.model_rejects_tools(&backend.id, &wire_model),
         };
 
         let max_completion_tokens = if context_length == 0 {
@@ -6622,6 +6827,7 @@ impl Inner {
             tool_schemas,
             consumer_tools,
             auto_tools,
+            tool_policy,
             remote_pricing,
             budget,
             charge_credits,
@@ -6889,8 +7095,18 @@ impl Inner {
     /// on 4xx alone would miss the common case; the cost of guessing wrong is
     /// one extra request, and `remember_tool_incapable` is not reached unless
     /// the retry actually succeeds.
+    ///
+    /// **Learned policies only.** Where the endpoint declared its answer the
+    /// probe has nothing left to discover, and running it anyway is actively
+    /// wrong: a transient upstream 500 on round 1 gets read as "this model
+    /// rejects `tools`", and if the toolless retry then succeeds the model
+    /// silently loses its tools for the rest of the process — having been
+    /// charged for both attempts. See [`ToolPolicy`].
     fn should_degrade_tools(&self, prep: &TurnPrep, round: usize, err: &AppError) -> bool {
-        round == 1 && prep.auto_tools && matches!(err, AppError::Server { .. })
+        round == 1
+            && prep.auto_tools
+            && prep.tool_policy.probes_on_failure()
+            && matches!(err, AppError::Server { .. })
     }
 
     /// `Reply` → a new child item replying to the target; `Revise` → a new
@@ -7294,6 +7510,16 @@ impl Inner {
             }
         }
 
+        // The turn's ceiling verdict, read once. Reaching here means tool
+        // assembly is behind us — a round that requested tools returned above —
+        // so this is the point where the ceiling, the content and the absence
+        // of tool calls are all known and the ending can be classified. The one
+        // value answers both readers: it is written onto the `inference` row
+        // (so a reopened space still shows the mark) and returned on
+        // `ChatResult` (so the window marking the live turn cannot disagree
+        // with the row it will reload).
+        let truncated = stopped_at_ceiling(finish_reason.as_deref());
+
         if status.is_success()
             && truncated_before_any_answer(finish_reason.as_deref(), &response_content)
         {
@@ -7321,6 +7547,7 @@ impl Inner {
                 } else {
                     "error"
                 },
+                truncated,
                 input_tokens,
                 output_tokens,
                 &response_reasoning,
@@ -7346,7 +7573,7 @@ impl Inner {
                 credits_charged: prep.total_credits as i64,
                 response_action_id: None,
                 declined: None,
-                truncated: stopped_at_ceiling(finish_reason.as_deref()),
+                truncated,
             }));
         }
 
@@ -7389,7 +7616,7 @@ impl Inner {
             credits_charged: prep.total_credits as i64,
             response_action_id,
             declined: None,
-            truncated: stopped_at_ceiling(finish_reason.as_deref()),
+            truncated,
         }))
     }
 
@@ -7942,12 +8169,14 @@ impl Inner {
         // one.** `Revise` supersedes an intact answer with what it writes, so
         // keeping transport-cut text there destroys a real answer and puts a
         // severed one in its place. An ordinary turn could in principle keep
-        // the text behind a marker — but the only marker available is
-        // session-scoped by construction (`ChatResult::truncated`), so a
-        // reopened window would show severed text with nothing saying so,
-        // which is exactly the lie `ResponseTruncated` exists to make
-        // unrepresentable. Two rules would also mean the classification
-        // depended on who asked rather than on what happened.
+        // the text behind a marker, and one is now durable (`action.truncated`)
+        // — but it is not this ending's to set. That flag records the
+        // *upstream's own* ceiling verdict, and a connection that died issued
+        // no verdict at all; writing it here would say "the model reached its
+        // length limit" about a dropped socket, which is a different lie told
+        // in the same place `ResponseTruncated` exists to keep empty. Two rules
+        // would also mean the classification depended on who asked rather than
+        // on what happened.
         //
         // Reported as `Network` because that is what it is, which also puts it
         // in `DelegationFailure::Upstream` for a delegated room and leaves it
@@ -8039,6 +8268,16 @@ impl Inner {
         }
 
         // --- the final round ---------------------------------------------
+        // The turn's ceiling verdict, read once. Reaching here means tool
+        // assembly is behind us — a round that requested tools returned above —
+        // so this is the point where the ceiling, the content and the absence
+        // of tool calls are all known and the ending can be classified. The one
+        // value answers both readers: it is written onto the `inference` row
+        // (so a reopened space still shows the mark) and returned on
+        // `ChatResult` (so the window marking the live turn cannot disagree
+        // with the row it will reload).
+        let truncated = stopped_at_ceiling(finish_reason.as_deref());
+
         if truncated_before_any_answer(finish_reason.as_deref(), &full_content) {
             return self
                 .end_round_truncated(
@@ -8060,6 +8299,7 @@ impl Inner {
         let response_action_id = prep
             .persist_turn(
                 "complete",
+                truncated,
                 input_tokens,
                 output_tokens,
                 &full_reasoning,
@@ -8082,7 +8322,7 @@ impl Inner {
                 credits_charged: prep.total_credits as i64,
                 response_action_id: None,
                 declined: None,
-                truncated: stopped_at_ceiling(finish_reason.as_deref()),
+                truncated,
             }));
         }
 
@@ -8104,7 +8344,7 @@ impl Inner {
             credits_charged: prep.total_credits as i64,
             response_action_id,
             declined: None,
-            truncated: stopped_at_ceiling(finish_reason.as_deref()),
+            truncated,
         }))
     }
 
@@ -8892,6 +9132,24 @@ impl AppCore {
         Self::build(config_dir, data_dir, Some(client))
     }
 
+    /// **Test-only seam.** Treat the eidola backend as though it were reached
+    /// at this build's compiled-in pin, so its published capabilities count as
+    /// a declaration rather than a hint.
+    ///
+    /// A test necessarily points the client at a mock over a base-URL
+    /// override, and an override is exactly what makes a declaration
+    /// untrustworthy in production. Without this seam the declared half of the
+    /// precedence rule could never be exercised end to end. Feature-gated like
+    /// the attestation bypass beside it, for the same reason: a release build
+    /// must contain no way to widen what counts as our own catalog.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn trust_declared_capabilities_for_test(&self, trusted: bool) {
+        self.inner
+            .trust_declared_capabilities
+            .store(trusted, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn build(
         config_dir: PathBuf,
         data_dir: PathBuf,
@@ -8962,6 +9220,8 @@ impl AppCore {
                 tool_incapable_models: std::sync::RwLock::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 http_override,
+                #[cfg(feature = "test-support")]
+                trust_declared_capabilities: std::sync::atomic::AtomicBool::new(false),
                 _db_lock: db_lock,
             }),
         })
@@ -11472,11 +11732,72 @@ struct ModelsResponseInfo {
     data: Vec<ModelListEntry>,
 }
 
+/// One row of `GET /v1/models`, parsed **leniently on purpose**.
+///
+/// Every field beyond the three the client cannot work without carries
+/// `#[serde(default)]`, and the capability leaves are optional all the way
+/// down. The list is fetched on every eidola-backed turn and one unreadable
+/// row fails the whole response, so a server that adds a modality name, omits
+/// a leaf, or ships a capability object this build has never heard of must
+/// degrade to "undeclared" rather than take every conversation down with it.
 #[derive(Deserialize)]
 struct ModelListEntry {
     id: String,
     context_length: u64,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    output_budget_class: Option<String>,
+    #[serde(default)]
+    capabilities: Option<ModelCapabilitiesInfo>,
     pricing: ModelPricingInfo,
+}
+
+#[derive(Deserialize, Default)]
+struct ModelCapabilitiesInfo {
+    #[serde(default)]
+    tool_calling: Option<CapabilityInfo>,
+    #[serde(default)]
+    reasoning: Option<CapabilityInfo>,
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    output_modalities: Option<Vec<String>>,
+}
+
+/// A capability leaf. An object rather than a bare boolean so the wire can
+/// grow a sibling key without a deployed client having to change type.
+#[derive(Deserialize)]
+struct CapabilityInfo {
+    #[serde(default)]
+    supported: Option<bool>,
+}
+
+impl ModelListEntry {
+    /// The declaration this row carries, in the client's three-state shape.
+    fn declared_capabilities(&self) -> ModelCapabilities {
+        let Some(caps) = &self.capabilities else {
+            return ModelCapabilities::default();
+        };
+        ModelCapabilities {
+            tool_calling: caps.tool_calling.as_ref().and_then(|c| c.supported),
+            reasoning: caps.reasoning.as_ref().and_then(|c| c.supported),
+            input_modalities: caps
+                .input_modalities
+                .as_ref()
+                .map(|m| m.iter().map(|s| Modality::from_wire(s)).collect()),
+            output_modalities: caps
+                .output_modalities
+                .as_ref()
+                .map(|m| m.iter().map(|s| Modality::from_wire(s)).collect()),
+        }
+    }
+
+    fn declared_budget_class(&self) -> Option<OutputBudgetClass> {
+        self.output_budget_class
+            .as_deref()
+            .and_then(OutputBudgetClass::from_wire)
+    }
 }
 
 // ============================================================================
@@ -11586,6 +11907,10 @@ struct TurnPrep {
     /// an explicit opt-in whose wire compatibility is the consumer's call, so
     /// they are never silently dropped.
     auto_tools: bool,
+    /// On whose authority this turn decided its endpoint could carry a
+    /// `tools` field. Read by [`Inner::should_degrade_tools`]: only a policy
+    /// that was never declared may be probed.
+    tool_policy: ToolPolicy,
     /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
     /// for every non-spend backend. Kept so a later round can re-estimate.
     remote_pricing: Option<(u128, u128, u128)>,
@@ -11895,6 +12220,7 @@ impl TurnPrep {
                 // This round's own hold — each round is a separate priced
                 // request, so each round's action carries its own charge.
                 credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                truncated: false,
                 created_at: now_ms(),
             },
         )
@@ -12028,6 +12354,7 @@ impl TurnPrep {
                 output_tokens: None,
                 // Tools run locally — no inference was purchased.
                 credits_consumed: None,
+                truncated: false,
                 created_at: now_ms(),
             },
         )
@@ -12131,6 +12458,7 @@ impl TurnPrep {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at: now_ms(),
             },
         )
@@ -12202,6 +12530,7 @@ impl TurnPrep {
     async fn persist_turn(
         &mut self,
         action_status: &str,
+        truncated: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
@@ -12216,6 +12545,7 @@ impl TurnPrep {
         let persisted = self
             .persist_turn_body(
                 action_status,
+                truncated,
                 input_tokens,
                 output_tokens,
                 reasoning,
@@ -12280,6 +12610,7 @@ impl TurnPrep {
     async fn persist_turn_body(
         &mut self,
         action_status: &str,
+        truncated: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
@@ -12325,6 +12656,7 @@ impl TurnPrep {
                 output_tokens,
                 // Local turns record no charge (`None`), not a fake zero.
                 credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                truncated,
                 created_at: now_ms(),
             },
         )
@@ -14338,6 +14670,7 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
             is_current: true,
             model: row.model.clone(),
             credits_consumed: row.credits_consumed,
+            truncated: row.truncated,
             relation: reply_parent.get(&action_id).map(|_| "reply".to_string()),
             depth,
             is_branch,
@@ -15432,6 +15765,134 @@ async fn flush_attestations(
 mod tests {
     use super::*;
 
+    /// A model list from a server that publishes no capabilities at all — the
+    /// shape every generic backend sends, and the shape our own server sent
+    /// until it learned to declare. Every axis must come back **undeclared**,
+    /// and undeclared must not be `false`: reading it as `false` would take
+    /// tools away from every model on every such backend at once.
+    #[test]
+    fn a_silent_model_list_declares_nothing_rather_than_no() {
+        let entry: ModelListEntry = serde_json::from_value(serde_json::json!({
+            "id": "some-model",
+            "context_length": 8192,
+            "pricing": {
+                "per_prompt_token": { "value": 1, "scale_factor": 1 },
+                "per_completion_token": { "value": 1, "scale_factor": 1 }
+            }
+        }))
+        .expect("a list with no capability fields still parses");
+
+        assert_eq!(entry.max_output_tokens, None);
+        assert_eq!(entry.declared_budget_class(), None);
+        assert_eq!(entry.declared_capabilities(), ModelCapabilities::default());
+        assert_eq!(entry.declared_capabilities().tool_calling, None);
+    }
+
+    /// A declaration is read leaf by leaf, and the leaf is an object.
+    #[test]
+    fn a_declared_model_list_is_read_leaf_by_leaf() {
+        let entry: ModelListEntry = serde_json::from_value(serde_json::json!({
+            "id": "some-model",
+            "context_length": 8192,
+            "max_output_tokens": 16384,
+            "output_budget_class": "reasoning",
+            "capabilities": {
+                "tool_calling": { "supported": true },
+                "reasoning": { "supported": false },
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"]
+            },
+            "pricing": {
+                "per_prompt_token": { "value": 1, "scale_factor": 1 },
+                "per_completion_token": { "value": 1, "scale_factor": 1 }
+            }
+        }))
+        .expect("a declaring list parses");
+
+        assert_eq!(entry.max_output_tokens, Some(16_384));
+        assert_eq!(
+            entry.declared_budget_class(),
+            Some(OutputBudgetClass::Reasoning)
+        );
+        let caps = entry.declared_capabilities();
+        assert_eq!(caps.tool_calling, Some(true));
+        assert_eq!(caps.reasoning, Some(false));
+        assert_eq!(
+            caps.input_modalities,
+            Some(vec![Modality::Text, Modality::Image])
+        );
+        assert_eq!(caps.output_modalities, Some(vec![Modality::Text]));
+    }
+
+    /// **A newer server must not be able to break every conversation on this
+    /// machine.** The list is fetched on every eidola-backed turn and one
+    /// unreadable row fails the whole response, so a value this build has
+    /// never seen — a modality name, a budget class, a leaf with keys but no
+    /// `supported` — degrades to "undeclared" rather than to a parse error.
+    #[test]
+    fn a_newer_declaration_degrades_to_undeclared_rather_than_failing() {
+        let entry: ModelListEntry = serde_json::from_value(serde_json::json!({
+            "id": "some-model",
+            "context_length": 8192,
+            "output_budget_class": "extended-thinking",
+            "capabilities": {
+                "tool_calling": { "efforts": ["low", "high"] },
+                "input_modalities": ["text", "video"],
+                "web_search": { "supported": true }
+            },
+            "pricing": {
+                "per_prompt_token": { "value": 1, "scale_factor": 1 },
+                "per_completion_token": { "value": 1, "scale_factor": 1 }
+            }
+        }))
+        .expect("an unfamiliar declaration must still parse");
+
+        let caps = entry.declared_capabilities();
+        assert_eq!(
+            caps.tool_calling, None,
+            "a leaf with no `supported` is undeclared, not a `false`"
+        );
+        assert_eq!(caps.reasoning, None, "an absent leaf is undeclared");
+        assert_eq!(
+            caps.input_modalities,
+            Some(vec![Modality::Text, Modality::Unknown]),
+            "an unknown modality is kept as unknown rather than dropped"
+        );
+        assert_eq!(
+            entry.declared_budget_class(),
+            None,
+            "an unrecognized ladder reads as undeclared, like an absent one"
+        );
+    }
+
+    /// The precedence rule, stated as a table.
+    #[test]
+    fn a_declaration_decides_only_where_one_can_exist() {
+        assert_eq!(
+            ToolPolicy::from_declaration(Some(true)),
+            ToolPolicy::Declared(true)
+        );
+        assert_eq!(
+            ToolPolicy::from_declaration(Some(false)),
+            ToolPolicy::Declared(false)
+        );
+        assert_eq!(
+            ToolPolicy::from_declaration(None),
+            ToolPolicy::Learned,
+            "silence falls back to discovery — the safe floor, never a `false`"
+        );
+
+        assert!(
+            !ToolPolicy::Declared(true).probes_on_failure(),
+            "a declared-capable model's failure is a failure"
+        );
+        assert!(!ToolPolicy::Declared(false).probes_on_failure());
+        assert!(
+            ToolPolicy::Learned.probes_on_failure(),
+            "discovery is the only path that may pay for a probe"
+        );
+    }
+
     #[test]
     fn hex_round_trip() {
         let data = vec![0xde, 0xad, 0xbe, 0xef];
@@ -15793,6 +16254,7 @@ mod tests {
                 data: None,
             }],
             references: Vec::new(),
+            truncated: false,
             created_at: TEST_AT,
         }
     }
@@ -16243,6 +16705,7 @@ mod tests {
             model: None,
             credits_consumed: None,
             generation: 0,
+            truncated: false,
             created_at,
         }
     }

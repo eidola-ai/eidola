@@ -242,11 +242,36 @@ pub struct VerifiedAttestation {
     /// fetched (see `verify_release`) — the template `cross_checks` only
     /// bind prose values to `release.json`, which is unsigned.
     pub artifact_manifest_sha256: String,
+    /// What the attestant swore about the macOS signature material, when
+    /// the attestation's schema records it. `None` for a schema that
+    /// predates those fields.
+    pub apple: Option<AppleSignatureAttestation>,
     pub fingerprint_hex: String,
     pub rekor_log_index: u64,
     pub attested_at: String,
     pub attestant_statement: String,
     pub claims: Vec<VerifiedClaim>,
+}
+
+/// The key-dependent facts about a signed macOS release, as a named human
+/// recorded them.
+///
+/// These are the values [`install::InstallPlan`] needs and the manifest may
+/// never hold: the envelope's hash, the installable's hash, and the
+/// identity the reconstruction must claim once the envelope is applied.
+/// The manifest is a function of source; a signature is a function of a
+/// key, so this is the layer that can carry it — see `docs/trust-root.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppleSignatureAttestation {
+    /// Lowercase hex sha256 of the container a browser downloads.
+    pub shipped_artifact_sha256: String,
+    /// Lowercase hex sha256 of the published detached signature material.
+    pub signature_bundle_sha256: String,
+    /// `None` where the signature names no team — an ad-hoc signature has
+    /// no Developer ID behind it, and saying so is not the same as
+    /// omitting the fact.
+    pub team_id: Option<String>,
+    pub signing_identifier: String,
 }
 
 #[derive(Debug, Clone)]
