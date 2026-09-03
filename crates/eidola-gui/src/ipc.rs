@@ -55,9 +55,12 @@
 //! their own, and a task nobody holds would go on being served through the
 //! whole asynchronous shutdown grace — long enough for a preconnected peer to
 //! start a billed turn moments before the process ends. So the accepted
-//! connections are tracked and ended with the listener. Removing the file is
-//! the one part that is best-effort tidiness rather than correctness, since the
-//! next bind replaces whatever it finds.
+//! connections are tracked and ended with the listener — and the sweep latches
+//! the door shut rather than merely emptying the set, because an abort is only
+//! a request and an accept already in hand runs to its next await regardless
+//! (see [`Serving`]). Removing the file is the one part that is best-effort
+//! tidiness rather than correctness, since the next bind replaces whatever it
+//! finds.
 
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -114,7 +117,7 @@ pub fn admit(peer_uid: Option<u32>, our_uid: u32) -> Admission {
     }
 }
 
-/// The connections currently being served, so a shutdown can end them.
+/// The connections being served, and whether the door has closed.
 ///
 /// **A door that is closed has to stop admitting *and* stop serving.** Each
 /// accepted connection runs as its own task, and a task nobody holds outlives
@@ -123,10 +126,47 @@ pub fn admit(peer_uid: Option<u32>, our_uid: u32) -> Admission {
 /// process ends, for an answer it will never receive. Closing the socket is the
 /// app saying it is going away, so it says so to everyone already inside.
 ///
-/// A `std` mutex, held only across `spawn` / `try_join_next` / `abort_all` and
-/// never across an `await`, because [`ControlSocket::close`] runs on the quit
-/// path — off any runtime — and has to be able to take it.
-type Connections = Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>;
+/// **The flag and the set live under one lock because the race is between
+/// them.** Aborting the accept loop only *schedules* its cancellation: tokio
+/// takes a task off at an await point, and everything from `accept` returning
+/// to the next `accept` is straight-line code — so an accept already in hand
+/// runs on and reaches the insert. Sweeping the set and *then* having a
+/// connection put into it is a peer served by a door that has closed, with a
+/// billed turn one request away. Deciding both under the same lock makes that
+/// insertion unrepresentable: the accept either gets there first and is swept
+/// with everything else, or finds the door shut and is dropped.
+///
+/// A `std` mutex, since it is held only across the synchronous half of that
+/// decision and never across an `await` — [`ControlSocket::close`] runs on the
+/// quit path, off any runtime, and has to be able to take it.
+#[derive(Default)]
+struct Serving {
+    closed: bool,
+    connections: tokio::task::JoinSet<()>,
+}
+
+impl Serving {
+    /// Take on a connection to serve. `false` means the door closed under it and
+    /// the caller must drop the stream — nothing here will ever answer it.
+    fn admit(&mut self, serve: impl std::future::Future<Output = ()> + Send + 'static) -> bool {
+        if self.closed {
+            return false;
+        }
+        self.connections.spawn(serve);
+        // Reap the ones that have hung up, so the set tracks who is actually
+        // here rather than everyone who ever was. Never blocks the accept loop.
+        while self.connections.try_join_next().is_some() {}
+        true
+    }
+
+    /// Shut the door, and end everyone already through it.
+    fn shut(&mut self) {
+        self.closed = true;
+        self.connections.abort_all();
+    }
+}
+
+type Connections = Arc<std::sync::Mutex<Serving>>;
 
 /// A bound socket, held for as long as the process serves it.
 pub struct ControlSocket {
@@ -143,10 +183,14 @@ impl ControlSocket {
 
     /// Stop serving and remove the socket file.
     ///
-    /// Ends the accept loop, the connections it accepted, and the file — in
-    /// that order, so nothing can be admitted into the gap. **Only a full
-    /// shutdown gets here**: ⌘Q's retire never reaches the quit hook that calls
-    /// this, which is what keeps a retired app answering (see the module docs).
+    /// Ends the accept loop, the connections it accepted, and the file. **Only a
+    /// full shutdown gets here**: ⌘Q's retire never reaches the quit hook that
+    /// calls this, which is what keeps a retired app answering (see the module
+    /// docs).
+    ///
+    /// Aborting the listener is a request, not a fact — see [`Serving`] for why
+    /// the sweep also latches the door shut, and why an accept caught in the
+    /// same breath is dropped rather than served.
     ///
     /// Best-effort by design: a bind replaces whatever it finds, so a process
     /// that dies without getting here costs the next launch nothing. Ending a
@@ -158,7 +202,7 @@ impl ControlSocket {
         self.connections
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .abort_all();
+            .shut();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -299,20 +343,26 @@ async fn accept_loop(
         }
 
         let core = Arc::clone(&core);
-        let mut held = connections.lock().unwrap_or_else(|e| e.into_inner());
-        held.spawn(async move {
-            let (reader, writer) = stream.into_split();
-            eidola_app_core::ipc::serve_connection(
-                core,
-                env!("CARGO_PKG_VERSION").to_string(),
-                reader,
-                writer,
-            )
-            .await;
-        });
-        // Reap the ones that have hung up, so the set tracks who is actually
-        // here rather than everyone who ever was. Never blocks the accept loop.
-        while held.try_join_next().is_some() {}
+        let admitted = connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .admit(async move {
+                let (reader, writer) = stream.into_split();
+                eidola_app_core::ipc::serve_connection(
+                    core,
+                    env!("CARGO_PKG_VERSION").to_string(),
+                    reader,
+                    writer,
+                )
+                .await;
+            });
+        if !admitted {
+            // The socket closed with this connection in hand — dropping the
+            // future drops the stream, so the peer sees the same hang-up every
+            // other caller just got. Returning rather than looping: the door is
+            // shut, and the abort we are racing is on its way regardless.
+            return;
+        }
     }
 }
 
@@ -346,6 +396,29 @@ mod tests {
             admit(None, 501),
             Admission::Refuse(Refusal::UnknownPeer),
             "an unknowable peer must fail closed"
+        );
+    }
+
+    #[test]
+    fn a_connection_arriving_after_the_sweep_is_refused() {
+        // The interleaving this exists for cannot be scheduled from a test: the
+        // accept loop's whole body between two `accept` calls is straight-line
+        // code, so an abort landing inside it takes effect only afterwards and
+        // the insert happens regardless. What *is* testable is the decision
+        // that makes the outcome harmless either way — a set that has been
+        // swept refuses the connection instead of taking it on.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let _guard = runtime.enter();
+
+        let mut serving = Serving::default();
+        assert!(serving.admit(async {}), "an open door takes the connection");
+
+        serving.shut();
+        assert!(
+            !serving.admit(async {}),
+            "a connection accepted a moment before the close was served past it"
         );
     }
 
