@@ -24,6 +24,10 @@
 //! - **A request's terminal frame is always sent.** Every path through
 //!   [`answer`] ends in exactly one `end` or `err`, so a caller waiting on an
 //!   id is never left waiting on a request that quietly evaporated.
+//! - **No frame this module writes is one its own reader would refuse.** Every
+//!   terminal frame is measured and every chunk is split — see the ceilings in
+//!   [`crate::ipc`], and `chunk_lines` for why a chunk is split where a result
+//!   is refused.
 //! - **The connection ends the *answers*, not the work.** In-flight tasks are
 //!   aborted when the reader stops, because their only consumer is gone. That
 //!   stops frames being written; it does **not** stop a turn. See "What a lost
