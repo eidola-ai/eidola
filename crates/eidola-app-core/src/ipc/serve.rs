@@ -172,6 +172,21 @@ const WRITER_QUEUE_FRAMES: usize = 2;
 /// of them, each still holding its permit), the queue
 /// ([`WRITER_QUEUE_FRAMES`]), and the one the writer has in hand.
 ///
+/// **It counts frames, and it is true because no frame is ever built past the
+/// ceiling.** Encoding a payload and *then* measuring it would make this number
+/// a description of well-behaved callers rather than a bound: the allocation
+/// arrives before the verdict, so one oversized result costs its whole size and
+/// no arithmetic here could say how much that is. Every frame carrying a
+/// payload is encoded under the ceiling instead — the terminal frames through
+/// `encode_line_within`, a turn's chunks through `chunk_lines`, which decides
+/// the whole-frame case by arithmetic and yields the pieces one at a time.
+///
+/// **What sits outside it, and always did:** the verb's own result before it is
+/// a frame, and a delta's own text before it is chunks. Those are the answer
+/// itself, produced by the code that was asked for it, and bounding them means
+/// paginating the verbs rather than budgeting the wire. Each is one allocation
+/// per in-flight request, freed as soon as its frame is built.
+///
 /// **The honest residual:** this is the inherent cost of serving N concurrent
 /// requests that may each produce a ceiling-sized result, and the only levers
 /// on it are those two constants and [`MAX_RESPONSE_BYTES`] itself — which is

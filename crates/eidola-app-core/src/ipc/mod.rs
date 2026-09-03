@@ -838,10 +838,94 @@ pub enum RemoteError {
 // ---------------------------------------------------------------------------
 
 /// Encode one frame as its NDJSON line, newline included.
+///
+/// For frames of **fixed shape** — a request, a refusal this build spells as a
+/// constant. Anything carrying a payload whose size is not this module's to
+/// decide goes through [`encode_line_within`] instead, which will not allocate
+/// what it is about to refuse.
 pub fn encode_line<T: Serialize>(frame: &T) -> Vec<u8> {
     let mut buf = serde_json::to_vec(frame).unwrap_or_else(|_| b"{}".to_vec());
     buf.push(b'\n');
     buf
+}
+
+/// A sink that **counts everything and keeps only what it was told it could**.
+///
+/// Serializing a frame and then measuring the result is the obvious way to hold
+/// a payload to a ceiling and the wrong one: the measurement arrives after the
+/// allocation it was supposed to prevent, so a result far past the limit is
+/// materialized in full and then thrown away. A listing is the app's own
+/// rendering of the profile's own data, so "far past the limit" is a large
+/// profile rather than an attack — and it made the ceiling a statement about
+/// what is *written* rather than about what is *held*.
+///
+/// Counting past the cap is deliberate and costs nothing: the refusal names the
+/// size the result actually reached, which is the number that tells a caller
+/// what to do about it. What it never does is keep those bytes.
+struct Capped {
+    /// The line so far, never longer than `cap`.
+    buf: Vec<u8>,
+    /// The most `buf` may hold.
+    cap: usize,
+    /// Everything written, kept or not.
+    written: usize,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.written += data.len();
+        let room = self.cap - self.buf.len();
+        if room > 0 {
+            self.buf.extend_from_slice(&data[..room.min(data.len())]);
+        }
+        // Always the whole slice: the sink is a budget, not a failure, and
+        // erroring here would end the encoding before it could say how big the
+        // frame really was.
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What came of encoding a frame under a ceiling.
+enum Encoded {
+    /// It fits; here is the line.
+    Fits(Vec<u8>),
+    /// It does not, and this is how long the line would have been. The bytes
+    /// themselves were never kept.
+    TooLarge { bytes: usize },
+}
+
+/// Encode one frame as its NDJSON line, holding the buffer to `limit` bytes.
+///
+/// **The ceiling bounds the allocation, not just the verdict.** At most `limit`
+/// bytes are ever retained, whatever the frame's payload turns out to weigh —
+/// which is what lets [`crate::ipc::serve::MAX_RETAINED_RESPONSE_BYTES`] be a
+/// true statement about a connection rather than an aspiration about its
+/// well-behaved callers.
+fn encode_line_within<T: Serialize>(frame: &T, limit: usize) -> Encoded {
+    // The line carries its newline, so the JSON has one byte less to live in.
+    let mut sink = Capped {
+        buf: Vec::new(),
+        cap: limit.saturating_sub(1),
+        written: 0,
+    };
+    if serde_json::to_writer(&mut sink, frame).is_err() {
+        // Unreachable for what this module encodes — a `Response` over a
+        // `Value`, into a sink that cannot fail — and answered the same way
+        // `encode_line` answers it rather than by inventing a second rule.
+        return Encoded::Fits(encode_line(frame));
+    }
+    let bytes = sink.written + 1;
+    if bytes <= limit {
+        let mut buf = sink.buf;
+        buf.push(b'\n');
+        Encoded::Fits(buf)
+    } else {
+        Encoded::TooLarge { bytes }
+    }
 }
 
 /// Decode one request line.
@@ -876,14 +960,18 @@ pub fn decode_response(line: &[u8]) -> Result<Response, ProtocolError> {
 /// rather than refuses: a chunk is a piece of an answer, so replacing one with a
 /// refusal would truncate that answer and put a second terminal frame behind it.
 pub fn terminal_line(id: u64, verb: &str, data: serde_json::Value, limit: usize) -> Vec<u8> {
-    let line = encode_line(&Response {
-        v: PROTOCOL_VERSION,
-        id,
-        body: ResponseBody::End { data },
-    });
-    if line.len() <= limit {
-        return line;
-    }
+    let framed = encode_line_within(
+        &Response {
+            v: PROTOCOL_VERSION,
+            id,
+            body: ResponseBody::End { data },
+        },
+        limit,
+    );
+    let bytes = match framed {
+        Encoded::Fits(line) => return line,
+        Encoded::TooLarge { bytes } => bytes,
+    };
     // Encoded rather than measured, and that is the base case rather than an
     // omission: the substitute is of fixed shape over a verb name this build
     // spells as a constant, so it fits any ceiling worth having. Measuring it
@@ -892,7 +980,7 @@ pub fn terminal_line(id: u64, verb: &str, data: serde_json::Value, limit: usize)
         id,
         WireError::from_protocol(&ProtocolError::ResultTooLarge {
             verb: verb.to_string(),
-            bytes: line.len(),
+            bytes,
             limit,
         }),
     ))
@@ -917,20 +1005,16 @@ pub fn terminal_error_line(id: u64, error: WireError, limit: usize) -> Vec<u8> {
     // needed if the frame turns out not to fit — copying the whole error to
     // measure it would double the very allocation being judged.
     let kind = error.kind.clone();
-    let line = encode_line(&Response::err(id, error));
-    if line.len() <= limit {
-        return line;
-    }
+    let bytes = match encode_line_within(&Response::err(id, error), limit) {
+        Encoded::Fits(line) => return line,
+        Encoded::TooLarge { bytes } => bytes,
+    };
     // The base case, for the same reason `terminal_line`'s substitute is: the
     // variant name is a constant in every build of this enum, so the frame that
     // says the failure did not fit is one that always does.
     encode_line(&Response::err(
         id,
-        WireError::from_protocol(&ProtocolError::ErrorTooLarge {
-            kind,
-            bytes: line.len(),
-            limit,
-        }),
+        WireError::from_protocol(&ProtocolError::ErrorTooLarge { kind, bytes, limit }),
     ))
 }
 
@@ -971,25 +1055,56 @@ const JSON_ESCAPE_WORST_CASE: usize = 6;
 ///
 /// Pieces end on character boundaries, so every frame is a valid JSON string
 /// and a reader never sees half a character.
-pub fn chunk_lines(id: u64, event: &crate::ChatStreamEvent, limit: usize) -> Vec<Vec<u8>> {
-    let whole = chunk_line(id, event);
-    if whole.len() <= limit {
-        return vec![whole];
-    }
+///
+/// **Lazy, and for the same reason the fast path is arithmetic**: an
+/// unsplittably large delta would otherwise be held twice over — once as the
+/// event and once as every piece of it at once — before a single frame reached
+/// the outbox. Produced one at a time, the caller's awaited send is what paces
+/// them, so a delta of any size costs one frame of retention.
+pub fn chunk_lines(
+    id: u64,
+    event: &crate::ChatStreamEvent,
+    limit: usize,
+) -> impl Iterator<Item = Vec<u8>> + '_ {
     // Measured rather than counted: the scaffolding is the frame plus the
     // variant's own tag, and asking for it with an empty text is the one way
     // that cannot drift from what the encoder actually writes.
     let overhead = chunk_line(id, &with_text(event, "")).len();
-    let budget = limit.saturating_sub(overhead) / JSON_ESCAPE_WORST_CASE;
 
+    // **Decided by arithmetic, never by encoding a candidate.** Encoding the
+    // whole event to ask whether it fits allocates exactly what an oversized
+    // delta was not supposed to cost — and worse than the terminal frames do,
+    // because building the frame's `Value` copies the text before the encoder
+    // sees it. The worst case is what escaping can make of the text, so a
+    // delta that passes this certainly fits and one that fails it merely
+    // might. Splitting the maybes is the cheap side of the trade: pieces
+    // concatenate to exactly what one frame would have said, so the cost of
+    // over-splitting is some extra frames on text no backend sensibly emits,
+    // while the cost of guessing the other way is unbounded.
+    let fits = text_of(event)
+        .len()
+        .checked_mul(JSON_ESCAPE_WORST_CASE)
+        .and_then(|worst| worst.checked_add(overhead))
+        .is_some_and(|worst| worst <= limit);
+
+    let budget = limit.saturating_sub(overhead) / JSON_ESCAPE_WORST_CASE;
     let mut rest = text_of(event);
-    let mut lines = Vec::new();
-    while !rest.is_empty() {
+    let mut whole_sent = false;
+    std::iter::from_fn(move || {
+        if fits {
+            if whole_sent {
+                return None;
+            }
+            whole_sent = true;
+            return Some(chunk_line(id, event));
+        }
+        if rest.is_empty() {
+            return None;
+        }
         let (head, tail) = rest.split_at(prefix_within(rest, budget));
-        lines.push(chunk_line(id, &with_text(event, head)));
         rest = tail;
-    }
-    lines
+        Some(chunk_line(id, &with_text(event, head)))
+    })
 }
 
 /// One `chunk` frame's bytes, whatever its size.
@@ -1485,6 +1600,87 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_past_the_ceiling_is_never_allocated_to_find_that_out() {
+        // The mechanism, tested where it lives. Measuring a frame after
+        // encoding it answers the question too late to matter: the bytes the
+        // ceiling exists to refuse have already been allocated, so the ceiling
+        // describes what is written rather than what is held. The sink is what
+        // makes the retention bound structural — its buffer cannot exceed its
+        // cap, whatever it is handed — and it keeps counting so the refusal can
+        // still say how big the frame really was.
+        use std::io::Write as _;
+
+        let mut sink = Capped {
+            buf: Vec::new(),
+            cap: 8,
+            written: 0,
+        };
+        for _ in 0..1000 {
+            sink.write_all(&[b'x'; 64]).expect("the sink is a budget");
+        }
+        assert_eq!(sink.buf.len(), 8, "the sink kept more than it was allowed");
+        assert_eq!(sink.written, 64_000, "the count is of everything");
+
+        // And through the encoder: a result far past the ceiling is refused
+        // with its true size named.
+        let big = serde_json::json!({ "text": "x".repeat(100_000) });
+        let line = terminal_line(5, "spaces.list", big, 256);
+        let frame = decode_response(&line[..line.len() - 1]).expect("decode");
+        match frame.body {
+            ResponseBody::Err { error } => match error.to_remote() {
+                RemoteError::Protocol(ProtocolError::ResultTooLarge { bytes, .. }) => {
+                    assert!(
+                        bytes > 100_000,
+                        "the refusal has to name the size that was reached, not the cap"
+                    );
+                }
+                other => panic!("unexpected: {other:?}"),
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_delta_that_might_not_fit_is_split_rather_than_encoded_to_find_out() {
+        // The same rule in the place it is spelled differently. `chunk_lines`
+        // cannot ask "does the whole thing fit?" by encoding the whole thing —
+        // that is the allocation an oversized delta was not supposed to cost,
+        // and building the frame's `Value` copies the text on top of it. So the
+        // question is answered by arithmetic, and a delta whose *worst case*
+        // exceeds the ceiling is split even where its actual encoding would
+        // have fitted. That pessimism is the deliberate side of the trade:
+        // pieces concatenate to exactly what one frame would have said.
+        let text = "a".repeat(200);
+        let event = crate::ChatStreamEvent::ContentDelta(text.clone());
+        let overhead = chunk_line(1, &with_text(&event, "")).len();
+
+        // A ceiling this text fits under comfortably when encoded — plain
+        // ASCII escapes to itself — and fails the six-bytes-per-byte bound.
+        let limit = overhead + 400;
+        assert!(
+            chunk_line(1, &event).len() <= limit,
+            "the encoding does fit, which is what makes this the interesting case"
+        );
+
+        let lines: Vec<_> = chunk_lines(1, &event, limit).collect();
+        assert!(
+            lines.len() > 1,
+            "a delta was encoded whole to discover whether it needed splitting"
+        );
+        let mut rebuilt = String::new();
+        for line in &lines {
+            assert!(line.len() <= limit, "a piece is past the ceiling");
+            let frame = decode_response(&line[..line.len() - 1]).expect("decode");
+            let ResponseBody::Chunk { data } = frame.body else {
+                panic!("not a chunk")
+            };
+            let piece: crate::ChatStreamEvent = serde_json::from_value(data).expect("event");
+            rebuilt.push_str(text_of(&piece));
+        }
+        assert_eq!(rebuilt, text, "over-splitting still says the same thing");
+    }
+
+    #[test]
     fn a_failure_that_fits_travels_whole() {
         let error = WireError::from_app_error(&AppError::Server {
             status: 503,
@@ -1607,7 +1803,7 @@ mod tests {
     #[test]
     fn an_ordinary_delta_is_one_frame() {
         let event = crate::ChatStreamEvent::ContentDelta("a token".into());
-        let lines = chunk_lines(2, &event, MAX_RESPONSE_BYTES);
+        let lines: Vec<_> = chunk_lines(2, &event, MAX_RESPONSE_BYTES).collect();
         assert_eq!(lines.len(), 1, "nothing is split that already fits");
         let line = &lines[0];
         let frame = decode_response(&line[..line.len() - 1]).expect("decode");
@@ -1621,7 +1817,7 @@ mod tests {
     /// side passes that same constant — so scaling both ends together is the
     /// same reader under the same rule, without allocating 64 MiB to say so.
     async fn split_round_trip(event: crate::ChatStreamEvent, limit: usize) -> String {
-        let lines = chunk_lines(7, &event, limit);
+        let lines: Vec<_> = chunk_lines(7, &event, limit).collect();
         assert!(lines.len() > 1, "an oversized delta has to be split at all");
         for line in &lines {
             assert!(
@@ -1697,7 +1893,8 @@ mod tests {
         // pieces are *characters*, not bytes: joined they equal the original
         // and each one alone is well formed.
         let text = "✂".repeat(300);
-        let lines = chunk_lines(1, &crate::ChatStreamEvent::ContentDelta(text.clone()), 256);
+        let lines: Vec<_> =
+            chunk_lines(1, &crate::ChatStreamEvent::ContentDelta(text.clone()), 256).collect();
         assert!(lines.len() > 1);
         let mut rebuilt = String::new();
         for line in &lines {
