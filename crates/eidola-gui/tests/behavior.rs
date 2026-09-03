@@ -19782,6 +19782,72 @@ fn space_find_hands_the_keyboard_back_to_the_inspector_field(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn space_find_opens_from_its_shortcut_with_a_panel_field_focused(cx: &mut TestAppContext) {
+    // The shortcut is context-free, and the component's own input-local search
+    // claims the same chord in the `Input` context — so with a panel field
+    // focused both bindings match at the same depth and the tie is broken by
+    // registration order alone (gpui sorts matched bindings by context depth,
+    // then by index descending). The app's keymap is therefore installed
+    // *after* `gpui_component::init`, which is what keeps ⌘F reaching the
+    // conversation from a field rather than a search the field never offers.
+    // Dispatching the action directly would step straight over that.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    // In the order production takes it: the component's keymap is already in
+    // (`open_space` → `gpui_component::init`), ours goes on top.
+    cx.update(eidola_gui::install_keybindings);
+    seed_quotable_space(&view, window, cx, findable_posts());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let title = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("title field");
+    cx.update_window(window, |_, window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    #[cfg(target_os = "macos")]
+    let chord = "cmd-f";
+    #[cfg(not(target_os = "macos"))]
+    let chord = "ctrl-f";
+    vcx.simulate_keystrokes(chord);
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_open_for_test(),
+            "the shortcut opened the conversation's find bar from the panel field"
+        );
+    });
+
+    // …and it borrowed the keyboard from that field, so closing gives it back.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+    let field = title.read_with(&vcx, |s, cx| s.focus_handle(cx));
+    vcx.update(|window, _| {
+        assert!(
+            field.is_focused(window),
+            "the lender was captured by the press the shortcut made"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_refreshes_the_field_it_borrowed_from_when_it_is_refocused(cx: &mut TestAppContext) {
     // The bar is opened once and re-focused many times. Opening it from the
     // conversation records no lender — correctly, nothing lent it — but a
