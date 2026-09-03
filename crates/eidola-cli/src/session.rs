@@ -16,6 +16,12 @@
 //!   socket to ask instead. It arrives two ways — no socket plus
 //!   [`AppError::DatabaseInUse`], and a socket that accepted a connection and
 //!   never greeted it — and both say the same actionable thing.
+//! - **It answers, for another profile** ⇒ refuse, in the handshake, before a
+//!   verb is dispatched at it. A profile is *both* roots and the socket is
+//!   found through the data one alone, so an app reached this way has not yet
+//!   been shown to speak for the account, default template and update feed
+//!   this command was given. It states its config root in the greeting; one
+//!   that is not ours is [`Startup::OtherProfile`], naming both.
 //!
 //! `--embedded` skips the dial entirely, which is the debugging escape hatch;
 //! it does not weaken anything, since the lock still decides who may open the
