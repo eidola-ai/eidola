@@ -828,15 +828,18 @@ pub fn terminal_line(id: u64, verb: &str, data: serde_json::Value, limit: usize)
     if line.len() <= limit {
         return line;
     }
-    terminal_error_line(
+    // Encoded rather than measured, and that is the base case rather than an
+    // omission: the substitute is of fixed shape over a verb name this build
+    // spells as a constant, so it fits any ceiling worth having. Measuring it
+    // would only be asking what to substitute for the substitute.
+    encode_line(&Response::err(
         id,
         WireError::from_protocol(&ProtocolError::ResultTooLarge {
             verb: verb.to_string(),
             bytes: line.len(),
             limit,
         }),
-        limit,
-    )
+    ))
 }
 
 /// The encoded terminal line for a verb that failed — and for every refusal,
@@ -862,6 +865,9 @@ pub fn terminal_error_line(id: u64, error: WireError, limit: usize) -> Vec<u8> {
     if line.len() <= limit {
         return line;
     }
+    // The base case, for the same reason `terminal_line`'s substitute is: the
+    // variant name is a constant in every build of this enum, so the frame that
+    // says the failure did not fit is one that always does.
     encode_line(&Response::err(
         id,
         WireError::from_protocol(&ProtocolError::ErrorTooLarge {
@@ -1307,6 +1313,63 @@ mod tests {
                     limit: reported,
                 }) => {
                     assert_eq!(verb, "spaces.list", "the refusal names what was asked");
+                    assert!(bytes > reported);
+                    assert_eq!(reported, limit);
+                }
+                other => panic!("unexpected: {other:?}"),
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failure_that_fits_travels_whole() {
+        let error = WireError::from_app_error(&AppError::Server {
+            status: 503,
+            message: "upstream said no".into(),
+        });
+        let line = terminal_error_line(9, error, 4096);
+        let frame = decode_response(&line[..line.len() - 1]).expect("decode");
+        assert_eq!(frame.id, 9);
+        match frame.body {
+            ResponseBody::Err { error } => match error.to_remote() {
+                RemoteError::App(AppError::Server { status, message }) => {
+                    assert_eq!(status, 503);
+                    assert_eq!(message, "upstream said no", "the typed failure is intact");
+                }
+                other => panic!("unexpected: {other:?}"),
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failure_too_big_to_read_is_named_rather_than_written() {
+        // The `err` twin of the result ceiling, and reachable where the result
+        // one is not: a failure's `message` is whoever rendered it, and an
+        // upstream's own error body travels uncapped inside `AppError::Server`.
+        // Written whole, that frame is the line the caller's reader refuses —
+        // so a typed failure would arrive as a closed connection instead.
+        let error = WireError::from_app_error(&AppError::Server {
+            status: 500,
+            message: "x".repeat(4096),
+        });
+        let limit = 256;
+        let line = terminal_error_line(11, error, limit);
+        assert!(
+            line.len() <= limit,
+            "the error about the error has to fit where the error did not"
+        );
+        let frame = decode_response(&line[..line.len() - 1]).expect("decode");
+        assert_eq!(frame.id, 11, "it still answers the request that asked");
+        match frame.body {
+            ResponseBody::Err { error } => match error.to_remote() {
+                RemoteError::Protocol(ProtocolError::ErrorTooLarge {
+                    kind,
+                    bytes,
+                    limit: reported,
+                }) => {
+                    assert_eq!(kind, "Server", "the caller still learns what failed");
                     assert!(bytes > reported);
                     assert_eq!(reported, limit);
                 }

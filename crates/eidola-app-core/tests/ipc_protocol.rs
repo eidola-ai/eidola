@@ -843,6 +843,97 @@ fn a_caller_that_stops_reading_stops_being_served() {
 }
 
 #[test]
+fn a_caller_that_will_never_read_again_is_asked_for_nothing_more() {
+    run(|| {
+        // The half-close, which the previous test cannot reach: a peer that
+        // shuts its *read* half and goes on writing looks, from the reader's
+        // side, exactly like a well-behaved caller. Nothing in the frames says
+        // the answers have nowhere to go — so without the writer's death
+        // reaching the read loop, every one of those requests is dispatched,
+        // and `chat.stream` is a turn that goes upstream and is paid for.
+        //
+        // The first turn here is legitimate: it was asked for while the answer
+        // could still be delivered, and it is what makes the writer try to
+        // write and fail. What must not happen is a second one.
+        let (mock, core, _dir) = served(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime().block_on(async {
+            let (client_writes, server_reads) = tokio::io::duplex(PIPE_BUFFER);
+            let (server_writes, client_reads) = tokio::io::duplex(PIPE_BUFFER);
+            tokio::spawn(serve_connection(
+                Arc::clone(&core),
+                APP_VERSION.to_string(),
+                server_reads,
+                server_writes,
+            ));
+            let mut writer = client_writes;
+            let mut reader = BufReader::new(client_reads);
+
+            writer
+                .write_all(&encode_line(&Request::new(1, &Call::Hello)))
+                .await
+                .expect("write");
+            read_frame(&mut reader)
+                .await
+                .expect("the connection is answering");
+
+            // From here the app can be told things and can answer none of them.
+            drop(reader);
+
+            let turn = Call::ChatStream {
+                prompt: "the one that was asked in good faith".into(),
+                model: Some(MODEL.into()),
+                space_id: None,
+            };
+            writer
+                .write_all(&encode_line(&Request::new(2, &turn)))
+                .await
+                .expect("write");
+            for _ in 0..600 {
+                if mock.chat_hits() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(mock.chat_hits() > 0, "the first turn never started");
+            // Long enough for that turn's frames to be attempted and refused,
+            // which is the moment the app learns it cannot answer anybody.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            // Now ask again, and keep asking. Each of these is a billed turn if
+            // it is dispatched.
+            let mut refused_the_write = false;
+            for id in 3..20u64 {
+                if writer
+                    .write_all(&encode_line(&Request::new(id, &turn)))
+                    .await
+                    .is_err()
+                {
+                    refused_the_write = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            assert_eq!(
+                mock.chat_hits(),
+                1,
+                "a peer the app cannot answer went on starting paid turns"
+            );
+            assert!(
+                refused_the_write,
+                "the connection went on reading after its answers had nowhere to go"
+            );
+        });
+    });
+}
+
+#[test]
 fn no_refusal_ever_wears_an_id_a_live_request_holds() {
     run(|| {
         // The one-terminal-frame-per-id rule has to survive frames that are
