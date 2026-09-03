@@ -205,10 +205,43 @@ pub fn no_listener(e: &io::Error) -> bool {
 /// machine) falls back to its literal spelling, which is the only thing left
 /// to compare.
 pub fn same_config_root(ours: &Path, theirs: &Path) -> bool {
-    fn resolve(p: &Path) -> std::path::PathBuf {
-        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    resolve_config_root(ours) == resolve_config_root(theirs)
+}
+
+/// A config root reduced to the one spelling the filesystem agrees with.
+///
+/// `canonicalize` answers only for a path that exists, and **a config root
+/// that does not exist yet is the ordinary case** — a fresh profile has no
+/// `config.toml` and therefore nothing has created the directory holding one.
+/// Left at that, two processes spelling the same root through a symlink and
+/// through its target would each fall back to their own literal spelling,
+/// disagree, and refuse each other over a directory neither had created.
+///
+/// So the missing part is put back rather than given up on: walk up to the
+/// longest ancestor that does exist, canonicalize *that*, and re-append what
+/// was missing. The appending is lexical, which is only sound because a
+/// component that could mean somewhere else is never appended —
+/// [`Path::file_name`] answers `None` for a path ending in `..`, and this
+/// falls back to the literal spelling there rather than resolving a `..`
+/// against a directory the kernel never walked.
+fn resolve_config_root(path: &Path) -> std::path::PathBuf {
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cursor) {
+            let mut resolved = real;
+            resolved.extend(missing.iter().rev());
+            return resolved;
+        }
+        match (cursor.parent(), cursor.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                cursor = parent;
+            }
+            // No ancestor left to try, or a component this must not append.
+            _ => return path.to_path_buf(),
+        }
     }
-    resolve(ours) == resolve(theirs)
 }
 
 /// A conversation with the app that holds the profile.
@@ -573,6 +606,49 @@ mod tests {
         assert!(
             same_config_root(&gone, &gone),
             "a root that does not exist yet still compares as itself"
+        );
+    }
+
+    #[test]
+    fn a_root_that_does_not_exist_yet_resolves_through_the_ancestor_that_does() {
+        // The ordinary shape of a fresh profile: no `config.toml`, so nothing
+        // has created the directory holding one — and the two processes spell
+        // the way there differently, one through a symlink and one through its
+        // target. Canonicalizing only the whole path fails on both and leaves
+        // two literal spellings that disagree, which would refuse the app over
+        // a directory neither side has created yet.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real).expect("the directory that exists");
+        std::os::unix::fs::symlink(&real, &link).expect("the other way to spell it");
+
+        assert!(
+            same_config_root(&link.join("eidola"), &real.join("eidola")),
+            "the same directory, reached two ways, is one profile"
+        );
+        assert!(
+            !same_config_root(&link.join("eidola"), &real.join("elsewhere")),
+            "resolving the ancestor must not make two different roots agree"
+        );
+        assert!(
+            same_config_root(&link.join("a").join("b"), &real.join("a").join("b")),
+            "more than one missing component is still just a suffix"
+        );
+    }
+
+    #[test]
+    fn a_missing_component_that_could_move_is_left_alone() {
+        // `..` against a directory the kernel never walked is not a suffix to
+        // re-append — the answer would depend on the symlink resolution that
+        // could not happen. The literal spelling is the honest fallback, and
+        // costs only that this pair is not recognised as equal.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let awkward = dir.path().join("missing").join("..");
+        assert_eq!(
+            resolve_config_root(&awkward),
+            awkward,
+            "a root ending in `..` past a missing directory stays as written"
         );
     }
 
