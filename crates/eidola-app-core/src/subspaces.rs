@@ -542,16 +542,53 @@ fn fold_name(name: &str) -> String {
     crate::search::fold_case(name.trim()).text().to_string()
 }
 
+/// The one form that names a participant by **id and nothing else** — the
+/// escape the ambiguity refusal hands out, and the only thing in this resolver
+/// that is not matched against both namespaces.
+///
+/// Bare names cannot carry that guarantee. Two participants can cross-collide —
+/// one whose id is the other's label and vice versa — and then *either* raw
+/// name matches both, so the refusal's "name it by its id instead" was advice
+/// no retry could take: every retry tied again and neither participant was
+/// reachable at all. A prefix is a namespace the model can type, so the refusal
+/// now hands out something that resolves.
+pub(crate) const SEAT_ID_PREFIX: &str = "id:";
+
+/// Every candidate `name` answers to, deduped by participant: an id exactly, an
+/// effective label case- and whitespace-insensitively ([`fold_name`]).
+///
+/// **Both namespaces, and neither wins by default.** An id is exposed to the
+/// model (the ambiguity refusal hands them out) and a label is arbitrary text a
+/// person chose, so one participant's label can be another's id — and giving
+/// ids unconditional precedence there seated the agent the model did *not*
+/// name, silently. Matching both and deduping turns that into the one thing it
+/// can honestly be: two candidates answering to one name, which is the refusal
+/// that already exists. A participant whose label happens to be its own id is
+/// one candidate, not two.
+fn seats_answering_to<'a>(candidates: &'a [SeatCandidate], name: &str) -> Vec<&'a SeatCandidate> {
+    let asked = fold_name(name);
+    let mut matches: Vec<&SeatCandidate> = Vec::new();
+    for c in candidates
+        .iter()
+        .filter(|c| c.participant_id == name || fold_name(&c.label) == asked)
+    {
+        if !matches.iter().any(|m| m.participant_id == c.participant_id) {
+            matches.push(c);
+        }
+    }
+    matches
+}
+
 /// Resolve the names a model asked for against the roster it was shown.
 ///
 /// Pure over its inputs — these decide what a model may reach, so they are
-/// unit-tested. A name is matched against **both** namespaces at once — an id
-/// exactly, an effective label case- and whitespace-insensitively
-/// ([`fold_name`]) — and the union, deduped by participant, is what decides:
-/// one match seats it, several are refused rather than guessed between. Failures are the message
-/// the model reads, and every one of them names what *is* available, because a
-/// listing of the current conversation's roster is something the model was
-/// already given.
+/// unit-tested. A bare name is matched against both namespaces at once
+/// ([`seats_answering_to`]): one match seats it, several are refused rather
+/// than guessed between. A name carrying [`SEAT_ID_PREFIX`] is matched against
+/// ids alone, which is what makes the refusal's advice followable — ids are
+/// unique, so that form can never tie. Failures are the message the model
+/// reads, and every one of them names what *is* available, because a listing of
+/// the current conversation's roster is something the model was already given.
 pub(crate) fn resolve_seats(
     candidates: &[SeatCandidate],
     requested: &[String],
@@ -559,25 +596,19 @@ pub(crate) fn resolve_seats(
     let mut seats: Vec<String> = Vec::new();
     for raw in requested {
         let name = raw.trim();
-        // **Both namespaces are searched, and neither wins by default.** An id
-        // is exposed to the model (the ambiguity refusal hands them out) and a
-        // label is arbitrary text a person chose, so one participant's label
-        // can be another's id — and giving ids unconditional precedence there
-        // seated the agent the model did *not* name, silently. Matching both
-        // and deduping by participant turns that into the one thing it can
-        // honestly be: two candidates answering to one name, which is the
-        // refusal that already exists. A participant whose label happens to be
-        // its own id is one candidate, not two.
-        let asked = fold_name(name);
-        let mut matches: Vec<&SeatCandidate> = Vec::new();
-        for c in candidates
-            .iter()
-            .filter(|c| c.participant_id == name || fold_name(&c.label) == asked)
-        {
-            if !matches.iter().any(|m| m.participant_id == c.participant_id) {
-                matches.push(c);
-            }
-        }
+        // **The prefix is an escape, not a reserved word.** A label really can
+        // begin `id:` — labels are arbitrary Unicode a person chose — so the
+        // prefixed form is tried against ids first and, finding none, the whole
+        // token falls through to the ordinary rule. That only ever widens what
+        // resolves: a name that reaches a participant by id is answered by that
+        // participant, and everything else is matched exactly as it was.
+        let matches = match name.strip_prefix(SEAT_ID_PREFIX).map(str::trim) {
+            Some(id) if candidates.iter().any(|c| c.participant_id == id) => candidates
+                .iter()
+                .filter(|c| c.participant_id == id)
+                .collect(),
+            _ => seats_answering_to(candidates, name),
+        };
         let id = match matches.as_slice() {
             [one] => one.participant_id.clone(),
             // **A blank entry is noise only where nothing answers to it.** An
@@ -627,15 +658,22 @@ fn addressable(candidate: &SeatCandidate) -> String {
 /// wire for every global agent's turn, and a refusal is exactly the moment the
 /// extra bytes buy something. Only the tied candidates are listed: the rest are
 /// reachable by the name the model already used.
+///
+/// **They are handed out in the [`SEAT_ID_PREFIX`] form, because a raw id is
+/// not always an answer.** A raw id is matched against labels too, so where two
+/// participants cross-collide — each one's id being the other's label — every
+/// raw id in this list ties exactly as the name did, and the retry this asks
+/// for could never succeed. The prefixed form resolves by id alone, so what the
+/// model is told to type is what will work.
 fn ambiguous_seat_message(matches: &[&SeatCandidate], name: &str) -> String {
     let ids = matches
         .iter()
-        .map(|c| c.participant_id.as_str())
+        .map(|c| format!("{SEAT_ID_PREFIX}{}", c.participant_id))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "more than one participant of this conversation is called {} — name the one you mean \
-         by its id instead: {ids}",
+        "more than one participant of this conversation is called {} — ask again for exactly \
+         one of these instead, written just like this: {ids}",
         crate::quoted_label(name)
     )
 }
@@ -1039,7 +1077,7 @@ mod tests {
         let err = resolve_seats(&tied, &[attack.into()]).unwrap_err();
         assert!(!err.contains('\n'), "{err}");
         assert_eq!(err.matches('"').count(), 2, "{err}");
-        assert!(err.contains("p-1, p-2"), "{err}");
+        assert!(err.contains("id:p-1, id:p-2"), "{err}");
     }
 
     /// A spawn outcome carrying `title`, for the rendering tests.
@@ -1071,7 +1109,7 @@ mod tests {
         let candidates = vec![candidate("p-1", "Ada"), candidate("p-2", "p-1")];
         let err = resolve_seats(&candidates, &["p-1".into()]).unwrap_err();
         assert!(err.contains("more than one participant"), "{err}");
-        assert!(err.contains("p-1, p-2"), "{err}");
+        assert!(err.contains("id:p-1, id:p-2"), "{err}");
         // Each is still reachable by a name nothing else answers to.
         assert_eq!(
             resolve_seats(&candidates, &["Ada".into()]).unwrap(),
@@ -1088,6 +1126,48 @@ mod tests {
             resolve_seats(&selfnamed, &["p-9".into()]).unwrap(),
             vec!["p-9".to_string()]
         );
+    }
+
+    /// **The refusal's advice has to be advice a retry can take.** Where two
+    /// participants cross-collide — each one's id is the other's label — every
+    /// raw id ties exactly as the name did, so a refusal handing out raw ids
+    /// sent the model round a loop with no exit and neither participant was
+    /// reachable at all. The prefixed form resolves by id alone, so what the
+    /// refusal prints is what works.
+    #[test]
+    fn a_cross_collision_is_escaped_by_the_form_the_refusal_prints() {
+        let crossed = vec![candidate("p-1", "p-2"), candidate("p-2", "p-1")];
+        for name in ["p-1", "p-2"] {
+            let err = resolve_seats(&crossed, &[name.into()]).unwrap_err();
+            assert!(err.contains("more than one participant"), "{err}");
+            assert!(err.contains("id:p-1, id:p-2"), "{err}");
+        }
+        // The form the refusal printed seats exactly the participant it names.
+        assert_eq!(
+            resolve_seats(&crossed, &["id:p-1".into()]).unwrap(),
+            vec!["p-1".to_string()]
+        );
+        assert_eq!(
+            resolve_seats(&crossed, &["id:p-2".into()]).unwrap(),
+            vec!["p-2".to_string()]
+        );
+        // A model's stray space inside the form is punctuation, not a name.
+        assert_eq!(
+            resolve_seats(&crossed, &["id: p-2".into()]).unwrap(),
+            vec!["p-2".to_string()]
+        );
+
+        // The prefix is an escape, not a reserved word: a label that really
+        // begins `id:` still answers to itself, because a prefixed token that
+        // names no id falls through to the ordinary both-namespaces rule.
+        let literal = vec![candidate("p-a", "id:archivist"), candidate("p-b", "Bo")];
+        assert_eq!(
+            resolve_seats(&literal, &["id:archivist".into()]).unwrap(),
+            vec!["p-a".to_string()]
+        );
+        // …and a name that reaches neither namespace is still an unknown name.
+        let err = resolve_seats(&literal, &["id:nobody".into()]).unwrap_err();
+        assert!(err.contains("no participant of this conversation"), "{err}");
     }
 
     /// **A list a model mistyped is a correctable mistake, not an empty list.**
@@ -1192,7 +1272,12 @@ mod tests {
         let tied = vec![candidate("p-1", ""), candidate("p-2", " ")];
         let err = resolve_seats(&tied, &["".into()]).unwrap_err();
         assert!(err.contains("more than one participant"), "{err}");
-        assert!(err.contains("p-1, p-2"), "{err}");
+        assert!(err.contains("id:p-1, id:p-2"), "{err}");
+        // …and the form it prints reaches one of them.
+        assert_eq!(
+            resolve_seats(&tied, &["id:p-2".into()]).unwrap(),
+            vec!["p-2".to_string()]
+        );
     }
 
     /// …while a blank entry in a list of real names is still punctuation. The
