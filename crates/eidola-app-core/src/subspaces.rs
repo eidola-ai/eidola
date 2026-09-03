@@ -536,16 +536,23 @@ fn fold_name(name: &str) -> String {
     crate::search::fold_case(name.trim()).text().to_string()
 }
 
-/// The one form that names a participant by **id and nothing else** — the
-/// escape the ambiguity refusal hands out, and the only thing in this resolver
-/// that is not matched against both namespaces.
+/// A second way to write a participant's id, so that a name a label has taken
+/// is not the only way to ask for it.
 ///
-/// Bare names cannot carry that guarantee. Two participants can cross-collide —
-/// one whose id is the other's label and vice versa — and then *either* raw
-/// name matches both, so the refusal's "name it by its id instead" was advice
-/// no retry could take: every retry tied again and neither participant was
-/// reachable at all. A prefix is a namespace the model can type, so the refusal
-/// now hands out something that resolves.
+/// Bare ids cannot carry a delegation on their own. Two participants can
+/// cross-collide — one whose id is the other's label and vice versa — and then
+/// *either* raw name matches both, so the refusal's "name it by its id instead"
+/// was advice no retry could take: every retry tied again and neither
+/// participant was reachable at all. This form gives the refusal something else
+/// to offer.
+///
+/// **It is an escape, not a reserved word.** Labels are arbitrary Unicode a
+/// person chose, so a participant really can be called `id:something`, and this
+/// form is therefore matched *in addition to* both namespaces rather than
+/// instead of them ([`matches_for`]) — which keeps that participant reachable
+/// by the name the roster shows, and makes the one case where the two readings
+/// disagree an honest tie. Neither form is assumed to resolve: what a refusal
+/// prints is what [`unique_token_for`] proved.
 pub(crate) const SEAT_ID_PREFIX: &str = "id:";
 
 /// Every candidate `name` answers to, deduped by participant: an id exactly, an
@@ -573,16 +580,69 @@ fn seats_answering_to<'a>(candidates: &'a [SeatCandidate], name: &str) -> Vec<&'
     matches
 }
 
+/// Everything one requested token answers to — **the whole matching rule**,
+/// shared by the resolution and by the refusal that has to hand out a token
+/// which works.
+///
+/// A token carrying [`SEAT_ID_PREFIX`] adds the participant whose id follows
+/// the prefix. **That is an addition, not a replacement**: the prefix is an
+/// escape rather than a reserved word, because a label really can begin `id:`
+/// — labels are arbitrary Unicode a person chose. So the full token is *also*
+/// put through [`seats_answering_to`], which is what keeps a participant
+/// literally called `id:something` reachable by the name the roster shows, and
+/// what turns the one case where those two readings disagree — A's label being
+/// `id:<B's id>` — into the tie it is rather than a silent seating of B.
+fn matches_for<'a>(candidates: &'a [SeatCandidate], name: &str) -> Vec<&'a SeatCandidate> {
+    let mut matches: Vec<&SeatCandidate> = match name.strip_prefix(SEAT_ID_PREFIX).map(str::trim) {
+        Some(id) => candidates
+            .iter()
+            .filter(|c| c.participant_id == id)
+            .collect(),
+        None => Vec::new(),
+    };
+    for c in seats_answering_to(candidates, name) {
+        if !matches.iter().any(|m| m.participant_id == c.participant_id) {
+            matches.push(c);
+        }
+    }
+    matches
+}
+
+/// A token that reaches `wanted` and nobody else, or `None` when the roster
+/// leaves it none.
+///
+/// **Asked by running the real matcher**, so what a refusal prints is what the
+/// next call will do — the alternative is a rule stated twice, and the second
+/// statement was wrong the moment a label began `id:`. The prefixed form is
+/// tried first because it is the one that works whenever the tie was on the id
+/// itself; the bare id answers the case where the *prefixed* form is what
+/// somebody else's label wears.
+///
+/// `None` is a real state and the refusal says so rather than inventing a
+/// token: it takes two other participants — one labelled with this one's id and
+/// one labelled with its `id:` form — and no third form exists to escape into,
+/// because escaping twice would only be another label somebody could wear. A
+/// person renaming one of them is the remedy, and the refusal asks for it.
+fn unique_token_for(candidates: &[SeatCandidate], wanted: &SeatCandidate) -> Option<String> {
+    [
+        format!("{SEAT_ID_PREFIX}{}", wanted.participant_id),
+        wanted.participant_id.clone(),
+    ]
+    .into_iter()
+    .find(|token| match matches_for(candidates, token).as_slice() {
+        [only] => only.participant_id == wanted.participant_id,
+        _ => false,
+    })
+}
+
 /// Resolve the names a model asked for against the roster it was shown.
 ///
 /// Pure over its inputs — these decide what a model may reach, so they are
-/// unit-tested. A bare name is matched against both namespaces at once
-/// ([`seats_answering_to`]): one match seats it, several are refused rather
-/// than guessed between. A name carrying [`SEAT_ID_PREFIX`] is matched against
-/// ids alone, which is what makes the refusal's advice followable — ids are
-/// unique, so that form can never tie. Failures are the message the model
-/// reads, and every one of them names what *is* available, because a listing of
-/// the current conversation's roster is something the model was already given.
+/// unit-tested. Each name is put through [`matches_for`]: one match seats it,
+/// several are refused rather than guessed between. Failures are the message
+/// the model reads, and every one of them names what *is* available, because a
+/// listing of the current conversation's roster is something the model was
+/// already given.
 pub(crate) fn resolve_seats(
     candidates: &[SeatCandidate],
     requested: &[String],
@@ -590,19 +650,7 @@ pub(crate) fn resolve_seats(
     let mut seats: Vec<String> = Vec::new();
     for raw in requested {
         let name = raw.trim();
-        // **The prefix is an escape, not a reserved word.** A label really can
-        // begin `id:` — labels are arbitrary Unicode a person chose — so the
-        // prefixed form is tried against ids first and, finding none, the whole
-        // token falls through to the ordinary rule. That only ever widens what
-        // resolves: a name that reaches a participant by id is answered by that
-        // participant, and everything else is matched exactly as it was.
-        let matches = match name.strip_prefix(SEAT_ID_PREFIX).map(str::trim) {
-            Some(id) if candidates.iter().any(|c| c.participant_id == id) => candidates
-                .iter()
-                .filter(|c| c.participant_id == id)
-                .collect(),
-            _ => seats_answering_to(candidates, name),
-        };
+        let matches = matches_for(candidates, name);
         let id = match matches.as_slice() {
             [one] => one.participant_id.clone(),
             // **A blank entry is noise only where nothing answers to it.** An
@@ -617,7 +665,7 @@ pub(crate) fn resolve_seats(
             // request.
             [] if name.is_empty() => continue,
             [] => return Err(unknown_seat_message(candidates, name)),
-            _ => return Err(ambiguous_seat_message(&matches, name)),
+            _ => return Err(ambiguous_seat_message(candidates, &matches, name)),
         };
         if !seats.contains(&id) {
             seats.push(id);
@@ -653,23 +701,51 @@ fn addressable(candidate: &SeatCandidate) -> String {
 /// extra bytes buy something. Only the tied candidates are listed: the rest are
 /// reachable by the name the model already used.
 ///
-/// **They are handed out in the [`SEAT_ID_PREFIX`] form, because a raw id is
-/// not always an answer.** A raw id is matched against labels too, so where two
-/// participants cross-collide — each one's id being the other's label — every
-/// raw id in this list ties exactly as the name did, and the retry this asks
-/// for could never succeed. The prefixed form resolves by id alone, so what the
-/// model is told to type is what will work.
-fn ambiguous_seat_message(matches: &[&SeatCandidate], name: &str) -> String {
-    let ids = matches
-        .iter()
-        .map(|c| format!("{SEAT_ID_PREFIX}{}", c.participant_id))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "more than one participant of this conversation is called {} — ask again for exactly \
-         one of these instead, written just like this: {ids}",
+/// **Each token is the one [`unique_token_for`] proved reaches that candidate
+/// alone**, rather than a form assumed to work. Neither namespace is safe to
+/// assume: a raw id is matched against labels too, so two participants whose
+/// ids are each other's labels tie on every raw id this could print; and the
+/// [`SEAT_ID_PREFIX`] form is matched against labels too, so a participant
+/// labelled `id:<somebody's id>` ties on that. Running the matcher is what
+/// keeps the advice and the rule one thing.
+///
+/// **And a candidate no token reaches is said so, not skipped.** That takes two
+/// other participants wearing this one's two forms as their labels, and there
+/// is no third form to escape into — so the refusal asks for the only remedy
+/// there is, a person renaming one of them, instead of sending the model round
+/// a loop.
+fn ambiguous_seat_message(
+    candidates: &[SeatCandidate],
+    matches: &[&SeatCandidate],
+    name: &str,
+) -> String {
+    let mut reachable: Vec<String> = Vec::new();
+    let mut stuck: Vec<String> = Vec::new();
+    for c in matches {
+        match unique_token_for(candidates, c) {
+            Some(token) => reachable.push(token),
+            None => stuck.push(addressable(c)),
+        }
+    }
+    let mut message = format!(
+        "more than one participant of this conversation is called {}",
         crate::quoted_label(name)
-    )
+    );
+    if !reachable.is_empty() {
+        message.push_str(&format!(
+            " — ask again for exactly one of these instead, written just like this: {}",
+            reachable.join(", ")
+        ));
+    }
+    if !stuck.is_empty() {
+        message.push_str(&format!(
+            "{} there is no name here that reaches {} and nobody else, because other \
+             participants answer to every name it has — ask a person to rename one of them",
+            if reachable.is_empty() { " —" } else { ";" },
+            stuck.join(", ")
+        ));
+    }
+    message
 }
 
 fn unknown_seat_message(candidates: &[SeatCandidate], name: &str) -> String {
@@ -1163,6 +1239,62 @@ mod tests {
         // …and a name that reaches neither namespace is still an unknown name.
         let err = resolve_seats(&literal, &["id:nobody".into()]).unwrap_err();
         assert!(err.contains("no participant of this conversation"), "{err}");
+    }
+
+    /// **The escape is a name too, so somebody can be wearing it.** A label of
+    /// `id:<somebody else's id>` is valid text a person may choose and the
+    /// roster renders it verbatim — so a model copying that label off the
+    /// roster typed the escape without meaning it, and reading the token as an
+    /// id and nothing else seated a *different* agent with no refusal to
+    /// correct. Both readings are kept, which makes it the tie it is.
+    #[test]
+    fn a_label_wearing_the_escape_ties_rather_than_seating_the_id_it_names() {
+        // A is called `id:p-b`, which is B's id in the escape's clothing.
+        let worn = vec![candidate("p-a", "id:p-b"), candidate("p-b", "Bo")];
+        let err = resolve_seats(&worn, &["id:p-b".into()]).unwrap_err();
+        assert!(err.contains("more than one participant"), "{err}");
+        // Both are reachable, each by the token the refusal proved reaches it:
+        // A by the escape (nobody wears `id:p-a`), B by its bare id (the
+        // escape's own form is what A's label took).
+        assert!(err.contains("id:p-a"), "{err}");
+        assert!(err.contains("p-b"), "{err}");
+        assert_eq!(
+            resolve_seats(&worn, &["id:p-a".into()]).unwrap(),
+            vec!["p-a".to_string()]
+        );
+        assert_eq!(
+            resolve_seats(&worn, &["p-b".into()]).unwrap(),
+            vec!["p-b".to_string()]
+        );
+        assert_eq!(
+            resolve_seats(&worn, &["Bo".into()]).unwrap(),
+            vec!["p-b".to_string()]
+        );
+
+        // Both of a participant's forms can be worn by others at once, and
+        // then no token reaches it. The refusal says which one and why rather
+        // than printing a form that would tie again.
+        let boxed_in = vec![
+            candidate("p-x", "Ada"),
+            candidate("p-y", "p-x"),
+            candidate("p-z", "id:p-x"),
+        ];
+        let err = resolve_seats(&boxed_in, &["p-x".into()]).unwrap_err();
+        assert!(
+            err.contains("id:p-y"),
+            "the tied one that is reachable: {err}"
+        );
+        assert!(err.contains("rename"), "{err}");
+        assert!(err.contains("\"Ada\""), "and which one is stuck: {err}");
+        // The other two are reachable, so only `p-x` is boxed in.
+        assert_eq!(
+            resolve_seats(&boxed_in, &["id:p-y".into()]).unwrap(),
+            vec!["p-y".to_string()]
+        );
+        assert_eq!(
+            resolve_seats(&boxed_in, &["id:p-z".into()]).unwrap(),
+            vec!["p-z".to_string()]
+        );
     }
 
     /// **A list a model mistyped is a correctable mistake, not an empty list.**
