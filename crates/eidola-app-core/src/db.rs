@@ -2362,7 +2362,8 @@ async fn spawn_subspace_tx_body(
     };
     if !has_model(&owner) {
         refuse!(SpawnRefusal::NoModelConfigured {
-            label: owner.label.clone(),
+            participant_id: plan.owner_participant_id.to_string(),
+            label: Some(owner.label.clone()),
         });
     }
 
@@ -2464,17 +2465,22 @@ async fn spawn_subspace_tx_body(
             Some(p) if p.scope == "global" && p.kind == "agent" && p.removed_at.is_none() => {
                 if !is_space_member(conn, plan.parent_space_id, id).await? {
                     refuse!(SpawnRefusal::ParticipantHasLeft {
-                        label: p.label.clone(),
+                        participant_id: id.to_string(),
+                        label: Some(p.label.clone()),
                     });
                 }
                 if !has_model(&p) {
                     refuse!(SpawnRefusal::NoModelConfigured {
-                        label: p.label.clone(),
+                        participant_id: id.to_string(),
+                        label: Some(p.label.clone()),
                     });
                 }
             }
+            // No name to give: the row may not be readable at all, and a row
+            // that is may be a kind this never had a roster name for.
             _ => refuse!(SpawnRefusal::ParticipantNotEligible {
                 participant_id: id.to_string(),
+                label: None,
             }),
         }
     }

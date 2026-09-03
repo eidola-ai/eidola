@@ -458,7 +458,8 @@ fn a_refused_spawn_writes_nothing_at_all() {
                 .unwrap_err()
             ),
             SpawnRefusal::ParticipantHasLeft {
-                label: "Adrift".into()
+                participant_id: gone.clone(),
+                label: Some("Adrift".into())
             }
         );
 
@@ -1731,7 +1732,8 @@ fn an_agent_with_no_model_of_its_own_is_refused_a_seat() {
                 .unwrap_err()
             ),
             SpawnRefusal::NoModelConfigured {
-                label: "Mute".into()
+                participant_id: mute.clone(),
+                label: Some("Mute".into())
             }
         );
 
@@ -1760,7 +1762,8 @@ fn an_agent_with_no_model_of_its_own_is_refused_a_seat() {
                 .unwrap_err()
             ),
             SpawnRefusal::NoModelConfigured {
-                label: "Mute".into()
+                participant_id: mute.clone(),
+                label: Some("Mute".into())
             },
             "the child sees the base config, so the parent's override cannot vouch for it"
         );
@@ -1818,7 +1821,8 @@ fn an_agent_with_no_model_of_its_own_is_refused_a_seat() {
                 .unwrap_err()
             ),
             SpawnRefusal::NoModelConfigured {
-                label: "Voiceless".into()
+                participant_id: voiceless.clone(),
+                label: Some("Voiceless".into())
             }
         );
     });
@@ -3505,6 +3509,74 @@ fn a_seat_that_leaves_mid_turn_is_refused_rather_than_seated() {
                 .expect("rooms")
                 .is_empty(),
             "and no room was opened around a seat the reader had already removed"
+        );
+    });
+}
+
+/// **And the refusal calls it what the roster called it.**
+///
+/// The door decides against *base* participant rows, which is right for what it
+/// decides — a spawn copies no overrides, so base configuration is what the new
+/// room would see. It is wrong for what it says: a helper renamed here carries
+/// one name in its own row and another in this conversation, and the second is
+/// the one the model read off the roster, typed into `participants`, and has to
+/// find again to fix the request. Naming the first sends it looking for a
+/// roster entry that does not exist — and with several seats asked for, it
+/// cannot even tell which of them the refusal is about. So the door answers
+/// with the id and the tool re-says it through the frozen snapshot.
+#[test]
+fn a_departed_seats_refusal_uses_the_name_the_roster_showed() {
+    run(|| {
+        let (mock, core, _dir, script) = tool_setup();
+        let core = std::sync::Arc::new(core);
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        // Renamed in this conversation only: the roster says "Tidewatcher",
+        // the participant row still says "Surveyor".
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                parent.clone(),
+                helper.clone(),
+                eidola_app_core::ParticipantOverride {
+                    label: Some(Some("Tidewatcher".to_string())),
+                    ..Default::default()
+                },
+            ))
+            .expect("rename the helper here");
+        let anchor = last_action(&core, &parent);
+
+        core.register_tool(std::sync::Arc::new(RemoveMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            space_id: parent.clone(),
+            participant: helper.clone(),
+        }))
+        .expect("register");
+
+        *script.lock().unwrap() = vec![
+            ("remove_helper_now".into(), "{}".into()),
+            (
+                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+                serde_json::json!({
+                    "brief": "Read Friday's tide tables and say when the second high water is.",
+                    "participants": ["Tidewatcher"],
+                })
+                .to_string(),
+            ),
+        ];
+        ask(&core, &parent, &owner, &anchor);
+
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 2, "{results:?}");
+        let refused = &results[1];
+        assert!(refused.contains("no longer taking part"), "{refused}");
+        assert!(
+            refused.contains("\"Tidewatcher\""),
+            "the name the model read and asked with: {refused}"
+        );
+        assert!(
+            !refused.contains("Surveyor"),
+            "and not a name this conversation never showed: {refused}"
         );
     });
 }

@@ -109,6 +109,15 @@ pub const MAX_SUBAGENTS_PER_SPAWN: i64 = 8;
 /// request, finish a sub-space it already has, ask for a capability it holds —
 /// so each says what happened in words a model reads without further
 /// translation. None of them names anything the asker did not already supply.
+///
+/// **Every variant that names a participant carries its id, and its name is an
+/// `Option` the caller may correct** — see [`SpawnRefusal::named_from`]. The
+/// door reads *base* participant rows, which is right for what it decides (a
+/// sub-space sees base configuration) and wrong for what it says: the model
+/// asked using the **effective** label the roster showed it, and a per-space
+/// override makes those two different strings. So the door supplies the name it
+/// has, the id is what makes the participant identifiable whatever the name,
+/// and the tool re-says it in the name the model read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpawnRefusal {
     /// The brief was empty. A sub-space with no brief is a room with no
@@ -136,12 +145,18 @@ pub enum SpawnRefusal {
     /// participant's **base** configuration (a spawn copies no overrides), and
     /// an agent with no model is skipped by every planner, so seating it would
     /// report a room that schedules nothing.
-    NoModelConfigured { label: String },
+    NoModelConfigured {
+        participant_id: String,
+        label: Option<String>,
+    },
     /// A requested capability is one the parent space does not hold, so there
     /// is nothing to pass down. This is the attenuation gate.
     CapabilityNotHeld { name: String },
     /// A requested sub-agent is not a live shared agent.
-    ParticipantNotEligible { participant_id: String },
+    ParticipantNotEligible {
+        participant_id: String,
+        label: Option<String>,
+    },
     /// A requested sub-agent is no longer taking part in the parent
     /// conversation. The seats a delegation names resolve against the roster
     /// the turn was prepared from — deliberately, so the name a model reads is
@@ -150,7 +165,10 @@ pub enum SpawnRefusal {
     /// already taken out of the conversation. Seating them would put an agent
     /// in a room opened from a conversation they are not in, and send their
     /// backend a brief drawn from it.
-    ParticipantHasLeft { label: String },
+    ParticipantHasLeft {
+        participant_id: String,
+        label: Option<String>,
+    },
     /// The post the delegation says it is being opened from is not a post
     /// the parent currently shows — wrong conversation, a superseded
     /// generation, or a hidden tip. The report attaches there, so an
@@ -198,28 +216,37 @@ impl std::fmt::Display for SpawnRefusal {
                 "that would seat {requested} participants and one delegated conversation holds \
                  at most {limit} — send fewer, or split the work across conversations"
             ),
-            Self::NoModelConfigured { label } => write!(
+            Self::NoModelConfigured {
+                participant_id,
+                label,
+            } => write!(
                 f,
                 "{} has no model of its own, so it would never answer there — give it one, \
                  or delegate to an agent that has one",
-                crate::quoted_label(label)
+                named(participant_id, label.as_deref())
             ),
             Self::CapabilityNotHeld { name } => write!(
                 f,
                 "you cannot grant `{name}` because this conversation does not have it; a \
                  delegated conversation never gets more than the one it came from"
             ),
-            Self::ParticipantNotEligible { participant_id } => write!(
+            Self::ParticipantNotEligible {
+                participant_id,
+                label,
+            } => write!(
                 f,
-                "{participant_id} is not a shared agent that can be invited into another \
-                 conversation"
+                "{} is not a shared agent that can be invited into another conversation",
+                named(participant_id, label.as_deref())
             ),
-            Self::ParticipantHasLeft { label } => write!(
+            Self::ParticipantHasLeft {
+                participant_id,
+                label,
+            } => write!(
                 f,
                 "{} is no longer taking part in this conversation, so it cannot be invited into \
                  one opened from it — name someone who is, or leave `participants` out to open a \
                  room of your own",
-                crate::quoted_label(label)
+                named(participant_id, label.as_deref())
             ),
             Self::AnchorNotInParent { action_id } => write!(
                 f,
@@ -232,6 +259,69 @@ impl std::fmt::Display for SpawnRefusal {
                  could never be reported back — say something here first"
             ),
         }
+    }
+}
+
+impl SpawnRefusal {
+    /// The same refusal, said in the names the model actually read.
+    ///
+    /// **The door reads base rows; the model read the roster.** A participant
+    /// with a per-space `override_label` is one string in `participant.label`
+    /// and another in the conversation the turn rendered — and the second is
+    /// the one the model typed and the one it must find again to fix the
+    /// request. A refusal naming the first sends the model looking for a
+    /// roster entry that is not there, and with several seats requested it
+    /// cannot even tell which of them the refusal is about.
+    ///
+    /// Widening the door's reads was the alternative and is the wrong half to
+    /// change: the door decides against base configuration on purpose (a spawn
+    /// copies no overrides, so base is what the new room will see), and a
+    /// second, presentation-only read inside the spawning transaction would put
+    /// the effective-label rule in two places. So the door answers with the id
+    /// — identity, not a name — and this substitutes the label from the frozen
+    /// snapshot the resolution already used, which is by construction what the
+    /// roster said.
+    ///
+    /// A participant the snapshot does not carry keeps whatever the door
+    /// supplied: the **owner** is the case that arises, since it is the one
+    /// participant excluded from its own seat roster, and its base label is
+    /// then the honest answer. A blank effective label leaves the id standing,
+    /// for the reason [`addressable`] gives — it is the only thing left that
+    /// can be typed back.
+    pub(crate) fn named_from(mut self, candidates: &[SeatCandidate]) -> Self {
+        let (id, label) = match &mut self {
+            Self::NoModelConfigured {
+                participant_id,
+                label,
+            }
+            | Self::ParticipantNotEligible {
+                participant_id,
+                label,
+            }
+            | Self::ParticipantHasLeft {
+                participant_id,
+                label,
+            } => (&*participant_id, label),
+            _ => return self,
+        };
+        if let Some(seen) = candidates.iter().find(|c| &c.participant_id == id) {
+            *label = Some(seen.label.clone());
+        }
+        self
+    }
+}
+
+/// A participant said to a model: its quoted name, or — with none to say — its
+/// id, which is the only thing left that identifies it.
+///
+/// The rule [`addressable`] follows for a roster listing, applied to the
+/// refusals that name one participant. A blank name is a real state (an
+/// override column's `''` means "override to empty"), and it is the same
+/// nothing as a name the door never had.
+fn named(participant_id: &str, label: Option<&str>) -> String {
+    match label.map(str::trim) {
+        Some(name) if !name.is_empty() => crate::quoted_label(name),
+        _ => participant_id.to_string(),
     }
 }
 
@@ -681,11 +771,7 @@ pub(crate) fn resolve_seats(
 /// The same rule the ambiguity refusal already follows one case along: where a
 /// name cannot pick a participant out, the listing carries the thing that can.
 fn addressable(candidate: &SeatCandidate) -> String {
-    if candidate.label.trim().is_empty() {
-        candidate.participant_id.clone()
-    } else {
-        crate::quoted_label(&candidate.label)
-    }
+    named(&candidate.participant_id, Some(&candidate.label))
 }
 
 /// Two participants answer to one name, so the label cannot pick between them
@@ -963,7 +1049,14 @@ impl Tool for DelegateTool {
                 .await
             {
                 Ok(spawned) => Ok(delegation_receipt(&spawned, &seated)),
-                Err(AppError::SpawnRefused { refusal }) => Err(ToolError::new(refusal.to_string())),
+                // **Said in the names the model read.** The door decides
+                // against base rows, so a refusal about a seat carries the id
+                // and whatever name the door had; the snapshot the resolution
+                // used is what the roster showed, and it is the only thing here
+                // that knows which entry the model must go and fix.
+                Err(AppError::SpawnRefused { refusal }) => Err(ToolError::new(
+                    refusal.named_from(&self.candidates).to_string(),
+                )),
                 Err(e) => Err(ToolError::new(format!(
                     "the delegated conversation could not be opened: {e}"
                 ))),
