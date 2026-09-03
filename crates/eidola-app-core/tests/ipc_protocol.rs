@@ -67,6 +67,12 @@ struct Client {
     next_id: u64,
 }
 
+/// The next frame, or `None` at the end of the stream. The bare-pipe twin of
+/// [`Client::recv`], for the tests that build their own halves.
+async fn client_frame(reader: &mut BufReader<DuplexStream>) -> Option<Response> {
+    read_frame(reader).await
+}
+
 async fn read_frame(reader: &mut BufReader<DuplexStream>) -> Option<Response> {
     let mut line = String::new();
     let read = reader.read_line(&mut line).await.expect("read a frame");
@@ -907,6 +913,173 @@ fn a_pipelined_hello_is_answered_before_anything_sent_behind_it() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             assert!(mock.chat_hits() > 0, "the pipelined turn never ran at all");
+        });
+    });
+}
+
+#[test]
+fn cancelling_the_connection_ends_its_writer_and_its_forwarder_too() {
+    run(|| {
+        // Whoever owns the connection cancels it by dropping this future — the
+        // socket's owner does exactly that on a full shutdown. **A dropped
+        // `JoinHandle` detaches its task rather than ending it**, so the writer
+        // and a turn's chunk forwarder each escaped the connection they belong
+        // to: the socket's write half stayed open and went on delivering until
+        // the turn finished, which is not what "this connection has ended"
+        // means to the process that ended it.
+        //
+        // The observable is prompt end-of-stream: the write half is released
+        // with the connection rather than at the turn's own pace.
+        let (mock, core, _dir) = served(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            // Far longer than the settle below, so "the writer went with the
+            // connection" and "the turn happened to finish" cannot be confused.
+            chat_delay_ms: 3_000,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime().block_on(async {
+            let (client_writes, server_reads) = tokio::io::duplex(PIPE_BUFFER);
+            let (server_writes, client_reads) = tokio::io::duplex(PIPE_BUFFER);
+            let serving = tokio::spawn(serve_connection(
+                Arc::clone(&core),
+                APP_VERSION.to_string(),
+                server_reads,
+                server_writes,
+            ));
+            let mut writer = client_writes;
+            let mut reader = BufReader::new(client_reads);
+
+            writer
+                .write_all(&encode_line(&Request::new(1, &Call::Hello)))
+                .await
+                .expect("write");
+            read_frame(&mut reader).await.expect("the handshake");
+
+            writer
+                .write_all(&encode_line(&Request::new(
+                    2,
+                    &Call::ChatStream {
+                        prompt: "running when the connection ends".into(),
+                        model: Some(MODEL.into()),
+                        space_id: None,
+                    },
+                )))
+                .await
+                .expect("write");
+            for _ in 0..600 {
+                if mock.chat_hits() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(mock.chat_hits() > 0, "the turn never started");
+
+            // The socket's owner ending this connection.
+            serving.abort();
+
+            let ended = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                client_frame(&mut reader),
+            )
+            .await;
+            assert!(
+                matches!(ended, Ok(None)),
+                "the write half outlived the connection that was ended: {ended:?}"
+            );
+        });
+    });
+}
+
+#[test]
+fn a_caller_that_half_closes_still_gets_the_answers_it_asked_for() {
+    run(|| {
+        // `shutdown(SHUT_WR)` and then read to completion is the polite client:
+        // it has said everything it means to say and is waiting on the answers
+        // it already asked for, with its read half wide open.
+        //
+        // A clean end of the *request* stream was read as the end of the
+        // conversation and aborted every in-flight task, so a turn already
+        // upstream could never enqueue its terminal frame — the caller waited
+        // out a `chat.stream` that finished and persisted, and got nothing.
+        let (mock, core, _dir) = served(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            // Long enough that the request is demonstrably still running when
+            // the write half closes.
+            chat_delay_ms: 800,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime().block_on(async {
+            let (client_writes, server_reads) = tokio::io::duplex(PIPE_BUFFER);
+            let (server_writes, client_reads) = tokio::io::duplex(PIPE_BUFFER);
+            tokio::spawn(serve_connection(
+                Arc::clone(&core),
+                APP_VERSION.to_string(),
+                server_reads,
+                server_writes,
+            ));
+            let mut writer = client_writes;
+            let mut reader = BufReader::new(client_reads);
+
+            writer
+                .write_all(&encode_line(&Request::new(1, &Call::Hello)))
+                .await
+                .expect("write");
+            read_frame(&mut reader).await.expect("the handshake");
+
+            writer
+                .write_all(&encode_line(&Request::new(
+                    2,
+                    &Call::ChatStream {
+                        prompt: "asked before saying goodbye".into(),
+                        model: Some(MODEL.into()),
+                        space_id: None,
+                    },
+                )))
+                .await
+                .expect("write");
+            // Demonstrably running before the write half goes.
+            for _ in 0..600 {
+                if mock.chat_hits() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(mock.chat_hits() > 0, "the turn never started");
+
+            // The half-close: nothing more will be sent, and the read half
+            // stays open for exactly the answer above.
+            drop(writer);
+
+            let mut chunks = 0;
+            let end = loop {
+                let frame = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client_frame(&mut reader),
+                )
+                .await
+                .expect("the answer arrived rather than the connection being torn down")
+                .expect("a frame, not the end of the stream");
+                assert_eq!(frame.id, 2);
+                match frame.body {
+                    ResponseBody::Chunk { .. } => chunks += 1,
+                    other => break other,
+                }
+            };
+            assert!(chunks > 0, "the turn's chunks were delivered");
+            assert!(
+                matches!(end, ResponseBody::End { .. }),
+                "the terminal frame is what a half-closed caller is waiting for: {end:?}"
+            );
+
+            // …and then the connection ends on its own, the answers being done.
+            assert!(
+                client_frame(&mut reader).await.is_none(),
+                "nothing follows the last answer"
+            );
         });
     });
 }
