@@ -1950,16 +1950,23 @@ mod tests {
 
     #[test]
     fn a_parameterless_verb_still_checks_the_shape_of_its_params() {
-        // Every verb that reads no fields — the four of them — used to build
-        // its call without looking at `params` at all, so anything whatsoever
-        // rode through. `hello` is the sharp one: a malformed frame completed
+        // Every verb that reads no fields used to build its call without
+        // looking at `params` at all, so anything whatsoever rode through. `hello` is the sharp one: a malformed frame completed
         // the handshake, which is the exchange whose entire job is agreeing on
         // the protocol.
         for verb in [
             "hello",
             "account.show",
+            "account.prices",
+            "account.balances",
             "wallet.credentials",
+            "wallet.spending",
+            "wallet.lifecycle",
+            "wallet.recover",
             "backend.list",
+            "model.list",
+            "update.check",
+            "chat.default_model",
         ] {
             for accepted in [
                 serde_json::Value::Null,
