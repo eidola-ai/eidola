@@ -865,7 +865,24 @@ impl SpaceView {
             // live at the moment of the question, including the composing
             // session, which is the one destination that leaves a reader able
             // to go on writing.
+            //
+            // **And "still there" is two questions, because one of the
+            // panel's fields outlives its panel.** The weak reference answers
+            // for a *form* — a participant editor retired while the bar stood
+            // open takes its `InputState` with it — but `set_inspector_open`
+            // deliberately keeps the title field and the open editor across a
+            // close, so a hidden panel's field upgrades perfectly well while
+            // its element is unmounted. Focusing it is the dead slot this
+            // window's whole focus doctrine is about: the handle still reports
+            // itself focused, so `inspector_field_focused` goes on yielding
+            // every printable to a field nobody is painting, and the window is
+            // silent until the reader clicks somewhere. So the mounting is
+            // asked of the panel, with the same predicate the render reads
+            // (`inspector_open`, which is exactly what decides whether a panel
+            // is painted at all) — derived at the moment of the question, like
+            // every other answer here, rather than cleared at the close.
             let back = lender
+                .filter(|_| self.inspector_open)
                 .and_then(|input| input.upgrade())
                 .map(|input| gpui::Focusable::focus_handle(input.read(cx), cx))
                 .unwrap_or_else(|| self.keyboard_home(cx));
