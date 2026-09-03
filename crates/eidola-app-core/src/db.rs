@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 9;
+const LATEST_VERSION: i64 = 10;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -1622,6 +1622,12 @@ pub struct SubspaceRow {
     /// named one. It is where the report attaches, so the answer lands on the
     /// branch the work was asked for on. `None` for a spawn that named none.
     pub parent_action_id: Option<String>,
+    /// The item the turn that opened this room writes its answer under — which
+    /// *turn* asked for the room, where the anchor above says only which post
+    /// it was asked on. The report attaches beneath that turn's answer. `None`
+    /// for a spawn with no turn behind it. See the column's own note in
+    /// `schema.sql`.
+    pub parent_answer_item_id: Option<String>,
     pub title: Option<String>,
     pub created_at: i64,
     pub archived_at: Option<i64>,
@@ -1717,9 +1723,10 @@ fn subspace_row(row: &turso::Row) -> Result<SubspaceRow, AppError> {
         parent_space_id: row.get::<String>(1).map_err(AppError::db)?,
         owner_participant_id: row.get::<String>(2).map_err(AppError::db)?,
         parent_action_id: row.get::<Option<String>>(3).map_err(AppError::db)?,
-        title: row.get::<Option<String>>(4).map_err(AppError::db)?,
-        created_at: row.get::<i64>(5).map_err(AppError::db)?,
-        archived_at: row.get::<Option<i64>>(6).map_err(AppError::db)?,
+        parent_answer_item_id: row.get::<Option<String>>(4).map_err(AppError::db)?,
+        title: row.get::<Option<String>>(5).map_err(AppError::db)?,
+        created_at: row.get::<i64>(6).map_err(AppError::db)?,
+        archived_at: row.get::<Option<i64>>(7).map_err(AppError::db)?,
     })
 }
 
@@ -1729,8 +1736,8 @@ async fn subspace_rows(
     param: Option<&str>,
 ) -> Result<Vec<SubspaceRow>, AppError> {
     let sql = format!(
-        "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.parent_action_id, s.title, \
-                s.created_at, s.archived_at \
+        "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.parent_action_id, \
+                s.parent_answer_item_id, s.title, s.created_at, s.archived_at \
          FROM space s \
          WHERE s.parent_space_id IS NOT NULL AND {SUBSPACE_OWNER_SQL} IS NOT NULL \
            AND {where_clause} \
@@ -2210,6 +2217,13 @@ pub(crate) struct SubspacePlan<'a> {
     /// to `space.parent_action_id` and validated to be a post the parent
     /// **currently shows** (current generation, terminal status, post type).
     pub parent_action_id: Option<&'a str>,
+    /// The item the spawning turn will write its answer under — which turn is
+    /// asking, which the anchor alone cannot say. Written to
+    /// `space.parent_answer_item_id`, unvalidated on purpose: at this moment
+    /// the answer does not exist, so there is nothing to check it against, and
+    /// the report's own lookup is what decides whether a visible post of it has
+    /// landed. `None` for a caller with no turn behind it.
+    pub answer_item_id: Option<&'a str>,
     /// Global agents to seat beside the owner, deduped and in requested order.
     pub participant_ids: &'a [String],
     /// Capability names requested; each must already be held by the parent,
@@ -2245,7 +2259,8 @@ pub(crate) struct SubspacePlan<'a> {
 /// 6. every requested sub-agent is a live global agent (the
 ///    `add_global_participant` rule, asked here so the refusal is the spawn's).
 ///
-/// Then, in one commit: the space row (parent, the parent's `cascade_limit`
+/// Then, in one commit: the space row (parent, the anchor and the spawning
+/// turn's answer item, the parent's `cascade_limit`
 /// and `router_model`, **born stamped** — an agent minted this deliberately,
 /// exactly as a promotion mints a notebook), the owner's `role = 'owner'`
 /// membership, each sub-agent as a `member` with `override_notify_policy =
@@ -2494,9 +2509,9 @@ async fn spawn_subspace_tx_body(
     // the brief below means it could never have been reaped anyway.
     conn.execute(
         "INSERT INTO space \
-         (id, parent_space_id, parent_action_id, title, linkability, cascade_limit, \
-          router_model, created_at, touched_at) \
-         VALUES (?1, ?2, ?7, ?3, 'unlinked', ?4, ?5, ?6, ?6)",
+         (id, parent_space_id, parent_action_id, parent_answer_item_id, title, linkability, \
+          cascade_limit, router_model, created_at, touched_at) \
+         VALUES (?1, ?2, ?7, ?8, ?3, 'unlinked', ?4, ?5, ?6, ?6)",
         (
             Value::Text(plan.space_id.to_string()),
             Value::Text(plan.parent_space_id.to_string()),
@@ -2505,6 +2520,7 @@ async fn spawn_subspace_tx_body(
             opt_str(parent_router_model.as_deref()),
             Value::Integer(plan.now),
             opt_str(plan.parent_action_id),
+            opt_str(plan.answer_item_id),
         ),
     )
     .await

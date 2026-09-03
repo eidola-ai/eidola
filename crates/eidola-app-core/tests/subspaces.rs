@@ -137,6 +137,7 @@ fn spawn_from(
         capabilities,
         None,
         parent_action_id.map(str::to_string),
+        None,
     ))
 }
 
@@ -3392,13 +3393,21 @@ fn the_delegate_tool_opens_a_room_from_the_turn_it_was_called_in() {
         let room = &rooms[0];
         assert_eq!(room.owner_participant_id, owner);
         assert_eq!(room.parent_space_id, parent);
-        // A committed spawn *keeps* its record of which turn opened the room —
-        // the report attaches beneath that turn's answer, and the driver is the
-        // one that clears it when the delegation ends.
+        // A committed spawn records *which turn* opened the room, in the room's
+        // own row — the item the owner's answer here is written under, which is
+        // what the report attaches beneath. The anchor cannot say it: one post
+        // can carry two answers from one agent.
+        let answer_item = core
+            .runtime()
+            .block_on(core.get_space_tree(parent.clone()))
+            .expect("tree")
+            .pop()
+            .expect("the owner answered")
+            .item_id;
         assert_eq!(
-            core.test_spawning_answer_record_count(),
-            1,
-            "the room the turn opened is recorded against the turn"
+            room.parent_answer_item_id.as_deref(),
+            Some(answer_item.as_str()),
+            "the room the turn opened is recorded against that turn's answer"
         );
         assert_eq!(
             room.parent_action_id.as_deref(),
@@ -3579,68 +3588,6 @@ fn a_space_owned_agent_is_offered_no_delegation() {
 /// **The tool is no way around a guard.** Every refusal the spawn door decides
 /// inside its transaction arrives at the model as a *tool result* — correctable
 /// — and leaves no room behind, which is what stops a model turning a refusal
-/// **A room closed before its driver settles takes its record with it.** The
-/// record of which turn opened a delegated room is cleared at
-/// `drive_subspace`'s terminal exits — and an archived room never reaches
-/// them: it is no longer a live delegated room, so the supervisor calls it
-/// ordinary and never arms a walk for it. The archival doors are therefore the
-/// only clearing there is, and without one a long-lived process opening and
-/// archiving delegations grows that map for as long as it runs.
-#[test]
-fn archiving_a_room_before_it_settles_releases_its_spawning_record() {
-    run(|| {
-        let (_mock, core, _dir, script) = tool_setup();
-        let parent = space(&core);
-        let owner = shared_agent(&core, &parent, "Navigator");
-        let anchor = last_action(&core, &parent);
-
-        // Three delegations, closed through both doors that reach `close_rooms`
-        // — `archive_space`, which hands it whatever its transaction closed (one
-        // room, or a whole subtree when the conversation above them goes), and a
-        // retirement, which hands it that agent's own set. A departure is the
-        // third caller of the same door with a set of the same shape.
-        for brief in ["First look.", "Second look.", "Third look."] {
-            *script.lock().unwrap() = vec![(
-                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
-                serde_json::json!({ "brief": brief }).to_string(),
-            )];
-            ask(&core, &parent, &owner, &anchor);
-        }
-        let rooms: Vec<String> = core
-            .runtime()
-            .block_on(core.subspaces_of(parent.clone()))
-            .expect("rooms")
-            .into_iter()
-            .map(|r| r.id)
-            .collect();
-        assert_eq!(rooms.len(), 3, "{rooms:?}");
-        assert_eq!(
-            core.test_spawning_answer_record_count(),
-            3,
-            "each open room is recorded against the turn that opened it"
-        );
-
-        // Directly.
-        core.runtime()
-            .block_on(core.archive_space(rooms[0].clone()))
-            .expect("archive the room");
-        assert_eq!(
-            core.test_spawning_answer_record_count(),
-            2,
-            "a closed room keeps nothing"
-        );
-
-        // With its owner — a retirement archives every room that agent owns.
-        core.runtime()
-            .block_on(core.retire_participant(owner.clone()))
-            .expect("retire the owner");
-        assert_eq!(
-            core.test_spawning_answer_record_count(),
-            0,
-            "and neither does a room closed with the agent answerable for it"
-        );
-    });
-}
 
 /// into a retry loop that mints anything.
 #[test]
@@ -3736,16 +3683,6 @@ fn the_delegate_tool_is_refused_by_every_guard_the_door_holds() {
                 .len() as i64,
             MAX_LIVE_SUBSPACES_PER_OWNER,
             "a refused call mints nothing"
-        );
-        // Including in memory. The record of which turn opened a room is
-        // written before the spawning transaction and keyed by a room id, so a
-        // refusal that left one behind would name a room nothing can ever reach
-        // to clear — and the live-rooms ceiling is a *standing* refusal, so it
-        // would be one more per attempt for the life of the process.
-        assert_eq!(
-            core.test_spawning_answer_record_count(),
-            0,
-            "a refused delegation records nothing about a room it did not open"
         );
     });
 }

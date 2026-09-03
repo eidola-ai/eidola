@@ -77,7 +77,6 @@ use uuid::Uuid;
 
 use crate::db;
 use crate::error::AppError;
-use crate::subspace_driver::SpawningAnswerGuard;
 use crate::tools::{Tool, ToolError, ToolFuture};
 use crate::{Change, Inner, derive_space_title, now_ms};
 
@@ -246,6 +245,10 @@ pub struct SubspaceInfo {
     /// The post in the parent it was opened from, when the spawn named one —
     /// where its report attaches. `None` for a spawn that named none.
     pub parent_action_id: Option<String>,
+    /// The item the turn that opened it writes its answer under — which *turn*
+    /// asked, where the anchor says only which post it was asked on. The report
+    /// attaches beneath that answer. `None` for a spawn with no turn behind it.
+    pub parent_answer_item_id: Option<String>,
     pub title: Option<String>,
     pub created_at: i64,
     pub archived_at: Option<i64>,
@@ -258,6 +261,7 @@ impl From<db::SubspaceRow> for SubspaceInfo {
             parent_space_id: r.parent_space_id,
             owner_participant_id: r.owner_participant_id,
             parent_action_id: r.parent_action_id,
+            parent_answer_item_id: r.parent_answer_item_id,
             title: r.title,
             created_at: r.created_at,
             archived_at: r.archived_at,
@@ -367,6 +371,14 @@ impl Inner {
             participant_ids: &seats,
             capabilities: &names,
             parent_action_id,
+            // **Which turn is asking, written with the room itself.** The
+            // report attaches beneath this turn's answer, and the column
+            // commits inside the spawn's transaction — so the fact is exactly
+            // as durable as the room, cannot be observed before the row it
+            // belongs to, and is still there when the process that opened the
+            // room is not. A delegation runs for as long as its work takes,
+            // and the app being quit in the middle of one is ordinary.
+            answer_item_id,
             now,
         };
         // **Recorded as this process's before the room exists.** A spawn
@@ -378,29 +390,10 @@ impl Inner {
         // window in which the row is enumerable and unrecorded, which is the
         // whole hazard; a refused spawn just leaves an id naming nothing.
         self.note_room_spawned_here(&space_id);
-        // **And which answer this room's report belongs under**, recorded on
-        // the same line and ahead of the same transaction, for the same
-        // reason: the spawn's own emissions can arm the driver, so a record
-        // written after the room exists leaves a window in which the driver
-        // can ask this question and be told nothing.
-        //
-        // Unlike the line above it, this one is **held by a guard**: it is
-        // keyed by a room id, and a spawn that never commits leaves an id
-        // naming nothing that the driver can never reach to clear. The refusal
-        // that makes it matter is the standing one — an owner at its
-        // live-rooms ceiling goes on asking — so every failing exit below
-        // releases it by dropping, and only a commit keeps it.
-        let answer_record = answer_item_id
-            .map(|item| SpawningAnswerGuard::note(self.spawning_answers(), &space_id, item));
         let title = match db::spawn_subspace_tx(&conn, &plan).await? {
             Ok(title) => title,
             Err(refusal) => return Err(AppError::SpawnRefused { refusal }),
         };
-        // Committed: the room exists, so the record is the driver's to drop
-        // when the delegation ends. Before the emissions, which can arm it.
-        if let Some(record) = answer_record {
-            record.keep();
-        }
 
         // One emission per thing the spawn wrote, mirroring what an
         // instantiation announces: the Library gained a row, the new space has
@@ -416,6 +409,7 @@ impl Inner {
                 parent_space_id: parent_space_id.to_string(),
                 owner_participant_id: owner_participant_id.to_string(),
                 parent_action_id: parent_action_id.map(str::to_string),
+                parent_answer_item_id: answer_item_id.map(str::to_string),
                 title: Some(title),
                 created_at: now,
                 archived_at: None,
@@ -1088,6 +1082,7 @@ mod tests {
                 parent_space_id: "s-0".into(),
                 owner_participant_id: "p-owner".into(),
                 parent_action_id: None,
+                parent_answer_item_id: None,
                 title: Some(title.into()),
                 created_at: 0,
                 archived_at: None,
@@ -1319,6 +1314,7 @@ mod tests {
                 parent_space_id: "s-0".into(),
                 owner_participant_id: "p-owner".into(),
                 parent_action_id: None,
+                parent_answer_item_id: None,
                 title: None,
                 created_at: 0,
                 archived_at: None,

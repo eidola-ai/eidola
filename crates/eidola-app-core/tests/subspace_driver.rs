@@ -124,6 +124,20 @@ fn spawn_from(
     participants: Vec<String>,
     anchor: Option<&str>,
 ) -> SpawnedSubspace {
+    spawn_for_turn(core, parent, owner, participants, anchor, None)
+}
+
+/// A spawn that names the **turn** it was opened from as well as the post: the
+/// item that turn will write its answer under, which is what the `delegate`
+/// tool supplies from inside a turn and what the report attaches beneath.
+fn spawn_for_turn(
+    core: &AppCore,
+    parent: &str,
+    owner: &str,
+    participants: Vec<String>,
+    anchor: Option<&str>,
+    answer_item: Option<&str>,
+) -> SpawnedSubspace {
     core.runtime()
         .block_on(core.spawn_subspace(
             parent.to_string(),
@@ -133,6 +147,7 @@ fn spawn_from(
             vec![],
             None,
             anchor.map(str::to_string),
+            answer_item.map(str::to_string),
         ))
         .expect("spawn")
 }
@@ -185,16 +200,29 @@ fn restartable() -> (
     AppCore,
     tempfile::TempDir,
 ) {
+    restartable_with(ChatBehavior::OkStreaming)
+}
+
+/// The same, on a mock that answers whichever transport the test needs — asks
+/// stream, a regeneration is blocking.
+fn restartable_with(
+    chat: ChatBehavior,
+) -> (
+    tokio::runtime::Runtime,
+    MockServer,
+    AppCore,
+    tempfile::TempDir,
+) {
     let mock_rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("mock runtime");
     let mock = mock_rt.block_on(chat_harness::start(MockConfig {
-        chat: ChatBehavior::OkStreaming,
+        chat,
         ..MockConfig::default()
     }));
     let (_unused, core, dir) = chat_harness::core_for(MockConfig {
-        chat: ChatBehavior::OkStreaming,
+        chat,
         ..MockConfig::default()
     });
     add_backend_at(&core, &mock.base_url);
@@ -1668,8 +1696,14 @@ fn a_report_waits_for_its_own_turns_answer_and_not_a_siblings() {
             .expect("the answer is in the parent")
             .item_id;
 
-        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
-        core.test_note_spawning_answer_item(&out.space.id, &item);
+        let out = spawn_for_turn(
+            &core,
+            &parent,
+            &owner,
+            vec![helper],
+            Some(&asked),
+            Some(&item),
+        );
 
         // A second, unrelated answer by the same owner to the same post lands
         // while that regeneration is still running. It is newer than the room,
@@ -1750,6 +1784,70 @@ fn a_report_finds_its_turns_answer_across_a_restart_and_an_edit() {
             report.parent_action_id.as_deref(),
             Some(edited.as_str()),
             "not on the anchor, as that answer's sibling"
+        );
+        drop(mock_rt);
+    });
+}
+
+/// **And it finds it when a sibling answered last and the process went away.**
+/// A delegation runs for as long as its work takes, so the spawning turn
+/// committing its answer and the app then being quit before the report lands is
+/// ordinary rather than exceptional. Held in memory, which turn opened the room
+/// was gone by the next start, and the newest-answer rule that was left picked
+/// whichever answer to the anchor committed last — the sibling turn's, where
+/// one had raced in. The room's own row records it instead, so the question
+/// reads the same on either side of a restart.
+#[test]
+fn a_report_finds_its_turns_answer_after_a_restart_a_sibling_won() {
+    run(|| {
+        // Both transports: the asks stream, the regeneration is blocking.
+        let (mock_rt, mock, core, dir) = restartable_with(ChatBehavior::OkEitherTransport);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+
+        // The delegation is opened from a regeneration of the owner's answer,
+        // so the spawning turn's item is that answer's.
+        let first = ask(&core, &parent, &owner, &asked);
+        let item = tree(&core, &parent)
+            .into_iter()
+            .find(|n| n.action_id == first)
+            .expect("the answer is in the parent")
+            .item_id;
+        let out = spawn_for_turn(
+            &core,
+            &parent,
+            &owner,
+            vec![helper],
+            Some(&asked),
+            Some(&item),
+        );
+
+        // The spawning turn lands its answer…
+        core.runtime()
+            .block_on(core.regenerate(first.clone(), MODEL.to_string()))
+            .expect("the spawning turn writes its answer");
+        // …and a sibling turn's answer to the same post commits *after* it, so
+        // the newest answer on the anchor is not this delegation's.
+        let sibling = ask(&core, &parent, &owner, &asked);
+
+        // The process goes away before the report lands.
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &mock.base_url);
+        drive_as_sweep(&core, &out.space.id).expect("the room is driven after the restart");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        let landed = report.parent_action_id.clone().expect("it attached");
+        assert_ne!(landed, sibling, "not beneath the sibling turn's answer");
+        assert_eq!(
+            tree(&core, &parent)
+                .into_iter()
+                .find(|n| n.action_id == landed)
+                .expect("the target is in the parent")
+                .item_id,
+            item,
+            "beneath the answer of the turn that opened the room"
         );
         drop(mock_rt);
     });
@@ -2294,6 +2392,7 @@ fn a_delegation_beneath_a_closed_conversation_stops_and_lets_go() {
                 vec![],
                 None,
                 Some(brief),
+                None,
             ))
             .expect("spawn");
 
@@ -3136,6 +3235,7 @@ fn a_spawn_cannot_anchor_to_a_hidden_tip() {
                     vec![],
                     None,
                     Some(id.clone()),
+                    None,
                 ))
                 .expect_err("a hidden generation is not an anchor")
             {

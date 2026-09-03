@@ -1723,13 +1723,6 @@ struct Inner {
     /// so these are exactly the rooms the sweep's licence is false about — see
     /// `Inner::note_room_spawned_here`.
     rooms_spawned_here: Mutex<Option<std::collections::HashSet<String>>>,
-    /// Delegated room → the **item** the turn that opened it will write its
-    /// answer under (`TurnPrep::inf_item_id`, minted before the turn's first
-    /// request). The report attaches beneath that answer, and this is the only
-    /// thing that tells one turn from another when the same agent has two
-    /// running against the same post — see
-    /// `Inner::note_spawning_answer_item`.
-    spawning_answer_items: subspace_driver::SpawningAnswerRegistry,
     /// The **items** a regeneration is currently running against, process-wide
     /// — the guard that keeps one post from being revised twice at once (see
     /// [`RegenerationGuard`]).
@@ -8937,7 +8930,6 @@ impl AppCore {
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
                 subspace_walks: Mutex::new(std::collections::HashMap::new()),
                 rooms_spawned_here: Mutex::new(Some(std::collections::HashSet::new())),
-                spawning_answer_items: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 regenerating_items: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 walk_permits: Arc::new(tokio::sync::Semaphore::new(
                     subspace_driver::MAX_CONCURRENT_WALKS,
@@ -10323,35 +10315,6 @@ impl AppCore {
         rx
     }
 
-    /// Test-only seam: how many delegated rooms this process is holding a
-    /// spawning-turn record for. A refused spawn must leave none behind, and a
-    /// room-keyed record naming a room that was never created is one nothing
-    /// could ever reach to clear.
-    #[doc(hidden)]
-    #[cfg(feature = "test-support")]
-    pub fn test_spawning_answer_record_count(&self) -> usize {
-        self.inner
-            .spawning_answers()
-            .lock()
-            .expect("spawning answer record poisoned")
-            .len()
-    }
-
-    /// Test-only seam: record which turn opened a delegated room, the way the
-    /// `delegate` tool does from inside a turn (see
-    /// `Inner::note_spawning_answer_item`).
-    ///
-    /// Exists because the record is made *inside* `prepare_turn`, from an item
-    /// a turn mints for itself — so the interleaving that matters here (a
-    /// second answer by the same owner to the same post, committing while the
-    /// spawning turn is still running) cannot be staged through the public
-    /// spawn door, which has no turn behind it and records nothing.
-    #[doc(hidden)]
-    #[cfg(feature = "test-support")]
-    pub fn test_note_spawning_answer_item(&self, space_id: &str, item_id: &str) {
-        self.inner.note_spawning_answer_item(space_id, item_id);
-    }
-
     /// Test-only seam: drive one delegated room to a stop and deliver its
     /// report, awaited to completion.
     ///
@@ -10532,6 +10495,18 @@ impl AppCore {
     /// caller with no turn behind it (a test, a direct API use); the report
     /// then falls back to the conversation's own last word.
     ///
+    /// **`answer_item_id` is which *turn* is asking**, and it is the caller's
+    /// for the same reason: the anchor says which post the work was asked on,
+    /// and one post can have two answers from one agent (a second explicit ask,
+    /// a regeneration running beside a reply), so only the turn knows which of
+    /// them the report belongs beneath. It is the item that turn will write its
+    /// answer under — minted before the turn's first request, because a capped
+    /// or budget-stopped turn writes no inference at all and so has no answer
+    /// id yet to give. Captured durably (`space.parent_answer_item_id`), so it
+    /// outlives the process that opened the room. `None` for a caller with no
+    /// turn behind it, which falls back to the owner's newest answer on the
+    /// anchor.
+    ///
     /// Refusals arrive as [`AppError::SpawnRefused`] carrying a
     /// [`SpawnRefusal`], and leave nothing behind. On success:
     /// [`Change::SpaceIndex`] (the Library lists sub-spaces like any other
@@ -10547,6 +10522,7 @@ impl AppCore {
         capabilities: Vec<String>,
         title: Option<String>,
         parent_action_id: Option<String>,
+        answer_item_id: Option<String>,
     ) -> Result<SpawnedSubspace, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -10560,9 +10536,7 @@ impl AppCore {
                         &capabilities,
                         title.as_deref(),
                         parent_action_id.as_deref(),
-                        // A direct caller has no turn behind it, so there is no
-                        // answer of its own for the report to wait for.
-                        None,
+                        answer_item_id.as_deref(),
                     )
                     .await
             })
