@@ -46,10 +46,19 @@
 //! **It always terminates.** If the caller never reads, it eventually goes
 //! away; the writer's socket write then fails, it drops the receiver, and every
 //! blocked send fails immediately rather than waiting — tasks unwind, permits
-//! release, the reader sees end-of-stream. The one thing that keeps growing
-//! meanwhile is the turn's own event channel (`chat_stream`'s sender is
-//! unbounded and belongs to app-core), and that is bounded by one answer's
-//! length rather than by the caller's appetite.
+//! release. The one thing that keeps growing meanwhile is the turn's own event
+//! channel (`chat_stream`'s sender is unbounded and belongs to app-core), and
+//! that is bounded by one answer's length rather than by the caller's appetite.
+//!
+//! **And the writer's death ends the reading, rather than being noticed only by
+//! whoever next tries to send.** A peer that closes its read half and keeps
+//! writing is still a well-behaved-looking caller from the reader's side, so
+//! nothing in the frames themselves says the answers have nowhere to go — and
+//! dispatching one anyway starts work that is billed (`chat.stream`) for a
+//! result that provably cannot be delivered. The read loop therefore races
+//! `next_line` against the outbox closing and asks once more before it
+//! dispatches. In-flight requests keep the semantics below: their frames stop,
+//! their turns do not.
 //!
 //! ## What a lost caller costs
 //!
@@ -98,7 +107,7 @@ use tokio::sync::mpsc;
 use super::{
     Call, FrameReader, HelloResult, MAX_RESPONSE_BYTES, NO_REQUEST, PROTOCOL_VERSION,
     ProtocolError, Request, Response, SpacesListResult, WalletCredentialsResult, WireError,
-    decode_request, encode_line, terminal_line,
+    decode_request, encode_line, terminal_error_line, terminal_line,
 };
 use crate::AppCore;
 use crate::error::AppError;
@@ -173,14 +182,18 @@ async fn read_frames<R: AsyncRead + Unpin>(
 
     // Every refusal below is awaited, and a writer that has gone away ends the
     // loop rather than being ignored: with a bounded outbox a send is where a
-    // stalled connection is felt, so swallowing its failure would spin.
+    // stalled connection is felt, so swallowing its failure would spin. The
+    // frame goes out through `terminal_error_line` like every other terminal
+    // frame — a refusal is one, and measuring only the ones that succeeded
+    // would leave the `err` branch as the way past the ceiling.
     macro_rules! refuse {
         ($id:expr, $err:expr) => {
             if out
-                .send(encode_line(&Response::err(
+                .send(terminal_error_line(
                     $id,
                     WireError::from_protocol(&$err),
-                )))
+                    MAX_RESPONSE_BYTES,
+                ))
                 .await
                 .is_err()
             {
@@ -190,16 +203,33 @@ async fn read_frames<R: AsyncRead + Unpin>(
     }
 
     loop {
-        let line = match frames.next_line().await {
-            Ok(Some(line)) => line.to_vec(),
-            Ok(None) => break,
-            Err(e) => {
+        // **Nothing is read while there is nowhere to put the answer.** The
+        // writer drops the outbox receiver when the socket stops taking bytes,
+        // and a peer that closed only its read half goes on sending perfectly
+        // good requests afterwards — so without this the loop would keep
+        // dispatching work whose answer is already known to be undeliverable,
+        // and `chat.stream` is billed work. Raced against the read rather than
+        // checked after it, so a caller already blocked on `next_line` is let
+        // go the moment the writer dies instead of at its next frame.
+        let next: Option<Result<Vec<u8>, ProtocolError>> = tokio::select! {
+            biased;
+            () = out.closed() => None,
+            read = frames.next_line() => match read {
+                Ok(Some(line)) => Some(Ok(line.to_vec())),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            },
+        };
+        let line = match next {
+            Some(Ok(line)) => line,
+            Some(Err(e)) => {
                 refuse!(NO_REQUEST, e);
                 if e.is_fatal() {
                     break;
                 }
                 continue;
             }
+            None => break,
         };
 
         let request = match decode_request(&line) {
@@ -266,6 +296,12 @@ async fn read_frames<R: AsyncRead + Unpin>(
         let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
             break;
         };
+        // Asked again on the last line before the work starts, because the wait
+        // above can be long: the answer to "can this still be delivered" has to
+        // be as fresh as the decision it gates.
+        if out.is_closed() {
+            break;
+        }
         let core = Arc::clone(&core);
         let app_version = app_version.clone();
         let out = out.clone();
@@ -276,12 +312,15 @@ async fn read_frames<R: AsyncRead + Unpin>(
             // abort — so an id is never stranded by a connection tearing down.
             let _in_flight = in_flight;
             let _permit = permit;
+            // Neither arm is `encode_line` directly: both are terminal frames
+            // under the same ceiling, and both carry a payload this app does
+            // not get to bound — a result grows with the profile, and a
+            // failure's message can be an upstream's own error body. The
+            // measured seam is what keeps the app from writing a line its own
+            // reader would refuse, whichever way the verb went.
             let line = match answer(&core, &app_version, id, call, &out).await {
-                // Not `encode_line` directly: a result is the one payload that
-                // grows with the profile, and `terminal_line` is what keeps the
-                // app from writing a line its own reader would refuse.
                 Ok(data) => terminal_line(id, verb, data, MAX_RESPONSE_BYTES),
-                Err(error) => encode_line(&Response::err(id, error)),
+                Err(error) => terminal_error_line(id, error, MAX_RESPONSE_BYTES),
             };
             // Awaited, and the permit is still held: that is how a caller who
             // stops reading stops being served instead of being buffered.
