@@ -1554,11 +1554,13 @@ mod tests {
             7 * MAX_RESPONSE_BYTES,
             "four requests in hand, two queued, one in the writer's"
         );
-        assert!(
-            serve::MAX_RETAINED_RESPONSE_BYTES <= 512 * 1024 * 1024,
-            "one connection may hold {} bytes",
-            serve::MAX_RETAINED_RESPONSE_BYTES
+        assert_eq!(
+            serve::MAX_RETAINED_RESPONSE_BYTES / (1024 * 1024),
+            448,
+            "MiB one connection may hold"
         );
+        // The ceiling itself is a `const` assertion beside the constants, so
+        // exceeding it fails the build rather than a test run.
     }
 
     #[test]
