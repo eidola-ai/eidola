@@ -170,21 +170,49 @@ impl Session {
                 }));
             }
         };
-        match runtime.block_on(Client::connect(&config_dir, &data_dir)) {
-            Ok(client) => Ok(Session {
-                mode: Mode::Client {
-                    runtime,
-                    client: tokio::sync::Mutex::new(client),
-                },
-                config_path,
-            }),
+        let client_mode = |runtime, client, config_path| Session {
+            mode: Mode::Client {
+                runtime,
+                client: tokio::sync::Mutex::new(client),
+            },
+            config_path,
+        };
+        match Self::dial(&runtime, &config_dir, &data_dir) {
+            Ok(client) => Ok(client_mode(runtime, client, config_path)),
             Err(Dial::NoListener) => {
                 // Nothing to ask, so open the profile here — which is also how
                 // we learn whether anything is holding it.
-                drop(runtime);
-                AppCore::new(config_dir, data_dir)
-                    .map(|core| Session::from_core(core, config_path))
-                    .map_err(unanswered)
+                match AppCore::new(config_dir.clone(), data_dir.clone()) {
+                    Ok(core) => {
+                        drop(runtime);
+                        Ok(Session::from_core(core, config_path))
+                    }
+                    // **Someone took the lock between that dial and this
+                    // open**, and starting the app is exactly how that
+                    // happens: the GUI takes the profile and binds its socket
+                    // a moment apart, and a command launched alongside it can
+                    // arrive in between. Look once more before concluding that
+                    // the holder does not serve the profile — the answer has
+                    // changed since the question was last asked. Once, not in
+                    // a loop: what this settles is a race that has already
+                    // resolved, and waiting for a holder that might start
+                    // serving is the silent wait the whole rule forbids.
+                    Err(e) if matches!(e, AppError::DatabaseInUse { .. }) => {
+                        match Self::dial(&runtime, &config_dir, &data_dir) {
+                            Ok(client) => Ok(client_mode(runtime, client, config_path)),
+                            // Still nothing serving it. The holder is an
+                            // Eidola older than the socket, or one whose
+                            // listener stopped — which is what `unanswered`
+                            // says, naming the process holding the lock.
+                            Err(Dial::NoListener | Dial::NotAccepting) => Err(unanswered(e)),
+                            Err(Dial::OtherProfile { ours, theirs }) => {
+                                Err(Startup::OtherProfile { ours, theirs })
+                            }
+                            Err(Dial::Failed(e)) => Err(Startup::Dial(e)),
+                        }
+                    }
+                    Err(other) => Err(unanswered(other)),
+                }
             }
             Err(Dial::NotAccepting) => Err(Startup::NotAccepting { pid: None }),
             // Refused during the handshake, so no verb was ever dispatched at
@@ -192,6 +220,21 @@ impl Session {
             Err(Dial::OtherProfile { ours, theirs }) => Err(Startup::OtherProfile { ours, theirs }),
             Err(Dial::Failed(e)) => Err(Startup::Dial(e)),
         }
+    }
+
+    /// One dial of the control socket, with every handshake gate the
+    /// selection rule applies — the profile check included, so a redial can
+    /// no more adopt another profile's app than the first attempt could.
+    fn dial(
+        runtime: &tokio::runtime::Runtime,
+        config_dir: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> Result<Client, Dial> {
+        #[cfg(test)]
+        if tests::first_dial_finds_nothing() {
+            return Err(Dial::NoListener);
+        }
+        runtime.block_on(Client::connect(config_dir, data_dir))
     }
 
     /// Embedded mode: this process opens the profile.
@@ -744,6 +787,27 @@ mod tests {
         );
     }
 
+    thread_local! {
+        /// Makes the **next** dial report that nothing is listening.
+        ///
+        /// The window this exists to test is a few syscalls wide — between
+        /// the first dial and the profile open that loses the lock — so a
+        /// test cannot schedule a listener into it from outside. Forcing the
+        /// first look to miss puts the process in exactly the state the race
+        /// leaves it in, with a real app already serving, and lets the redial
+        /// be the thing under test rather than the timer.
+        static FIRST_DIAL_MISSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Takes the flag, so only the first dial of a run is affected.
+    pub(super) fn first_dial_finds_nothing() -> bool {
+        FIRST_DIAL_MISSES.with(|f| f.replace(false))
+    }
+
+    fn make_first_dial_miss() {
+        FIRST_DIAL_MISSES.with(|f| f.set(true));
+    }
+
     /// An app serving `config_dir` as its config root, recording every verb
     /// it is asked so a refusal that arrived too late is visible.
     fn profile_greeter(
@@ -849,6 +913,63 @@ mod tests {
         std::fs::write(dir.path().join("config.toml"), "account_id = \"second\"\n")
             .expect("rewrite config");
         assert_eq!(session.account_identity(), Some("second".to_string()));
+    }
+
+    #[test]
+    fn a_profile_taken_between_the_dial_and_the_open_is_asked_again() {
+        // Starting the app is a race a command can lose by microseconds: the
+        // GUI takes the profile lock and binds its socket a moment apart, and
+        // a dial that arrives in between finds nothing, then the open finds
+        // the lock gone. Concluding there that the holder does not serve the
+        // profile tells the reader to quit an app that is answering — so the
+        // question is asked once more, because its answer has changed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = profile_greeter(
+            dir.path(),
+            Some(eidola_app_core::ipc::path_bytes(dir.path())),
+            std::sync::Arc::clone(&seen),
+        );
+        // The peer that won the race holds the profile and serves it.
+        let holder = AppCore::new(dir.path().into(), dir.path().into()).expect("the peer's open");
+
+        make_first_dial_miss();
+        let session =
+            Session::open(dir.path().into(), dir.path().into(), false).expect("the redial answers");
+        assert!(
+            session.is_client(),
+            "an app that is serving takes the command, whichever order the \
+             race resolved in"
+        );
+
+        drop(session);
+        drop(holder);
+        server.join().expect("the server ends with the connection");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec!["hello".to_string()],
+            "and the redial is a real handshake, gates and all"
+        );
+    }
+
+    #[test]
+    fn a_holder_that_serves_nothing_is_still_named_as_that() {
+        // The other side of the same door, and the reason the redial is one
+        // look rather than a wait: a lock holder that serves no socket — an
+        // Eidola older than it, or one whose listener stopped — must still be
+        // reported, not waited on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let holder = AppCore::new(dir.path().into(), dir.path().into()).expect("the holder");
+
+        make_first_dial_miss();
+        match Session::open(dir.path().into(), dir.path().into(), false) {
+            Err(Startup::NotAccepting { .. }) => {}
+            other => panic!(
+                "a second look that finds nothing is still the honest refusal: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        drop(holder);
     }
 
     #[test]
