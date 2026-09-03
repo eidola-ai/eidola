@@ -437,6 +437,29 @@ fn a_refused_spawn_writes_nothing_at_all() {
             ),
             SpawnRefusal::ParticipantNotEligible { .. }
         ));
+        // A live shared agent that has left *this* conversation is refused
+        // too, and told apart from the one above: it is perfectly invitable
+        // somewhere it still takes part, just not into a room opened from here.
+        let gone = shared_agent(&core, &parent, "Adrift");
+        core.runtime()
+            .block_on(core.remove_space_participant(parent.clone(), gone.clone()))
+            .expect("remove from the parent");
+        assert_eq!(
+            refusal(
+                spawn(
+                    &core,
+                    &parent,
+                    &owner,
+                    "Do a thing.",
+                    vec![gone.clone()],
+                    vec![],
+                )
+                .unwrap_err()
+            ),
+            SpawnRefusal::ParticipantHasLeft {
+                label: "Adrift".into()
+            }
+        );
 
         assert_eq!(
             core.runtime()
@@ -3415,6 +3438,100 @@ fn the_delegate_tool_opens_a_room_from_the_turn_it_was_called_in() {
             results[0]
         );
     });
+}
+
+/// **A seat is asked about at the write, not at the snapshot.**
+///
+/// The names a delegation may use resolve against the roster its turn was
+/// prepared from, and that asymmetry is deliberate: the name a model reads is
+/// the name that resolves. But a snapshot is a snapshot — a reader taking a
+/// helper out of the conversation while the turn runs leaves a candidate that
+/// still resolves to somebody who has gone. Seating it would put an agent in a
+/// room opened from a conversation it is no longer in and hand its backend a
+/// newly written brief drawn from that conversation, so the spawn asks the
+/// membership question again inside its own transaction, where it cannot be
+/// raced.
+#[test]
+fn a_seat_that_leaves_mid_turn_is_refused_rather_than_seated() {
+    run(|| {
+        let (mock, core, _dir, script) = tool_setup();
+        let core = std::sync::Arc::new(core);
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let anchor = last_action(&core, &parent);
+
+        core.register_tool(std::sync::Arc::new(RemoveMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            space_id: parent.clone(),
+            participant: helper.clone(),
+        }))
+        .expect("register");
+
+        // The first call takes the helper out of the conversation; the second
+        // asks for it by the name the turn's roster still carries.
+        *script.lock().unwrap() = vec![
+            ("remove_helper_now".into(), "{}".into()),
+            (
+                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+                serde_json::json!({
+                    "brief": "Read Friday's tide tables and say when the second high water is.",
+                    "participants": ["Surveyor"],
+                })
+                .to_string(),
+            ),
+        ];
+        ask(&core, &parent, &owner, &anchor);
+
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 2, "{results:?}");
+        let refused = &results[1];
+        assert!(
+            refused.contains("\"Surveyor\"") && refused.contains("no longer taking part"),
+            "the refusal names the seat, and is one the model can act on: {refused}"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent.clone()))
+                .expect("rooms")
+                .is_empty(),
+            "and no room was opened around a seat the reader had already removed"
+        );
+    });
+}
+
+/// A tool that takes a participant out of the conversation from inside a turn
+/// running in it — the interleave the seat recheck is about, made
+/// deterministic.
+struct RemoveMidTurn {
+    core: std::sync::Weak<AppCore>,
+    space_id: String,
+    participant: String,
+}
+
+impl eidola_app_core::tools::Tool for RemoveMidTurn {
+    fn name(&self) -> &str {
+        "remove_helper_now"
+    }
+    fn description(&self) -> &str {
+        "Take the helper out of this conversation, right now."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}, "required": []})
+    }
+    fn call<'a>(&'a self, _a: serde_json::Value) -> eidola_app_core::tools::ToolFuture<'a> {
+        Box::pin(async move {
+            let core = self.core.upgrade().expect("core outlives the turn");
+            let removed = core
+                .remove_space_participant(self.space_id.clone(), self.participant.clone())
+                .await
+                .map_err(|e| {
+                    eidola_app_core::tools::ToolError::new(format!("removal failed: {e}"))
+                })?;
+            assert!(removed, "the helper was a member");
+            Ok("removed".to_string())
+        })
+    }
 }
 
 /// **The gate is the one `list_my_spaces` carries, and for the same reason.**
