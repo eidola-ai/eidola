@@ -86,6 +86,32 @@ const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 16;
 /// How long the accept loop waits after a failure before trying again.
 const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How many connections this socket serves at once.
+///
+/// **The per-connection bound is not an aggregate one.** Each served connection
+/// gets its own concurrency limit and its own outbox
+/// (`eidola_app_core::ipc::serve`), so without a cap here a caller that opens
+/// sockets in a loop multiplies both without bound — and `chat.stream` is
+/// billed work, so "as many as the peer can open" is the wrong shape for it.
+/// Capping *connections* rather than sharing one request semaphore keeps
+/// per-connection fairness intact (nobody's pipeline starves anyone else's) and
+/// leaves the request bound where its contract already lives.
+///
+/// Eight, because the consumer this protocol has is a command-line client: a
+/// person running several invocations at once is a handful, a script fanning
+/// out has room, and the aggregate is a stated number (8 × the per-connection
+/// limit) rather than an open question.
+///
+/// **This is an anti-footgun, not a defence.** Every peer here is the same uid
+/// by construction (the peer-cred gate above), so what it bounds is a *buggy*
+/// local caller, not an adversary — one that could already read the database off
+/// disk. A peer past the cap is dropped with a diagnostic rather than told
+/// why in a frame: a correct client never reaches this state, and a typed
+/// refusal for it would mean a wire addition every client has to learn. The
+/// cost, named honestly, is that the caller sees an immediate end of stream and
+/// has to look at stderr to learn it was the cap.
+const MAX_CONNECTIONS: usize = 8;
+
 /// The verdict on one connecting peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
@@ -146,17 +172,20 @@ struct Serving {
 }
 
 impl Serving {
-    /// Take on a connection to serve. `false` means the door closed under it and
-    /// the caller must drop the stream — nothing here will ever answer it.
-    fn admit(&mut self, serve: impl std::future::Future<Output = ()> + Send + 'static) -> bool {
+    /// Take on a connection to serve, or say why not.
+    fn admit(&mut self, serve: impl std::future::Future<Output = ()> + Send + 'static) -> Admitted {
         if self.closed {
-            return false;
+            return Admitted::DoorShut;
+        }
+        // Reaped **before** the count, and that order is load-bearing: a stale
+        // tally would turn callers away on behalf of connections that hung up
+        // long ago. Never blocks the accept loop.
+        while self.connections.try_join_next().is_some() {}
+        if self.connections.len() >= MAX_CONNECTIONS {
+            return Admitted::AtCapacity;
         }
         self.connections.spawn(serve);
-        // Reap the ones that have hung up, so the set tracks who is actually
-        // here rather than everyone who ever was. Never blocks the accept loop.
-        while self.connections.try_join_next().is_some() {}
-        true
+        Admitted::Yes
     }
 
     /// Shut the door, and end everyone already through it.
@@ -164,6 +193,16 @@ impl Serving {
         self.closed = true;
         self.connections.abort_all();
     }
+}
+
+/// What the door said to one connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admitted {
+    Yes,
+    /// The socket closed while this connection was in hand.
+    DoorShut,
+    /// [`MAX_CONNECTIONS`] are already being served.
+    AtCapacity,
 }
 
 type Connections = Arc<std::sync::Mutex<Serving>>;
@@ -356,12 +395,23 @@ async fn accept_loop(
                 )
                 .await;
             });
-        if !admitted {
-            // The socket closed with this connection in hand — dropping the
-            // future drops the stream, so the peer sees the same hang-up every
-            // other caller just got. Returning rather than looping: the door is
-            // shut, and the abort we are racing is on its way regardless.
-            return;
+        match admitted {
+            Admitted::Yes => {}
+            Admitted::DoorShut => {
+                // The socket closed with this connection in hand — dropping the
+                // future drops the stream, so the peer sees the same hang-up
+                // every other caller just got. Returning rather than looping:
+                // the door is shut, and the abort we are racing is on its way
+                // regardless.
+                return;
+            }
+            Admitted::AtCapacity => {
+                // Dropped, and the loop reads on: unlike a closed door this is
+                // a passing condition, and the next caller may well fit.
+                eprintln!(
+                    "eidola-gui: refused a local connection — already serving {MAX_CONNECTIONS}"
+                );
+            }
         }
     }
 }
@@ -413,12 +463,43 @@ mod tests {
         let _guard = runtime.enter();
 
         let mut serving = Serving::default();
-        assert!(serving.admit(async {}), "an open door takes the connection");
+        assert_eq!(
+            serving.admit(std::future::pending()),
+            Admitted::Yes,
+            "an open door takes the connection"
+        );
 
         serving.shut();
-        assert!(
-            !serving.admit(async {}),
+        assert_eq!(
+            serving.admit(std::future::pending()),
+            Admitted::DoorShut,
             "a connection accepted a moment before the close was served past it"
+        );
+    }
+
+    #[test]
+    fn a_caller_that_opens_sockets_without_end_is_bounded() {
+        // Each connection carries its own concurrency limit and its own outbox,
+        // so without a cap here a caller that opens sockets in a loop
+        // multiplies both — and what one of those requests can start is billed.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let _guard = runtime.enter();
+
+        // Futures that never finish, so every seat stays taken.
+        let mut serving = Serving::default();
+        for i in 0..MAX_CONNECTIONS {
+            assert_eq!(
+                serving.admit(std::future::pending()),
+                Admitted::Yes,
+                "connection {i} is within the cap"
+            );
+        }
+        assert_eq!(
+            serving.admit(std::future::pending()),
+            Admitted::AtCapacity,
+            "the cap bounds the aggregate, not just one connection's pipeline"
         );
     }
 
