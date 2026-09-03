@@ -113,8 +113,8 @@ use tokio::sync::mpsc;
 
 use super::{
     Call, FrameReader, HelloResult, MAX_RESPONSE_BYTES, NO_REQUEST, PROTOCOL_VERSION,
-    ProtocolError, Request, Response, SpacesListResult, WalletCredentialsResult, WireError,
-    decode_request, encode_line, terminal_error_line, terminal_line,
+    ProtocolError, Request, SpacesListResult, WalletCredentialsResult, WireError, chunk_lines,
+    decode_request, terminal_error_line, terminal_line,
 };
 use crate::AppCore;
 use crate::error::AppError;
@@ -498,18 +498,22 @@ async fn answer(
             // turn is running and paid for either way, and a receiver dropped
             // under it would only turn a finished turn into a torn one.
             let pump = tokio::spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    let data = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
-                    // Awaited, so a reader that has fallen behind slows the
-                    // turn's delivery instead of being queued at. A writer that
-                    // has gone away ends the pump: there is nobody to deliver
-                    // to, and the turn itself is unaffected either way.
-                    if chunks
-                        .send(encode_line(&Response::chunk(id, data)))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                'events: while let Some(event) = rx.recv().await {
+                    // A delta's size is the backend's decision, not this app's,
+                    // so it goes out through `chunk_lines` — which splits an
+                    // oversized one into frames that fit rather than refusing
+                    // it. Several frames concatenate to exactly what one would
+                    // have said, and they leave in order through this one
+                    // outbox.
+                    for line in chunk_lines(id, &event, MAX_RESPONSE_BYTES) {
+                        // Awaited, so a reader that has fallen behind slows the
+                        // turn's delivery instead of being queued at. A writer
+                        // that has gone away ends the pump: there is nobody to
+                        // deliver to, and the turn itself is unaffected either
+                        // way.
+                        if chunks.send(line).await.is_err() {
+                            break 'events;
+                        }
                     }
                 }
             });
