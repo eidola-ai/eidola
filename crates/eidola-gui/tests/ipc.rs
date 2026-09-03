@@ -141,3 +141,78 @@ fn closing_takes_the_door_away() {
         "and there is nothing left to connect to"
     );
 }
+
+/// A connection that stays open, so a test can ask it something twice.
+fn connect(
+    path: &std::path::Path,
+) -> (
+    std::os::unix::net::UnixStream,
+    BufReader<std::os::unix::net::UnixStream>,
+) {
+    let stream = std::os::unix::net::UnixStream::connect(path).expect("connect");
+    // A caller that is never answered must fail rather than hang the suite.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let reader = BufReader::new(stream.try_clone().expect("clone"));
+    (stream, reader)
+}
+
+/// Ask over an established connection; `None` when the app answered nothing.
+fn ask(
+    stream: &mut std::os::unix::net::UnixStream,
+    reader: &mut BufReader<std::os::unix::net::UnixStream>,
+    id: u64,
+    call: &Call,
+) -> Option<ResponseBody> {
+    // A write that fails is itself an answer: the connection is gone.
+    stream
+        .write_all(&encode_line(&Request::new(id, call)))
+        .ok()?;
+    stream.flush().ok()?;
+    let mut line = String::new();
+    if reader.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    let frame = eidola_app_core::ipc::decode_response(line.trim_end().as_bytes())
+        .expect("the app wrote a frame");
+    assert_eq!(frame.id, id);
+    Some(frame.body)
+}
+
+#[test]
+fn closing_ends_the_connections_it_had_already_accepted() {
+    // Aborting the accept loop stops the *next* peer. The ones already inside
+    // are tasks of their own, and a task nobody holds outlives the listener
+    // that spawned it — so a peer connected when the app began quitting could
+    // go on dispatching through the whole asynchronous shutdown grace, long
+    // enough to start a billed turn moments before the process ends.
+    let (core, _dir) = core();
+    let socket = ipc::serve(&core).expect("bind");
+    let (mut stream, mut reader) = connect(socket.path());
+
+    // Genuinely established: it has completed the handshake on this very
+    // connection, so what follows is about a peer the app already knows.
+    assert!(
+        matches!(
+            ask(&mut stream, &mut reader, 1, &Call::Hello),
+            Some(ResponseBody::End { .. })
+        ),
+        "the connection is being served"
+    );
+
+    socket.close();
+
+    assert!(
+        ask(
+            &mut stream,
+            &mut reader,
+            2,
+            &Call::SpacesList {
+                include_archived: false
+            },
+        )
+        .is_none(),
+        "a closed door went on answering the peers already through it"
+    );
+}
