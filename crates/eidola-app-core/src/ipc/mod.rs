@@ -1530,6 +1530,26 @@ mod tests {
     }
 
     #[test]
+    fn what_one_connection_can_hold_is_a_stated_number() {
+        // The queue is bounded by frame *count* while what costs is a frame's
+        // *size*, so the two constants together are the memory bound — and the
+        // dominant term is the concurrency limit, not the queue: a permitted
+        // task holds its completed frame from the moment it is built until its
+        // awaited send is taken. Asserted as a number so raising either
+        // constant has to be a decision rather than a discovery.
+        assert_eq!(
+            serve::MAX_RETAINED_RESPONSE_BYTES,
+            7 * MAX_RESPONSE_BYTES,
+            "four requests in hand, two queued, one in the writer's"
+        );
+        assert!(
+            serve::MAX_RETAINED_RESPONSE_BYTES <= 512 * 1024 * 1024,
+            "one connection may hold {} bytes",
+            serve::MAX_RETAINED_RESPONSE_BYTES
+        );
+    }
+
+    #[test]
     fn a_parameterless_verb_still_checks_the_shape_of_its_params() {
         // Every verb that reads no fields — the four of them — used to build
         // its call without looking at `params` at all, so anything whatsoever

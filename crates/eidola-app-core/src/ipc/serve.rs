@@ -137,7 +137,14 @@ use crate::error::AppError;
 /// caller that pipelines hard is slowed, never failed. Ample for the one
 /// consumer this protocol has (a command-line client, whose only long verb is
 /// a turn) and low enough that a runaway peer cannot spawn without bound.
-pub const MAX_IN_FLIGHT_REQUESTS: usize = 16;
+///
+/// **This is also the dominant term in what one connection can hold** — see
+/// [`MAX_RETAINED_RESPONSE_BYTES`]. A task holds its completed frame from the
+/// moment `answer` returns until its awaited send is taken, so `N` permitted
+/// requests are `N` frames in hand, each of which may approach
+/// [`MAX_RESPONSE_BYTES`]. Nothing about the *queue* can bound that; only this
+/// number can, which is why it is the smaller of the two.
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 4;
 
 /// How many finished frames may sit waiting for the socket at once.
 ///
@@ -145,14 +152,43 @@ pub const MAX_IN_FLIGHT_REQUESTS: usize = 16;
 /// request releases its permit as soon as its answer is *enqueued*, so with an
 /// unbounded queue a caller that pipelines valid requests and simply never
 /// reads makes the app hold every answer it has produced — and a result can be
-/// tens of megabytes. Sixteen requests at a time then bounds nothing but the
-/// number of threads doing the allocating.
+/// tens of megabytes.
 ///
-/// One slot per permitted request is the natural pairing: no request can queue
-/// a second answer without first releasing and re-acquiring a permit, so what a
-/// connection can hold is bounded by the concurrency limit rather than by how
-/// fast the caller can type.
-const WRITER_QUEUE_FRAMES: usize = MAX_IN_FLIGHT_REQUESTS;
+/// **Two, because the queue exists to decouple the writer from the producers,
+/// not to warehouse answers.** One frame travelling to the writer while it
+/// writes another is already a full pipeline; the writer never idles waiting
+/// for a producer while anything is queued. Matching it to the concurrency
+/// limit was the natural-looking pairing and the wrong one — it made the
+/// *count* the bound while a frame's *size* is what costs, so a slow reader
+/// could have a whole permitted round queued on top of the round being built.
+const WRITER_QUEUE_FRAMES: usize = 2;
+
+/// The most one connection's answers can occupy at once, worst case.
+///
+/// Stated as a derived constant rather than left as an inference, because the
+/// bound is what the two numbers above are *for* and a later edit to either
+/// should have to look at it. Three places hold a completed frame: the tasks
+/// that have built one and are awaiting their send ([`MAX_IN_FLIGHT_REQUESTS`]
+/// of them, each still holding its permit), the queue
+/// ([`WRITER_QUEUE_FRAMES`]), and the one the writer has in hand.
+///
+/// **The honest residual:** this is the inherent cost of serving N concurrent
+/// requests that may each produce a ceiling-sized result, and the only levers
+/// on it are those two constants and [`MAX_RESPONSE_BYTES`] itself — which is
+/// deliberately generous, because a *legitimate* listing grows with the
+/// profile and a tighter ceiling refuses working ones. Reaching the worst case
+/// needs a same-uid caller deliberately pipelining ceiling-sized listings
+/// against a profile of a few hundred thousand conversations and never
+/// reading; the socket's connection cap multiplies it. That is anti-footgun
+/// territory rather than a threat, and the answer is a stated number rather
+/// than an unstated one.
+pub const MAX_RETAINED_RESPONSE_BYTES: usize =
+    (MAX_IN_FLIGHT_REQUESTS + WRITER_QUEUE_FRAMES + 1) * MAX_RESPONSE_BYTES;
+
+/// The budget the numbers above are chosen against. A change to either that
+/// pushes the worst case past it does not compile, which is the point: the
+/// bound is a decision, not a consequence to be discovered later.
+const _: () = assert!(MAX_RETAINED_RESPONSE_BYTES <= 512 * 1024 * 1024);
 
 /// Serve one connection until the peer goes away.
 ///
