@@ -2642,4 +2642,247 @@ mod tests {
         );
         assert!(unaccounted_engines(&[], &snapshot).is_empty());
     }
+
+    // --- Client mode, driven through `run` --------------------------------
+
+    use eidola_app_core::ipc::{
+        AccountCheckoutResult, FrameReader, HelloResult, PROTOCOL_VERSION, Request, Response,
+        decode_request, encode_line, socket_path,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// A stand-in Eidola on the control socket for `dir`, answering from
+    /// `script` and recording every request it was sent — so what a command
+    /// put on the wire is assertable, not just what it printed.
+    #[allow(clippy::type_complexity)]
+    fn scripted_app<F>(
+        dir: &std::path::Path,
+        script: F,
+    ) -> (std::thread::JoinHandle<()>, Arc<Mutex<Vec<Request>>>)
+    where
+        F: Fn(&Request) -> Vec<Response> + Send + 'static,
+    {
+        let seen: Arc<Mutex<Vec<Request>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let config_dir = dir.display().to_string();
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket_path(dir)).expect("bind the socket");
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let listener = tokio::net::UnixListener::from_std(listener).expect("adopt");
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (reader, mut writer) = stream.into_split();
+                let mut frames = FrameReader::new(tokio::io::BufReader::new(reader));
+                while let Ok(Some(line)) = frames.next_line().await {
+                    let request = decode_request(line).expect("a frame");
+                    recorder.lock().expect("seen").push(request.clone());
+                    let answers = if request.verb == "hello" {
+                        vec![Response::end(
+                            request.id,
+                            &HelloResult {
+                                protocol: PROTOCOL_VERSION,
+                                app_version: "9.9.9".into(),
+                                config_dir: Some(config_dir.clone()),
+                            },
+                        )]
+                    } else {
+                        script(&request)
+                    };
+                    use tokio::io::AsyncWriteExt;
+                    for answer in answers {
+                        if writer.write_all(&encode_line(&answer)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        });
+        (handle, seen)
+    }
+
+    fn client_session(dir: &std::path::Path) -> Session {
+        Session::open(dir.into(), dir.into(), false).expect("client mode")
+    }
+
+    fn verbs(seen: &Arc<Mutex<Vec<Request>>>) -> Vec<String> {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .map(|r| r.verb.clone())
+            .collect()
+    }
+
+    fn params_of(seen: &Arc<Mutex<Vec<Request>>>, verb: &str) -> serde_json::Value {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .find(|r| r.verb == verb)
+            .unwrap_or_else(|| panic!("`{verb}` was never sent"))
+            .params
+            .clone()
+    }
+
+    #[test]
+    fn a_checkout_link_minted_for_a_replaced_account_is_refused() {
+        // The app owns the profile in client mode, so the account can be
+        // reset or reconfigured in its window while this command's round trip
+        // is in flight. The link came back for the account that was
+        // configured when it went out; printing it would offer to fund an
+        // account whose secret this machine no longer holds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "account_id = \"before\"\n").expect("write config");
+        let replaced = config.clone();
+        let (server, seen) = scripted_app(dir.path(), move |request| {
+            if request.verb == "account.checkout" {
+                std::fs::write(&replaced, "account_id = \"after\"\n").expect("replace the account");
+            }
+            vec![Response::end(
+                request.id,
+                &AccountCheckoutResult {
+                    url: "https://checkout.example/session".into(),
+                },
+            )]
+        });
+
+        let session = client_session(dir.path());
+        let cli = Cli::parse_from(["eidola", "account", "checkout", "price_1", "--no-browser"]);
+        let outcome = session.runtime().block_on(run(&session, cli));
+        match outcome {
+            Err(Failure::AccountReplaced { what }) => assert_eq!(what, "that checkout link"),
+            other => panic!(
+                "a link for a replaced account must not be exposed: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert_eq!(verbs(&seen), vec!["hello", "account.checkout"]);
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn a_checkout_link_for_the_account_still_configured_is_offered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), "account_id = \"same\"\n")
+            .expect("write config");
+        let (server, _seen) = scripted_app(dir.path(), |request| {
+            vec![Response::end(
+                request.id,
+                &AccountCheckoutResult {
+                    url: "https://checkout.example/session".into(),
+                },
+            )]
+        });
+
+        let session = client_session(dir.path());
+        let cli = Cli::parse_from(["eidola", "account", "checkout", "price_1", "--no-browser"]);
+        session
+            .runtime()
+            .block_on(run(&session, cli))
+            .expect("an unchanged account is the ordinary case");
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    fn turn_answer(request: &Request, model: &str) -> Vec<Response> {
+        vec![Response::end(
+            request.id,
+            &eidola_app_core::ChatResult {
+                space_id: "s1".into(),
+                content: "hello".into(),
+                model: model.into(),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                credits_charged: 2,
+                response_action_id: None,
+                declined: None,
+                truncated: false,
+            },
+        )]
+    }
+
+    #[test]
+    fn a_turn_that_names_no_model_leaves_the_default_to_the_app() {
+        // The app can change the default template — or that template's agent
+        // model — between any lookup here and the turn itself, and a resolved
+        // default is indistinguishable on the wire from a model the reader
+        // named. So nothing is looked up and nothing is sent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (server, seen) = scripted_app(dir.path(), |request| turn_answer(request, "current@x"));
+
+        let session = client_session(dir.path());
+        let cli = Cli::parse_from(["eidola", "chat", "hi"]);
+        session
+            .runtime()
+            .block_on(run(&session, cli))
+            .expect("the turn runs");
+
+        assert_eq!(
+            verbs(&seen),
+            vec!["hello", "chat.stream"],
+            "no separate default-model lookup — resolving it here is what \
+             makes it stale"
+        );
+        assert!(
+            params_of(&seen, "chat.stream")["model"].is_null(),
+            "an unnamed model travels unnamed"
+        );
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn a_turn_that_names_a_model_sends_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (server, seen) = scripted_app(dir.path(), |request| match request.verb.as_str() {
+            "backend.list" => vec![Response::end(
+                request.id,
+                &eidola_app_core::ipc::BackendListResult { backends: vec![] },
+            )],
+            _ => turn_answer(request, "named@x"),
+        });
+
+        let session = client_session(dir.path());
+        let cli = Cli::parse_from(["eidola", "chat", "--model", "named@x", "hi"]);
+        session
+            .runtime()
+            .block_on(run(&session, cli))
+            .expect("the turn runs");
+
+        assert_eq!(
+            params_of(&seen, "chat.stream")["model"],
+            serde_json::json!("named@x"),
+            "a model the reader asked for by name is the one thing that must travel"
+        );
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn an_update_verdict_from_another_build_says_whose_it_is() {
+        let ours = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            update_check_attribution(None),
+            None,
+            "embedded, the build that ran the check is this one"
+        );
+        assert_eq!(
+            update_check_attribution(Some(ours)),
+            None,
+            "the same release reaches the answer this build would have"
+        );
+        let note =
+            update_check_attribution(Some("99.9.9")).expect("a different build is disclosed");
+        assert!(note.contains("99.9.9"), "{note}");
+        assert!(note.contains(ours), "both builds are named: {note}");
+        assert!(
+            note.contains("expected claims"),
+            "the claim expectations are the app's too, not only its version: {note}"
+        );
+    }
 }
