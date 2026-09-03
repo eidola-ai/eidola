@@ -8216,6 +8216,24 @@ impl AppCore {
         &self.inner.data_dir
     }
 
+    /// The config root this core composes its profile from — the directory
+    /// holding `config.toml`.
+    ///
+    /// A profile is the *pair* of roots, and the two are resolved from
+    /// independent environment variables, so the data directory alone does
+    /// not name it. Exposed for the same reason as [`AppCore::data_dir`]: the
+    /// process answering for the profile ([`crate::ipc`]) has to be able to
+    /// state which profile that is.
+    pub fn config_dir(&self) -> &std::path::Path {
+        // Always `<config_dir>/config.toml`, so the parent always exists as a
+        // path; the fallback keeps the accessor total rather than panicking
+        // over a shape this type constructs itself.
+        self.inner
+            .config_path
+            .parent()
+            .unwrap_or(&self.inner.config_path)
+    }
+
     /// Register a tool the turn loop may call (see [`tools`]).
     ///
     /// The registry starts **empty**, and an empty registry sends no `tools`

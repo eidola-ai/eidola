@@ -606,6 +606,19 @@ pub struct HelloResult {
     /// The version of the app answering. Informational — the compatibility
     /// decision is `protocol`, which moves independently.
     pub app_version: String,
+    /// The config root the answering process composes its profile from.
+    ///
+    /// The socket lives in the *data* directory, and the two roots are
+    /// resolved from independent environment variables, so a process that
+    /// finds this socket has learned nothing yet about whose account,
+    /// default template and update feed it is about to use. Stating the
+    /// config root is what lets a caller decide that the app answering is
+    /// serving the profile the caller was given, before it sends a verb.
+    ///
+    /// `None` means the app did not state one — an app older than this
+    /// field, which is a thing to say rather than a mismatch to invent.
+    #[serde(default)]
+    pub config_dir: Option<String>,
 }
 
 /// The `end` payload of `spaces.list`.
@@ -1252,6 +1265,7 @@ mod tests {
             &HelloResult {
                 protocol: 1,
                 app_version: "0.0.0".into(),
+                config_dir: None,
             },
         );
         let value: serde_json::Value = serde_json::from_slice(&encode_line(&end)).unwrap();

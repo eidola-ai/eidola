@@ -384,6 +384,9 @@ async fn answer(
         Call::Hello => ok(HelloResult {
             protocol: PROTOCOL_VERSION,
             app_version: app_version.to_string(),
+            // The socket is in the data directory; the config root is the
+            // other half of the profile, and only this side knows it.
+            config_dir: Some(core.config_dir().display().to_string()),
         }),
         Call::SpacesList { include_archived } => {
             let spaces = core.list_spaces(include_archived).await.map_err(failed)?;
