@@ -1639,67 +1639,58 @@ impl Inner {
                         });
                     }
                     let conn = self.db_conn().await?;
-                    // **Only an answer newer than this room.** A spawn that
-                    // named an anchor happened inside the owner's turn (the
-                    // `space.parent_action_id` column says so: it is written
-                    // only by the spawn door, which is reached from inside a
-                    // turn), so the answer this report belongs under is the one
-                    // that turn has yet to persist. An answer of the same owner
-                    // to the same anchor that is *already* there is a different
-                    // answer — the generation a regeneration is replacing, or
-                    // an earlier reply to the same post — and accepting it ends
-                    // the wait against the wrong word while the right one is
-                    // still on the wire. The room's brief is that line and
-                    // needs no new state to record it (see
-                    // [`db::subspace_opened_at_row`]). A room whose brief
-                    // somehow cannot be read leaves the line unset, which is
-                    // the pre-existing rule rather than a refusal: a delegation
-                    // must still be able to report.
-                    // **The turn's own answer, whenever the room records which
-                    // turn it was.** The watermark below rules out answers that
-                    // predate the room; what it cannot rule out is an answer by
-                    // the same owner to the same post that commits *after* the
-                    // room opened and belongs to a different turn — a second
-                    // explicit ask, or a regeneration running beside a reply,
-                    // neither of which app-core serializes. The item the
-                    // spawning turn answers under is the one thing that tells
-                    // them apart, so where it is recorded the question is asked
-                    // of that item alone: no visible post of it yet means
-                    // *this* turn has not answered, whatever else has landed on
-                    // the anchor.
+                    // **Which answer belongs to this delegation is a question
+                    // about its turn, so both rules here are the turn's.**
+                    // `space.parent_answer_item_id` records the item the
+                    // spawning turn writes its answer under, and where it is
+                    // set the question is asked of that item alone: no visible
+                    // post of it yet means *this* turn has not answered,
+                    // whatever else has landed on the anchor. Nothing
+                    // serializes two turns of one agent against one post — a
+                    // second explicit ask, a regeneration running beside a
+                    // reply — so the item is the only thing that tells them
+                    // apart. It is read from the room's own row, written in the
+                    // spawn's transaction, so it answers the same after a
+                    // restart as before one: a delegation runs for as long as
+                    // its work takes, and the app being quit between the
+                    // spawning turn's answer and the report is ordinary.
                     //
-                    // **It is read from the room's own row**
-                    // (`space.parent_answer_item_id`, written in the spawn's
-                    // transaction), so it answers the same after a restart as
-                    // before one. Nothing about the question is
-                    // process-scoped: a delegation runs for as long as its work
-                    // takes, so the spawning turn committing its answer and
-                    // then the app being quit before the report lands is
-                    // ordinary. Held in memory, the identity was gone by then
-                    // and the newest-answer rule below picked whichever answer
-                    // to the anchor committed last — the sibling turn's, where
-                    // one had raced in.
-                    let opened_at = db::subspace_opened_at_row(&conn, &sub.id).await?;
+                    // **The watermark goes with it.** A turn's own answer is
+                    // one it has yet to persist, so anything of that item
+                    // already visible is the generation a regeneration is
+                    // replacing — accepting it would end the wait against a
+                    // word about to be superseded, and a failed regeneration
+                    // would then leave the report hanging under a hidden tip.
+                    // The room's brief *is* that line and needs no new state to
+                    // record it ([`db::subspace_opened_at_row`]); a room whose
+                    // brief cannot be read leaves it unset, which is a
+                    // delegation still being able to report rather than a
+                    // refusal.
+                    //
+                    // **A spawn with no turn behind it gets neither**, and that
+                    // is not a gap: a direct API caller supplying an anchor is
+                    // saying "report under the owner's answer to this post",
+                    // and there is no later answer coming, because there is no
+                    // turn to write one. Filtering to answers newer than the
+                    // room would then discard the only answer the caller could
+                    // have meant and leave the report waiting out its grace to
+                    // land on the anchor instead — a rule borrowed from a
+                    // premise that does not hold here. The owner's newest
+                    // answer is the whole of what is known, exactly as the
+                    // anchorless fallback below reads its own.
                     let answered = match sub.parent_answer_item_id.as_deref() {
-                        // The item names the turn; the watermark names the
-                        // generation. A regeneration's item is the one it is
-                        // revising, whose visible post until the turn lands is
-                        // the answer being replaced — so both rules apply.
                         Some(item) => {
+                            let opened_at = db::subspace_opened_at_row(&conn, &sub.id).await?;
                             db::visible_post_of_item(&conn, &sub.parent_space_id, item, opened_at)
                                 .await?
                         }
-                        // No turn identity: a spawn with no turn behind it,
-                        // which is a direct API caller. The durable rule stands
-                        // alone, and the owner's newest answer is the best
-                        // guess there is.
                         None => {
                             db::last_reply_by_participant(
                                 &conn,
                                 &sub.parent_space_id,
                                 &sub.owner_participant_id,
                                 anchor,
-                                opened_at,
+                                None,
                             )
                             .await?
                         }

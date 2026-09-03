@@ -1619,47 +1619,116 @@ fn a_report_waits_for_the_answer_it_belongs_under() {
     });
 }
 
-/// **An answer that was already there is not this delegation's answer.** A
-/// spawn that names an anchor happens inside the owner's turn, so the answer
-/// the report belongs under is the one that turn has yet to write. An answer of
-/// the same owner to the same anchor that predates the room is a different
-/// answer — an earlier reply to the same post, or the generation a
-/// regeneration is in the middle of replacing — and accepting it ends the wait
-/// against the wrong word while the right one is still on the wire.
+/// **An answer of the spawning turn's own item that was already there is not
+/// its answer yet.** A turn-bound delegation opens inside the owner's turn, so
+/// the answer it belongs under is the one that turn has yet to write — and
+/// where the turn is a regeneration, the item it will write under already has a
+/// visible post: the generation being replaced. Accepting that one ends the
+/// wait against a word about to be superseded, and if the regeneration then
+/// fails, the report is left hanging under a hidden tip. The room's brief is
+/// the line that rules it out.
 #[test]
 fn a_report_does_not_settle_on_an_answer_older_than_its_room() {
+    run(|| {
+        // Both transports: the ask streams, the regeneration is blocking.
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+
+        // The owner's answer to the post, and the delegation is opened from a
+        // regeneration of it — so the spawning turn's item is this one, and its
+        // visible post right now is the generation that regeneration replaces.
+        let earlier = ask(&core, &parent, &owner, &asked);
+        let item = tree(&core, &parent)
+            .into_iter()
+            .find(|n| n.action_id == earlier)
+            .expect("the answer is in the parent")
+            .item_id;
+
+        let out = spawn_for_turn(
+            &core,
+            &parent,
+            &owner,
+            vec![helper],
+            Some(&asked),
+            Some(&item),
+        );
+        drive(&core, &out.space.id).expect("the room is driven");
+        assert!(
+            report(&core, &parent).is_none(),
+            "the older generation must not end the wait: the answer this room \
+             came from is still in flight"
+        );
+
+        // The spawning turn lands, and the report goes under *its* generation.
+        core.runtime()
+            .block_on(core.regenerate(earlier.clone(), MODEL.to_string()))
+            .expect("the spawning turn writes its answer");
+        drive(&core, &out.space.id).expect("the room is driven again");
+        let report = report(&core, &parent).expect("the delegation is reported");
+        let landed = report.parent_action_id.clone().expect("it attached");
+        assert_ne!(
+            landed, earlier,
+            "not beneath the generation that was already there"
+        );
+        assert_eq!(
+            tree(&core, &parent)
+                .into_iter()
+                .find(|n| n.action_id == landed)
+                .expect("the target is in the parent")
+                .item_id,
+            item,
+            "beneath the answer of the turn that opened the room"
+        );
+    });
+}
+
+/// **A delegation with no turn behind it takes the answer that is there.** A
+/// direct caller supplying an anchor is saying "report under the owner's answer
+/// to this post", and no turn of its own is going to write a later one — so the
+/// line that rules out answers older than the room is a rule borrowed from a
+/// premise this path does not have. Drawn here, it discarded the only answer
+/// the caller could have meant: the walk waited out its grace and landed on the
+/// anchor, while a restart sweep — which never waits — landed there at once, so
+/// the same room reported two different ways depending on when it was picked
+/// up.
+#[test]
+fn a_spawn_with_no_turn_behind_it_reports_under_the_answer_already_there() {
     run(|| {
         let (_mock, core, _dir) = setup();
         let parent = parent_with_a_post(&core);
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
         let asked = tree(&core, &parent)[0].action_id.clone();
-        // The owner has answered this post once already — an explicit ask, the
-        // reachable way to get a second answer to one post out of one agent.
-        let earlier = ask(&core, &parent, &owner, &asked);
-
-        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
-        drive(&core, &out.space.id).expect("the room is driven");
-        assert!(
-            report(&core, &parent).is_none(),
-            "the older answer must not end the wait: the answer this room came \
-             from is still in flight"
-        );
-
-        // The answer this delegation was opened from lands, and the report goes
-        // under *it*.
+        // The owner's answer, committed before either room exists.
         let answer = ask(&core, &parent, &owner, &asked);
-        drive(&core, &out.space.id).expect("the room is driven again");
-        let report = report(&core, &parent).expect("the delegation is reported");
+
+        // Driven in the process that opened it: no wait, and no grace spent.
+        let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], Some(&asked));
+        drive(&core, &out.space.id).expect("the room is driven");
+        let report = report(&core, &parent).expect("the delegation is reported, not waiting");
         assert_eq!(
             report.parent_action_id.as_deref(),
             Some(answer.as_str()),
-            "beneath the answer that opened it"
+            "beneath the owner's answer to the anchor"
         );
-        assert_ne!(
-            report.parent_action_id.as_deref(),
-            Some(earlier.as_str()),
-            "and not beneath the one that was already there"
+
+        // …and a sweep, which never waits, answers the same question the same
+        // way rather than falling through to the anchor.
+        let swept = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        drive_as_sweep(&core, &swept.space.id).expect("the second room is driven");
+        let both = reports(&core, &parent);
+        assert_eq!(both.len(), 2, "both delegations reported: {both:?}");
+        assert!(
+            both.iter()
+                .all(|r| r.parent_action_id.as_deref() == Some(answer.as_str())),
+            "and both sit beneath the same answer: {both:?}"
         );
     });
 }
@@ -1853,10 +1922,11 @@ fn a_report_finds_its_turns_answer_after_a_restart_a_sibling_won() {
     });
 }
 
-/// The wait is not unbounded by this: a spawning turn that died leaves no
-/// answer newer than the room, and the arms that claim a licence still end it —
-/// against the anchor, which is the honest attachment when there is nothing of
-/// this delegation's own to sit beneath.
+/// The wait is not unbounded by this: a spawning turn that died never writes
+/// under the item the room names, and the arms that claim a licence still end
+/// it — against the anchor, which is the honest attachment when there is
+/// nothing of this delegation's own to sit beneath. An answer of the same owner
+/// to the same post is not that: it belongs to another turn.
 #[test]
 fn an_older_answer_does_not_hold_a_room_past_its_licence() {
     run(|| {
@@ -1865,15 +1935,28 @@ fn an_older_answer_does_not_hold_a_room_past_its_licence() {
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
         let asked = tree(&core, &parent)[0].action_id.clone();
-        ask(&core, &parent, &owner, &asked);
+        let other_turns = ask(&core, &parent, &owner, &asked);
 
-        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        // An item the spawning turn minted and died before writing under —
+        // which is the whole of what a turn that failed leaves behind.
+        let out = spawn_for_turn(
+            &core,
+            &parent,
+            &owner,
+            vec![helper],
+            Some(&asked),
+            Some("an-answer-that-never-lands"),
+        );
         drive_as_sweep(&core, &out.space.id).expect("the room is driven");
         let report = report(&core, &parent).expect("the delegation is reported");
         assert_eq!(
             report.parent_action_id.as_deref(),
             Some(asked.as_str()),
             "the anchor itself, not an answer this room never came from"
+        );
+        assert_ne!(
+            report.parent_action_id.as_deref(),
+            Some(other_turns.as_str())
         );
     });
 }
