@@ -2664,7 +2664,7 @@ mod tests {
     {
         let seen: Arc<Mutex<Vec<Request>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&seen);
-        let config_dir = dir.display().to_string();
+        let config_dir = eidola_app_core::ipc::path_bytes(dir);
         let listener =
             std::os::unix::net::UnixListener::bind(socket_path(dir)).expect("bind the socket");
         let handle = std::thread::spawn(move || {

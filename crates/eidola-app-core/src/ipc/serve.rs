@@ -107,7 +107,7 @@ use tokio::sync::mpsc;
 use super::{
     Call, FrameReader, HelloResult, MAX_RESPONSE_BYTES, NO_REQUEST, PROTOCOL_VERSION,
     ProtocolError, Request, Response, SpacesListResult, WalletCredentialsResult, WireError,
-    decode_request, encode_line, terminal_error_line, terminal_line,
+    decode_request, encode_line, path_bytes, terminal_error_line, terminal_line,
 };
 use crate::AppCore;
 use crate::error::AppError;
@@ -424,8 +424,10 @@ async fn answer(
             protocol: PROTOCOL_VERSION,
             app_version: app_version.to_string(),
             // The socket is in the data directory; the config root is the
-            // other half of the profile, and only this side knows it.
-            config_dir: Some(core.config_dir().display().to_string()),
+            // other half of the profile, and only this side knows it. Its
+            // own bytes, because the caller compares it against a path of
+            // its own and a lossy rendering would not survive that.
+            config_dir: Some(path_bytes(core.config_dir())),
         }),
         Call::SpacesList { include_archived } => {
             let spaces = core.list_spaces(include_archived).await.map_err(failed)?;

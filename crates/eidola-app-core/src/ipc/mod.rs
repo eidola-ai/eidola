@@ -606,7 +606,8 @@ pub struct HelloResult {
     /// The version of the app answering. Informational — the compatibility
     /// decision is `protocol`, which moves independently.
     pub app_version: String,
-    /// The config root the answering process composes its profile from.
+    /// The config root the answering process composes its profile from, as
+    /// the operating system's own bytes ([`path_bytes`]).
     ///
     /// The socket lives in the *data* directory, and the two roots are
     /// resolved from independent environment variables, so a process that
@@ -615,10 +616,35 @@ pub struct HelloResult {
     /// config root is what lets a caller decide that the app answering is
     /// serving the profile the caller was given, before it sends a verb.
     ///
+    /// **Bytes rather than a string, because this is compared and not only
+    /// read.** A Unix path is a byte string that need not be UTF-8, and
+    /// `Path::display` replaces every byte that is not with U+FFFD — so a
+    /// home or `XDG_CONFIG_HOME` carrying one would arrive as a path that
+    /// names nothing, and the caller would refuse the very app it shares a
+    /// directory with, on every command. Rendering for a *message* may be
+    /// lossy; deciding may not.
+    ///
     /// `None` means the app did not state one — an app older than this
     /// field, which is a thing to say rather than a mismatch to invent.
     #[serde(default)]
-    pub config_dir: Option<String>,
+    pub config_dir: Option<Vec<u8>>,
+}
+
+/// A path as the operating system's own bytes.
+///
+/// The whole protocol is a Unix socket, so a path here is a byte string with
+/// no encoding promised, and this is the only lossless way to put one on a
+/// wire that carries bytes. The inverse is [`path_from_bytes`]; the pair
+/// exists so the two ends cannot spell the conversion differently.
+pub fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+/// The path those bytes named. Inverse of [`path_bytes`].
+pub fn path_from_bytes(bytes: &[u8]) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
 }
 
 /// The `end` payload of `spaces.list`.

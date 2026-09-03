@@ -58,7 +58,7 @@ use std::time::Duration;
 use eidola_app_core::error::AppError;
 use eidola_app_core::ipc::{
     Call, FrameReader, HelloResult, NO_REQUEST, PROTOCOL_VERSION, ProtocolError, RemoteError,
-    Request, Response, ResponseBody, decode_response, encode_line, socket_path,
+    Request, Response, ResponseBody, decode_response, encode_line, path_from_bytes, socket_path,
 };
 use eidola_app_core::{ChatResult, ChatStreamEvent};
 use serde::de::DeserializeOwned;
@@ -148,9 +148,9 @@ impl From<ProtocolError> for Failure {
 /// what to do about it.
 #[derive(Debug)]
 pub enum Dial {
-    /// Nothing is listening — no socket file, or a file left behind by a
-    /// process that is gone. There is no app to ask, so the caller opens the
-    /// profile itself.
+    /// Nothing is listening — no socket file, a file left behind by a process
+    /// that is gone, or a path no socket address can hold in the first place.
+    /// There is no app to ask, so the caller opens the profile itself.
     NoListener,
     /// The socket exists and accepted a connection, but the handshake went
     /// unanswered. Something is holding the path without serving it.
@@ -160,7 +160,7 @@ pub enum Dial {
     /// only useful thing to say is which two disagree.
     OtherProfile {
         ours: std::path::PathBuf,
-        theirs: String,
+        theirs: std::path::PathBuf,
     },
     /// The conversation started and failed.
     Failed(Failure),
@@ -168,18 +168,31 @@ pub enum Dial {
 
 /// Whether a failure to reach the socket means "no app is running here".
 ///
-/// Exactly two conditions qualify: no socket file at all, and a socket file
-/// nobody is listening on — what a process that died without tidying up
-/// leaves behind. Anything else (a permission failure, a path occupied by
-/// something that is not a socket) is a condition in its own right and is
-/// reported as one; quietly reading it as "the app must not be running" would
-/// send the caller off to take a lock it may not be entitled to and report the
-/// wrong problem when that failed.
+/// Three conditions qualify. Two are about the filesystem: no socket file at
+/// all, and a socket file nobody is listening on — what a process that died
+/// without tidying up leaves behind. The third never reaches the filesystem:
+/// **a path no socket address can hold**. A Unix address carries the path
+/// inside `sun_path`, about a hundred bytes, so a data directory deep enough
+/// (or a path with an interior NUL) is refused by the standard library before
+/// any syscall. Nothing can be *listening* on an address nothing can bind, so
+/// that is an absent app by construction — and reading it as a transport
+/// failure instead made every command fail on such a machine, including the
+/// ones embedded mode would have served, since the database has no such limit
+/// and sits happily at that path.
+///
+/// The distinguishing mark is that the standard library made the error itself
+/// (`raw_os_error` is `None`): an `InvalidInput` the *kernel* returned would
+/// be about the socket rather than about the path, and stays a condition of
+/// its own. So does everything else — a permission failure, a path occupied
+/// by something that is not a socket — because quietly reading one of those
+/// as "the app must not be running" would send the caller off to take a lock
+/// it may not be entitled to and then report the wrong problem.
 pub fn no_listener(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-    )
+    match e.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => true,
+        io::ErrorKind::InvalidInput => e.raw_os_error().is_none(),
+        _ => false,
+    }
 }
 
 /// Whether two config roots name the same profile.
@@ -262,13 +275,17 @@ impl Client {
         // one. An app that states *none* is older than the field; that is a
         // thing this build cannot check rather than a mismatch it may invent,
         // so it is left alone.
-        if let Some(theirs) = &hello.config_dir
-            && !same_config_root(config_dir, Path::new(theirs))
-        {
-            return Err(Dial::OtherProfile {
-                ours: config_dir.to_path_buf(),
-                theirs: theirs.clone(),
-            });
+        if let Some(theirs) = &hello.config_dir {
+            // Their own bytes, so a root that is not UTF-8 compares as the
+            // directory it is rather than as the question marks printing it
+            // would have left.
+            let theirs = path_from_bytes(theirs);
+            if !same_config_root(config_dir, &theirs) {
+                return Err(Dial::OtherProfile {
+                    ours: config_dir.to_path_buf(),
+                    theirs,
+                });
+            }
         }
         client.app_version = hello.app_version;
         Ok(client)
@@ -400,7 +417,7 @@ fn transport(message: String) -> Failure {
 mod tests {
     use super::*;
     use eidola_app_core::ipc::{
-        AccountPricesResult, DefaultModelResult, Request, WireError, decode_request,
+        AccountPricesResult, DefaultModelResult, Request, WireError, decode_request, path_bytes,
     };
 
     /// A stand-in for the app: one connection, every request answered from
@@ -467,6 +484,37 @@ mod tests {
                 "{kind:?} is a condition of its own, not an absent app"
             );
         }
+        // An address the standard library would not even build: nothing can
+        // be listening on it, so this is an absent app.
+        assert!(no_listener(&io::Error::from(io::ErrorKind::InvalidInput)));
+        // The same kind from the *kernel* is about the socket rather than
+        // about the path, and stays a condition of its own.
+        assert!(!no_listener(&io::Error::from_raw_os_error(
+            rustix::io::Errno::INVAL.raw_os_error()
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_socket_path_too_long_to_exist_is_no_listener() {
+        // A Unix address holds its path in `sun_path`, about a hundred bytes,
+        // so a deep enough data directory is refused before any syscall. The
+        // database has no such limit and sits happily there, so reading this
+        // as a transport failure took embedded mode away from a machine that
+        // could have been served.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deep = dir.path().join("d".repeat(120));
+        std::fs::create_dir(&deep).expect("a data directory that far down");
+        assert!(
+            socket_path(&deep).as_os_str().len() > 108,
+            "the fixture has to overflow the address to prove anything"
+        );
+        match Client::connect(dir.path(), &deep).await {
+            Err(Dial::NoListener) => {}
+            other => panic!(
+                "nothing can be listening on an address nothing can bind: {:?}",
+                other.map(|_| ())
+            ),
+        }
     }
 
     #[tokio::test]
@@ -492,7 +540,7 @@ mod tests {
     /// An app that greets with `config_dir` as the config root it composes
     /// its profile from, and answers nothing else — reaching a verb at all
     /// would mean the gate did not hold.
-    fn serve_profile(dir: &std::path::Path, config_dir: Option<String>) {
+    fn serve_profile(dir: &std::path::Path, config_dir: Option<Vec<u8>>) {
         serve(dir, move |request| {
             assert_eq!(
                 request.verb, "hello",
@@ -533,14 +581,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let theirs = dir.path().join("another-profile");
         std::fs::create_dir(&theirs).expect("their config root");
-        serve_profile(dir.path(), Some(theirs.display().to_string()));
+        serve_profile(dir.path(), Some(path_bytes(&theirs)));
         // The socket is found through the data root, which both share; the
         // config root is what says whose account and default template the
         // answering app speaks for.
         match Client::connect(dir.path(), dir.path()).await {
             Err(Dial::OtherProfile { ours, theirs: t }) => {
                 assert_eq!(ours, dir.path());
-                assert_eq!(t, theirs.display().to_string());
+                assert_eq!(t, theirs);
             }
             other => panic!(
                 "a shared data root is not a shared profile: {:?}",
@@ -550,11 +598,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_config_root_that_is_not_utf8_still_matches_itself() {
+        // A Unix path is bytes, and a home or `XDG_CONFIG_HOME` may hold ones
+        // no encoding claims. Rendered for a message that is fine; compared,
+        // it is the difference between sharing a directory and being told you
+        // do not — on every command, for as long as the app runs.
+        //
+        // The directory is deliberately not created: the comparison does not
+        // need it to exist (an unresolvable root falls back to its literal
+        // spelling), and not every filesystem would take the name — APFS
+        // refuses one outright, which is exactly the sort of platform
+        // difference a regression must not depend on.
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut raw = path_bytes(dir.path());
+        raw.extend_from_slice(b"/caf\xe9");
+        let ours = std::path::PathBuf::from(std::ffi::OsString::from_vec(raw));
+        assert!(
+            ours.to_str().is_none(),
+            "the fixture has to actually be un-renderable to prove anything"
+        );
+
+        serve_profile(dir.path(), Some(path_bytes(&ours)));
+        Client::connect(&ours, dir.path())
+            .await
+            .expect("the same directory is the same profile, encoding or no encoding");
+    }
+
+    #[tokio::test]
     async fn an_app_composed_from_this_config_root_is_ours() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Spelled differently, resolving to the same directory: the same
         // profile by any measure the filesystem would agree with.
-        serve_profile(dir.path(), Some(dir.path().join(".").display().to_string()));
+        serve_profile(dir.path(), Some(path_bytes(&dir.path().join("."))));
         Client::connect(dir.path(), dir.path())
             .await
             .expect("the same profile, spelled another way");

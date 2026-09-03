@@ -99,7 +99,7 @@ pub enum Startup {
     /// The app answering for this data directory composes its profile from a
     /// different config root, so it speaks for another account, another
     /// default template and another update feed than this command was given.
-    OtherProfile { ours: PathBuf, theirs: String },
+    OtherProfile { ours: PathBuf, theirs: PathBuf },
     /// The conversation with the running app failed before it began.
     Dial(Failure),
 }
@@ -115,10 +115,15 @@ impl std::fmt::Display for Startup {
                 }
                 write!(f, " but is not accepting local connections")
             }
+            // Both roots printed rather than compared: the decision was made
+            // on their bytes, and this is only the sentence about it, so a
+            // root that does not render exactly still names itself as well as
+            // it can be named.
             Startup::OtherProfile { ours, theirs } => write!(
                 f,
                 "the Eidola running for this data directory reads its config from \
-                 {theirs}, not {} — it speaks for a different profile",
+                 {}, not {} — it speaks for a different profile",
+                theirs.display(),
                 ours.display()
             ),
             Startup::Dial(e) => write!(f, "{e}"),
@@ -743,7 +748,7 @@ mod tests {
     /// it is asked so a refusal that arrived too late is visible.
     fn profile_greeter(
         dir: &std::path::Path,
-        config_dir: Option<String>,
+        config_dir: Option<Vec<u8>>,
         seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) -> std::thread::JoinHandle<()> {
         let listener =
@@ -793,14 +798,14 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let server = profile_greeter(
             dir.path(),
-            Some(theirs.display().to_string()),
+            Some(eidola_app_core::ipc::path_bytes(&theirs)),
             std::sync::Arc::clone(&seen),
         );
 
         match Session::open(ours.clone(), dir.path().into(), false) {
             Err(Startup::OtherProfile { ours: o, theirs: t }) => {
                 assert_eq!(o, ours);
-                assert_eq!(t, theirs.display().to_string());
+                assert_eq!(t, theirs);
             }
             other => panic!(
                 "an app serving another config root must not take this command: {:?}",
@@ -819,7 +824,7 @@ mod tests {
     fn the_refusal_names_both_roots_and_what_to_do() {
         let rendered = Startup::OtherProfile {
             ours: "/here/eidola".into(),
-            theirs: "/there/eidola".to_string(),
+            theirs: "/there/eidola".into(),
         }
         .to_string();
         assert!(rendered.contains("/here/eidola"), "{rendered}");
