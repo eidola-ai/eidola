@@ -2029,13 +2029,15 @@ impl Inner {
     /// what the UI should now show.
     ///
     /// **A verdict applies only if no check begun after it has already
-    /// answered.** Completion order is not start order — two checks can
-    /// observe genuinely different, genuinely valid feed states, and the
-    /// slower request's picture is the older one. [`updates::UpdateState::absorb`]
-    /// holds an alert against a later *failure*; it cannot hold one against a
-    /// stale `UpToDate`, which is not wrong, merely from before. So each check
-    /// takes a number as it starts and the completion is ignored outright if a
-    /// higher one has landed.
+    /// observed the feed.** Completion order is not start order — two checks
+    /// can observe genuinely different, genuinely valid feed states, and the
+    /// slower request's picture is the older one.
+    /// [`updates::UpdateState::absorb`] holds an alert against a later
+    /// *failure*; it cannot hold one against a stale `UpToDate`, which is not
+    /// wrong, merely from before. So each check takes a number as it starts,
+    /// and a completion is ignored outright if a higher-numbered one has
+    /// landed — but **only a check that reached the feed raises that mark**,
+    /// because a failure saw nothing and so makes nothing older.
     ///
     /// **Nothing about the state crosses the network wait — not even one
     /// field of it.** The round trip ends in a decision-free
