@@ -2059,12 +2059,17 @@ impl Inner {
                     .clone()
                     .expect("a check has applied, so a snapshot stands");
             }
-            // Recorded even when `absorb` declines below: what this fixes is
-            // an older observation landing last, and a newer check having
-            // *completed* is the fact that makes the older one old — whether
-            // or not its verdict was the one worth keeping.
-            *applied = started;
             let result = updates::classify(outcome, state.accepted.as_ref());
+            // **A failed request made no observation, so it makes nothing
+            // older.** It reached no feed and drew no conclusion; recording
+            // it as the newest thing known would let a quick failure silence
+            // a slower check that actually saw something — a real security
+            // alert discarded for having started first, which is a strictly
+            // worse outcome than the staleness the marker exists to prevent.
+            // Only a verdict drawn from a feed advances it.
+            if !matches!(result, updates::UpdateCheckResult::CheckFailed { .. }) {
+                *applied = started;
+            }
             state.absorb(updates::UpdateCheckSnapshot {
                 checked_at_ms,
                 result,

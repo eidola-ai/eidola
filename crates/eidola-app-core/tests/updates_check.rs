@@ -897,6 +897,97 @@ fn a_newer_alert_is_not_replaced_by_an_older_check_that_finished_after_it() {
     );
 }
 
+#[test]
+fn a_quick_failure_does_not_silence_a_slower_check_that_saw_something() {
+    // The other edge of the start-order rule. A check that *failed* reached
+    // no feed and drew no conclusion, so it is not a newer observation — it
+    // is no observation. Counting it as one lets a network blip that started
+    // a moment later throw away a real security alert for having begun first,
+    // which is worse than the staleness the ordering exists to prevent.
+    let config_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let core = eidola_app_core::AppCore::new(
+        config_dir.path().to_path_buf(),
+        data_dir.path().to_path_buf(),
+    )
+    .expect("open core");
+
+    let feed = |uri: &str| {
+        std::fs::write(
+            config_dir.path().join("config.toml"),
+            format!("update_feed = \"{uri}\"\n"),
+        )
+        .unwrap();
+    };
+
+    core.runtime().block_on(async {
+        // Started first, finishes last, and actually saw the feed: the
+        // genuine bundle replayed under a newer tag.
+        let slow = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/releases/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(latest_release_json(
+                        &slow.uri(),
+                        "v9.9.9",
+                        &["artifact-manifest.json", "artifact-manifest.json.sigstore"],
+                    ))
+                    .set_delay(std::time::Duration::from_secs(3)),
+            )
+            .mount(&slow)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/assets/artifact-manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(FIXTURE_MANIFEST.to_vec()))
+            .mount(&slow)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/assets/artifact-manifest.json.sigstore"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(FIXTURE_BUNDLE.to_vec()))
+            .mount(&slow)
+            .await;
+        // Started second, finishes first, and reached nothing at all.
+        let offline = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/releases/latest"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&offline)
+            .await;
+
+        feed(&slow.uri());
+        let slow_check = core.update_check();
+        tokio::pin!(slow_check);
+        tokio::select! {
+            _ = &mut slow_check => panic!("the slow feed answered too early to prove anything"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+
+        feed(&offline.uri());
+        let blip = core.update_check().await;
+        assert!(
+            matches!(blip.result, UpdateCheckResult::CheckFailed { .. }),
+            "the fixture has to actually fail to prove anything: {:#?}",
+            blip.result
+        );
+
+        let alert = slow_check.await;
+        assert!(
+            matches!(alert.result, UpdateCheckResult::Unverifiable { .. }),
+            "a check that reached nothing cannot make a real verdict old: {:#?}",
+            alert.result
+        );
+    });
+
+    assert!(
+        matches!(
+            core.last_update_check().map(|s| s.result),
+            Some(UpdateCheckResult::Unverifiable { .. })
+        ),
+        "and the alert is what persists"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Feed anomalies that are neither crypto verdicts nor offline blips
 // ---------------------------------------------------------------------------
