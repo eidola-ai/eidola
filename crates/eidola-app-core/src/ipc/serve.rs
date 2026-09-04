@@ -137,7 +137,14 @@ use crate::error::AppError;
 /// caller that pipelines hard is slowed, never failed. Ample for the one
 /// consumer this protocol has (a command-line client, whose only long verb is
 /// a turn) and low enough that a runaway peer cannot spawn without bound.
-pub const MAX_IN_FLIGHT_REQUESTS: usize = 16;
+///
+/// **This is also the dominant term in what one connection can hold** — see
+/// [`MAX_RETAINED_RESPONSE_BYTES`]. A task holds its completed frame from the
+/// moment `answer` returns until its awaited send is taken, so `N` permitted
+/// requests are `N` frames in hand, each of which may approach
+/// [`MAX_RESPONSE_BYTES`]. Nothing about the *queue* can bound that; only this
+/// number can, which is why it is the smaller of the two.
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 4;
 
 /// How many finished frames may sit waiting for the socket at once.
 ///
@@ -145,14 +152,58 @@ pub const MAX_IN_FLIGHT_REQUESTS: usize = 16;
 /// request releases its permit as soon as its answer is *enqueued*, so with an
 /// unbounded queue a caller that pipelines valid requests and simply never
 /// reads makes the app hold every answer it has produced — and a result can be
-/// tens of megabytes. Sixteen requests at a time then bounds nothing but the
-/// number of threads doing the allocating.
+/// tens of megabytes.
 ///
-/// One slot per permitted request is the natural pairing: no request can queue
-/// a second answer without first releasing and re-acquiring a permit, so what a
-/// connection can hold is bounded by the concurrency limit rather than by how
-/// fast the caller can type.
-const WRITER_QUEUE_FRAMES: usize = MAX_IN_FLIGHT_REQUESTS;
+/// **Two, because the queue exists to decouple the writer from the producers,
+/// not to warehouse answers.** One frame travelling to the writer while it
+/// writes another is already a full pipeline; the writer never idles waiting
+/// for a producer while anything is queued. Matching it to the concurrency
+/// limit was the natural-looking pairing and the wrong one — it made the
+/// *count* the bound while a frame's *size* is what costs, so a slow reader
+/// could have a whole permitted round queued on top of the round being built.
+const WRITER_QUEUE_FRAMES: usize = 2;
+
+/// The most one connection's answers can occupy at once, worst case.
+///
+/// Stated as a derived constant rather than left as an inference, because the
+/// bound is what the two numbers above are *for* and a later edit to either
+/// should have to look at it. Three places hold a completed frame: the tasks
+/// that have built one and are awaiting their send ([`MAX_IN_FLIGHT_REQUESTS`]
+/// of them, each still holding its permit), the queue
+/// ([`WRITER_QUEUE_FRAMES`]), and the one the writer has in hand.
+///
+/// **It counts frames, and it is true because no frame is ever built past the
+/// ceiling.** Encoding a payload and *then* measuring it would make this number
+/// a description of well-behaved callers rather than a bound: the allocation
+/// arrives before the verdict, so one oversized result costs its whole size and
+/// no arithmetic here could say how much that is. Every frame carrying a
+/// payload is encoded under the ceiling instead — the terminal frames through
+/// `encode_line_within`, a turn's chunks through `chunk_lines`, which decides
+/// the whole-frame case by arithmetic and yields the pieces one at a time.
+///
+/// **What sits outside it, and always did:** the verb's own result before it is
+/// a frame, and a delta's own text before it is chunks. Those are the answer
+/// itself, produced by the code that was asked for it, and bounding them means
+/// paginating the verbs rather than budgeting the wire. Each is one allocation
+/// per in-flight request, freed as soon as its frame is built.
+///
+/// **The honest residual:** this is the inherent cost of serving N concurrent
+/// requests that may each produce a ceiling-sized result, and the only levers
+/// on it are those two constants and [`MAX_RESPONSE_BYTES`] itself — which is
+/// deliberately generous, because a *legitimate* listing grows with the
+/// profile and a tighter ceiling refuses working ones. Reaching the worst case
+/// needs a same-uid caller deliberately pipelining ceiling-sized listings
+/// against a profile of a few hundred thousand conversations and never
+/// reading; the socket's connection cap multiplies it. That is anti-footgun
+/// territory rather than a threat, and the answer is a stated number rather
+/// than an unstated one.
+pub const MAX_RETAINED_RESPONSE_BYTES: usize =
+    (MAX_IN_FLIGHT_REQUESTS + WRITER_QUEUE_FRAMES + 1) * MAX_RESPONSE_BYTES;
+
+/// The budget the numbers above are chosen against. A change to either that
+/// pushes the worst case past it does not compile, which is the point: the
+/// bound is a decision, not a consequence to be discovered later.
+const _: () = assert!(MAX_RETAINED_RESPONSE_BYTES <= 512 * 1024 * 1024);
 
 /// Serve one connection until the peer goes away.
 ///
@@ -163,18 +214,73 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    serve_connection_with_shutdown(core, app_version, reader, writer, Shutdown::default()).await
+}
+
+/// The same, watching a latch the socket's owner throws when the process is
+/// going away.
+///
+/// **A cancellation is not a synchronous stop, and this is the half it cannot
+/// cover.** The owner ends a connection by aborting its task, and tokio takes a
+/// task off at an await point — but the read loop's whole stretch from a line
+/// arriving to the dispatch is straight-line code through awaits that are
+/// already ready (a free permit, a queue with room), so a connection can run
+/// that stretch to completion *after* the abort was requested and start a
+/// billed `chat.stream` while engine teardown is underway. The latch is read
+/// synchronously at the last moment before the work starts, which is exactly
+/// the seam the abort cannot reach.
+///
+/// The two compose rather than overlap: the abort ends a connection **parked**
+/// at an await, and the latch stops one **between** awaits.
+pub async fn serve_connection_with_shutdown<R, W>(
+    core: Arc<AppCore>,
+    app_version: String,
+    reader: R,
+    writer: W,
+    shutdown: Shutdown,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (out, outbox) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE_FRAMES);
     // Guarded, not merely held: whoever cancels this future is cancelling the
     // connection, and a bare `JoinHandle` dropped on that path would *detach*
     // the writer rather than end it — leaving the socket's write half open and
     // still delivering (see `AbortOnDrop`).
     let mut pen = AbortOnDrop::new(tokio::spawn(write_frames(writer, outbox)));
-    read_frames(core, app_version, reader, out).await;
+    read_frames(core, app_version, reader, out, shutdown).await;
     // Dropping the last sender ends the writer once it has drained — which is
     // what flushes the final terminal frame before the socket closes. Awaited
     // with the guard still standing, so a cancellation landing mid-drain takes
     // the writer with it.
     pen.join().await;
+}
+
+/// A latch the socket's owner throws when the process is going away.
+///
+/// Shared by every connection it is handed to, read synchronously, and one-way:
+/// nothing un-latches. Absent (`default`) for a caller that has no shutdown to
+/// signal — the protocol is exercised over a bare pipe with no process
+/// lifecycle around it, and a never-latched one costs an atomic load per
+/// dispatch.
+#[derive(Clone, Default)]
+pub struct Shutdown(Arc<std::sync::atomic::AtomicBool>);
+
+impl Shutdown {
+    /// A latch nobody has thrown.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Say the process is going away. One-way, and safe to call twice.
+    pub fn latch(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether it has been thrown.
+    pub fn is_latched(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// A spawned task that ends with whoever holds this.
@@ -265,6 +371,11 @@ enum Ending {
     /// is desynchronized and the caller is not keeping to the protocol, so this
     /// tears down rather than drains.
     Fatal,
+    /// The process is going away. Deliberately **not** the draining exit a
+    /// clean end-of-request-stream takes: the answers a drain waits for can be
+    /// a whole turn long, and this is a teardown with a budget measured in
+    /// milliseconds.
+    ShuttingDown,
 }
 
 /// The reader loop: parse, gate, dispatch.
@@ -273,6 +384,7 @@ async fn read_frames<R: AsyncRead + Unpin>(
     app_version: String,
     reader: R,
     out: mpsc::Sender<Vec<u8>>,
+    shutdown: Shutdown,
 ) {
     let mut frames = FrameReader::new(tokio::io::BufReader::new(reader));
     let mut tasks = tokio::task::JoinSet::new();
@@ -444,6 +556,18 @@ async fn read_frames<R: AsyncRead + Unpin>(
         if out.is_closed() {
             break Ending::WriterGone;
         }
+        // **And whether the process is still here**, asked at the same last
+        // moment and for the same reason: the answer has to be as fresh as the
+        // decision it gates. An abort was very likely already requested by now
+        // and simply cannot land mid-stretch (see `Shutdown`), so without this
+        // the next line starts a billed turn into a process that is draining
+        // its engines. Refused rather than dropped: the writer is still alive
+        // at this instant, so the caller can be told rather than left to infer
+        // it from a hang-up.
+        if shutdown.is_latched() {
+            refuse!(request.id, ProtocolError::ShuttingDown);
+            break Ending::ShuttingDown;
+        }
         let core = Arc::clone(&core);
         let app_version = app_version.clone();
         let out = out.clone();
@@ -486,7 +610,7 @@ async fn read_frames<R: AsyncRead + Unpin>(
         // not stop a turn already running on the core's runtime (see "What a
         // lost caller costs" above), and it must not — that would be
         // cancellation landing inside a durable operation.
-        Ending::WriterGone | Ending::Fatal => tasks.abort_all(),
+        Ending::WriterGone | Ending::Fatal | Ending::ShuttingDown => tasks.abort_all(),
     }
 }
 

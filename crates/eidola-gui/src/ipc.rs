@@ -177,6 +177,9 @@ pub fn admit(peer_uid: Option<u32>, our_uid: u32) -> Admission {
 struct Serving {
     closed: bool,
     connections: tokio::task::JoinSet<()>,
+    /// Cloned into every connection this set admits, so the shut below reaches
+    /// the ones already inside — see [`Serving::shut`].
+    shutdown: eidola_app_core::ipc::Shutdown,
 }
 
 impl Serving {
@@ -197,8 +200,19 @@ impl Serving {
     }
 
     /// Shut the door, and end everyone already through it.
+    ///
+    /// **Three layers, three moments, and they do not overlap.** `closed`
+    /// refuses a connection arriving from here on; the shutdown latch stops an
+    /// *already admitted* one from dispatching anything more; the abort ends
+    /// the tasks themselves. The middle one exists because an abort is a
+    /// request tokio grants at an await point, and a connection can run its
+    /// whole read-to-dispatch stretch — every await in it already ready —
+    /// after the abort was asked for, starting billed work into a process
+    /// draining its engines. Latched **before** the abort, so nothing can read
+    /// it as still open in the window between the two.
     fn shut(&mut self) {
         self.closed = true;
+        self.shutdown.latch();
         self.connections.abort_all();
     }
 }
@@ -281,10 +295,18 @@ pub fn serve(core: &Arc<AppCore>) -> Option<ControlSocket> {
         }
     };
     let connections: Connections = Default::default();
+    // The accept loop's own handle on the latch, taken once so building a
+    // connection's future needs no lock.
+    let shutdown = connections
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .shutdown
+        .clone();
     let accepting = core.runtime().spawn(accept_loop(
         Arc::clone(core),
         listener,
         Arc::clone(&connections),
+        shutdown,
     ));
     Some(ControlSocket {
         path,
@@ -329,6 +351,7 @@ async fn accept_loop(
     core: Arc<AppCore>,
     listener: std::os::unix::net::UnixListener,
     connections: Connections,
+    shutdown: eidola_app_core::ipc::Shutdown,
 ) {
     let listener = match tokio::net::UnixListener::from_std(listener) {
         Ok(listener) => listener,
@@ -374,16 +397,18 @@ async fn accept_loop(
         }
 
         let core = Arc::clone(&core);
+        let shutdown = shutdown.clone();
         let admitted = connections
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .admit(async move {
                 let (reader, writer) = stream.into_split();
-                eidola_app_core::ipc::serve_connection(
+                eidola_app_core::ipc::serve_connection_with_shutdown(
                     core,
                     env!("CARGO_PKG_VERSION").to_string(),
                     reader,
                     writer,
+                    shutdown,
                 )
                 .await;
             });
@@ -466,6 +491,28 @@ mod tests {
             serving.admit(std::future::pending()),
             Admitted::DoorShut,
             "a connection accepted a moment before the close was served past it"
+        );
+    }
+
+    #[test]
+    fn shutting_reaches_the_connections_already_inside() {
+        // The refusal above covers the door. This covers everyone already
+        // through it: the latch they each hold is set, so the next request one
+        // of them reads is refused rather than dispatched — which an abort
+        // alone cannot promise, because it lands only at an await point.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let _guard = runtime.enter();
+
+        let mut serving = Serving::default();
+        let held = serving.shutdown.clone();
+        assert!(!held.is_latched(), "a serving socket is not shutting down");
+
+        serving.shut();
+        assert!(
+            held.is_latched(),
+            "a connection admitted before the close would keep dispatching work"
         );
     }
 

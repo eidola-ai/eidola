@@ -33,9 +33,9 @@ use chat_harness::{ChatBehavior, MODEL, MockConfig, core_for, with_account};
 use eidola_app_core::AppCore;
 use eidola_app_core::ipc::{
     Call, DefaultModelResult, Done, HelloResult, MAX_FRAME_BYTES, ModelListResult, NO_REQUEST,
-    PROTOCOL_VERSION, ProtocolError, RemoteError, Request, Response, ResponseBody,
+    PROTOCOL_VERSION, ProtocolError, RemoteError, Request, Response, ResponseBody, Shutdown,
     SpacesArchiveResult, SpacesListResult, WalletCredentialsResult, decode_response, encode_line,
-    serve_connection,
+    serve_connection, serve_connection_with_shutdown,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
@@ -1153,6 +1153,88 @@ fn a_reused_id_never_overlaps_the_exchange_it_reuses() {
             let reused: SpacesListResult = client.ok(&ask).await;
             let _ = reused;
             client.hello().await;
+        });
+    });
+}
+
+#[test]
+fn a_latched_shutdown_starts_no_more_work_on_a_connection_already_serving() {
+    run(|| {
+        // The socket's owner ends a connection by aborting its task, and tokio
+        // grants that at an await point — but the stretch from a line arriving
+        // to the dispatch is straight-line code through awaits that are already
+        // ready (a free permit, a queue with room). So a connection can run the
+        // whole stretch *after* the abort was requested and start a billed turn
+        // into a process that is draining its engines. The latch is the half
+        // the abort cannot reach.
+        let (mock, core, _dir) = served(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime().block_on(async {
+            let shutdown = Shutdown::new();
+            let (client_writes, server_reads) = tokio::io::duplex(PIPE_BUFFER);
+            let (server_writes, client_reads) = tokio::io::duplex(PIPE_BUFFER);
+            tokio::spawn(serve_connection_with_shutdown(
+                Arc::clone(&core),
+                APP_VERSION.to_string(),
+                server_reads,
+                server_writes,
+                shutdown.clone(),
+            ));
+            let mut writer = client_writes;
+            let mut reader = BufReader::new(client_reads);
+
+            writer
+                .write_all(&encode_line(&Request::new(1, &Call::Hello)))
+                .await
+                .expect("write");
+            read_frame(&mut reader).await.expect("the handshake");
+
+            // The process is going away.
+            shutdown.latch();
+
+            writer
+                .write_all(&encode_line(&Request::new(
+                    2,
+                    &Call::ChatStream {
+                        prompt: "asked as the lights go out".into(),
+                        model: Some(MODEL.into()),
+                        space_id: None,
+                    },
+                )))
+                .await
+                .expect("write");
+
+            // Told, rather than left to infer it from a hang-up: the writer is
+            // still alive at the moment the latch is read.
+            let frame = client_frame(&mut reader)
+                .await
+                .expect("a refusal, not silence");
+            assert_eq!(frame.id, 2, "the refusal answers the request that asked");
+            match frame.body {
+                ResponseBody::Err { error } => match error.to_remote() {
+                    RemoteError::Protocol(ProtocolError::ShuttingDown) => {}
+                    other => panic!("unexpected: {other:?}"),
+                },
+                other => panic!("the turn was served during shutdown: {other:?}"),
+            }
+
+            // …and the connection ends rather than waiting on answers nobody
+            // has the budget to produce.
+            assert!(
+                client_frame(&mut reader).await.is_none(),
+                "the connection stayed open through the shutdown"
+            );
+
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                mock.chat_hits(),
+                0,
+                "a billed turn began after the process had decided to go"
+            );
         });
     });
 }
