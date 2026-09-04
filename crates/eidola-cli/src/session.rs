@@ -260,7 +260,8 @@ impl Session {
         }
     }
 
-    /// The account this profile speaks for **right now**.
+    /// The credentials this profile holds **right now**, named by
+    /// [`eidola_app_core::config::account_fingerprint`].
     ///
     /// Read from `config.toml` on every call, in both modes, because the
     /// question it answers is about *now* rather than about when the session
@@ -269,12 +270,18 @@ impl Session {
     /// client mode it is authoritative precisely because the handshake
     /// refuses an app composed from another config root.
     ///
+    /// The **pair**, not the account id: a profile can be reset and
+    /// reconfigured with the same id and a different secret, and an id-only
+    /// answer would call those two the same thing.
+    ///
     /// `None` is a real answer (no account configured), and so is the answer
     /// after a torn write, which decodes as a default config: either way the
-    /// identity on record is not the one a caller captured, which is the
+    /// credentials on record are not the ones a caller captured, which is the
     /// conservative direction for the one thing this is used for.
-    pub fn account_identity(&self) -> Option<String> {
-        eidola_app_core::config::Config::load_from(&self.config_path).account_id
+    pub fn account_fingerprint(&self) -> Option<String> {
+        eidola_app_core::config::account_fingerprint(&eidola_app_core::config::Config::load_from(
+            &self.config_path,
+        ))
     }
 
     /// The runtime this session's work runs on.
@@ -399,17 +406,30 @@ impl Session {
         }
     }
 
-    pub async fn account_checkout(&self, price_id: String) -> Result<String, Failure> {
+    /// Mint a checkout link, **with the identity the mint ran under**.
+    ///
+    /// The identity comes from whichever process signed the request, because
+    /// that is the only one that knows which credentials it used. A caller's
+    /// own before-and-after look cannot settle it alone: an account replaced
+    /// and replaced back inside the round trip leaves those two looks
+    /// agreeing about a link minted for something else in between.
+    pub async fn account_checkout(
+        &self,
+        price_id: String,
+    ) -> Result<AccountCheckoutResult, Failure> {
         match &self.mode {
-            Mode::Embedded(core) => Ok(core.account_checkout(price_id).await?),
-            Mode::Client { client, .. } => {
-                let r: AccountCheckoutResult = client
-                    .lock()
-                    .await
-                    .call(&Call::AccountCheckout { price_id })
-                    .await?;
-                Ok(r.url)
+            Mode::Embedded(core) => {
+                let mint = core.account_checkout(price_id).await?;
+                Ok(AccountCheckoutResult {
+                    url: mint.url,
+                    minted_for: Some(mint.minted_for),
+                })
             }
+            Mode::Client { client, .. } => Ok(client
+                .lock()
+                .await
+                .call(&Call::AccountCheckout { price_id })
+                .await?),
         }
     }
 
@@ -897,22 +917,58 @@ mod tests {
     }
 
     #[test]
-    fn the_account_identity_is_read_fresh_every_time() {
+    fn the_account_fingerprint_is_read_fresh_and_names_the_pair() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _server = greeter(dir.path());
         let session =
             Session::open(dir.path().into(), dir.path().into(), false).expect("client mode");
-        assert_eq!(session.account_identity(), None, "nothing configured yet");
+        let write = |id: &str, secret: &str| {
+            std::fs::write(
+                dir.path().join("config.toml"),
+                format!("account_id = \"{id}\"\naccount_secret = \"{secret}\"\n"),
+            )
+            .expect("write config");
+        };
+
+        assert_eq!(
+            session.account_fingerprint(),
+            None,
+            "nothing configured yet"
+        );
 
         // The app owns the profile in client mode, so the answer has to come
         // off disk each time it is asked rather than from anything captured
         // when the session opened.
-        std::fs::write(dir.path().join("config.toml"), "account_id = \"first\"\n")
+        write("acct", "one");
+        let first = session.account_fingerprint().expect("configured");
+        write("acct", "one");
+        assert_eq!(
+            session.account_fingerprint().as_deref(),
+            Some(first.as_str()),
+            "the same pair is the same answer"
+        );
+
+        // Reset and reconfigured under the same id: a different credential
+        // pair, and an id-only answer would call it the same one.
+        write("acct", "two");
+        assert_ne!(
+            session.account_fingerprint().as_deref(),
+            Some(first.as_str()),
+            "a new secret under the same id is not the same credentials"
+        );
+
+        // And the secret itself never appears in what travels.
+        let named = session.account_fingerprint().expect("configured");
+        assert!(!named.contains("two"), "{named}");
+        assert!(
+            named.len() == 64 && named.chars().all(|c| c.is_ascii_hexdigit()),
+            "{named}"
+        );
+
+        // No secret is no answer: there is nothing to mint under.
+        std::fs::write(dir.path().join("config.toml"), "account_id = \"acct\"\n")
             .expect("write config");
-        assert_eq!(session.account_identity(), Some("first".to_string()));
-        std::fs::write(dir.path().join("config.toml"), "account_id = \"second\"\n")
-            .expect("rewrite config");
-        assert_eq!(session.account_identity(), Some("second".to_string()));
+        assert_eq!(session.account_fingerprint(), None);
     }
 
     #[test]

@@ -763,6 +763,21 @@ pub struct AccountPricesResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountCheckoutResult {
     pub url: String,
+    /// `crate::config::account_fingerprint` of the credentials this link was
+    /// minted under, read where the request was signed.
+    ///
+    /// **A payment link is bound to an account, so it travels with the one it
+    /// funds.** The caller's own before-and-after look at the profile cannot
+    /// settle this on its own: the account can be replaced and replaced back
+    /// inside one round trip, and the two looks then agree about a link minted
+    /// for something else in between.
+    ///
+    /// `None` means the app did not say — one older than this field. That is
+    /// let through rather than refused, because the caller's before-and-after
+    /// check is still there underneath and refusing every older app would take
+    /// a working purchase away to close a narrower hole than the one it opens.
+    #[serde(default)]
+    pub minted_for: Option<String>,
 }
 
 /// The `end` payload of `wallet.spending`.

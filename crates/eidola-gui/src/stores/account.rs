@@ -304,7 +304,9 @@ impl AccountStore {
         let core = self.app_core.clone()?;
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {
-            let _ = tx.send(core.account_checkout(price_id).await);
+            // The view keeps its own before-and-after identity guard, so
+            // only the link is passed on.
+            let _ = tx.send(core.account_checkout(price_id).await.map(|m| m.url));
         });
         Some(rx)
     }

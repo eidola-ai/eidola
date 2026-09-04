@@ -623,8 +623,11 @@ async fn answer(
             ok(balances)
         }
         Call::AccountCheckout { price_id } => {
-            let url = core.account_checkout(price_id).await.map_err(failed)?;
-            ok(super::AccountCheckoutResult { url })
+            let mint = core.account_checkout(price_id).await.map_err(failed)?;
+            ok(super::AccountCheckoutResult {
+                url: mint.url,
+                minted_for: Some(mint.minted_for),
+            })
         }
         Call::WalletSpending => {
             let credentials = core.wallet_spending_credentials().await.map_err(failed)?;

@@ -869,17 +869,28 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                 // the running app, which owns the profile in client mode.
                 // Printing it then would put a checkout that funds an account
                 // this machine no longer holds the secret for in front of the
-                // reader under the current account's name. So the identity it
-                // was minted for is captured here and re-checked where the
-                // answer is still knowable, before a single character of the
-                // URL is exposed.
-                let minted_for = session.account_identity();
-                let url = session.account_checkout(price_id).await?;
-                if session.account_identity() != minted_for {
+                // reader under the current account's name.
+                //
+                // **The answering side says which credentials it signed
+                // with**, and that is what the profile is checked against,
+                // because it is the only answer an account replaced and
+                // replaced back inside the round trip cannot fool. The look
+                // taken before the request is the fallback for an app too old
+                // to say — weaker against that swap, and still far better than
+                // exposing the link unchecked.
+                let before = session.account_fingerprint();
+                let mint = session.account_checkout(price_id).await?;
+                let current = session.account_fingerprint();
+                let still_ours = match &mint.minted_for {
+                    Some(used) => current.as_deref() == Some(used.as_str()),
+                    None => current == before,
+                };
+                if !still_ours {
                     return Err(Failure::AccountReplaced {
                         what: "that checkout link",
                     });
                 }
+                let url = mint.url;
                 let should_open = !no_browser && std::io::stdout().is_terminal();
                 println!("{url}");
                 if should_open {
@@ -2727,33 +2738,54 @@ mod tests {
             .clone()
     }
 
+    /// The credentials `config.toml` holds at this instant, named the way the
+    /// answering side names them.
+    fn fingerprint_at(config: &std::path::Path) -> Option<String> {
+        eidola_app_core::config::account_fingerprint(&eidola_app_core::config::Config::load_from(
+            config,
+        ))
+    }
+
+    fn write_account(config: &std::path::Path, id: &str, secret: &str) {
+        std::fs::write(
+            config,
+            format!("account_id = \"{id}\"\naccount_secret = \"{secret}\"\n"),
+        )
+        .expect("write config");
+    }
+
+    fn checkout(session: &Session) -> Result<(), Failure> {
+        let cli = Cli::parse_from(["eidola", "account", "checkout", "price_1", "--no-browser"]);
+        session.runtime().block_on(run(session, cli))
+    }
+
     #[test]
     fn a_checkout_link_minted_for_a_replaced_account_is_refused() {
         // The app owns the profile in client mode, so the account can be
         // reset or reconfigured in its window while this command's round trip
-        // is in flight. The link came back for the account that was
+        // is in flight. The link came back for the credentials that were
         // configured when it went out; printing it would offer to fund an
         // account whose secret this machine no longer holds.
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("config.toml");
-        std::fs::write(&config, "account_id = \"before\"\n").expect("write config");
+        write_account(&config, "before", "s1");
+        let minted_for = fingerprint_at(&config);
         let replaced = config.clone();
         let (server, seen) = scripted_app(dir.path(), move |request| {
             if request.verb == "account.checkout" {
-                std::fs::write(&replaced, "account_id = \"after\"\n").expect("replace the account");
+                write_account(&replaced, "after", "s2");
             }
             vec![Response::end(
                 request.id,
                 &AccountCheckoutResult {
                     url: "https://checkout.example/session".into(),
+                    minted_for: minted_for.clone(),
                 },
             )]
         });
 
         let session = client_session(dir.path());
-        let cli = Cli::parse_from(["eidola", "account", "checkout", "price_1", "--no-browser"]);
-        let outcome = session.runtime().block_on(run(&session, cli));
-        match outcome {
+        match checkout(&session) {
             Err(Failure::AccountReplaced { what }) => assert_eq!(what, "that checkout link"),
             other => panic!(
                 "a link for a replaced account must not be exposed: {:?}",
@@ -2766,27 +2798,113 @@ mod tests {
     }
 
     #[test]
-    fn a_checkout_link_for_the_account_still_configured_is_offered() {
+    fn a_link_minted_for_an_account_swapped_away_and_back_is_refused() {
+        // The look before and the look after can both find the same account
+        // and still be wrong: replaced and replaced back inside one round
+        // trip, the mint ran under something neither look ever saw. Nothing
+        // this process can observe about its own profile settles that — only
+        // the side that signed the request knows what it signed with, so that
+        // is what the profile is checked against.
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("config.toml"), "account_id = \"same\"\n")
-            .expect("write config");
-        let (server, _seen) = scripted_app(dir.path(), |request| {
+        let config = dir.path().join("config.toml");
+        write_account(&config, "ours", "s1");
+        let restored = std::fs::read(&config).expect("the account we start and end with");
+        let swap = config.clone();
+        let (server, _seen) = scripted_app(dir.path(), move |request| {
+            let mut minted_for = None;
+            if request.verb == "account.checkout" {
+                // Someone else's account was configured when the request was
+                // signed …
+                write_account(&swap, "theirs", "s2");
+                minted_for = fingerprint_at(&swap);
+                // … and ours was put back before the answer arrived.
+                std::fs::write(&swap, &restored).expect("restore the account");
+            }
             vec![Response::end(
                 request.id,
                 &AccountCheckoutResult {
                     url: "https://checkout.example/session".into(),
+                    minted_for,
                 },
             )]
         });
 
         let session = client_session(dir.path());
-        let cli = Cli::parse_from(["eidola", "account", "checkout", "price_1", "--no-browser"]);
-        session
-            .runtime()
-            .block_on(run(&session, cli))
-            .expect("an unchanged account is the ordinary case");
+        assert_eq!(
+            session.account_fingerprint(),
+            fingerprint_at(&config),
+            "the profile ends where it started, which is the whole trap"
+        );
+        match checkout(&session) {
+            Err(Failure::AccountReplaced { what }) => assert_eq!(what, "that checkout link"),
+            other => panic!(
+                "a link minted for another account must not be exposed just \
+                 because the swap was undone: {:?}",
+                other.map(|_| ())
+            ),
+        }
         drop(session);
         server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn a_checkout_link_for_the_account_still_configured_is_offered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        write_account(&config, "same", "s1");
+        let minted_for = fingerprint_at(&config);
+        let (server, _seen) = scripted_app(dir.path(), move |request| {
+            vec![Response::end(
+                request.id,
+                &AccountCheckoutResult {
+                    url: "https://checkout.example/session".into(),
+                    minted_for: minted_for.clone(),
+                },
+            )]
+        });
+
+        let session = client_session(dir.path());
+        checkout(&session).expect("an unchanged account is the ordinary case");
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn an_app_that_does_not_say_what_it_minted_under_still_gets_the_older_check() {
+        // An app older than the field says nothing about which credentials it
+        // used. Refusing every such app would take a working purchase away to
+        // close a narrower hole than it opens, so the look before and after
+        // is still there underneath — weaker against a swap-and-restore, and
+        // far better than exposing the link unchecked.
+        for (replace, expect_refusal) in [(false, false), (true, true)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = dir.path().join("config.toml");
+            write_account(&config, "before", "s1");
+            let replaced = config.clone();
+            let (server, _seen) = scripted_app(dir.path(), move |request| {
+                if replace && request.verb == "account.checkout" {
+                    write_account(&replaced, "after", "s2");
+                }
+                vec![Response::end(
+                    request.id,
+                    &AccountCheckoutResult {
+                        url: "https://checkout.example/session".into(),
+                        minted_for: None,
+                    },
+                )]
+            });
+
+            let session = client_session(dir.path());
+            let outcome = checkout(&session);
+            assert_eq!(
+                matches!(outcome, Err(Failure::AccountReplaced { .. })),
+                expect_refusal,
+                "replaced={replace}: {:?}",
+                outcome.map(|_| ())
+            );
+            drop(session);
+            server.join().expect("the server ends with the connection");
+        }
     }
 
     fn turn_answer(request: &Request, model: &str) -> Vec<Response> {

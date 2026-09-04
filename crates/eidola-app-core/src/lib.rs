@@ -597,6 +597,23 @@ pub struct AccountShowResult {
     pub created_at: i64,
 }
 
+/// A minted checkout link, and the credentials the mint actually ran under.
+///
+/// **The identity is read where the request is signed, not where it is
+/// asked for.** A checkout is a network round trip, and the account can be
+/// replaced and replaced back inside it — so a caller comparing what it saw
+/// before with what it sees after can find them equal and still be holding a
+/// link minted for a third thing in between. Only the process that signed
+/// the request knows which credentials it used, so it says.
+#[derive(Clone, Debug)]
+pub struct CheckoutMint {
+    /// The URL to open.
+    pub url: String,
+    /// [`config::account_fingerprint`] of the credentials this link was
+    /// minted under, taken at the moment the request was signed.
+    pub minted_for: String,
+}
+
 /// **Serialized by the local control protocol** ([`crate::ipc`]): a field
 /// rename here is a wire change.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -2675,11 +2692,16 @@ impl Inner {
             .collect())
     }
 
-    async fn account_checkout(&self, price_id: &str) -> Result<String, AppError> {
+    async fn account_checkout(&self, price_id: &str) -> Result<CheckoutMint, AppError> {
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
+        // Taken from the very config the request is about to be signed with,
+        // so what comes back is bound to the credentials that produced it
+        // rather than to whatever a caller happened to read.
+        let minted_for = config::account_fingerprint(&cfg)
+            .expect("credentials just required are credentials to name");
 
         let client = self.build_client(&eidola, None).await?;
         let resp = client
@@ -2698,7 +2720,10 @@ impl Inner {
                 message: format!("failed to parse response: {e}"),
             })?;
 
-        Ok(checkout.checkout_url)
+        Ok(CheckoutMint {
+            url: checkout.checkout_url,
+            minted_for,
+        })
     }
 
     /// The account's subscription standing, read live from the server.
@@ -9440,7 +9465,7 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    pub async fn account_checkout(&self, price_id: String) -> Result<String, AppError> {
+    pub async fn account_checkout(&self, price_id: String) -> Result<CheckoutMint, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.account_checkout(&price_id).await })
