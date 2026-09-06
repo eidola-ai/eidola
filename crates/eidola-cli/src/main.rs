@@ -1658,9 +1658,17 @@ fn status_cell(
 /// A row the registry *does* carry takes its details from that later read too,
 /// so a port or a pin that moved is not printed stale.
 ///
-/// **Only a claim of running is reconciled.** A `Downloading` row is left
-/// alone even when an engine for its id exists, because that pair is a real
-/// state — re-downloading a slug whose engine is still up — and promoting it
+/// **It settles the question in both directions**, because the later read is
+/// the later read whichever way the two disagree. A row the scan found
+/// `Available` whose id the registry *does* carry is describing a moment
+/// before an engine started — another connection can load one between the
+/// scan's per-row peek and the whole-walk registry read, and in client mode
+/// the app answering has a long-lived registry and other callers to do it.
+/// Left alone, that row printed `available` while [`unaccounted_engines`]
+/// printed the very same id as running, two lines apart in one payload.
+///
+/// **Only a `Downloading` row is left alone.** An engine for its id is a real
+/// pair — re-downloading a slug whose engine is still up — and promoting it
 /// would hide the transfer the row exists to report. That engine earns its own
 /// line below instead, which is the other direction of the same reconciliation.
 fn reconciled_status(
@@ -1668,10 +1676,7 @@ fn reconciled_status(
     running: &[eidola_app_core::RunningEngine],
 ) -> eidola_app_core::LocalModelStatus {
     use eidola_app_core::LocalModelStatus;
-    if !matches!(
-        row.status,
-        LocalModelStatus::Loaded { .. } | LocalModelStatus::Loading
-    ) {
+    if matches!(row.status, LocalModelStatus::Downloading { .. }) {
         return row.status.clone();
     }
     match running.iter().find(|e| e.id == row.id) {
@@ -1698,9 +1703,13 @@ fn reconciled_status(
 /// The table alone therefore claims less is running than actually is.
 ///
 /// An engine is dropped here only when the printed table already said it is
-/// up: a managed-store row with the same id whose status is `Loaded` or
-/// `Loading`. Everything else earns a line — including an engine on a
-/// `llamacpp` backend, whose models this listing never prints at all.
+/// up — and *printed* is the operative word: the test is
+/// [`reconciled_status`], the very status the row will carry, not the raw
+/// scan status underneath it. Asking the scan instead would put a row that
+/// this payload promotes to `loaded` back in this section as well, saying the
+/// same thing twice in two voices. Everything else earns a line — including
+/// an engine on a `llamacpp` backend, whose models this listing never prints
+/// at all, and a `Downloading` row's engine, which no printed row speaks for.
 ///
 /// `orphaned` is the stronger claim and is made only on the stronger
 /// evidence: **no row the scan actually found** carries this id, external
@@ -1723,7 +1732,7 @@ fn unaccounted_engines(
             let listed = state.models.iter().find(|m| m.id == engine.id && m.on_disk);
             let spoken_for = listed.is_some_and(|m| {
                 matches!(
-                    m.status,
+                    reconciled_status(m, running),
                     eidola_app_core::LocalModelStatus::Loaded { .. }
                         | eidola_app_core::LocalModelStatus::Loading
                 )
@@ -2575,17 +2584,74 @@ mod tests {
     /// A stale `Available` row (the scan ran before the engine registered)
     /// is not a claim that anything is running, so the engine still gets its
     /// line — but the file is there, so no orphan flag.
+    /// A row that genuinely is not claiming to run: the bytes for this slug
+    /// are streaming again while the old engine still serves the copy on
+    /// disk. Nothing the table prints for it says "running", so the engine is
+    /// still this section's to name — and the row's own file is right there,
+    /// so it is not orphaned.
     #[test]
     fn a_row_that_does_not_claim_to_be_running_does_not_speak_for_the_engine() {
         let running = vec![engine("gemma@local", 52341, true)];
         let snapshot = state(
-            vec![model("gemma@local", LocalModelStatus::Available)],
+            vec![model(
+                "gemma@local",
+                LocalModelStatus::Downloading {
+                    received: 1_000,
+                    total: Some(1_000_000_000),
+                },
+            )],
             vec![],
         );
 
         let out = unaccounted_engines(&running, &snapshot);
         assert_eq!(out.len(), 1);
         assert!(!out[0].orphaned);
+    }
+
+    /// The other direction of the same later-read authority: an engine
+    /// started between the scan's peek at this row and the whole-walk
+    /// registry read. The row is `Available` only because it was looked at
+    /// first — and in client mode the app answering has a long-lived registry
+    /// and other callers to start engines in it.
+    #[test]
+    fn a_row_the_registry_has_since_started_an_engine_for_is_promoted() {
+        let running = vec![engine("gemma@local", 52341, true)];
+        let snapshot = state(
+            vec![model("gemma@local", LocalModelStatus::Available)],
+            vec![],
+        );
+
+        let row = &snapshot.models[0];
+        assert_eq!(
+            reconciled_status(row, &running),
+            LocalModelStatus::Loaded {
+                port: 52341,
+                context_tokens: 4096,
+                pinned: false,
+            },
+            "the registry is the later read whichever way the two disagree"
+        );
+        assert!(
+            unaccounted_engines(&running, &snapshot).is_empty(),
+            "and the row now speaks for it, so one payload says one thing"
+        );
+    }
+
+    /// The same moment caught a beat earlier: the engine is spawned but not
+    /// yet answering health checks.
+    #[test]
+    fn a_row_whose_engine_has_only_just_spawned_is_promoted_to_loading() {
+        let running = vec![engine("gemma@local", 52341, false)];
+        let snapshot = state(
+            vec![model("gemma@local", LocalModelStatus::Available)],
+            vec![],
+        );
+
+        assert_eq!(
+            reconciled_status(&snapshot.models[0], &running),
+            LocalModelStatus::Loading
+        );
+        assert!(unaccounted_engines(&running, &snapshot).is_empty());
     }
 
     /// The file was deleted under a running engine and the user started the
