@@ -471,6 +471,102 @@ pub(crate) struct Match {
     pub(crate) fraction: f32,
 }
 
+/// Every match on the visible branch, grouped by the node it belongs to.
+///
+/// **The grouping is the point.** Two surfaces ask a per-node question on every
+/// frame a session is open — the highlight layers, once per body editor
+/// (`sync_references` walks every post that has one), and the minimap, once per
+/// cell of the selected column — and each used to answer it by scanning the
+/// whole match vector and cloning what matched. That is `O(posts × matches)`
+/// per frame, on a list a one-character query in a long conversation makes very
+/// long, and it is paid while the reader scrolls and while a reveal animates,
+/// with none of the virtualization that bounds post *shaping* helping at all.
+///
+/// So the group is built where the matches are: `sync_find` walks the scope in
+/// document order and pushes one node's matches at a time, which already lays
+/// them out as contiguous runs — [`Self::push`] only has to record where each
+/// run starts and ends. A per-node read is then a **slice of that node's own
+/// run**, which is what makes "an editor never looks at another node's matches"
+/// structural rather than careful.
+///
+/// The two halves cannot drift, because `push` and `clear` are the only ways to
+/// change either: the index is a function of the vector, maintained in the same
+/// statement that grows it.
+#[derive(Default)]
+pub(crate) struct MatchSet {
+    all: Vec<Match>,
+    /// Node id → that node's contiguous run of `all`.
+    runs: HashMap<SharedString, Range<usize>>,
+}
+
+impl MatchSet {
+    /// Append one match. Matches arrive grouped by node (the scope walk), so a
+    /// match whose node is the one the last run names extends that run; any
+    /// other opens a new one.
+    fn push(&mut self, m: Match) {
+        let at = self.all.len();
+        match self.runs.get_mut(&m.node) {
+            Some(run) if run.end == at => run.end = at + 1,
+            Some(_) => debug_assert!(
+                false,
+                "a node's matches arrive in one run: {} came back later",
+                m.node
+            ),
+            None => {
+                self.runs.insert(m.node.clone(), at..at + 1);
+            }
+        }
+        self.all.push(m);
+    }
+
+    fn clear(&mut self) {
+        self.all.clear();
+        self.runs.clear();
+    }
+
+    /// One node's own matches, in projection order. The read every per-node
+    /// surface takes, and the reason neither of them is O(all).
+    fn of(&self, node: &SharedString) -> &[Match] {
+        match self.runs.get(node) {
+            Some(run) => &self.all[run.clone()],
+            None => &[],
+        }
+    }
+
+    /// Which of `node`'s own matches the anchor names, as an offset into
+    /// [`Self::of`].
+    ///
+    /// O(1) and local: a node's ordinals are `0..run.len()` by construction
+    /// (`sync_find` enumerates a projection's hits), so the anchor's ordinal
+    /// *is* the offset once its key names this run — which is the whole of what
+    /// a per-node surface needs to know about "which one is current", without
+    /// resolving the anchor against every match in the space.
+    fn current_of(&self, node: &SharedString, anchor: &Option<MatchAnchor>) -> Option<usize> {
+        let anchor = anchor.as_ref()?;
+        let run = self.of(node);
+        let m = run.get(anchor.ordinal)?;
+        (MatchAnchor::of(m) == *anchor).then_some(anchor.ordinal)
+    }
+}
+
+impl std::ops::Deref for MatchSet {
+    type Target = [Match];
+
+    fn deref(&self) -> &[Match] {
+        &self.all
+    }
+}
+
+impl FromIterator<Match> for MatchSet {
+    fn from_iter<T: IntoIterator<Item = Match>>(iter: T) -> Self {
+        let mut set = Self::default();
+        for m in iter {
+            set.push(m);
+        }
+        set
+    }
+}
+
 /// The anchor for "the current match": an identity, never an index into the
 /// match list.
 ///
@@ -534,8 +630,9 @@ pub(crate) struct FindSession {
     pub(crate) text: String,
     /// The prepared query, or `None` while the field is empty.
     pub(crate) query: Option<Query>,
-    /// Every match on the visible branch, in document order.
-    pub(crate) matches: Vec<Match>,
+    /// Every match on the visible branch, in document order and grouped by
+    /// node — see [`MatchSet`] for why the grouping is not an optimization.
+    pub(crate) matches: MatchSet,
     /// Which match the readout counts as current.
     pub(crate) anchor: Option<MatchAnchor>,
     /// Per-node searchable projections, keyed by node id, each remembered with
@@ -710,7 +807,7 @@ fn reanchor(
 /// between two draws. The rule is asserted here, where that fusion cannot
 /// reach it.
 fn invalidate_for_new_query(
-    matches: &mut Vec<Match>,
+    matches: &mut MatchSet,
     anchor: &mut Option<MatchAnchor>,
     pending_reveal: &mut Option<PendingReveal>,
 ) {
@@ -883,7 +980,7 @@ impl SpaceView {
             _sub: sub,
             text: String::new(),
             query: None,
-            matches: Vec::new(),
+            matches: MatchSet::default(),
             anchor: None,
             projections: HashMap::new(),
             pending_reveal: None,
@@ -1246,6 +1343,10 @@ impl SpaceView {
 
     /// The match ranges to paint on one node: the ordinary matches, and the
     /// current one on its own layer above them.
+    ///
+    /// Reads that node's own run and nothing else ([`MatchSet`]) — this runs
+    /// once per body editor on every frame the bar is open, so scanning the
+    /// whole set here made the paint `O(posts × matches)`.
     pub(crate) fn find_match_ranges(
         &self,
         node: &SharedString,
@@ -1253,11 +1354,12 @@ impl SpaceView {
         let Some(session) = self.find.as_ref() else {
             return (Vec::new(), Vec::new());
         };
-        let current = session.current();
-        let mut all = Vec::new();
+        let matches = session.matches.of(node);
+        let current = session.matches.current_of(node, &session.anchor);
+        let mut all = Vec::with_capacity(matches.len());
         let mut active = Vec::new();
-        for m in session.matches.iter().filter(|m| &m.node == node) {
-            if Some(m) == current {
+        for (i, m) in matches.iter().enumerate() {
+            if Some(i) == current {
                 active.push(m.source.clone());
             } else {
                 all.push(m.source.clone());
@@ -1267,16 +1369,18 @@ impl SpaceView {
     }
 
     /// The minimap's tick positions for one node: `(fraction, is_current)`.
+    /// Per cell of the selected column, so it takes the same per-node read.
     pub(crate) fn find_ticks(&self, node: &SharedString) -> Vec<(f32, bool)> {
         let Some(session) = self.find.as_ref() else {
             return Vec::new();
         };
-        let current = session.current();
+        let current = session.matches.current_of(node, &session.anchor);
         session
             .matches
+            .of(node)
             .iter()
-            .filter(|m| &m.node == node)
-            .map(|m| (m.fraction, Some(m) == current))
+            .enumerate()
+            .map(|(i, m)| (m.fraction, Some(i) == current))
             .collect()
     }
 
@@ -2170,7 +2274,7 @@ mod tests {
         // step must find nothing to walk — otherwise it anchors in the
         // previous query's results and the rebuild honours that as the
         // reader's place.
-        let mut matches = vec![m("a3", Some("i3"), 0)];
+        let mut matches: MatchSet = [m("a3", Some("i3"), 0)].into_iter().collect();
         let mut anchor = Some(MatchAnchor::of(&matches[0]));
         let mut pending: Option<PendingReveal> = None;
 
@@ -2186,11 +2290,13 @@ mod tests {
         let previous = anchor
             .clone()
             .map(|a| (a, current_position(&matches, &anchor).unwrap_or(0)));
-        matches = vec![
+        matches = [
             m("a1", Some("i1"), 0),
             m("a2", Some("i2"), 0),
             m("a3", Some("i3"), 0),
-        ];
+        ]
+        .into_iter()
+        .collect();
         reanchor(&matches, &mut anchor, previous);
 
         assert_eq!(
@@ -2199,6 +2305,55 @@ mod tests {
             "the new query starts at its own first match, not forwarded onto \
              the post the old query's anchor named"
         );
+    }
+
+    #[test]
+    fn a_nodes_matches_are_read_as_its_own_run() {
+        // The per-node surfaces — every body editor's highlight layers, every
+        // minimap cell — used to answer by scanning the whole match vector,
+        // which is `O(posts × matches)` on every frame the bar is open. They
+        // now read a slice, so what has to hold is that the slice is exactly
+        // what the scan would have selected, and that the runs account for
+        // every match once.
+        let matches: MatchSet = [
+            m("a1", Some("i1"), 0),
+            m("a1", Some("i1"), 1),
+            m("a2", Some("i2"), 0),
+            m("draft-1", None, 0),
+            m("draft-1", None, 1),
+            m("draft-1", None, 2),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut accounted = 0;
+        for node in ["a1", "a2", "draft-1", "nobody"] {
+            let node = SharedString::from(node);
+            let scanned: Vec<&Match> = matches.iter().filter(|m| m.node == node).collect();
+            let run: Vec<&Match> = matches.of(&node).iter().collect();
+            assert_eq!(run, scanned, "the run for {node} is what a scan selects");
+            accounted += run.len();
+        }
+        assert_eq!(
+            accounted,
+            matches.len(),
+            "every match is in exactly one run"
+        );
+
+        // And which of a node's own matches is current is answered from that
+        // run alone — an offset into it, never a position in the whole set.
+        let anchor = Some(MatchAnchor::of(&matches[4]));
+        assert_eq!(
+            matches.current_of(&"draft-1".into(), &anchor),
+            Some(1),
+            "the second of the draft's own matches"
+        );
+        assert_eq!(
+            matches.current_of(&"a1".into(), &anchor),
+            None,
+            "and no other node claims it"
+        );
+        assert_eq!(matches.current_of(&"a1".into(), &None), None);
     }
 
     #[test]
