@@ -20099,6 +20099,91 @@ fn space_find_stops_the_old_reveal_when_the_query_stops_matching(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn space_find_stops_its_reveal_when_the_reader_edits_a_post(cx: &mut TestAppContext) {
+    // The composer's twin, reached through the other editor. An inline edit
+    // has no caret-into-view of its own to arm, so it never passed the seam
+    // every reader-driven motion goes through — and a reveal armed at an
+    // off-screen match survived the reader typing into a post, with phase 2
+    // pulling the page onto that match frames later.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "the off-screen match is being glided to"
+        );
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "…with the correction owed once that post is measured"
+        );
+    });
+
+    // The reader starts editing the post at the top of the page and types.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post's body editor is the edit buffer");
+    let caret = editor.read_with(&vcx, |e, cx| gpui::Focusable::focus_handle(e, cx));
+    vcx.update(|window, cx| window.focus(&caret, cx));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("h i");
+    vcx.run_until_parked();
+    assert!(
+        editor
+            .read_with(&vcx, |e, _| e.value().to_string())
+            .starts_with("hi"),
+        "the keystrokes reached the edit buffer"
+    );
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_pending_reveal_for_test(),
+            None,
+            "the reveal the reader superseded is not still owed"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…and neither is the motion it was phase 1 of"
+        );
+    });
+
+    // So nothing is left that could travel to the match under their caret.
+    let resting = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.drive_page_glide_for_test(1.0));
+    });
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_scroll_offset_y_for_test(),
+            resting,
+            "the page stayed where the reader is editing"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_stops_its_reveal_when_the_reader_resumes_composing(cx: &mut TestAppContext) {
     // A reveal at an off-screen match is a two-phase motion: a glide to the
     // byte-fraction estimate, then a correction once the post is measured.
