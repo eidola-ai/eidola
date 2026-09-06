@@ -211,6 +211,7 @@ fn fixture_user_post(action_id: &str, text: &str) -> PostNode {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     }
 }
 
@@ -401,6 +402,7 @@ fn stub_space(id: &str, title: Option<&str>, snippet: Option<&str>, ts: i64) -> 
         last_activity_at: ts,
         message_count: 2,
         archived_at: None,
+        parent: None,
     }
 }
 
@@ -669,6 +671,148 @@ fn library_pencil_click_does_not_also_open_row(cx: &mut TestAppContext) {
             "clicking the pencil must NOT also open the row (the propagation/reshape race)"
         );
     });
+}
+
+/// The parent badge opens the conversation a delegated one was opened from —
+/// and, being a control inside a row that is itself a control, must not open
+/// its own row on the way (the rename pencil's propagation race, in the one
+/// other place a row now carries a click of its own).
+#[gpui::test]
+fn library_parent_badge_opens_the_parent_and_not_its_own_row(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![SpaceInfo {
+            parent: Some(eidola_app_core::SpaceParent {
+                space_id: "s0".into(),
+                title: Some("Tides and the moon".into()),
+            }),
+            ..stub_space("s1", Some("Check Friday's tide tables"), None, 1_000)
+        }];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+    cx.run_until_parked();
+
+    // The badge is a link only on the revealed row — the same gate the row's
+    // other verbs take, and what keeps the listing one tab stop.
+    view.update(cx, |v, _| v.set_hovered_for_test(Some(0)));
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(520.), px(620.)));
+    vcx.run_until_parked();
+    let bounds = vcx
+        .debug_bounds("parent-badge-0")
+        .expect("the revealed parent badge must be painted with its debug selector");
+    let center: Point<gpui::Pixels> = bounds.center();
+
+    vcx.simulate_click(center, Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.open_parent_requests_for_test(),
+            1,
+            "the badge opens the conversation this one was delegated from"
+        );
+        assert_eq!(
+            v.open_space_requests_for_test(),
+            0,
+            "and never the row it sits in"
+        );
+    });
+}
+
+/// **The parent link is a tab stop, and it comes before the row's verbs.** The
+/// Library is one tab stop with a roving cursor whose row reveals its
+/// affordances, so making the badge a `Link` added a stop to that order —
+/// list → Parent → Rename → Archive → out — and a documented order nothing
+/// checks is a contract the next accessibility pass can quietly drop.
+///
+/// Two halves, because the harness can measure two different things. **That it
+/// is a stop** is measured by walking Tab until the focus wraps: a delegated
+/// row's listing has exactly one more stop than the same listing without a
+/// parent. **Where it is** follows from paint order, which is what orders stops
+/// within one tab region (`crate::focus::TabRegion`), so the badge painting to
+/// the left of the rename pencil is the same fact as its coming first.
+#[gpui::test]
+fn library_tab_order_reaches_a_parent_before_the_row_verbs(cx: &mut TestAppContext) {
+    /// Tab from the top until focus comes back where it started; the count is
+    /// the number of stops the window offers.
+    fn stops(cx: &mut TestAppContext, window: gpui::AnyWindowHandle) -> usize {
+        let focused = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.focused(cx).map(|h| format!("{h:?}"))
+            })
+            .unwrap()
+        };
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..50 {
+            cx.update_window(window, |_, window, cx| window.focus_next(cx))
+                .unwrap();
+            cx.update_window(window, |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+            let Some(id) = focused(cx) else { break };
+            if seen.contains(&id) {
+                break;
+            }
+            seen.push(id);
+        }
+        seen.len()
+    }
+
+    let ordinary = stub_space("s1", Some("Check Friday's tide tables"), None, 1_000);
+    let delegated = SpaceInfo {
+        parent: Some(eidola_app_core::SpaceParent {
+            space_id: "s0".into(),
+            title: Some("Tides and the moon".into()),
+        }),
+        ..ordinary.clone()
+    };
+
+    let plain_stores = stub_stores(cx, |s| s.spaces = vec![ordinary]);
+    let (plain_window, _) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(plain_stores, window, cx))
+    });
+    cx.run_until_parked();
+    let plain = stops(cx, plain_window);
+
+    let stores = stub_stores(cx, |s| s.spaces = vec![delegated]);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        stops(cx, window),
+        plain + 1,
+        "a delegated row puts one more stop in the Library's order"
+    );
+
+    // And the cursor row really is what reveals it — the badge is a `Link`
+    // where the verbs are live, not a stop that outlives its own reveal.
+    let seen = cx
+        .update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, cx| v.cursor_and_reveal_for_test(window, cx))
+        })
+        .unwrap();
+    assert_eq!(seen.1, Some(0), "the row whose verbs are revealed");
+
+    // Position: stops within one tab region follow paint order, so this is the
+    // order Tab reads.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(520.), px(620.)));
+    vcx.run_until_parked();
+    let badge = vcx
+        .debug_bounds("parent-badge-0")
+        .expect("the revealed parent badge is painted");
+    let pencil = vcx
+        .debug_bounds("rename-pencil-0")
+        .expect("the revealed rename pencil is painted");
+    assert!(
+        badge.origin.x < pencil.origin.x,
+        "Parent is painted — and so reached — before Rename: {badge:?} vs {pencil:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2617,6 +2761,9 @@ fn inspector_participants_render_with_scroll_indicator(cx: &mut TestAppContext) 
             .map(|i| eidola_app_core::ModelInfo {
                 id: format!("model-{i:02}"),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: eidola_app_core::ModelCapabilities::default(),
                 prompt_credits_per_token: 1.0,
                 completion_credits_per_token: 2.0,
                 request_credits: None,
@@ -2807,6 +2954,7 @@ fn open_floating_composer_scene(
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -3033,6 +3181,7 @@ fn space_composer_dock_shadow_is_stable_cold(cx: &mut TestAppContext) {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     };
     let mut nodes = Vec::new();
     for i in 0..12 {
@@ -3120,6 +3269,7 @@ fn space_resize_above_column_cap_does_not_churn_height_cache(cx: &mut TestAppCon
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     };
     let mut nodes = Vec::new();
     for i in 0..12 {
@@ -5237,6 +5387,7 @@ fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -5349,6 +5500,7 @@ fn space_scrolled_floating_composer_glides_to_its_top_by_the_dock(cx: &mut TestA
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -13682,6 +13834,113 @@ fn retiring_closes_every_window_and_leaves_the_app_standing(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn the_full_shutdown_closes_the_control_socket(cx: &mut TestAppContext) {
+    // gpui invokes quit observers in **registration order**, so a socket close
+    // registered as its own hook ran *after* the engine teardown registered
+    // before it — and the core's runtime keeps serving connections across that
+    // gap, long enough for a caller to start a billed `chat.stream` after the
+    // process had decided to go, or reach for an engine registry already
+    // latched shut.
+    //
+    // One hook owns the whole sequence now, so the order is two adjacent lines
+    // in one body rather than two calls at the launch site — nothing a test can
+    // guard better than reading it. What is worth pinning is the half that
+    // *could* silently rot: that closing the door is a step of the quit path at
+    // all, rather than a closure nobody calls.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let stores = stub_stores_with_config(cx);
+    let closed = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = closed.clone();
+    cx.update(|cx| {
+        let bridge = eidola_gui::stores::install_bus_bridge(&stores, cx);
+        eidola_gui::lifecycle::install_shutdown(
+            &stores,
+            bridge,
+            move || flag.store(true, Ordering::SeqCst),
+            cx,
+        );
+    });
+    assert!(
+        !closed.load(Ordering::SeqCst),
+        "nothing is torn down before the quit"
+    );
+
+    cx.update(|cx| cx.shutdown());
+
+    assert!(
+        closed.load(Ordering::SeqCst),
+        "the full shutdown left the door open"
+    );
+}
+
+#[gpui::test]
+fn retiring_leaves_the_control_socket_and_the_callers_on_it_answering(cx: &mut TestAppContext) {
+    // The socket's side of the same retire. ⌘Q is not a shutdown, so the door
+    // another process knocks on stays open with the process, the stores and the
+    // engines — and so do the peers already through it, which is the half a
+    // shutdown that ends established connections has to be careful not to take
+    // with it. Only `on_app_quit` closes the socket, and a retire never reaches
+    // it; what closing then costs is pinned beside the socket (`tests/ipc.rs`).
+    use std::io::{BufRead, Write};
+
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    let path = eidola_app_core::ipc::socket_path(core.data_dir());
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // Held for the test's duration exactly as the shutdown hook holds it in
+    // production; closing is that hook's first step, and a retire never runs it.
+    let _socket = eidola_gui::ipc::bind(&stores).expect("bind");
+    assert!(path.exists(), "the door is open to begin with");
+
+    // A peer that was already connected when the retire happened.
+    let mut stream = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+    let mut ask = |stream: &mut std::os::unix::net::UnixStream, id: u64, call| {
+        stream
+            .write_all(&eidola_app_core::ipc::encode_line(
+                &eidola_app_core::ipc::Request::new(id, &call),
+            ))
+            .expect("write");
+        stream.flush().expect("flush");
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).expect("read");
+        assert!(read > 0, "the connection was ended");
+        eidola_app_core::ipc::decode_response(line.trim_end().as_bytes()).expect("a frame")
+    };
+    let hello = ask(&mut stream, 1, eidola_app_core::ipc::Call::Hello);
+    assert!(matches!(
+        hello.body,
+        eidola_app_core::ipc::ResponseBody::End { .. }
+    ));
+
+    // The retire: every window goes, nothing on the quit path runs.
+    cx.update(eidola_gui::lifecycle::close_all_windows);
+    cx.run_until_parked();
+
+    assert!(path.exists(), "the retire took the door with the windows");
+    let answer = ask(
+        &mut stream,
+        2,
+        eidola_app_core::ipc::Call::SpacesList {
+            include_archived: false,
+        },
+    );
+    assert!(
+        matches!(answer.body, eidola_app_core::ipc::ResponseBody::End { .. }),
+        "a retired app stopped answering a caller it had already admitted"
+    );
+}
+
+#[gpui::test]
 fn retiring_from_a_windows_own_update_still_closes_that_window(cx: &mut TestAppContext) {
     // ⌘Q arrives with a window key, and `App::dispatch_action` routes an
     // action *through* the active window — so the Quit handler runs inside
@@ -17947,6 +18206,59 @@ fn space_marks_an_answer_that_stopped_at_its_length_limit(cx: &mut TestAppContex
     assert!(
         names.iter().any(|n| n.ends_with("/cut-off")),
         "the answer says where it stopped: {names:?}"
+    );
+}
+
+#[gpui::test]
+fn space_marks_a_reloaded_answer_that_stopped_at_its_length_limit(cx: &mut TestAppContext) {
+    // The durable half. This window watched no turn — it is the window a
+    // reader opens afterwards — so nothing has told it anything; the only
+    // source of the mark is the post's own row. A `truncated` post is
+    // therefore seeded and the mark asserted with no event delivered at all,
+    // and the sibling that is not truncated pins that the mark is per-post
+    // rather than a property of the space.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = fixture_assistant_post("a2", "the reply that ran out of room");
+    a2.parent_action_id = Some("a1".into());
+    a2.truncated = true;
+    let mut a3 = fixture_assistant_post("a3", "a whole answer");
+    a3.parent_action_id = Some("a2".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "original text"), a2, a3], cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.truncated_posts_for_test().is_empty(),
+            "this window watched no turn, so it remembers nothing"
+        );
+    });
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let cut_off: Vec<&String> = names.iter().filter(|n| n.ends_with("/cut-off")).collect();
+    assert_eq!(
+        cut_off.len(),
+        1,
+        "exactly the reloaded post that stopped short says so: {names:?}"
+    );
+    assert!(
+        cut_off[0].starts_with("space/post/1/"),
+        "and it is the second post, not its sibling: {cut_off:?}"
     );
 }
 

@@ -137,6 +137,7 @@ fn spawn_from(
         capabilities,
         None,
         parent_action_id.map(str::to_string),
+        None,
     ))
 }
 
@@ -437,6 +438,30 @@ fn a_refused_spawn_writes_nothing_at_all() {
             ),
             SpawnRefusal::ParticipantNotEligible { .. }
         ));
+        // A live shared agent that has left *this* conversation is refused
+        // too, and told apart from the one above: it is perfectly invitable
+        // somewhere it still takes part, just not into a room opened from here.
+        let gone = shared_agent(&core, &parent, "Adrift");
+        core.runtime()
+            .block_on(core.remove_space_participant(parent.clone(), gone.clone()))
+            .expect("remove from the parent");
+        assert_eq!(
+            refusal(
+                spawn(
+                    &core,
+                    &parent,
+                    &owner,
+                    "Do a thing.",
+                    vec![gone.clone()],
+                    vec![],
+                )
+                .unwrap_err()
+            ),
+            SpawnRefusal::ParticipantHasLeft {
+                participant_id: gone.clone(),
+                label: Some("Adrift".into())
+            }
+        );
 
         assert_eq!(
             core.runtime()
@@ -1707,7 +1732,8 @@ fn an_agent_with_no_model_of_its_own_is_refused_a_seat() {
                 .unwrap_err()
             ),
             SpawnRefusal::NoModelConfigured {
-                label: "Mute".into()
+                participant_id: mute.clone(),
+                label: Some("Mute".into())
             }
         );
 
@@ -1736,7 +1762,8 @@ fn an_agent_with_no_model_of_its_own_is_refused_a_seat() {
                 .unwrap_err()
             ),
             SpawnRefusal::NoModelConfigured {
-                label: "Mute".into()
+                participant_id: mute.clone(),
+                label: Some("Mute".into())
             },
             "the child sees the base config, so the parent's override cannot vouch for it"
         );
@@ -1794,7 +1821,8 @@ fn an_agent_with_no_model_of_its_own_is_refused_a_seat() {
                 .unwrap_err()
             ),
             SpawnRefusal::NoModelConfigured {
-                label: "Voiceless".into()
+                participant_id: voiceless.clone(),
+                label: Some("Voiceless".into())
             }
         );
     });
@@ -1850,13 +1878,16 @@ fn a_brief_with_no_openable_line_still_names_its_room() {
 // Writing into a room you were not asked into
 // ===========================================================================
 
-/// Reading a sub-space is oversight; writing into one is membership. Until the
-/// join has a surface of its own, the composer's post is refused rather than
-/// written by a participant the roster does not carry.
+/// Reading a sub-space is oversight; **speaking in one is joining it**. The
+/// membership is written in the post's own transaction, so the roster the
+/// models read is true of the transcript they read from that post onward — no
+/// window in which somebody the roster omits has said something, and no
+/// separate step a reader has to know to take first.
 #[test]
-fn a_human_cannot_post_into_a_subspace_without_joining_it() {
+fn a_humans_first_post_into_a_subspace_joins_them_to_it() {
     run(|| {
         let (_mock, core, _dir) = setup();
+        let mut rx = core.subscribe_changes();
         let parent = space(&core);
         let owner = shared_agent(&core, &parent, "Navigator");
         let out = spawn(
@@ -1869,29 +1900,69 @@ fn a_human_cannot_post_into_a_subspace_without_joining_it() {
         )
         .expect("spawn");
         let sub = out.space.id.clone();
+        let roster = core
+            .runtime()
+            .block_on(core.list_space_participants(sub.clone()))
+            .expect("roster");
+        assert!(
+            roster.iter().all(|p| p.kind != "human"),
+            "the room starts with no human in it: {roster:?}"
+        );
+        let _ = drain(&mut rx);
 
-        let err = core
+        let posted = core
             .runtime()
             .block_on(core.post("Actually, check Saturday.".into(), Some(sub.clone())))
-            .expect_err("posting is membership");
-        match &err {
-            // Data, not prose: the id is what a surface offering the join
-            // needs, and the sentence a reader sees is chosen in their locale.
-            AppError::NotJoined { space_id } => assert_eq!(space_id, &sub),
-            other => panic!("expected NotJoined, got {other:?}"),
-        }
-        // Zero trace: the room still holds only its brief.
+            .expect("speaking in a delegated room is how a reader joins it");
+        assert_eq!(posted.space_id, sub);
+
+        let roster = core
+            .runtime()
+            .block_on(core.list_space_participants(sub.clone()))
+            .expect("roster");
+        let human = roster
+            .iter()
+            .find(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+            .expect("the reader is in the room they just spoke in");
         assert_eq!(
-            core.runtime()
-                .block_on(core.get_space_tree(sub.clone()))
-                .unwrap()
-                .len(),
-            1
+            human.role, "member",
+            "and joins as a member — `owner` is the delegation's own structural role: {roster:?}"
+        );
+        // The post and the membership are one commit, so the transcript never
+        // carries a word by somebody the roster does not.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(sub.clone()))
+            .unwrap();
+        assert_eq!(tree.len(), 2, "brief + the reader's post: {tree:?}");
+        let changes = drain(&mut rx);
+        assert!(
+            changes.iter().any(|c| matches!(c, Change::Participants)),
+            "a roster changed, and every surface that renders one has to re-read: {changes:?}"
         );
 
-        // `chat` reaches the membership gate first — it is a combined
-        // post-and-turn, and in a live sub-space that combination is refused
-        // before posting, but an unjoined reader still sees NotJoined.
+        // Saying a second thing writes no second membership and announces
+        // nothing about the roster — an invalidation about nothing is noise.
+        core.runtime()
+            .block_on(core.post("And Sunday.".into(), Some(sub.clone())))
+            .expect("post");
+        let changes = drain(&mut rx);
+        assert!(
+            !changes.iter().any(|c| matches!(c, Change::Participants)),
+            "the join is idempotent and silent once it holds: {changes:?}"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.list_space_participants(sub.clone()))
+                .expect("roster")
+                .len(),
+            2,
+            "owner + the reader, once"
+        );
+
+        // `chat` is still refused, and now for the one reason that actually
+        // stands in the way: the room drives its own cascade. Posting is the
+        // door, and it is open.
         let err = core
             .runtime()
             .block_on(core.chat(
@@ -1899,21 +1970,26 @@ fn a_human_cannot_post_into_a_subspace_without_joining_it() {
                 MODEL.into(),
                 Some(sub.clone()),
             ))
-            .expect_err("chat is membership first");
-        assert!(matches!(err, AppError::NotJoined { .. }), "{err:?}");
-        assert_eq!(
-            core.runtime()
-                .block_on(core.get_space_tree(sub.clone()))
-                .unwrap()
-                .len(),
-            1,
-            "and no turn was funded either"
+            .expect_err("a delegated room's cascade is the driver's");
+        assert!(
+            matches!(err, AppError::DrivenConversation { .. }),
+            "{err:?}"
         );
 
         // The human's own conversations are untouched.
         core.runtime()
-            .block_on(core.post("Ordinary.".into(), Some(parent)))
+            .block_on(core.post("Ordinary.".into(), Some(parent.clone())))
             .expect("posting where you are a member is unchanged");
+        assert_eq!(
+            core.runtime()
+                .block_on(core.list_space_participants(parent))
+                .expect("roster")
+                .iter()
+                .filter(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+                .count(),
+            1,
+            "and joins nobody twice"
+        );
     });
 }
 
@@ -2017,7 +2093,7 @@ fn a_brief_can_be_neither_edited_nor_regenerated() {
         // Two independent gates stand in front of these verbs, and this test is
         // about the inner one: joining first takes the membership gate out of
         // the way so the *kind* rule is what answers.
-        // (`an_unjoined_reader_cannot_spend_or_write_in_a_room_they_only_watch`
+        // (`an_unjoined_reader_cannot_spend_or_change_what_is_already_there`
         // covers the outer one.)
         core.runtime()
             .block_on(core.add_global_participant(
@@ -2881,18 +2957,19 @@ fn a_sub_space_owners_policy_cannot_be_edited_back_into_the_cascade() {
 /// **Oversight is looking, and the line it stops at is every verb that acts.**
 ///
 /// A human can open any room their agents opened between themselves, and the
-/// window that opens is an ordinary one — composer, per-post gutter, retry.
-/// `post` was gated when the read bypass was built, which left the other three
-/// doors that act *as the human* open: an edit, a regeneration and a retry all
-/// write into a conversation nobody joined, and the last two **spend** doing
-/// it. Each takes the same gate now, before any write and before any request.
+/// window that opens is an ordinary one — composer, per-post gutter, retry. An
+/// edit, a regeneration and a retry all act on somebody else's work in a
+/// conversation nobody joined, and the last two **spend** doing it, so each is
+/// refused before any write and before any request. Saying something is the
+/// one act that is not refused — it joins the reader instead — which is what
+/// makes the refusals a line rather than a wall.
 ///
 /// `respond_stream_as` is deliberately not on that list and is checked here
 /// too: it names the participant it acts as, is gated on *that* participant's
 /// membership, and is the door a turn driver uses — a human-membership test
 /// there would refuse a room's own agents working in their own room.
 #[test]
-fn an_unjoined_reader_cannot_spend_or_write_in_a_room_they_only_watch() {
+fn an_unjoined_reader_cannot_spend_or_change_what_is_already_there() {
     run(|| {
         let (mock, core, _dir) = setup();
         let parent = space(&core);
@@ -2932,11 +3009,10 @@ fn an_unjoined_reader_cannot_spend_or_write_in_a_room_they_only_watch() {
             .expect("actions")
             .len();
 
-        // Every door that acts as the human refuses, naming the room.
-        let post_err = core
-            .runtime()
-            .block_on(core.post("Actually, check Saturday.".into(), Some(sub.clone())))
-            .expect_err("post");
+        // Every door that acts as the human **on work already here** refuses,
+        // naming the room. `post` is not among them and never could be: it is
+        // how a reader joins, so a reader who has not joined is exactly the one
+        // it is for.
         let edit_err = core
             .runtime()
             .block_on(core.edit_post(answer.clone(), "Say it differently.".into()))
@@ -2954,7 +3030,6 @@ fn an_unjoined_reader_cannot_spend_or_write_in_a_room_they_only_watch() {
             })
             .expect_err("retry");
         for (what, err) in [
-            ("post", post_err),
             ("edit", edit_err),
             ("regenerate", regen_err),
             ("retry", retry_err),
@@ -2992,20 +3067,14 @@ fn an_unjoined_reader_cannot_spend_or_write_in_a_room_they_only_watch() {
             2
         );
 
-        // And once joined, the same verbs work.
-        core.runtime()
-            .block_on(core.add_global_participant(
-                sub.clone(),
-                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
-                Some(eidola_app_core::MembershipRole::Member),
-            ))
-            .expect("join");
+        // And **the join is a post**: speaking is what a reader does, and the
+        // three verbs above are open the moment they have.
         core.runtime()
             .block_on(core.post("Now I can speak.".into(), Some(sub.clone())))
-            .expect("a member posts");
+            .expect("speaking joins");
         core.runtime()
             .block_on(core.regenerate(answer, MODEL.into()))
-            .expect("and may regenerate an answer");
+            .expect("and may then regenerate an answer");
 
         // The parent — an ordinary conversation the human is a member of — was
         // never affected by any of this.
@@ -3131,6 +3200,686 @@ fn a_human_may_quote_out_of_a_room_they_watch_but_not_out_of_a_notebook() {
         assert!(
             matches!(err, AppError::NotAParticipant { .. }),
             "and it refuses without naming anything: {err:?}"
+        );
+    });
+}
+
+// ===========================================================================
+// The tool — how a model reaches the door
+// ===========================================================================
+
+/// A core whose upstream answers a scripted tool call. The script is filled in
+/// at run time, because the arguments a delegation names — labels, sometimes
+/// handles — only exist once the fixture space does.
+fn tool_setup() -> (
+    MockServer,
+    AppCore,
+    tempfile::TempDir,
+    chat_harness::ToolScript,
+) {
+    let script = chat_harness::tool_script();
+    let (mock, core, dir) = chat_harness::core_for(MockConfig {
+        chat: ChatBehavior::ToolScript,
+        tool_script: script.clone(),
+        ..MockConfig::default()
+    });
+    core.runtime()
+        .block_on(core.add_backend(eidola_app_core::NewBackend {
+            id: "ext".into(),
+            kind: eidola_app_core::BackendKind::OpenAi,
+            display_name: String::new(),
+            base_url: Some(mock.base_url.clone()),
+            api_key: None,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+        }))
+        .expect("add backend");
+    (mock, core, dir, script)
+}
+
+/// Every tool result of the last request the mock received, in call order.
+fn tool_results(mock: &MockServer) -> Vec<String> {
+    let bodies = mock.chat_bodies();
+    let last = bodies.last().expect("a follow-up round");
+    flat_messages(last)
+        .into_iter()
+        .filter(|(role, _)| role == "tool")
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// The tool schemas advertised on the round that carried the call — the
+/// second-to-last request, since the loop's follow-up round is the last.
+fn advertised(mock: &MockServer) -> Vec<String> {
+    let bodies = mock.chat_bodies();
+    let first = &bodies[bodies.len() - 2];
+    first["tools"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Ask a named participant to answer a post — the door a turn takes.
+fn ask(core: &AppCore, space_id: &str, participant: &str, target: &str) {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    core.runtime()
+        .block_on(core.respond_stream_as(
+            space_id.to_string(),
+            participant.to_string(),
+            target.to_string(),
+            tx,
+        ))
+        .expect("the ask runs");
+}
+
+/// The post a space's transcript ends on.
+fn last_action(core: &AppCore, space_id: &str) -> String {
+    core.runtime()
+        .block_on(core.get_space_tree(space_id.to_string()))
+        .expect("tree")
+        .pop()
+        .expect("a post")
+        .action_id
+}
+
+/// **A delegation's anchor is a generation, so it follows the edit.**
+///
+/// A turn answering a post carries that post's id raw, and for a regeneration
+/// that id comes off the answer's reply edge — the generation that was current
+/// when the answer was written. Edit the post since and threading shows the
+/// edit while the edge still names what it always named, so every `delegate`
+/// call in that regeneration handed the door a generation the parent no longer
+/// shows. The door was right to refuse it (an unshowable anchor would put the
+/// report at the conversation root); what was wrong was the id, and the model
+/// neither chose it nor could correct it.
+#[test]
+fn a_delegation_anchors_on_the_generation_the_parent_shows() {
+    run(|| {
+        let (mock, core, _dir, script) = tool_setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+
+        // The post, and the agent's answer to it.
+        let asked = last_action(&core, &parent);
+        ask(&core, &parent, &owner, &asked);
+        let answer = last_action(&core, &parent);
+
+        // The reader rewords the post. Its item now shows a new generation; the
+        // answer's reply edge still names the old one.
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(asked.clone(), "What do Friday's tide tables say?".into()))
+            .expect("edit the post")
+            .action_id;
+        assert_ne!(edited, asked, "the edit is a new generation");
+
+        // Regenerate the answer, and let that turn delegate.
+        *script.lock().unwrap() = vec![(
+            eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+            serde_json::json!({ "brief": "Check the tables and report back." }).to_string(),
+        )];
+        core.runtime()
+            .block_on(core.regenerate(answer, MODEL.to_string()))
+            .expect("the regeneration runs");
+
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(
+            results[0].starts_with("Opened "),
+            "the room opens instead of meeting a refusal nobody can act on: {}",
+            results[0]
+        );
+
+        let rooms = core
+            .runtime()
+            .block_on(core.subspaces_of(parent.clone()))
+            .expect("rooms");
+        assert_eq!(rooms.len(), 1, "{rooms:?}");
+        assert_eq!(
+            rooms[0].parent_action_id.as_deref(),
+            Some(edited.as_str()),
+            "anchored on the generation the parent shows, not the one the edge names"
+        );
+    });
+}
+
+/// **The tool is the spawn door, reached from inside a turn.**
+///
+/// What only the turn knows is what it supplies: the room's owner is the
+/// responding participant, the parent is the space it is answering in, and the
+/// anchor its report will attach beneath is the post it is answering.
+#[test]
+fn the_delegate_tool_opens_a_room_from_the_turn_it_was_called_in() {
+    run(|| {
+        let (mock, core, _dir, script) = tool_setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let anchor = last_action(&core, &parent);
+
+        *script.lock().unwrap() = vec![(
+            eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+            serde_json::json!({
+                "brief": "Read Friday's tide tables and say when the second high water is.",
+                "participants": ["Surveyor"],
+            })
+            .to_string(),
+        )];
+        ask(&core, &parent, &owner, &anchor);
+
+        // The schema was advertised and the note joined the system message —
+        // both on the round that carried the call.
+        assert!(
+            advertised(&mock).contains(&eidola_app_core::subspaces::DELEGATE_TOOL_NAME.to_string()),
+            "{:?}",
+            advertised(&mock)
+        );
+        let bodies = mock.chat_bodies();
+        let system = flat_messages(&bodies[bodies.len() - 2])[0].1.clone();
+        assert!(
+            system.contains(eidola_app_core::subspaces::DELEGATE_NOTE),
+            "{system}"
+        );
+
+        // One room, under this conversation, owned by the agent that asked,
+        // anchored on the post it was answering.
+        let rooms = core
+            .runtime()
+            .block_on(core.subspaces_of(parent.clone()))
+            .expect("rooms");
+        assert_eq!(rooms.len(), 1, "{rooms:?}");
+        let room = &rooms[0];
+        assert_eq!(room.owner_participant_id, owner);
+        assert_eq!(room.parent_space_id, parent);
+        // A committed spawn records *which turn* opened the room, in the room's
+        // own row — the item the owner's answer here is written under, which is
+        // what the report attaches beneath. The anchor cannot say it: one post
+        // can carry two answers from one agent.
+        let answer_item = core
+            .runtime()
+            .block_on(core.get_space_tree(parent.clone()))
+            .expect("tree")
+            .pop()
+            .expect("the owner answered")
+            .item_id;
+        assert_eq!(
+            room.parent_answer_item_id.as_deref(),
+            Some(answer_item.as_str()),
+            "the room the turn opened is recorded against that turn's answer"
+        );
+        assert_eq!(
+            room.parent_action_id.as_deref(),
+            Some(anchor.as_str()),
+            "the report attaches beneath this agent's answer to the post it was asked on"
+        );
+
+        // The brief is its first post, and the roster is the two agents.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(room.id.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].action_type, "brief");
+        assert_eq!(
+            tree[0].blocks[0].text.as_deref(),
+            Some("Read Friday's tide tables and say when the second high water is.")
+        );
+        let seats = core
+            .runtime()
+            .block_on(core.list_space_participants(room.id.clone()))
+            .expect("roster");
+        assert_eq!(seats.len(), 2, "{seats:?}");
+        assert!(seats.iter().any(|p| p.id == helper));
+        assert!(seats.iter().all(|p| p.kind != "human"));
+
+        // And the model reads back what it can act on: where the work went,
+        // who is in it, and that the answer comes to it rather than being
+        // waited for.
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(results[0].contains(&room.id), "{}", results[0]);
+        assert!(results[0].contains("\"Surveyor\""), "{}", results[0]);
+        assert!(
+            results[0].contains("told in this conversation when it finishes"),
+            "{}",
+            results[0]
+        );
+    });
+}
+
+/// **A seat is asked about at the write, not at the snapshot.**
+///
+/// The names a delegation may use resolve against the roster its turn was
+/// prepared from, and that asymmetry is deliberate: the name a model reads is
+/// the name that resolves. But a snapshot is a snapshot — a reader taking a
+/// helper out of the conversation while the turn runs leaves a candidate that
+/// still resolves to somebody who has gone. Seating it would put an agent in a
+/// room opened from a conversation it is no longer in and hand its backend a
+/// newly written brief drawn from that conversation, so the spawn asks the
+/// membership question again inside its own transaction, where it cannot be
+/// raced.
+#[test]
+fn a_seat_that_leaves_mid_turn_is_refused_rather_than_seated() {
+    run(|| {
+        let (mock, core, _dir, script) = tool_setup();
+        let core = std::sync::Arc::new(core);
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let anchor = last_action(&core, &parent);
+
+        core.register_tool(std::sync::Arc::new(RemoveMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            space_id: parent.clone(),
+            participant: helper.clone(),
+        }))
+        .expect("register");
+
+        // The first call takes the helper out of the conversation; the second
+        // asks for it by the name the turn's roster still carries.
+        *script.lock().unwrap() = vec![
+            ("remove_helper_now".into(), "{}".into()),
+            (
+                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+                serde_json::json!({
+                    "brief": "Read Friday's tide tables and say when the second high water is.",
+                    "participants": ["Surveyor"],
+                })
+                .to_string(),
+            ),
+        ];
+        ask(&core, &parent, &owner, &anchor);
+
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 2, "{results:?}");
+        let refused = &results[1];
+        assert!(
+            refused.contains("\"Surveyor\"") && refused.contains("no longer taking part"),
+            "the refusal names the seat, and is one the model can act on: {refused}"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent.clone()))
+                .expect("rooms")
+                .is_empty(),
+            "and no room was opened around a seat the reader had already removed"
+        );
+    });
+}
+
+/// **And the refusal calls it what the roster called it.**
+///
+/// The door decides against *base* participant rows, which is right for what it
+/// decides — a spawn copies no overrides, so base configuration is what the new
+/// room would see. It is wrong for what it says: a helper renamed here carries
+/// one name in its own row and another in this conversation, and the second is
+/// the one the model read off the roster, typed into `participants`, and has to
+/// find again to fix the request. Naming the first sends it looking for a
+/// roster entry that does not exist — and with several seats asked for, it
+/// cannot even tell which of them the refusal is about. So the door answers
+/// with the id and the tool re-says it through the frozen snapshot.
+#[test]
+fn a_departed_seats_refusal_uses_the_name_the_roster_showed() {
+    run(|| {
+        let (mock, core, _dir, script) = tool_setup();
+        let core = std::sync::Arc::new(core);
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        // Renamed in this conversation only: the roster says "Tidewatcher",
+        // the participant row still says "Surveyor".
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                parent.clone(),
+                helper.clone(),
+                eidola_app_core::ParticipantOverride {
+                    label: Some(Some("Tidewatcher".to_string())),
+                    ..Default::default()
+                },
+            ))
+            .expect("rename the helper here");
+        let anchor = last_action(&core, &parent);
+
+        core.register_tool(std::sync::Arc::new(RemoveMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            space_id: parent.clone(),
+            participant: helper.clone(),
+        }))
+        .expect("register");
+
+        *script.lock().unwrap() = vec![
+            ("remove_helper_now".into(), "{}".into()),
+            (
+                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+                serde_json::json!({
+                    "brief": "Read Friday's tide tables and say when the second high water is.",
+                    "participants": ["Tidewatcher"],
+                })
+                .to_string(),
+            ),
+        ];
+        ask(&core, &parent, &owner, &anchor);
+
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 2, "{results:?}");
+        let refused = &results[1];
+        assert!(refused.contains("no longer taking part"), "{refused}");
+        assert!(
+            refused.contains("\"Tidewatcher\""),
+            "the name the model read and asked with: {refused}"
+        );
+        assert!(
+            !refused.contains("Surveyor"),
+            "and not a name this conversation never showed: {refused}"
+        );
+    });
+}
+
+/// A tool that takes a participant out of the conversation from inside a turn
+/// running in it — the interleave the seat recheck is about, made
+/// deterministic.
+struct RemoveMidTurn {
+    core: std::sync::Weak<AppCore>,
+    space_id: String,
+    participant: String,
+}
+
+impl eidola_app_core::tools::Tool for RemoveMidTurn {
+    fn name(&self) -> &str {
+        "remove_helper_now"
+    }
+    fn description(&self) -> &str {
+        "Take the helper out of this conversation, right now."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}, "required": []})
+    }
+    fn call<'a>(&'a self, _a: serde_json::Value) -> eidola_app_core::tools::ToolFuture<'a> {
+        Box::pin(async move {
+            let core = self.core.upgrade().expect("core outlives the turn");
+            let removed = core
+                .remove_space_participant(self.space_id.clone(), self.participant.clone())
+                .await
+                .map_err(|e| {
+                    eidola_app_core::tools::ToolError::new(format!("removal failed: {e}"))
+                })?;
+            assert!(removed, "the helper was a member");
+            Ok("removed".to_string())
+        })
+    }
+}
+
+/// **The gate is the one `list_my_spaces` carries, and for the same reason.**
+/// A space-owned participant cannot be referenced into another space at all,
+/// so it cannot own one either — and is offered no schema that could only be
+/// refused.
+#[test]
+fn a_space_owned_agent_is_offered_no_delegation() {
+    run(|| {
+        let (mock, core, _dir, script) = tool_setup();
+        let parent = space(&core);
+        let local = core
+            .runtime()
+            .block_on(core.add_space_participant(
+                parent.clone(),
+                NewParticipant {
+                    label: "Local".into(),
+                    model_ref: Some(MODEL.to_string()),
+                    system_prompt: None,
+                    notify_policy: "human".into(),
+                },
+            ))
+            .expect("add agent")
+            .id;
+        let anchor = last_action(&core, &parent);
+        // The script stays empty: a turn with no tools at all never calls one.
+        assert!(script.lock().unwrap().is_empty());
+        ask(&core, &parent, &local, &anchor);
+
+        let bodies = mock.chat_bodies();
+        let body = bodies.last().expect("the turn's request");
+        assert!(
+            body.get("tools").is_none(),
+            "a space-owned agent's turn carries no tools field at all: {body}"
+        );
+        assert!(
+            !flat_messages(body)[0]
+                .1
+                .contains(eidola_app_core::subspaces::DELEGATE_NOTE),
+            "nor the note describing an affordance it does not have"
+        );
+    });
+}
+
+/// **The tool is no way around a guard.** Every refusal the spawn door decides
+/// inside its transaction arrives at the model as a *tool result* — correctable
+/// — and leaves no room behind, which is what stops a model turning a refusal
+/// into a retry loop that mints anything.
+#[test]
+fn the_delegate_tool_is_refused_by_every_guard_the_door_holds() {
+    run(|| {
+        let (mock, core, _dir, script) = tool_setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let anchor = last_action(&core, &parent);
+
+        // Fill the owner's live-room quota through the API, then ask for one
+        // more through the tool.
+        for i in 0..MAX_LIVE_SUBSPACES_PER_OWNER {
+            spawn(
+                &core,
+                &parent,
+                &owner,
+                &format!("Room {i}."),
+                vec![],
+                vec![],
+            )
+            .expect("spawn");
+        }
+        *script.lock().unwrap() = vec![
+            (
+                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+                serde_json::json!({ "brief": "One more." }).to_string(),
+            ),
+            // A brief is the whole contract, so there is no such thing as an
+            // empty one.
+            (
+                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+                serde_json::json!({ "brief": "   " }).to_string(),
+            ),
+        ];
+        ask(&core, &parent, &owner, &anchor);
+
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(
+            results[0].contains(&format!("the limit is {MAX_LIVE_SUBSPACES_PER_OWNER}")),
+            "{}",
+            results[0]
+        );
+        assert!(results[1].contains("a brief is required"), "{}", results[1]);
+
+        // And the attenuation gate is the door's, not the tool's: nothing in
+        // production holds a capability, so asking for one is asking for
+        // something unmintable — asked by an agent with a quota to spare, so
+        // it is this guard answering and not the one above it.
+        let second = shared_agent(&core, &parent, "Surveyor");
+        *script.lock().unwrap() = vec![(
+            eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+            serde_json::json!({ "brief": "Sandboxed work.", "capabilities": ["sandbox"] })
+                .to_string(),
+        )];
+        ask(&core, &parent, &second, &anchor);
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(
+            results[0].contains("cannot grant `sandbox`"),
+            "{}",
+            results[0]
+        );
+
+        // A list the model mistyped is a correctable mistake, not an empty one:
+        // filtered down to nothing it was indistinguishable from the advertised
+        // solo mode, so a typo spent a live-room slot and set a driver working.
+        *script.lock().unwrap() = vec![
+            (
+                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+                serde_json::json!({ "brief": "Look this over.", "participants": [{"name": "Ada"}] })
+                    .to_string(),
+            ),
+            (
+                eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+                serde_json::json!({ "brief": "Look this over.", "participants": ["Surveyor", 7] })
+                    .to_string(),
+            ),
+        ];
+        ask(&core, &parent, &second, &anchor);
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(results[0].contains("`participants`"), "{}", results[0]);
+        assert!(results[0].contains("an object"), "{}", results[0]);
+        assert!(results[1].contains("entry 2"), "{}", results[1]);
+
+        // Every one of them left the world exactly as it was.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent.clone()))
+                .expect("rooms")
+                .len() as i64,
+            MAX_LIVE_SUBSPACES_PER_OWNER,
+            "a refused call mints nothing"
+        );
+    });
+}
+
+/// **A delegation can name only this conversation's own roster.**
+///
+/// A model learns who exists from the roster it is shown, and that is exactly
+/// the set the tool resolves against — so an agent working elsewhere in the
+/// library is not merely refused, it is unnameable. The refusal says who *is*
+/// available, which is a listing the model was already given.
+#[test]
+fn a_delegation_can_only_name_the_conversations_own_roster() {
+    run(|| {
+        let (mock, core, _dir, script) = tool_setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        // A shared agent that exists, is eligible in every way the door asks
+        // about, and takes part somewhere else entirely.
+        let elsewhere = space(&core);
+        shared_agent(&core, &elsewhere, "Archivist");
+        let anchor = last_action(&core, &parent);
+
+        *script.lock().unwrap() = vec![(
+            eidola_app_core::subspaces::DELEGATE_TOOL_NAME.into(),
+            serde_json::json!({ "brief": "Dig out the 1953 tables.", "participants": ["Archivist"] })
+                .to_string(),
+        )];
+        ask(&core, &parent, &owner, &anchor);
+
+        let results = tool_results(&mock);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(
+            results[0].contains("no participant of this conversation is called \"Archivist\""),
+            "{}",
+            results[0]
+        );
+        assert!(
+            results[0].contains("leave `participants` out"),
+            "the refusal names the way forward: {}",
+            results[0]
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent))
+                .expect("rooms")
+                .is_empty(),
+            "and nothing was opened"
+        );
+    });
+}
+
+/// The name is protocol surface: a system note promises it with these
+/// semantics, and what executes must be the tool that note describes.
+#[test]
+fn registering_the_delegate_tool_name_is_refused() {
+    run(|| {
+        let (_mock, core, _dir, _script) = tool_setup();
+        let err = core
+            .register_tool(std::sync::Arc::new(eidola_app_core::tools::EchoTool))
+            .err();
+        assert!(err.is_none(), "an unreserved name registers: {err:?}");
+        assert!(eidola_app_core::tools::is_reserved_tool_name(
+            eidola_app_core::subspaces::DELEGATE_TOOL_NAME
+        ));
+    });
+}
+
+/// **The roster a delegated room shows is true of the reader who joined it.**
+///
+/// A room of two agents is not multi-party, so its turns carry no roster at
+/// all. A human posting there makes three — and the roster that appears names
+/// them, in the same wire bytes every other space's does. That is the whole
+/// point of joining at the post: the models are never shown a room whose roster
+/// omits somebody who has spoken in it.
+#[test]
+fn the_roster_of_a_delegated_room_names_the_reader_who_joined_it() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![helper.clone()],
+            vec![],
+        )
+        .expect("spawn");
+        let sub = out.space.id.clone();
+
+        // Two agents, linear: no roster and no trailing message at all.
+        ask(&core, &sub, &helper, &out.brief_action_id);
+        let bodies = mock.chat_bodies();
+        let msgs = flat_messages(bodies.last().expect("the turn"));
+        assert!(
+            !msgs.iter().any(|(_, c)| c.contains("Participants in this")),
+            "a two-party room says nothing about who is in it: {msgs:?}"
+        );
+
+        // The reader speaks, which joins them — and the next turn's roster says
+        // so, naming them the way every roster names the shared human.
+        core.runtime()
+            .block_on(core.post("What about Saturday?".into(), Some(sub.clone())))
+            .expect("speaking joins");
+        let joined = core
+            .runtime()
+            .block_on(core.get_space_tree(sub.clone()))
+            .expect("tree")
+            .pop()
+            .expect("the reader's post");
+        ask(&core, &sub, &helper, &joined.action_id);
+
+        let bodies = mock.chat_bodies();
+        let msgs = flat_messages(bodies.last().expect("the turn"));
+        let expected = chat_harness::roster(&[
+            (chat_harness::HUMAN_LABEL, "human", false),
+            ("Navigator", "agent", false),
+            ("Surveyor", "agent", true),
+        ]);
+        let handle = eidola_app_core::post_handle(&joined.item_id);
+        assert_eq!(
+            msgs.last().expect("a trailing message").1,
+            chat_harness::trailing(Some(&expected), None, &handle),
+            "the roster names the reader who joined by speaking"
         );
     });
 }

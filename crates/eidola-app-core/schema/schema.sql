@@ -206,6 +206,24 @@ CREATE TABLE space (
     -- owning agent happened to speak last. Fixed at birth and never
     -- updated: it records a fact about the space's origin, not its state.
     parent_action_id  TEXT REFERENCES action(id),
+    -- Which *turn* opened this room, recorded as the item that turn will
+    -- write its answer under. The anchor above says which post the work was
+    -- asked on; it cannot say which of that post's answers the report belongs
+    -- beneath, because nothing serializes two turns of one agent against one
+    -- post — a second explicit ask, or a regeneration running beside a reply,
+    -- answers the same anchor from the same owner. An item does say it:
+    -- `prepare_turn` mints it before the turn's first request (a turn that is
+    -- capped or budget-stopped writes no inference at all, so there is no
+    -- answer id yet to record), and a regeneration reuses the item it revises.
+    -- Written here, inside the spawn's own transaction, so the fact commits
+    -- with the room and outlives the process that opened it: a delegation runs
+    -- for as long as its work takes, and the app being quit in the middle of
+    -- one is ordinary rather than exceptional.
+    -- No foreign key: at the spawn that answer does not exist, so no row
+    -- carries the item yet. Fixed at birth, like the anchor beside it.
+    -- NULL for a spawn with no turn behind it (a direct API caller), whose
+    -- report falls back to the owner's newest answer on the anchor.
+    parent_answer_item_id TEXT,
     title             TEXT,
     linkability       TEXT NOT NULL CHECK (linkability IN (
                           'linked', 'unlinked', 'public'
@@ -541,6 +559,29 @@ CREATE TABLE action (
                         'error'
                     )) DEFAULT 'complete',
 
+    -- The upstream stopped this generation at the completion ceiling
+    -- (`finish_reason: "length"`) rather than because the model was
+    -- done — the durable half of "this answer reached its length
+    -- limit", so a reader who reopens the space still sees the mark
+    -- under an answer that stops mid-thought.
+    --
+    -- A COLUMN, not a `status` value, and the distinction is load
+    -- bearing. `status` is the lifecycle slot: one value at a time,
+    -- and the reads that mean "durable and renderable" spell it
+    -- `status IN ('complete', 'cancelled')` in a dozen places (the
+    -- tree, the transcript, context assembly, search, the record). A
+    -- truncated answer IS complete in exactly that sense — it
+    -- committed, it renders, it is context for the next turn — so a
+    -- 'truncated' status would drop it out of every one of those
+    -- reads until each was widened, and the cost of missing one is a
+    -- real answer vanishing from a conversation. How generation
+    -- stopped is an orthogonal fact about a completed action, so it
+    -- gets its own field.
+    --
+    -- Only an inference has a `finish_reason` to read, so only an
+    -- inference may carry the flag.
+    truncated       INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
+
     intent          TEXT,
     model           TEXT,
 
@@ -554,6 +595,7 @@ CREATE TABLE action (
     -- supersedes is item-scoped: both halves present together, the item
     -- is this row's own, and the referenced (action, item) pair must
     -- really exist — so a generation chain cannot hop items.
+    CHECK (truncated = 0 OR action_type = 'inference'),
     CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
     CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
     FOREIGN KEY (supersedes_action_id, supersedes_item_id)
@@ -946,6 +988,7 @@ SELECT
     a.input_tokens,
     a.output_tokens,
     a.credits_consumed,
+    a.truncated,
     a.created_at,
     (SELECT COUNT(*) FROM action b
      WHERE b.item_id = a.item_id

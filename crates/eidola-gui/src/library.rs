@@ -28,6 +28,7 @@ use gpui_component::{
 
 use crate::actions::CloseWindow;
 use crate::focus::TabRegion as _;
+use crate::i18n::msg;
 use crate::participants::load_error_panel;
 use crate::probe::Probe as _;
 use crate::stores::{SpacesStore, Stores};
@@ -111,6 +112,9 @@ pub struct LibraryView {
     /// does NOT also trigger the row's open (`open_space` itself defers a real
     /// window open that a behavior test can't easily count).
     open_space_requests: usize,
+    /// Test-only: how many times `open_parent` has been invoked — the badge's
+    /// own counter, so a test can tell it apart from the row's open.
+    open_parent_requests: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -136,6 +140,7 @@ impl LibraryView {
                 .tab_stop(true),
             focused_row: 0,
             open_space_requests: 0,
+            open_parent_requests: 0,
             _subscriptions,
         }
     }
@@ -304,12 +309,30 @@ impl LibraryView {
         });
     }
 
+    /// Open the conversation a delegated one was opened from — the parent
+    /// badge's click. The same window-open path a row takes, counted
+    /// separately so a test can tell "the badge opened the parent" from "the
+    /// row opened itself".
+    pub fn open_parent(&mut self, parent_space_id: String, cx: &mut Context<Self>) {
+        self.open_parent_requests += 1;
+        let stores = self.stores.clone();
+        cx.defer(move |cx: &mut App| {
+            crate::open_space_window(cx, stores, parent_space_id);
+        });
+    }
+
     /// Test-only: how many times `open_space` has fired. The pencil-rename
     /// propagation regression test asserts this stays `0` when only the rename
     /// pencil was clicked.
     #[doc(hidden)]
     pub fn open_space_requests_for_test(&self) -> usize {
         self.open_space_requests
+    }
+
+    /// Test-only: how many times `open_parent` has fired.
+    #[doc(hidden)]
+    pub fn open_parent_requests_for_test(&self) -> usize {
+        self.open_parent_requests
     }
 
     /// Begin inline rename for the given space.  Creates an `InputState` seeded
@@ -643,6 +666,7 @@ impl LibraryView {
 
         row = row
             .child(title_content)
+            .children(self.render_parent_badge(idx, space, hovered && !is_renaming, cx))
             .child(
                 div()
                     .text_sm()
@@ -661,6 +685,87 @@ impl LibraryView {
             row = row.border_t_1().border_color(theme.border);
         }
         row
+    }
+
+    /// The parent-conversation badge: on a row one of the reader's agents
+    /// opened from another conversation, it names that conversation and — once
+    /// the row is revealed — opens it.
+    ///
+    /// **The fact is always painted; the affordance is revealed**, which is why
+    /// the role changes with it. A delegated row is a conversation the reader
+    /// never started, so where it came from has to be readable at rest — but a
+    /// tab stop on every row is exactly what a virtualized listing cannot have
+    /// (only the materialized window would be in the tab order), and this
+    /// listing's answer is one tab stop with a roving cursor whose row reveals
+    /// its verbs. So the badge joins the rename and archive verbs in being
+    /// interactive only on the revealed row (hover, or the keyboard cursor),
+    /// and says which it is: a `Link` where a click will do something, a
+    /// `Label` where it is a caption. The alternative — a `Link` role standing
+    /// on every row with no handler behind it — is the "activatable-looking
+    /// link with no listener" the footnote rail already refuses.
+    fn render_parent_badge(
+        &self,
+        idx: usize,
+        space: &SpaceInfo,
+        revealed: bool,
+        cx: &Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let parent = space.parent.as_ref()?;
+        let theme = cx.theme();
+        // The parent's own name where it has one, and a phrase in the reader's
+        // language where it has not — this crate chooses the words, because
+        // app-core writes no user-facing strings and a title it did write would
+        // be read as-is in every language.
+        let name: String = match parent.title.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => msg::library_row_parent_untitled(cx).to_string(),
+        };
+        let text = msg::library_row_parent(cx, name.clone());
+        let badge = div()
+            .id(("parent-badge", idx))
+            .flex_none()
+            .max_w(rems(10.))
+            .truncate()
+            .text_xs()
+            .text_color(theme.muted_foreground);
+        Some(if revealed {
+            let parent_id = parent.space_id.clone();
+            badge
+                .probe(
+                    format!("library/row/{idx}/parent"),
+                    gpui::Role::Link,
+                    msg::library_row_parent_open(cx, name),
+                )
+                .cursor_pointer()
+                .text_color(theme.foreground)
+                // The both-phase propagation block the row's other affordances
+                // take: the row arms its own click on mouse-*down* and captures
+                // the mouse-up before any child's bubble click runs, so an
+                // `on_click` that stops propagation is not enough on its own —
+                // without this, opening the parent would also open this row.
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_parent(parent_id.clone(), cx);
+                }))
+                .debug_selector(move || format!("parent-badge-{idx}"))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                )
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                )
+                .child(text)
+        } else {
+            badge
+                .probe(
+                    format!("library/row/{idx}/parent"),
+                    gpui::Role::Label,
+                    text.clone(),
+                )
+                .child(text)
+        })
     }
 }
 

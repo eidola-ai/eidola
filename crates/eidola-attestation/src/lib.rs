@@ -285,6 +285,7 @@ mod tests {
         assert_eq!(
             claim_ids,
             [
+                "apple_signature_reconstructs",
                 "code_delivers_guarantees",
                 "diff_reviewed",
                 "manifest_reproduced",

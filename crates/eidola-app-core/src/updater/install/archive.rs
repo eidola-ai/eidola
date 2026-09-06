@@ -43,7 +43,7 @@ const MAX_MEMBERS: usize = 50_000;
 ///
 /// Returns the number of regular files written. Directory entries are
 /// created as needed; every other member kind is a refusal.
-pub(super) fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize, InstallError> {
+pub fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize, InstallError> {
     // Read the count the container claims before handing it to a parser
     // that will believe it. `ZipArchive::new` walks the whole central
     // directory eagerly and retains a record per member, so a container

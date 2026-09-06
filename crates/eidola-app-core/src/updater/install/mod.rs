@@ -45,6 +45,15 @@
 
 mod archive;
 
+/// Unpack a container under the installer's rules — no symbolic links, no
+/// traversal, no duplicate members, bounded in members and in bytes.
+///
+/// Public because the release tooling reconstructs the same objects on the
+/// signing side, and two extractors would be two rule sets: what the
+/// release officer proves reconstructs must be unpacked exactly as the
+/// installer will unpack it.
+pub use archive::unpack_zip;
+
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
@@ -484,7 +493,14 @@ fn compare_signature(
 /// Today's macOS container is around 40 MB; this leaves an order of
 /// magnitude of headroom and still bounds what a hostile server can make
 /// this allocate.
-const MAX_CONTAINER_BYTES: u64 = 512 * 1024 * 1024;
+///
+/// Public for the same reason `unpack_zip` is, and the same reason the
+/// attestant-key classifier is re-exported for `release-tool`: a release
+/// must not be publishable in a shape every installed client refuses. The
+/// release tooling pre-flights the containers it is about to publish
+/// against this exact number, so the two sides cannot drift into a bound
+/// the signing side thinks is generous and the client side does not.
+pub const MAX_CONTAINER_BYTES: u64 = 512 * 1024 * 1024;
 
 async fn fetch(fetcher: &Fetcher, file: &RemoteFile, label: &str) -> Result<Vec<u8>, InstallError> {
     fetcher

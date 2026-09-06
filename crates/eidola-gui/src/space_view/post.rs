@@ -387,10 +387,15 @@ impl SpaceView {
         // model was done — said beneath the text it is about, in the quiet
         // register, because the alternative is a reader who reads a
         // mid-sentence stop as the model's own choice.
-        if post
-            .action_id
-            .as_ref()
-            .is_some_and(|id| self.truncated_posts.contains(id))
+        // Read from the post's own row first — the durable fact, so a space
+        // closed and reopened still carries the mark — and from the live set
+        // second, which covers the frames between the turn ending and the
+        // reload that brings the row in.
+        if post.truncated
+            || post
+                .action_id
+                .as_ref()
+                .is_some_and(|id| self.truncated_posts.contains(id))
         {
             // The label a screen reader hears **is** the message a sighted
             // reader sees — the probe name is the stable selector, the label is

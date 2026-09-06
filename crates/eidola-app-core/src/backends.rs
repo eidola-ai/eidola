@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 use crate::changes::Change;
 use crate::db;
 use crate::error::AppError;
-use crate::{Inner, ModelInfo, now_ms};
+use crate::{Inner, ModelCapabilities, ModelInfo, now_ms};
 
 /// The reserved singleton backend ids.
 pub const EIDOLA_BACKEND_ID: &str = "eidola";
@@ -101,7 +101,9 @@ impl BackendKind {
 
 /// One configured backend, as surfaced to the CLI/GUI. The api key itself
 /// is never carried — only whether one is set (replacing it is write-only).
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackendInfo {
     pub id: String,
     pub kind: BackendKind,
@@ -740,6 +742,14 @@ impl Inner {
                         } => Some(ModelInfo {
                             id: m.id,
                             context_length: context_tokens as u64,
+                            // A local model is a file someone supplied. What
+                            // it can do is a property of the chat template
+                            // baked into that file, which this build has never
+                            // seen — so there is no declaration to make, and
+                            // saying nothing is the only honest answer.
+                            max_output_tokens: None,
+                            output_budget_class: None,
+                            capabilities: ModelCapabilities::default(),
                             prompt_credits_per_token: 0.0,
                             completion_credits_per_token: 0.0,
                             request_credits: None,
@@ -748,6 +758,9 @@ impl Inner {
                         | crate::local_models::LocalModelStatus::Loading => Some(ModelInfo {
                             id: m.id,
                             context_length: 0,
+                            max_output_tokens: None,
+                            output_budget_class: None,
+                            capabilities: ModelCapabilities::default(),
                             prompt_credits_per_token: 0.0,
                             completion_credits_per_token: 0.0,
                             request_credits: None,
@@ -760,12 +773,16 @@ impl Inner {
     }
 }
 
-/// A model whose backend publishes no pricing or context metadata — the
-/// honest shape for generic OpenAI-compatible listings.
+/// A model whose backend publishes no pricing, context or capability
+/// metadata — the honest shape for generic OpenAI-compatible listings, where
+/// `data[].id` is the only field anything agrees on.
 fn plain_model_info(id: String) -> ModelInfo {
     ModelInfo {
         id,
         context_length: 0,
+        max_output_tokens: None,
+        output_budget_class: None,
+        capabilities: ModelCapabilities::default(),
         prompt_credits_per_token: 0.0,
         completion_credits_per_token: 0.0,
         request_credits: None,

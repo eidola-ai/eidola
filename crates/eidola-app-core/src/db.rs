@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 9;
+const LATEST_VERSION: i64 = 11;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -1622,6 +1622,12 @@ pub struct SubspaceRow {
     /// named one. It is where the report attaches, so the answer lands on the
     /// branch the work was asked for on. `None` for a spawn that named none.
     pub parent_action_id: Option<String>,
+    /// The item the turn that opened this room writes its answer under — which
+    /// *turn* asked for the room, where the anchor above says only which post
+    /// it was asked on. The report attaches beneath that turn's answer. `None`
+    /// for a spawn with no turn behind it. See the column's own note in
+    /// `schema.sql`.
+    pub parent_answer_item_id: Option<String>,
     pub title: Option<String>,
     pub created_at: i64,
     pub archived_at: Option<i64>,
@@ -1717,9 +1723,10 @@ fn subspace_row(row: &turso::Row) -> Result<SubspaceRow, AppError> {
         parent_space_id: row.get::<String>(1).map_err(AppError::db)?,
         owner_participant_id: row.get::<String>(2).map_err(AppError::db)?,
         parent_action_id: row.get::<Option<String>>(3).map_err(AppError::db)?,
-        title: row.get::<Option<String>>(4).map_err(AppError::db)?,
-        created_at: row.get::<i64>(5).map_err(AppError::db)?,
-        archived_at: row.get::<Option<i64>>(6).map_err(AppError::db)?,
+        parent_answer_item_id: row.get::<Option<String>>(4).map_err(AppError::db)?,
+        title: row.get::<Option<String>>(5).map_err(AppError::db)?,
+        created_at: row.get::<i64>(6).map_err(AppError::db)?,
+        archived_at: row.get::<Option<i64>>(7).map_err(AppError::db)?,
     })
 }
 
@@ -1729,8 +1736,8 @@ async fn subspace_rows(
     param: Option<&str>,
 ) -> Result<Vec<SubspaceRow>, AppError> {
     let sql = format!(
-        "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.parent_action_id, s.title, \
-                s.created_at, s.archived_at \
+        "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.parent_action_id, \
+                s.parent_answer_item_id, s.title, s.created_at, s.archived_at \
          FROM space s \
          WHERE s.parent_space_id IS NOT NULL AND {SUBSPACE_OWNER_SQL} IS NOT NULL \
            AND {where_clause} \
@@ -1936,7 +1943,22 @@ pub async fn has_reference_from(
 ///
 /// A direct reply rather than any descendant, because the relationship is
 /// exact: a spawn happens inside a turn, and that turn persists its answer as a
-/// reply to the very post it was answering. Newest — by **commit order**, the
+/// reply to the very post it was answering.
+///
+/// **"The same post" is the item, not the generation.** A reply edge records
+/// the generation that was current when it was written and is never remapped
+/// (causality is action ids), while everything that *renders* or *attaches*
+/// resolves an edge to its antecedent's item — so an anchor and an answer can
+/// name one post through two different generations and still be about it. That
+/// is not hypothetical here: a delegation resolves its anchor to the generation
+/// the parent currently shows, while the answer of the very turn that opened it
+/// keeps the raw antecedent the turn was prepared with, so an edit landing
+/// between preparation and the tool put the two in different namespaces.
+/// Matching on `aa.antecedent_action_id` missed the answer entirely, and the
+/// report then attached to the anchor as that answer's sibling. Joining through
+/// the item is the same identity rule the transcript already threads by, and it
+/// is what keeps this one rule rather than a second record of which answer
+/// belongs to which delegation. Newest — by **commit order**, the
 /// one ordering a writer's clock cannot contradict (see [`action_watermark`])
 /// — and **a generation the parent shows** (current, terminal status, post
 /// type — the transcript's predicate, as settlement reads it): an answer
@@ -1956,41 +1978,46 @@ pub async fn has_reference_from(
 /// answer and wait out the grace alarm, attaching the report to the anchor as
 /// a sibling of a word the parent already shows.
 ///
-/// **This resolves an answer, not *the* answer, and the gap is recorded rather
-/// than closed.** If the same owner answers the same post twice without one
-/// superseding the other — two concurrent explicit asks on one target, which is
-/// the only way to get there — the report attaches beneath the newer of the
-/// two, which may not be the turn the spawn happened inside. Nothing durable
-/// distinguishes them: a turn's rounds chain off *the post it answers*,
-/// deliberately never off its own inference (which a capped or budget-stopped
-/// turn never writes), so there is no edge from a spawning round to that turn's
-/// own answer. The one durable trace that relates them at all is
-/// `context_assembly`, and it is not one-to-one — a later turn replaying a
-/// trace records the same round in its own assembly, so the join answers a set.
-/// Recording the spawning round on the room would need a caller that could
-/// supply it, and there is none: nothing exposes the spawn door as a tool, and
-/// `tools::Tool::call` receives parsed arguments and no turn identity at all.
-/// So the residual is exactly this: **same owner, same anchor, two live answers
-/// — the report lands under the newer.** No report is lost, and the inversion
-/// the wait exists to prevent cannot happen either way, because both candidates
-/// are answers *of that owner to that anchor*: the report still sits beneath
-/// one of them rather than above it. Building for it before a caller exists
-/// would be machinery for a shape that has not been designed yet.
+/// **`after_row` is the line that says *which* answer.** An anchored spawn
+/// happens inside the owning agent's turn, so the answer the report belongs
+/// under is the one that turn is still to write — and any answer of that owner
+/// to that anchor which is already committed is a *different* answer: the
+/// generation a regeneration is in the middle of replacing, or a prior reply to
+/// the same post. Accepting one of those ends the wait at once and reports
+/// beneath an answer the delegation did not come from, while the answer it did
+/// come from is still on the wire; if the regeneration in flight then fails,
+/// its item's tip is a hidden `error` and the report is left hanging under a
+/// generation the parent no longer shows. So a caller that knows a turn is
+/// behind the delegation passes the commit-order line the room was opened at
+/// ([`subspace_opened_at_row`]) and only answers committed after it are
+/// candidates. `None` keeps the unrestricted rule, which is the honest one for
+/// a caller with no turn behind it: the newest answer is then the best guess
+/// available.
+///
+/// **It is a `rowid` and not a clock** for the reason [`action_watermark`]
+/// gives: every writer samples `now_ms()` above its own transaction, so a
+/// timestamp cannot order two writes that raced, while `rowid` is assigned at
+/// insert under serialized writers and `action` is append-only — nothing here
+/// ever deletes a row, so the sequence cannot be reused.
 pub async fn last_reply_by_participant(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
     antecedent_action_id: &str,
+    after_row: Option<i64>,
 ) -> Result<Option<String>, AppError> {
     let sql = format!(
         "SELECT a.id FROM action a \
          JOIN action_antecedent aa \
            ON aa.action_id = a.id AND aa.relation = 'reply' \
+         JOIN action ante ON ante.id = aa.antecedent_action_id \
+         JOIN action anchored ON anchored.id = ?3 \
          JOIN item_current ic ON ic.current_action_id = a.id \
          JOIN action origin ON origin.item_id = a.item_id \
            AND origin.supersedes_action_id IS NULL \
          WHERE a.space_id = ?1 AND origin.participant_id = ?2 \
-           AND aa.antecedent_action_id = ?3 \
+           AND ante.item_id = anchored.item_id \
+           AND a.rowid > ?4 \
            AND a.status IN ('complete', 'cancelled') \
            AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
          ORDER BY a.rowid DESC LIMIT 1"
@@ -2001,12 +2028,43 @@ pub async fn last_reply_by_participant(
             Value::Text(space_id.to_string()),
             Value::Text(participant_id.to_string()),
             Value::Text(antecedent_action_id.to_string()),
+            // No line means every row is after it. `rowid` starts at 1.
+            Value::Integer(after_row.unwrap_or(0)),
         ])
         .await
         .map_err(AppError::db)?;
     match rows.next().await.map_err(AppError::db)? {
         None => Ok(None),
         Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// The commit-order line a delegated room was opened at: the `rowid` of its
+/// **brief**, which [`spawn_subspace_tx`] writes in the same transaction as the
+/// room itself and which is therefore the first action the room has.
+///
+/// **No new state records this** — the fact was already durable. Every action
+/// committed before the spawn has a lower `rowid` and every action committed
+/// after it a higher one (writers are serialized and `action` is append-only),
+/// so the brief *is* the pre-spawn watermark, and it reads the same after a
+/// restart as before one because it reads rows. `MIN` rather than a stored
+/// brief id for the same reason: the room's own first action is the brief by
+/// construction, so there is nothing to keep in step.
+pub async fn subspace_opened_at_row(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<i64>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT MIN(rowid) FROM action WHERE space_id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(space_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => row.get::<Option<i64>>(0).map_err(AppError::db),
     }
 }
 
@@ -2159,6 +2217,13 @@ pub(crate) struct SubspacePlan<'a> {
     /// to `space.parent_action_id` and validated to be a post the parent
     /// **currently shows** (current generation, terminal status, post type).
     pub parent_action_id: Option<&'a str>,
+    /// The item the spawning turn will write its answer under — which turn is
+    /// asking, which the anchor alone cannot say. Written to
+    /// `space.parent_answer_item_id`, unvalidated on purpose: at this moment
+    /// the answer does not exist, so there is nothing to check it against, and
+    /// the report's own lookup is what decides whether a visible post of it has
+    /// landed. `None` for a caller with no turn behind it.
+    pub answer_item_id: Option<&'a str>,
     /// Global agents to seat beside the owner, deduped and in requested order.
     pub participant_ids: &'a [String],
     /// Capability names requested; each must already be held by the parent,
@@ -2194,7 +2259,8 @@ pub(crate) struct SubspacePlan<'a> {
 /// 6. every requested sub-agent is a live global agent (the
 ///    `add_global_participant` rule, asked here so the refusal is the spawn's).
 ///
-/// Then, in one commit: the space row (parent, the parent's `cascade_limit`
+/// Then, in one commit: the space row (parent, the anchor and the spawning
+/// turn's answer item, the parent's `cascade_limit`
 /// and `router_model`, **born stamped** — an agent minted this deliberately,
 /// exactly as a promotion mints a notebook), the owner's `role = 'owner'`
 /// membership, each sub-agent as a `member` with `override_notify_policy =
@@ -2296,7 +2362,8 @@ async fn spawn_subspace_tx_body(
     };
     if !has_model(&owner) {
         refuse!(SpawnRefusal::NoModelConfigured {
-            label: owner.label.clone(),
+            participant_id: plan.owner_participant_id.to_string(),
+            label: Some(owner.label.clone()),
         });
     }
 
@@ -2377,20 +2444,43 @@ async fn spawn_subspace_tx_body(
         });
     }
 
-    // (7) the sub-agents themselves — the same base-config rule as the owner:
-    // an agent with no model of its own is skipped by every planner, so
+    // (7) the sub-agents themselves — the same three rules as the owner, in
+    // the same order and for the same reasons. **Eligible**: a space-owned or
+    // retired participant cannot be referenced into another space at all.
+    // **Still in the parent**: the seats a delegation names are resolved
+    // against the roster its turn was prepared from, which is deliberate (the
+    // name a model reads is the name that resolves) and is a *snapshot* — so
+    // a departure landing between that snapshot and this write leaves a
+    // candidate that still resolves to somebody who has left. Asked here, at
+    // the write, because that is the only place it cannot be raced: seating a
+    // departed member would put an agent in a room opened from a conversation
+    // it is not in, and hand its backend a brief drawn from that conversation.
+    // The owner's own membership is asked one guard up for the same reason,
+    // and this is that rule applied to the other side of the roster.
+    // **Modelled**: the sub-space sees each participant's base configuration,
+    // and an agent with no model of its own is skipped by every planner, so
     // seating one would report a spawn that scheduled nothing.
     for id in plan.participant_ids {
         match get_participant(conn, id).await? {
             Some(p) if p.scope == "global" && p.kind == "agent" && p.removed_at.is_none() => {
+                if !is_space_member(conn, plan.parent_space_id, id).await? {
+                    refuse!(SpawnRefusal::ParticipantHasLeft {
+                        participant_id: id.to_string(),
+                        label: Some(p.label.clone()),
+                    });
+                }
                 if !has_model(&p) {
                     refuse!(SpawnRefusal::NoModelConfigured {
-                        label: p.label.clone(),
+                        participant_id: id.to_string(),
+                        label: Some(p.label.clone()),
                     });
                 }
             }
+            // No name to give: the row may not be readable at all, and a row
+            // that is may be a kind this never had a roster name for.
             _ => refuse!(SpawnRefusal::ParticipantNotEligible {
                 participant_id: id.to_string(),
+                label: None,
             }),
         }
     }
@@ -2425,9 +2515,9 @@ async fn spawn_subspace_tx_body(
     // the brief below means it could never have been reaped anyway.
     conn.execute(
         "INSERT INTO space \
-         (id, parent_space_id, parent_action_id, title, linkability, cascade_limit, \
-          router_model, created_at, touched_at) \
-         VALUES (?1, ?2, ?7, ?3, 'unlinked', ?4, ?5, ?6, ?6)",
+         (id, parent_space_id, parent_action_id, parent_answer_item_id, title, linkability, \
+          cascade_limit, router_model, created_at, touched_at) \
+         VALUES (?1, ?2, ?7, ?8, ?3, 'unlinked', ?4, ?5, ?6, ?6)",
         (
             Value::Text(plan.space_id.to_string()),
             Value::Text(plan.parent_space_id.to_string()),
@@ -2436,6 +2526,7 @@ async fn spawn_subspace_tx_body(
             opt_str(parent_router_model.as_deref()),
             Value::Integer(plan.now),
             opt_str(plan.parent_action_id),
+            opt_str(plan.answer_item_id),
         ),
     )
     .await
@@ -2515,13 +2606,14 @@ async fn spawn_subspace_tx_body(
             participant_id: plan.owner_participant_id.to_string(),
             item_id: plan.brief_item_id.to_string(),
             supersedes_action_id: None,
-            action_type: "brief".to_string(),
+            action_type: BRIEF_ACTION_TYPE.to_string(),
             status: "complete".to_string(),
             intent: None,
             model: None,
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
             created_at: plan.now,
         },
     )
@@ -3988,6 +4080,12 @@ pub async fn participant_spaces(
             archived_at: row.get::<Option<i64>>(3).map_err(AppError::db)?,
             last_activity_at: row.get::<i64>(4).map_err(AppError::db)?,
             message_count: row.get::<i64>(5).map_err(AppError::db)?,
+            // **Deliberately never a parent here.** This read is model-facing
+            // (`list_my_spaces`), and membership is its whole boundary: naming
+            // the conversation a delegated room was opened from would report a
+            // space the asking agent may well not be in, from a listing that
+            // exists to report only the ones it is.
+            parent: None,
         });
     }
     Ok(out)
@@ -5259,6 +5357,10 @@ pub struct ActionEntry {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub credits_consumed: Option<i64>,
+    /// The upstream stopped this generation at the completion ceiling rather
+    /// than because the model was done. Only an `inference` may set it (the
+    /// schema CHECKs that); every other writer passes `false`.
+    pub truncated: bool,
     pub created_at: i64,
 }
 
@@ -5295,12 +5397,31 @@ pub(crate) struct PostPlan<'a> {
     /// Quoted references at ordinals `1..=N` in supplied order — already
     /// validated by the caller, which is where a refusal belongs.
     pub references: &'a [crate::ReferenceSpec],
+    /// Join the author into this space as part of writing the post.
+    ///
+    /// Set for a **delegated room**, where the shared human has no membership
+    /// by construction: the first thing they say there joins them. The join
+    /// rides the post's own transaction because the roster the models are shown
+    /// has to be true of the transcript they read — a post by somebody the
+    /// roster omits is a lie about the room, and any gap between the two
+    /// writes is a window in which a turn can be planned over exactly that.
+    pub join_author: bool,
     pub created_at: i64,
 }
 
+/// What [`post_tx`] committed, beyond the post itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PostOutcome {
+    /// The space took a derived title from this post.
+    pub auto_titled: bool,
+    /// The author's membership was written (a fresh join or a revived one) —
+    /// what the caller announces on.
+    pub joined: bool,
+}
+
 /// Write one post — **the action, its text, its reply edge, its quoted
-/// references and any title it earns, in one `BEGIN IMMEDIATE` transaction.**
-/// Answers whether the space took a derived title.
+/// references, any title it earns and, where the plan asks for it, the author's
+/// own membership, in one `BEGIN IMMEDIATE` transaction.**
 ///
 /// **A post is not its action row.** Written as separate autocommitted
 /// statements, the row lands first and its text, its place in the thread and
@@ -5319,12 +5440,15 @@ pub(crate) struct PostPlan<'a> {
 /// adjacent, which is what makes them transaction-able at all — and the caller
 /// validates before it opens this, so a refusal still writes nothing and now
 /// cannot half-write either.
-pub(crate) async fn post_tx(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, AppError> {
+pub(crate) async fn post_tx(
+    conn: &Connection,
+    plan: &PostPlan<'_>,
+) -> Result<PostOutcome, AppError> {
     begin_write(conn).await?;
     match post_tx_body(conn, plan).await {
-        Ok(auto_titled) => {
+        Ok(outcome) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
-            Ok(auto_titled)
+            Ok(outcome)
         }
         Err(e) => {
             // Best-effort rollback; propagate the original error regardless.
@@ -5334,7 +5458,24 @@ pub(crate) async fn post_tx(conn: &Connection, plan: &PostPlan<'_>) -> Result<bo
     }
 }
 
-async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, AppError> {
+async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<PostOutcome, AppError> {
+    // The membership lands **before** the words, so no ordering inside the
+    // transaction can show a post whose author the roster does not carry.
+    // Insert-or-revive on the space's primary key: a live membership is left
+    // exactly as it stands, so this is a no-op for every ordinary space and
+    // for the second thing a reader says in a delegated one.
+    let joined = if plan.join_author {
+        ensure_space_participant(
+            conn,
+            plan.space_id,
+            plan.participant_id,
+            crate::MembershipRole::Member.as_str(),
+            plan.created_at,
+        )
+        .await?
+    } else {
+        false
+    };
     insert_action(
         conn,
         &ActionEntry {
@@ -5350,6 +5491,7 @@ async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, Ap
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
             created_at: plan.created_at,
         },
     )
@@ -5383,7 +5525,10 @@ async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, Ap
         )
         .await?;
     }
-    Ok(auto_titled)
+    Ok(PostOutcome {
+        auto_titled,
+        joined,
+    })
 }
 
 /// Everything an edit writes, validated by the caller before this is opened.
@@ -5451,6 +5596,7 @@ async fn edit_post_tx_body(conn: &Connection, plan: &EditPostPlan<'_>) -> Result
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
             created_at: plan.created_at,
         },
     )
@@ -5487,9 +5633,10 @@ pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(),
     conn.execute(
         "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
          supersedes_action_id, supersedes_item_id, action_type, status, \
-         intent, model, input_tokens, output_tokens, credits_consumed, created_at) \
+         intent, model, input_tokens, output_tokens, credits_consumed, truncated, \
+         created_at) \
          VALUES (?1, ?2, ?3, (SELECT scope FROM participant WHERE id = ?3), \
-                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         (
             Value::Text(entry.id.clone()),
             Value::Text(entry.space_id.clone()),
@@ -5519,6 +5666,7 @@ pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(),
                 Some(c) => Value::Integer(c),
                 None => Value::Null,
             },
+            Value::Integer(i64::from(entry.truncated)),
             Value::Integer(entry.created_at),
         ),
     )
@@ -5846,6 +5994,57 @@ async fn is_visible_post_in_space(
 /// The post `action_id`'s item currently shows, or `None` if that item has no
 /// visible tip — superseded wording, a hidden `error` generation, a missing
 /// row. The walk asks this of every frontier id before planning it, so an
+/// The post an **item** currently shows in `space_id`, or `None` when it shows
+/// none — the item-keyed twin of [`visible_tip_of_action`], through the same
+/// transcript predicate (current generation, terminal status, post type).
+///
+/// It exists for the one question an action id cannot answer: *has the turn
+/// that opened this delegated room written its answer yet?* A turn mints the
+/// item its answer will be written under before it makes a single request
+/// (`TurnPrep::inf_item_id`), and that item is the only thing that identifies
+/// one turn among several the same agent may be running against the same post
+/// — the answer's own action id does not exist until the turn ends, and a
+/// capped or budget-stopped turn never writes one at all.
+///
+/// **`after_row` is still required, and the two rules are not redundant.** An
+/// item names the turn but not the *generation*: a regeneration's
+/// `inf_item_id` is the item it is revising, whose visible post until the turn
+/// lands is the answer being replaced. So the item rules out an answer from
+/// **another** turn, and the watermark rules out an answer that predates the
+/// room; each covers exactly what the other cannot. See
+/// [`last_reply_by_participant`] for the watermark's own argument.
+pub async fn visible_post_of_item(
+    conn: &Connection,
+    space_id: &str,
+    item_id: &str,
+    after_row: Option<i64>,
+) -> Result<Option<String>, AppError> {
+    let sql = format!(
+        "SELECT tip.id FROM item_current ic \
+         JOIN action tip ON tip.id = ic.current_action_id \
+         WHERE ic.item_id = ?1 AND ic.space_id = ?2 \
+           AND tip.rowid > ?3 \
+           AND tip.status IN ('complete', 'cancelled') \
+           AND tip.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         LIMIT 1"
+    );
+    let mut rows = conn
+        .query(
+            &sql,
+            (
+                Value::Text(item_id.to_string()),
+                Value::Text(space_id.to_string()),
+                Value::Integer(after_row.unwrap_or(0)),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
 /// edit or regeneration that landed while a sibling branch was walking is
 /// one wording, not two.
 pub async fn visible_tip_of_action(
@@ -6928,6 +7127,24 @@ pub struct SpaceListRow {
     pub archived_at: Option<i64>,
     pub last_activity_at: i64,
     pub message_count: i64,
+    /// The conversation this one was delegated from, when it was — `None` for
+    /// an ordinary conversation.
+    pub parent: Option<ParentSpace>,
+}
+
+/// The conversation a delegated room was opened from: enough to name it and to
+/// open it, and nothing else.
+///
+/// **One value, not two nullable columns.** "Which conversation" and "what it
+/// is called" travel together or not at all — a title with no id names
+/// somewhere a reader cannot go, and an id with no title is a link with no
+/// words — so the pair is the unit and its absence is the ordinary case. The
+/// title stays optional inside it because a conversation genuinely need not
+/// have one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParentSpace {
+    pub space_id: String,
+    pub title: Option<String>,
 }
 
 pub async fn list_spaces(
@@ -6944,11 +7161,20 @@ pub async fn list_spaces(
     } else {
         "WHERE s.notebook_participant_id IS NULL AND s.archived_at IS NULL "
     };
+    // The parent join is a self-join on the navigational `parent_space_id`, and
+    // it answers in the **same read** as the listing rather than in a per-row
+    // lookup behind it: a listing is virtualized, so a second read per row
+    // would put a query inside a scroll. A delegated room's parent always
+    // exists (the FK says so) and is deliberately **not** filtered on archival
+    // or on being a notebook — a room can be opened from either, and naming
+    // where a row came from is not a door into it.
     let sql = format!(
         "SELECT s.id, s.title, s.created_at, s.archived_at, \
                 COALESCE(MAX(a.created_at), s.created_at) AS last_activity_at, \
-                COUNT(a.id) AS message_count \
+                COUNT(a.id) AS message_count, \
+                s.parent_space_id, p.title \
          FROM space s \
+         LEFT JOIN space p ON p.id = s.parent_space_id \
          LEFT JOIN action a ON a.space_id = s.id \
               AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
               AND a.status IN ('complete', 'cancelled') \
@@ -6956,7 +7182,7 @@ pub async fn list_spaces(
                   SELECT 1 FROM action sup WHERE sup.supersedes_action_id = a.id \
               ) \
          {filter}\
-         GROUP BY s.id, s.title, s.created_at, s.archived_at \
+         GROUP BY s.id, s.title, s.created_at, s.archived_at, s.parent_space_id, p.title \
          ORDER BY last_activity_at DESC"
     );
     let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
@@ -6970,6 +7196,13 @@ pub async fn list_spaces(
             archived_at: row.get::<Option<i64>>(3).map_err(AppError::db)?,
             last_activity_at: row.get::<i64>(4).map_err(AppError::db)?,
             message_count: row.get::<i64>(5).map_err(AppError::db)?,
+            parent: row
+                .get::<Option<String>>(6)
+                .map_err(AppError::db)?
+                .map(|space_id| ParentSpace {
+                    space_id,
+                    title: row.get::<Option<String>>(7).ok().flatten(),
+                }),
         });
     }
     Ok(results)
@@ -7305,13 +7538,21 @@ pub const POST_ACTION_TYPES_SQL: &str = "'user_input', 'inference', 'brief'";
 /// The same set, for the checks that happen in Rust rather than in SQL — the
 /// reference gate (what a quote may name) and the read-side filters that back
 /// it up. Kept beside [`POST_ACTION_TYPES_SQL`] so the two cannot drift.
-pub const POST_ACTION_TYPES: [&str; 3] = ["user_input", "inference", "brief"];
+pub const POST_ACTION_TYPES: [&str; 3] = ["user_input", "inference", BRIEF_ACTION_TYPE];
+
+/// The opening post of an agent-spawned sub-space — the only action type this
+/// module writes outside a turn, and written in exactly one place
+/// ([`spawn_subspace_tx`]). Named because planning asks about it by name (a
+/// brief is the one post that must schedule somebody; see
+/// `crate::Inner::mechanical_plan`), and a rule that spelled the type inline
+/// would be a rule that drifts from the writer.
+pub const BRIEF_ACTION_TYPE: &str = "brief";
 
 /// Action types an **agent** authors as a post. The role split that renders a
 /// transcript for a model is participant-derived (only the responder's own
 /// posts are `assistant`), but the display-side view has no responder to ask,
 /// so it reads this.
-pub const AGENT_POST_ACTION_TYPES: [&str; 2] = ["inference", "brief"];
+pub const AGENT_POST_ACTION_TYPES: [&str; 2] = ["inference", BRIEF_ACTION_TYPE];
 
 /// Whether an action type is a post an agent authored (see
 /// [`AGENT_POST_ACTION_TYPES`]).
@@ -7347,6 +7588,11 @@ pub struct PostActionRow {
     pub action_type: String,
     pub model: Option<String>,
     pub credits_consumed: Option<i64>,
+    /// The upstream stopped this generation at its completion ceiling — the
+    /// durable fact behind the render's "this answer reached its length limit"
+    /// mark, which is why it is read here and not only carried on the live
+    /// turn's result.
+    pub truncated: bool,
     /// Derived 0-based generation number of this (tip) action. The item's total
     /// generation count is `generation + 1`.
     pub generation: i64,
@@ -7424,7 +7670,8 @@ pub async fn get_space_tree_data(
     let action_sql = format!(
         "SELECT ar.action_id, ar.item_id, p.kind, \
                 COALESCE(sp.override_label, p.label), ar.action_type, \
-                ar.model, ar.credits_consumed, ar.generation, ar.created_at \
+                ar.model, ar.credits_consumed, ar.truncated, ar.generation, \
+                ar.created_at \
          FROM action_resolved ar \
          JOIN participant p ON p.id = ar.participant_id \
          LEFT JOIN space_participant sp \
@@ -7454,8 +7701,9 @@ pub async fn get_space_tree_data(
             action_type: row.get::<String>(4).map_err(AppError::db)?,
             model: row.get::<Option<String>>(5).map_err(AppError::db)?,
             credits_consumed: row.get::<Option<i64>>(6).map_err(AppError::db)?,
-            generation: row.get::<i64>(7).map_err(AppError::db)?,
-            created_at: row.get::<i64>(8).map_err(AppError::db)?,
+            truncated: row.get::<i64>(7).map_err(AppError::db)? != 0,
+            generation: row.get::<i64>(8).map_err(AppError::db)?,
+            created_at: row.get::<i64>(9).map_err(AppError::db)?,
         });
     }
 
@@ -8842,6 +9090,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at,
             },
         )
@@ -9038,7 +9287,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            last_reply_by_participant(&conn, "parent", &owner, &asked)
+            last_reply_by_participant(&conn, "parent", &owner, &asked, None)
                 .await
                 .unwrap()
                 .as_deref(),
@@ -9058,7 +9307,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            last_reply_by_participant(&conn, "parent", &owner, &asked)
+            last_reply_by_participant(&conn, "parent", &owner, &asked, None)
                 .await
                 .unwrap()
                 .as_deref(),
@@ -9115,6 +9364,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at,
             },
         )
@@ -9163,6 +9413,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at,
             },
         )
@@ -9226,6 +9477,7 @@ mod tests {
                     range_end: None,
                     annotation: None,
                 }],
+                join_author: false,
                 created_at: 3_000,
             },
         )
@@ -9266,11 +9518,13 @@ mod tests {
                     auto_title: Some("Named by its first post"),
                     reply_to: Some(&first),
                     references: &[],
+                    join_author: false,
                     created_at: 4_000,
                 },
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .auto_titled,
             "the space took the title"
         );
         assert!(
@@ -9465,6 +9719,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at: 4_000,
             },
         )
@@ -9657,6 +9912,7 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     credits_consumed: credits,
+                    truncated: false,
                     created_at: at,
                 },
             )
@@ -9808,6 +10064,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
             created_at: 1_000,
         };
 
@@ -9898,6 +10155,7 @@ mod tests {
                 input_tokens: Some(120),
                 output_tokens: Some(480),
                 credits_consumed: Some(700),
+                truncated: false,
                 created_at: 2_200,
             },
         )

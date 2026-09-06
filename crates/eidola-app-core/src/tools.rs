@@ -177,22 +177,25 @@ impl ToolRegistry {
 ///
 /// These are the **turn-scoped** tools `prepare_turn` attaches on top of the
 /// process-registry snapshot: the navigation tools of a branched turn (see
-/// below), task 35's `remember`, and task 36's `list_my_spaces`. They are
+/// below), the agent-memory `remember`, `list_my_spaces`, and `delegate`. They are
 /// protocol surface, not ordinary built-ins — a system note promises the model
 /// these names with these semantics, and each is bound to something only the
 /// turn has (its own `ThreadSnapshot`; for `remember`, the responding
 /// participant's identity and residence space; for `list_my_spaces`, the
 /// responding participant, whose membership *is* the boundary the tool
-/// enforces) that a process-scoped registration structurally cannot
+/// enforces; for `delegate`, the responding participant, the space it is
+/// delegating from, the roster it was shown, and the post this turn answers)
+/// that a process-scoped registration structurally cannot
 /// supply. Reserving them keeps "what the model was promised" and "what
 /// executes" the same object on every turn, instead of silently diverging the
 /// moment a space branches or memory is switched on.
-pub const RESERVED_TOOL_NAMES: [&str; 5] = [
+pub const RESERVED_TOOL_NAMES: [&str; 6] = [
     "list_branches",
     "read_thread",
     "read_post",
     crate::memory::REMEMBER_TOOL_NAME,
     crate::discovery::LIST_MY_SPACES_TOOL_NAME,
+    crate::subspaces::DELEGATE_TOOL_NAME,
 ];
 
 /// Whether `name` is reserved for a turn-scoped tool.
@@ -618,7 +621,11 @@ mod tests {
         assert!(is_reserved_tool_name(
             crate::discovery::LIST_MY_SPACES_TOOL_NAME
         ));
-        assert_eq!(RESERVED_TOOL_NAMES.len(), 5);
+        // `delegate` likewise: it owns a room on behalf of the responding
+        // participant, from the space this turn is in, anchored on the post
+        // this turn answers.
+        assert!(is_reserved_tool_name(crate::subspaces::DELEGATE_TOOL_NAME));
+        assert_eq!(RESERVED_TOOL_NAMES.len(), 6);
     }
 
     #[test]

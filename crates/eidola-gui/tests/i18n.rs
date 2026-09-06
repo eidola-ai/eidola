@@ -258,6 +258,7 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("snippet", "the opening of what it says");
                 args.set("space", "Tides and the moon");
                 args.set("label", "Sofia, in another space");
+                args.set("parent", "Tides and the moon");
                 args.set("n", 2);
                 args.set("index", 1);
                 args.set("total", 3);
