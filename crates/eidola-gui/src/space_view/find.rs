@@ -133,22 +133,31 @@ enum Mark<'a> {
     Skip,
 }
 
-/// The barrier a table's grid chrome projects as — the block gap's newline,
-/// reached by the other door.
+/// What source bytes project as when they stand between two things the reader
+/// sees apart — the block gap's newline, reached by every other door.
 ///
-/// **Not every hidden range is zero-width formatting.** A read-only table hides
-/// the pipes and padding between cells, so deleting them wholesale would
-/// concatenate the visible cell texts and let `| left | right |` match
-/// `leftright` — a phrase occupying two cells the reader plainly sees apart.
-/// The chrome is *structural*, the way a paragraph gap is, so it projects as
-/// the same thing: one newline, which a query typed into a one-line field can
-/// never contain.
+/// **Not every excluded span is zero-width formatting**, and there are two
+/// ways to reach the mistake of treating one as if it were:
+///
+/// - **A table's grid chrome.** A read-only table hides the pipes and padding
+///   between cells, so deleting them wholesale concatenated the visible cell
+///   texts and let `| left | right |` match `leftright` — a phrase occupying
+///   two cells the reader plainly sees apart.
+/// - **An inline overlay the element layer really replaces.** Typeset math and
+///   an inline image are *atoms on the page*, each occupying width between the
+///   text either side of it, so deleting their source zero-width let
+///   `left$x$right` match `leftright` — again a phrase the reader sees in two
+///   pieces, with a rendered thing standing between them.
+///
+/// Both spans are *structural*, the way a paragraph gap is, so all three
+/// project as the same thing: one newline, which a query typed into a one-line
+/// field can never contain.
 ///
 /// It is a **substitution**, not a fabricated run: the newline stands for the
-/// chrome's own source bytes, so the projected text still maps back to a range
+/// span's own source bytes, so the projected text still maps back to a range
 /// of the post — the one rule [`ProjectionBuilder`] exists to keep. (Nothing
 /// can ever match *into* it, so the atom-coverage semantics never come up.)
-const TABLE_CELL_BARRIER: &str = "\n";
+const BARRIER: &str = "\n";
 
 fn append_block(
     builder: &mut ProjectionBuilder<'_>,
@@ -242,16 +251,25 @@ fn append_block(
     // projection has to do: its bytes are the visible glyphs, so the walk
     // copies them like any other run and the source-range rule holds without
     // a substitution.
+    //
+    // **And what the element layer puts in an overlay's place is an atom, not
+    // a deletion.** An overlay it really replaces occupies width on the page,
+    // so the text either side of it is two things the reader sees apart:
+    // `left$x$right` reads as `left`, a formula, `right`. Excluding the span
+    // zero-width projected `leftright`, and counted — and painted — a match on
+    // a phrase that is nowhere on the page. That is the grid chrome's mistake
+    // reached by a third door, so these spans project as the same [`BARRIER`],
+    // substituted for their own source bytes.
     for math in &block.math_overlays {
         let r = clamp(&math.source_range, content.len());
         if r.start < r.end && gpui_markdown_editor::math_overlay_typesets(block, content, math) {
-            marks.push((r, Mark::Skip));
+            marks.push((r, Mark::Substitute(BARRIER)));
         }
     }
     for image in &block.image_overlays {
         let r = clamp(&image.source_range, content.len());
         if r.start < r.end {
-            marks.push((r, Mark::Skip));
+            marks.push((r, Mark::Substitute(BARRIER)));
         }
     }
     // Substitutions before skips at the same start: an escape or an entity is
@@ -365,7 +383,7 @@ fn split_at_cell_edges<'a>(
                     .min()
                     .unwrap_or(range.end)
                     .min(range.end);
-                out.push((pos..end, Mark::Substitute(TABLE_CELL_BARRIER)));
+                out.push((pos..end, Mark::Substitute(BARRIER)));
                 pos = end;
             }
         }
@@ -1865,6 +1883,32 @@ mod tests {
     }
 
     #[test]
+    fn a_rendered_atom_keeps_the_text_either_side_of_it_apart() {
+        // The element layer replaces a typeset formula and an inline image
+        // with something that occupies width, so the text either side of one
+        // is two things the reader sees apart. Excluding the source span
+        // zero-width joined them into a word that is nowhere on the page —
+        // counted in the readout and painted by the highlight layer — which is
+        // the table chrome's mistake reached by a third door.
+        let math = "left$\\alpha_{beta}$right";
+        assert_eq!(overlay_count(math), 1, "the formula really is an overlay");
+        assert!(
+            find(math, "leftright").is_empty(),
+            "the formula stands between them on the page"
+        );
+        assert_eq!(find(math, "left"), vec!["left".to_string()]);
+        assert_eq!(find(math, "right"), vec!["right".to_string()]);
+
+        let image = "left![a red kite](https://example/kite.png)right";
+        assert!(
+            find(image, "leftright").is_empty(),
+            "the picture stands between them on the page"
+        );
+        assert_eq!(find(image, "left"), vec!["left".to_string()]);
+        assert_eq!(find(image, "right"), vec!["right".to_string()]);
+    }
+
+    #[test]
     fn a_substitution_inside_a_merged_hide_is_still_searchable() {
         // `merge_hidden_ranges` coalesces the emphasis delimiters with the
         // entity's own hide into one range starting at byte 0, and
@@ -1886,9 +1930,11 @@ mod tests {
         // **But an overlay is atomic.** An entity in an image's alt text is a
         // substitution inside a range the element layer replaces wholesale,
         // so it never reaches the page and must stay unsearchable — the hide
-        // rule above must not reach into an overlay.
+        // rule above must not reach into an overlay. The overlay projects as
+        // the barrier every replaced-atom span takes (the picture stands
+        // between the words either side of it), which is what the newline is.
         let alt = "look ![a &amp; b](https://e/k.png) here";
-        assert_eq!(project(alt).text(), "look  here");
+        assert_eq!(project(alt).text(), "look \n here");
         assert!(find(alt, "&").is_empty());
     }
 
