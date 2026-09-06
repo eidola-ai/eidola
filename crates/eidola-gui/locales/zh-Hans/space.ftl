@@ -1,7 +1,7 @@
 # The conversation window (src/space_view/mod.rs), Simplified Chinese.
 
 space-error-archived = 此对话已归档，无法接收新的回复。
-space-error-not-joined = 这是你的助理之间开启的对话。你可以阅读全部内容；要参与则需加入，而此版本尚无法做到。
+space-error-not-joined = 这是你的助理之间开启的对话。你可以阅读全部内容；若要在这里修改或重新提问，请先发言参与。
 
 space-footnote-delegation-concluded = 已告一段落
 space-footnote-delegation-concluded-truncated = 已告一段落，但结束在一条因长度上限而中断的回复上

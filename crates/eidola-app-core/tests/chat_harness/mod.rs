@@ -1502,6 +1502,14 @@ async fn handle_chat(
             // and every later request answers normally.
             let script: Vec<(String, String)> =
                 std::mem::take(&mut *config.tool_script.lock().unwrap());
+            // **Whichever transport asked.** A turn driven for a named
+            // participant streams (`respond_stream_as`), which is the only
+            // door a delegated room's own agents take — so a blocking-only arm
+            // would answer those a body their parser reads as no content at
+            // all, and no scripted call would ever be made.
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_script_stream(stream, &script).await;
+            }
             let mut body = if script.is_empty() {
                 serde_json::json!({
                     "choices": [{ "message": {
@@ -1611,6 +1619,56 @@ async fn write_sse_decline_stream(stream: &mut TcpStream) -> std::io::Result<()>
     for d in deltas {
         stream.write_all(&sse_event(&d.to_string())).await?;
     }
+    stream.write_all(&sse_event("[DONE]")).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// The SSE twin of the [`ChatBehavior::ToolScript`] body: every scripted call
+/// in one delta, or the plain answer when the script is spent.
+///
+/// One delta per call rather than the split-across-deltas shape
+/// [`write_sse_tool_stream`] uses — that stream exists to exercise the client's
+/// accumulator, and this one exists to deliver arguments a test wrote.
+async fn write_sse_script_stream(
+    stream: &mut TcpStream,
+    script: &[(String, String)],
+) -> std::io::Result<()> {
+    stream.write_all(sse_head().as_bytes()).await?;
+    stream.flush().await?;
+    if script.is_empty() {
+        stream
+            .write_all(&sse_event(
+                &serde_json::json!({"choices":[{"delta":{"content":TOOL_FINAL_CONTENT}}]})
+                    .to_string(),
+            ))
+            .await?;
+    } else {
+        let calls: Vec<serde_json::Value> = script
+            .iter()
+            .enumerate()
+            .map(|(i, (name, arguments))| {
+                serde_json::json!({
+                    "index": i,
+                    "id": tool_call_id(i as u64 + 1),
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                })
+            })
+            .collect();
+        stream
+            .write_all(&sse_event(
+                &serde_json::json!({"choices":[{"delta":{"tool_calls":calls}}]}).to_string(),
+            ))
+            .await?;
+    }
+    stream
+        .write_all(&sse_event(
+            &serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}})
+                .to_string(),
+        ))
+        .await?;
     stream.write_all(&sse_event("[DONE]")).await?;
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;

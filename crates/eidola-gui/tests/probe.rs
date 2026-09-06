@@ -1143,6 +1143,23 @@ fn space_info(id: &str, title: Option<&str>) -> eidola_app_core::SpaceInfo {
         last_activity_at: ts,
         message_count: 4,
         archived_at: None,
+        parent: None,
+    }
+}
+
+/// A listing row for a conversation an agent opened from another one.
+fn delegated_space_info(
+    id: &str,
+    title: &str,
+    parent_id: &str,
+    parent_title: Option<&str>,
+) -> eidola_app_core::SpaceInfo {
+    eidola_app_core::SpaceInfo {
+        parent: Some(eidola_app_core::SpaceParent {
+            space_id: parent_id.into(),
+            title: parent_title.map(String::from),
+        }),
+        ..space_info(id, Some(title))
     }
 }
 
@@ -5444,6 +5461,96 @@ fn keyboard_focus_reveals_a_library_rows_verbs(cx: &mut TestAppContext) {
         gpui::Role::Button,
         "Rename Tides and the moon",
     );
+}
+
+/// A delegated conversation names the one it was opened from — always — and
+/// becomes a link to it exactly where the row's other verbs become live.
+///
+/// The two halves are one rule: the fact belongs on every row (a delegated row
+/// is a conversation the reader never started, and at rest it would otherwise
+/// stand there unexplained), while the affordance belongs to the revealed row
+/// only, because a virtualized listing is one tab stop with a roving cursor and
+/// a stop per row would describe an order that omits whatever nobody scrolled
+/// to. So the badge says which it is.
+#[gpui::test]
+fn a_delegated_library_row_names_the_conversation_it_came_from(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            delegated_space_info(
+                "s1a",
+                "Check Friday's tide tables",
+                "s1",
+                Some("Tides and the moon"),
+            ),
+            space_info("s1", Some("Tides and the moon")),
+            delegated_space_info("s2a", "Second opinion", "s2", None),
+        ];
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    // At rest: a caption on the delegated rows, nothing on the ordinary one.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/parent",
+        gpui::Role::Label,
+        "From Tides and the moon",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "library/row/1/parent"),
+        "an ordinary conversation came from nowhere and says nothing"
+    );
+    // A parent nobody named still names its row's provenance, in the reader's
+    // language rather than in a title app-core would have had to invent.
+    assert_probe(
+        &entries,
+        "library/row/2/parent",
+        gpui::Role::Label,
+        "From an untitled conversation",
+    );
+
+    // Revealed — here by the keyboard cursor, the half hover cannot answer for:
+    // the badge becomes a link, and says what activating it opens.
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/parent",
+        gpui::Role::Link,
+        "Open Tides and the moon, the conversation this was delegated from",
+    );
+    assert_probe(
+        &entries,
+        "library/row/2/parent",
+        gpui::Role::Label,
+        "From an untitled conversation",
+    );
+
+    // **The badge's label is its own text**, so it is pinned in a locale where
+    // an English literal beside the accessor would still read as English: the
+    // sighted reader would see the message and a screen reader would hear the
+    // literal, in every language but the source one.
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/parent",
+        gpui::Role::Link,
+        "Ouvrir Tides and the moon, la conversation depuis laquelle celle-ci a été déléguée",
+    );
+    assert_probe(
+        &entries,
+        "library/row/2/parent",
+        gpui::Role::Label,
+        "Depuis une conversation sans titre",
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    probe::set_probes_enabled(false);
 }
 
 /// Send one key **down** — what a view's own key listener reads (navigation,

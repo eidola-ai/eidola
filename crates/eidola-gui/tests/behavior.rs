@@ -402,6 +402,7 @@ fn stub_space(id: &str, title: Option<&str>, snippet: Option<&str>, ts: i64) -> 
         last_activity_at: ts,
         message_count: 2,
         archived_at: None,
+        parent: None,
     }
 }
 
@@ -670,6 +671,148 @@ fn library_pencil_click_does_not_also_open_row(cx: &mut TestAppContext) {
             "clicking the pencil must NOT also open the row (the propagation/reshape race)"
         );
     });
+}
+
+/// The parent badge opens the conversation a delegated one was opened from —
+/// and, being a control inside a row that is itself a control, must not open
+/// its own row on the way (the rename pencil's propagation race, in the one
+/// other place a row now carries a click of its own).
+#[gpui::test]
+fn library_parent_badge_opens_the_parent_and_not_its_own_row(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![SpaceInfo {
+            parent: Some(eidola_app_core::SpaceParent {
+                space_id: "s0".into(),
+                title: Some("Tides and the moon".into()),
+            }),
+            ..stub_space("s1", Some("Check Friday's tide tables"), None, 1_000)
+        }];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+    cx.run_until_parked();
+
+    // The badge is a link only on the revealed row — the same gate the row's
+    // other verbs take, and what keeps the listing one tab stop.
+    view.update(cx, |v, _| v.set_hovered_for_test(Some(0)));
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(520.), px(620.)));
+    vcx.run_until_parked();
+    let bounds = vcx
+        .debug_bounds("parent-badge-0")
+        .expect("the revealed parent badge must be painted with its debug selector");
+    let center: Point<gpui::Pixels> = bounds.center();
+
+    vcx.simulate_click(center, Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.open_parent_requests_for_test(),
+            1,
+            "the badge opens the conversation this one was delegated from"
+        );
+        assert_eq!(
+            v.open_space_requests_for_test(),
+            0,
+            "and never the row it sits in"
+        );
+    });
+}
+
+/// **The parent link is a tab stop, and it comes before the row's verbs.** The
+/// Library is one tab stop with a roving cursor whose row reveals its
+/// affordances, so making the badge a `Link` added a stop to that order —
+/// list → Parent → Rename → Archive → out — and a documented order nothing
+/// checks is a contract the next accessibility pass can quietly drop.
+///
+/// Two halves, because the harness can measure two different things. **That it
+/// is a stop** is measured by walking Tab until the focus wraps: a delegated
+/// row's listing has exactly one more stop than the same listing without a
+/// parent. **Where it is** follows from paint order, which is what orders stops
+/// within one tab region (`crate::focus::TabRegion`), so the badge painting to
+/// the left of the rename pencil is the same fact as its coming first.
+#[gpui::test]
+fn library_tab_order_reaches_a_parent_before_the_row_verbs(cx: &mut TestAppContext) {
+    /// Tab from the top until focus comes back where it started; the count is
+    /// the number of stops the window offers.
+    fn stops(cx: &mut TestAppContext, window: gpui::AnyWindowHandle) -> usize {
+        let focused = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.focused(cx).map(|h| format!("{h:?}"))
+            })
+            .unwrap()
+        };
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..50 {
+            cx.update_window(window, |_, window, cx| window.focus_next(cx))
+                .unwrap();
+            cx.update_window(window, |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+            let Some(id) = focused(cx) else { break };
+            if seen.contains(&id) {
+                break;
+            }
+            seen.push(id);
+        }
+        seen.len()
+    }
+
+    let ordinary = stub_space("s1", Some("Check Friday's tide tables"), None, 1_000);
+    let delegated = SpaceInfo {
+        parent: Some(eidola_app_core::SpaceParent {
+            space_id: "s0".into(),
+            title: Some("Tides and the moon".into()),
+        }),
+        ..ordinary.clone()
+    };
+
+    let plain_stores = stub_stores(cx, |s| s.spaces = vec![ordinary]);
+    let (plain_window, _) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(plain_stores, window, cx))
+    });
+    cx.run_until_parked();
+    let plain = stops(cx, plain_window);
+
+    let stores = stub_stores(cx, |s| s.spaces = vec![delegated]);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        stops(cx, window),
+        plain + 1,
+        "a delegated row puts one more stop in the Library's order"
+    );
+
+    // And the cursor row really is what reveals it — the badge is a `Link`
+    // where the verbs are live, not a stop that outlives its own reveal.
+    let seen = cx
+        .update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, cx| v.cursor_and_reveal_for_test(window, cx))
+        })
+        .unwrap();
+    assert_eq!(seen.1, Some(0), "the row whose verbs are revealed");
+
+    // Position: stops within one tab region follow paint order, so this is the
+    // order Tab reads.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(520.), px(620.)));
+    vcx.run_until_parked();
+    let badge = vcx
+        .debug_bounds("parent-badge-0")
+        .expect("the revealed parent badge is painted");
+    let pencil = vcx
+        .debug_bounds("rename-pencil-0")
+        .expect("the revealed rename pencil is painted");
+    assert!(
+        badge.origin.x < pencil.origin.x,
+        "Parent is painted — and so reached — before Rename: {badge:?} vs {pencil:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -206,6 +206,24 @@ CREATE TABLE space (
     -- owning agent happened to speak last. Fixed at birth and never
     -- updated: it records a fact about the space's origin, not its state.
     parent_action_id  TEXT REFERENCES action(id),
+    -- Which *turn* opened this room, recorded as the item that turn will
+    -- write its answer under. The anchor above says which post the work was
+    -- asked on; it cannot say which of that post's answers the report belongs
+    -- beneath, because nothing serializes two turns of one agent against one
+    -- post — a second explicit ask, or a regeneration running beside a reply,
+    -- answers the same anchor from the same owner. An item does say it:
+    -- `prepare_turn` mints it before the turn's first request (a turn that is
+    -- capped or budget-stopped writes no inference at all, so there is no
+    -- answer id yet to record), and a regeneration reuses the item it revises.
+    -- Written here, inside the spawn's own transaction, so the fact commits
+    -- with the room and outlives the process that opened it: a delegation runs
+    -- for as long as its work takes, and the app being quit in the middle of
+    -- one is ordinary rather than exceptional.
+    -- No foreign key: at the spawn that answer does not exist, so no row
+    -- carries the item yet. Fixed at birth, like the anchor beside it.
+    -- NULL for a spawn with no turn behind it (a direct API caller), whose
+    -- report falls back to the owner's newest answer on the anchor.
+    parent_answer_item_id TEXT,
     title             TEXT,
     linkability       TEXT NOT NULL CHECK (linkability IN (
                           'linked', 'unlinked', 'public'

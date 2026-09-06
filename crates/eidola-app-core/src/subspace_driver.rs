@@ -1120,8 +1120,8 @@ impl Inner {
                     }
                 }
             }
-            // Delivered, or there was nothing to deliver to. Either way this
-            // ending is done with.
+            // Settled: the report is delivered, or there was nothing to
+            // deliver it to. Either way this ending is done with.
             Ok(Report::Settled) => self.forget_ending(&space_id),
             // The delivery itself failed. Forgetting is what keeps a decided
             // ending from being retried past the work that earned it.
@@ -1639,14 +1639,63 @@ impl Inner {
                         });
                     }
                     let conn = self.db_conn().await?;
-                    match db::last_reply_by_participant(
-                        &conn,
-                        &sub.parent_space_id,
-                        &sub.owner_participant_id,
-                        anchor,
-                    )
-                    .await?
-                    {
+                    // **Which answer belongs to this delegation is a question
+                    // about its turn, so both rules here are the turn's.**
+                    // `space.parent_answer_item_id` records the item the
+                    // spawning turn writes its answer under, and where it is
+                    // set the question is asked of that item alone: no visible
+                    // post of it yet means *this* turn has not answered,
+                    // whatever else has landed on the anchor. Nothing
+                    // serializes two turns of one agent against one post — a
+                    // second explicit ask, a regeneration running beside a
+                    // reply — so the item is the only thing that tells them
+                    // apart. It is read from the room's own row, written in the
+                    // spawn's transaction, so it answers the same after a
+                    // restart as before one: a delegation runs for as long as
+                    // its work takes, and the app being quit between the
+                    // spawning turn's answer and the report is ordinary.
+                    //
+                    // **The watermark goes with it.** A turn's own answer is
+                    // one it has yet to persist, so anything of that item
+                    // already visible is the generation a regeneration is
+                    // replacing — accepting it would end the wait against a
+                    // word about to be superseded, and a failed regeneration
+                    // would then leave the report hanging under a hidden tip.
+                    // The room's brief *is* that line and needs no new state to
+                    // record it ([`db::subspace_opened_at_row`]); a room whose
+                    // brief cannot be read leaves it unset, which is a
+                    // delegation still being able to report rather than a
+                    // refusal.
+                    //
+                    // **A spawn with no turn behind it gets neither**, and that
+                    // is not a gap: a direct API caller supplying an anchor is
+                    // saying "report under the owner's answer to this post",
+                    // and there is no later answer coming, because there is no
+                    // turn to write one. Filtering to answers newer than the
+                    // room would then discard the only answer the caller could
+                    // have meant and leave the report waiting out its grace to
+                    // land on the anchor instead — a rule borrowed from a
+                    // premise that does not hold here. The owner's newest
+                    // answer is the whole of what is known, exactly as the
+                    // anchorless fallback below reads its own.
+                    let answered = match sub.parent_answer_item_id.as_deref() {
+                        Some(item) => {
+                            let opened_at = db::subspace_opened_at_row(&conn, &sub.id).await?;
+                            db::visible_post_of_item(&conn, &sub.parent_space_id, item, opened_at)
+                                .await?
+                        }
+                        None => {
+                            db::last_reply_by_participant(
+                                &conn,
+                                &sub.parent_space_id,
+                                &sub.owner_participant_id,
+                                anchor,
+                                None,
+                            )
+                            .await?
+                        }
+                    };
+                    match answered {
                         Some(answer) => {
                             self.end_anchor_wait(&sub.id);
                             Some(answer)
@@ -1943,6 +1992,20 @@ impl Inner {
     /// this; it then finds the room archived at its next hop or at the report
     /// gate and clears it there, which is the same one-walk cost that door
     /// always had. Ending it here is what removes the standing one.
+    ///
+    /// **Every per-room record this process holds is released here, for that
+    /// one reason** — the anchor wait being the one there is. Anything added
+    /// later belongs here too: an archived room no longer takes
+    /// `drive_subspace`'s terminal exits, so a record cleared only there leaks
+    /// for the life of a long-lived GUI that opens and archives delegations.
+    /// Which turn opened a room is *not* among them, because it is not held in
+    /// memory at all: it commits with the room
+    /// (`space.parent_answer_item_id`) and is read back from the row.
+    ///
+    /// **One door for all three archival paths**: a direct archival, a parent's
+    /// (`archive_space_tx` answers with the whole subtree it closed), and a
+    /// retirement's or a departure's set. Each hands its archived ids straight
+    /// here, so none of them has to know what a room keeps.
     pub(crate) fn close_rooms(&self, space_ids: &[String]) {
         for id in space_ids {
             self.end_anchor_wait(id);

@@ -923,6 +923,22 @@ pub struct SpaceInfo {
     /// When the space was archived, if it has been. Always `None` unless
     /// listing was asked to include archived spaces.
     pub archived_at: Option<i64>,
+    /// The conversation this one was delegated from (see [`subspaces`]) —
+    /// `None` for an ordinary conversation. A listing row is where a reader
+    /// meets a delegated room, and without this it is a conversation they never
+    /// started with no way to see what it belongs to.
+    pub parent: Option<SpaceParent>,
+}
+
+/// The conversation a delegated room was opened from, as a listing row carries
+/// it: enough to name it and to open it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceParent {
+    pub space_id: String,
+    /// `None` for a conversation that was never named — the presentation layer
+    /// chooses what to say instead, because this crate ships no user-facing
+    /// strings.
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2010,6 +2026,58 @@ struct Inner {
 }
 
 // --- Config helpers (sync) ---------------------------------------------------
+
+/// The mechanical notify set, with the **brief floor kept separable**.
+///
+/// Two things want the same computation and want different halves of it. The
+/// mechanical door ([`Inner::mechanical_plan`], and `AppCore`'s inspection
+/// seam over it) wants the set the rule answers with — floor folded in. The
+/// door that actually drives turns ([`Inner::plan_and_refine`]) wants the floor
+/// *after* the may-decline router has spoken, because the router legitimately
+/// answers "nobody" and over a `brief` that answer is the delegated room doing
+/// no work at all and reporting its own untouched brief as concluded — the
+/// silent no-work delegation the floor exists to make unrepresentable.
+///
+/// Carrying the floor beside the plan is what lets one derivation serve both:
+/// the reads happen once, `applied()` is the mechanical answer, and the
+/// refining door still holds the turn the router is not allowed to erase.
+struct MechanicalOutcome {
+    /// The set the notify policies produced, before the floor.
+    plan: NotificationPlan,
+    /// The turn a `brief` falls back to when nothing else answers it — the
+    /// room's owner, which is its author. `None` for any other post, for an
+    /// owner that cannot respond, and for a plan that never got that far.
+    floor: Option<PlannedTurn>,
+}
+
+impl MechanicalOutcome {
+    /// Nothing to notify and no floor — the shape every early exit takes.
+    fn nothing() -> Self {
+        Self {
+            plan: NotificationPlan::Turns(Vec::new()),
+            floor: None,
+        }
+    }
+
+    /// The cascade guard spoke. It is not a set the floor may fill: a pause is
+    /// the room being told to stop, and the report says so.
+    fn paused(depth: i64, limit: i64) -> Self {
+        Self {
+            plan: NotificationPlan::Paused { depth, limit },
+            floor: None,
+        }
+    }
+
+    /// The mechanical answer: the floor applies exactly when nothing else does.
+    fn applied(self) -> NotificationPlan {
+        match (self.plan, self.floor) {
+            (NotificationPlan::Turns(t), Some(floor)) if t.is_empty() => {
+                NotificationPlan::Turns(vec![floor])
+            }
+            (plan, _) => plan,
+        }
+    }
+}
 
 impl Inner {
     fn load_config(&self) -> Config {
@@ -3337,6 +3405,10 @@ impl Inner {
                 last_activity_at: r.last_activity_at,
                 message_count: r.message_count,
                 archived_at: r.archived_at,
+                parent: r.parent.map(|p| SpaceParent {
+                    space_id: p.space_id,
+                    title: p.title,
+                }),
             });
         }
         Ok(spaces)
@@ -4153,15 +4225,22 @@ impl Inner {
     /// conversation they never joined. Oversight is looking; this is the line
     /// it stops at.
     ///
-    /// **Every door that acts *as the human* asks this**, and that is exactly
-    /// the set: `post` (and `chat`/`chat_stream`/`submit` through it), which
-    /// hard-codes the human as author, and `edit_post`, `regenerate` and
+    /// **Every door that acts *as the human* on something already here asks
+    /// this**, and that is exactly the set: `edit_post`, `regenerate` and
     /// `respond_stream`, which the human's own picker and per-post verbs drive.
-    /// `respond_stream_as` deliberately does **not** — it names the participant
-    /// it acts as, is already gated on *that* participant's membership
-    /// (`resolve_explicit_participant`), and is the door a turn driver uses, so
-    /// a human-membership test there would refuse the sub-space's own agents
-    /// working in their own room.
+    /// `post` is the one that is not gated but *satisfies* the rule instead —
+    /// speaking is how a reader joins, and the join rides the post's own
+    /// transaction (`db::PostPlan::join_author`), so the roster is true of the
+    /// transcript from that post onward rather than from a separate step
+    /// somebody has to take first. The distinction is not a softening: the
+    /// three doors that remain are the ones that act on *another* participant's
+    /// work or spend the reader's credits, and none of them is a way to say
+    /// something.
+    /// `respond_stream_as` deliberately does **not** ask — it names the
+    /// participant it acts as, is already gated on *that* participant's
+    /// membership (`resolve_explicit_participant`), and is the door a turn
+    /// driver uses, so a human-membership test there would refuse the
+    /// sub-space's own agents working in their own room.
     ///
     /// Asked before any write and before any spend, so a refusal is zero-trace.
     /// A **notebook** is deliberately untouched — the human has always been
@@ -4183,10 +4262,17 @@ impl Inner {
     }
 
     /// Combined post-and-turn (`chat` / `chat_stream`) is a cascade, and a
-    /// live sub-space's cascade belongs to the driver. Membership is asked
-    /// first so an unjoined reader still sees [`AppError::NotJoined`]; a
-    /// joined one is refused here before any write, rather than posting and
-    /// then driving the same notify-all seat the driver's arm will take.
+    /// live sub-space's cascade belongs to the driver. Refused here before any
+    /// write, rather than posting and then driving the same notify-all seat the
+    /// driver's arm will take.
+    ///
+    /// **The refusal is the same whoever asks.** It used to ask membership
+    /// first, so an unjoined reader read [`AppError::NotJoined`] — the honest
+    /// answer while posting meant joining first. Now that posting *is* joining,
+    /// a membership question in front of this one would demand a step for a
+    /// verb that is refused either way, and would name the wrong obstacle:
+    /// what stands in the way is the driver, not the roster. `post` remains,
+    /// and takes the reader in with it.
     async fn refuse_combined_ask_in_subspace(
         &self,
         space_id: Option<&str>,
@@ -4196,7 +4282,6 @@ impl Inner {
         };
         let conn = self.db_conn().await?;
         if db::is_live_subspace(&conn, space_id).await? {
-            self.require_human_joined(&conn, space_id).await?;
             return Err(AppError::DrivenConversation {
                 space_id: space_id.to_string(),
             });
@@ -5234,6 +5319,10 @@ impl Inner {
             last_activity_at: now,
             message_count: 0,
             archived_at: None,
+            // Every creation door here mints an ordinary conversation; the one
+            // that mints a delegated room is `spawn_subspace`, which answers
+            // with a `SubspaceInfo` of its own.
+            parent: None,
         })
     }
 
@@ -5266,6 +5355,10 @@ impl Inner {
             last_activity_at: now,
             message_count: 0,
             archived_at: None,
+            // Every creation door here mints an ordinary conversation; the one
+            // that mints a delegated room is `spawn_subspace`, which answers
+            // with a `SubspaceInfo` of its own.
+            parent: None,
         })
     }
 
@@ -5387,22 +5480,32 @@ impl Inner {
                 .await?;
         }
 
-        let (space_id, space_title, is_new_space) = if let Some(sid) = space_id {
+        // **Speaking in a delegated room joins you to it.** Those rooms have no
+        // human member by construction, and a post by somebody the roster omits
+        // makes that roster a lie to every model in the room — so the join is
+        // part of the post rather than a step in front of it (`PostPlan::
+        // join_author`, written in the post's own transaction). Reading it here
+        // races nothing: `parent_space_id` is written once, at creation, and
+        // there is no door that makes an ordinary conversation into a delegated
+        // one — the same fact the driver's negative cache rests on. The
+        // *membership* is deliberately **not** read here; the insert-or-revive
+        // decides that inside the transaction.
+        let (space_id, space_title, is_new_space, join_author) = if let Some(sid) = space_id {
             let row =
                 db::get_space(&db_conn, sid)
                     .await?
                     .ok_or_else(|| AppError::NotConfigured {
                         message: format!("space not found: {sid}"),
                     })?;
-            self.require_human_joined(&db_conn, sid).await?;
-            (sid.to_string(), row.title, false)
+            let subspace = db::subspace(&db_conn, sid).await?.is_some();
+            (sid.to_string(), row.title, false, subspace)
         } else {
             // A new space is instantiated from the default template, so it has
             // its participants (You + the template agents) from birth.
             let sid = new_space_id();
             self.instantiate_default_space(&db_conn, &sid, None, now)
                 .await?;
-            (sid, None, true)
+            (sid, None, true, false)
         };
 
         // No prior terminal action ⇒ this is the space's first post: eligible
@@ -5435,7 +5538,10 @@ impl Inner {
         // and billing a turn against an empty post. See `db::post_tx`. The
         // validations above stay in front of it, where a refusal belongs: they
         // are reads, and now they leave neither a trace nor a fragment.
-        let auto_titled = db::post_tx(
+        let db::PostOutcome {
+            auto_titled,
+            joined,
+        } = db::post_tx(
             &db_conn,
             &db::PostPlan {
                 space_id: &space_id,
@@ -5446,6 +5552,7 @@ impl Inner {
                 auto_title: auto_title.as_deref(),
                 reply_to: reply_ante.as_deref(),
                 references,
+                join_author,
                 created_at: now,
             },
         )
@@ -5454,6 +5561,12 @@ impl Inner {
         self.bus.emit(Change::Space(space_id.clone()));
         if is_new_space || auto_titled {
             self.bus.emit(Change::SpaceIndex);
+        }
+        // A roster changed, so every surface that renders one has to re-read.
+        // Only when the join actually wrote: saying it on every post into a
+        // room the reader is already in would be an invalidation about nothing.
+        if joined {
+            self.bus.emit(Change::Participants);
         }
         // The post is committed and emitted; anything a grown branch needs
         // summarized happens behind it, never in front of it.
@@ -6333,6 +6446,36 @@ impl Inner {
         // path resolves or mints one), so the scope is the whole test.
         let spaces_tool = model_participant_scope == "global" && backend_accepts_tools;
 
+        // ---- Delegation ---------------------------------------------------
+        //
+        // `delegate` opens a sub-space owned by the responding agent (see
+        // [`subspaces`]). Its gate is the **same structural one**, and that is
+        // not a coincidence: the rule that lets a global agent be referenced
+        // into another space is the rule that lets it own one, so a
+        // space-owned participant fails both for one reason rather than two.
+        // The guards themselves — depth, live rooms per owner, seats — are the
+        // spawn door's and are decided inside its transaction; the tool adds
+        // none of its own, so it cannot be a way around any of them.
+        let delegate_tool = model_participant_scope == "global" && backend_accepts_tools;
+        // The seats a delegation may name are exactly the agents this turn's
+        // roster carries — read off the same participant snapshot the roster
+        // renders from, so what a model can name is what it was shown, and no
+        // second query can disagree with the first. The human is not a
+        // candidate (a delegated room has no human member by construction) and
+        // neither is the responder, which the spawn seats itself.
+        let seat_candidates: Vec<subspaces::SeatCandidate> = if delegate_tool {
+            members
+                .iter()
+                .filter(|m| m.kind == "agent" && m.participant_id != model_participant_id)
+                .map(|m| subspaces::SeatCandidate {
+                    participant_id: m.participant_id.clone(),
+                    label: m.label.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Render the rows from the *responding participant's* point of view:
         // only its own prior posts are `assistant`, everyone else's are `user`,
         // and every message carries its uniform `#<handle> · <label>` header
@@ -6415,6 +6558,13 @@ impl Inner {
         // and is byte-stable thereafter.
         if spaces_tool {
             notes.push(discovery::GLOBAL_AGENT_NOTE);
+        }
+        // The delegation note flips at the same moment for the same reason,
+        // and says the three things the schema cannot: the brief is a
+        // contract, the answer comes back as a post rather than a return
+        // value, and the guards are bounded.
+        if delegate_tool {
+            notes.push(subspaces::DELEGATE_NOTE);
         }
         let mut system_content = match system_prompt
             .as_deref()
@@ -6550,7 +6700,7 @@ impl Inner {
         // vanish. Done at the snapshot, so the model never sees the schema and
         // `declined_reason` (which keys on the registry, not the name) cannot
         // fire even if it guesses the name.
-        let auto_tools = nav_tools || memory_tool || spaces_tool;
+        let auto_tools = nav_tools || memory_tool || spaces_tool || delegate_tool;
         let tool_registry = if auto_tools {
             let mut registry = (*consumer_tools).clone();
             if nav_tools {
@@ -6580,6 +6730,30 @@ impl Inner {
                     self.self_ref.clone(),
                     model_participant_id.clone(),
                     space_id.clone(),
+                )));
+            }
+            if delegate_tool {
+                // The anchor is this turn's own reply target — the post the
+                // work is being asked for on. Only the turn knows it, which is
+                // the whole reason the spawn door takes it from its caller: a
+                // delegation opened here reports back beneath this agent's
+                // answer to *this* post, rather than beneath wherever it
+                // happened to speak last.
+                registry.register(Arc::new(subspaces::DelegateTool::new(
+                    self.self_ref.clone(),
+                    model_participant_id.clone(),
+                    space_id.clone(),
+                    inf_reply_to.clone(),
+                    // **Which turn this is.** The answer a delegation reports
+                    // beneath is this turn's, and the same agent can have two
+                    // turns running against the same post (two explicit asks,
+                    // a regeneration beside a reply) — so the room records the
+                    // item this turn's answer will be written under, which is
+                    // minted here, before the first request, precisely because
+                    // the answer's own action id does not exist yet and may
+                    // never exist at all.
+                    inf_item_id.clone(),
+                    seat_candidates.clone(),
                 )));
             }
             Arc::new(registry)
@@ -8212,14 +8386,32 @@ impl Inner {
     /// → only when the post's author is human; `explicit` → never (only an
     /// explicit ask reaches them).
     ///
+    /// **A brief is never left unanswered** — the one floor under that set.
+    /// A `brief` is the opening post of a delegated room, written by the agent
+    /// that owns it, and it is the one post whose entire purpose is to be
+    /// worked on. The rules above would answer it with nobody in the room the
+    /// tool advertises most plainly: a delegation that seats no sub-agent
+    /// holds its owner alone, the owner authored the brief and an author is
+    /// excluded from its own post's notify set, so the driver would report an
+    /// untouched brief as a concluded delegation and the room would do no work
+    /// at all. So when the set over a brief comes back empty, the brief's
+    /// author takes the turn. It fires **only** when nobody else would, which
+    /// is what keeps a panel unchanged (its sub-agents are seated `all`, so
+    /// the set is never empty there, and the owner is deliberately quiet among
+    /// its helpers), and it is bounded by the shape of a brief rather than by
+    /// a counter: there is exactly one per room, written at the spawn, and
+    /// neither editable nor regenerable — so the floor can schedule at most
+    /// one turn per room, and the owner's own answer is an `inference` that
+    /// gets no floor of its own.
+    ///
     /// A **pure read** — no network, no commits, no emissions. Production
     /// callers go through [`Inner::plan_and_refine`], which additionally
     /// filters this set through the space's may-decline router.
-    async fn mechanical_plan(
+    async fn mechanical_outcome(
         &self,
         space_id: &str,
         post_action_id: &str,
-    ) -> Result<NotificationPlan, AppError> {
+    ) -> Result<MechanicalOutcome, AppError> {
         let conn = self.db_conn().await?;
 
         // The post must belong to this space: the notify set + cascade limit come
@@ -8238,10 +8430,10 @@ impl Inner {
         // depth behind `ChatResult::response_action_id` being `None` on a
         // declined turn (see [`decline`]); the guard is cheap and the failure
         // it prevents is silent.
-        match db::action_type(&conn, post_action_id).await? {
-            Some(t) if db::is_post_action_type(&t) => {}
-            _ => return Ok(NotificationPlan::Turns(Vec::new())),
-        }
+        let action_type = match db::action_type(&conn, post_action_id).await? {
+            Some(t) if db::is_post_action_type(&t) => t,
+            _ => return Ok(MechanicalOutcome::nothing()),
+        };
 
         // **An archived conversation plans no turns**, and the same read that
         // answers that carries the cascade budget — one statement for the
@@ -8253,35 +8445,36 @@ impl Inner {
         // hidden or refused a reader — it is the end of new work.
         let space = db::get_space(&conn, space_id).await?;
         if space.as_ref().is_some_and(|s| s.archived_at.is_some()) {
-            return Ok(NotificationPlan::Turns(Vec::new()));
+            return Ok(MechanicalOutcome::nothing());
         }
         let limit = space
             .map(|s| s.cascade_limit)
             .unwrap_or(DEFAULT_CASCADE_LIMIT);
         let depth = db::agent_cascade_depth(&conn, post_action_id).await?;
         if depth >= limit {
-            return Ok(NotificationPlan::Paused { depth, limit });
+            return Ok(MechanicalOutcome::paused(depth, limit));
         }
 
         // The post's author (excluded from the notify set; its kind resolves the
         // `human` predicate).
         let (author_id, author_kind) = match db::action_author(&conn, post_action_id).await? {
             Some((id, _scope, kind)) => (id, kind),
-            None => return Ok(NotificationPlan::Turns(Vec::new())),
+            None => return Ok(MechanicalOutcome::nothing()),
         };
 
+        // An agent with no model can't respond — never plan a turn for it.
+        let can_respond = |m: &db::EffectiveParticipantRow| {
+            m.kind == "agent"
+                && m.model_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty())
+        };
+
+        let members = db::space_participants(&conn, space_id).await?;
         let mut turns = Vec::new();
-        for m in db::space_participants(&conn, space_id).await? {
-            if m.kind != "agent" || m.participant_id == author_id {
-                continue;
-            }
-            // An agent with no model can't respond — never plan a turn for it.
-            if m.model_ref
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none()
-            {
+        for m in &members {
+            if !can_respond(m) || m.participant_id == author_id {
                 continue;
             }
             let fires = match m.notify_policy.as_str() {
@@ -8291,13 +8484,57 @@ impl Inner {
             };
             if fires {
                 turns.push(PlannedTurn {
-                    participant_id: m.participant_id,
+                    participant_id: m.participant_id.clone(),
                     target_action_id: post_action_id.to_string(),
                     cascade_depth: depth + 1,
                 });
             }
         }
-        Ok(NotificationPlan::Turns(turns))
+
+        // **The floor: a brief is never left unanswered.** See this method's
+        // doc comment for why — a solo delegation is a room whose only agent
+        // wrote the post, and the author exclusion above would leave it with
+        // nothing to do. The owner's own notify policy is deliberately not
+        // consulted: `spawn_subspace_tx` writes it as `human` so the agent
+        // answerable for a delegation stays quiet among its helpers, and a
+        // floor that a policy could switch off would be no floor. Everything
+        // that makes a participant unable to answer still applies.
+        //
+        // **Computed whether or not it fires**, because the set it stands aside
+        // for is not the last word: the may-decline router runs after this,
+        // "nobody" is a valid answer from it, and over a brief that answer is
+        // the room doing no work at all. So the floor travels beside the plan
+        // rather than only inside it — see [`MechanicalOutcome`].
+        let floor = (action_type == db::BRIEF_ACTION_TYPE)
+            .then(|| {
+                members
+                    .iter()
+                    .find(|m| m.participant_id == author_id && m.role == "owner" && can_respond(m))
+            })
+            .flatten()
+            .map(|owner| PlannedTurn {
+                participant_id: owner.participant_id.clone(),
+                target_action_id: post_action_id.to_string(),
+                cascade_depth: depth + 1,
+            });
+        Ok(MechanicalOutcome {
+            plan: NotificationPlan::Turns(turns),
+            floor,
+        })
+    }
+
+    /// The mechanical notify set as the rule answers it, floor folded in — see
+    /// [`Inner::mechanical_outcome`], the same computation with the floor still
+    /// separable.
+    async fn mechanical_plan(
+        &self,
+        space_id: &str,
+        post_action_id: &str,
+    ) -> Result<NotificationPlan, AppError> {
+        Ok(self
+            .mechanical_outcome(space_id, post_action_id)
+            .await?
+            .applied())
     }
 
     /// The notification plan production drives: the mechanical set
@@ -8353,10 +8590,34 @@ impl Inner {
                 return Ok(NotificationPlan::Turns(Vec::new()));
             }
         }
-        let plan = self.mechanical_plan(space_id, post_action_id).await?;
-        Ok(self
-            .refine_notifications(space_id, post_action_id, plan)
-            .await)
+        // **The brief floor is re-asserted after refinement, because the
+        // router can empty what the floor stood aside for.** A delegated room
+        // inherits its parent's `router_model`, and a room that seats helpers
+        // has a non-empty mechanical set — so the floor does not fire, and the
+        // router is then handed a real choice. `{"notify": []}` is a *valid*
+        // answer from it ("nobody responds"), and over a `brief` that answer is
+        // the room taking no turn at all: the driver walks a room where nothing
+        // happened and reports the untouched brief as a concluded delegation.
+        // That is precisely the silent no-work delegation the floor exists to
+        // make unrepresentable, arriving by the one door the floor did not
+        // cover.
+        //
+        // So the floor binds the *refined* plan too. It is still a floor and
+        // not a veto: the router's selection stands whenever it selected
+        // anybody, and this only replaces "nobody" with the one agent
+        // answerable for the delegation. A router cannot switch it off for the
+        // same reason a notify policy cannot.
+        let outcome = self.mechanical_outcome(space_id, post_action_id).await?;
+        let floor = outcome.floor.clone();
+        let refined = self
+            .refine_notifications(space_id, post_action_id, outcome.applied())
+            .await;
+        Ok(match (refined, floor) {
+            (NotificationPlan::Turns(t), Some(floor)) if t.is_empty() => {
+                NotificationPlan::Turns(vec![floor])
+            }
+            (refined, _) => refined,
+        })
     }
 
     /// The composer CTA path: save a post (`post`), then plan + refine over it
@@ -10494,6 +10755,18 @@ impl AppCore {
     /// caller with no turn behind it (a test, a direct API use); the report
     /// then falls back to the conversation's own last word.
     ///
+    /// **`answer_item_id` is which *turn* is asking**, and it is the caller's
+    /// for the same reason: the anchor says which post the work was asked on,
+    /// and one post can have two answers from one agent (a second explicit ask,
+    /// a regeneration running beside a reply), so only the turn knows which of
+    /// them the report belongs beneath. It is the item that turn will write its
+    /// answer under — minted before the turn's first request, because a capped
+    /// or budget-stopped turn writes no inference at all and so has no answer
+    /// id yet to give. Captured durably (`space.parent_answer_item_id`), so it
+    /// outlives the process that opened the room. `None` for a caller with no
+    /// turn behind it, which falls back to the owner's newest answer on the
+    /// anchor.
+    ///
     /// Refusals arrive as [`AppError::SpawnRefused`] carrying a
     /// [`SpawnRefusal`], and leave nothing behind. On success:
     /// [`Change::SpaceIndex`] (the Library lists sub-spaces like any other
@@ -10509,6 +10782,7 @@ impl AppCore {
         capabilities: Vec<String>,
         title: Option<String>,
         parent_action_id: Option<String>,
+        answer_item_id: Option<String>,
     ) -> Result<SpawnedSubspace, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -10522,6 +10796,7 @@ impl AppCore {
                         &capabilities,
                         title.as_deref(),
                         parent_action_id.as_deref(),
+                        answer_item_id.as_deref(),
                     )
                     .await
             })
@@ -14061,7 +14336,22 @@ fn render_messages(
             continue; // skip tool_call, tool_result, etc. for now
         }
         let role = match responder_participant_id {
-            // Upstream: only the responder's own posts are its words.
+            // Upstream: only the responder's own posts are its words — with
+            // **one exception, and it is the brief**. A brief is not a
+            // contribution to the conversation, it is the conversation's
+            // premise: the contract the room was opened to act on, addressed to
+            // everyone in it. Rendered as the author's own words it reached the
+            // one participant who wrote it — the owner, which is exactly who
+            // the brief floor schedules for a delegation that seats nobody — as
+            // its own prior output, at the end of a room with no roster block
+            // and no thread map behind it (both live in the system message, and
+            // neither exists for a single unbranched member). A model handed
+            // its own text as the last thing said has been asked to continue
+            // it, not to carry it out, and the delegation would then produce
+            // more brief. As `user` it is what it always was to every other
+            // participant: the request. Nothing is misattributed — the message
+            // header still names its author.
+            Some(_) if row.action_type == db::BRIEF_ACTION_TYPE => "user",
             Some(responder) => {
                 if row.participant_id == responder {
                     "assistant"
