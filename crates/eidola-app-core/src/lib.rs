@@ -5,6 +5,7 @@ pub mod db;
 pub mod decline;
 pub mod discovery;
 pub mod error;
+pub mod ipc;
 pub mod local_models;
 pub mod memory;
 pub mod router;
@@ -587,7 +588,9 @@ pub struct AccountCreateResult {
     pub terms: TermsAcceptance,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AccountShowResult {
     pub id: String,
     pub stripe_customer_id: Option<String>,
@@ -651,7 +654,9 @@ pub struct BalancePoolInfo {
     pub expires_at: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CredentialInfo {
     pub nonce: String,
     pub credits: i64,
@@ -763,7 +768,10 @@ fn documents_not_covered(required: &[TermsDocument], recorded: &[TermsDocument])
         .collect()
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]) as the `end`
+/// payload of a turn run over the socket, so a field rename here is a wire
+/// change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ChatResult {
     pub space_id: String,
     pub content: String,
@@ -800,7 +808,7 @@ pub struct ChatResult {
 }
 
 /// A turn that ended at the agent-side decline checkpoint (see [`decline`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DeclineOutcome {
     /// The reason the agent stated, or empty when it gave none. The *act* of
     /// declining is the datum; the reason is commentary.
@@ -907,7 +915,9 @@ pub struct SubmitResult {
     pub plan: NotificationPlan,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SpaceInfo {
     pub id: String,
     pub title: Option<String>,
@@ -1717,7 +1727,12 @@ fn auto_allocation_amount(available: i64, required: i64) -> Result<i64, AppError
 /// Incremental events emitted by `AppCore::chat_stream`. The terminal
 /// outcome is the function's `Result<ChatResult, AppError>` return value;
 /// senders close their channel when the function returns.
-#[derive(Clone, Debug)]
+///
+/// **The serde shape is the local control protocol's chunk vocabulary**
+/// ([`crate::ipc`]): a turn streamed to another process sends these, so
+/// renaming a variant is a wire change, not a refactor.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "text", rename_all = "snake_case")]
 pub enum ChatStreamEvent {
     /// A piece of the model's reasoning ("thinking") output. Append to a
     /// running buffer; treat empty events as no-ops.
@@ -8677,6 +8692,17 @@ pub struct AppCore {
 impl AppCore {
     pub fn runtime(&self) -> &tokio::runtime::Runtime {
         &self.runtime
+    }
+
+    /// The data directory this core opened — where the database, its lockfile
+    /// and anything else belonging to *this* profile live.
+    ///
+    /// Exposed because the process holding the single-writer lock is also the
+    /// one that answers for the profile ([`crate::ipc`]), and the socket it
+    /// listens on has to be the one belonging to the profile it actually
+    /// opened, not one recomputed from configuration that may have moved.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.inner.data_dir
     }
 
     /// Register a tool the turn loop may call (see [`tools`]).

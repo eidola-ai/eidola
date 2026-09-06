@@ -58,8 +58,11 @@ unic-langid = "0.9"
 libc = "0.2"
 serde_json = "1"
 # `signal` backs the windowless mode's SIGTERM/SIGINT → `cx.quit()` bridge
-# (`lifecycle::install_signal_quit`); `time` its bounded engine teardown.
-tokio = { version = "1", features = ["sync", "signal", "time"] }
+# (`lifecycle::install_signal_quit`); `time` its bounded engine teardown and the
+# control socket's bounded accept retry. `net` + `io-util` + `rt` are the
+# control socket itself (`src/ipc.rs`): a `UnixListener`, split stream halves,
+# and connection tasks spawned onto the core's runtime.
+tokio = { version = "1", features = ["sync", "signal", "time", "net", "io-util", "rt"] }
 
 # The status item, the Regular ⇄ Accessory activation flip, and the login
 # item (task 17 wave 3) are AppKit/ServiceManagement, not gpui — a status menu
