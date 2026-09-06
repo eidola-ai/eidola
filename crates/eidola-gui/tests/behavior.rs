@@ -20287,6 +20287,60 @@ fn space_find_keeps_the_readers_place_in_the_conversation(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn space_find_waits_for_geometry_the_current_layout_produced(cx: &mut TestAppContext) {
+    // A body editor is retained for every post but rendered only near the
+    // viewport, and it clears its paint-time geometry only in its own render —
+    // so an off-screen post answers `content_y_for_offset` with the pixels of a
+    // layout that is gone, and answers `Some`. Taken as exact, the correction
+    // is consumed against a width nobody is looking at.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "the off-screen match is owed a correction"
+        );
+    });
+
+    // The reading column narrows, which is exactly the height cache's key —
+    // every measured height goes, and no post has painted at the new width yet.
+    let before = view.read_with(&vcx, |v, _| v.layout_clears_for_test());
+    vcx.simulate_resize(gpui::size(px(520.), px(520.)));
+    let after = view.read_with(&vcx, |v, _| v.layout_clears_for_test());
+    assert!(
+        after > before,
+        "the resize really did invalidate the layout ({before} -> {after})"
+    );
+
+    // The reveal is still owed: geometry from the old width is no answer, so
+    // the correction waits exactly as it does before a post has ever painted.
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "the correction did not spend itself on the layout that is gone"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_stops_its_reveal_when_the_reader_takes_a_branch(cx: &mut TestAppContext) {
     // A branch dot writes no page offset — it is a horizontal switch — so it
     // reaches the motion seam through neither of the helpers that fold half of
