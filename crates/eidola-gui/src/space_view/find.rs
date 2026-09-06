@@ -356,9 +356,9 @@ fn push_hide<'a>(
 /// inline markup and contributes nothing, outside every cell it is grid chrome
 /// and contributes a barrier.
 ///
-/// `cells` is in source order and non-overlapping (the render's own geometry),
-/// and every edge is a character boundary of the source, so each piece is a
-/// range [`ProjectionBuilder`] will accept.
+/// `cells` is in source order and non-overlapping (the render's own geometry —
+/// [`table_cells`] asserts it), and every edge is a character boundary of the
+/// source, so each piece is a range [`ProjectionBuilder`] will accept.
 fn split_at_cell_edges<'a>(
     range: Range<usize>,
     cells: &[Range<usize>],
@@ -367,22 +367,16 @@ fn split_at_cell_edges<'a>(
 ) {
     let mut pos = range.start;
     while pos < range.end {
-        match cells.iter().find(|c| c.start <= pos && pos < c.end) {
+        match cell_at(cells, pos) {
             // Inside a cell — inline markup, up to that cell's end.
-            Some(cell) => {
-                let end = cell.end.min(range.end);
+            CellAt::Inside(end) => {
+                let end = end.min(range.end);
                 push_hide(pos..end, sub_starts, out);
                 pos = end;
             }
             // Between cells — the grid, up to wherever the next cell begins.
-            None => {
-                let end = cells
-                    .iter()
-                    .map(|c| c.start)
-                    .filter(|start| *start > pos)
-                    .min()
-                    .unwrap_or(range.end)
-                    .min(range.end);
+            CellAt::Between(next) => {
+                let end = next.unwrap_or(range.end).min(range.end);
                 out.push((pos..end, Mark::Substitute(BARRIER)));
                 pos = end;
             }
@@ -390,20 +384,65 @@ fn split_at_cell_edges<'a>(
     }
 }
 
+/// Where one byte of a table block falls, relative to the grid's cells.
+#[derive(Debug, PartialEq, Eq)]
+enum CellAt {
+    /// Inside a cell, whose content ends here.
+    Inside(usize),
+    /// Outside every cell — grid chrome — running until the next cell begins,
+    /// or to the end of the block where none does.
+    Between(Option<usize>),
+}
+
+/// Which cell (if any) a byte falls in, by **binary search** rather than a scan.
+///
+/// `append_block` calls `split_at_cell_edges` once per hidden range, and a table
+/// has one hidden chrome range per cell edge — so a linear `find` over the cell
+/// list, plus the second linear scan the between-cells arm took for the next
+/// cell start, made opening the bar on a large generated table quadratic in its
+/// cells and froze the window synchronously. The cells are already in source
+/// order and non-overlapping (the render laid the grid), so the position is a
+/// question a `partition_point` answers, and one call answers both arms: the
+/// cell before the partition is the only one that can contain `pos`, and the
+/// cell at it is the next one to begin.
+///
+/// **A lookup, not a rule.** The verdict this feeds — inside a cell is inline
+/// markup, outside is a barrier — is unchanged, which is what keeps the
+/// cell-edge and merged-hide semantics exactly as they were.
+fn cell_at(cells: &[Range<usize>], pos: usize) -> CellAt {
+    let next = cells.partition_point(|c| c.start <= pos);
+    if let Some(cell) = next.checked_sub(1).map(|i| &cells[i])
+        && pos < cell.end
+    {
+        return CellAt::Inside(cell.end);
+    }
+    CellAt::Between(cells.get(next).map(|c| c.start))
+}
+
 /// The content ranges of every cell a table block carries, or an empty vec for
 /// any other block. The delimiter row has no cells to name — the render hides
 /// its whole line, which is then outside every cell and so a barrier like the
 /// rest of the grid.
+///
+/// Rows come out of the geometry in source order and a row's cells in column
+/// order, so the result is sorted and non-overlapping — the premise
+/// [`cell_at`]'s binary search rests on, asserted here where it is established
+/// rather than assumed where it is used.
 fn table_cells(block: &gpui_markdown_editor::RenderBlock) -> Vec<Range<usize>> {
     let gpui_markdown_editor::BlockKind::Table { geometry, .. } = &block.kind else {
         return Vec::new();
     };
-    geometry
+    let cells: Vec<Range<usize>> = geometry
         .rows
         .iter()
         .filter(|row| row.kind != gpui_markdown_editor::table::RowKind::Delimiter)
         .flat_map(|row| row.cells.iter().cloned())
-        .collect()
+        .collect();
+    debug_assert!(
+        cells.windows(2).all(|w| w[0].end <= w[1].start),
+        "the render's grid is in source order and non-overlapping: {cells:?}"
+    );
+    cells
 }
 
 /// One match: where it is, and the identity that lets the current-match anchor
@@ -1880,6 +1919,32 @@ mod tests {
         let inline = "look ![a red kite](https://example/kite.png) here";
         assert_eq!(find(inline, "look"), vec!["look".to_string()]);
         assert!(find(inline, "kite").is_empty());
+    }
+
+    #[test]
+    fn the_cell_lookup_answers_what_a_scan_would() {
+        // `cell_at` replaced two linear scans per hidden range — which made a
+        // table quadratic in its cells — with one `partition_point`. Only the
+        // cost moved, so the lookup is pinned against the scan it stands in
+        // for, over every byte of a grid with gaps at both ends, between every
+        // pair of cells, and one cell butting straight onto the next.
+        let cells = vec![2..5, 5..9, 12..14, 20..20, 21..30];
+        for pos in 0..34 {
+            let inside = cells.iter().find(|c| c.start <= pos && pos < c.end);
+            let expected = match inside {
+                Some(cell) => CellAt::Inside(cell.end),
+                None => CellAt::Between(
+                    cells
+                        .iter()
+                        .map(|c| c.start)
+                        .filter(|start| *start > pos)
+                        .min(),
+                ),
+            };
+            assert_eq!(cell_at(&cells, pos), expected, "at byte {pos}");
+        }
+        // A block with no grid at all takes the between-cells arm to its end.
+        assert_eq!(cell_at(&[], 7), CellAt::Between(None));
     }
 
     #[test]
