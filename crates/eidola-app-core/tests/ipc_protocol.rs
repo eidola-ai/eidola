@@ -32,9 +32,10 @@ use std::sync::Arc;
 use chat_harness::{ChatBehavior, MODEL, MockConfig, core_for, with_account};
 use eidola_app_core::AppCore;
 use eidola_app_core::ipc::{
-    Call, HelloResult, MAX_FRAME_BYTES, NO_REQUEST, PROTOCOL_VERSION, ProtocolError, RemoteError,
-    Request, Response, ResponseBody, Shutdown, SpacesListResult, WalletCredentialsResult,
-    decode_response, encode_line, serve_connection, serve_connection_with_shutdown,
+    Call, DefaultModelResult, Done, HelloResult, MAX_FRAME_BYTES, ModelListResult, NO_REQUEST,
+    PROTOCOL_VERSION, ProtocolError, RemoteError, Request, Response, ResponseBody, Shutdown,
+    SpacesArchiveResult, SpacesListResult, WalletCredentialsResult, decode_response, encode_line,
+    serve_connection, serve_connection_with_shutdown,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
@@ -446,6 +447,126 @@ fn the_read_verbs_answer_from_the_open_profile() {
                 wallet.credentials.is_empty(),
                 "a fresh profile has spent nothing"
             );
+        });
+    });
+}
+
+#[test]
+fn a_write_verb_changes_the_profile_it_speaks_for() {
+    run(|| {
+        let (_mock, core, _dir) = served(MockConfig::default());
+        let space = core
+            .runtime()
+            .block_on(core.create_space(Some("Field notes".into())))
+            .expect("create a space");
+
+        core.runtime().block_on(async {
+            let mut client = Client::connect(&core);
+            client.hello().await;
+
+            let _: Done = client
+                .ok(&Call::SpacesRename {
+                    space_id: space.id.clone(),
+                    title: "Renamed over the socket".into(),
+                })
+                .await;
+            let listing: SpacesListResult = client
+                .ok(&Call::SpacesList {
+                    include_archived: false,
+                })
+                .await;
+            assert_eq!(
+                listing.spaces[0].title.as_deref(),
+                Some("Renamed over the socket"),
+                "the write landed in the profile, not in a copy of it"
+            );
+
+            let archived: SpacesArchiveResult = client
+                .ok(&Call::SpacesArchive {
+                    space_id: space.id.clone(),
+                })
+                .await;
+            assert!(archived.archived);
+            let listing: SpacesListResult = client
+                .ok(&Call::SpacesList {
+                    include_archived: false,
+                })
+                .await;
+            assert!(listing.spaces.is_empty(), "and the listing agrees");
+
+            // Archiving what is already archived is an answer, not a failure.
+            let again: SpacesArchiveResult = client
+                .ok(&Call::SpacesArchive {
+                    space_id: space.id.clone(),
+                })
+                .await;
+            assert!(!again.archived);
+        });
+    });
+}
+
+#[test]
+fn the_backend_registry_answers_and_takes_a_choice() {
+    run(|| {
+        let (_mock, core, _dir) = served(MockConfig::default());
+        core.runtime().block_on(async {
+            let mut client = Client::connect(&core);
+            client.hello().await;
+
+            let _: Done = client
+                .ok(&Call::BackendSetEnabled {
+                    id: "eidola".into(),
+                    enabled: false,
+                })
+                .await;
+            let backends: eidola_app_core::ipc::BackendListResult =
+                client.ok(&Call::BackendList).await;
+            let eidola = backends
+                .backends
+                .iter()
+                .find(|b| b.id == "eidola")
+                .expect("the seeded row");
+            assert!(!eidola.enabled, "the choice took, and the listing shows it");
+        });
+    });
+}
+
+#[test]
+fn the_model_verbs_answer_for_the_process_that_owns_the_engines() {
+    run(|| {
+        let (_mock, core, _dir) = served(MockConfig::default());
+        let expected = core
+            .runtime()
+            .block_on(core.default_model())
+            .expect("a default model");
+
+        core.runtime().block_on(async {
+            let mut client = Client::connect(&core);
+            client.hello().await;
+
+            // Read as a frame first: `running` has no serde default, so a
+            // payload that stopped carrying the registry would not decode.
+            // **What this cannot reach is a non-empty registry** — putting an
+            // engine in it needs a real `llama-server` and a real `.gguf`, so
+            // the value's honesty rests on `running_engines` itself and on the
+            // CLI's reconciliation tests, not on this one.
+            let (_, outcome) = client.call(&Call::ModelList).await;
+            let data = match outcome {
+                Outcome::End(data) => data,
+                other => panic!("expected a result, got {other:?}"),
+            };
+            assert!(
+                data["running"].is_array(),
+                "the registry travels beside the scan"
+            );
+            let models: ModelListResult = serde_json::from_value(data).expect("the verb's result");
+            assert!(models.state.models.is_empty(), "a fresh profile has none");
+
+            // Which model a turn that names none would use — the resolution
+            // that needs the database, which is why it has a verb at all.
+            let default: DefaultModelResult = client.ok(&Call::ChatDefaultModel).await;
+            assert_eq!(default.model, expected);
+            assert_eq!(default.model, MODEL);
         });
     });
 }

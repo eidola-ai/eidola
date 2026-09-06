@@ -6459,3 +6459,110 @@ fn a_regeneration_whose_stream_never_finished_keeps_the_answer_it_would_replace(
         assert!(settled.is_ok(), "the claim released and announced it");
     });
 }
+
+// ---------------------------------------------------------------------------
+// Recovery vs. a turn that is still flying
+// ---------------------------------------------------------------------------
+
+/// A credential is `spending` from the instant its pending-refund row is
+/// written until its successor is minted, and the database cannot say which of
+/// the two situations that covers: a request in flight, or a hold stranded by
+/// a process that died mid-turn. Only the second is recoverable.
+///
+/// The recovery endpoint takes an unrecorded nullifier as proof the request
+/// never arrived — it records it and refunds — so asking it about a live hold
+/// does not merely fail to help, it **breaks the turn**: the real request then
+/// reaches the server with a nullifier already recorded and is refused as a
+/// replay, and an answer the account paid for is lost because somebody asked
+/// for the money back on its behalf. This is why the process taking the turn
+/// keeps its own record of which holds are its own, and recovery reads it.
+#[test]
+fn a_hold_a_live_turn_is_flying_with_is_not_recovered() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            // A window to act inside — an instant answer makes an in-flight
+            // turn unobservable, and this is entirely about that instant.
+            chat_delay_ms: 1_500,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (turn, in_flight, recovered) = core.runtime().block_on(async {
+            let taking = core.chat("How do tides work?".into(), MODEL.into(), None);
+            let recovering = async {
+                // Let the turn take its hold and get its request out.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let in_flight = core
+                    .wallet_spending_credentials()
+                    .await
+                    .expect("the wallet reads");
+                let recovered = core
+                    .recover_spending_credentials()
+                    .await
+                    .expect("recovery runs");
+                (in_flight, recovered)
+            };
+            let (turn, (in_flight, recovered)) = tokio::join!(taking, recovering);
+            (turn, in_flight, recovered)
+        });
+
+        assert_eq!(
+            in_flight.len(),
+            1,
+            "the fixture has to actually catch the hold mid-flight to prove anything"
+        );
+        assert!(
+            recovered.is_empty(),
+            "a hold whose request is still going is not stranded: {recovered:?}"
+        );
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "and the server was never even asked about it — the ask is what \
+             records the nullifier and dooms the turn"
+        );
+        let turn = turn.expect("so the turn still lands");
+        assert!(turn.credits_charged > 0, "and is billed, once");
+    });
+}
+
+/// The other half, and the reason the record is dropped rather than cleared at
+/// any particular success: a hold whose turn ended without settling it **is**
+/// stranded, and must be recoverable again the moment that turn is over.
+#[test]
+fn a_hold_whose_turn_ended_without_settling_it_is_recovered() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            // The round's own settlement attempt fails; the next call to the
+            // recovery endpoint succeeds.
+            refund: RefundMode::FailFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the turn answers even though its hold did not settle");
+
+        let (in_flight, recovered) = core.runtime().block_on(async {
+            let in_flight = core
+                .wallet_spending_credentials()
+                .await
+                .expect("the wallet reads");
+            let recovered = core
+                .recover_spending_credentials()
+                .await
+                .expect("recovery runs");
+            (in_flight, recovered)
+        });
+
+        assert_eq!(in_flight.len(), 1, "the turn left its hold behind");
+        assert_eq!(
+            recovered.len(),
+            1,
+            "and nothing holds it out of recovery once its turn is over"
+        );
+    });
+}
