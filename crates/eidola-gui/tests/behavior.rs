@@ -20160,6 +20160,87 @@ fn space_find_keeps_the_readers_place_in_the_conversation(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn space_find_stops_its_reveal_when_the_reader_selects_a_passage(cx: &mut TestAppContext) {
+    // The third editor population, and the one that is only ever read. A
+    // selection is anchored to document positions, so a page still gliding
+    // toward an off-screen match drags the reader's selection across text they
+    // never aimed at — and phase 2 could pull the page onto that match after.
+    // Only a drag that reaches a viewport edge passed through the motion seam
+    // before, which leaves every ordinary click and mid-page drag out.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "the off-screen match is being glided to"
+        );
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "…with the correction owed once that post is measured"
+        );
+    });
+
+    // The reader selects in the post they can see — the context menu's own
+    // Select All over a read-only body, which is a real caret move.
+    let body = view
+        .read_with(&vcx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post at the top of the page has a body editor");
+    vcx.update(|window, cx| {
+        body.update(cx, |e, cx| {
+            e.perform(gpui_markdown_editor::EditorCommand::SelectAll, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.post_selection_action_id().is_some()),
+        "the selection really was made"
+    );
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_pending_reveal_for_test(),
+            None,
+            "the reveal the reader superseded is not still owed"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…and the page is not still travelling under their selection"
+        );
+    });
+
+    let resting = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.drive_page_glide_for_test(1.0));
+    });
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_scroll_offset_y_for_test(),
+            resting,
+            "the page stayed where the reader is selecting"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_stops_its_reveal_when_the_reader_edits_a_post(cx: &mut TestAppContext) {
     // The composer's twin, reached through the other editor. An inline edit
     // has no caret-into-view of its own to arm, so it never passed the seam

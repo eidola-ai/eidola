@@ -2371,12 +2371,27 @@ impl SpaceView {
                     // Track this post's selection: a read-only body is where
                     // a quote is *made*, so its `SelectionChanged` is the
                     // only signal that gates the Edit menu's Quote items.
+                    //
+                    // **And selecting is the reader claiming the page where it
+                    // stands.** A find reveal is a multi-frame glide toward an
+                    // off-screen match, and a selection is anchored to document
+                    // positions, so a page sliding under the pointer smears the
+                    // drag across text the reader never aimed at — and phase 2
+                    // could still pull the page onto the match afterwards. Only
+                    // a drag that reaches a viewport edge passed through the
+                    // motion seam before (`autoscroll_selection`), which leaves
+                    // every ordinary click and mid-page drag out. The editor
+                    // emits this on a real caret move alone — `set_value`
+                    // announces `Change` and never this — so a transcript
+                    // re-seed cannot fire it.
                     let sub_id = id.clone();
                     let sub = cx.subscribe(&editor, move |this, _editor, event, cx| {
                         if matches!(
                             event,
                             gpui_markdown_editor::MarkdownEditorEvent::SelectionChanged
                         ) {
+                            this.cancel_page_glide();
+                            this.demote_tail_pin_for_reader();
                             this.note_body_selection(&sub_id, cx);
                         }
                     });
