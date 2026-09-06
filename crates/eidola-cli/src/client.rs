@@ -101,6 +101,15 @@ pub enum Failure {
     /// somebody else — and the only correct thing to do with the result is
     /// not use it.
     AccountReplaced { what: &'static str },
+    /// The app answering left out something this protocol requires it to
+    /// state, so a check that decides whether to go on cannot be made.
+    ///
+    /// **Silence is refused rather than tolerated.** A field the protocol
+    /// requires is stated by every peer that speaks it, so an answer without
+    /// one is a build that predates the requirement — and treating that as
+    /// "nothing to check here" would leave exactly the hole the field was
+    /// added to close, in the one situation nobody can see it happening.
+    Incomplete { what: &'static str },
 }
 
 impl std::fmt::Display for Failure {
@@ -118,6 +127,9 @@ impl std::fmt::Display for Failure {
                 f,
                 "the account changed while {what} was being prepared, so nothing was opened"
             ),
+            Failure::Incomplete { what } => {
+                write!(f, "the running Eidola does not state {what}")
+            }
         }
     }
 }
@@ -305,20 +317,24 @@ impl Client {
         // Whose profile is it? An app that states another config root is
         // serving another account, another default template and another
         // update feed, and every verb after this would quietly be about that
-        // one. An app that states *none* is older than the field; that is a
-        // thing this build cannot check rather than a mismatch it may invent,
-        // so it is left alone.
-        if let Some(theirs) = &hello.config_dir {
-            // Their own bytes, so a root that is not UTF-8 compares as the
-            // directory it is rather than as the question marks printing it
-            // would have left.
-            let theirs = path_from_bytes(theirs);
-            if !same_config_root(config_dir, &theirs) {
-                return Err(Dial::OtherProfile {
-                    ours: config_dir.to_path_buf(),
-                    theirs,
-                });
-            }
+        // one. **An app that states none is refused too**: the socket is
+        // found through the data root alone, so silence here is not "nothing
+        // to check", it is the check being impossible — and going on anyway
+        // is the whole hole this gate exists to close, taken on trust.
+        let Some(theirs) = &hello.config_dir else {
+            return Err(Dial::Failed(Failure::Incomplete {
+                what: "which profile it serves",
+            }));
+        };
+        // Their own bytes, so a root that is not UTF-8 compares as the
+        // directory it is rather than as the question marks printing it
+        // would have left.
+        let theirs = path_from_bytes(theirs);
+        if !same_config_root(config_dir, &theirs) {
+            return Err(Dial::OtherProfile {
+                ours: config_dir.to_path_buf(),
+                theirs,
+            });
         }
         client.app_version = hello.app_version;
         Ok(client)
@@ -476,17 +492,26 @@ mod tests {
         });
     }
 
+    /// The greeting an app serving `dir` as its profile gives. Every process
+    /// speaking this protocol states its config root, so a fixture that wants
+    /// to be adopted has to state one too.
+    fn greeting(dir: &std::path::Path) -> HelloResult {
+        HelloResult {
+            protocol: PROTOCOL_VERSION,
+            app_version: "9.9.9".into(),
+            config_dir: Some(path_bytes(dir)),
+        }
+    }
+
     /// The ordinary app: greets, and answers the two verbs these tests ask for.
-    fn ordinary(request: &Request) -> Vec<Response> {
+    fn ordinary(dir: &std::path::Path) -> impl Fn(&Request) -> Vec<Response> + Send + 'static {
+        let hello = greeting(dir);
+        move |request: &Request| ordinary_with(&hello, request)
+    }
+
+    fn ordinary_with(hello: &HelloResult, request: &Request) -> Vec<Response> {
         match request.verb.as_str() {
-            "hello" => vec![Response::end(
-                request.id,
-                &HelloResult {
-                    protocol: PROTOCOL_VERSION,
-                    app_version: "9.9.9".into(),
-                    config_dir: None,
-                },
-            )],
+            "hello" => vec![Response::end(request.id, hello)],
             "chat.default_model" => vec![Response::end(
                 request.id,
                 &DefaultModelResult {
@@ -713,21 +738,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_app_that_states_no_config_root_is_not_refused_for_it() {
+    async fn an_app_that_states_no_config_root_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // An app older than the field. Unknown is not a mismatch, and
-        // inventing one would refuse every such app for a check it cannot
-        // make.
+        // Every process speaking this protocol states its config root, so an
+        // answer without one is a build from before it did. Silence is not
+        // "nothing to check" — the socket is found through the data root
+        // alone, so it is the check being impossible, and adopting the app
+        // anyway would run every verb against whatever profile it happens to
+        // hold. Refused before a verb is dispatched, like a mismatch.
         serve_profile(dir.path(), None);
-        Client::connect(dir.path(), dir.path())
-            .await
-            .expect("an app that says nothing is not an app that disagrees");
+        match Client::connect(dir.path(), dir.path()).await {
+            Err(Dial::Failed(Failure::Incomplete { what })) => {
+                assert_eq!(what, "which profile it serves")
+            }
+            other => panic!(
+                "an app that cannot say whose profile it serves must not be \
+                 adopted: {:?}",
+                other.map(|_| ())
+            ),
+        }
     }
 
     #[tokio::test]
     async fn the_handshake_names_the_app_and_the_verbs_answer() {
         let dir = tempfile::tempdir().expect("tempdir");
-        serve(dir.path(), ordinary);
+        serve(dir.path(), ordinary(dir.path()));
         let mut client = Client::connect(dir.path(), dir.path())
             .await
             .expect("connect");
@@ -825,15 +860,9 @@ mod tests {
             "the fixture has to actually exceed the request bound to prove anything"
         );
 
+        let hello = greeting(dir.path());
         serve(dir.path(), move |request| match request.verb.as_str() {
-            "hello" => vec![Response::end(
-                request.id,
-                &HelloResult {
-                    protocol: PROTOCOL_VERSION,
-                    app_version: "9.9.9".into(),
-                    config_dir: None,
-                },
-            )],
+            "hello" => vec![Response::end(request.id, &hello)],
             _ => vec![Response::end(
                 request.id,
                 &WalletRecoverResult {
@@ -858,7 +887,7 @@ mod tests {
     #[tokio::test]
     async fn a_verb_the_app_does_not_have_costs_one_command() {
         let dir = tempfile::tempdir().expect("tempdir");
-        serve(dir.path(), ordinary);
+        serve(dir.path(), ordinary(dir.path()));
         let mut client = Client::connect(dir.path(), dir.path())
             .await
             .expect("connect");
@@ -896,15 +925,9 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let refusal = refusal.clone();
+            let hello = greeting(dir.path());
             serve(dir.path(), move |request| match request.verb.as_str() {
-                "hello" => vec![Response::end(
-                    request.id,
-                    &HelloResult {
-                        protocol: PROTOCOL_VERSION,
-                        app_version: "9.9.9".into(),
-                        config_dir: None,
-                    },
-                )],
+                "hello" => vec![Response::end(request.id, &hello)],
                 _ => vec![Response::err(
                     NO_REQUEST,
                     WireError::from_protocol(&refusal),
@@ -937,15 +960,9 @@ mod tests {
     #[tokio::test]
     async fn a_typed_app_failure_arrives_typed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        serve(dir.path(), |request| match request.verb.as_str() {
-            "hello" => vec![Response::end(
-                request.id,
-                &HelloResult {
-                    protocol: PROTOCOL_VERSION,
-                    app_version: "9.9.9".into(),
-                    config_dir: None,
-                },
-            )],
+        let hello = greeting(dir.path());
+        serve(dir.path(), move |request| match request.verb.as_str() {
+            "hello" => vec![Response::end(request.id, &hello)],
             _ => vec![Response::err(
                 request.id,
                 WireError::from_app_error(&AppError::InsufficientBalance {
@@ -974,15 +991,9 @@ mod tests {
     #[tokio::test]
     async fn a_turn_streams_its_events_and_ends_with_its_result() {
         let dir = tempfile::tempdir().expect("tempdir");
-        serve(dir.path(), |request| match request.verb.as_str() {
-            "hello" => vec![Response::end(
-                request.id,
-                &HelloResult {
-                    protocol: PROTOCOL_VERSION,
-                    app_version: "9.9.9".into(),
-                    config_dir: None,
-                },
-            )],
+        let hello = greeting(dir.path());
+        serve(dir.path(), move |request| match request.verb.as_str() {
+            "hello" => vec![Response::end(request.id, &hello)],
             _ => vec![
                 // A frame answering another request: this connection has one
                 // in flight, so it must be skipped rather than acted on.

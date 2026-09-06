@@ -648,6 +648,7 @@ mod tests {
     /// Runs on its own runtime in its own thread, because the thing under test
     /// blocks the one it is called on.
     fn greeter(dir: &std::path::Path) -> std::thread::JoinHandle<()> {
+        let config_dir = eidola_app_core::ipc::path_bytes(dir);
         let listener =
             std::os::unix::net::UnixListener::bind(socket_path(dir)).expect("bind the socket");
         std::thread::spawn(move || {
@@ -669,7 +670,7 @@ mod tests {
                         &HelloResult {
                             protocol: PROTOCOL_VERSION,
                             app_version: "9.9.9".into(),
-                            config_dir: None,
+                            config_dir: Some(config_dir.clone()),
                         },
                     );
                     use tokio::io::AsyncWriteExt;
@@ -696,6 +697,7 @@ mod tests {
         seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) -> std::thread::JoinHandle<()> {
         use eidola_app_core::ipc::{WalletCredentialsResult, WalletLifecycleResult};
+        let config_dir = eidola_app_core::ipc::path_bytes(dir);
         let listener =
             std::os::unix::net::UnixListener::bind(socket_path(dir)).expect("bind the socket");
         std::thread::spawn(move || {
@@ -719,7 +721,7 @@ mod tests {
                             &HelloResult {
                                 protocol: PROTOCOL_VERSION,
                                 app_version: "9.9.9".into(),
-                                config_dir: None,
+                                config_dir: Some(config_dir.clone()),
                             },
                         ),
                         "wallet.lifecycle" => Response::end(

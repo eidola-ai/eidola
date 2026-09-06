@@ -481,6 +481,14 @@ fn failure_hint(e: &Failure) {
                  `eidola account show` and run this again"
             );
         }
+        // Every process that speaks this control protocol states these, so an
+        // answer missing one is a build from before it did.
+        Failure::Incomplete { .. } => {
+            eprintln!(
+                "hint: the running Eidola is a build from before this `eidola` \
+                 — quit it and run the app that came with this one"
+            );
+        }
         // Deliberately unhinted: the pipelining refusals
         // (`DuplicateRequestId`, `ReservedRequestId`) reconstruct typed and
         // render their own sentence, but this client is strictly
@@ -874,18 +882,18 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                 // **The answering side says which credentials it signed
                 // with**, and that is what the profile is checked against,
                 // because it is the only answer an account replaced and
-                // replaced back inside the round trip cannot fool. The look
-                // taken before the request is the fallback for an app too old
-                // to say — weaker against that swap, and still far better than
-                // exposing the link unchecked.
-                let before = session.account_fingerprint();
+                // replaced back inside the round trip cannot fool. An answer
+                // that does not say is refused rather than fallen back on:
+                // there is nothing weaker to fall back *to* that this process
+                // could trust, since every look it can take of its own is the
+                // one that swap defeats.
                 let mint = session.account_checkout(price_id).await?;
-                let current = session.account_fingerprint();
-                let still_ours = match &mint.minted_for {
-                    Some(used) => current.as_deref() == Some(used.as_str()),
-                    None => current == before,
+                let Some(minted_for) = mint.minted_for.as_deref() else {
+                    return Err(Failure::Incomplete {
+                        what: "which account it minted that link for",
+                    });
                 };
-                if !still_ours {
+                if session.account_fingerprint().as_deref() != Some(minted_for) {
                     return Err(Failure::AccountReplaced {
                         what: "that checkout link",
                     });
@@ -2870,41 +2878,39 @@ mod tests {
     }
 
     #[test]
-    fn an_app_that_does_not_say_what_it_minted_under_still_gets_the_older_check() {
-        // An app older than the field says nothing about which credentials it
-        // used. Refusing every such app would take a working purchase away to
-        // close a narrower hole than it opens, so the look before and after
-        // is still there underneath — weaker against a swap-and-restore, and
-        // far better than exposing the link unchecked.
-        for (replace, expect_refusal) in [(false, false), (true, true)] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let config = dir.path().join("config.toml");
-            write_account(&config, "before", "s1");
-            let replaced = config.clone();
-            let (server, _seen) = scripted_app(dir.path(), move |request| {
-                if replace && request.verb == "account.checkout" {
-                    write_account(&replaced, "after", "s2");
-                }
-                vec![Response::end(
-                    request.id,
-                    &AccountCheckoutResult {
-                        url: "https://checkout.example/session".into(),
-                        minted_for: None,
-                    },
-                )]
-            });
+    fn an_app_that_does_not_say_what_it_minted_under_is_refused() {
+        // Every process serving this protocol states which credentials it
+        // signed with, so an answer without one is a build from before it
+        // did. There is nothing weaker to fall back to that would settle the
+        // question either: every look this process can take of its own
+        // profile is exactly what a swap-and-restore inside the round trip
+        // defeats. So the link is not exposed, and the reason is the build,
+        // not the account.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        write_account(&config, "ours", "s1");
+        let (server, _seen) = scripted_app(dir.path(), move |request| {
+            vec![Response::end(
+                request.id,
+                &AccountCheckoutResult {
+                    url: "https://checkout.example/session".into(),
+                    minted_for: None,
+                },
+            )]
+        });
 
-            let session = client_session(dir.path());
-            let outcome = checkout(&session);
-            assert_eq!(
-                matches!(outcome, Err(Failure::AccountReplaced { .. })),
-                expect_refusal,
-                "replaced={replace}: {:?}",
-                outcome.map(|_| ())
-            );
-            drop(session);
-            server.join().expect("the server ends with the connection");
+        let session = client_session(dir.path());
+        match checkout(&session) {
+            Err(Failure::Incomplete { what }) => {
+                assert_eq!(what, "which account it minted that link for")
+            }
+            other => panic!(
+                "an unverifiable payment link must not be exposed: {:?}",
+                other.map(|_| ())
+            ),
         }
+        drop(session);
+        server.join().expect("the server ends with the connection");
     }
 
     fn turn_answer(request: &Request, model: &str) -> Vec<Response> {

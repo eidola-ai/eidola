@@ -693,8 +693,14 @@ pub struct HelloResult {
     /// directory with, on every command. Rendering for a *message* may be
     /// lossy; deciding may not.
     ///
-    /// `None` means the app did not state one — an app older than this
-    /// field, which is a thing to say rather than a mismatch to invent.
+    /// **Every process serving this protocol states it, and a caller that
+    /// finds it absent refuses the connection.** The `Option` and the serde
+    /// default are for decoding — a frame missing a field must fail as a
+    /// typed absence rather than as a malformed line — not for tolerating
+    /// the absence: the socket is found through the data root alone, so a
+    /// greeting that says nothing about the config root leaves the whole
+    /// profile question unanswerable, and going on anyway is the hole this
+    /// field exists to close.
     #[serde(default)]
     pub config_dir: Option<Vec<u8>>,
 }
@@ -772,10 +778,13 @@ pub struct AccountCheckoutResult {
     /// inside one round trip, and the two looks then agree about a link minted
     /// for something else in between.
     ///
-    /// `None` means the app did not say — one older than this field. That is
-    /// let through rather than refused, because the caller's before-and-after
-    /// check is still there underneath and refusing every older app would take
-    /// a working purchase away to close a narrower hole than the one it opens.
+    /// **Every process serving this protocol states it, and a caller that
+    /// finds it absent refuses the link** — the same rule as
+    /// [`HelloResult::config_dir`], and for the same reason: the caller has
+    /// nothing weaker to fall back to that would answer the question, since
+    /// every look it can take of its own profile is exactly what a swap-and-
+    /// restore inside the round trip defeats. The `Option` and the serde
+    /// default are for decoding, not for tolerating the absence.
     #[serde(default)]
     pub minted_for: Option<String>,
 }
