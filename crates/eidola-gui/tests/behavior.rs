@@ -19601,6 +19601,65 @@ fn space_find_searches_an_edit_in_progress_not_the_post_it_will_replace(cx: &mut
 }
 
 #[gpui::test]
+fn space_find_follows_the_typing_in_an_inline_edit(cx: &mut TestAppContext) {
+    // `sync_find` runs in the parent's render, and an inline edit's editor is
+    // a child entity the reader types into directly. Nothing else in the
+    // window moves, so the count and the ranges have to follow that buffer on
+    // the keystroke itself rather than waiting for an unrelated repaint.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    })
+    .unwrap();
+    let editor = view
+        .read_with(cx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post's body editor is the edit buffer");
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // The bar takes the keyboard while the query is typed; the reader then
+    // goes back to the edit they were making.
+    run_find(&view, window, &mut vcx, "merlin");
+    let caret = editor.read_with(&vcx, |e, cx| gpui::Focusable::focus_handle(e, cx));
+    vcx.update(|window, cx| window.focus(&caret, cx));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "the word is not in the buffer yet"
+        );
+    });
+
+    vcx.simulate_keystrokes("m e r l i n");
+    // Deliberately no `window.refresh()`: the point is that the keystroke
+    // alone is enough, with nothing unrelated repainting the window.
+    vcx.run_until_parked();
+
+    assert!(
+        editor
+            .read_with(&vcx, |e, _| e.value().to_string())
+            .contains("merlin"),
+        "the keystrokes reached the edit buffer"
+    );
+    view.read_with(&vcx, |v, _| {
+        let (matches, _) = v.find_matches_for_test();
+        assert_eq!(
+            matches.iter().map(|(n, _)| n.as_ref()).collect::<Vec<_>>(),
+            vec!["a1"],
+            "the search followed the buffer the reader is typing in: {matches:?}"
+        );
+        let (_, source) = &matches[0];
+        assert_eq!(
+            &editor.read_with(&vcx, |e, _| e.value().to_string())[source.clone()],
+            "merlin",
+            "and its range addresses that buffer, not the one before the edit"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_projects_an_edit_started_under_an_open_bar(cx: &mut TestAppContext) {
     // The bar is already open when the reader starts an inline edit, and they
     // touch neither caret nor buffer afterwards. `sync_find` runs in the
