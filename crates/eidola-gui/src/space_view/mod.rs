@@ -797,8 +797,16 @@ pub struct SpaceView {
     /// failure — nothing broke, there is nothing to retry, and the band it
     /// renders in is the muted one.
     pub(crate) reference_notice: Option<SharedString>,
-    /// The posts this window watched stop at their **length allowance** — the
-    /// marker's whole state (see `SpaceEvent::TurnEnded`).
+    /// The posts this window watched stop at their **length allowance**.
+    ///
+    /// Not the marker's whole state — the durable one is `PostData::truncated`,
+    /// read off the answer's own row. This set is the **live** half: the turn
+    /// ends many frames before the transcript reload that carries its row
+    /// arrives (and that reload can itself fail), so without it the mark would
+    /// blink in after a delay, or not at all until the next successful load.
+    /// The two are one value at the source — app-core classifies the ceiling
+    /// once and both writes it and reports it — so they cannot say different
+    /// things about the same generation.
     pub(crate) truncated_posts: HashSet<SharedString>,
     /// The generations this window asked to regenerate and was told were
     /// already being regenerated elsewhere (see
@@ -2185,8 +2193,9 @@ impl SpaceView {
             } => {
                 // An answer that stopped at its length allowance is marked
                 // where it is read, beneath the post itself — the only place
-                // the mark means anything. Session-scoped by necessity: the
-                // reason an answer stops is not part of what is stored.
+                // the mark means anything. The answer's row records the same
+                // fact; this is what shows it in the frames before the reload
+                // carrying that row lands.
                 if let (true, Some(id)) = (*truncated, response_action_id.as_deref()) {
                     self.truncated_posts
                         .insert(SharedString::from(id.to_string()));
@@ -2437,6 +2446,7 @@ fn post_data_from(
         references: m.references.clone(),
         blocks: m.blocks.clone(),
         regenerable: m.regenerable,
+        truncated: m.truncated,
     }
 }
 

@@ -72,6 +72,10 @@ pub struct PostData {
     /// renders in that column too and cannot be regenerated). Carried from
     /// `ChatMessageView::regenerable`, which reads the action type.
     pub regenerable: bool,
+    /// The post's own row says this generation stopped at the model's
+    /// completion ceiling. The durable half of the cut-off mark: it survives a
+    /// window close, which `SpaceView::truncated_posts` cannot.
+    pub truncated: bool,
 }
 
 /// What a [`TreeNode`] renders from.
@@ -283,6 +287,7 @@ mod tests {
             references: Vec::new(),
             blocks: Vec::new(),
             regenerable: kind == "agent",
+            truncated: false,
         }
     }
 
@@ -303,6 +308,7 @@ mod tests {
             references: Vec::new(),
             blocks: Vec::new(),
             regenerable: false,
+            truncated: false,
         }
     }
 

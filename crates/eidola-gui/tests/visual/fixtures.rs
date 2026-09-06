@@ -49,6 +49,7 @@ pub fn fixture_post(
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
     }
 }
 
@@ -852,6 +853,7 @@ pub fn destination_spaces() -> Vec<eidola_app_core::SpaceInfo> {
         last_activity_at: ts,
         message_count: 6,
         archived_at: None,
+        parent: None,
     };
     vec![
         space("demo", "Thrasymachus and the shepherd", 3),

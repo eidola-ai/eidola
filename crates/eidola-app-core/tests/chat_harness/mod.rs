@@ -357,6 +357,19 @@ pub struct MockConfig {
     pub models_status: Option<u16>,
     /// The calls [`ChatBehavior::ToolScript`] serves (ignored otherwise).
     pub tool_script: ToolScript,
+    /// What `GET /v1/models` declares about [`MODEL`]'s tool calling.
+    ///
+    /// `None` — the default — omits the `capabilities` object entirely, which
+    /// is the shape a server too old to publish capabilities sends and the
+    /// shape every backend that cannot declare anything sends. That is what
+    /// keeps the client on the learned path, so every test written before
+    /// declarations existed keeps exercising exactly what it always did.
+    ///
+    /// `Some(_)` publishes a leaf. Acting on it also needs
+    /// `trust_declared_capabilities_for_test`, since a test necessarily
+    /// reaches this mock through a base-URL override and an override is a
+    /// hint, never a declaration.
+    pub declared_tool_calling: Option<bool>,
     /// How long a chat request is held before it is answered.
     ///
     /// A real model request takes time — that is the whole reason a surface
@@ -376,6 +389,7 @@ impl Default for MockConfig {
             balance: 10_000_000,
             models_status: None,
             tool_script: tool_script(),
+            declared_tool_calling: None,
             chat_delay_ms: 0,
         }
     }
@@ -955,7 +969,7 @@ async fn handle_conn(
                     write_json(&mut stream, status, r#"{"error":"models unavailable"}"#).await?;
                 }
                 None => {
-                    write_json(&mut stream, 200, &models_body()).await?;
+                    write_json(&mut stream, 200, &models_body(&config)).await?;
                 }
             }
         }
@@ -1488,6 +1502,14 @@ async fn handle_chat(
             // and every later request answers normally.
             let script: Vec<(String, String)> =
                 std::mem::take(&mut *config.tool_script.lock().unwrap());
+            // **Whichever transport asked.** A turn driven for a named
+            // participant streams (`respond_stream_as`), which is the only
+            // door a delegated room's own agents take — so a blocking-only arm
+            // would answer those a body their parser reads as no content at
+            // all, and no scripted call would ever be made.
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_script_stream(stream, &script).await;
+            }
             let mut body = if script.is_empty() {
                 serde_json::json!({
                     "choices": [{ "message": {
@@ -1597,6 +1619,56 @@ async fn write_sse_decline_stream(stream: &mut TcpStream) -> std::io::Result<()>
     for d in deltas {
         stream.write_all(&sse_event(&d.to_string())).await?;
     }
+    stream.write_all(&sse_event("[DONE]")).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// The SSE twin of the [`ChatBehavior::ToolScript`] body: every scripted call
+/// in one delta, or the plain answer when the script is spent.
+///
+/// One delta per call rather than the split-across-deltas shape
+/// [`write_sse_tool_stream`] uses — that stream exists to exercise the client's
+/// accumulator, and this one exists to deliver arguments a test wrote.
+async fn write_sse_script_stream(
+    stream: &mut TcpStream,
+    script: &[(String, String)],
+) -> std::io::Result<()> {
+    stream.write_all(sse_head().as_bytes()).await?;
+    stream.flush().await?;
+    if script.is_empty() {
+        stream
+            .write_all(&sse_event(
+                &serde_json::json!({"choices":[{"delta":{"content":TOOL_FINAL_CONTENT}}]})
+                    .to_string(),
+            ))
+            .await?;
+    } else {
+        let calls: Vec<serde_json::Value> = script
+            .iter()
+            .enumerate()
+            .map(|(i, (name, arguments))| {
+                serde_json::json!({
+                    "index": i,
+                    "id": tool_call_id(i as u64 + 1),
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                })
+            })
+            .collect();
+        stream
+            .write_all(&sse_event(
+                &serde_json::json!({"choices":[{"delta":{"tool_calls":calls}}]}).to_string(),
+            ))
+            .await?;
+    }
+    stream
+        .write_all(&sse_event(
+            &serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}})
+                .to_string(),
+        ))
+        .await?;
     stream.write_all(&sse_event("[DONE]")).await?;
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
@@ -1872,16 +1944,27 @@ async fn write_sse_stream(
     Ok(())
 }
 
-fn models_body() -> String {
+fn models_body(config: &MockConfig) -> String {
+    let mut primary = serde_json::json!({
+        "id": MODEL,
+        "context_length": 8192u64,
+        "pricing": {
+            "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },
+            "per_completion_token": { "value": 1u64, "scale_factor": 1u64 }
+        }
+    });
+    if let Some(supported) = config.declared_tool_calling {
+        primary["capabilities"] = serde_json::json!({
+            "tool_calling": { "supported": supported },
+            "reasoning": { "supported": false },
+            "input_modalities": ["text"],
+            "output_modalities": ["text"],
+        });
+        primary["max_output_tokens"] = serde_json::json!(4096u64);
+        primary["output_budget_class"] = serde_json::json!("standard");
+    }
     serde_json::json!({
-        "data": [{
-            "id": MODEL,
-            "context_length": 8192u64,
-            "pricing": {
-                "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },
-                "per_completion_token": { "value": 1u64, "scale_factor": 1u64 }
-            }
-        }, {
+        "data": [primary, {
             "id": ROUTER_REMOTE_MODEL,
             "context_length": 8192u64,
             "pricing": {

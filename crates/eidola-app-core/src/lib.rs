@@ -958,6 +958,22 @@ pub struct SpaceInfo {
     /// When the space was archived, if it has been. Always `None` unless
     /// listing was asked to include archived spaces.
     pub archived_at: Option<i64>,
+    /// The conversation this one was delegated from (see [`subspaces`]) —
+    /// `None` for an ordinary conversation. A listing row is where a reader
+    /// meets a delegated room, and without this it is a conversation they never
+    /// started with no way to see what it belongs to.
+    pub parent: Option<SpaceParent>,
+}
+
+/// The conversation a delegated room was opened from, as a listing row carries
+/// it: enough to name it and to open it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceParent {
+    pub space_id: String,
+    /// `None` for a conversation that was never named — the presentation layer
+    /// chooses what to say instead, because this crate ships no user-facing
+    /// strings.
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1421,6 +1437,10 @@ pub struct PostNode {
     pub is_current: bool,
     pub model: Option<String>,
     pub credits_consumed: Option<i64>,
+    /// This generation stopped at the model's completion ceiling rather than
+    /// because it was done — the durable fact a render marks the post with.
+    /// Never true for a post that was not inferred.
+    pub truncated: bool,
     /// Edge relation to the structural parent (`reply`); `None` for a root.
     pub relation: Option<String>,
     /// Indent level: `0` is the spine; `> 0` is an indented branch.
@@ -1476,6 +1496,15 @@ pub fn quote_snippet(block_text: &str, range_start: i64, range_end: i64) -> Opti
 pub struct ModelInfo {
     pub id: String,
     pub context_length: u64,
+    /// The largest completion the backend says this model may be asked for.
+    /// `None` when nothing was declared — see [`ModelCapabilities`] for why
+    /// that is never read as a zero.
+    pub max_output_tokens: Option<u64>,
+    /// Which public output-budget ladder the model draws from, if the backend
+    /// names one.
+    pub output_budget_class: Option<OutputBudgetClass>,
+    /// What the backend declares this model can do.
+    pub capabilities: ModelCapabilities,
     /// Credits charged per prompt token. Credits are micro-USD-denominated,
     /// so this is numerically the same as USD per million prompt tokens.
     /// Zero for per-request-priced models.
@@ -1486,6 +1515,81 @@ pub struct ModelInfo {
     /// Flat per-request price for models that charge per request rather
     /// than per token (e.g. transcription); `None` for token-priced models.
     pub request_credits: Option<f64>,
+}
+
+/// What a backend declares a model can do.
+///
+/// **Every field is three-state, and absence is never `false`.** Most backends
+/// this client talks to declare nothing at all and structurally cannot: a
+/// local model is an arbitrary `.gguf` a person supplied, whose tool support
+/// is a property of the chat template inside that file, and a generic
+/// OpenAI-compatible listing publishes only ids. Undeclared is therefore the
+/// *common* case rather than an edge, and reading it as "no" would take tools
+/// away from every model on every such backend at once — a metadata rollout
+/// that looks exactly like a fleet-wide outage. `unwrap_or(false)` on any of
+/// these is a bug, not a shortcut.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    /// Whether the model accepts a `tools` request field.
+    pub tool_calling: Option<bool>,
+    /// Whether the model produces reasoning content before its answer.
+    pub reasoning: Option<bool>,
+    /// The content kinds the model accepts.
+    pub input_modalities: Option<Vec<Modality>>,
+    /// The content kinds the model produces.
+    pub output_modalities: Option<Vec<Modality>>,
+}
+
+/// A kind of content a model accepts or produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Modality {
+    Text,
+    Image,
+    Audio,
+    /// A modality this build does not know. Kept rather than refused: the
+    /// model list is parsed on every turn, so a backend that grows a new
+    /// modality name must not be able to fail the parse and with it every
+    /// conversation on the machine.
+    Unknown,
+}
+
+impl Modality {
+    fn from_wire(name: &str) -> Self {
+        match name {
+            "text" => Modality::Text,
+            "image" => Modality::Image,
+            "audio" => Modality::Audio,
+            _ => Modality::Unknown,
+        }
+    }
+}
+
+/// Which public output-budget ladder a model draws from.
+///
+/// A *class* rather than a number, and public per model rather than chosen per
+/// person: what a request asks for must be a function of the model and the
+/// turn's own structure, never of anything this installation happens to know
+/// about its user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputBudgetClass {
+    /// A model that answers directly.
+    Standard,
+    /// A model that thinks before it answers, and so needs a materially
+    /// larger budget to produce the same answer.
+    Reasoning,
+}
+
+impl OutputBudgetClass {
+    /// A class name this build does not know reads as *undeclared*, which is
+    /// the same thing the field's absence means — a consumer falls back to
+    /// whatever default it already applies either way.
+    fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "standard" => Some(OutputBudgetClass::Standard),
+            "reasoning" => Some(OutputBudgetClass::Reasoning),
+            _ => None,
+        }
+    }
 }
 
 /// One credential row with its lifecycle state, as computed by the local
@@ -1684,6 +1788,63 @@ impl ToolEndpoint {
             backend_id: backend_id.to_string(),
             wire_model: wire_model.to_string(),
         }
+    }
+}
+
+/// On whose authority this turn decides whether its endpoint can carry a
+/// `tools` field.
+///
+/// **Declaration where a declaration can exist; discovery where it cannot.**
+/// The two are not alternatives to pick between — they cover disjoint ground:
+///
+/// * A backend that publishes per-model capabilities, reached at the trust
+///   root this binary was built with, has already answered the question. Its
+///   answer is [`ToolPolicy::Declared`], and it is believed in both
+///   directions: a declared *no* withholds the field without paying for a
+///   round that can only fail, and a declared *yes* means a failure is a
+///   failure.
+/// * Everywhere else there is no fact in this build to consult, and not for
+///   want of effort. A local model is an arbitrary `.gguf` a person supplied,
+///   and whether it does tools is a property of the chat template inside that
+///   file — "llama.cpp supports tools" is false as a blanket claim, since it
+///   answers 500 without `--jinja` and, with it, still 500s on templates whose
+///   filters it lacks. A generic OpenAI-compatible endpoint publishes only
+///   ids. Those are [`ToolPolicy::Learned`]: offer, and remember a rejection.
+///
+/// The line is drawn by **provenance, not by backend kind**. An eidola backend
+/// reached through a base-URL or measurement override is not the catalog this
+/// binary pinned — it may be a development stack mid-iteration, or someone
+/// else's server whose catalog we cannot vouch for — so its declaration is
+/// only a hint and the learned path stays armed, exactly as it is today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolPolicy {
+    /// The pinned backend declares the answer.
+    Declared(bool),
+    /// Nothing authoritative to consult: offer, and learn from a rejection.
+    Learned,
+}
+
+impl ToolPolicy {
+    /// The policy for an endpoint whose declaration this client may act on:
+    /// a stated capability is [`ToolPolicy::Declared`]; a silent one falls
+    /// back to discovery, which is the safe floor rather than a "no".
+    fn from_declaration(declared: Option<bool>) -> Self {
+        match declared {
+            Some(supported) => ToolPolicy::Declared(supported),
+            None => ToolPolicy::Learned,
+        }
+    }
+
+    /// May a round-1 failure be retried with the turn's own tools withdrawn?
+    ///
+    /// Only where the answer was never declared. A declared-capable model
+    /// answers the question the probe existed to ask, so a 500 from one is a
+    /// genuine failure and must surface as one — treating it as a capability
+    /// verdict is how a transient upstream error silently costs a model its
+    /// tools for the rest of the process, after charging twice for the
+    /// privilege.
+    fn probes_on_failure(self) -> bool {
+        matches!(self, ToolPolicy::Learned)
     }
 }
 
@@ -1895,6 +2056,19 @@ struct Inner {
     /// builds contain no bypass path at all.
     #[cfg(feature = "test-support")]
     http_override: Option<reqwest::Client>,
+    /// **Test-only seam.** Makes the eidola backend's declarations count as
+    /// authoritative even though the harness reaches it through a base-URL
+    /// override.
+    ///
+    /// The compiled-in pin is an `https://` origin with a fixed enclave
+    /// measurement, which no in-process mock can be reached at — so without
+    /// this the declared-capability half of [`ToolPolicy`] would be
+    /// unreachable from any test, and only the override half could be
+    /// exercised. Same shape and same justification as `http_override`: it
+    /// exists only under the non-default `test-support` feature, so a release
+    /// build contains no path that widens what counts as our own catalog.
+    #[cfg(feature = "test-support")]
+    trust_declared_capabilities: std::sync::atomic::AtomicBool,
     /// The process-lifetime exclusive advisory lock on the local database
     /// (`<data_dir>/eidola.db.lock`). Taken in [`AppCore::build`] — a second
     /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
@@ -1905,6 +2079,58 @@ struct Inner {
 }
 
 // --- Config helpers (sync) ---------------------------------------------------
+
+/// The mechanical notify set, with the **brief floor kept separable**.
+///
+/// Two things want the same computation and want different halves of it. The
+/// mechanical door ([`Inner::mechanical_plan`], and `AppCore`'s inspection
+/// seam over it) wants the set the rule answers with — floor folded in. The
+/// door that actually drives turns ([`Inner::plan_and_refine`]) wants the floor
+/// *after* the may-decline router has spoken, because the router legitimately
+/// answers "nobody" and over a `brief` that answer is the delegated room doing
+/// no work at all and reporting its own untouched brief as concluded — the
+/// silent no-work delegation the floor exists to make unrepresentable.
+///
+/// Carrying the floor beside the plan is what lets one derivation serve both:
+/// the reads happen once, `applied()` is the mechanical answer, and the
+/// refining door still holds the turn the router is not allowed to erase.
+struct MechanicalOutcome {
+    /// The set the notify policies produced, before the floor.
+    plan: NotificationPlan,
+    /// The turn a `brief` falls back to when nothing else answers it — the
+    /// room's owner, which is its author. `None` for any other post, for an
+    /// owner that cannot respond, and for a plan that never got that far.
+    floor: Option<PlannedTurn>,
+}
+
+impl MechanicalOutcome {
+    /// Nothing to notify and no floor — the shape every early exit takes.
+    fn nothing() -> Self {
+        Self {
+            plan: NotificationPlan::Turns(Vec::new()),
+            floor: None,
+        }
+    }
+
+    /// The cascade guard spoke. It is not a set the floor may fill: a pause is
+    /// the room being told to stop, and the report says so.
+    fn paused(depth: i64, limit: i64) -> Self {
+        Self {
+            plan: NotificationPlan::Paused { depth, limit },
+            floor: None,
+        }
+    }
+
+    /// The mechanical answer: the floor applies exactly when nothing else does.
+    fn applied(self) -> NotificationPlan {
+        match (self.plan, self.floor) {
+            (NotificationPlan::Turns(t), Some(floor)) if t.is_empty() => {
+                NotificationPlan::Turns(vec![floor])
+            }
+            (plan, _) => plan,
+        }
+    }
+}
 
 impl Inner {
     fn load_config(&self) -> Config {
@@ -2361,6 +2587,31 @@ impl Inner {
             return Ok(client.clone());
         }
         local_models::plain_http_client()
+    }
+
+    /// Is what this eidola connection says about its models a fact this
+    /// client may act on, or merely a hint?
+    ///
+    /// **Provenance, not backend kind.** A declaration is authoritative when —
+    /// and only when — the client is talking to the trust root it was built
+    /// with: no base-URL override, no measurement override. Anything reached
+    /// through an override is, for capability purposes, an unknown external
+    /// endpoint. It may be a development stack being iterated on, or another
+    /// operator's server whose catalog is theirs and not ours; either way a
+    /// wrong `true` there would suppress the fallback that recovers from it
+    /// and turn every branched turn into an unrecoverable failure.
+    ///
+    /// Both predicates are already computed on the path a turn takes, so the
+    /// rule costs no new state.
+    fn declarations_are_authoritative(&self, eidola: &EidolaResolved) -> bool {
+        #[cfg(feature = "test-support")]
+        if self
+            .trust_declared_capabilities
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        !eidola.base_url_is_override && !eidola.measurements_are_override
     }
 }
 
@@ -3291,8 +3542,10 @@ impl Inner {
             .data
             .into_iter()
             .map(|m| ModelInfo {
-                id: m.id,
                 context_length: m.context_length,
+                max_output_tokens: m.max_output_tokens,
+                output_budget_class: m.declared_budget_class(),
+                capabilities: m.declared_capabilities(),
                 prompt_credits_per_token: m.pricing.per_prompt_token.credits_per_unit(),
                 completion_credits_per_token: m.pricing.per_completion_token.credits_per_unit(),
                 request_credits: m
@@ -3300,6 +3553,7 @@ impl Inner {
                     .per_request
                     .as_ref()
                     .map(ScaledPriceInfo::credits_per_unit),
+                id: m.id,
             })
             .collect())
     }
@@ -3321,6 +3575,10 @@ impl Inner {
                 last_activity_at: r.last_activity_at,
                 message_count: r.message_count,
                 archived_at: r.archived_at,
+                parent: r.parent.map(|p| SpaceParent {
+                    space_id: p.space_id,
+                    title: p.title,
+                }),
             });
         }
         Ok(spaces)
@@ -4137,15 +4395,22 @@ impl Inner {
     /// conversation they never joined. Oversight is looking; this is the line
     /// it stops at.
     ///
-    /// **Every door that acts *as the human* asks this**, and that is exactly
-    /// the set: `post` (and `chat`/`chat_stream`/`submit` through it), which
-    /// hard-codes the human as author, and `edit_post`, `regenerate` and
+    /// **Every door that acts *as the human* on something already here asks
+    /// this**, and that is exactly the set: `edit_post`, `regenerate` and
     /// `respond_stream`, which the human's own picker and per-post verbs drive.
-    /// `respond_stream_as` deliberately does **not** — it names the participant
-    /// it acts as, is already gated on *that* participant's membership
-    /// (`resolve_explicit_participant`), and is the door a turn driver uses, so
-    /// a human-membership test there would refuse the sub-space's own agents
-    /// working in their own room.
+    /// `post` is the one that is not gated but *satisfies* the rule instead —
+    /// speaking is how a reader joins, and the join rides the post's own
+    /// transaction (`db::PostPlan::join_author`), so the roster is true of the
+    /// transcript from that post onward rather than from a separate step
+    /// somebody has to take first. The distinction is not a softening: the
+    /// three doors that remain are the ones that act on *another* participant's
+    /// work or spend the reader's credits, and none of them is a way to say
+    /// something.
+    /// `respond_stream_as` deliberately does **not** ask — it names the
+    /// participant it acts as, is already gated on *that* participant's
+    /// membership (`resolve_explicit_participant`), and is the door a turn
+    /// driver uses, so a human-membership test there would refuse the
+    /// sub-space's own agents working in their own room.
     ///
     /// Asked before any write and before any spend, so a refusal is zero-trace.
     /// A **notebook** is deliberately untouched — the human has always been
@@ -4167,10 +4432,17 @@ impl Inner {
     }
 
     /// Combined post-and-turn (`chat` / `chat_stream`) is a cascade, and a
-    /// live sub-space's cascade belongs to the driver. Membership is asked
-    /// first so an unjoined reader still sees [`AppError::NotJoined`]; a
-    /// joined one is refused here before any write, rather than posting and
-    /// then driving the same notify-all seat the driver's arm will take.
+    /// live sub-space's cascade belongs to the driver. Refused here before any
+    /// write, rather than posting and then driving the same notify-all seat the
+    /// driver's arm will take.
+    ///
+    /// **The refusal is the same whoever asks.** It used to ask membership
+    /// first, so an unjoined reader read [`AppError::NotJoined`] — the honest
+    /// answer while posting meant joining first. Now that posting *is* joining,
+    /// a membership question in front of this one would demand a step for a
+    /// verb that is refused either way, and would name the wrong obstacle:
+    /// what stands in the way is the driver, not the roster. `post` remains,
+    /// and takes the reader in with it.
     async fn refuse_combined_ask_in_subspace(
         &self,
         space_id: Option<&str>,
@@ -4180,7 +4452,6 @@ impl Inner {
         };
         let conn = self.db_conn().await?;
         if db::is_live_subspace(&conn, space_id).await? {
-            self.require_human_joined(&conn, space_id).await?;
             return Err(AppError::DrivenConversation {
                 space_id: space_id.to_string(),
             });
@@ -5218,6 +5489,10 @@ impl Inner {
             last_activity_at: now,
             message_count: 0,
             archived_at: None,
+            // Every creation door here mints an ordinary conversation; the one
+            // that mints a delegated room is `spawn_subspace`, which answers
+            // with a `SubspaceInfo` of its own.
+            parent: None,
         })
     }
 
@@ -5250,6 +5525,10 @@ impl Inner {
             last_activity_at: now,
             message_count: 0,
             archived_at: None,
+            // Every creation door here mints an ordinary conversation; the one
+            // that mints a delegated room is `spawn_subspace`, which answers
+            // with a `SubspaceInfo` of its own.
+            parent: None,
         })
     }
 
@@ -5371,22 +5650,32 @@ impl Inner {
                 .await?;
         }
 
-        let (space_id, space_title, is_new_space) = if let Some(sid) = space_id {
+        // **Speaking in a delegated room joins you to it.** Those rooms have no
+        // human member by construction, and a post by somebody the roster omits
+        // makes that roster a lie to every model in the room — so the join is
+        // part of the post rather than a step in front of it (`PostPlan::
+        // join_author`, written in the post's own transaction). Reading it here
+        // races nothing: `parent_space_id` is written once, at creation, and
+        // there is no door that makes an ordinary conversation into a delegated
+        // one — the same fact the driver's negative cache rests on. The
+        // *membership* is deliberately **not** read here; the insert-or-revive
+        // decides that inside the transaction.
+        let (space_id, space_title, is_new_space, join_author) = if let Some(sid) = space_id {
             let row =
                 db::get_space(&db_conn, sid)
                     .await?
                     .ok_or_else(|| AppError::NotConfigured {
                         message: format!("space not found: {sid}"),
                     })?;
-            self.require_human_joined(&db_conn, sid).await?;
-            (sid.to_string(), row.title, false)
+            let subspace = db::subspace(&db_conn, sid).await?.is_some();
+            (sid.to_string(), row.title, false, subspace)
         } else {
             // A new space is instantiated from the default template, so it has
             // its participants (You + the template agents) from birth.
             let sid = new_space_id();
             self.instantiate_default_space(&db_conn, &sid, None, now)
                 .await?;
-            (sid, None, true)
+            (sid, None, true, false)
         };
 
         // No prior terminal action ⇒ this is the space's first post: eligible
@@ -5419,7 +5708,10 @@ impl Inner {
         // and billing a turn against an empty post. See `db::post_tx`. The
         // validations above stay in front of it, where a refusal belongs: they
         // are reads, and now they leave neither a trace nor a fragment.
-        let auto_titled = db::post_tx(
+        let db::PostOutcome {
+            auto_titled,
+            joined,
+        } = db::post_tx(
             &db_conn,
             &db::PostPlan {
                 space_id: &space_id,
@@ -5430,6 +5722,7 @@ impl Inner {
                 auto_title: auto_title.as_deref(),
                 reply_to: reply_ante.as_deref(),
                 references,
+                join_author,
                 created_at: now,
             },
         )
@@ -5438,6 +5731,12 @@ impl Inner {
         self.bus.emit(Change::Space(space_id.clone()));
         if is_new_space || auto_titled {
             self.bus.emit(Change::SpaceIndex);
+        }
+        // A roster changed, so every surface that renders one has to re-read.
+        // Only when the join actually wrote: saying it on every post into a
+        // room the reader is already in would be an invalidation about nothing.
+        if joined {
+            self.bus.emit(Change::Participants);
         }
         // The post is committed and emitted; anything a grown branch needs
         // summarized happens behind it, never in front of it.
@@ -5832,44 +6131,6 @@ impl Inner {
         };
         let model = canonical_model.as_str();
 
-        // Whether this turn's endpoint can be offered a `tools` field at all.
-        //
-        // **Capability is *learned*, never assumed from the backend's kind.**
-        // Nothing about a kind establishes tool-calling support, and this is
-        // not hypothetical: llama.cpp returns HTTP 500 `tools param requires
-        // --jinja flag` without `--jinja`, and *with* `--jinja` still 500s with
-        // a template-render crash when the model's tool block uses Jinja
-        // filters it lacks (a mainstream case — Qwen3 Coder does exactly
-        // this). A generic OpenAI-compatible endpoint may reject the field
-        // outright, and a deployed enclave older than the server's tool wire
-        // types refuses it as an unknown member. Since this turn attaches tools
-        // *automatically* the moment a space branches, assuming capability
-        // would mean "branching your conversation breaks every turn on this
-        // model", with no opt-out and triggered by a core UX action. So an
-        // endpoint that has rejected a `tools` field this process is remembered
-        // and simply not offered them again (the turn that discovered it
-        // degraded and carried on — see the round loop).
-        //
-        // **The memo is per (backend, wire model)**, because one backend serves
-        // many models: eidola's catalog and a llama.cpp install both do. A
-        // single tool-incapable model must cost only itself its tools, not
-        // every sibling on the same host.
-        //
-        // Deliberately in-process and not persisted: it is an *observation*,
-        // not configuration. No column, no setting to get wrong, nothing to
-        // migrate, and an endpoint that gains tool support (a rebuilt engine, a
-        // redeployed enclave, an upgraded proxy) is re-probed on the next
-        // restart rather than being written off forever. The real per-model
-        // capability metadata stays genuinely deferred.
-        //
-        // Note this gates only the tools *this turn attaches*. A consumer's own
-        // `AppCore::register_tool` registrations are untouched — that surface's
-        // wire compatibility is the consumer's call, exactly as task 20 left it.
-        // The **map** rides the messages array and is never gated by any of
-        // this, so a branched space keeps its whole structural view even where
-        // the descend-further affordance is withdrawn.
-        let backend_accepts_tools = !self.model_rejects_tools(&backend.id, &wire_model);
-
         let mut engine_lease: Option<local_models::EngineLease> = None;
         let (
             provider_id,
@@ -5879,6 +6140,7 @@ impl Inner {
             context_length,
             remote_pricing,
             external_auth,
+            tool_policy,
         ) = match backend_kind {
             BackendKind::Local | BackendKind::LlamaCpp => {
                 // A request *is* the load trigger: an unloaded engine is
@@ -5929,6 +6191,7 @@ impl Inner {
                     context_tokens as u64,
                     None,
                     None,
+                    ToolPolicy::Learned,
                 )
             }
             BackendKind::OpenAi => {
@@ -5944,7 +6207,16 @@ impl Inner {
                 let auth = backend.api_key.as_ref().map(|k| format!("Bearer {k}"));
                 // Context length is unknown for a generic server — 0
                 // resolves to the 4096 completion default below.
-                (provider_id, client, base_url, None, 0u64, None, auth)
+                (
+                    provider_id,
+                    client,
+                    base_url,
+                    None,
+                    0u64,
+                    None,
+                    auth,
+                    ToolPolicy::Learned,
+                )
             }
             BackendKind::Eidola => {
                 // The eidola row was already fetched by `require_backend`
@@ -5982,6 +6254,18 @@ impl Inner {
                     model_entry.pricing.per_completion_token.value as u128,
                     model_entry.pricing.per_prompt_token.scale_factor as u128,
                 );
+                // Whose catalog is this? Declarations are acted on only when
+                // the client is talking to the trust root it was built with:
+                // an overridden base URL or measurement set means some other
+                // server, whose catalog this binary cannot vouch for, and
+                // there the declaration is a hint and discovery stays armed.
+                // The two predicates are already computed on the path this
+                // turn took, so the rule costs nothing.
+                let tool_policy = if self.declarations_are_authoritative(&eidola) {
+                    ToolPolicy::from_declaration(model_entry.declared_capabilities().tool_calling)
+                } else {
+                    ToolPolicy::Learned
+                };
                 (
                     provider_id,
                     client,
@@ -5990,8 +6274,42 @@ impl Inner {
                     model_entry.context_length,
                     Some(pricing),
                     None,
+                    tool_policy,
                 )
             }
+        };
+
+        // Whether this turn's endpoint can be offered a `tools` field at all.
+        //
+        // Two mechanisms, over disjoint ground — see [`ToolPolicy`] for why a
+        // declaration cannot exist for a local `.gguf` and why discovery must
+        // therefore survive. A declared answer is believed; an undeclared one
+        // falls back to the memo of endpoints that have rejected a
+        // `tools`-bearing request during this process's lifetime.
+        //
+        // **The memo is per (backend, wire model)**, because one backend serves
+        // many models: eidola's catalog and a llama.cpp install both do. A
+        // single tool-incapable model must cost only itself its tools, not
+        // every sibling on the same host.
+        //
+        // Deliberately in-process and not persisted: it is an *observation*,
+        // not configuration. No column, no setting to get wrong, nothing to
+        // migrate, and an endpoint that gains tool support (a rebuilt engine,
+        // an upgraded proxy) is re-probed on the next restart rather than
+        // being written off forever. Persisting it would also make the shape
+        // of a request a function of *this device's history*, so a fresh
+        // install and a long-lived one would send structurally different
+        // requests for the same model.
+        //
+        // Note this gates only the tools *this turn attaches*. A consumer's own
+        // `AppCore::register_tool` registrations are untouched — that surface's
+        // wire compatibility is the consumer's call, exactly as task 20 left it.
+        // The **map** rides the messages array and is never gated by any of
+        // this, so a branched space keeps its whole structural view even where
+        // the descend-further affordance is withdrawn.
+        let backend_accepts_tools = match tool_policy {
+            ToolPolicy::Declared(supported) => supported,
+            ToolPolicy::Learned => !self.model_rejects_tools(&backend.id, &wire_model),
         };
 
         let max_completion_tokens = if context_length == 0 {
@@ -6298,6 +6616,36 @@ impl Inner {
         // path resolves or mints one), so the scope is the whole test.
         let spaces_tool = model_participant_scope == "global" && backend_accepts_tools;
 
+        // ---- Delegation ---------------------------------------------------
+        //
+        // `delegate` opens a sub-space owned by the responding agent (see
+        // [`subspaces`]). Its gate is the **same structural one**, and that is
+        // not a coincidence: the rule that lets a global agent be referenced
+        // into another space is the rule that lets it own one, so a
+        // space-owned participant fails both for one reason rather than two.
+        // The guards themselves — depth, live rooms per owner, seats — are the
+        // spawn door's and are decided inside its transaction; the tool adds
+        // none of its own, so it cannot be a way around any of them.
+        let delegate_tool = model_participant_scope == "global" && backend_accepts_tools;
+        // The seats a delegation may name are exactly the agents this turn's
+        // roster carries — read off the same participant snapshot the roster
+        // renders from, so what a model can name is what it was shown, and no
+        // second query can disagree with the first. The human is not a
+        // candidate (a delegated room has no human member by construction) and
+        // neither is the responder, which the spawn seats itself.
+        let seat_candidates: Vec<subspaces::SeatCandidate> = if delegate_tool {
+            members
+                .iter()
+                .filter(|m| m.kind == "agent" && m.participant_id != model_participant_id)
+                .map(|m| subspaces::SeatCandidate {
+                    participant_id: m.participant_id.clone(),
+                    label: m.label.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Render the rows from the *responding participant's* point of view:
         // only its own prior posts are `assistant`, everyone else's are `user`,
         // and every message carries its uniform `#<handle> · <label>` header
@@ -6380,6 +6728,13 @@ impl Inner {
         // and is byte-stable thereafter.
         if spaces_tool {
             notes.push(discovery::GLOBAL_AGENT_NOTE);
+        }
+        // The delegation note flips at the same moment for the same reason,
+        // and says the three things the schema cannot: the brief is a
+        // contract, the answer comes back as a post rather than a return
+        // value, and the guards are bounded.
+        if delegate_tool {
+            notes.push(subspaces::DELEGATE_NOTE);
         }
         let mut system_content = match system_prompt
             .as_deref()
@@ -6515,7 +6870,7 @@ impl Inner {
         // vanish. Done at the snapshot, so the model never sees the schema and
         // `declined_reason` (which keys on the registry, not the name) cannot
         // fire even if it guesses the name.
-        let auto_tools = nav_tools || memory_tool || spaces_tool;
+        let auto_tools = nav_tools || memory_tool || spaces_tool || delegate_tool;
         let tool_registry = if auto_tools {
             let mut registry = (*consumer_tools).clone();
             if nav_tools {
@@ -6545,6 +6900,30 @@ impl Inner {
                     self.self_ref.clone(),
                     model_participant_id.clone(),
                     space_id.clone(),
+                )));
+            }
+            if delegate_tool {
+                // The anchor is this turn's own reply target — the post the
+                // work is being asked for on. Only the turn knows it, which is
+                // the whole reason the spawn door takes it from its caller: a
+                // delegation opened here reports back beneath this agent's
+                // answer to *this* post, rather than beneath wherever it
+                // happened to speak last.
+                registry.register(Arc::new(subspaces::DelegateTool::new(
+                    self.self_ref.clone(),
+                    model_participant_id.clone(),
+                    space_id.clone(),
+                    inf_reply_to.clone(),
+                    // **Which turn this is.** The answer a delegation reports
+                    // beneath is this turn's, and the same agent can have two
+                    // turns running against the same post (two explicit asks,
+                    // a regeneration beside a reply) — so the room records the
+                    // item this turn's answer will be written under, which is
+                    // minted here, before the first request, precisely because
+                    // the answer's own action id does not exist yet and may
+                    // never exist at all.
+                    inf_item_id.clone(),
+                    seat_candidates.clone(),
                 )));
             }
             Arc::new(registry)
@@ -6618,6 +6997,7 @@ impl Inner {
             tool_schemas,
             consumer_tools,
             auto_tools,
+            tool_policy,
             remote_pricing,
             budget,
             charge_credits,
@@ -6899,8 +7279,18 @@ impl Inner {
     /// on 4xx alone would miss the common case; the cost of guessing wrong is
     /// one extra request, and `remember_tool_incapable` is not reached unless
     /// the retry actually succeeds.
+    ///
+    /// **Learned policies only.** Where the endpoint declared its answer the
+    /// probe has nothing left to discover, and running it anyway is actively
+    /// wrong: a transient upstream 500 on round 1 gets read as "this model
+    /// rejects `tools`", and if the toolless retry then succeeds the model
+    /// silently loses its tools for the rest of the process — having been
+    /// charged for both attempts. See [`ToolPolicy`].
     fn should_degrade_tools(&self, prep: &TurnPrep, round: usize, err: &AppError) -> bool {
-        round == 1 && prep.auto_tools && matches!(err, AppError::Server { .. })
+        round == 1
+            && prep.auto_tools
+            && prep.tool_policy.probes_on_failure()
+            && matches!(err, AppError::Server { .. })
     }
 
     /// `Reply` → a new child item replying to the target; `Revise` → a new
@@ -7304,6 +7694,16 @@ impl Inner {
             }
         }
 
+        // The turn's ceiling verdict, read once. Reaching here means tool
+        // assembly is behind us — a round that requested tools returned above —
+        // so this is the point where the ceiling, the content and the absence
+        // of tool calls are all known and the ending can be classified. The one
+        // value answers both readers: it is written onto the `inference` row
+        // (so a reopened space still shows the mark) and returned on
+        // `ChatResult` (so the window marking the live turn cannot disagree
+        // with the row it will reload).
+        let truncated = stopped_at_ceiling(finish_reason.as_deref());
+
         if status.is_success()
             && truncated_before_any_answer(finish_reason.as_deref(), &response_content)
         {
@@ -7331,6 +7731,7 @@ impl Inner {
                 } else {
                     "error"
                 },
+                truncated,
                 input_tokens,
                 output_tokens,
                 &response_reasoning,
@@ -7356,7 +7757,7 @@ impl Inner {
                 credits_charged: prep.total_credits as i64,
                 response_action_id: None,
                 declined: None,
-                truncated: stopped_at_ceiling(finish_reason.as_deref()),
+                truncated,
             }));
         }
 
@@ -7399,7 +7800,7 @@ impl Inner {
             credits_charged: prep.total_credits as i64,
             response_action_id,
             declined: None,
-            truncated: stopped_at_ceiling(finish_reason.as_deref()),
+            truncated,
         }))
     }
 
@@ -7952,12 +8353,14 @@ impl Inner {
         // one.** `Revise` supersedes an intact answer with what it writes, so
         // keeping transport-cut text there destroys a real answer and puts a
         // severed one in its place. An ordinary turn could in principle keep
-        // the text behind a marker — but the only marker available is
-        // session-scoped by construction (`ChatResult::truncated`), so a
-        // reopened window would show severed text with nothing saying so,
-        // which is exactly the lie `ResponseTruncated` exists to make
-        // unrepresentable. Two rules would also mean the classification
-        // depended on who asked rather than on what happened.
+        // the text behind a marker, and one is now durable (`action.truncated`)
+        // — but it is not this ending's to set. That flag records the
+        // *upstream's own* ceiling verdict, and a connection that died issued
+        // no verdict at all; writing it here would say "the model reached its
+        // length limit" about a dropped socket, which is a different lie told
+        // in the same place `ResponseTruncated` exists to keep empty. Two rules
+        // would also mean the classification depended on who asked rather than
+        // on what happened.
         //
         // Reported as `Network` because that is what it is, which also puts it
         // in `DelegationFailure::Upstream` for a delegated room and leaves it
@@ -8049,6 +8452,16 @@ impl Inner {
         }
 
         // --- the final round ---------------------------------------------
+        // The turn's ceiling verdict, read once. Reaching here means tool
+        // assembly is behind us — a round that requested tools returned above —
+        // so this is the point where the ceiling, the content and the absence
+        // of tool calls are all known and the ending can be classified. The one
+        // value answers both readers: it is written onto the `inference` row
+        // (so a reopened space still shows the mark) and returned on
+        // `ChatResult` (so the window marking the live turn cannot disagree
+        // with the row it will reload).
+        let truncated = stopped_at_ceiling(finish_reason.as_deref());
+
         if truncated_before_any_answer(finish_reason.as_deref(), &full_content) {
             return self
                 .end_round_truncated(
@@ -8070,6 +8483,7 @@ impl Inner {
         let response_action_id = prep
             .persist_turn(
                 "complete",
+                truncated,
                 input_tokens,
                 output_tokens,
                 &full_reasoning,
@@ -8092,7 +8506,7 @@ impl Inner {
                 credits_charged: prep.total_credits as i64,
                 response_action_id: None,
                 declined: None,
-                truncated: stopped_at_ceiling(finish_reason.as_deref()),
+                truncated,
             }));
         }
 
@@ -8114,7 +8528,7 @@ impl Inner {
             credits_charged: prep.total_credits as i64,
             response_action_id,
             declined: None,
-            truncated: stopped_at_ceiling(finish_reason.as_deref()),
+            truncated,
         }))
     }
 
@@ -8156,14 +8570,32 @@ impl Inner {
     /// → only when the post's author is human; `explicit` → never (only an
     /// explicit ask reaches them).
     ///
+    /// **A brief is never left unanswered** — the one floor under that set.
+    /// A `brief` is the opening post of a delegated room, written by the agent
+    /// that owns it, and it is the one post whose entire purpose is to be
+    /// worked on. The rules above would answer it with nobody in the room the
+    /// tool advertises most plainly: a delegation that seats no sub-agent
+    /// holds its owner alone, the owner authored the brief and an author is
+    /// excluded from its own post's notify set, so the driver would report an
+    /// untouched brief as a concluded delegation and the room would do no work
+    /// at all. So when the set over a brief comes back empty, the brief's
+    /// author takes the turn. It fires **only** when nobody else would, which
+    /// is what keeps a panel unchanged (its sub-agents are seated `all`, so
+    /// the set is never empty there, and the owner is deliberately quiet among
+    /// its helpers), and it is bounded by the shape of a brief rather than by
+    /// a counter: there is exactly one per room, written at the spawn, and
+    /// neither editable nor regenerable — so the floor can schedule at most
+    /// one turn per room, and the owner's own answer is an `inference` that
+    /// gets no floor of its own.
+    ///
     /// A **pure read** — no network, no commits, no emissions. Production
     /// callers go through [`Inner::plan_and_refine`], which additionally
     /// filters this set through the space's may-decline router.
-    async fn mechanical_plan(
+    async fn mechanical_outcome(
         &self,
         space_id: &str,
         post_action_id: &str,
-    ) -> Result<NotificationPlan, AppError> {
+    ) -> Result<MechanicalOutcome, AppError> {
         let conn = self.db_conn().await?;
 
         // The post must belong to this space: the notify set + cascade limit come
@@ -8182,10 +8614,10 @@ impl Inner {
         // depth behind `ChatResult::response_action_id` being `None` on a
         // declined turn (see [`decline`]); the guard is cheap and the failure
         // it prevents is silent.
-        match db::action_type(&conn, post_action_id).await? {
-            Some(t) if db::is_post_action_type(&t) => {}
-            _ => return Ok(NotificationPlan::Turns(Vec::new())),
-        }
+        let action_type = match db::action_type(&conn, post_action_id).await? {
+            Some(t) if db::is_post_action_type(&t) => t,
+            _ => return Ok(MechanicalOutcome::nothing()),
+        };
 
         // **An archived conversation plans no turns**, and the same read that
         // answers that carries the cascade budget — one statement for the
@@ -8197,35 +8629,36 @@ impl Inner {
         // hidden or refused a reader — it is the end of new work.
         let space = db::get_space(&conn, space_id).await?;
         if space.as_ref().is_some_and(|s| s.archived_at.is_some()) {
-            return Ok(NotificationPlan::Turns(Vec::new()));
+            return Ok(MechanicalOutcome::nothing());
         }
         let limit = space
             .map(|s| s.cascade_limit)
             .unwrap_or(DEFAULT_CASCADE_LIMIT);
         let depth = db::agent_cascade_depth(&conn, post_action_id).await?;
         if depth >= limit {
-            return Ok(NotificationPlan::Paused { depth, limit });
+            return Ok(MechanicalOutcome::paused(depth, limit));
         }
 
         // The post's author (excluded from the notify set; its kind resolves the
         // `human` predicate).
         let (author_id, author_kind) = match db::action_author(&conn, post_action_id).await? {
             Some((id, _scope, kind)) => (id, kind),
-            None => return Ok(NotificationPlan::Turns(Vec::new())),
+            None => return Ok(MechanicalOutcome::nothing()),
         };
 
+        // An agent with no model can't respond — never plan a turn for it.
+        let can_respond = |m: &db::EffectiveParticipantRow| {
+            m.kind == "agent"
+                && m.model_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty())
+        };
+
+        let members = db::space_participants(&conn, space_id).await?;
         let mut turns = Vec::new();
-        for m in db::space_participants(&conn, space_id).await? {
-            if m.kind != "agent" || m.participant_id == author_id {
-                continue;
-            }
-            // An agent with no model can't respond — never plan a turn for it.
-            if m.model_ref
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none()
-            {
+        for m in &members {
+            if !can_respond(m) || m.participant_id == author_id {
                 continue;
             }
             let fires = match m.notify_policy.as_str() {
@@ -8235,13 +8668,57 @@ impl Inner {
             };
             if fires {
                 turns.push(PlannedTurn {
-                    participant_id: m.participant_id,
+                    participant_id: m.participant_id.clone(),
                     target_action_id: post_action_id.to_string(),
                     cascade_depth: depth + 1,
                 });
             }
         }
-        Ok(NotificationPlan::Turns(turns))
+
+        // **The floor: a brief is never left unanswered.** See this method's
+        // doc comment for why — a solo delegation is a room whose only agent
+        // wrote the post, and the author exclusion above would leave it with
+        // nothing to do. The owner's own notify policy is deliberately not
+        // consulted: `spawn_subspace_tx` writes it as `human` so the agent
+        // answerable for a delegation stays quiet among its helpers, and a
+        // floor that a policy could switch off would be no floor. Everything
+        // that makes a participant unable to answer still applies.
+        //
+        // **Computed whether or not it fires**, because the set it stands aside
+        // for is not the last word: the may-decline router runs after this,
+        // "nobody" is a valid answer from it, and over a brief that answer is
+        // the room doing no work at all. So the floor travels beside the plan
+        // rather than only inside it — see [`MechanicalOutcome`].
+        let floor = (action_type == db::BRIEF_ACTION_TYPE)
+            .then(|| {
+                members
+                    .iter()
+                    .find(|m| m.participant_id == author_id && m.role == "owner" && can_respond(m))
+            })
+            .flatten()
+            .map(|owner| PlannedTurn {
+                participant_id: owner.participant_id.clone(),
+                target_action_id: post_action_id.to_string(),
+                cascade_depth: depth + 1,
+            });
+        Ok(MechanicalOutcome {
+            plan: NotificationPlan::Turns(turns),
+            floor,
+        })
+    }
+
+    /// The mechanical notify set as the rule answers it, floor folded in — see
+    /// [`Inner::mechanical_outcome`], the same computation with the floor still
+    /// separable.
+    async fn mechanical_plan(
+        &self,
+        space_id: &str,
+        post_action_id: &str,
+    ) -> Result<NotificationPlan, AppError> {
+        Ok(self
+            .mechanical_outcome(space_id, post_action_id)
+            .await?
+            .applied())
     }
 
     /// The notification plan production drives: the mechanical set
@@ -8297,10 +8774,34 @@ impl Inner {
                 return Ok(NotificationPlan::Turns(Vec::new()));
             }
         }
-        let plan = self.mechanical_plan(space_id, post_action_id).await?;
-        Ok(self
-            .refine_notifications(space_id, post_action_id, plan)
-            .await)
+        // **The brief floor is re-asserted after refinement, because the
+        // router can empty what the floor stood aside for.** A delegated room
+        // inherits its parent's `router_model`, and a room that seats helpers
+        // has a non-empty mechanical set — so the floor does not fire, and the
+        // router is then handed a real choice. `{"notify": []}` is a *valid*
+        // answer from it ("nobody responds"), and over a `brief` that answer is
+        // the room taking no turn at all: the driver walks a room where nothing
+        // happened and reports the untouched brief as a concluded delegation.
+        // That is precisely the silent no-work delegation the floor exists to
+        // make unrepresentable, arriving by the one door the floor did not
+        // cover.
+        //
+        // So the floor binds the *refined* plan too. It is still a floor and
+        // not a veto: the router's selection stands whenever it selected
+        // anybody, and this only replaces "nobody" with the one agent
+        // answerable for the delegation. A router cannot switch it off for the
+        // same reason a notify policy cannot.
+        let outcome = self.mechanical_outcome(space_id, post_action_id).await?;
+        let floor = outcome.floor.clone();
+        let refined = self
+            .refine_notifications(space_id, post_action_id, outcome.applied())
+            .await;
+        Ok(match (refined, floor) {
+            (NotificationPlan::Turns(t), Some(floor)) if t.is_empty() => {
+                NotificationPlan::Turns(vec![floor])
+            }
+            (refined, _) => refined,
+        })
     }
 
     /// The composer CTA path: save a post (`post`), then plan + refine over it
@@ -8844,6 +9345,24 @@ impl AppCore {
         Self::build(config_dir, data_dir, Some(client))
     }
 
+    /// **Test-only seam.** Treat the eidola backend as though it were reached
+    /// at this build's compiled-in pin, so its published capabilities count as
+    /// a declaration rather than a hint.
+    ///
+    /// A test necessarily points the client at a mock over a base-URL
+    /// override, and an override is exactly what makes a declaration
+    /// untrustworthy in production. Without this seam the declared half of the
+    /// precedence rule could never be exercised end to end. Feature-gated like
+    /// the attestation bypass beside it, for the same reason: a release build
+    /// must contain no way to widen what counts as our own catalog.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn trust_declared_capabilities_for_test(&self, trusted: bool) {
+        self.inner
+            .trust_declared_capabilities
+            .store(trusted, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn build(
         config_dir: PathBuf,
         data_dir: PathBuf,
@@ -8916,6 +9435,8 @@ impl AppCore {
                 tool_incapable_models: std::sync::RwLock::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 http_override,
+                #[cfg(feature = "test-support")]
+                trust_declared_capabilities: std::sync::atomic::AtomicBool::new(false),
                 _db_lock: db_lock,
             }),
         })
@@ -10449,6 +10970,18 @@ impl AppCore {
     /// caller with no turn behind it (a test, a direct API use); the report
     /// then falls back to the conversation's own last word.
     ///
+    /// **`answer_item_id` is which *turn* is asking**, and it is the caller's
+    /// for the same reason: the anchor says which post the work was asked on,
+    /// and one post can have two answers from one agent (a second explicit ask,
+    /// a regeneration running beside a reply), so only the turn knows which of
+    /// them the report belongs beneath. It is the item that turn will write its
+    /// answer under — minted before the turn's first request, because a capped
+    /// or budget-stopped turn writes no inference at all and so has no answer
+    /// id yet to give. Captured durably (`space.parent_answer_item_id`), so it
+    /// outlives the process that opened the room. `None` for a caller with no
+    /// turn behind it, which falls back to the owner's newest answer on the
+    /// anchor.
+    ///
     /// Refusals arrive as [`AppError::SpawnRefused`] carrying a
     /// [`SpawnRefusal`], and leave nothing behind. On success:
     /// [`Change::SpaceIndex`] (the Library lists sub-spaces like any other
@@ -10464,6 +10997,7 @@ impl AppCore {
         capabilities: Vec<String>,
         title: Option<String>,
         parent_action_id: Option<String>,
+        answer_item_id: Option<String>,
     ) -> Result<SpawnedSubspace, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -10477,6 +11011,7 @@ impl AppCore {
                         &capabilities,
                         title.as_deref(),
                         parent_action_id.as_deref(),
+                        answer_item_id.as_deref(),
                     )
                     .await
             })
@@ -11412,11 +11947,72 @@ struct ModelsResponseInfo {
     data: Vec<ModelListEntry>,
 }
 
+/// One row of `GET /v1/models`, parsed **leniently on purpose**.
+///
+/// Every field beyond the three the client cannot work without carries
+/// `#[serde(default)]`, and the capability leaves are optional all the way
+/// down. The list is fetched on every eidola-backed turn and one unreadable
+/// row fails the whole response, so a server that adds a modality name, omits
+/// a leaf, or ships a capability object this build has never heard of must
+/// degrade to "undeclared" rather than take every conversation down with it.
 #[derive(Deserialize)]
 struct ModelListEntry {
     id: String,
     context_length: u64,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    output_budget_class: Option<String>,
+    #[serde(default)]
+    capabilities: Option<ModelCapabilitiesInfo>,
     pricing: ModelPricingInfo,
+}
+
+#[derive(Deserialize, Default)]
+struct ModelCapabilitiesInfo {
+    #[serde(default)]
+    tool_calling: Option<CapabilityInfo>,
+    #[serde(default)]
+    reasoning: Option<CapabilityInfo>,
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    output_modalities: Option<Vec<String>>,
+}
+
+/// A capability leaf. An object rather than a bare boolean so the wire can
+/// grow a sibling key without a deployed client having to change type.
+#[derive(Deserialize)]
+struct CapabilityInfo {
+    #[serde(default)]
+    supported: Option<bool>,
+}
+
+impl ModelListEntry {
+    /// The declaration this row carries, in the client's three-state shape.
+    fn declared_capabilities(&self) -> ModelCapabilities {
+        let Some(caps) = &self.capabilities else {
+            return ModelCapabilities::default();
+        };
+        ModelCapabilities {
+            tool_calling: caps.tool_calling.as_ref().and_then(|c| c.supported),
+            reasoning: caps.reasoning.as_ref().and_then(|c| c.supported),
+            input_modalities: caps
+                .input_modalities
+                .as_ref()
+                .map(|m| m.iter().map(|s| Modality::from_wire(s)).collect()),
+            output_modalities: caps
+                .output_modalities
+                .as_ref()
+                .map(|m| m.iter().map(|s| Modality::from_wire(s)).collect()),
+        }
+    }
+
+    fn declared_budget_class(&self) -> Option<OutputBudgetClass> {
+        self.output_budget_class
+            .as_deref()
+            .and_then(OutputBudgetClass::from_wire)
+    }
 }
 
 // ============================================================================
@@ -11526,6 +12122,10 @@ struct TurnPrep {
     /// an explicit opt-in whose wire compatibility is the consumer's call, so
     /// they are never silently dropped.
     auto_tools: bool,
+    /// On whose authority this turn decided its endpoint could carry a
+    /// `tools` field. Read by [`Inner::should_degrade_tools`]: only a policy
+    /// that was never declared may be probed.
+    tool_policy: ToolPolicy,
     /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
     /// for every non-spend backend. Kept so a later round can re-estimate.
     remote_pricing: Option<(u128, u128, u128)>,
@@ -11871,6 +12471,7 @@ impl TurnPrep {
                 // This round's own hold — each round is a separate priced
                 // request, so each round's action carries its own charge.
                 credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                truncated: false,
                 created_at: now_ms(),
             },
         )
@@ -12004,6 +12605,7 @@ impl TurnPrep {
                 output_tokens: None,
                 // Tools run locally — no inference was purchased.
                 credits_consumed: None,
+                truncated: false,
                 created_at: now_ms(),
             },
         )
@@ -12107,6 +12709,7 @@ impl TurnPrep {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
                 created_at: now_ms(),
             },
         )
@@ -12178,6 +12781,7 @@ impl TurnPrep {
     async fn persist_turn(
         &mut self,
         action_status: &str,
+        truncated: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
@@ -12192,6 +12796,7 @@ impl TurnPrep {
         let persisted = self
             .persist_turn_body(
                 action_status,
+                truncated,
                 input_tokens,
                 output_tokens,
                 reasoning,
@@ -12256,6 +12861,7 @@ impl TurnPrep {
     async fn persist_turn_body(
         &mut self,
         action_status: &str,
+        truncated: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
@@ -12301,6 +12907,7 @@ impl TurnPrep {
                 output_tokens,
                 // Local turns record no charge (`None`), not a fake zero.
                 credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                truncated,
                 created_at: now_ms(),
             },
         )
@@ -13980,7 +14587,22 @@ fn render_messages(
             continue; // skip tool_call, tool_result, etc. for now
         }
         let role = match responder_participant_id {
-            // Upstream: only the responder's own posts are its words.
+            // Upstream: only the responder's own posts are its words — with
+            // **one exception, and it is the brief**. A brief is not a
+            // contribution to the conversation, it is the conversation's
+            // premise: the contract the room was opened to act on, addressed to
+            // everyone in it. Rendered as the author's own words it reached the
+            // one participant who wrote it — the owner, which is exactly who
+            // the brief floor schedules for a delegation that seats nobody — as
+            // its own prior output, at the end of a room with no roster block
+            // and no thread map behind it (both live in the system message, and
+            // neither exists for a single unbranched member). A model handed
+            // its own text as the last thing said has been asked to continue
+            // it, not to carry it out, and the delegation would then produce
+            // more brief. As `user` it is what it always was to every other
+            // participant: the request. Nothing is misattributed — the message
+            // header still names its author.
+            Some(_) if row.action_type == db::BRIEF_ACTION_TYPE => "user",
             Some(responder) => {
                 if row.participant_id == responder {
                     "assistant"
@@ -14299,6 +14921,7 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
             is_current: true,
             model: row.model.clone(),
             credits_consumed: row.credits_consumed,
+            truncated: row.truncated,
             relation: reply_parent.get(&action_id).map(|_| "reply".to_string()),
             depth,
             is_branch,
@@ -15393,6 +16016,134 @@ async fn flush_attestations(
 mod tests {
     use super::*;
 
+    /// A model list from a server that publishes no capabilities at all — the
+    /// shape every generic backend sends, and the shape our own server sent
+    /// until it learned to declare. Every axis must come back **undeclared**,
+    /// and undeclared must not be `false`: reading it as `false` would take
+    /// tools away from every model on every such backend at once.
+    #[test]
+    fn a_silent_model_list_declares_nothing_rather_than_no() {
+        let entry: ModelListEntry = serde_json::from_value(serde_json::json!({
+            "id": "some-model",
+            "context_length": 8192,
+            "pricing": {
+                "per_prompt_token": { "value": 1, "scale_factor": 1 },
+                "per_completion_token": { "value": 1, "scale_factor": 1 }
+            }
+        }))
+        .expect("a list with no capability fields still parses");
+
+        assert_eq!(entry.max_output_tokens, None);
+        assert_eq!(entry.declared_budget_class(), None);
+        assert_eq!(entry.declared_capabilities(), ModelCapabilities::default());
+        assert_eq!(entry.declared_capabilities().tool_calling, None);
+    }
+
+    /// A declaration is read leaf by leaf, and the leaf is an object.
+    #[test]
+    fn a_declared_model_list_is_read_leaf_by_leaf() {
+        let entry: ModelListEntry = serde_json::from_value(serde_json::json!({
+            "id": "some-model",
+            "context_length": 8192,
+            "max_output_tokens": 16384,
+            "output_budget_class": "reasoning",
+            "capabilities": {
+                "tool_calling": { "supported": true },
+                "reasoning": { "supported": false },
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"]
+            },
+            "pricing": {
+                "per_prompt_token": { "value": 1, "scale_factor": 1 },
+                "per_completion_token": { "value": 1, "scale_factor": 1 }
+            }
+        }))
+        .expect("a declaring list parses");
+
+        assert_eq!(entry.max_output_tokens, Some(16_384));
+        assert_eq!(
+            entry.declared_budget_class(),
+            Some(OutputBudgetClass::Reasoning)
+        );
+        let caps = entry.declared_capabilities();
+        assert_eq!(caps.tool_calling, Some(true));
+        assert_eq!(caps.reasoning, Some(false));
+        assert_eq!(
+            caps.input_modalities,
+            Some(vec![Modality::Text, Modality::Image])
+        );
+        assert_eq!(caps.output_modalities, Some(vec![Modality::Text]));
+    }
+
+    /// **A newer server must not be able to break every conversation on this
+    /// machine.** The list is fetched on every eidola-backed turn and one
+    /// unreadable row fails the whole response, so a value this build has
+    /// never seen — a modality name, a budget class, a leaf with keys but no
+    /// `supported` — degrades to "undeclared" rather than to a parse error.
+    #[test]
+    fn a_newer_declaration_degrades_to_undeclared_rather_than_failing() {
+        let entry: ModelListEntry = serde_json::from_value(serde_json::json!({
+            "id": "some-model",
+            "context_length": 8192,
+            "output_budget_class": "extended-thinking",
+            "capabilities": {
+                "tool_calling": { "efforts": ["low", "high"] },
+                "input_modalities": ["text", "video"],
+                "web_search": { "supported": true }
+            },
+            "pricing": {
+                "per_prompt_token": { "value": 1, "scale_factor": 1 },
+                "per_completion_token": { "value": 1, "scale_factor": 1 }
+            }
+        }))
+        .expect("an unfamiliar declaration must still parse");
+
+        let caps = entry.declared_capabilities();
+        assert_eq!(
+            caps.tool_calling, None,
+            "a leaf with no `supported` is undeclared, not a `false`"
+        );
+        assert_eq!(caps.reasoning, None, "an absent leaf is undeclared");
+        assert_eq!(
+            caps.input_modalities,
+            Some(vec![Modality::Text, Modality::Unknown]),
+            "an unknown modality is kept as unknown rather than dropped"
+        );
+        assert_eq!(
+            entry.declared_budget_class(),
+            None,
+            "an unrecognized ladder reads as undeclared, like an absent one"
+        );
+    }
+
+    /// The precedence rule, stated as a table.
+    #[test]
+    fn a_declaration_decides_only_where_one_can_exist() {
+        assert_eq!(
+            ToolPolicy::from_declaration(Some(true)),
+            ToolPolicy::Declared(true)
+        );
+        assert_eq!(
+            ToolPolicy::from_declaration(Some(false)),
+            ToolPolicy::Declared(false)
+        );
+        assert_eq!(
+            ToolPolicy::from_declaration(None),
+            ToolPolicy::Learned,
+            "silence falls back to discovery — the safe floor, never a `false`"
+        );
+
+        assert!(
+            !ToolPolicy::Declared(true).probes_on_failure(),
+            "a declared-capable model's failure is a failure"
+        );
+        assert!(!ToolPolicy::Declared(false).probes_on_failure());
+        assert!(
+            ToolPolicy::Learned.probes_on_failure(),
+            "discovery is the only path that may pay for a probe"
+        );
+    }
+
     #[test]
     fn hex_round_trip() {
         let data = vec![0xde, 0xad, 0xbe, 0xef];
@@ -15754,6 +16505,7 @@ mod tests {
                 data: None,
             }],
             references: Vec::new(),
+            truncated: false,
             created_at: TEST_AT,
         }
     }
@@ -16204,6 +16956,7 @@ mod tests {
             model: None,
             credits_consumed: None,
             generation: 0,
+            truncated: false,
             created_at,
         }
     }

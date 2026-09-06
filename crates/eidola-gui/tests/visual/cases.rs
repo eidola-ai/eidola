@@ -9,8 +9,8 @@ use eidola_app_core::updates::{
 };
 use eidola_app_core::{
     AttestationDetail, AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState,
-    CredentialLifecycleInfo, MeasurementInfo, ModelInfo, PriceInfo, RequestDetail, RequestInfo,
-    SpaceInfo, SpendTrailEntry,
+    CredentialLifecycleInfo, MeasurementInfo, Modality, ModelCapabilities, ModelInfo,
+    OutputBudgetClass, PriceInfo, RequestDetail, RequestInfo, SpaceInfo, SpendTrailEntry,
 };
 use eidola_gui::about::AboutView;
 use eidola_gui::backends_settings::BackendsTab;
@@ -104,6 +104,7 @@ fn register_space(s: &mut Snapshots) {
                     last_activity_at: 0,
                     message_count: 4,
                     archived_at: None,
+                    parent: None,
                 }];
                 s.space_settings = Some((
                     "demo".into(),
@@ -757,6 +758,7 @@ fn library_space(id: &str, title: Option<&str>, snippet: Option<&str>, days_ago:
         last_activity_at: ts,
         message_count: 4,
         archived_at: None,
+        parent: None,
     }
 }
 
@@ -1569,6 +1571,14 @@ fn model_stores(cx: &mut App) -> Stores {
             ModelInfo {
                 id: "gemma4-31b".into(),
                 context_length: 131_072,
+                max_output_tokens: Some(16_384),
+                output_budget_class: Some(OutputBudgetClass::Reasoning),
+                capabilities: ModelCapabilities {
+                    tool_calling: Some(true),
+                    reasoning: Some(true),
+                    input_modalities: Some(vec![Modality::Text, Modality::Image]),
+                    output_modalities: Some(vec![Modality::Text]),
+                },
                 prompt_credits_per_token: 0.53,
                 completion_credits_per_token: 1.5,
                 request_credits: None,
@@ -1576,20 +1586,41 @@ fn model_stores(cx: &mut App) -> Stores {
             ModelInfo {
                 id: "kimi-k2-6".into(),
                 context_length: 262_144,
+                max_output_tokens: Some(32_768),
+                output_budget_class: Some(OutputBudgetClass::Reasoning),
+                capabilities: ModelCapabilities {
+                    tool_calling: Some(true),
+                    reasoning: Some(true),
+                    input_modalities: Some(vec![Modality::Text]),
+                    output_modalities: Some(vec![Modality::Text]),
+                },
                 prompt_credits_per_token: 3.0,
                 completion_credits_per_token: 9.0,
                 request_credits: None,
             },
+            // A backend that declares nothing — a generic OpenAI-compatible
+            // listing or a local file. Undeclared is the common case, so the
+            // picker has to render one.
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 1.05,
                 completion_credits_per_token: 5.25,
                 request_credits: None,
             },
+            // A per-request-priced row, which the picker renders differently.
+            // Deliberately a synthetic id: nothing in the catalog is priced
+            // this way, and a real transcription model's name here would
+            // imply we sell one.
             ModelInfo {
-                id: "whisper-large-v3".into(),
+                id: "per-request-example".into(),
                 context_length: 0,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 0.0,
                 completion_credits_per_token: 0.0,
                 request_credits: Some(9_000.0),

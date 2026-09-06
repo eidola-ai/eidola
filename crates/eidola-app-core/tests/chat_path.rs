@@ -2604,6 +2604,172 @@ fn a_retry_will_not_take_a_hold_while_the_last_one_is_unsettled() {
     });
 }
 
+/// **A declared "no" withholds the field: no probe, no failed round, no hold.**
+///
+/// The mock rejects any `tools`-bearing request, so a client that offered the
+/// field anyway would pay for a round that can only fail. Declaring the answer
+/// is what turns that from a lesson learned the expensive way into a
+/// non-event: one request, no `tools` on it, and one credential moved rather
+/// than two.
+#[test]
+fn a_declared_incapable_model_is_never_offered_tools() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            declared_tool_calling: Some(false),
+            ..MockConfig::default()
+        });
+        // A test necessarily reaches the mock through a base-URL override, and
+        // an override is a hint rather than a declaration — see
+        // `ToolPolicy`. This stands in for the compiled-in pin.
+        core.trust_declared_capabilities_for_test(true);
+        with_account(&core);
+        let space = branched_eidola_space(&core);
+
+        let settled_before = settled_credentials(&core);
+        let requests_before = mock.chat_bodies().len();
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
+            .expect("a withheld tools field must leave an ordinary turn");
+        assert_eq!(result.content, "Hello from the mock.");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len() - requests_before,
+            1,
+            "one request — the probe never happened"
+        );
+        assert!(
+            bodies[requests_before].get("tools").is_none(),
+            "a declared `false` withholds the field: {}",
+            bodies[requests_before]
+        );
+        // The map still rides the messages array: withholding the *tools*
+        // never costs the space its structural view.
+        assert!(
+            flat_messages(&bodies[requests_before])
+                .last()
+                .expect("a message")
+                .1
+                .contains("</thread-map>"),
+            "the branched space keeps its map"
+        );
+        assert_eq!(
+            settled_credentials(&core) - settled_before,
+            1,
+            "one hold for one round — nothing was spent discovering what was declared"
+        );
+    });
+}
+
+/// **A declared "yes" disarms the probe, so a failure stays a failure.**
+///
+/// Today any round-1 `Server` error is read as "this endpoint rejects the
+/// `tools` field". Where the endpoint has *declared* it accepts one, that
+/// reading is simply wrong, and wrong in an expensive direction: a transient
+/// upstream 500 would be retried toolless, and if the retry succeeded the
+/// model would silently lose its tools for the rest of the process — after
+/// charging for both attempts. Declaration answers the question the probe
+/// existed to ask, so the error surfaces instead.
+#[test]
+fn a_declared_capable_model_does_not_degrade_on_a_server_error() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            declared_tool_calling: Some(true),
+            ..MockConfig::default()
+        });
+        core.trust_declared_capabilities_for_test(true);
+        with_account(&core);
+        let space = branched_eidola_space(&core);
+
+        let requests_before = mock.chat_bodies().len();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
+            .expect_err("a 500 from a model we know does tools is a genuine failure");
+        assert!(
+            matches!(err, AppError::Server { .. }),
+            "the turn reports the upstream failure rather than a capability verdict: {err:?}"
+        );
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len() - requests_before,
+            1,
+            "no toolless retry: the declaration already answered the question"
+        );
+        assert!(
+            bodies[requests_before].get("tools").is_some(),
+            "the declared-capable model was offered its tools: {}",
+            bodies[requests_before]
+        );
+    });
+}
+
+/// **Provenance, not backend kind: an override-reached eidola backend keeps
+/// discovering.**
+///
+/// The same mock declares `tool_calling: false` here, and the client offers
+/// the field anyway. The connection was reached through a base-URL override,
+/// so it is not the catalog this binary pinned — it might be a development
+/// stack mid-iteration, or another operator's server whose catalog is theirs.
+/// A declaration there is a hint, and the learned degrade stays armed exactly
+/// as it is for a local engine.
+#[test]
+fn a_declaration_from_an_override_reached_backend_is_only_a_hint() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            declared_tool_calling: Some(false),
+            ..MockConfig::default()
+        });
+        // Deliberately *not* trusting the declaration: this is the default
+        // state, and the one every override-reached connection is in.
+        with_account(&core);
+        let space = branched_eidola_space(&core);
+
+        let requests_before = mock.chat_bodies().len();
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
+            .expect("the degrade still recovers the turn");
+        assert_eq!(result.content, "Hello from the mock.");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len() - requests_before,
+            2,
+            "the hinted `false` was ignored: tools offered, rejected, retried"
+        );
+        assert!(
+            bodies[requests_before].get("tools").is_some(),
+            "a hint does not withhold: {}",
+            bodies[requests_before]
+        );
+        assert!(
+            bodies[requests_before + 1].get("tools").is_none(),
+            "and the retry withdraws them: {}",
+            bodies[requests_before + 1]
+        );
+    });
+}
+
+/// Credentials that have settled into a completed spend — one per round that
+/// reached the wire and was charged for.
+fn settled_credentials(core: &AppCore) -> usize {
+    core.runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("lifecycle")
+        .iter()
+        .filter(|c| c.state == "spent")
+        .count()
+}
+
 /// The degrade is remembered for the process, so the wasted request happens at
 /// most once per model rather than on every branched turn. It is an in-process
 /// observation, not a config surface and not persisted — the capability flag
@@ -5606,9 +5772,69 @@ fn a_partial_answer_at_the_ceiling_is_kept_and_reported_as_truncated() {
         // Both answers are in the transcript.
         let messages = core
             .runtime()
-            .block_on(core.get_space_messages(blocking.space_id))
+            .block_on(core.get_space_messages(blocking.space_id.clone()))
             .expect("messages");
         assert_eq!(messages.len(), 4, "two questions, two partial answers");
+
+        // And the verdict is on the answers' own rows, not only on the result
+        // the caller happened to be holding — one classification, two readers.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(blocking.space_id))
+            .expect("tree");
+        for post in &tree {
+            let expected = post.action_type == "inference";
+            assert_eq!(
+                post.truncated, expected,
+                "{} ({}) recorded the wrong ceiling verdict",
+                post.action_id, post.action_type
+            );
+        }
+    });
+}
+
+/// The mark is **durable**, which only a second process can prove: a reopened
+/// profile has none of the first one's memory, so a mark that survives the
+/// restart survives because the answer's own row carries it.
+#[test]
+fn a_cut_off_answer_still_says_so_after_a_restart() {
+    run(|| {
+        let (mock, core, dir) = setup(MockConfig {
+            chat: ChatBehavior::PartialAnswerLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let res = core
+            .runtime()
+            .block_on(core.chat("go on".into(), MODEL.into(), None))
+            .expect("a partial answer is still a turn");
+        assert!(res.truncated, "the live turn reported the ceiling");
+        let space_id = res.space_id.clone();
+        let answer = res.response_action_id.clone().expect("the text is kept");
+        let base_url = mock.base_url.clone();
+
+        // The mock runs on the core's runtime, so it goes with it; nothing
+        // below needs an upstream, only the database left on disk.
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &base_url);
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space_id))
+            .expect("tree");
+        let post = tree
+            .iter()
+            .find(|p| p.action_id == answer)
+            .expect("the answer survived the restart");
+        assert!(
+            post.truncated,
+            "the reopened profile shows the answer with nothing saying it stopped short"
+        );
+        assert!(
+            tree.iter().all(|p| p.truncated == (p.action_id == answer)),
+            "only the cut-off answer carries the mark; got {tree:#?}"
+        );
     });
 }
 
@@ -5624,6 +5850,14 @@ fn an_ordinary_turn_is_not_reported_as_truncated() {
             .block_on(core.chat("hello".into(), MODEL.into(), None))
             .expect("chat");
         assert!(!res.truncated);
+
+        // Nor is the durable flag set on anything the turn wrote — "nobody set
+        // it" and "it is false" have to be the same state on disk too.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id))
+            .expect("tree");
+        assert!(tree.iter().all(|p| !p.truncated), "got {tree:#?}");
     });
 }
 

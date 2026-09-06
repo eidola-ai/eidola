@@ -7964,6 +7964,7 @@ dependencies = [
  "spki",
  "tempfile",
  "x509-cert",
+ "zip",
 ]
 
 [[package]]
