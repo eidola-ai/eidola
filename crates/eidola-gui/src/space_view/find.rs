@@ -1068,11 +1068,29 @@ impl SpaceView {
     }
 
     /// Whether the find surface currently owns the keyboard — what gates the
-    /// Escape rung, so an Escape in the composer still deactivates the draft.
+    /// Escape rung, so an Escape in the composer still deactivates the draft,
+    /// and what puts the bar in `transient_overlay_open`.
+    ///
+    /// **Two questions, because containment is a paint-time answer and the
+    /// field's own handle is not.** `contains_focused` reads the dispatch tree
+    /// the *last* frame built, so on the frame ⌘F mounts the bar it cannot yet
+    /// see the input `open_find` has already focused — the bar's container has
+    /// not painted. `sync_tree_focus` runs at the head of that same render, so
+    /// it read "no overlay", found the reader's post no longer focused, and
+    /// cleared their place in the tree; closing the bar then landed on the view
+    /// root instead of the post they opened it from. Asking the field first
+    /// answers from a fact that is true the instant focus moves, with no frame
+    /// in between.
+    ///
+    /// Containment stays as the second half rather than being replaced: the
+    /// bar's close and step verbs are ordinary tab stops, so a reader who Tabs
+    /// onto one is still inside the bar with the *field* unfocused, and only
+    /// the subtree can say so.
     pub(crate) fn find_holds_focus(&self, window: &Window, cx: &gpui::App) -> bool {
-        self.find
-            .as_ref()
-            .is_some_and(|s| s.focus.contains_focused(window, cx))
+        self.find.as_ref().is_some_and(|s| {
+            gpui::Focusable::focus_handle(s.input.read(cx), cx).is_focused(window)
+                || s.focus.contains_focused(window, cx)
+        })
     }
 
     /// Apply a committed query. Never called from an observer or a render.

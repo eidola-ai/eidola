@@ -20099,6 +20099,67 @@ fn space_find_stops_the_old_reveal_when_the_query_stops_matching(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn space_find_keeps_the_readers_place_in_the_conversation(cx: &mut TestAppContext) {
+    // ⌘F from a keyboard-focused post: the bar takes the keyboard, and the
+    // reader's place in the tree has to survive the frame the bar mounts in —
+    // `sync_tree_focus` runs at the head of the parent's render, so on that
+    // first frame the bar's container has not painted and containment cannot
+    // yet see the input it already focused. Reading that as "no overlay" drops
+    // the level, and closing the bar then lands on the view root.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    let place = view.read_with(&vcx, |v, _| v.tree_focus_for_test());
+    assert_eq!(
+        place,
+        Some(("a1".to_string(), None)),
+        "the reader is on a post"
+    );
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(v.find_open_for_test(), "the bar is up");
+        assert_eq!(
+            v.tree_focus_for_test(),
+            place,
+            "the bar borrowed the keyboard; it did not take the reader's place"
+        );
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            place,
+            "and closing it returns them to the post they left"
+        );
+    });
+    // The honest proof that the keyboard really landed there: the arrows
+    // still walk the tree, which they cannot do from the view root.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), None)),
+            "the arrow moved on from the post the bar was opened over"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_stops_its_reveal_when_the_reader_edits_a_post(cx: &mut TestAppContext) {
     // The composer's twin, reached through the other editor. An inline edit
     // has no caret-into-view of its own to arm, so it never passed the seam
