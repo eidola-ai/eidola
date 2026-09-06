@@ -20570,11 +20570,26 @@ fn space_find_stops_its_reveal_when_the_reader_resumes_composing(cx: &mut TestAp
     let editor = draft.read_with(&vcx, gpui::Focusable::focus_handle);
     vcx.update(|window, cx| window.focus(&editor, cx));
     vcx.run_until_parked();
+    // Returning to a composer is itself the reader taking the page, so the
+    // motion ends here — and the reveal with it.
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_pending_reveal_for_test(),
+            None,
+            "clicking into the composer is a takeover in its own right"
+        );
+    });
+
+    // Re-arm, so what the typing below has to cure is a reveal armed while the
+    // reader was already in the composer — the arming events' own case.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.find_step(true, window, cx));
+    });
+    vcx.run_until_parked();
     view.read_with(&vcx, |v, _| {
         assert!(
-            v.page_glide_target_for_test().is_some(),
-            "returning to the composer has not moved the page by itself — the \
-             typing below is what the assertions are about"
+            v.find_pending_reveal_for_test().is_some(),
+            "a step re-arms the correction the typing must drop"
         );
     });
 
