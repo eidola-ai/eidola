@@ -20170,6 +20170,62 @@ fn space_find_bar_is_not_covered_by_a_maximised_composer(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn space_find_hands_the_keyboard_back_from_the_frame_it_opened_in(cx: &mut TestAppContext) {
+    // ⌘F then Escape before the bar has painted. The Escape rung admits the
+    // press by asking the field's own handle, so the session is dropped — and
+    // the close has to ask the same question, or the handback is skipped and
+    // the reader is left on the handle of an input that no longer exists.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    let place = view.read_with(&vcx, |v, _| v.tree_focus_for_test());
+    assert_eq!(
+        place,
+        Some(("a1".to_string(), None)),
+        "the reader is on a post"
+    );
+
+    // Both in one window update, so no frame is drawn in between — which is
+    // the whole of the situation: containment still describes the tree from
+    // before the bar existed.
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+        view.update(cx, |v, cx| {
+            assert!(v.find_open_for_test(), "the bar opened in this frame");
+            assert!(v.close_find(window, cx), "and Escape closed it in the same");
+        });
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_open_for_test(), "the bar is gone");
+        assert_eq!(
+            v.tree_focus_for_test(),
+            place,
+            "and the reader is still where they opened it from"
+        );
+    });
+    // The honest proof: the arrows still walk the tree, which they cannot do
+    // from a dropped input's handle.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), None)),
+            "the keyboard really came back to the conversation"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_keeps_the_readers_place_in_the_conversation(cx: &mut TestAppContext) {
     // ⌘F from a keyboard-focused post: the bar takes the keyboard, and the
     // reader's place in the tree has to survive the frame the bar mounts in —

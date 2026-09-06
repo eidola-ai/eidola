@@ -8220,11 +8220,42 @@ fn space_find_with_no_results_says_so_and_offers_no_steps(cx: &mut TestAppContex
         "No results",
     );
     // The arrows still paint (a bar losing controls under the reader's hand is
-    // worse than inert ones), but neither is a tab stop or activatable.
-    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(
-        names.contains(&"space/find/next"),
-        "the arrows stay on screen: {names:?}"
+    // worse than inert ones) — but they stop being *buttons*. This rev has no
+    // `aria_disabled`, and AccessKit answers a click action by synthesizing a
+    // press, so a `Role::Button` with no listener is a control VoiceOver
+    // offers and activates to no effect. `Role::Label` keeps the name
+    // readable and claims nothing about pressing it.
+    assert_probe(
+        &entries,
+        "space/find/previous",
+        gpui::Role::Label,
+        "Previous match",
+    );
+    assert_probe(&entries, "space/find/next", gpui::Role::Label, "Next match");
+
+    // And a query that matches gives the buttons back.
+    cx.update_window(window, |_, window, cx| {
+        for _ in 0..6 {
+            window.dispatch_keystroke(gpui::Keystroke::parse("backspace").unwrap(), cx);
+        }
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/previous",
+        gpui::Role::Button,
+        "Previous match",
+    );
+    assert_probe(
+        &entries,
+        "space/find/next",
+        gpui::Role::Button,
+        "Next match",
     );
 
     probe::set_probes_enabled(false);

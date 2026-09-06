@@ -690,6 +690,24 @@ pub(crate) struct FindSession {
 }
 
 impl FindSession {
+    /// Whether this session owns the keyboard: the query field's own handle,
+    /// or anything inside the bar's subtree.
+    ///
+    /// **One predicate, because its two callers ask on different frames.**
+    /// `SpaceView::find_holds_focus` gates the Escape rung and the
+    /// transient-overlay predicate; `close_find` asks the same question to
+    /// decide whether it owes a handback. Containment alone answers from the
+    /// dispatch tree the *last* frame built, so between ⌘F focusing the field
+    /// and the bar's first paint it says no — and an Escape arriving in that
+    /// window is admitted by the rung (which asks the field) and then dropped
+    /// by the close (which did not), taking the session away without putting
+    /// the keyboard back where it came from. Written once, the two cannot
+    /// disagree about a frame.
+    fn holds_focus(&self, window: &Window, cx: &gpui::App) -> bool {
+        gpui::Focusable::focus_handle(self.input.read(cx), cx).is_focused(window)
+            || self.focus.contains_focused(window, cx)
+    }
+
     /// The current match, if the anchor still names one.
     pub(crate) fn current(&self) -> Option<&Match> {
         current_match(&self.matches, &self.anchor)
@@ -1025,8 +1043,9 @@ impl SpaceView {
         };
         // Only from a bar that is actually holding the keyboard — a reader
         // composing beside it never lent it (the handback rule every form in
-        // this window owes).
-        let held = session.focus.contains_focused(window, cx);
+        // this window owes). The same predicate the Escape rung was admitted
+        // by, so the two cannot disagree about the frame the bar mounts in.
+        let held = session.holds_focus(window, cx);
         let lender = session.returned_input.clone();
         drop(session);
         self.set_page_scroll_y(self.page_scroll.offset().y.as_f32() + FIND_BAR_H);
@@ -1086,11 +1105,13 @@ impl SpaceView {
     /// bar's close and step verbs are ordinary tab stops, so a reader who Tabs
     /// onto one is still inside the bar with the *field* unfocused, and only
     /// the subtree can say so.
+    ///
+    /// The pair lives on [`FindSession::holds_focus`] so the two callers who
+    /// ask it cannot answer differently — see that method.
     pub(crate) fn find_holds_focus(&self, window: &Window, cx: &gpui::App) -> bool {
-        self.find.as_ref().is_some_and(|s| {
-            gpui::Focusable::focus_handle(s.input.read(cx), cx).is_focused(window)
-                || s.focus.contains_focused(window, cx)
-        })
+        self.find
+            .as_ref()
+            .is_some_and(|s| s.holds_focus(window, cx))
     }
 
     /// Apply a committed query. Never called from an observer or a render.
@@ -1857,9 +1878,23 @@ impl SpaceView {
         )
     }
 
-    /// One of the two step arrows. **One predicate decides both tab-stopness
-    /// and activation**, so a bar that is focused when the last match
-    /// disappears cannot keep a live `on_click` for a step that does nothing.
+    /// One of the two step arrows. **One predicate decides the role, the
+    /// tab-stopness and the activation**, so a bar that is focused when the
+    /// last match disappears cannot keep a live `on_click` for a step that
+    /// does nothing — nor a node claiming to be a button for one.
+    ///
+    /// The arrows deliberately keep painting with no results (a bar losing
+    /// controls under the reader's hand is worse than dimmed ones), and that
+    /// is exactly why the *role* has to move with the handler: this gpui rev
+    /// exposes no `aria_disabled`, and `Window::handle_a11y_action` answers
+    /// `Action::Click` by synthesizing a press at the node's centre — so a
+    /// `Role::Button` left standing with no listener is a control VoiceOver
+    /// offers, activates, and silently does nothing with. `Role::Label` keeps
+    /// the glyph and its name readable while claiming nothing about pressing
+    /// it, and derives neither focusability nor a tab stop (`focus::is_tab_stop`).
+    /// It is `references::footnote_row`'s rule — the role tracks whether a
+    /// handler attaches — reaching the one control in this bar that outlives
+    /// its own verb.
     #[allow(clippy::too_many_arguments)]
     fn find_step_button(
         &self,
@@ -1872,9 +1907,14 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = cx.theme();
+        let role = if enabled {
+            gpui::Role::Button
+        } else {
+            gpui::Role::Label
+        };
         let el = div()
             .id(id)
-            .probe(probe, gpui::Role::Button, aria)
+            .probe(probe, role, aria)
             .flex_none()
             .px_2()
             .py_1()
