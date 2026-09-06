@@ -967,7 +967,7 @@ pub struct SpaceInfo {
 
 /// The conversation a delegated room was opened from, as a listing row carries
 /// it: enough to name it and to open it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpaceParent {
     pub space_id: String,
     /// `None` for a conversation that was never named — the presentation layer
@@ -1528,7 +1528,7 @@ pub struct ModelInfo {
 /// away from every model on every such backend at once — a metadata rollout
 /// that looks exactly like a fleet-wide outage. `unwrap_or(false)` on any of
 /// these is a bug, not a shortcut.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelCapabilities {
     /// Whether the model accepts a `tools` request field.
     pub tool_calling: Option<bool>,
@@ -1541,7 +1541,7 @@ pub struct ModelCapabilities {
 }
 
 /// A kind of content a model accepts or produces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Modality {
     Text,
     Image,
@@ -1570,7 +1570,7 @@ impl Modality {
 /// person: what a request asks for must be a function of the model and the
 /// turn's own structure, never of anything this installation happens to know
 /// about its user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OutputBudgetClass {
     /// A model that answers directly.
     Standard,
