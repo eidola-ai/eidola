@@ -20287,6 +20287,72 @@ fn space_find_keeps_the_readers_place_in_the_conversation(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn space_find_stops_its_reveal_when_the_reader_takes_a_branch(cx: &mut TestAppContext) {
+    // A branch dot writes no page offset — it is a horizontal switch — so it
+    // reaches the motion seam through neither of the helpers that fold half of
+    // it in. Ending the glide alone leaves the reveal owed on the branch just
+    // left, and phase 2 drags the page onto it after the reader has navigated.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "the off-screen match is owed a correction"
+        );
+    });
+
+    let resting = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_branch_dot_for_test("a1".into(), 0, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_pending_reveal_for_test(),
+            None,
+            "the reveal the reader navigated away from is not still owed"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…and no motion is still travelling"
+        );
+    });
+    let after = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.drive_page_glide_for_test(1.0));
+    });
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_scroll_offset_y_for_test(),
+            after,
+            "the page stayed where the branch switch left it (from {resting})"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_stops_its_reveal_when_the_reader_selects_a_passage(cx: &mut TestAppContext) {
     // The third editor population, and the one that is only ever read. A
     // selection is anchored to document positions, so a page still gliding

@@ -319,6 +319,11 @@ impl SpaceView {
         // A reader who has started composing again owns the viewport: from here
         // the composer's own caret-into-view path drives the page, and the
         // post-submit pin must not race it (see `follow_streaming_tail`).
+        // Through the seam, because the pin is only half of what a takeover
+        // owes — writing `Inactive` alone left a find reveal still pending,
+        // and a bare click into a draft types nothing, so nothing else
+        // recovered it.
+        self.reader_takes_the_page();
         self.tail_pin = super::TailPin::Inactive;
         // An editing session is beginning: seed the accessible value from the
         // draft as it stands. This is the seam every session passes through —
@@ -1239,6 +1244,10 @@ impl SpaceView {
                     } else {
                         ScrollOwner::Body
                     });
+                // Scrolling any surface is the reader taking the page — and
+                // the Composer arm stops propagation, so the page's own
+                // listener never reaches `note_scroll_activity` to do it.
+                this.reader_takes_the_page();
                 match owner {
                     ScrollOwner::Composer => cx.stop_propagation(),
                     ScrollOwner::Body => {

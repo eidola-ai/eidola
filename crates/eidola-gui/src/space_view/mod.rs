@@ -160,6 +160,26 @@ impl SpaceView {
     /// callers are exactly the seams that cancel a navigation glide, plus the
     /// glide door itself: the reader's own motions, and the navigations they
     /// asked for.
+    /// **The reader is moving the page, so the reader owns it.** One door for
+    /// both halves of the takeover — the glide in flight and the reveal still
+    /// owed — because they are separable and every site that took only one
+    /// took the wrong one.
+    ///
+    /// `cancel_page_glide` ends a motion; `demote_tail_pin_for_reader` drops
+    /// the *pending* one. `set_page_scroll_y` folds in the first and
+    /// `glide_page_to` the second, so a site reaching a motion through either
+    /// helper alone is silently half-covered, and a site reaching one through
+    /// neither — a branch-dot click, which writes no page offset at all — is
+    /// covered not at all. This class has now produced four instances (the
+    /// composer's arming, an inline edit, a read-only selection, a branch dot),
+    /// so the seam is named rather than re-derived: a reader-driven navigation
+    /// calls this, and the audit in `crates/eidola-gui/AGENTS.md` says which
+    /// entry points are which.
+    pub(crate) fn reader_takes_the_page(&mut self) {
+        self.cancel_page_glide();
+        self.demote_tail_pin_for_reader();
+    }
+
     pub(crate) fn demote_tail_pin_for_reader(&mut self) {
         if self.tail_pin.forced() {
             self.tail_pin = TailPin::Observing;

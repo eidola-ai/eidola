@@ -960,12 +960,15 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let open = self.find.as_ref().map(|session| {
-            (
-                session.input.clone(),
-                session.focus.contains_focused(window, cx),
-            )
-        });
+        // The same predicate the rung and the close ask — a second ⌘F can land
+        // on the frame the bar mounts in, where containment alone still
+        // describes the tree from before it existed, and answering "no" there
+        // re-borrows: the focus query finds no inspector field (the keyboard is
+        // in the query field) and clobbers a good lender with `None`.
+        let open = self
+            .find
+            .as_ref()
+            .map(|session| (session.input.clone(), session.holds_focus(window, cx)));
         if let Some((input, holds)) = open {
             // **A re-borrow is still a borrow, so the lender is refreshed to
             // match.** The bar is opened once and re-focused many times, and

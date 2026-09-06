@@ -408,8 +408,11 @@ impl SpaceView {
         // sibling takeovers cancel at their own entry (the wheel through
         // `note_scroll_activity`, the minimap through `minimap_press`, the
         // keyboard through `set_page_scroll_y`); the dot is the only one that
-        // reaches a switch without passing through any of them.
-        self.cancel_page_glide();
+        // reaches a switch without passing through any of them — which is also
+        // why it takes the *whole* seam: ending the glide alone left a reveal
+        // still owed on the branch just left, and phase 2 pulled the page onto
+        // it frames after the reader had navigated away.
+        self.reader_takes_the_page();
         let stride = (page_width + BAND_HEIGHT).as_f32();
         if stride <= 0.0 {
             return;
