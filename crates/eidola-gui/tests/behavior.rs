@@ -20404,7 +20404,7 @@ fn space_find_stops_its_reveal_when_the_reader_takes_a_branch(cx: &mut TestAppCo
     let before = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
-            v.click_branch_dot_for_test("a1".into(), 1, window, cx);
+            v.click_branch_dot_for_test("a1", 1, window, cx);
         });
     });
     vcx.run_until_parked();
