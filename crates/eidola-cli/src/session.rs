@@ -79,6 +79,27 @@ enum Mode {
     },
 }
 
+/// How long a command waits for the listener of a process that **already
+/// holds the profile**, before reporting that the holder does not serve it.
+///
+/// Sized against what the wait actually contains, which has no network in it:
+/// a database open and schema validation, the sub-space driver starting, the
+/// window system launching, and the app's stores and startup refreshes — all
+/// of it between the lock and the bind. Two seconds covers that on a cold,
+/// slow start while staying short enough that a genuinely unserved profile is
+/// still reported promptly. Nothing waits this long on the ordinary paths:
+/// a machine with no app running never reaches here.
+const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The gap before the second look, doubling up to [`MAX_RETRY_GAP`]. Small
+/// first, because most of this race is decided in milliseconds and a command
+/// that could have run immediately should.
+const FIRST_RETRY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The longest gap between looks, so the tail of a slow start is still
+/// noticed promptly rather than slept through.
+const MAX_RETRY_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The session a command runs against.
 pub struct Session {
     mode: Mode,
@@ -189,21 +210,20 @@ impl Session {
                     }
                     // **Someone took the lock between that dial and this
                     // open**, and starting the app is exactly how that
-                    // happens: the GUI takes the profile and binds its socket
-                    // a moment apart, and a command launched alongside it can
-                    // arrive in between. Look once more before concluding that
-                    // the holder does not serve the profile — the answer has
-                    // changed since the question was last asked. Once, not in
-                    // a loop: what this settles is a race that has already
-                    // resolved, and waiting for a holder that might start
-                    // serving is the silent wait the whole rule forbids.
+                    // happens: the app takes the profile *well* before it
+                    // binds its socket, and a command launched alongside it
+                    // can arrive anywhere in between. So look again — and
+                    // keep looking for a bounded moment, because here, unlike
+                    // the cold-start path above, a holder is known to exist
+                    // and a listener is expected of it.
                     Err(e) if matches!(e, AppError::DatabaseInUse { .. }) => {
-                        match Self::dial(&runtime, &config_dir, &data_dir) {
+                        match Self::await_listener(&runtime, &config_dir, &data_dir) {
                             Ok(client) => Ok(client_mode(runtime, client, config_path)),
-                            // Still nothing serving it. The holder is an
-                            // Eidola older than the socket, or one whose
-                            // listener stopped — which is what `unanswered`
-                            // says, naming the process holding the lock.
+                            // The grace ran out with nothing serving it. The
+                            // holder is an Eidola older than the socket, or
+                            // one whose listener stopped — which is what
+                            // `unanswered` says, naming the process holding
+                            // the lock.
                             Err(Dial::NoListener | Dial::NotAccepting) => Err(unanswered(e)),
                             Err(Dial::OtherProfile { ours, theirs }) => {
                                 Err(Startup::OtherProfile { ours, theirs })
@@ -222,6 +242,48 @@ impl Session {
         }
     }
 
+    /// Dial until a lock holder's listener appears, or until
+    /// [`STARTUP_GRACE`] runs out.
+    ///
+    /// **Only ever called when the profile is held**, which is what makes
+    /// waiting honest rather than hopeful: something already owns the
+    /// profile, and if it is an Eidola of this build a listener is coming.
+    /// The gap it is waiting out is not a few syscalls — the app takes the
+    /// lock, opens and validates the database, starts the sub-space driver,
+    /// launches its window system, builds its stores and kicks off its
+    /// startup refreshes, and only then binds. A single immediate look lands
+    /// inside that gap far more often than not, and reports that a starting
+    /// app is refusing to serve.
+    ///
+    /// **Never a silent *unbounded* wait**, which is the rule the selection
+    /// logic actually keeps: the ceiling is stated, short, and ends in the
+    /// same refusal — naming the holder — that an app which never binds has
+    /// always earned. Only an absent socket is worth another look; a socket
+    /// that accepted and never greeted has already spent
+    /// [`crate::client::HANDSHAKE_TIMEOUT`] proving it is not being served,
+    /// and a mismatched profile or a broken conversation is an answer, not a
+    /// wait.
+    fn await_listener(
+        runtime: &tokio::runtime::Runtime,
+        config_dir: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> Result<Client, Dial> {
+        let deadline = std::time::Instant::now() + STARTUP_GRACE;
+        let mut wait = FIRST_RETRY;
+        loop {
+            match Self::dial(runtime, config_dir, data_dir) {
+                Err(Dial::NoListener) => {}
+                other => return other,
+            }
+            let now = std::time::Instant::now();
+            if now + wait >= deadline {
+                return Err(Dial::NoListener);
+            }
+            std::thread::sleep(wait);
+            wait = (wait * 2).min(MAX_RETRY_GAP);
+        }
+    }
+
     /// One dial of the control socket, with every handshake gate the
     /// selection rule applies — the profile check included, so a redial can
     /// no more adopt another profile's app than the first attempt could.
@@ -231,7 +293,7 @@ impl Session {
         data_dir: &std::path::Path,
     ) -> Result<Client, Dial> {
         #[cfg(test)]
-        if tests::first_dial_finds_nothing() {
+        if tests::dial_finds_nothing() {
             return Err(Dial::NoListener);
         }
         runtime.block_on(Client::connect(config_dir, data_dir))
@@ -810,24 +872,31 @@ mod tests {
     }
 
     thread_local! {
-        /// Makes the **next** dial report that nothing is listening.
+        /// How many of the next dials report that nothing is listening.
         ///
-        /// The window this exists to test is a few syscalls wide — between
-        /// the first dial and the profile open that loses the lock — so a
-        /// test cannot schedule a listener into it from outside. Forcing the
-        /// first look to miss puts the process in exactly the state the race
-        /// leaves it in, with a real app already serving, and lets the redial
-        /// be the thing under test rather than the timer.
-        static FIRST_DIAL_MISSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// A test cannot schedule a listener into this race from outside: the
+        /// app it stands in for takes the profile lock and binds its socket
+        /// with a whole startup in between, and nothing here can be timed
+        /// against that. Making the first looks miss puts the process in
+        /// exactly the state the race leaves it in — a real app already
+        /// holding the lock, its socket not yet there — and lets the looking
+        /// be what is under test rather than a timer. Counted rather than a
+        /// flag, so a listener can be made to appear *after* a given look
+        /// and the waiting itself is what finds it.
+        static DIALS_THAT_MISS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
-    /// Takes the flag, so only the first dial of a run is affected.
-    pub(super) fn first_dial_finds_nothing() -> bool {
-        FIRST_DIAL_MISSES.with(|f| f.replace(false))
+    /// Spends one forced miss, if any are left.
+    pub(super) fn dial_finds_nothing() -> bool {
+        DIALS_THAT_MISS.with(|f| {
+            let left = f.get();
+            f.set(left.saturating_sub(1));
+            left > 0
+        })
     }
 
-    fn make_first_dial_miss() {
-        FIRST_DIAL_MISSES.with(|f| f.set(true));
+    fn make_dials_miss(n: u32) {
+        DIALS_THAT_MISS.with(|f| f.set(n));
     }
 
     /// An app serving `config_dir` as its config root, recording every verb
@@ -991,7 +1060,7 @@ mod tests {
         // The peer that won the race holds the profile and serves it.
         let holder = AppCore::new(dir.path().into(), dir.path().into()).expect("the peer's open");
 
-        make_first_dial_miss();
+        make_dials_miss(1);
         let session =
             Session::open(dir.path().into(), dir.path().into(), false).expect("the redial answers");
         assert!(
@@ -1011,22 +1080,77 @@ mod tests {
     }
 
     #[test]
+    fn a_listener_that_only_appears_during_startup_is_still_found() {
+        // Losing the lock does not mean the socket is up: the app that took
+        // it opens and validates a database, starts the sub-space driver,
+        // launches its window system and builds its stores before it binds.
+        // A single look lands inside that gap far more often than not, so the
+        // looking continues for a bounded moment — here the socket is missed
+        // three times over and found on the fourth, which no one-shot retry
+        // would reach.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = profile_greeter(
+            dir.path(),
+            Some(eidola_app_core::ipc::path_bytes(dir.path())),
+            std::sync::Arc::clone(&seen),
+        );
+        let holder = AppCore::new(dir.path().into(), dir.path().into()).expect("the peer's open");
+
+        // The look before the open, and the first two of the ones after it.
+        make_dials_miss(3);
+        let started = std::time::Instant::now();
+        let session =
+            Session::open(dir.path().into(), dir.path().into(), false).expect("the app is serving");
+        assert!(
+            session.is_client(),
+            "an app that is serving takes the command, however late it bound"
+        );
+        assert!(
+            started.elapsed() < STARTUP_GRACE,
+            "and it is found inside the grace, not at the end of it"
+        );
+
+        drop(session);
+        drop(holder);
+        server.join().expect("the server ends with the connection");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec!["hello".to_string()],
+            "and every look is a real handshake, gates and all"
+        );
+    }
+
+    #[test]
     fn a_holder_that_serves_nothing_is_still_named_as_that() {
-        // The other side of the same door, and the reason the redial is one
-        // look rather than a wait: a lock holder that serves no socket — an
-        // Eidola older than it, or one whose listener stopped — must still be
-        // reported, not waited on.
+        // The other side of the same door, and the reason the waiting is
+        // bounded: a lock holder that serves no socket — an Eidola older than
+        // it, or one whose listener stopped — must still be reported, and
+        // reported after a stated ceiling rather than waited on forever.
         let dir = tempfile::tempdir().expect("tempdir");
         let holder = AppCore::new(dir.path().into(), dir.path().into()).expect("the holder");
 
-        make_first_dial_miss();
+        make_dials_miss(1);
+        let started = std::time::Instant::now();
         match Session::open(dir.path().into(), dir.path().into(), false) {
             Err(Startup::NotAccepting { .. }) => {}
             other => panic!(
-                "a second look that finds nothing is still the honest refusal: {:?}",
+                "looking again and finding nothing is still the honest refusal: {:?}",
                 other.map(|_| ())
             ),
         }
+        // Up to one gap short of the ceiling, never past it: the looking
+        // stops as soon as another sleep would cross the deadline, so the
+        // grace is a bound on the wait rather than a duration it always
+        // spends.
+        assert!(
+            started.elapsed() >= STARTUP_GRACE - MAX_RETRY_GAP,
+            "it gave the holder the grace before saying so"
+        );
+        assert!(
+            started.elapsed() < STARTUP_GRACE + MAX_RETRY_GAP,
+            "and did not wait past it"
+        );
         drop(holder);
     }
 
