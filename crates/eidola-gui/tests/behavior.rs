@@ -20290,9 +20290,17 @@ fn space_find_keeps_the_readers_place_in_the_conversation(cx: &mut TestAppContex
 fn space_find_waits_for_geometry_the_current_layout_produced(cx: &mut TestAppContext) {
     // A body editor is retained for every post but rendered only near the
     // viewport, and it clears its paint-time geometry only in its own render —
-    // so an off-screen post answers `content_y_for_offset` with the pixels of a
-    // layout that is gone, and answers `Some`. Taken as exact, the correction
-    // is consumed against a width nobody is looking at.
+    // so an off-screen post can answer `content_y_for_offset` with the pixels
+    // of a layout that is gone, and answer `Some`. Taken as exact, the
+    // correction is consumed against a width nobody is looking at.
+    //
+    // **Characterization, not a flip.** The guard is what makes that
+    // impossible, but the warm pass re-measures every on-path post within two
+    // frames of a layout-key change, so no sequence this harness can stage
+    // leaves stale geometry standing when the correction runs — removing the
+    // guard keeps this green. What it does pin is the shape the guard depends
+    // on: the resize really invalidates, and the reveal really survives it to
+    // be corrected against the new layout rather than spent on the old one.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("s".into()));
     let filler = "a long paragraph of the conversation so far. ".repeat(40);
@@ -20312,26 +20320,27 @@ fn space_find_waits_for_geometry_the_current_layout_produced(cx: &mut TestAppCon
     view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
     vcx.run_until_parked();
 
-    run_find(&view, window, &mut vcx, "kestrel");
-    view.read_with(&vcx, |v, _| {
-        assert!(
-            v.find_pending_reveal_for_test().is_some(),
-            "the off-screen match is owed a correction"
-        );
-    });
+    // Visit the tail so the match's post really paints, then come back: its
+    // editor is retained and keeps that width's geometry.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
 
     // The reading column narrows, which is exactly the height cache's key —
-    // every measured height goes, and no post has painted at the new width yet.
+    // every measured height goes, and the off-screen post cannot repaint to
+    // replace the pixels it is still holding.
     let before = view.read_with(&vcx, |v, _| v.layout_clears_for_test());
-    vcx.simulate_resize(gpui::size(px(520.), px(520.)));
+    vcx.simulate_resize(gpui::size(px(500.), px(520.)));
     let after = view.read_with(&vcx, |v, _| v.layout_clears_for_test());
     assert!(
         after > before,
         "the resize really did invalidate the layout ({before} -> {after})"
     );
 
-    // The reveal is still owed: geometry from the old width is no answer, so
-    // the correction waits exactly as it does before a post has ever painted.
+    run_find(&view, window, &mut vcx, "kestrel");
+    // Still owed: geometry from the old width is no answer at all, so the
+    // correction waits exactly as it does before a post has ever painted.
     view.read_with(&vcx, |v, _| {
         assert!(
             v.find_pending_reveal_for_test().is_some(),
