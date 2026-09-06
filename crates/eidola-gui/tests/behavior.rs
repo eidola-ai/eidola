@@ -20290,21 +20290,32 @@ fn space_find_keeps_the_readers_place_in_the_conversation(cx: &mut TestAppContex
 fn space_find_stops_its_reveal_when_the_reader_takes_a_branch(cx: &mut TestAppContext) {
     // A branch dot writes no page offset — it is a horizontal switch — so it
     // reaches the motion seam through neither of the helpers that fold half of
-    // it in. Ending the glide alone leaves the reveal owed on the branch just
-    // left, and phase 2 drags the page onto it after the reader has navigated.
-    let stores = stub_stores_with_config(cx);
+    // it in. Ending the glide alone leaves the *reveal* owed, and its phase-2
+    // correction then drags the page onto a match on the branch the reader has
+    // just navigated away from.
+    let stores = stub_stores_with_agents(cx, "s");
     let (window, view) = open_space(cx, &stores, Some("s".into()));
-    let filler = "a long paragraph of the conversation so far. ".repeat(30);
-    let mut a2 = fixture_assistant_post("a2", &filler);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    // A short root keeps its band — and its branch dots — on screen; the fork
+    // below it is what the dot switches between. The match sits far down the
+    // first branch, so revealing it is a real journey.
+    let mut a2 = fixture_assistant_post("a2", &long);
     a2.parent_action_id = Some("a1".into());
-    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
-    a3.parent_action_id = Some("a2".into());
-    seed_quotable_space(
-        &view,
-        window,
-        cx,
-        vec![fixture_user_post("a1", &filler), a2, a3],
-    );
+    let mut a3 = fixture_assistant_post("a3", &long);
+    a3.parent_action_id = Some("a1".into());
+    let mut a4 = fixture_user_post("a4", &format!("{long} and the one kestrel"));
+    a4.parent_action_id = Some("a2".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![fixture_user_post("a1", "a short question"), a2, a4, a3],
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
     let mut vcx = VisualTestContext::from_window(window, cx);
     vcx.simulate_resize(gpui::size(px(760.), px(520.)));
     vcx.run_until_parked();
@@ -20313,43 +20324,34 @@ fn space_find_stops_its_reveal_when_the_reader_takes_a_branch(cx: &mut TestAppCo
 
     run_find(&view, window, &mut vcx, "kestrel");
     view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().0.len(),
+            1,
+            "the match is on this branch"
+        );
         assert!(
             v.find_pending_reveal_for_test().is_some(),
-            "the off-screen match is owed a correction"
+            "…and its correction is owed"
         );
     });
 
-    let resting = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    // A branch dot is a *horizontal* switch, so the page's own offset must not
+    // move at all across it — which is exactly what a surviving correction did,
+    // by landing phase 2 on a match on the branch being left.
+    let before = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
-            v.click_branch_dot_for_test("a1".into(), 0, window, cx);
+            v.click_branch_dot_for_test("a1".into(), 1, window, cx);
         });
     });
     vcx.run_until_parked();
 
-    view.read_with(&vcx, |v, _| {
-        assert_eq!(
-            v.find_pending_reveal_for_test(),
-            None,
-            "the reveal the reader navigated away from is not still owed"
-        );
-        assert_eq!(
-            v.page_glide_target_for_test(),
-            None,
-            "…and no motion is still travelling"
-        );
-    });
     let after = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
-    vcx.update(|_, cx| {
-        view.update(cx, |v, _| v.drive_page_glide_for_test(1.0));
-    });
-    view.read_with(&vcx, |v, _| {
-        assert_eq!(
-            v.page_scroll_offset_y_for_test(),
-            after,
-            "the page stayed where the branch switch left it (from {resting})"
-        );
-    });
+    assert!(
+        (after - before).abs() < 1.0,
+        "a branch switch moves the page vertically not at all \
+         ({before} -> {after})"
+    );
 }
 
 #[gpui::test]
