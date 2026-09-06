@@ -20099,6 +20099,77 @@ fn space_find_stops_the_old_reveal_when_the_query_stops_matching(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn space_find_bar_is_not_covered_by_a_maximised_composer(cx: &mut TestAppContext) {
+    // The floating bar is anchored at the window bottom, so its top is
+    // `win - bar_h`. Dragged to the maximum fraction in the shortest window
+    // the app allows, that top rises above the find bar's controls — and the
+    // composer paints *after* the bar, so its containment wins the hit test
+    // for the query row's lower edge. The bar's rendered height therefore
+    // yields to the document's top reserve.
+    let (_window, view, mut vcx) = open_floating_composer_scene(cx, "cover");
+    // The shortest window `base_window_options` allows.
+    const WIN: f32 = 360.0;
+
+    // Drag the composer to its maximum: the reader's own stored preference.
+    view.update(&mut vcx, |v, cx| {
+        v.begin_composer_resize_for_test(WIN / 2.0, WIN, cx)
+    });
+    view.update(&mut vcx, |v, cx| {
+        v.move_composer_resize_for_test(-10_000.0, WIN, cx)
+    });
+    vcx.run_until_parked();
+    let fraction = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
+    assert!(
+        (fraction - 0.85).abs() < 1e-6,
+        "the drag clamped to the maximum fraction (got {fraction})"
+    );
+
+    // With no bar up, that maximum is the whole of what the reader asked for.
+    let free = view.read_with(&vcx, |v, _| v.composer_float_bar_h_for_test(WIN));
+    assert!(
+        (free - 0.85 * WIN).abs() < 1.0,
+        "the composer rests at the fraction it was dragged to ({free})"
+    );
+
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(v.find_open_for_test(), "the bar is up");
+        let reserve = v.doc_reserve_for_test();
+        let bar = v.composer_float_bar_h_for_test(WIN);
+        assert!(
+            WIN - bar >= reserve - 0.5,
+            "the composer's top ({}) stands at or below the reserve the find              controls occupy ({reserve})",
+            WIN - bar
+        );
+        // The reader's preference is a preference, not a casualty.
+        assert!(
+            (v.composer_fraction_for_test() - 0.85).abs() < 1e-6,
+            "and the stored fraction is untouched"
+        );
+    });
+
+    // Closing the bar gives the height straight back.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        let bar = v.composer_float_bar_h_for_test(WIN);
+        assert!(
+            (bar - free).abs() < 1.0,
+            "the composer is back to the height it was asked for ({bar} vs {free})"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_find_keeps_the_readers_place_in_the_conversation(cx: &mut TestAppContext) {
     // ⌘F from a keyboard-focused post: the bar takes the keyboard, and the
     // reader's place in the tree has to survive the frame the bar mounts in —

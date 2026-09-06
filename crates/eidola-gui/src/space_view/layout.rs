@@ -762,12 +762,32 @@ impl SpaceView {
         // is what compresses, never the fixed surfaces.
         let fixed =
             (Self::composer_chrome() + self.composer_gutters.get().bottom).min(window_h.as_f32());
+        // **And the bar never rises into the document's top reserve.** A
+        // floating bar is anchored at the window bottom, so its top edge *is*
+        // `window - height` — and it paints after the chrome standing in that
+        // reserve, so a taller bar both covers those controls and, being
+        // mouse-containing, wins the hit test for them. Dragged to the maximum
+        // fraction in the shortest window the app allows, a bar of `0.85 · 360`
+        // starts at 54 while an open find bar's controls run to 80: a quarter
+        // of the query row unclickable for a reader who had just asked to
+        // search. Reading `doc_reserve` is what makes the two unable to
+        // overlap whatever chrome it grows next — the rule every other surface
+        // over the document's top already takes, read from the other end.
+        //
+        // This caps the **rendered** height, never the stored fraction: the
+        // reader's preference survives, and the bar returns to it the moment
+        // the bar closes or the window grows. With no find session the reserve
+        // is the title band alone, which `COMPOSER_FRACTION_MAX` clears in any
+        // window this app can open — so the clamp binds only where something
+        // is actually standing there.
+        let headroom = (window_h.as_f32() - self.doc_reserve()).max(0.0);
         super::composer::float_bar_height(
             self.composer_floating_natural_height(),
             self.composer_fraction,
             window_h.as_f32(),
             self.composer_sizing,
         )
+        .min(headroom)
         .max(fixed)
     }
 
