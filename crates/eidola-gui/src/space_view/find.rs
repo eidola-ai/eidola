@@ -43,7 +43,7 @@
 //! [`SpaceView::projections_built_for_test`] is what lets a test see that none
 //! was *built* either, which no amount of looking at the cache could show.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use eidola_app_core::search::{Projection, ProjectionBuilder, Query};
@@ -905,6 +905,25 @@ impl ScopeNode {
     }
 }
 
+/// The node ids this frame's scope covers — what a cached projection has to be
+/// in to survive the prune.
+///
+/// **Pruning is a membership question, so it is asked of a set.** The cache
+/// holds one projection per node the scope carried, so scanning the scope for
+/// each surviving entry is `O(posts²)` — and `sync_find` runs *every frame a
+/// session is open*, before the query is even looked at, so a long visible
+/// branch paid it while the reader scrolled and while a reveal animated, with
+/// nothing about the conversation having changed. Building the set once is one
+/// pass over the scope and one hash lookup per entry.
+///
+/// **Only the lookup moves**: the surviving set is exactly what the scan
+/// selected — a projection lives while its node is still in scope, and the
+/// cache is still bounded by the scope, which is what keeps closing the bar the
+/// thing that drops every projection.
+fn live_scope_nodes(scope: &[ScopeNode]) -> HashSet<&SharedString> {
+    scope.iter().map(|entry| &entry.node).collect()
+}
+
 impl SpaceView {
     /// What the open find bar adds to the document's top reserve.
     pub(crate) fn find_bar_h(&self) -> f32 {
@@ -1125,9 +1144,8 @@ impl SpaceView {
             )
         });
         session.matches.clear();
-        session
-            .projections
-            .retain(|node, _| scope.iter().any(|s| &s.node == node));
+        let live = live_scope_nodes(&scope);
+        session.projections.retain(|node, _| live.contains(node));
 
         if let Some(query) = session.query.clone() {
             for entry in &scope {
@@ -2252,6 +2270,36 @@ mod tests {
                 let _ = &source[range];
             }
         }
+    }
+
+    #[test]
+    fn the_projection_prune_asks_a_set_what_the_scope_holds() {
+        // `sync_find` runs every frame the bar is open and prunes the cache
+        // before it looks at the query, so scanning the scope per cached entry
+        // was `O(posts²)` on an unchanged conversation. The membership set is
+        // what makes it one lookup — and it *is* a set, so a revert to the scan
+        // has nothing to call.
+        let scope: Vec<ScopeNode> = ["a1", "a2", "draft-1"]
+            .into_iter()
+            .map(|node| ScopeNode {
+                node: node.into(),
+                item_id: None,
+                content: SharedString::default(),
+                embeds: EmbedMap::default(),
+                frozen: false,
+                render_cursor: None,
+            })
+            .collect();
+        let live = live_scope_nodes(&scope);
+
+        // Exactly the scope's nodes survive — what the scan selected.
+        assert_eq!(live.len(), scope.len(), "one entry per scope node");
+        for entry in &scope {
+            assert!(live.contains(&entry.node), "{} is in scope", entry.node);
+        }
+        // And a node the branch no longer carries does not, which is what
+        // keeps the cache bounded by the scope.
+        assert!(!live.contains(&SharedString::from("a3")));
     }
 
     /// One match, named by node/item/ordinal — the identity the anchor is
