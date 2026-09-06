@@ -301,6 +301,31 @@ pub struct LaidOutBlock {
     /// regressions can assert on real laid-out chrome (a list's bullet
     /// glyphs, a code block's panel) instead of eyeballing a snapshot.
     pub embed_content: Option<EmbedContentGeometry>,
+    /// `Some` only for a block that scrolls horizontally instead of wrapping
+    /// (a fenced code block or a table). What it records is the clip the
+    /// reader is looking through — see [`HorizontalBand`].
+    pub horizontal: Option<HorizontalBand>,
+}
+
+/// The horizontal viewport of a block that does not wrap, recorded at paint so
+/// a later `&self` query can answer where a source offset sits relative to
+/// what the reader can actually see.
+///
+/// The widths and the applied offset live only in the transient paint structs
+/// otherwise, so without this a caller outside the paint pass can measure a
+/// line's x but has nothing to compare it against — it cannot tell a match
+/// behind the right edge from one in plain view.
+#[derive(Clone, Copy, Debug)]
+pub struct HorizontalBand {
+    /// Window x of the left edge of the visible content band.
+    pub content_left: Pixels,
+    /// How much of the content is on screen at once.
+    pub visible_width: Pixels,
+    /// The offset already subtracted from this frame's content-line origins,
+    /// so a painted x plus this is the unscrolled content x.
+    pub scroll_x: Pixels,
+    /// The furthest right the band can go — the widest line less the viewport.
+    pub max_scroll: Pixels,
 }
 
 /// Laid-out content of one rendered embed block, in window coordinates.
@@ -2709,6 +2734,15 @@ impl Element for BlockElement {
                 _ => None,
             },
             embed_content: None,
+            // Recorded for the no-wrap blocks alone, which is what keeps a
+            // wrapping paragraph out of every caller that asks about
+            // horizontal position — there is nothing there to answer with.
+            horizontal: no_wrap.then_some(HorizontalBand {
+                content_left,
+                visible_width: visible_content_width,
+                scroll_x,
+                max_scroll,
+            }),
         };
 
         // Marker-overlay cursor: when the cursor is inside a task
@@ -3549,6 +3583,7 @@ impl Element for BlockElement {
                 source_range: 0..0,
                 embed_ordinal: None,
                 embed_content: None,
+                horizontal: None,
             },
         );
         let laid_out = LaidOutBlock {

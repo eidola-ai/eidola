@@ -225,3 +225,72 @@ fn update_readonly_refuses_document_mutations_wholesale() {
     assert_eq!(next.markdown, raw);
     assert_eq!(next.selection, Selection::Range { anchor: 0, head: 4 });
 }
+
+/// A block that scrolls horizontally instead of wrapping can hide a source
+/// offset off to one side, however well its *row* has been revealed — the case
+/// a host's find bar meets when a match lands past the right edge of a wide
+/// fenced block. The reveal seam is the horizontal twin of
+/// `content_y_for_offset`, and it moves the band only when it has to.
+#[gpui::test]
+fn a_wide_code_block_reveals_an_offset_outside_its_clip(cx: &mut TestAppContext) {
+    // One code row far wider than the 700px window, with the word to find at
+    // the far end of it.
+    let filler = "abcdefghij ".repeat(30);
+    let markdown = format!("```\n{filler}kestrel\n```");
+    let far = markdown
+        .find("kestrel")
+        .expect("the token is in the source");
+    let near = markdown
+        .find("abcdefghij")
+        .expect("the opening is in the source");
+
+    let (mut vcx, editor) = open_readonly_editor(cx, &markdown);
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        0.0,
+        "the block starts unscrolled"
+    );
+
+    // An offset already inside the band moves nothing — the reader's own
+    // horizontal scroll is not something a reveal may tidy up.
+    let moved = editor.update(&mut vcx, |e, cx| e.reveal_offset_horizontally(near, cx));
+    assert!(!moved, "an offset in plain view is already revealed");
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        0.0,
+        "…and the band did not move for it"
+    );
+
+    // One beyond the clip brings the band to it.
+    let moved = editor.update(&mut vcx, |e, cx| e.reveal_offset_horizontally(far, cx));
+    assert!(moved, "the offset past the right edge needed revealing");
+    let scrolled = editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0));
+    assert!(
+        scrolled > 0.0,
+        "the block scrolled to reach it (offset {scrolled})"
+    );
+
+    // Its own postcondition: having revealed it, the seam has nothing left to
+    // do for that offset.
+    vcx.run_until_parked();
+    let again = editor.update(&mut vcx, |e, cx| e.reveal_offset_horizontally(far, cx));
+    assert!(!again, "the revealed offset is now inside the band");
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        scrolled,
+        "…and nothing moved again"
+    );
+}
+
+/// A block that wraps has no horizontal viewport to speak of, so the seam
+/// answers for it without arithmetic — which is what keeps every ordinary
+/// paragraph out of the reveal path entirely.
+#[gpui::test]
+fn a_wrapping_paragraph_has_no_horizontal_reveal(cx: &mut TestAppContext) {
+    let markdown = "a plain paragraph ".repeat(40);
+    let far = markdown.len() - 10;
+    let (mut vcx, editor) = open_readonly_editor(cx, &markdown);
+
+    let moved = editor.update(&mut vcx, |e, cx| e.reveal_offset_horizontally(far, cx));
+    assert!(!moved, "a wrapping block never scrolls sideways");
+}

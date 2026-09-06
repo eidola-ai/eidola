@@ -1527,12 +1527,31 @@ impl SpaceView {
             return;
         };
         // Nothing to correct until the editor has painted.
-        let answered = self
-            .node_editor(&pending.node)
+        let editor = self.node_editor(&pending.node);
+        let answered = editor
+            .as_ref()
             .and_then(|e| e.read(cx).content_y_for_offset(pending.offset))
             .is_some();
         if !answered {
             return;
+        }
+        // **A match can be off to one side as well as off the top.** A fenced
+        // code block and a table do not wrap — they clip behind a per-block
+        // horizontal scroll — so revealing the match's *row* can leave the
+        // match itself outside the strip the reader is looking through, named
+        // in the readout and wearing a highlight nobody can see. The editor
+        // answers for its own clip and moves nothing for a block that wraps or
+        // a match already in view, so this is one call rather than a case
+        // analysis here (`reveal_offset_horizontally`).
+        //
+        // It runs beside the vertical correction rather than inside either
+        // arm: which *surface* scrolls vertically is the page-versus-composer
+        // question below, and the block's own horizontal band is the same
+        // either way.
+        if let Some(editor) = editor {
+            editor.update(cx, |e, cx| {
+                e.reveal_offset_horizontally(pending.offset, cx);
+            });
         }
         let Some(m) = self.find.as_ref().and_then(|s| s.current().cloned()) else {
             return;

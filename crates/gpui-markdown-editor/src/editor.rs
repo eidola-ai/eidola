@@ -908,6 +908,15 @@ impl MarkdownEditorState {
         self.code_block_scrolls.insert(block_index, offset);
     }
 
+    /// This block's horizontal scroll, for tests reaching in from outside the
+    /// crate — the accessor above is `pub(crate)`, and an integration test is
+    /// its own crate. The diagnostic idiom `debug_line_*_geometry` already
+    /// takes.
+    #[doc(hidden)]
+    pub fn code_block_scroll_for_test(&self, block_index: usize) -> f32 {
+        self.code_block_scroll(block_index).into()
+    }
+
     pub fn render_spec(&self) -> RenderSpec {
         let tree = parse(&self.state.markdown);
         // A disabled (read-only) editor renders as *published* markdown: there
@@ -974,6 +983,82 @@ impl MarkdownEditorState {
     /// estimate first and correct once this answers.
     pub fn content_y_for_offset(&self, offset: usize) -> Option<(Pixels, Pixels)> {
         self.content_y_at(offset, true)
+    }
+
+    /// Scroll the block containing `offset` horizontally so that offset is
+    /// inside the visible band, and report whether anything moved.
+    ///
+    /// **The vertical seam's twin, and the half `content_y_for_offset`
+    /// discards.** A fenced code block and a table do not wrap: they shape at
+    /// full width and clip behind a per-block horizontal scroll, so a caller
+    /// that has revealed a source offset *vertically* can still be looking at
+    /// a blank strip with the thing it revealed off to one side. That is not
+    /// hypothetical for a search — a match to the right of the clip, or one at
+    /// the left after the reader scrolled right, becomes the current result
+    /// and takes a highlight while remaining entirely invisible.
+    ///
+    /// **Nothing happens for a block that wraps.** The band is recorded at
+    /// paint for the no-wrap blocks alone ([`crate::element::HorizontalBand`]),
+    /// so a paragraph answers `None` before any arithmetic runs and no caller
+    /// needs to know which kind of block it is looking at.
+    ///
+    /// **And nothing happens for a match already in view.** The reader's own
+    /// horizontal scroll is theirs; this moves the band by the least that puts
+    /// the offset inside it, and leaves it alone when it already is. Same
+    /// minimal-motion rule the vertical reveals take.
+    ///
+    /// Paint-derived like every other geometry answer here, so it reports
+    /// `false` before the block has painted — the caller re-asks on the frame
+    /// the geometry arrives, exactly as the vertical correction does.
+    pub fn reveal_offset_horizontally(&mut self, offset: usize, cx: &mut Context<Self>) -> bool {
+        let Some((block, target)) = self.horizontal_reveal_for_offset(offset) else {
+            return false;
+        };
+        self.set_code_block_scroll(block, target);
+        cx.notify();
+        true
+    }
+
+    /// The block index and the scroll it would take to bring `offset` into
+    /// that block's horizontal viewport, or `None` when there is nothing to do
+    /// — the block wraps, has not painted, or already shows the offset.
+    fn horizontal_reveal_for_offset(&self, offset: usize) -> Option<(usize, Pixels)> {
+        let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
+        keys.sort_unstable();
+        for k in keys {
+            let laid_out = &self.last_blocks[&k];
+            let Some(band) = laid_out.horizontal else {
+                continue;
+            };
+            let Some(line) = laid_out
+                .lines
+                .iter()
+                .find(|l| l.contains_source_offset(offset))
+            else {
+                continue;
+            };
+            // A fence row is pinned at the content edge and never translates,
+            // so its x says nothing about where the code sits.
+            if line.is_delimiter {
+                continue;
+            }
+            // Painted x, less the offset already applied, is the x this
+            // character occupies in the unscrolled content.
+            let painted = line.origin.x + line.local_position_for_source_offset(offset).x;
+            let content_x = painted - band.content_left + band.scroll_x;
+            let visible_from = band.scroll_x;
+            let visible_to = band.scroll_x + band.visible_width;
+            let target = if content_x < visible_from {
+                content_x
+            } else if content_x > visible_to {
+                content_x - band.visible_width
+            } else {
+                return None;
+            };
+            let target = target.clamp(px(0.0), band.max_scroll);
+            return (target != band.scroll_x).then_some((k, target));
+        }
+        None
     }
 
     /// **Coordinate frame.** Derived from the previous frame's `last_blocks`
