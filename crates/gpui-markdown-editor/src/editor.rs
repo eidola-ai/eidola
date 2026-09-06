@@ -434,6 +434,39 @@ pub struct MarkdownEditorState {
     _focus_subscriptions: Vec<Subscription>,
 }
 
+/// The laid-out line that claims `offset`, resolving a boundary two lines
+/// share the way `downstream` asks.
+///
+/// Line ranges are end-inclusive, so an offset where one line ends and the
+/// next begins — a code block's rows, a hard-broken paragraph, a table's row
+/// boundary — is claimed by both. `downstream` takes the line that *starts*
+/// there (the row a reader would say the offset is on); upstream keeps the
+/// earlier one, which is where an upstream caret renders.
+///
+/// **Both geometry seams resolve through this**, so the vertical answer and
+/// the horizontal one can never name different rows for one offset — which is
+/// exactly what a `find` over the lines quietly did.
+fn claiming_line<'a>(
+    lines: impl IntoIterator<Item = &'a crate::element::LaidOutLine>,
+    offset: usize,
+    downstream: bool,
+) -> Option<&'a crate::element::LaidOutLine> {
+    let mut hit: Option<&crate::element::LaidOutLine> = None;
+    for line in lines {
+        if !line.contains_source_offset(offset) {
+            continue;
+        }
+        let better = match hit {
+            None => true,
+            Some(prev) => downstream && line.source_range.start > prev.source_range.start,
+        };
+        if better {
+            hit = Some(line);
+        }
+    }
+    hit
+}
+
 impl MarkdownEditorState {
     /// Create an empty editor state. Chain [`default_value`](Self::default_value)
     /// to seed initial markdown — mirrors `InputState::new(window, cx)`.
@@ -908,6 +941,15 @@ impl MarkdownEditorState {
         self.code_block_scrolls.insert(block_index, offset);
     }
 
+    /// This block's horizontal scroll, for tests reaching in from outside the
+    /// crate — the accessor above is `pub(crate)`, and an integration test is
+    /// its own crate. The diagnostic idiom `debug_line_*_geometry` already
+    /// takes.
+    #[doc(hidden)]
+    pub fn code_block_scroll_for_test(&self, block_index: usize) -> f32 {
+        self.code_block_scroll(block_index).into()
+    }
+
     pub fn render_spec(&self) -> RenderSpec {
         let tree = parse(&self.state.markdown);
         // A disabled (read-only) editor renders as *published* markdown: there
@@ -976,6 +1018,103 @@ impl MarkdownEditorState {
         self.content_y_at(offset, true)
     }
 
+    /// Scroll the block containing `range` horizontally so the whole span is
+    /// inside the visible band, and report whether anything moved.
+    ///
+    /// **The vertical seam's twin, and the half `content_y_for_offset`
+    /// discards.** A fenced code block and a table do not wrap: they shape at
+    /// full width and clip behind a per-block horizontal scroll, so a caller
+    /// that has revealed a source offset *vertically* can still be looking at
+    /// a blank strip with the thing it revealed off to one side. That is not
+    /// hypothetical for a search — a match to the right of the clip, or one at
+    /// the left after the reader scrolled right, becomes the current result
+    /// and takes a highlight while remaining entirely invisible.
+    ///
+    /// **Nothing happens for a block that wraps.** The band is recorded at
+    /// paint for the no-wrap blocks alone ([`crate::element::HorizontalBand`]),
+    /// so a paragraph answers `None` before any arithmetic runs and no caller
+    /// needs to know which kind of block it is looking at.
+    ///
+    /// **And nothing happens for a match already in view.** The reader's own
+    /// horizontal scroll is theirs; this moves the band by the least that puts
+    /// the offset inside it, and leaves it alone when it already is. Same
+    /// minimal-motion rule the vertical reveals take.
+    ///
+    /// Paint-derived like every other geometry answer here, so it reports
+    /// `false` before the block has painted — the caller re-asks on the frame
+    /// the geometry arrives, exactly as the vertical correction does.
+    pub fn reveal_range_horizontally(
+        &mut self,
+        range: &Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((block, target)) = self.horizontal_reveal_for_range(range) else {
+            return false;
+        };
+        self.set_code_block_scroll(block, target);
+        cx.notify();
+        true
+    }
+
+    /// The block index and the scroll it would take to bring `range` into that
+    /// block's horizontal viewport, or `None` when there is nothing to do —
+    /// the block wraps, has not painted, or already shows the span.
+    fn horizontal_reveal_for_range(&self, range: &Range<usize>) -> Option<(usize, Pixels)> {
+        let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
+        keys.sort_unstable();
+        for k in keys {
+            let laid_out = &self.last_blocks[&k];
+            let Some(band) = laid_out.horizontal else {
+                continue;
+            };
+            // The row the *vertical* seam would answer for, through the one
+            // selection both share — so the two can never reveal a span into
+            // different rows.
+            let Some(line) = claiming_line(&laid_out.lines, range.start, true) else {
+                continue;
+            };
+            // A fence row is pinned at the content edge and never translates,
+            // so its x says nothing about where the code sits.
+            if line.is_delimiter {
+                continue;
+            }
+            // Painted x, less the offset already applied, is the x a character
+            // occupies in the unscrolled content.
+            let content_x = |offset: usize| {
+                line.origin.x + line.local_position_for_source_offset(offset).x - band.content_left
+                    + band.scroll_x
+            };
+            let start_x = content_x(range.start);
+            // **The span's trailing edge, not its start.** An offset's x is the
+            // leading edge of its glyph, so a target computed from `range.start`
+            // alone parks the *first* character at the clip and leaves the
+            // matched text running off the far side — and then reports it
+            // revealed. The end offset's leading edge is exactly the last
+            // matched glyph's trailing edge, which is what has to be inside.
+            // A span running past this row ends, as far as this row can show,
+            // at the row's own end.
+            let end_x = if line.contains_source_offset(range.end) {
+                content_x(range.end)
+            } else {
+                content_x(line.source_range.end)
+            };
+            let visible_from = band.scroll_x;
+            let visible_to = band.scroll_x + band.visible_width;
+            let target = if start_x < visible_from {
+                start_x
+            } else if end_x > visible_to {
+                // Bring the end in, but never at the start's expense: a span
+                // wider than the viewport is read from its beginning.
+                (end_x - band.visible_width).min(start_x)
+            } else {
+                return None;
+            };
+            let target = target.clamp(px(0.0), band.max_scroll);
+            return (target != band.scroll_x).then_some((k, target));
+        }
+        None
+    }
+
     /// **Coordinate frame.** Derived from the previous frame's `last_blocks`
     /// exactly like [`Self::bounds_for_range`], but re-based to content-local
     /// coordinates: `last_blocks`/`last_bounds` are window-absolute, so
@@ -998,29 +1137,25 @@ impl MarkdownEditorState {
         // that the way the caller asked: `downstream` takes the line that
         // *starts* at the offset (the row a reader would say the offset is on),
         // upstream keeps the earlier line (where an upstream caret renders).
-        let mut hit: Option<&crate::element::LaidOutLine> = None;
+        let hit = claiming_line(
+            keys.iter().flat_map(|k| &self.last_blocks[k].lines),
+            offset,
+            downstream,
+        );
         // Fallback for an offset past every laid-out range — the document end
         // after a trailing newline synthesizes an empty paragraph that isn't
         // always laid out as a line, the same edge `bounds_for_range` hits. Keep
         // the latest line whose range ends at or before the offset and clamp it
         // onto it (its last row) rather than returning `None`.
         let mut fallback: Option<&crate::element::LaidOutLine> = None;
-        for k in keys {
-            for line in &self.last_blocks[&k].lines {
-                if line.contains_source_offset(offset) {
-                    let better = match hit {
-                        None => true,
-                        Some(prev) => {
-                            downstream && line.source_range.start > prev.source_range.start
-                        }
-                    };
-                    if better {
-                        hit = Some(line);
+        if hit.is_none() {
+            for k in &keys {
+                for line in &self.last_blocks[k].lines {
+                    if line.source_range.end <= offset
+                        && fallback.is_none_or(|f| line.source_range.end >= f.source_range.end)
+                    {
+                        fallback = Some(line);
                     }
-                } else if line.source_range.end <= offset
-                    && fallback.is_none_or(|f| line.source_range.end >= f.source_range.end)
-                {
-                    fallback = Some(line);
                 }
             }
         }

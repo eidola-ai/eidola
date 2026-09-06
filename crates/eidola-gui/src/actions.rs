@@ -95,6 +95,11 @@ actions!(
         /// like `CloseWindow`, so macOS greys it when no space window is open;
         /// the space itself carries no visual toggle by design.
         ToggleInspector,
+        /// Open **Find in Conversation** — the ⌘F bar over the visible
+        /// branch. Edit menu; registered per-`SpaceView` like
+        /// `ToggleInspector`, so macOS greys it with no space window open.
+        /// With a bar already open it re-focuses the query field.
+        FindInSpace,
         /// Toggle **gpui's element inspector** — the development overlay, not
         /// the product's. Bound to ⌥⇧⌘I (it gave up ⌥⌘I to the space
         /// inspector above). Requires the `inspector` feature on `gpui`

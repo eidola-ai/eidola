@@ -646,10 +646,8 @@ impl SpaceView {
             let ranges = self.highlight_ranges(i, cx);
             let embeds = gpui_markdown_editor::EmbedMap::new(entries.clone());
             let highlights = gpui_markdown_editor::HighlightSet::new(ranges.clone());
-            let (embeds_stale, highlights_stale) = {
-                let e = editor.read(cx);
-                (*e.embeds() != embeds, *e.highlights() != highlights)
-            };
+            let embeds_stale = *editor.read(cx).embeds() != embeds;
+            let highlights_stale = *editor.read(cx).highlights() != highlights;
             if embeds_stale || highlights_stale {
                 editor.update(cx, |e, cx| {
                     if embeds_stale {
@@ -660,7 +658,76 @@ impl SpaceView {
                     }
                 });
             }
+            self.sync_match_layers(&id, &editor, cx);
         }
+        // A draft's editor carries no quoted-passage wash — nothing quotes an
+        // unsent draft — but it does carry find matches, and the visible
+        // drafts are in scope exactly as posts are.
+        for draft in &self.drafts {
+            let editor = draft.editor.clone();
+            self.sync_match_layers(&draft.id, &editor, cx);
+        }
+    }
+
+    /// Paint one node's find matches on the two upper highlight layers —
+    /// ordinary matches on `Overlay`, the current one on `Accent` above them.
+    ///
+    /// **Under the same compare-before-set guard the base layer takes**: the
+    /// setters notify unconditionally, so writing every frame would be an
+    /// infinite render loop. Layers keep the two washes apart from the base
+    /// layer's quoted-passage wash, which is the whole reason the plugin has
+    /// them: merged into one set the two would take one colour, coalesce into
+    /// one wash, and a click on a match would fire the reference navigation
+    /// the reader never asked for.
+    fn sync_match_layers(
+        &self,
+        node_id: &SharedString,
+        editor: &gpui::Entity<gpui_markdown_editor::MarkdownEditorState>,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_markdown_editor::{HighlightLayer, HighlightSet};
+        // **Nothing is painted on a buffer the match ranges do not describe.**
+        // While an IME composition is live the buffer holds preedit the reader
+        // has not chosen, and `sync_find` deliberately keeps the projection of
+        // the text they *have* — so the ranges are offsets into the committed
+        // text and the buffer under them is a different document. Applied
+        // anyway they slide onto unrelated bytes, and the reader watches the
+        // wash crawl while they type a word.
+        //
+        // Hiding them costs the feature's own promise that the count equals
+        // what is highlighted, for the length of one composition. That is the
+        // honest side to fail on: the count still describes something real
+        // (the committed text), where a shifted wash describes nothing at all,
+        // and remapping is not the third option it looks like — the preedit is
+        // inserted *at the caret*, so a match the caret sits inside would have
+        // to be split around text the reader has not chosen, and painting over
+        // that text would claim it matched.
+        let (matches, current) = if editor.read(cx).is_composing() {
+            (Vec::new(), Vec::new())
+        } else {
+            self.find_match_ranges(node_id)
+        };
+        // The key is unused: an upper layer is inert paint and never routes a
+        // click, so there is nothing for a key to index into.
+        let matches: Vec<(std::ops::Range<usize>, u64)> =
+            matches.into_iter().map(|r| (r, 0u64)).collect();
+        let current: Vec<(std::ops::Range<usize>, u64)> =
+            current.into_iter().map(|r| (r, 0u64)).collect();
+        let matches_stale = *editor.read(cx).highlights_in(HighlightLayer::Overlay)
+            != HighlightSet::new(matches.clone());
+        let current_stale = *editor.read(cx).highlights_in(HighlightLayer::Accent)
+            != HighlightSet::new(current.clone());
+        if !matches_stale && !current_stale {
+            return;
+        }
+        editor.update(cx, |e, cx| {
+            if matches_stale {
+                e.set_highlights_in(HighlightLayer::Overlay, matches, cx);
+            }
+            if current_stale {
+                e.set_highlights_in(HighlightLayer::Accent, current, cx);
+            }
+        });
     }
 
     /// Note that post `node_id` rendered for real this frame, so the next
@@ -1011,7 +1078,8 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         if dest.focus.contains_focused(window, cx) {
-            window.focus(&self.keyboard_home(), cx);
+            let back = self.keyboard_home(cx);
+            window.focus(&back, cx);
         }
     }
 
@@ -2299,6 +2367,11 @@ impl SpaceView {
         true
     }
 
+    /// How much clear space a followed reference leaves above the post it
+    /// lands on, below whatever chrome covers the document's top: enough that
+    /// the passage reads as *in* the page rather than jammed against its edge.
+    const NAVIGATION_BREATH: f32 = 24.0;
+
     /// Scroll the page so `node_id` rests near the top of the reading area —
     /// enough to read the quoted passage in place without hunting for it.
     ///
@@ -2318,7 +2391,12 @@ impl SpaceView {
         else {
             return;
         };
-        let target = super::TITLE_BAR_RESERVE.as_f32() + 24.0;
+        // The reserve, not the title band's share of it: an open find bar adds
+        // its own row above the document ([`SpaceView::doc_reserve`]) and stays
+        // open while the reader follows a footnote, so aligning to the constant
+        // put the quoted passage — the whole point of the navigation — under
+        // the find row.
+        let target = self.doc_reserve() + Self::NAVIGATION_BREATH;
         let y = (target - doc_top).min(0.0);
         self.glide_page_to(y, window, cx);
     }

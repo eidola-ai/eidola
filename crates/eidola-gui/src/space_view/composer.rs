@@ -93,6 +93,29 @@ impl SpaceView {
             + self.composer_gutters.get().bottom
     }
 
+    /// **The reader is writing, so the reader owns the page.**
+    ///
+    /// Arming the caret scroll-into-view is a request to move a surface for the
+    /// reader — the composer's own viewport while it floats, `page_scroll` once
+    /// it docks — so it is one of the reader-driven motions, and it takes the
+    /// page from whatever was moving it: an in-flight page glide, and the
+    /// pending find reveal that glide is phase 1 of
+    /// ([`SpaceView::demote_tail_pin_for_reader`], the seam every such motion
+    /// already passes through). Without it a reveal armed at an off-screen
+    /// match survived the reader resuming composition, and phase 2 pulled the
+    /// page back onto the match some frames later — against a caret the docked
+    /// composer had just scrolled into view.
+    ///
+    /// Both of the editor's arming events are the reader acting: an edit is a
+    /// buffer change (a live preedit keystroke included — that *is* typing),
+    /// and a `SelectionChanged` is only emitted where the caret really moved.
+    fn arm_composer_caret_scroll(&mut self, cx: &mut Context<Self>) {
+        self.cancel_page_glide();
+        self.demote_tail_pin_for_reader();
+        self.composer_caret_scroll_pending.set(true);
+        cx.notify();
+    }
+
     // -- Draft lifecycle ---------------------------------------------------
 
     /// Mint a draft node replying to `parent`: a fresh editor wired to activate
@@ -127,8 +150,7 @@ impl SpaceView {
                     // layout is fresh). Only the active draft renders as the
                     // scrollable composer, so ignore Changes from any other.
                     MarkdownEditorEvent::Change if this.active_draft.as_ref() == Some(&sub_id) => {
-                        this.composer_caret_scroll_pending.set(true);
-                        cx.notify();
+                        this.arm_composer_caret_scroll(cx);
                     }
                     // Keyboard caret movement with no buffer change (arrows,
                     // Home/End, word moves) must scroll the caret into view too —
@@ -136,8 +158,7 @@ impl SpaceView {
                     MarkdownEditorEvent::SelectionChanged
                         if this.active_draft.as_ref() == Some(&sub_id) =>
                     {
-                        this.composer_caret_scroll_pending.set(true);
-                        cx.notify();
+                        this.arm_composer_caret_scroll(cx);
                     }
                     MarkdownEditorEvent::PressEnter {
                         secondary: true,
@@ -298,6 +319,11 @@ impl SpaceView {
         // A reader who has started composing again owns the viewport: from here
         // the composer's own caret-into-view path drives the page, and the
         // post-submit pin must not race it (see `follow_streaming_tail`).
+        // Through the seam, because the pin is only half of what a takeover
+        // owes — writing `Inactive` alone left a find reveal still pending,
+        // and a bare click into a draft types nothing, so nothing else
+        // recovered it.
+        self.reader_takes_the_page();
         self.tail_pin = super::TailPin::Inactive;
         // An editing session is beginning: seed the accessible value from the
         // draft as it stands. This is the seam every session passes through —
@@ -1218,6 +1244,10 @@ impl SpaceView {
                     } else {
                         ScrollOwner::Body
                     });
+                // Scrolling any surface is the reader taking the page — and
+                // the Composer arm stops propagation, so the page's own
+                // listener never reaches `note_scroll_activity` to do it.
+                this.reader_takes_the_page();
                 match owner {
                     ScrollOwner::Composer => cx.stop_propagation(),
                     ScrollOwner::Body => {
@@ -2285,7 +2315,12 @@ const CARET_SCROLL_MARGIN: f32 = 8.0;
 /// caret is already comfortably visible or when `scroll_max == 0` (a fit-height
 /// composer can't scroll — the phantom-scroll invariant). Pure so the geometry
 /// is unit-testable without a real render.
-fn caret_scroll_offset(
+///
+/// Shared with the find bar's composer reveal ([`SpaceView::scroll_composer_to`]):
+/// bringing a *match* into the floating bar's viewport is the same geometry with
+/// a different span and a different margin, and one rule is what keeps the two
+/// motions from disagreeing about where the fold is.
+pub(crate) fn caret_scroll_offset(
     caret_top: f32,
     caret_bot: f32,
     viewport_h: f32,

@@ -942,7 +942,7 @@ pub struct SpaceInfo {
 
 /// The conversation a delegated room was opened from, as a listing row carries
 /// it: enough to name it and to open it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpaceParent {
     pub space_id: String,
     /// `None` for a conversation that was never named — the presentation layer

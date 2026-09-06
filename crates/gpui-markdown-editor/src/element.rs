@@ -301,6 +301,31 @@ pub struct LaidOutBlock {
     /// regressions can assert on real laid-out chrome (a list's bullet
     /// glyphs, a code block's panel) instead of eyeballing a snapshot.
     pub embed_content: Option<EmbedContentGeometry>,
+    /// `Some` only for a block that scrolls horizontally instead of wrapping
+    /// (a fenced code block or a table). What it records is the clip the
+    /// reader is looking through — see [`HorizontalBand`].
+    pub horizontal: Option<HorizontalBand>,
+}
+
+/// The horizontal viewport of a block that does not wrap, recorded at paint so
+/// a later `&self` query can answer where a source offset sits relative to
+/// what the reader can actually see.
+///
+/// The widths and the applied offset live only in the transient paint structs
+/// otherwise, so without this a caller outside the paint pass can measure a
+/// line's x but has nothing to compare it against — it cannot tell a match
+/// behind the right edge from one in plain view.
+#[derive(Clone, Copy, Debug)]
+pub struct HorizontalBand {
+    /// Window x of the left edge of the visible content band.
+    pub content_left: Pixels,
+    /// How much of the content is on screen at once.
+    pub visible_width: Pixels,
+    /// The offset already subtracted from this frame's content-line origins,
+    /// so a painted x plus this is the unscrolled content x.
+    pub scroll_x: Pixels,
+    /// The furthest right the band can go — the widest line less the viewport.
+    pub max_scroll: Pixels,
 }
 
 /// Laid-out content of one rendered embed block, in window coordinates.
@@ -549,33 +574,16 @@ fn augment_block_with_math(
     let mut paint_specs: Vec<InlineMathPaintSpec> = Vec::new();
 
     for overlay in &block.math_overlays {
-        let Some(latex) = source.get(overlay.content_range.clone()) else {
-            // Source bounds got out from under us — fall back to
-            // raw shaping (no substitution, no overlay). Treat it
-            // the same as a typeset failure so the user at least
-            // sees the construct.
+        let Some(math_layout) = typeset_math_overlay(block, source, overlay) else {
+            // No layout — render the raw `$..$` source dimmed
+            // (delimiters) + mono (content) so the user can see and
+            // correct the bad LaTeX. This is the same visual
+            // treatment used when the cursor sits strictly inside a
+            // (well-formed) math construct, so the failure mode
+            // reads as "still markdown, just hasn't been typeset
+            // yet."
             push_failed_overlay_fallback(&mut augmented, overlay);
             continue;
-        };
-        let mode = if overlay.display_style {
-            crate::math::MathMode::Display
-        } else {
-            crate::math::MathMode::Inline
-        };
-        let sanitized_latex = sanitize_latex(latex, &block.containers);
-        let math_layout = match crate::math::typeset(&sanitized_latex, mode) {
-            Ok(l) => l,
-            Err(_) => {
-                // Typeset failed — render the raw `$..$` source
-                // dimmed (delimiters) + mono (content) so the user
-                // can see and correct the bad LaTeX. This is the
-                // same visual treatment used when the cursor sits
-                // strictly inside a (well-formed) math construct,
-                // so the failure mode reads as "still markdown,
-                // just hasn't been typeset yet."
-                push_failed_overlay_fallback(&mut augmented, overlay);
-                continue;
-            }
         };
         let math_width = math_layout.size(em_px).width;
         // Round up so the math has a tiny bit of trailing slack
@@ -1008,6 +1016,49 @@ fn combined_row_extra(math: MathRowExtra, image: MathRowExtra) -> MathRowExtra {
         top: math.top.max(image.top),
         bottom: math.bottom.max(image.bottom),
     }
+}
+
+/// Typeset one [`MathOverlay`] the way the paint path does: slice
+/// the content range out of `source`, sanitize it against the
+/// block's containers, and hand it to RaTeX in the overlay's own
+/// mode. `None` means no typeset math exists for this overlay —
+/// either the source bounds got out from under us or RaTeX rejected
+/// the LaTeX — and every caller treats those the same way.
+///
+/// Pure: the outcome is a function of the source bytes, the
+/// containers, and the mode. Nothing here touches the text system
+/// (font registration is a paint-time concern), so a caller with no
+/// `Window` — the searchable projection, which must know whether a
+/// construct shows typeset math or raw source — can ask the same
+/// question and get the same answer.
+fn typeset_math_overlay(
+    block: &RenderBlock,
+    source: &str,
+    overlay: &MathOverlay,
+) -> Option<crate::math::MathLayout> {
+    let latex = source.get(overlay.content_range.clone())?;
+    let mode = if overlay.display_style {
+        crate::math::MathMode::Display
+    } else {
+        crate::math::MathMode::Inline
+    };
+    let sanitized_latex = sanitize_latex(latex, &block.containers);
+    crate::math::typeset(&sanitized_latex, mode).ok()
+}
+
+/// Whether `overlay` renders as typeset math rather than as its own
+/// raw `$..$` source.
+///
+/// **The two outcomes look nothing alike to a reader**, and callers
+/// outside the paint path need to tell them apart: on success the
+/// element layer substitutes a width-matched pad run and paints the
+/// math over it, so no source byte is visible; on failure
+/// [`push_failed_overlay_fallback`] styles the source bytes and they
+/// shape as themselves — dim delimiters, mono content — every one of
+/// them on screen. Deciding through [`typeset_math_overlay`] is what
+/// keeps that answer identical to the one the paint path acts on.
+pub fn math_overlay_typesets(block: &RenderBlock, source: &str, overlay: &MathOverlay) -> bool {
+    typeset_math_overlay(block, source, overlay).is_some()
 }
 
 /// Append fallback inline runs for a math overlay whose typeset
@@ -2683,6 +2734,15 @@ impl Element for BlockElement {
                 _ => None,
             },
             embed_content: None,
+            // Recorded for the no-wrap blocks alone, which is what keeps a
+            // wrapping paragraph out of every caller that asks about
+            // horizontal position — there is nothing there to answer with.
+            horizontal: no_wrap.then_some(HorizontalBand {
+                content_left,
+                visible_width: visible_content_width,
+                scroll_x,
+                max_scroll,
+            }),
         };
 
         // Marker-overlay cursor: when the cursor is inside a task
@@ -3523,6 +3583,7 @@ impl Element for BlockElement {
                 source_range: 0..0,
                 embed_ordinal: None,
                 embed_content: None,
+                horizontal: None,
             },
         );
         let laid_out = LaidOutBlock {

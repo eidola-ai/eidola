@@ -690,6 +690,68 @@ fn a_stale_transcript_says_so_where_the_reader_is(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// Two pieces of chrome over the document's top must not stand in the same
+/// place. The stale-read strip is painted *after* the find bar, so overlapping
+/// it would not merely look wrong — the strip's centred pill wins the hit test
+/// over the query field beneath it, leaving part of the find controls
+/// unclickable for a reader who just asked to search.
+#[gpui::test]
+fn a_stale_read_strip_stands_clear_of_the_find_bar(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "a kestrel hovers over the verge");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "about the kestrel"), a2], cx);
+            s.fail_transcript_refresh_for_test(cx);
+        });
+    });
+    draw(cx, window);
+
+    let before = fresh_entries(cx, window)
+        .iter()
+        .find(|(n, _)| n == "space/transcript/refresh-retry")
+        .map(|(_, e)| e.bounds)
+        .expect("the strip paints over a stale transcript");
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    let strip = entries
+        .iter()
+        .find(|(n, _)| n == "space/transcript/refresh-retry")
+        .map(|(_, e)| e.bounds)
+        .expect("the strip is still standing");
+    let field = entries
+        .iter()
+        .find(|(n, _)| n == "space/find/field")
+        .map(|(_, e)| e.bounds)
+        .expect("the find field paints");
+
+    assert!(
+        strip.origin.y > before.origin.y,
+        "the strip moved down by the bar the reserve grew: {before:?} → {strip:?}"
+    );
+    assert!(
+        strip.origin.y >= field.bottom(),
+        "the strip must begin below the find controls: strip {strip:?}, field {field:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn a_streaming_reply_is_not_an_article(cx: &mut TestAppContext) {
     // The §4 trap: a value bound to streaming text makes assistive technology
@@ -8023,4 +8085,231 @@ fn a_post_being_regenerated_keeps_its_node_and_loses_only_its_value(cx: &mut Tes
         "the streaming revision must not bind a value AT would re-read per token: {:?}",
         entry.value
     );
+}
+
+/// The find bar's accessible surface: its field is the labelled editor (the
+/// two-regime rule — the `Input` owns the focus handle, so the *widget* is the
+/// node and the wrapper is bounds-only), its verbs say what their click does,
+/// and the index readout is a `Label` whose **label and value are the same
+/// short sentence** — the notices' shape, so it starts speaking the day gpui
+/// gains `aria_live` and is perceivable by review today.
+#[gpui::test]
+fn space_find_bar_probes_its_field_verbs_and_readout(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "another kestrel, and a kestrel again");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers"), a2], cx)
+        });
+    });
+    draw(cx, window);
+
+    // Open the bar and type — the production path, and the only one that emits
+    // the `InputEvent::Change` the search is driven by.
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/close",
+        gpui::Role::Button,
+        "Close find",
+    );
+    assert_probe(
+        &entries,
+        "space/find/previous",
+        gpui::Role::Button,
+        "Previous match",
+    );
+    assert_probe(
+        &entries,
+        "space/find/next",
+        gpui::Role::Button,
+        "Next match",
+    );
+    // The field's probe is registry-only (no AccessKit attributes) — the
+    // labelled `Input` inside it is the node.
+    assert_probe(&entries, "space/find/field", gpui::Role::TextInput, "Find");
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "1 of 3",
+        "1 of 3",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// A query that matches nothing says so, rather than reading "0 of 0" — a
+/// position that does not exist — and withholds the step arrows, which is one
+/// predicate deciding both their tab-stopness and their activation.
+#[gpui::test]
+fn space_find_with_no_results_says_so_and_offers_no_steps(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers")], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["o", "s", "p", "r", "e", "y"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "No results",
+        "No results",
+    );
+    // The arrows still paint (a bar losing controls under the reader's hand is
+    // worse than inert ones) — but they stop being *buttons*. This rev has no
+    // `aria_disabled`, and AccessKit answers a click action by synthesizing a
+    // press, so a `Role::Button` with no listener is a control VoiceOver
+    // offers and activates to no effect. `Role::Label` keeps the name
+    // readable and claims nothing about pressing it.
+    assert_probe(
+        &entries,
+        "space/find/previous",
+        gpui::Role::Label,
+        "Previous match",
+    );
+    assert_probe(&entries, "space/find/next", gpui::Role::Label, "Next match");
+
+    // And a query that matches gives the buttons back.
+    cx.update_window(window, |_, window, cx| {
+        for _ in 0..6 {
+            window.dispatch_keystroke(gpui::Keystroke::parse("backspace").unwrap(), cx);
+        }
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/previous",
+        gpui::Role::Button,
+        "Previous match",
+    );
+    assert_probe(
+        &entries,
+        "space/find/next",
+        gpui::Role::Button,
+        "Next match",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The find bar's own strings are its accessible names, so they are pinned in a
+/// **non-English** locale: an English literal beside the accessor is invisible
+/// in the source language and would leave a screen-reader reader hearing it in
+/// every other one.
+#[gpui::test]
+fn the_find_bars_readout_and_verbs_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "un faucon crécerelle")], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["f", "a", "u", "c", "o", "n"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/next",
+        gpui::Role::Button,
+        "Occurrence suivante",
+    );
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "1 sur 1",
+        "1 sur 1",
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    probe::set_probes_enabled(false);
 }

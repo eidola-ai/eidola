@@ -225,3 +225,146 @@ fn update_readonly_refuses_document_mutations_wholesale() {
     assert_eq!(next.markdown, raw);
     assert_eq!(next.selection, Selection::Range { anchor: 0, head: 4 });
 }
+
+/// A block that scrolls horizontally instead of wrapping can hide a source
+/// offset off to one side, however well its *row* has been revealed — the case
+/// a host's find bar meets when a match lands past the right edge of a wide
+/// fenced block. The reveal seam is the horizontal twin of
+/// `content_y_for_offset`, and it moves the band only when it has to.
+#[gpui::test]
+fn a_wide_code_block_reveals_an_offset_outside_its_clip(cx: &mut TestAppContext) {
+    // One code row far wider than the 700px window, with the word to find at
+    // the far end of it.
+    let filler = "abcdefghij ".repeat(30);
+    let markdown = format!("```\n{filler}kestrel\n```");
+    let far = markdown
+        .find("kestrel")
+        .expect("the token is in the source");
+    let near = markdown
+        .find("abcdefghij")
+        .expect("the opening is in the source");
+
+    let (mut vcx, editor) = open_readonly_editor(cx, &markdown);
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        0.0,
+        "the block starts unscrolled"
+    );
+
+    // An offset already inside the band moves nothing — the reader's own
+    // horizontal scroll is not something a reveal may tidy up.
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(near..near + 3), cx)
+    });
+    assert!(!moved, "an offset in plain view is already revealed");
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        0.0,
+        "…and the band did not move for it"
+    );
+
+    // One beyond the clip brings the band to it.
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
+    assert!(moved, "the offset past the right edge needed revealing");
+    let scrolled = editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0));
+    assert!(
+        scrolled > 0.0,
+        "the block scrolled to reach it (offset {scrolled})"
+    );
+
+    // Its own postcondition: having revealed it, the seam has nothing left to
+    // do for that offset.
+    vcx.run_until_parked();
+    let again = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
+    assert!(!again, "the revealed offset is now inside the band");
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        scrolled,
+        "…and nothing moved again"
+    );
+}
+
+/// What has to end up inside the clip is the match's **last** glyph. A target
+/// computed from the start alone parks the first character at the clip edge and
+/// leaves the rest running off the far side — and then reports it revealed.
+#[gpui::test]
+fn a_wide_code_block_reveals_the_whole_match_not_its_first_glyph(cx: &mut TestAppContext) {
+    let filler = "abcdefghij ".repeat(30);
+    let markdown = format!("```\n{filler}kestrel and a longer tail\n```");
+    let far = markdown
+        .find("kestrel")
+        .expect("the token is in the source");
+
+    // Two editors over one document, revealed from the same start offset: one
+    // a short span, one running further right. Revealing only the start would
+    // scroll both identically.
+    let (mut short_cx, short) = open_readonly_editor(cx, &markdown);
+    let moved = short.update(&mut short_cx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
+    assert!(moved, "the short span was outside the clip");
+    let short_scroll = short.read_with(&short_cx, |e, _| e.code_block_scroll_for_test(0));
+
+    let (mut long_cx, long) = open_readonly_editor(cx, &markdown);
+    let moved = long.update(&mut long_cx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 25), cx)
+    });
+    assert!(moved, "the long span was outside the clip too");
+    let long_scroll = long.read_with(&long_cx, |e, _| e.code_block_scroll_for_test(0));
+
+    assert!(
+        long_scroll > short_scroll,
+        "a span reaching further right has to scroll further \
+         (short {short_scroll}, long {long_scroll})"
+    );
+}
+
+/// Row ranges are end-inclusive, so an offset where one row ends and the next
+/// begins is claimed by both. The vertical seam resolves that downstream — the
+/// row a reader would say the offset is on — and the horizontal one has to give
+/// the same answer, or the two seams reveal a match into different rows.
+#[gpui::test]
+fn a_match_at_a_row_boundary_is_revealed_on_the_row_it_starts(cx: &mut TestAppContext) {
+    // A very wide first row, then a short second row whose first token is the
+    // match. Resolved upstream the offset is the *end* of the wide row, far off
+    // to the right, and the block scrolls; resolved downstream it is the start
+    // of the short row, already in view, and nothing moves.
+    let wide = "abcdefghij ".repeat(40);
+    let markdown = format!("```\n{wide}\nkestrel\n```");
+    let at = markdown
+        .find("kestrel")
+        .expect("the token is in the source");
+
+    let (mut vcx, editor) = open_readonly_editor(cx, &markdown);
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(at..at + 7), cx)
+    });
+    assert!(
+        !moved,
+        "the match begins its own row at the content edge — it is already in view"
+    );
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        0.0,
+        "…so the block never scrolled to the previous row's far end"
+    );
+}
+
+/// A block that wraps has no horizontal viewport to speak of, so the seam
+/// answers for it without arithmetic — which is what keeps every ordinary
+/// paragraph out of the reveal path entirely.
+#[gpui::test]
+fn a_wrapping_paragraph_has_no_horizontal_reveal(cx: &mut TestAppContext) {
+    let markdown = "a plain paragraph ".repeat(40);
+    let far = markdown.len() - 10;
+    let (mut vcx, editor) = open_readonly_editor(cx, &markdown);
+
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
+    assert!(!moved, "a wrapping block never scrolls sideways");
+}

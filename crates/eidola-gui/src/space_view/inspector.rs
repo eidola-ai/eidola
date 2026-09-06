@@ -306,6 +306,29 @@ impl SpaceView {
             || self.inspector_participant_field_focused(window, cx)
     }
 
+    /// The inspector text input that holds the keyboard, weakly — what a
+    /// surface borrowing the keyboard from the panel needs in order to give it
+    /// back to the field the reader was actually in, rather than to the view
+    /// root (where the conversation's key handler would treat their next
+    /// character as type-to-compose and start a draft with it).
+    ///
+    /// See [`SpaceView::inspector_participant_focused_input`] for why this is
+    /// an enumeration where [`Self::inspector_field_focused`] is a
+    /// containment test, and why the reference is weak.
+    pub(crate) fn inspector_focused_input(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Option<gpui::WeakEntity<gpui_component::input::InputState>> {
+        self.inspector_title
+            .as_ref()
+            .filter(|(state, _)| {
+                gpui::Focusable::focus_handle(state.read(cx), cx).is_focused(window)
+            })
+            .map(|(state, _)| state.downgrade())
+            .or_else(|| self.inspector_participant_focused_input(window, cx))
+    }
+
     /// Close the router dropdown, reporting whether it was open — the Escape
     /// rung the view root owns (the context-menu pattern).
     pub(crate) fn close_inspector_picker(&mut self, cx: &mut Context<Self>) -> bool {

@@ -255,6 +255,10 @@ pub fn is_focusable(role: Role) -> bool {
 /// floating chrome, `AUX`. The numbers are sparse so a region can be inserted
 /// between two without touching the rest.
 pub mod region {
+    /// The conversation window's **find bar** — chrome the reader opened over
+    /// the page and is acting in, so Tab reaches it before the conversation
+    /// itself rather than after every post.
+    pub const FIND: isize = -30;
     /// A window's primary navigation — the Settings nav band, the Record
     /// section strip, the Backends tab strip.
     pub const NAV: isize = -20;
@@ -338,6 +342,12 @@ mod tests {
         // *ungrouped* affordance (path `[0]`) precedes every member of a group
         // at index >= 0. Content regions must therefore be negative, or the
         // space window's floating composer would tab before its conversation.
+        const {
+            assert!(
+                region::FIND < region::NAV,
+                "a bar the reader opened over the page leads everything"
+            )
+        };
         const { assert!(region::NAV < region::MAIN, "navigation leads") };
         const { assert!(region::MAIN < 0, "main precedes ungrouped chrome") };
         const { assert!(region::AUX > 0, "auxiliary navigation follows it") };

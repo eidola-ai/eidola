@@ -348,19 +348,27 @@ impl SpaceView {
     }
 
     /// The document's top reserve: headroom that holds whatever leads the
-    /// document clear of the (transparent, overlaid) titlebar. It is
-    /// **unconditional** — a composer-only notebook is led by the composer, and
-    /// the words typed there have to sit exactly where they will sit once
-    /// they're a post, or posting moves them (task 40: the reserve appearing
-    /// with the first post shifted the whole document down by
+    /// document clear of the (transparent, overlaid) titlebar. The titlebar's
+    /// share is **unconditional** — a composer-only notebook is led by the
+    /// composer, and the words typed there have to sit exactly where they will
+    /// sit once they're a post, or posting moves them (previously, the reserve
+    /// appearing with the first post shifted the whole document down by
     /// [`TITLE_BAR_RESERVE`] at the submit moment). Every scrollable-document
     /// computation (the scroll range, the forest origin, the minimap, the dock
     /// math) reads this single value, so "what's interactive" and "what's
     /// visible" stay in lockstep. The titlebar's own visual height (the
     /// gradient overlay in `render_title_bar`) is the same constant and
     /// independent of this.
+    ///
+    /// **An open find bar adds its own row on top** ([`super::find::FIND_BAR_H`]):
+    /// the bar takes space rather than floating, because one that covered the
+    /// first post would hide the matches it is counting. Three subsystems
+    /// observe that through this one accessor — the document's top padding, the
+    /// minimap's `total_h` denominator, and the keyboard reveal's top inset —
+    /// and opening compensates the page scroll by the same delta so the
+    /// reader's content does not jump.
     pub(crate) fn doc_reserve(&self) -> f32 {
-        TITLE_BAR_RESERVE.as_f32()
+        TITLE_BAR_RESERVE.as_f32() + self.find_bar_h()
     }
 
     /// The height a slot that **stands alone** claims: one window *below* the
@@ -754,12 +762,32 @@ impl SpaceView {
         // is what compresses, never the fixed surfaces.
         let fixed =
             (Self::composer_chrome() + self.composer_gutters.get().bottom).min(window_h.as_f32());
+        // **And the bar never rises into the document's top reserve.** A
+        // floating bar is anchored at the window bottom, so its top edge *is*
+        // `window - height` — and it paints after the chrome standing in that
+        // reserve, so a taller bar both covers those controls and, being
+        // mouse-containing, wins the hit test for them. Dragged to the maximum
+        // fraction in the shortest window the app allows, a bar of `0.85 · 360`
+        // starts at 54 while an open find bar's controls run to 80: a quarter
+        // of the query row unclickable for a reader who had just asked to
+        // search. Reading `doc_reserve` is what makes the two unable to
+        // overlap whatever chrome it grows next — the rule every other surface
+        // over the document's top already takes, read from the other end.
+        //
+        // This caps the **rendered** height, never the stored fraction: the
+        // reader's preference survives, and the bar returns to it the moment
+        // the bar closes or the window grows. With no find session the reserve
+        // is the title band alone, which `COMPOSER_FRACTION_MAX` clears in any
+        // window this app can open — so the clamp binds only where something
+        // is actually standing there.
+        let headroom = (window_h.as_f32() - self.doc_reserve()).max(0.0);
         super::composer::float_bar_height(
             self.composer_floating_natural_height(),
             self.composer_fraction,
             window_h.as_f32(),
             self.composer_sizing,
         )
+        .min(headroom)
         .max(fixed)
     }
 
