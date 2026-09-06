@@ -19622,7 +19622,7 @@ fn space_find_follows_the_typing_in_an_inline_edit(cx: &mut TestAppContext) {
     // The bar takes the keyboard while the query is typed; the reader then
     // goes back to the edit they were making.
     run_find(&view, window, &mut vcx, "merlin");
-    let caret = editor.read_with(&vcx, |e, cx| gpui::Focusable::focus_handle(e, cx));
+    let caret = editor.read_with(&vcx, gpui::Focusable::focus_handle);
     vcx.update(|window, cx| window.focus(&caret, cx));
     vcx.run_until_parked();
     view.read_with(&vcx, |v, _| {
@@ -20144,7 +20144,7 @@ fn space_find_stops_its_reveal_when_the_reader_edits_a_post(cx: &mut TestAppCont
     let editor = view
         .read_with(&vcx, |v, _| v.post_body_editor_for_test("a1"))
         .expect("the post's body editor is the edit buffer");
-    let caret = editor.read_with(&vcx, |e, cx| gpui::Focusable::focus_handle(e, cx));
+    let caret = editor.read_with(&vcx, gpui::Focusable::focus_handle);
     vcx.update(|window, cx| window.focus(&caret, cx));
     vcx.run_until_parked();
     vcx.simulate_keystrokes("h i");
