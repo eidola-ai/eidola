@@ -1521,7 +1521,7 @@ impl SpaceView {
             .as_ref()?
             .pending_reveal
             .as_ref()
-            .map(|p| (p.node.clone(), p.offset))
+            .map(|p| (p.node.clone(), p.source.start))
     }
 
     /// The projections this window is currently holding, by node id.

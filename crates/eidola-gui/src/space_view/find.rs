@@ -604,7 +604,10 @@ impl MatchAnchor {
 #[derive(Clone, Debug)]
 pub(crate) struct PendingReveal {
     pub(crate) node: SharedString,
-    pub(crate) offset: usize,
+    /// The match's own byte range. The vertical correction needs only its
+    /// start; the horizontal one needs the whole span, because what has to end
+    /// up inside a block's clip is the *last* matched glyph.
+    pub(crate) source: Range<usize>,
 }
 
 /// Everything one window holds while its find bar is open.
@@ -750,7 +753,7 @@ impl FindSession {
         };
         self.pending_reveal = Some(PendingReveal {
             node: m.node.clone(),
-            offset: m.source.start,
+            source: m.source.clone(),
         });
     }
 }
@@ -1084,6 +1087,33 @@ impl SpaceView {
         // sees no session and writes empty sets.
         cx.notify();
         true
+    }
+
+    /// Whether this node's editor geometry describes the layout on screen now.
+    ///
+    /// **A retained editor keeps the pixels of a layout that is gone.** A body
+    /// editor is kept for every live post but *rendered* only near the
+    /// viewport, and the editor clears its paint-time geometry only in its own
+    /// render — so a post that last painted at another reading-column width,
+    /// type scale or gutter scheme goes on answering `content_y_for_offset`
+    /// with those pixels, and answers `Some`, which is indistinguishable from
+    /// fresh. The reveal's correction then took a stale answer as exact,
+    /// dropped the pending reveal, and the rewrapped match landed off-screen
+    /// with nothing left to correct it — and the two halves of the sum
+    /// disagreed on top of that, since the *slot* term comes from the height
+    /// cache, which a width change does invalidate.
+    ///
+    /// That cache is the answer rather than a new stamp: [`Layout`] is keyed on
+    /// exactly the editor's own geometry inputs (reading-column width, type
+    /// scale, gutter scheme) and is wiped whenever any of them moves, so an
+    /// entry exists only for a node that has painted **since** — which is the
+    /// question, asked of state that already exists and cannot drift from the
+    /// rendering because the measuring canvas writes it.
+    ///
+    /// The active draft carries no entry and needs none: it is the one node
+    /// that renders every frame, so its geometry is fresh by construction.
+    fn node_geometry_is_current(&self, node: &SharedString) -> bool {
+        self.layout.measured(node).is_some() || self.active_draft.as_ref() == Some(node)
     }
 
     /// Whether the find surface currently owns the keyboard — what gates the
@@ -1507,7 +1537,7 @@ impl SpaceView {
         if let Some(session) = self.find.as_mut() {
             session.pending_reveal = Some(PendingReveal {
                 node: m.node.clone(),
-                offset: m.source.start,
+                source: m.source.clone(),
             });
         }
     }
@@ -1526,11 +1556,15 @@ impl SpaceView {
         let Some(pending) = self.find.as_ref().and_then(|s| s.pending_reveal.clone()) else {
             return;
         };
-        // Nothing to correct until the editor has painted.
-        let editor = self.node_editor(&pending.node);
+        // Nothing to correct until the editor has painted **the layout that is
+        // on screen** — a stale answer is treated exactly as no answer, so the
+        // reveal stays pending and the estimate stands until the post repaints.
+        let editor = self
+            .node_editor(&pending.node)
+            .filter(|_| self.node_geometry_is_current(&pending.node));
         let answered = editor
             .as_ref()
-            .and_then(|e| e.read(cx).content_y_for_offset(pending.offset))
+            .and_then(|e| e.read(cx).content_y_for_offset(pending.source.start))
             .is_some();
         if !answered {
             return;
@@ -1542,15 +1576,16 @@ impl SpaceView {
         // in the readout and wearing a highlight nobody can see. The editor
         // answers for its own clip and moves nothing for a block that wraps or
         // a match already in view, so this is one call rather than a case
-        // analysis here (`reveal_offset_horizontally`).
+        // analysis here (`reveal_range_horizontally`).
         //
         // It runs beside the vertical correction rather than inside either
         // arm: which *surface* scrolls vertically is the page-versus-composer
         // question below, and the block's own horizontal band is the same
-        // either way.
+        // either way. It takes the whole span, because the thing that has to
+        // be inside the clip is the match's last glyph, not its first.
         if let Some(editor) = editor {
             editor.update(cx, |e, cx| {
-                e.reveal_offset_horizontally(pending.offset, cx);
+                e.reveal_range_horizontally(&pending.source, cx);
             });
         }
         let Some(m) = self.find.as_ref().and_then(|s| s.current().cloned()) else {
@@ -1727,7 +1762,10 @@ impl SpaceView {
         // disclosure above its body, so the exact arm lands a disclosure's
         // height high; the reveal margin absorbs it and the highlight is what
         // the reader is looking for.
-        match editor.and_then(|e| e.read(cx).content_y_for_offset(m.source.start)) {
+        match editor
+            .filter(|_| self.node_geometry_is_current(&m.node))
+            .and_then(|e| e.read(cx).content_y_for_offset(m.source.start))
+        {
             Some((t, b)) => {
                 let base = top + pad + metadata;
                 Some(MatchReveal::Page {

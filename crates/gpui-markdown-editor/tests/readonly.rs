@@ -253,7 +253,9 @@ fn a_wide_code_block_reveals_an_offset_outside_its_clip(cx: &mut TestAppContext)
 
     // An offset already inside the band moves nothing — the reader's own
     // horizontal scroll is not something a reveal may tidy up.
-    let moved = editor.update(&mut vcx, |e, cx| e.reveal_offset_horizontally(near, cx));
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(near..near + 3), cx)
+    });
     assert!(!moved, "an offset in plain view is already revealed");
     assert_eq!(
         editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
@@ -262,7 +264,9 @@ fn a_wide_code_block_reveals_an_offset_outside_its_clip(cx: &mut TestAppContext)
     );
 
     // One beyond the clip brings the band to it.
-    let moved = editor.update(&mut vcx, |e, cx| e.reveal_offset_horizontally(far, cx));
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
     assert!(moved, "the offset past the right edge needed revealing");
     let scrolled = editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0));
     assert!(
@@ -273,7 +277,9 @@ fn a_wide_code_block_reveals_an_offset_outside_its_clip(cx: &mut TestAppContext)
     // Its own postcondition: having revealed it, the seam has nothing left to
     // do for that offset.
     vcx.run_until_parked();
-    let again = editor.update(&mut vcx, |e, cx| e.reveal_offset_horizontally(far, cx));
+    let again = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
     assert!(!again, "the revealed offset is now inside the band");
     assert_eq!(
         editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
@@ -291,6 +297,8 @@ fn a_wrapping_paragraph_has_no_horizontal_reveal(cx: &mut TestAppContext) {
     let far = markdown.len() - 10;
     let (mut vcx, editor) = open_readonly_editor(cx, &markdown);
 
-    let moved = editor.update(&mut vcx, |e, cx| e.reveal_offset_horizontally(far, cx));
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
     assert!(!moved, "a wrapping block never scrolls sideways");
 }
