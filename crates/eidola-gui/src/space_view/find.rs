@@ -2340,6 +2340,17 @@ mod tests {
             "every match is in exactly one run"
         );
 
+        // **And the read is a borrow of the stored vector, not a filtered
+        // copy** — which is what bounds the per-node surfaces to that node's
+        // own matches rather than to all of them. A scan cannot answer with a
+        // `&[Match]` at all, so this address is the cost claim itself: the
+        // run's first element *is* the fourth match, not an equal one.
+        let run = matches.of(&"draft-1".into());
+        assert!(
+            std::ptr::eq(&run[0], &matches[3]),
+            "a node's run is a slice of the set, in place"
+        );
+
         // And which of a node's own matches is current is answered from that
         // run alone — an offset into it, never a position in the whole set.
         let anchor = Some(MatchAnchor::of(&matches[4]));
