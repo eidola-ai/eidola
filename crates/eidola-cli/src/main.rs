@@ -1763,27 +1763,28 @@ fn catalog_installed(models: &[eidola_app_core::LocalModelInfo], file_name: &str
 
 /// Print one `update check` outcome — the same five states the GUI's
 /// Updates window renders, sharing the core types.
-/// The line that says whose build an update verdict is about, when that is
-/// not this one's.
+/// The line that says whose build an update verdict is about.
 ///
 /// `checked_by` is the answering app's version in client mode and `None`
 /// embedded. The verdict is a comparison against the *running* build — its
 /// version and the claim expectations compiled into it — so in client mode it
-/// is the app's answer, not this `eidola`'s. Where the two builds are the same
-/// release there is nothing to disclose: the version names the release, and
-/// the expectations come from that release's trust root, so the app reached
-/// the answer this binary would have. Where they differ, saying so is the
-/// whole point — the same command can report a different availability or
-/// security state merely because the app is running.
+/// is the app's answer, not this `eidola`'s, and that is said every time.
+///
+/// **Matching versions are not a matching build.** A version names a release;
+/// two binaries built from different commits report the same one, and today
+/// every source build reports `0.1.0`. Their expected claims and their
+/// embedded trust roots can differ regardless, which is exactly what the
+/// verdict is computed from — so suppressing the note when the numbers agree
+/// would present the app's answer as one this build had reached, on the
+/// strength of a number that does not say so.
 fn update_check_attribution(checked_by: Option<&str>) -> Option<String> {
     let theirs = checked_by?;
     let ours = env!("CARGO_PKG_VERSION");
-    if theirs == ours {
-        return None;
-    }
     Some(format!(
         "note: the running Eidola ({theirs}) ran this check, so the verdict below \
-         is about its build and its expected claims — not this `eidola` ({ours})"
+         is about its build and its expected claims, not this `eidola`'s ({ours}) \
+         — a version names a release, not a build, so matching numbers are not \
+         proof of a matching answer"
     ))
 }
 
@@ -2988,25 +2989,27 @@ mod tests {
     }
 
     #[test]
-    fn an_update_verdict_from_another_build_says_whose_it_is() {
+    fn every_client_mode_verdict_says_whose_build_it_is() {
         let ours = env!("CARGO_PKG_VERSION");
         assert_eq!(
             update_check_attribution(None),
             None,
             "embedded, the build that ran the check is this one"
         );
-        assert_eq!(
-            update_check_attribution(Some(ours)),
-            None,
-            "the same release reaches the answer this build would have"
-        );
-        let note =
-            update_check_attribution(Some("99.9.9")).expect("a different build is disclosed");
-        assert!(note.contains("99.9.9"), "{note}");
-        assert!(note.contains(ours), "both builds are named: {note}");
-        assert!(
-            note.contains("expected claims"),
-            "the claim expectations are the app's too, not only its version: {note}"
-        );
+
+        // Including when the two report the same version. A version names a
+        // release, and two builds from different commits report the same one
+        // while carrying different expected claims and different trust roots
+        // — which is what the verdict is computed from.
+        for theirs in [ours, "99.9.9"] {
+            let note = update_check_attribution(Some(theirs))
+                .unwrap_or_else(|| panic!("a remote check is always attributed ({theirs})"));
+            assert!(note.contains(theirs), "{note}");
+            assert!(note.contains(ours), "both builds are named: {note}");
+            assert!(
+                note.contains("expected claims"),
+                "the claim expectations are the app's too, not only its version: {note}"
+            );
+        }
     }
 }
