@@ -348,19 +348,41 @@ fn code_span_body(inner: &[char]) -> Vec<char> {
 impl SpaceView {
     /// How wide the strip is drawn this frame.
     ///
-    /// [`MINIMAP_WIDTH`] at rest; [`MINIMAP_FIND_WIDTH`] while a find session
-    /// is open, because a sibling column then has a number to carry and 36px
-    /// split between two of them has no room for one. Nothing but the strip's
-    /// own painting reads it: the map's scroll image is `scale = strip_h /
-    /// total_h`, the drag maps a window-space *y*, and the page's own width
-    /// never subtracted the strip (it overlays the right gutter). So the
-    /// widening costs the layout nothing and buys the numerals.
-    pub(crate) fn minimap_width(&self) -> gpui::Pixels {
-        if self.find.is_some() {
-            MINIMAP_FIND_WIDTH
-        } else {
-            MINIMAP_WIDTH
+    /// [`MINIMAP_WIDTH`] at rest; while a find session is open it widens toward
+    /// [`MINIMAP_FIND_WIDTH`], because a sibling column then has a number to
+    /// carry and 36px split between two of them has no room for one.
+    ///
+    /// **Bounded by the gutter it overlays, because that is what makes the
+    /// widening free.** No *document* geometry reads this width — the map's
+    /// scroll image is `scale = strip_h / total_h`, the drag maps a window-space
+    /// *y*, and the page never subtracted the strip — but the strip is painted
+    /// over the page and contains the mouse while it is up, so its **footprint**
+    /// is not free at all. Beyond the reading column's own margin it covers
+    /// prose: at the narrowest window this app opens (480px), the compact layout
+    /// leaves a 40px inset either side of a 400px column, and a 96px strip
+    /// reaches 56px into the text — obscuring line ends and taking their clicks
+    /// from selection and from links. The resting 36px strip always fit, and
+    /// clamping restores exactly that property for the widened one.
+    ///
+    /// The numerals compose with the clamp rather than fighting it: a narrower
+    /// strip simply fails [`branch_count_fits`] sooner and the cells fall back
+    /// to the tint, with the exact count still in every cell's accessible name.
+    /// So the exactness surface is honest at every width — which is the half
+    /// that must not be traded away — and only the numeral is a function of the
+    /// room available. Never narrower than at rest, so the widening can only
+    /// ever add.
+    pub(crate) fn minimap_width(&self, page_width: gpui::Pixels) -> gpui::Pixels {
+        if self.find.is_none() {
+            return MINIMAP_WIDTH;
         }
+        // The margin between the reading column and the window edge — half of
+        // whatever the page has beyond its column, in either gutter scheme.
+        let gutter =
+            (page_width.as_f32() - super::layout::page_layout(page_width).body_width) / 2.0;
+        px(MINIMAP_FIND_WIDTH
+            .as_f32()
+            .min(gutter)
+            .max(MINIMAP_WIDTH.as_f32()))
     }
 
     /// Record a scroll event for the minimap's show/hide. `moved` is whether the
@@ -496,10 +518,12 @@ impl SpaceView {
         let clearance = crate::chrome::corner_clearance(window);
         // **The strip widens while a find session is open**, because a sibling
         // column has a number to carry and 36px split `flex_1` leaves no room
-        // for one. Free, and only vertical geometry is load-bearing here —
-        // nothing about the document, the 1:1 scroll image or the drag reads
-        // this width.
-        let strip_w = self.minimap_width();
+        // for one — bounded by the gutter it overlays, so it never reaches into
+        // prose (see [`SpaceView::minimap_width`]). Only vertical geometry is
+        // load-bearing for the map itself: nothing about the document, the 1:1
+        // scroll image or the drag reads this width.
+        let strip_w = self.minimap_width(page_width);
+        let rem = window.rem_size().as_f32();
         let mut container = div()
             .id("space-minimap")
             // A navigation landmark, not a plain group: the strip *is* this
@@ -582,12 +606,17 @@ impl SpaceView {
                 let screen_top = doc_y + scroll_y;
 
                 let mut row = h_flex().w_full().h(row_h).gap(MINIMAP_COL_GAP);
-                // Whether *this* level's columns can hold a numeral. Asked per
-                // level, because a level's sibling count is what divides the
-                // strip: a two-way fork carries its numbers where a five-way
-                // one falls back to the tint.
-                let numeral_fits =
-                    branch_count_fits(strip_w.as_f32(), sibs.len(), MINIMAP_COL_GAP.as_f32());
+                // Whether *this* level's cells can hold a numeral. Asked per
+                // level, because both of its dimensions are per level: the
+                // sibling count divides the strip's width, and the row's height
+                // is this post's share of the document.
+                let numeral_fits = branch_count_fits(
+                    strip_w.as_f32(),
+                    sibs.len(),
+                    MINIMAP_COL_GAP.as_f32(),
+                    row_h.as_f32(),
+                    rem,
+                );
                 for (i, sib) in sibs.iter().enumerate() {
                     let is_active = i == *active;
                     // **What an inactive sibling carries: the matches
@@ -945,28 +974,48 @@ impl SpaceView {
 /// match's position in the post, in the same wash the highlight paints.
 const MATCH_TICK_H: f32 = 2.0;
 
-/// The narrowest sibling cell a match count's **numeral** is drawn in.
+/// The narrowest sibling cell a match count's **numeral** is drawn in, as a
+/// multiple of the root font size.
 ///
-/// Two digits at the cell's `text_xs` need roughly this much before the glyphs
-/// touch the column edges, and a numeral that has to be squinted at is worse
-/// than none. Below it the cell falls back to a tint — and the count is in the
-/// cell's accessible name either way, exactly, however many branches the level
-/// has (see [`branch_count_fits`]).
-const MATCH_COUNT_MIN_CELL_W: f32 = 18.0;
+/// Two digits at the cell's `text_xs` (0.75 rem) need roughly this much before
+/// the glyphs touch the column edges, and a numeral that has to be squinted at
+/// is worse than none. **In rems rather than pixels because the type scale is
+/// the reader's choice**: a fixed pixel floor is right at one scale and wrong
+/// at the two ends of the range this app supports, and at 2.0 it would paint a
+/// numeral wider than its own column.
+const MATCH_COUNT_MIN_CELL_W_REMS: f32 = 1.3;
 
-/// Whether a level's sibling cells are wide enough for a numeral, given the
-/// strip's width and how many columns share it.
+/// The shortest **row** the numeral is drawn in, on the same terms.
+///
+/// A row's height is its post's real height scaled into the strip, so it
+/// shrinks with the conversation's length and with nothing about the strip's
+/// width: a long branch of short posts can leave a row thinner than one line of
+/// `text_xs`, and the numeral — absolutely positioned and centred in its cell —
+/// then paints outside the cell and over the levels either side of it. Width
+/// alone therefore does not decide whether a numeral fits, which is the same
+/// mistake the strip's own width made about the page (see
+/// [`SpaceView::minimap_width`]): geometry has three axes here, and the
+/// fallback has to answer to all of them.
+const MATCH_COUNT_MIN_CELL_H_REMS: f32 = 1.125;
+
+/// Whether a level's sibling cells have room for a numeral — in **both**
+/// directions, and at the reader's own type scale.
 ///
 /// Pure, so the presentation constraint the widened strip exists for is stated
-/// as arithmetic rather than as a hope: at 36px two columns get ~16px and three
-/// ~9px; at [`MINIMAP_FIND_WIDTH`] two get 46px and five still get 17.6px,
-/// which is where the tint takes over.
-pub(crate) fn branch_count_fits(strip_w: f32, columns: usize, gap: f32) -> bool {
+/// as arithmetic rather than as a hope. Where it says no the cell falls back to
+/// a tint, and the count is in the cell's accessible name either way, exactly.
+pub(crate) fn branch_count_fits(
+    strip_w: f32,
+    columns: usize,
+    gap: f32,
+    row_h: f32,
+    rem: f32,
+) -> bool {
     if columns == 0 {
         return false;
     }
-    let cell = (strip_w - gap * (columns.saturating_sub(1)) as f32) / columns as f32;
-    cell >= MATCH_COUNT_MIN_CELL_W
+    let cell_w = (strip_w - gap * (columns.saturating_sub(1)) as f32) / columns as f32;
+    cell_w >= rem * MATCH_COUNT_MIN_CELL_W_REMS && row_h >= rem * MATCH_COUNT_MIN_CELL_H_REMS
 }
 
 /// One selected-branch minimap column: a full-height column split into medium
@@ -1109,26 +1158,58 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_count_needs_the_wider_strip() {
+    fn a_branch_count_needs_room_in_both_directions() {
         // The presentation constraint the widening exists for, as arithmetic
-        // rather than as a hope. At rest the strip is 36px, and a fork of two
-        // leaves ~16px a column with a 4px gap — no numeral fits, and three
-        // leaves ~9px.
+        // rather than as a hope — and over all three axes it actually has:
+        // the strip's width, the level's sibling count, and the row's height,
+        // each measured against the reader's own type scale.
         let gap = MINIMAP_COL_GAP.as_f32();
         let rest = MINIMAP_WIDTH.as_f32();
-        assert!(!branch_count_fits(rest, 2, gap), "36px / two columns");
-        assert!(!branch_count_fits(rest, 3, gap), "…and worse with three");
+        let open = MINIMAP_FIND_WIDTH.as_f32();
+        let rem = 14.0;
+        let tall = 200.0;
+
+        // At rest a fork of two leaves ~16px a column, and three leaves ~9px.
+        assert!(
+            !branch_count_fits(rest, 2, gap, tall, rem),
+            "36px / two columns"
+        );
+        assert!(
+            !branch_count_fits(rest, 3, gap, tall, rem),
+            "…and worse with three"
+        );
         // Widened, a fork carries its numbers — and so does a four-way one
         // (96px less three 4px gaps is 21px a column).
-        let open = MINIMAP_FIND_WIDTH.as_f32();
-        assert!(branch_count_fits(open, 2, gap));
-        assert!(branch_count_fits(open, 3, gap));
-        assert!(branch_count_fits(open, 4, gap));
+        for columns in 2..=4 {
+            assert!(
+                branch_count_fits(open, columns, gap, tall, rem),
+                "{columns} columns of the widened strip"
+            );
+        }
         // Past that the tint takes over — which is why the exact count is in
         // the cell's accessible name whatever the width.
-        assert!(!branch_count_fits(open, 5, gap));
+        assert!(!branch_count_fits(open, 5, gap, tall, rem));
         // A level with no columns is not a level.
-        assert!(!branch_count_fits(open, 0, gap));
+        assert!(!branch_count_fits(open, 0, gap, tall, rem));
+
+        // **A short row refuses a numeral however wide its column is.** A
+        // row's height is its post's share of the document, so a long branch
+        // of short posts squeezes it independently of the strip — and a
+        // numeral centred in a cell shorter than one line paints outside it,
+        // over the levels either side.
+        assert!(
+            !branch_count_fits(open, 2, gap, rem * 0.9, rem),
+            "shorter than one line of the numeral's own type"
+        );
+        assert!(branch_count_fits(open, 2, gap, rem * 1.5, rem));
+
+        // **And both floors follow the type scale.** A geometry that fits at
+        // the default fails at 2.0, where the same glyphs are twice the size.
+        assert!(branch_count_fits(open, 4, gap, 20.0, 14.0));
+        assert!(
+            !branch_count_fits(open, 4, gap, 20.0, 28.0),
+            "the reader's zoom is the third axis"
+        );
     }
 
     #[test]

@@ -19398,6 +19398,20 @@ fn findable_posts() -> Vec<PostNode> {
 /// never ran. It also exercises the routing: a printable reaching the query
 /// field at all depends on the conversation's key handler yielding while the
 /// bar holds the keyboard, or type-to-compose would swallow every character.
+/// Let the cross-branch count finish.
+///
+/// `run_until_parked` cannot: the pass suspends on a real timer between chunks
+/// (`find::COUNT_YIELD`, which must not be zero — a zero duration is
+/// `Task::ready` at our gpui pin and would not suspend at all), and gpui's test
+/// scheduler expires a timer only once the clock reaches it. Advancing is
+/// therefore how a test says "let it land" — and it is what makes the
+/// *unfinished* state observable in the first place.
+fn settle_find_count(vcx: &mut VisualTestContext) {
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    vcx.run_until_parked();
+}
+
 fn run_find(
     view: &Entity<SpaceView>,
     window: AnyWindowHandle,
@@ -21555,7 +21569,22 @@ fn space_find_says_it_is_counting_rather_than_showing_a_number_on_its_way(cx: &m
         );
     });
 
+    // **And it really suspends between chunks.** `run_until_parked` runs every
+    // task the executor can run without moving the clock, so a loop that merely
+    // *looked* like it yielded — an await on a already-ready task — would come
+    // back finished here. Still counting is the proof that the frame was given
+    // up rather than held for the length of the pass.
     vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "the pass gives the frame up between chunks rather than running \
+             them all in one poll"
+        );
+        assert_eq!(v.find_space_total_for_test(), None);
+    });
+
+    settle_find_count(&mut vcx);
     view.read_with(&vcx, |v, _| {
         assert!(!v.find_counting_for_test(), "the pass lands");
         assert_eq!(
@@ -21605,35 +21634,52 @@ fn space_find_takes_its_total_back_when_the_conversation_moves(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn space_find_widens_the_map_without_moving_the_page(cx: &mut TestAppContext) {
+fn space_find_widens_the_map_only_as_far_as_the_gutter(cx: &mut TestAppContext) {
     // The strip widens while a session is open, because a sibling column then
     // has a number to carry and 36px split between two of them has no room for
-    // one. It is free: the map's scroll image is `strip_h / total_h` and the
-    // strip overlays the right gutter rather than taking width from the page,
-    // so nothing about the reading column moves — which the height cache is the
-    // witness for, being keyed on exactly that width.
+    // one — **bounded by the gutter it overlays**. The map's own geometry is
+    // vertical (`strip_h / total_h`) and the page never subtracted the strip,
+    // so no document layout reads this width; but the strip is painted over the
+    // page and contains the mouse while it is up, so a width past the reading
+    // column's margin covers prose and takes its clicks.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("s".into()));
     seed_quotable_space(&view, window, cx, cross_branch_posts());
     let mut vcx = VisualTestContext::from_window(window, cx);
-    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
-    vcx.run_until_parked();
 
-    let (rest_w, clears_before) = view.read_with(&vcx, |v, _| {
-        (v.minimap_width_for_test(), v.layout_clears_for_test())
-    });
+    // `(strip width, reading-column width, page width, height-cache clears)`.
+    let read = |vcx: &mut VisualTestContext| {
+        vcx.update(|window, cx| view.read(cx).minimap_width_for_test(window));
+        vcx.update(|window, cx| {
+            let v = view.read(cx);
+            (
+                v.minimap_width_for_test(window),
+                v.body_width_for_test(window),
+                v.page_width_for_test(window),
+                v.layout_clears_for_test(),
+            )
+        })
+    };
+
+    // A window wide enough that the gutter has room to spare.
+    vcx.simulate_resize(gpui::size(px(1000.), px(700.)));
+    vcx.run_until_parked();
+    let (rest_w, _, _, clears_before) = read(&mut vcx);
     assert_eq!(rest_w, 36.0, "the resting strip");
 
     dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
     vcx.update(|window, _| window.refresh());
     vcx.run_until_parked();
 
-    let (open_w, clears_after) = view.read_with(&vcx, |v, _| {
-        (v.minimap_width_for_test(), v.layout_clears_for_test())
-    });
+    let (wide_w, wide_body, wide_page, clears_after) = read(&mut vcx);
+    assert_eq!(
+        wide_w, 96.0,
+        "with the gutter to spare the strip takes its full width"
+    );
     assert!(
-        open_w > rest_w,
-        "the map is in a different mode and says so ({rest_w} -> {open_w})"
+        wide_w <= (wide_page - wide_body) / 2.0,
+        "…and still stands clear of the reading column \
+         (strip {wide_w}, column {wide_body} of {wide_page})"
     );
     assert_eq!(
         clears_after, clears_before,
@@ -21641,7 +21687,26 @@ fn space_find_widens_the_map_without_moving_the_page(cx: &mut TestAppContext) {
          width and was not invalidated"
     );
 
-    // …and it goes back when the bar does.
+    // The narrowest window this app opens. The compact layout leaves a 40px
+    // inset either side, so an unclamped 96px strip reached 56px into the text.
+    vcx.simulate_resize(gpui::size(px(480.), px(700.)));
+    vcx.run_until_parked();
+    let (narrow_w, narrow_body, narrow_page, _) = read(&mut vcx);
+    let gutter = (narrow_page - narrow_body) / 2.0;
+    assert!(
+        narrow_w <= gutter,
+        "the strip never reaches into prose (strip {narrow_w}, gutter {gutter})"
+    );
+    assert!(
+        narrow_w < 96.0,
+        "precondition: this window really is too narrow for the full strip"
+    );
+    assert!(
+        narrow_w >= 36.0,
+        "…and the widening can only ever add ({narrow_w})"
+    );
+
+    // …and it all goes back when the bar does.
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.close_find(window, cx);
@@ -21649,8 +21714,8 @@ fn space_find_widens_the_map_without_moving_the_page(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
     assert_eq!(
-        view.read_with(&vcx, |v, _| v.minimap_width_for_test()),
-        rest_w,
+        read(&mut vcx).0,
+        36.0,
         "closing the bar takes the width back with it"
     );
 }
@@ -21670,6 +21735,7 @@ fn space_find_does_not_recount_a_transcript_that_has_not_moved(cx: &mut TestAppC
     vcx.simulate_resize(gpui::size(px(760.), px(520.)));
     vcx.run_until_parked();
     run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
     assert_eq!(
         view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
         Some(36),
@@ -21696,4 +21762,70 @@ fn space_find_does_not_recount_a_transcript_that_has_not_moved(cx: &mut TestAppC
             "…and the total stands"
         );
     });
+}
+
+#[gpui::test]
+fn space_find_counts_a_draft_left_on_a_branch_the_reader_left(cx: &mut TestAppContext) {
+    // A tail draft is minted for **every leaf of the whole tree**, and a
+    // non-empty one is never pruned — so a reader who writes on one branch and
+    // walks to another leaves prose behind. It is in the effective tree, but
+    // not in `posts` and not in the search scope, so the cross-branch count
+    // reached neither: its matches were missing from the sibling number and
+    // from the total, and appeared the moment the reader visited that branch
+    // with nothing about the conversation having changed.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Write in the far fork's composer — a6 is that branch's leaf — and leave
+    // it there. The draft is inactive and off the selected path from here on.
+    let elsewhere = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a6"))
+        .expect("every leaf has a tail draft");
+    elsewhere.update(&mut vcx, |e, cx| {
+        e.set_value("one more kestrel, written over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    let (branch, total, account, siblings) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+                v.minimap_branch_counts_for_test(window, cx),
+            )
+        })
+    });
+
+    assert_eq!(
+        total,
+        Some(9),
+        "eight in the posts and one in the draft nobody is looking at"
+    );
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()) || branch < 9,
+        "precondition: the reader is not on that branch"
+    );
+    assert_eq!(
+        account, 9,
+        "the map still accounts for the whole space, draft included"
+    );
+    let far = siblings
+        .iter()
+        .find(|(id, _)| id == "a3")
+        .map(|(_, n)| *n)
+        .expect("the far fork is a shown sibling");
+    assert_eq!(
+        far,
+        Some(5),
+        "the sibling names what is only reachable through it: one on a3, \
+         three on a6, and the draft left on a6's composer"
+    );
 }

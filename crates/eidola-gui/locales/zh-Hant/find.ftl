@@ -10,3 +10,4 @@ find-no-results = 沒有結果
 find-total = 共 { $total } 個
 find-total-counting = 正在統計…
 find-branch-count = 此分支中還有 { $count } 個
+find-no-results-in-branch = 此分支中沒有結果

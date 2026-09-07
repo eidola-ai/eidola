@@ -1366,6 +1366,7 @@ impl SpaceView {
         // The visible branch is settled for this frame; the rest of the space
         // is the count's business, and it may take several.
         self.sync_space_count(cx);
+        self.count_retained_drafts(cx);
         // One walk of the effective tree per frame, held as an integer for the
         // readout — and `None` for as long as the pass has not finished.
         let total = self.find_space_total(tree);
@@ -1378,18 +1379,106 @@ impl SpaceView {
         self.correct_find_reveal(tree, page_width, window, cx);
     }
 
+    /// Count the drafts the search scope does not cover.
+    ///
+    /// **A draft is minted for every leaf of the whole tree, and a non-empty
+    /// one is never pruned** (`sync_tail_drafts` over `tail_parents`), so a
+    /// reader who wrote on one branch and navigated to another leaves prose
+    /// behind. It is in the effective tree — every draft is attached — but it
+    /// is not in `self.posts` and not in the scope, so without this its matches
+    /// were in neither the sibling number nor the total, and appeared the
+    /// moment the reader visited that branch with nothing about the
+    /// conversation having changed.
+    ///
+    /// **On the frame rather than in the chunked pass**, because a draft's text
+    /// moves with no transcript rebuild behind it: it has no honest place in
+    /// [`CountKey`], so it is recomputed each frame instead — bounded by one
+    /// draft per leaf, each short, each cached against its own seed like every
+    /// other projection, and an empty one (the common case) costs a comparison
+    /// and no allocation at all. The composition guard is kept for symmetry
+    /// with the scope; an unfocused editor cannot in fact be composing.
+    fn count_retained_drafts(&mut self, cx: &mut Context<Self>) {
+        let Some(query) = self.find.as_ref().and_then(|s| s.query.clone()) else {
+            return;
+        };
+        let mut empty: Vec<SharedString> = Vec::new();
+        let mut work: Vec<(SharedString, ProjectionSeed, bool)> = Vec::new();
+        for draft in &self.drafts {
+            if self
+                .find
+                .as_ref()
+                .is_some_and(|s| s.branch_nodes.contains(&draft.id))
+            {
+                continue;
+            }
+            let editor = draft.editor.read(cx);
+            if editor.value().is_empty() {
+                empty.push(draft.id.clone());
+                continue;
+            }
+            work.push((
+                draft.id.clone(),
+                ProjectionSeed {
+                    content: SharedString::from(editor.value().to_string()),
+                    embeds: EmbedMap::new(draft.embed_map()),
+                    // Every draft renders enabled, on its own branch as much as
+                    // on the selected one — the same reason `draft_scope_node`
+                    // passes a cursor rather than asking.
+                    render_cursor: Some(editor.selection()),
+                },
+                editor.is_composing(),
+            ));
+        }
+        for node in empty {
+            if let Some(session) = self.find.as_mut() {
+                session.space.counts.insert(node, 0);
+            }
+        }
+        for (node, seed, frozen) in work {
+            let cached = self
+                .find
+                .as_ref()
+                .and_then(|s| s.projections.get(&node))
+                .filter(|(built_from, _)| frozen || built_from == &seed);
+            let count = match cached {
+                Some((_, projection)) => projection.find(&query).len(),
+                // Composing with nothing cached: not searched yet, exactly as
+                // in the scope. Leaving no entry is the honest state, and the
+                // pass's own settling is untouched (drafts are not posts).
+                None if frozen => continue,
+                None => {
+                    let projection =
+                        searchable_projection(&seed.content, &seed.embeds, seed.render_cursor);
+                    self.projections_built.set(self.projections_built.get() + 1);
+                    let count = projection.find(&query).len();
+                    if let Some(session) = self.find.as_mut() {
+                        session.projections.insert(node.clone(), (seed, projection));
+                    }
+                    count
+                }
+            };
+            if let Some(session) = self.find.as_mut() {
+                session.space.counts.insert(node, count);
+            }
+        }
+    }
+
     /// The node ids a cached projection may be kept for: this frame's visible
     /// branch, **plus every post in the space**.
     ///
     /// The cache is the whole space's now, because a post off the selected
     /// branch is exactly what the cross-branch count is about — so the prune's
-    /// membership set grew to match. It is still bounded by what exists, which
-    /// is what keeps closing the bar the thing that drops every projection.
+    /// membership set grew to match, and again for the **retained drafts** the
+    /// count reaches ([`Self::count_retained_drafts`]); without them their
+    /// projections would be dropped and rebuilt on every frame. It is still
+    /// bounded by what exists, which is what keeps closing the bar the thing
+    /// that drops every projection.
     fn live_projection_nodes(&self, branch: &HashSet<SharedString>) -> HashSet<SharedString> {
         let mut live: HashSet<SharedString> = (0..self.posts.len())
             .map(|i| super::model::node_id(&self.posts, i))
             .collect();
         live.extend(branch.iter().cloned());
+        live.extend(self.drafts.iter().map(|d| d.id.clone()));
         live
     }
 
@@ -1456,13 +1545,9 @@ impl SpaceView {
         }
         let task = cx.spawn(async move |this: gpui::WeakEntity<Self>, cx| {
             loop {
-                // A zero timer is this executor's yield: it lets the frame the
-                // task was armed on finish, and under the test scheduler it
-                // expires on the next tick, so `run_until_parked` drives the
-                // whole pass with no clock to advance.
-                cx.background_executor()
-                    .timer(std::time::Duration::ZERO)
-                    .await;
+                // The suspension between chunks. See [`COUNT_YIELD`] for why it
+                // cannot be zero.
+                cx.background_executor().timer(COUNT_YIELD).await;
                 let finished = this.update(cx, |this, cx| {
                     let finished = this.count_chunk(cx);
                     // Every chunk moves a number the bar is showing — the
@@ -2232,16 +2317,6 @@ impl SpaceView {
         let input = self.find.as_ref().expect("checked").input.clone();
         let focus = self.find.as_ref().expect("checked").focus.clone();
 
-        // The readout is a `Label` whose **label and value are the same short
-        // sentence** — the notices' shape, so it starts speaking the day gpui
-        // gains `aria_live` and is perceivable by review today.
-        let readout: SharedString = match (has_query, index) {
-            (false, _) => SharedString::default(),
-            (true, Some(i)) => crate::i18n::msg::find_count(cx, i, total),
-            (true, None) => crate::i18n::msg::find_no_results(cx),
-        };
-        let steppable = total > 0;
-
         // **The cross-branch total, and its honest in-progress state.** A
         // different number from the index's: that one counts the branch the
         // reader is looking at, this one the whole conversation. While the
@@ -2249,8 +2324,8 @@ impl SpaceView {
         // `None` from [`SpaceView::find_space_total`] — and the readout says
         // *that*, because a partial sum reads on screen exactly like a settled
         // one and the previous query's total is the same lie with a longer
-        // fuse. A settled zero shows nothing at all: "No results" beside it
-        // has already said so, on both counts.
+        // fuse. A settled zero shows nothing at all: the index's own sentence
+        // beside it has already said so, on both counts.
         let space_total = self.find.as_ref().and_then(|s| s.space.total);
         let settled_total = space_total.filter(|n| *n > 0);
         let total_readout: Option<SharedString> = if !has_query {
@@ -2263,13 +2338,37 @@ impl SpaceView {
             }
         };
 
+        // The readout is a `Label` whose **label and value are the same short
+        // sentence** — the notices' shape, so it starts speaking the day gpui
+        // gains `aria_live` and is perceivable by review today.
+        //
+        // **The empty case is qualified by what the rest of the space holds.**
+        // "No results" standing beside "3 total" is a contradiction on its
+        // face, and worst of all as two `Label` nodes read one after the other,
+        // where nothing places them in the same breath. The unqualified
+        // sentence stays for the case it is true of — a query nothing anywhere
+        // matches — and, deliberately, for the frames while the pass is still
+        // walking: nothing is yet *known* to be elsewhere, and claiming a
+        // branch is the empty one of many is a settled statement the count has
+        // not made yet.
+        let readout: SharedString = match (has_query, index) {
+            (false, _) => SharedString::default(),
+            (true, Some(i)) => crate::i18n::msg::find_count(cx, i, total),
+            (true, None) if settled_total.is_some() => {
+                crate::i18n::msg::find_no_results_in_branch(cx)
+            }
+            (true, None) => crate::i18n::msg::find_no_results(cx),
+        };
+        let steppable = total > 0;
+
         // **The controls stop where the map begins.** The minimap is painted
         // after the bar, so anything under it is covered — and it *widens* while
         // a session is open, precisely so a sibling column can hold a number, so
         // a flat inset would have put the new total readout behind the strip
         // exactly when the strip grew to meet it. Read from the one accessor,
         // the two cannot overlap whatever width the map takes next.
-        let map_inset = px(self.minimap_width().as_f32() + BAR_EDGE_PAD);
+        let map_inset =
+            px(self.minimap_width(self.page_size(window).width).as_f32() + BAR_EDGE_PAD);
 
         let controls = h_flex()
             .absolute()
@@ -2501,6 +2600,26 @@ const FIND_ESTIMATED_LINE_H: f32 = 28.0;
 /// value, named because the right-hand inset is the minimap's width *plus*
 /// this rather than this alone.
 const BAR_EDGE_PAD: f32 = 12.0;
+
+/// How long the cross-branch pass waits between chunks.
+///
+/// **It cannot be zero, and a zero would be silent.** At the pinned gpui
+/// revision `BackgroundExecutor::timer` short-circuits a zero duration to
+/// `Task::ready(())` (`gpui/src/executor.rs:162`), and awaiting a ready task
+/// never returns `Pending` — so a "yield" of zero suspends nothing, and the
+/// loop runs every remaining chunk in one poll on the main executor: a long
+/// conversation freezes input until it is fully counted, which is exactly what
+/// bounding the work per yield exists to avoid. Nothing about the code would
+/// look wrong; only the wall clock would.
+///
+/// A millisecond is this codebase's shape for a real suspension (the theme's
+/// clock tick, the minimap's hide delay, the engine teardown grace), and it
+/// paces a thousand-post conversation across tens of yields rather than one
+/// long stall. It also makes the unfinished state observable: gpui's test
+/// scheduler expires a timer only once the clock reaches it, so
+/// `run_until_parked` leaves the pass suspended and a test can assert that it
+/// *is* suspended before advancing the clock to let it land.
+const COUNT_YIELD: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// How many posts one chunk of the whole-space pass will **project**.
 ///

@@ -39,3 +39,9 @@ find-total-counting = Counting…
 # in the cell where it fits and a tint stands in where it does not — this is
 # what a screen reader hears either way, and it is always the exact count.
 find-branch-count = { $count } more in this branch
+# The same readout when the visible branch holds nothing but the conversation
+# does. "No results" beside "3 total" is a contradiction on its face — and the
+# two are separate nodes, so a screen reader meets them one after the other with
+# nothing placing them in one breath. The unqualified line above stays for a
+# query nothing anywhere matches.
+find-no-results-in-branch = None on this branch

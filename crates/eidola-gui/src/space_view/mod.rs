@@ -1240,6 +1240,23 @@ impl SpaceView {
         self.drafts.last().map(|d| d.editor.clone())
     }
 
+    /// One **named** branch's tail-draft editor — the draft replying to
+    /// `parent`, whether or not it is the active one or on the selected path.
+    ///
+    /// `tail_draft_state_for_test` answers with the last draft minted, which is
+    /// the trailing one of the branch the reader is on; a test about a draft the
+    /// reader has *left behind* needs to name the branch instead.
+    #[doc(hidden)]
+    pub fn draft_editor_for_parent_for_test(
+        &self,
+        parent: &str,
+    ) -> Option<Entity<MarkdownEditorState>> {
+        self.drafts
+            .iter()
+            .find(|d| d.parent.as_deref() == Some(parent))
+            .map(|d| d.editor.clone())
+    }
+
     /// Leave the composing session (the Escape gesture), so a test can reach
     /// the "nothing is composing" state the keyboard model needs.
     #[doc(hidden)]
@@ -1614,10 +1631,17 @@ impl SpaceView {
     }
 
     /// The strip's rendered width this frame — 36px at rest, wider while the
-    /// find bar stands.
+    /// find bar stands, never past the gutter it overlays.
     #[doc(hidden)]
-    pub fn minimap_width_for_test(&self) -> f32 {
-        self.minimap_width().as_f32()
+    pub fn minimap_width_for_test(&self, window: &Window) -> f32 {
+        self.minimap_width(self.page_size(window).width).as_f32()
+    }
+
+    /// The reading column's own width this frame — what the map's clamp is
+    /// measured against.
+    #[doc(hidden)]
+    pub fn body_width_for_test(&self, window: &Window) -> f32 {
+        layout::page_layout(self.page_size(window).width).body_width
     }
 
     /// The projections this window is currently holding, by node id.

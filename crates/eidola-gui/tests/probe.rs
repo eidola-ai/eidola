@@ -8244,9 +8244,93 @@ fn the_find_bars_controls_stand_clear_of_the_map(cx: &mut TestAppContext) {
     );
     // …and the map really is the widened one, or the assertion above would be
     // measuring against a strip that never grew.
+    let strip_w = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).minimap_width_for_test(window)
+        })
+        .unwrap();
     assert!(
-        view.read_with(cx, |v, _| v.minimap_width_for_test()) > 36.0,
+        strip_w > 36.0,
         "precondition: the strip widened for the session"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **An empty branch beside a space that is not empty says which it means.**
+/// "No results" standing next to "1 total" is a contradiction on its face, and
+/// the two are separate `Label` nodes, so a screen reader meets them one after
+/// the other with nothing placing them in one breath.
+#[gpui::test]
+fn the_find_bar_qualifies_an_empty_branch_when_the_space_is_not(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    // The selected branch (a1 → a2, the first child) holds nothing; the fork
+    // beside it does.
+    let mut a2 = probe_post("a2", "still nothing to see on this fork");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = probe_post("a3", "a kestrel over on the other fork");
+    a3.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the opening question"), a2, a3], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let type_query = |cx: &mut TestAppContext, keys: &[&str]| {
+        cx.update_window(window, |_, window, cx| {
+            for key in keys {
+                window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    type_query(cx, &["k", "e", "s", "t", "r", "e", "l"]);
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "None on this branch",
+        "None on this branch",
+    );
+    assert_probe_value(
+        &entries,
+        "space/find/total",
+        gpui::Role::Label,
+        "1 total",
+        "1 total",
+    );
+
+    // …and the unqualified sentence stays for what it is true of: a query
+    // nothing anywhere matches, which shows no total beside it either.
+    type_query(cx, &["backspace"; 7]);
+    type_query(cx, &["w", "r", "e", "n"]);
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "No results",
+        "No results",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/find/total"),
+        "a settled zero shows no total at all"
     );
 
     probe::set_probes_enabled(false);
