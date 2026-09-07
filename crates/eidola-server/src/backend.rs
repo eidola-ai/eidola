@@ -311,14 +311,22 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "gpt-oss-safeguard-120b",
         name: "GPT-OSS Safeguard 120B",
+        // Upstream's own description calls it a *safety reasoning* model while
+        // publishing `reasoning: false` beside it. The flag is what a client
+        // shapes a request from, and it is what this row transcribes; the name
+        // of the model family is not a capability.
         description: "Safety reasoning model for content classification and trust & safety applications",
         context_length: 131_072,
         tool_calling: true,
-        reasoning: true,
+        reasoning: false,
         input_modalities: &[Modality::Text],
         output_modalities: &[Modality::Text],
         max_output_tokens: Some(8_192),
-        output_budget_class: OutputBudgetClass::Reasoning,
+        // Standard follows from the line above rather than from the model's
+        // name: the reasoning ladder exists because thinking spends the budget
+        // before the answer starts, which cannot happen to a model that emits
+        // no reasoning content.
+        output_budget_class: OutputBudgetClass::Standard,
         input_per_m: 0.15,
         output_per_m: 0.60,
         per_request_usd: 0.0,
@@ -362,7 +370,19 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
 pub struct UnsoldModel {
     /// The upstream model id.
     pub id: &'static str,
-    /// Why it is not sold.
+    /// The upstream route the omission is *about*, when the omission is about
+    /// a route at all: this server registers exactly one inference route, so a
+    /// model served somewhere else is not something a conversation can reach.
+    ///
+    /// `None` records an omission that would stand even if upstream served the
+    /// model where we route conversations. It is the narrower case and it must
+    /// stay narrow — every entry that is only "we have no route for that" is
+    /// route-bound, and saying so is what lets a check notice when upstream
+    /// moves the model onto the chat route and the reason below stops being
+    /// true.
+    pub upstream_route: Option<&'static str>,
+    /// Why it is not sold. Does not restate `upstream_route`; the route is
+    /// carried once, where it can be checked.
     pub reason: &'static str,
 }
 
@@ -375,41 +395,65 @@ pub struct UnsoldModel {
 /// mutes it. This list is what gives such a check teeth: anything upstream
 /// publishes that appears in neither the catalog nor here is genuinely new.
 ///
-/// Every entry today is the same call — this server exposes exactly one
+/// Almost every entry is the same call — this server exposes exactly one
 /// inference route, `POST /v1/chat/completions`, so a model that serves some
 /// other endpoint is not something a conversation can be routed to. Listing
 /// one anyway would sell a selection that can only fail at the point of use,
-/// and no downstream filter is as strong as never offering it.
+/// and no downstream filter is as strong as never offering it. Those entries
+/// name the route they are about, so the reason can be checked against the
+/// published list rather than only read. The one entry that names no route is
+/// the one whose omission has nothing to do with routing.
 pub const NOT_SOLD_UPSTREAM_MODELS: &[UnsoldModel] = &[
     UnsoldModel {
         id: "nomic-embed-text",
-        reason: "embeddings only (/v1/embeddings); no embeddings route is exposed",
+        upstream_route: Some("/v1/embeddings"),
+        reason: "embeddings only; this server exposes no embeddings route",
     },
     UnsoldModel {
         id: "whisper-large-v3-turbo",
-        reason: "transcription only (/v1/audio/transcriptions); no audio route is exposed",
+        upstream_route: Some("/v1/audio/transcriptions"),
+        reason: "transcription only; this server exposes no audio route",
     },
     UnsoldModel {
         id: "doc-upload",
-        reason: "document conversion (/v1/convert/file); no conversion route is exposed",
+        upstream_route: Some("/v1/convert/file"),
+        reason: "document conversion; this server exposes no conversion route",
     },
     UnsoldModel {
         id: "websearch",
-        reason: "an upstream-hosted tool, not a model a conversation is routed to",
+        // Deliberately not route-bound: upstream publishes this one *on* the
+        // chat route, and it is still not a model — it is a tool the upstream
+        // hosts. Routing a conversation to it is not a thing to be missed, so
+        // its presence there must not read as one.
+        upstream_route: None,
+        reason: "an upstream-hosted tool rather than a model, wherever it is served",
     },
     UnsoldModel {
         id: "qwen3-tts",
-        reason: "speech synthesis (/v1/audio/speech); no audio route is exposed",
+        upstream_route: Some("/v1/audio/speech"),
+        reason: "speech synthesis; this server exposes no audio route",
     },
     UnsoldModel {
         id: "voxtral-tts",
-        reason: "speech synthesis (/v1/audio/speech); no audio route is exposed",
+        upstream_route: Some("/v1/audio/speech"),
+        reason: "speech synthesis; this server exposes no audio route",
     },
     UnsoldModel {
         id: "voxtral-mini-4b-realtime",
-        reason: "realtime sessions (/v1/realtime); no realtime route is exposed",
+        upstream_route: Some("/v1/realtime"),
+        reason: "realtime sessions; this server exposes no realtime route",
     },
 ];
+
+/// The two lists above against the published list they were transcribed from.
+///
+/// Test-only, and its live half is `#[ignore]`d: the fetch belongs to a
+/// scheduled workflow rather than to `cargo test`, because upstream moving a
+/// value is not something a pull request introduced. It sits in this module's
+/// tree so it reads `MODEL_CATALOG` and `NOT_SOLD_UPSTREAM_MODELS` themselves
+/// rather than a restatement of them.
+#[cfg(test)]
+mod catalog_drift;
 
 /// Convert USD per million tokens to scaled integer credits, applying markup.
 ///
