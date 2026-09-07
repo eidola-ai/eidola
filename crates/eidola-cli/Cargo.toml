@@ -15,7 +15,19 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 eidola-app-core = { path = "../eidola-app-core" }
 open = "5"
-tokio = { version = "1", features = ["sync", "macros", "time", "signal"] }
+serde = "1"
+serde_json = "1"
+# `net` + `io-util` are the control-socket client (`client.rs`); `rt` is the
+# runtime it runs on when there is no core to borrow one from.
+tokio = { version = "1", features = [
+    "sync",
+    "macros",
+    "time",
+    "signal",
+    "net",
+    "io-util",
+    "rt",
+] }
 
 # `faccessat(X_OK, AT_EACCESS)` — "can the installing user execute this?", the
 # question a mode-bit mask cannot answer. Already in the workspace graph.
@@ -24,5 +36,9 @@ rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 # `service::install` writes into an XDG config home; the unit tests point it
-# at a temp dir rather than the developer's real ~/.config.
+# at a temp dir rather than the developer's real ~/.config. The client tests
+# put their sockets there too.
 tempfile = "3"
+# `start_paused` — the handshake deadline is asserted by advancing the clock,
+# not by waiting out five real seconds.
+tokio = { version = "1", features = ["test-util"] }

@@ -377,8 +377,65 @@ pub struct CheckContext {
     pub ci_issuer: String,
     /// The expected structural claim set (see module docs).
     pub expected_claims: Vec<Claim>,
-    /// A previously recorded "treat as update" decision, if any.
-    pub accepted: Option<AcceptedClaims>,
+}
+
+/// What a completed check found, **before** any decision that depends on
+/// persisted state.
+///
+/// A check is a network round trip and a pile of cryptography, and the user
+/// can act during it: "treat as update" may land while the request that will
+/// report on that very manifest is still in the air. Deciding acceptance
+/// inside the check means deciding it against the state as it was when the
+/// request went out, and a check that then reports `ClaimsChanged` for a
+/// manifest the user has just accepted puts the warning and the button back
+/// while the acceptance sits recorded beside it. So the network phase ends
+/// here, holding what it *found*, and [`classify`] turns that into a verdict
+/// against the acceptance that exists when it lands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckOutcome {
+    /// A verdict no acceptance can change: nothing to update to, nothing
+    /// verifiable, or nothing reached at all.
+    Settled(UpdateCheckResult),
+    /// The release verified and its claims were compared. Whether that
+    /// comparison is *tolerated* is the only open question, and it is a
+    /// question about persisted state.
+    Compared {
+        release: VerifiedRelease,
+        comparison: ClaimsComparison,
+    },
+}
+
+/// Turn what a check found into the verdict to show, given the acceptance on
+/// record **now**.
+///
+/// Pure, and deliberately so: this is the whole decision that depends on
+/// state, it needs nothing async, and keeping it out of the network phase is
+/// what lets a caller hold it until it has the current state in hand. An
+/// empty diff is an ordinary update regardless of acceptance; a non-empty one
+/// is tolerated only by an acceptance naming this exact version *and*
+/// manifest hash.
+pub fn classify(outcome: CheckOutcome, accepted: Option<&AcceptedClaims>) -> UpdateCheckResult {
+    let (mut release, comparison) = match outcome {
+        CheckOutcome::Settled(result) => return result,
+        CheckOutcome::Compared {
+            release,
+            comparison,
+        } => (release, comparison),
+    };
+    release.claims_accepted = !comparison.deltas.is_empty()
+        && accepted.is_some_and(|a| {
+            a.version == release.version
+                && a.manifest_sha256
+                    .eq_ignore_ascii_case(&release.manifest_sha256)
+        });
+    if comparison.deltas.is_empty() || release.claims_accepted {
+        UpdateCheckResult::UpdateAvailable { release }
+    } else {
+        UpdateCheckResult::ClaimsChanged {
+            release,
+            comparison,
+        }
+    }
 }
 
 impl CheckContext {
@@ -391,7 +448,6 @@ impl CheckContext {
             ci_identity_pattern: trust_root::EXPECTED_CI_IDENTITY_PATTERN.to_string(),
             ci_issuer: trust_root::EXPECTED_CI_ISSUER.to_string(),
             expected_claims: expected_claims(),
-            accepted: None,
         }
     }
 }
@@ -423,18 +479,33 @@ struct GhAsset {
 
 /// Run one update check. Infallible by design: every failure mode maps to
 /// an [`UpdateCheckResult`] variant per the matrix in the module docs.
-pub async fn check_for_update(client: &reqwest::Client, ctx: &CheckContext) -> UpdateCheckResult {
+/// Run one check and classify it against `accepted` — [`check_outcome`] and
+/// [`classify`] in one step, for a caller with nothing to reconcile against.
+///
+/// A caller that persists state should use the two halves instead and take
+/// the acceptance from the state it is about to write, since anything read
+/// before the round trip is a fact about a moment the user may have moved on
+/// from. See `Inner::run_update_check`.
+pub async fn check_for_update(
+    client: &reqwest::Client,
+    ctx: &CheckContext,
+    accepted: Option<&AcceptedClaims>,
+) -> UpdateCheckResult {
+    classify(check_outcome(client, ctx).await, accepted)
+}
+
+pub async fn check_outcome(client: &reqwest::Client, ctx: &CheckContext) -> CheckOutcome {
     // ── discover: the release marked `latest` ───────────────────────────
     let release = match fetch_latest_release(client, &ctx.feed_url).await {
         Ok(Some(r)) => r,
         // 404: no release is marked `latest` (the human-attested marker
         // hasn't been applied to anything). Not an update, not an error.
         Ok(None) => {
-            return UpdateCheckResult::UpToDate {
+            return CheckOutcome::Settled(UpdateCheckResult::UpToDate {
                 latest_version: None,
-            };
+            });
         }
-        Err(message) => return UpdateCheckResult::CheckFailed { message },
+        Err(message) => return CheckOutcome::Settled(UpdateCheckResult::CheckFailed { message }),
     };
 
     // ── version gate: compare semver against the `latest` tag ───────────
@@ -445,34 +516,36 @@ pub async fn check_for_update(client: &reqwest::Client, ctx: &CheckContext) -> U
         Err(e) => {
             // A malformed tag is a feed anomaly, not a crypto verdict —
             // we never reached any signed material.
-            return UpdateCheckResult::CheckFailed {
+            return CheckOutcome::Settled(UpdateCheckResult::CheckFailed {
                 message: format!("latest release tag `{tag}` is not semver: {e}"),
-            };
+            });
         }
     };
     let installed = match semver::Version::parse(&ctx.installed_version) {
         Ok(v) => v,
         Err(e) => {
-            return UpdateCheckResult::CheckFailed {
+            return CheckOutcome::Settled(UpdateCheckResult::CheckFailed {
                 message: format!(
                     "installed version `{}` is not semver: {e}",
                     ctx.installed_version
                 ),
-            };
+            });
         }
     };
     if latest <= installed {
-        return UpdateCheckResult::UpToDate {
+        return CheckOutcome::Settled(UpdateCheckResult::UpToDate {
             latest_version: Some(version_str),
-        };
+        });
     }
 
     // From here on, a newer `latest` exists — every failure is a security
     // state, never silence.
-    let unverifiable = |reason: String| UpdateCheckResult::Unverifiable {
-        version: version_str.clone(),
-        tag: tag.clone(),
-        reason,
+    let unverifiable = |reason: String| {
+        CheckOutcome::Settled(UpdateCheckResult::Unverifiable {
+            version: version_str.clone(),
+            tag: tag.clone(),
+            reason,
+        })
     };
 
     // ── fetch the two verifier assets ────────────────────────────────────
@@ -481,7 +554,7 @@ pub async fn check_for_update(client: &reqwest::Client, ctx: &CheckContext) -> U
         Ok(bytes) => bytes,
         Err(FetchAssetError::Security(reason)) => return unverifiable(reason),
         Err(FetchAssetError::Transient(message)) => {
-            return UpdateCheckResult::CheckFailed { message };
+            return CheckOutcome::Settled(UpdateCheckResult::CheckFailed { message });
         }
     };
     let bundle_bytes =
@@ -489,7 +562,7 @@ pub async fn check_for_update(client: &reqwest::Client, ctx: &CheckContext) -> U
             Ok(bytes) => bytes,
             Err(FetchAssetError::Security(reason)) => return unverifiable(reason),
             Err(FetchAssetError::Transient(message)) => {
-                return UpdateCheckResult::CheckFailed { message };
+                return CheckOutcome::Settled(UpdateCheckResult::CheckFailed { message });
             }
         };
 
@@ -544,11 +617,6 @@ pub async fn check_for_update(client: &reqwest::Client, ctx: &CheckContext) -> U
     let attested = attested_claims(&manifest_value);
     let deltas = compare_claims(&ctx.expected_claims, &attested);
 
-    let claims_accepted = !deltas.is_empty()
-        && ctx.accepted.as_ref().is_some_and(|a| {
-            a.version == version_str && a.manifest_sha256.eq_ignore_ascii_case(&manifest_sha256)
-        });
-
     let release = VerifiedRelease {
         version: version_str.clone(),
         tag: tag.clone(),
@@ -557,20 +625,19 @@ pub async fn check_for_update(client: &reqwest::Client, ctx: &CheckContext) -> U
         ci_identity: verified.ci_identity,
         rekor_log_index: verified.rekor_log_index,
         manifest_sha256,
-        claims_accepted,
+        // Not yet knowable here: acceptance is a fact about persisted state,
+        // and this function is the half that must not read it. `classify`
+        // fills it in.
+        claims_accepted: false,
     };
 
-    if deltas.is_empty() || claims_accepted {
-        UpdateCheckResult::UpdateAvailable { release }
-    } else {
-        UpdateCheckResult::ClaimsChanged {
-            release,
-            comparison: ClaimsComparison {
-                expected: ctx.expected_claims.clone(),
-                attested,
-                deltas,
-            },
-        }
+    CheckOutcome::Compared {
+        release,
+        comparison: ClaimsComparison {
+            expected: ctx.expected_claims.clone(),
+            attested,
+            deltas,
+        },
     }
 }
 

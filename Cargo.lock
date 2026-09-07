@@ -2685,6 +2685,8 @@ dependencies = [
  "eidola-app-core",
  "open",
  "rustix 1.1.4",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

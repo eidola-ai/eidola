@@ -597,7 +597,26 @@ pub struct AccountShowResult {
     pub created_at: i64,
 }
 
+/// A minted checkout link, and the credentials the mint actually ran under.
+///
+/// **The identity is read where the request is signed, not where it is
+/// asked for.** A checkout is a network round trip, and the account can be
+/// replaced and replaced back inside it — so a caller comparing what it saw
+/// before with what it sees after can find them equal and still be holding a
+/// link minted for a third thing in between. Only the process that signed
+/// the request knows which credentials it used, so it says.
 #[derive(Clone, Debug)]
+pub struct CheckoutMint {
+    /// The URL to open.
+    pub url: String,
+    /// [`config::account_fingerprint`] of the credentials this link was
+    /// minted under, taken at the moment the request was signed.
+    pub minted_for: String,
+}
+
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PriceInfo {
     pub id: String,
     pub product_name: String,
@@ -641,13 +660,17 @@ pub struct SubscriptionInfo {
     pub current_period_end: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BalancesResult {
     pub available: i64,
     pub pools: Vec<BalancePoolInfo>,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BalancePoolInfo {
     pub amount: i64,
     pub source: String,
@@ -663,7 +686,9 @@ pub struct CredentialInfo {
     pub generation: i64,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InFlightCredentialInfo {
     pub nonce: String,
     pub credits: i64,
@@ -942,7 +967,7 @@ pub struct SpaceInfo {
 
 /// The conversation a delegated room was opened from, as a listing row carries
 /// it: enough to name it and to open it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpaceParent {
     pub space_id: String,
     /// `None` for a conversation that was never named — the presentation layer
@@ -1465,7 +1490,9 @@ pub fn quote_snippet(block_text: &str, range_start: i64, range_end: i64) -> Opti
     Some(&block_text[start..end])
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub context_length: u64,
@@ -1501,7 +1528,7 @@ pub struct ModelInfo {
 /// away from every model on every such backend at once — a metadata rollout
 /// that looks exactly like a fleet-wide outage. `unwrap_or(false)` on any of
 /// these is a bug, not a shortcut.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelCapabilities {
     /// Whether the model accepts a `tools` request field.
     pub tool_calling: Option<bool>,
@@ -1514,7 +1541,7 @@ pub struct ModelCapabilities {
 }
 
 /// A kind of content a model accepts or produces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Modality {
     Text,
     Image,
@@ -1543,7 +1570,7 @@ impl Modality {
 /// person: what a request asks for must be a function of the model and the
 /// turn's own structure, never of anything this installation happens to know
 /// about its user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OutputBudgetClass {
     /// A model that answers directly.
     Standard,
@@ -1569,7 +1596,9 @@ impl OutputBudgetClass {
 /// `credential_lifecycle` view: `active` (spendable), `spending` (a spend
 /// proof is in flight / unsettled), `spent` (settled into a successor), or
 /// `expired` (issuer key past its expiry).
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CredentialLifecycleInfo {
     pub nonce: String,
     pub credits: i64,
@@ -1833,9 +1862,14 @@ struct Inner {
     config_path: PathBuf,
     data_dir: PathBuf,
     db: tokio::sync::OnceCell<turso::Database>,
-    /// Cached update-check state (last result + accepted-claims choice),
-    /// lazily loaded from `<data_dir>/update-state.json` on first access.
-    update_state: Mutex<Option<updates::UpdateState>>,
+    /// Cached update-check state and the ordering that governs writes to it
+    /// (see [`UpdateStateCell`]), lazily loaded from
+    /// `<data_dir>/update-state.json` on first access.
+    update_state: Mutex<UpdateStateCell>,
+    /// Hands each check a number as it **starts**, so a completion can tell
+    /// whether a check begun after it has already answered. Process-local and
+    /// meaningless anywhere else, which is why it is not persisted.
+    update_checks_started: std::sync::atomic::AtomicU64,
     /// Latch so `start_update_polling` spawns at most one poll loop.
     update_polling: std::sync::atomic::AtomicBool,
     /// Invalidation bus — emits a [`Change`] after every durable commit.
@@ -1853,6 +1887,10 @@ struct Inner {
     /// pool), or waits bounded for an in-flight refund. Held only around the
     /// provisioning step in `prepare_turn`; the HTTP request runs outside it.
     spend_gate: tokio::sync::Mutex<()>,
+    /// The holds this process has a request in flight for — see
+    /// [`LiveSpends`]. Recovery consults it so it never refunds a credential
+    /// that is `spending` because it is *being spent right now*.
+    live_spends: LiveSpends,
     /// Serializes each backend's configuration writes with the cleanup that
     /// belongs to them (`backends::Inner::lock_backend_config`). Keyed by
     /// backend id, so unrelated backends never wait on each other.
@@ -2147,52 +2185,142 @@ impl Inner {
 
 // --- Update checking ----------------------------------------------------------
 
+/// The update state, and the one fact that decides who may write it.
+///
+/// `applied_check` is not part of the persisted state and never travels with
+/// it: it numbers *this process's* checks, and a number from another process
+/// or another run would be a comparison between two things that were never
+/// ordered. It lives here rather than beside here because it is read and
+/// written in the same breath as the state it orders, under the same lock —
+/// an ordering rule kept in a second lock is an ordering rule waiting to be
+/// taken in the wrong order.
+#[derive(Default)]
+struct UpdateStateCell {
+    /// Lazily loaded from disk on first access.
+    state: Option<updates::UpdateState>,
+    /// The newest check, by start order, whose completion has been recorded.
+    /// `0` before any check has completed.
+    applied_check: u64,
+}
+
 impl Inner {
     /// Cached-or-loaded copy of the persisted update state.
     fn update_state_snapshot(&self) -> updates::UpdateState {
         let mut guard = self.update_state.lock().expect("update_state lock");
         guard
+            .state
             .get_or_insert_with(|| updates::load_state(&self.data_dir))
             .clone()
     }
 
-    /// Replace the cached state and persist it. A disk write failure is
-    /// logged, not fatal — the in-memory state stays authoritative for the
-    /// rest of the run.  Emits [`Change::UpdateState`] after the write.
-    fn store_update_state(&self, state: updates::UpdateState) {
-        if let Err(e) = updates::save_state(&self.data_dir, &state) {
-            eprintln!("warning: failed to persist update-check state: {e}");
-        }
-        *self.update_state.lock().expect("update_state lock") = Some(state);
+    /// Change the persisted update state, **under the lock, in place**.
+    ///
+    /// The one way this state is written, and that is the point rather than
+    /// tidiness. Every interesting mutation here is a read-modify-write, and
+    /// the rule the state exists to keep — *a standing security alert
+    /// survives later failures* ([`updates::UpdateState::absorb`]) — is a
+    /// decision about what is there **now**. Read a copy, do slow work, write
+    /// the copy back, and that decision is made against a past that another
+    /// writer has already moved on from: the alert it could not see is the
+    /// alert it silently clears. So `f` is handed the current state and its
+    /// answer is persisted before the lock is released, and no caller
+    /// topology — a poll and a manual check, an app and a command-line
+    /// client, an acceptance landing mid-check — can interleave into a lost
+    /// write. A disk failure is logged, not fatal: the in-memory state stays
+    /// authoritative for the rest of the run.
+    ///
+    /// [`Change::UpdateState`] is emitted after the lock is released, so a
+    /// subscriber that reads back cannot deadlock against the write that
+    /// woke it.
+    fn update_state_with<T>(&self, f: impl FnOnce(&mut updates::UpdateState, &mut u64) -> T) -> T {
+        let answer = {
+            let mut guard = self.update_state.lock().expect("update_state lock");
+            let cell = &mut *guard;
+            let state = cell
+                .state
+                .get_or_insert_with(|| updates::load_state(&self.data_dir));
+            let answer = f(state, &mut cell.applied_check);
+            if let Err(e) = updates::save_state(&self.data_dir, state) {
+                eprintln!("warning: failed to persist update-check state: {e}");
+            }
+            answer
+        };
         self.bus.emit(Change::UpdateState);
+        answer
     }
 
     /// Run one check and fold it into the persisted state (a `CheckFailed`
     /// never clears a standing security state — see
     /// [`updates::UpdateState::absorb`]). Returns the *effective* snapshot:
     /// what the UI should now show.
+    ///
+    /// **A verdict applies only if no check begun after it has already
+    /// observed the feed.** Completion order is not start order — two checks
+    /// can observe genuinely different, genuinely valid feed states, and the
+    /// slower request's picture is the older one.
+    /// [`updates::UpdateState::absorb`] holds an alert against a later
+    /// *failure*; it cannot hold one against a stale `UpToDate`, which is not
+    /// wrong, merely from before. So each check takes a number as it starts,
+    /// and a completion is ignored outright if a higher-numbered one has
+    /// landed — but **only a check that reached the feed raises that mark**,
+    /// because a failure saw nothing and so makes nothing older.
+    ///
+    /// **Nothing about the state crosses the network wait — not even one
+    /// field of it.** The round trip ends in a decision-free
+    /// [`updates::CheckOutcome`], and both decisions that depend on state are
+    /// made under the lock at the end: whether the release's claims count as
+    /// accepted ([`updates::classify`]) and whether this verdict may replace
+    /// the standing one ([`updates::UpdateState::absorb`]). A check that
+    /// carried either answer across its round trip would be answering about a
+    /// moment the user has since moved on from — accepting "treat as update"
+    /// while the request reporting on that very manifest is in the air is one
+    /// keystroke, and the reward used to be the warning coming straight back.
     async fn run_update_check(&self) -> updates::UpdateCheckSnapshot {
-        let mut state = self.update_state_snapshot();
+        let started = self
+            .update_checks_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         let feed_url = self.load_config().update_feed_url();
 
-        let result = match updater::build_http_client() {
+        let outcome = match updater::build_http_client() {
             Ok(client) => {
-                let mut ctx = updates::CheckContext::new(feed_url, env!("CARGO_PKG_VERSION"));
-                ctx.accepted = state.accepted.clone();
-                updates::check_for_update(&client, &ctx).await
+                let ctx = updates::CheckContext::new(feed_url, env!("CARGO_PKG_VERSION"));
+                updates::check_outcome(&client, &ctx).await
             }
-            Err(e) => updates::UpdateCheckResult::CheckFailed {
+            Err(e) => updates::CheckOutcome::Settled(updates::UpdateCheckResult::CheckFailed {
                 message: format!("constructing HTTPS client: {e}"),
-            },
+            }),
         };
 
-        state.absorb(updates::UpdateCheckSnapshot {
-            checked_at_ms: now_ms(),
-            result,
-        });
-        let effective = state.last.clone().expect("absorb always leaves a snapshot");
-        self.store_update_state(state);
-        effective
+        let checked_at_ms = now_ms();
+        self.update_state_with(|state, applied| {
+            if started < *applied {
+                // A check begun after this one has already answered, so this
+                // one is describing the feed as it was before that. Not a
+                // failure and not wrong — just superseded, and the caller is
+                // told what stands rather than what it happened to see.
+                return state
+                    .last
+                    .clone()
+                    .expect("a check has applied, so a snapshot stands");
+            }
+            let result = updates::classify(outcome, state.accepted.as_ref());
+            // **A failed request made no observation, so it makes nothing
+            // older.** It reached no feed and drew no conclusion; recording
+            // it as the newest thing known would let a quick failure silence
+            // a slower check that actually saw something — a real security
+            // alert discarded for having started first, which is a strictly
+            // worse outcome than the staleness the marker exists to prevent.
+            // Only a verdict drawn from a feed advances it.
+            if !matches!(result, updates::UpdateCheckResult::CheckFailed { .. }) {
+                *applied = started;
+            }
+            state.absorb(updates::UpdateCheckSnapshot {
+                checked_at_ms,
+                result,
+            });
+            state.last.clone().expect("absorb always leaves a snapshot")
+        })
     }
 
     fn accept_changed_claims(
@@ -2200,29 +2328,29 @@ impl Inner {
         version: String,
         manifest_sha256: String,
     ) -> Result<(), AppError> {
-        let mut state = self.update_state_snapshot();
-        state.accepted = Some(updates::AcceptedClaims {
-            version: version.clone(),
-            manifest_sha256: manifest_sha256.clone(),
-            accepted_at_ms: now_ms(),
+        let accepted_at_ms = now_ms();
+        self.update_state_with(|state, _applied| {
+            state.accepted = Some(updates::AcceptedClaims {
+                version: version.clone(),
+                manifest_sha256: manifest_sha256.clone(),
+                accepted_at_ms,
+            });
+
+            // If the standing result is the claims-changed release being
+            // accepted, rewrite it as an available update so UIs reflect the
+            // choice without waiting for the next poll.
+            if let Some(snapshot) = state.last.as_mut()
+                && let updates::UpdateCheckResult::ClaimsChanged { release, .. } = &snapshot.result
+                && release.version == version
+                && release
+                    .manifest_sha256
+                    .eq_ignore_ascii_case(&manifest_sha256)
+            {
+                let mut release = release.clone();
+                release.claims_accepted = true;
+                snapshot.result = updates::UpdateCheckResult::UpdateAvailable { release };
+            }
         });
-
-        // If the standing result is the claims-changed release being
-        // accepted, rewrite it as an available update so UIs reflect the
-        // choice without waiting for the next poll.
-        if let Some(snapshot) = state.last.as_mut()
-            && let updates::UpdateCheckResult::ClaimsChanged { release, .. } = &snapshot.result
-            && release.version == version
-            && release
-                .manifest_sha256
-                .eq_ignore_ascii_case(&manifest_sha256)
-        {
-            let mut release = release.clone();
-            release.claims_accepted = true;
-            snapshot.result = updates::UpdateCheckResult::UpdateAvailable { release };
-        }
-
-        self.store_update_state(state);
         Ok(())
     }
 }
@@ -2817,11 +2945,16 @@ impl Inner {
             .collect())
     }
 
-    async fn account_checkout(&self, price_id: &str) -> Result<String, AppError> {
+    async fn account_checkout(&self, price_id: &str) -> Result<CheckoutMint, AppError> {
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
+        // Taken from the very config the request is about to be signed with,
+        // so what comes back is bound to the credentials that produced it
+        // rather than to whatever a caller happened to read.
+        let minted_for = config::account_fingerprint(&cfg)
+            .expect("credentials just required are credentials to name");
 
         let client = self.build_client(&eidola, None).await?;
         let resp = client
@@ -2840,7 +2973,10 @@ impl Inner {
                 message: format!("failed to parse response: {e}"),
             })?;
 
-        Ok(checkout.checkout_url)
+        Ok(CheckoutMint {
+            url: checkout.checkout_url,
+            minted_for,
+        })
     }
 
     /// The account's subscription standing, read live from the server.
@@ -3321,7 +3457,26 @@ impl Inner {
         let rows = db::list_spending_credentials(&db_conn).await?;
         let mut recovered = Vec::new();
 
+        // **A hold a request is still flying with is not a stranded hold.**
+        // Recovery asks the server to refund a spend it has no record of, and
+        // the server takes an unrecorded nullifier as proof the request never
+        // arrived: it records it and refunds. Do that to a turn that is about
+        // to arrive and the turn's own request is then refused as a replay —
+        // the answer lost, and lost *because* somebody asked for their money
+        // back on its behalf. Embedded, this could not happen: the profile's
+        // one writer is this process and it is not taking a turn. Answering
+        // for the profile removes that accident, so the exclusion is stated
+        // rather than inherited from who happens to be running.
+        let live = self
+            .live_spends
+            .lock()
+            .expect("live spends lock poisoned")
+            .clone();
+
         for row in rows {
+            if live.contains(&row.pre_credential_id) {
+                continue;
+            }
             let spend_proof_cbor = row.spend_proof_data;
 
             let spend_proof = match SpendProof::<128>::from_cbor(&spend_proof_cbor) {
@@ -6976,6 +7131,19 @@ impl Inner {
             message: format!("failed to encode spend proof: {e}"),
         })?;
         let pre_cred_id = Uuid::now_v7().to_string();
+        // Claimed **before** the row that makes this credential `spending`,
+        // so there is no instant where the database says "in flight" and this
+        // process has not yet said whose flight it is. Recovery reads the two
+        // in the other order, so the overlap can only ever protect a live
+        // hold, never expose one.
+        self.live_spends
+            .lock()
+            .expect("live spends lock poisoned")
+            .insert(pre_cred_id.clone());
+        let live = LiveSpend {
+            set: Arc::clone(&self.live_spends),
+            pre_cred_id: pre_cred_id.clone(),
+        };
         db::insert_pre_credential_refund(
             db_conn,
             &pre_cred_id,
@@ -7011,6 +7179,7 @@ impl Inner {
                 spend_proof,
                 pre_refund,
                 pre_cred_id,
+                _live: live,
             },
             auth_value,
         ))
@@ -8705,6 +8874,24 @@ impl AppCore {
         &self.inner.data_dir
     }
 
+    /// The config root this core composes its profile from — the directory
+    /// holding `config.toml`.
+    ///
+    /// A profile is the *pair* of roots, and the two are resolved from
+    /// independent environment variables, so the data directory alone does
+    /// not name it. Exposed for the same reason as [`AppCore::data_dir`]: the
+    /// process answering for the profile ([`crate::ipc`]) has to be able to
+    /// state which profile that is.
+    pub fn config_dir(&self) -> &std::path::Path {
+        // Always `<config_dir>/config.toml`, so the parent always exists as a
+        // path; the fallback keeps the accessor total rather than panicking
+        // over a shape this type constructs itself.
+        self.inner
+            .config_path
+            .parent()
+            .unwrap_or(&self.inner.config_path)
+    }
+
     /// Register a tool the turn loop may call (see [`tools`]).
     ///
     /// The registry starts **empty**, and an empty registry sends no `tools`
@@ -9202,11 +9389,13 @@ impl AppCore {
                 config_path: config_dir.join("config.toml"),
                 data_dir,
                 db: tokio::sync::OnceCell::new(),
-                update_state: Mutex::new(None),
+                update_state: Mutex::new(UpdateStateCell::default()),
+                update_checks_started: std::sync::atomic::AtomicU64::new(0),
                 update_polling: std::sync::atomic::AtomicBool::new(false),
                 bus,
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
+                live_spends: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 backend_config_gates: Mutex::new(std::collections::HashMap::new()),
                 #[cfg(feature = "test-support")]
                 backend_config_pause: Mutex::new(None),
@@ -9799,7 +9988,7 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    pub async fn account_checkout(&self, price_id: String) -> Result<String, AppError> {
+    pub async fn account_checkout(&self, price_id: String) -> Result<CheckoutMint, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.account_checkout(&price_id).await })
@@ -11973,6 +12162,38 @@ struct TurnPrep {
     bus: BroadcastSource,
 }
 
+/// The pre-credential ids this process is spending **right now**.
+///
+/// A credential is `spending` in the database from the instant its
+/// pending-refund row is written until its successor is minted, and that
+/// covers two very different situations: a request in flight, and a hold
+/// stranded by a process that died mid-turn. Only the second is recoverable,
+/// and the database cannot tell them apart — the difference is whether some
+/// process still has the request going, which is knowledge only that process
+/// has. This is that knowledge, written down.
+type LiveSpends = Arc<Mutex<std::collections::HashSet<String>>>;
+
+/// One entry in [`LiveSpends`], held for exactly as long as the spend it
+/// names.
+///
+/// Removed on drop rather than at any particular success or failure, because
+/// every way a turn can end has to remove it: a hold whose turn was abandoned
+/// **is** stranded and must become recoverable again, and a hold whose turn is
+/// still running must not. Dropping is the one event both share.
+struct LiveSpend {
+    set: LiveSpends,
+    pre_cred_id: String,
+}
+
+impl Drop for LiveSpend {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .expect("live spends lock poisoned")
+            .remove(&self.pre_cred_id);
+    }
+}
+
 /// The credential-spend half of a prepared (remote) turn: the spendable
 /// credential, the proof materials, and the pending-refund row id.
 struct SpendPrep {
@@ -11982,6 +12203,10 @@ struct SpendPrep {
     spend_proof: SpendProof<128>,
     pre_refund: PreRefund,
     pre_cred_id: String,
+    /// Marks this hold as one a request is in flight for, for as long as
+    /// these materials exist. `SpendPrep` is the only in-memory handle to a
+    /// hold, so its lifetime *is* the window recovery must stay out of.
+    _live: LiveSpend,
 }
 
 /// Persist-time verdict for a mechanical report. Ordinary turns skip the

@@ -129,6 +129,41 @@ pub enum LightCharacter {
     Warm,
 }
 
+/// A stable, non-revealing name for the credentials a profile holds **right
+/// now** — `None` when no account is configured.
+///
+/// Two questions get confused if only the account id is compared: "is this
+/// the same account?" and "is this the same credential pair?". A profile can
+/// be reset and reconfigured with the same id and a different secret, so the
+/// id alone cannot tell a caller that what it is holding was minted under
+/// what is here now. Folding both together answers the second question,
+/// which is the one that matters to anything binding a result to the
+/// credentials that produced it.
+///
+/// **The secret itself never leaves the profile.** This is a one-way digest
+/// over a server-generated, high-entropy secret, and it is compared, never
+/// reversed — which is what lets the answer travel to a caller that has no
+/// business holding credentials.
+pub fn account_fingerprint(cfg: &Config) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let (id, secret) = (cfg.account_id.as_ref()?, cfg.account_secret.as_ref()?);
+    let mut hasher = Sha256::new();
+    // Domain-separated, and length-prefixed so no two different pairs can
+    // hash the same bytes by moving the boundary between them.
+    hasher.update(b"eidola.account-fingerprint.v1\0");
+    hasher.update((id.len() as u64).to_be_bytes());
+    hasher.update(id.as_bytes());
+    hasher.update((secret.len() as u64).to_be_bytes());
+    hasher.update(secret.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    Some(out)
+}
+
 /// Returns the default config file path: `<config_dir>/eidola/config.toml`.
 pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("eidola").join("config.toml"))
