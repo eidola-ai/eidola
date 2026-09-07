@@ -20195,6 +20195,95 @@ fn space_find_reveals_a_match_in_the_off_branch_composer(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn space_find_does_not_count_the_floating_composer_as_elsewhere(cx: &mut TestAppContext) {
+    // **The floating composer is on the visible side of the exactness
+    // equation.** The active draft is in scope whatever branch it belongs to,
+    // because it floats over whatever is showing — that is the whole reason
+    // `MatchReveal::Composer` exists. But `effective_tree` still attaches it
+    // beneath its own inactive sibling, so the sibling's subtree aggregate
+    // reached it too: a query matching only that draft read "1 of 1" and
+    // "1 total" beside a map cell announcing "1 more in this branch" — a match
+    // that is not *more*, it is the one on screen, and the reader was invited
+    // to go and look for it where it already is.
+    //
+    // "Reachable only through this branch" has to mean **not currently
+    // visible**, so the number the map carries excludes it and the visible
+    // side takes it — which is what keeps the total, the index and the map
+    // describing one conversation.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut left = fixture_assistant_post("a2", "the left branch, which the page is showing");
+    left.parent_action_id = Some("a1".into());
+    let mut right = fixture_assistant_post("a3", "the right branch, off to one side");
+    right.parent_action_id = Some("a1".into());
+    space.update(cx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", "the fork"), left, right], cx)
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    let right_index = view
+        .read_with(&vcx, |v, _| v.draft_parents_for_test())
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a3"))
+        .expect("the right branch has a tail draft");
+    // Activating a draft does not select its branch — the page stays on the
+    // left one, so this composer floats over a branch it is not part of.
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(right_index, cx));
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the off-branch draft is the active composer");
+    editor.update(&mut vcx, |e, cx| {
+        e.set_value("one kestrel, typed over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+
+    let (matches, total, account, siblings) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+                v.minimap_branch_counts_for_test(window, cx),
+            )
+        })
+    });
+
+    assert_eq!(matches, 1, "the floating draft is searched where it stands");
+    assert_eq!(
+        total,
+        Some(1),
+        "and it is in the space's total — excluding it from the sibling must \
+         not make it count nowhere"
+    );
+    let far = siblings
+        .iter()
+        .find(|(id, _)| id == "a3")
+        .map(|(_, n)| *n)
+        .expect("the other fork is a shown sibling");
+    assert_eq!(
+        far, None,
+        "the branch the composer belongs to holds nothing the reader cannot \
+         already see, so its cell says nothing rather than 'one more'"
+    );
+    assert_eq!(
+        account,
+        total.expect("settled"),
+        "and the map still accounts for the whole space — the draft moved to \
+         the visible side of the sum, it did not leave it"
+    );
+}
+
+#[gpui::test]
 fn space_find_stops_the_page_when_the_next_match_is_in_the_composer(cx: &mut TestAppContext) {
     // Only the page arm of the reveal replaces a glide; a step onto a match in
     // the off-branch composer scrolls a different surface entirely. The glide

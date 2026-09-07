@@ -720,6 +720,13 @@ pub(crate) struct FindSession {
     /// node, so the total, the sibling counts and the highlight layers can
     /// never describe different text (see [`SpaceView::own_match_count`]).
     pub(crate) branch_nodes: HashSet<SharedString>,
+    /// The scope node that is in [`Self::branch_nodes`] **only because it
+    /// floats** — the active draft whose own branch is not the selected one.
+    ///
+    /// It is on screen, so it belongs to the *visible* side of the exactness
+    /// sum and never to a sibling's "reachable only through this branch". See
+    /// [`FindScope`] for the whole rule.
+    pub(crate) floating: Option<SharedString>,
     /// The whole-space count and its honest in-progress state.
     pub(crate) space: SpaceCount,
     /// The chunked pass that fills [`Self::space`].
@@ -987,6 +994,28 @@ pub(crate) struct ProjectionSeed {
     render_cursor: Option<Selection>,
 }
 
+/// This frame's search scope, and which of its nodes is in it **only because
+/// it floats**.
+///
+/// The scope admits the active draft whatever branch it belongs to, because an
+/// active composer paints over whatever is showing — that is what
+/// [`MatchReveal::Composer`] exists for. The tree, meanwhile, still attaches
+/// that draft beneath its own branch, so without naming it the sibling
+/// aggregate counted it as well: a query matching only the floating draft read
+/// "1 of 1" and "1 total" beside a map cell offering "1 more in this branch",
+/// which is a match that is not *more* — it is the one on screen.
+///
+/// So the exactness invariant is stated with the visible side named: **"only
+/// through this branch" means not currently visible**, the floating composer
+/// belongs to the visible side of the sum, and it is excluded from the sibling
+/// subtree exactly when (and only when) it is the active floated one. Reported
+/// from the one place that decides it rather than re-derived — see
+/// [`SpaceView::find_scope`].
+struct FindScope {
+    nodes: Vec<ScopeNode>,
+    floating: Option<SharedString>,
+}
+
 /// One node the search covers, in document order.
 struct ScopeNode {
     node: SharedString,
@@ -1216,6 +1245,7 @@ impl SpaceView {
             branch_nodes: HashSet::new(),
             space: SpaceCount::default(),
             count_task: None,
+            floating: None,
             projections: HashMap::new(),
             pending_reveal: None,
             reveal_when_anchored: false,
@@ -1405,7 +1435,10 @@ impl SpaceView {
         if self.find.is_none() {
             return;
         }
-        let scope = self.find_scope(tree, page_width, cx);
+        let FindScope {
+            nodes: scope,
+            floating,
+        } = self.find_scope(tree, page_width, cx);
         let mut session = self.find.take().expect("checked above");
         let previous = session.anchor.clone().map(|a| {
             (
@@ -1415,6 +1448,7 @@ impl SpaceView {
         });
         session.matches.clear();
         session.branch_nodes = live_scope_nodes(&scope);
+        session.floating = floating;
         let live = self.live_projection_nodes(&session.branch_nodes);
         session.projections.retain(|node, _| live.contains(node));
 
@@ -1904,7 +1938,7 @@ impl SpaceView {
     /// said separately: that turn is the same thing wearing the other shape,
     /// rendering *in place of* the answer it replaces rather than as a leaf
     /// beneath it, so it never reaches the streaming arm below.
-    fn find_scope(&self, tree: &[TreeNode], page_width: Pixels, cx: &gpui::App) -> Vec<ScopeNode> {
+    fn find_scope(&self, tree: &[TreeNode], page_width: Pixels, cx: &gpui::App) -> FindScope {
         let mut scope: Vec<ScopeNode> = Vec::new();
         let mut seen: Vec<SharedString> = Vec::new();
         for (sibs, active) in self.selected_levels(tree, page_width) {
@@ -1963,13 +1997,24 @@ impl SpaceView {
         // The active draft floats over whatever is showing, so it is in scope
         // even when its own branch is not the selected one — an active
         // composer for a draft belonging to another branch still matches.
+        //
+        // **And that is exactly the node the sibling aggregates must not
+        // claim**, so the decision is reported rather than re-derived: this is
+        // the one place that knows the draft joined *despite* the path not
+        // carrying it. `seen` holds the selected path's own nodes, so an
+        // active draft already on it is not floating and nothing is recorded.
+        let mut floating = None;
         if let Some(active) = self.active_draft.clone()
             && !seen.contains(&active)
             && let Some(entry) = self.draft_scope_node(&active, cx)
         {
+            floating = Some(entry.node.clone());
             scope.push(entry);
         }
-        scope
+        FindScope {
+            nodes: scope,
+            floating,
+        }
     }
 
     /// The text to search one post's node, and whether it is frozen.
@@ -2107,8 +2152,18 @@ impl SpaceView {
 
     /// The matches reachable through one node: its own plus every
     /// descendant's — "*n* more matches reachable only through this branch".
+    ///
+    /// **Less the floating composer**, which is on screen rather than down
+    /// there; see [`FindScope`]. Its count rejoins the sum on the visible side,
+    /// in [`space_total`] and [`levels_account`].
     pub(crate) fn subtree_match_count(&self, node: &TreeNode) -> usize {
-        subtree_matches(node, &|id| self.own_match_count(id))
+        subtree_matches(node, &|id| self.own_match_count(id), self.floating_node())
+    }
+
+    /// The node the search reaches only because its composer floats over the
+    /// branch the reader is on, if there is one this frame.
+    fn floating_node(&self) -> Option<&SharedString> {
+        self.find.as_ref()?.floating.as_ref()
     }
 
     /// The whole space's total, or `None` while the pass is still walking.
@@ -2125,10 +2180,13 @@ impl SpaceView {
     /// with the numbers beside it.
     pub(crate) fn find_space_total(&self, tree: &[TreeNode]) -> Option<usize> {
         let session = self.find.as_ref()?;
-        session
-            .space
-            .is_settled()
-            .then(|| tree.iter().map(|root| self.subtree_match_count(root)).sum())
+        session.space.is_settled().then(|| {
+            space_total(
+                tree,
+                &|id| self.own_match_count(id),
+                session.floating.as_ref(),
+            )
+        })
     }
 
     /// The count a minimap **sibling** cell carries: the matches reachable
@@ -2155,9 +2213,11 @@ impl SpaceView {
     /// the subtree of exactly one non-active child of that ancestor — which is
     /// exactly one of the siblings the map draws.
     pub(crate) fn find_levels_account(&self, tree: &[TreeNode], page_width: Pixels) -> usize {
-        levels_account(&self.selected_levels(tree, page_width), &|id| {
-            self.own_match_count(id)
-        })
+        levels_account(
+            &self.selected_levels(tree, page_width),
+            &|id| self.own_match_count(id),
+            self.floating_node(),
+        )
     }
 
     /// Phase 1 of the reveal, from a caller with no tree in hand (the step
@@ -2481,13 +2541,54 @@ impl SpaceView {
 /// `LIMIT`-free and branch-unfiltered — so a per-branch total is one walk over
 /// the tree the view already builds, never a database question. The same shape
 /// as `subtree_has_draft_content` beside it.
-fn subtree_matches(node: &TreeNode, own: &impl Fn(&SharedString) -> usize) -> usize {
+fn subtree_matches(
+    node: &TreeNode,
+    own: &impl Fn(&SharedString) -> usize,
+    floating: Option<&SharedString>,
+) -> usize {
+    if floating == Some(&node.id) {
+        // **The floating composer is on the visible side, so a branch it
+        // happens to hang from does not get to claim it.** `effective_tree`
+        // attaches the active draft under its own branch whatever the reader
+        // is looking at, and this walk is what answers "reachable only through
+        // this branch" — a phrase that has to mean *not currently visible*, or
+        // the map offers the reader a trip to the one match already under
+        // their eyes. Its own count is added once, on the visible side, by
+        // [`space_total`] and [`levels_account`], so nothing is lost: this
+        // moves the term, it does not drop it.
+        //
+        // Its descendants, if any, still count — the exclusion is one node,
+        // the one the composer is painting.
+        return node
+            .children
+            .iter()
+            .map(|child| subtree_matches(child, own, floating))
+            .sum();
+    }
     own(&node.id)
         + node
             .children
             .iter()
-            .map(|child| subtree_matches(child, own))
+            .map(|child| subtree_matches(child, own, floating))
             .sum::<usize>()
+}
+
+/// The right-hand side of the **exactness invariant**: every match in the
+/// space, counted once.
+///
+/// The forest's own walk plus the floating composer, which that walk skips —
+/// the one place the two halves of the split are put back together, so the
+/// total and the map's account can only ever be read from one definition.
+fn space_total(
+    roots: &[TreeNode],
+    own: &impl Fn(&SharedString) -> usize,
+    floating: Option<&SharedString>,
+) -> usize {
+    roots
+        .iter()
+        .map(|root| subtree_matches(root, own, floating))
+        .sum::<usize>()
+        + floating.map_or(0, own)
 }
 
 /// The selected path's own matches plus every shown sibling's whole subtree —
@@ -2496,14 +2597,34 @@ fn subtree_matches(node: &TreeNode, own: &impl Fn(&SharedString) -> usize) -> us
 fn levels_account(
     levels: &[(Vec<&TreeNode>, usize)],
     own: &impl Fn(&SharedString) -> usize,
+    floating: Option<&SharedString>,
 ) -> usize {
-    let mut total = 0;
+    // The floating composer is on screen, so the visible side owes it exactly
+    // one term — and which term depends on where the levels put it. A draft
+    // whose branch the reader is *not* on appears in no level (the sibling
+    // subtrees deliberately skip it), so it is added here. One the reader
+    // **is** on is an ordinary active node at its own level and is already
+    // counted there; adding it again would be the double count this whole
+    // split exists to remove, one step along.
+    //
+    // `find_scope` only ever records the first case, so the second is
+    // unreachable through the view — but stating it makes the invariant true
+    // for every path rather than for the paths production happens to produce,
+    // which is what lets the exactness test walk all of them.
+    let already_on_the_path = levels
+        .iter()
+        .any(|(sibs, active)| Some(&sibs[*active].id) == floating);
+    let mut total = if already_on_the_path {
+        0
+    } else {
+        floating.map_or(0, own)
+    };
     for (sibs, active) in levels {
         for (i, sib) in sibs.iter().enumerate() {
             total += if i == *active {
                 own(&sib.id)
             } else {
-                subtree_matches(sib, own)
+                subtree_matches(sib, own, floating)
             };
         }
     }
@@ -3382,7 +3503,7 @@ mod tests {
         .into_iter()
         .collect();
         let own = |id: &SharedString| counts.get(id.as_ref()).copied().unwrap_or(0);
-        let total: usize = roots.iter().map(|r| subtree_matches(r, &own)).sum();
+        let total = space_total(&roots, &own, None);
         assert_eq!(
             total,
             counts.values().sum::<usize>(),
@@ -3397,7 +3518,7 @@ mod tests {
                     for l3 in 0..3 {
                         let levels = levels_of(&roots, &[r, l1, l2, l3]);
                         assert_eq!(
-                            levels_account(&levels, &own),
+                            levels_account(&levels, &own, None),
                             total,
                             "path {:?} does not account for the space",
                             levels
@@ -3411,6 +3532,52 @@ mod tests {
             }
         }
         assert_eq!(checked, 54, "every combination was walked");
+
+        // **And the same walk with the off-branch composer floating over it.**
+        // `b2b` hangs under `b`, which is a sibling of the `a` the reader is
+        // on — so the tree puts it *down there* while the composer paints it
+        // *right here*. The invariant has to hold with it on the visible side:
+        // its matches are in the total exactly once, they are in every path's
+        // account exactly once, and the branch it belongs to no longer offers
+        // them as somewhere to go.
+        let composer = SharedString::from("b2b");
+        let floated = Some(&composer);
+        let total_floating = space_total(&roots, &own, floated);
+        assert_eq!(
+            total_floating, total,
+            "moving the composer to the visible side changes no total — the \
+             draft is counted once either way"
+        );
+        let b = &roots[0].children[1];
+        assert_eq!(b.id, SharedString::from("b"));
+        assert_eq!(
+            subtree_matches(b, &own, floated),
+            subtree_matches(b, &own, None) - own(&composer),
+            "the branch the composer belongs to stops claiming what is on \
+             screen — 'only through this branch' means not currently visible"
+        );
+        let mut checked_floating = 0;
+        for r in 0..2 {
+            for l1 in 0..3 {
+                for l2 in 0..3 {
+                    for l3 in 0..3 {
+                        let levels = levels_of(&roots, &[r, l1, l2, l3]);
+                        assert_eq!(
+                            levels_account(&levels, &own, floated),
+                            total_floating,
+                            "path {:?} does not account for the space with a \
+                             floating composer",
+                            levels
+                                .iter()
+                                .map(|(sibs, active)| sibs[*active].id.as_ref())
+                                .collect::<Vec<_>>()
+                        );
+                        checked_floating += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked_floating, 54);
     }
 
     #[test]
@@ -3423,13 +3590,20 @@ mod tests {
         let b = &roots[0].children[1];
         assert_eq!(b.id, SharedString::from("b"));
         assert_eq!(
-            subtree_matches(b, &own),
+            subtree_matches(b, &own, None),
             15,
             "5 of its own plus 0 + 2 + 7 + 1 beneath it"
         );
         // A leaf is its own subtree, and a node nothing matched in contributes
         // nothing rather than being absent.
-        assert_eq!(subtree_matches(&roots[1], &own), 0);
+        assert_eq!(subtree_matches(&roots[1], &own, None), 0);
+        // Excluding the floating composer drops that one node and nothing
+        // under it — `b2` keeps its own 2 and its other child's 1.
+        assert_eq!(
+            subtree_matches(b, &own, Some(&SharedString::from("b2a"))),
+            8,
+            "the excluded node's 7 leaves; its siblings and ancestors stay"
+        );
     }
 
     #[test]
