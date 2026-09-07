@@ -18,5 +18,6 @@ space-footnote-delegation-failed = 已中止：{ $reason ->
 
 space-regenerating = 正在重新產生…
 space-error-response-truncated = 模型把全部長度額度都用在思考上，始終沒有開始作答。沒有新增或取代任何回答——請重試，或換一個更簡短的問題。
+space-error-model-unavailable = { $model } 所在的後端已不再提供該模型，也不會由其他模型代為作答。沒有發送任何請求，也沒有產生任何費用——請改選一個模型後重試。
 space-regenerating-elsewhere = 這則回覆正在重新產生。
 space-answer-cut-off = 這則回覆達到了長度上限，在中途停下。

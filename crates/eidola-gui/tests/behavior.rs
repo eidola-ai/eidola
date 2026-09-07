@@ -16919,6 +16919,97 @@ async fn an_archived_conversations_refusal_is_localized(cx: &mut gpui::TestAppCo
     }
 }
 
+/// **A selection that has gone stale fails honestly, by name, and nothing
+/// answers in its place.**
+///
+/// A catalog row is retired upstream while the participant that picked it goes
+/// on naming it. App-core refuses at turn time with the model it was asked for
+/// (`AppError::ModelUnavailable`) rather than quietly using another one, and
+/// this is the reader's side of that promise: the notice names the model — the
+/// one thing the reader has to change — and says outright that nothing
+/// answered instead, which is the fact a silent substitution would have hidden.
+///
+/// The recovery is deliberately a **re-ask of the same participant**: this app
+/// never picks a model on the reader's behalf, so what makes the next press
+/// work is the reader choosing one. The retry record is therefore what pins
+/// "no substitution" on this side — the participant and the post it was asked
+/// about both stand unchanged.
+#[gpui::test]
+async fn a_stale_model_selection_says_which_model_and_substitutes_none(
+    cx: &mut gpui::TestAppContext,
+) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::ModelUnavailable {
+                    model: "gemma4-31b@eidola".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let english = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(
+        english.contains("gemma4-31b@eidola"),
+        "the notice names the selection the reader has to change: {english}"
+    );
+    assert!(
+        english.contains("nothing will answer in its place"),
+        "and says no other model answered instead: {english}"
+    );
+    assert!(
+        !english.contains("no longer offers the model `"),
+        "the raw Display must not be what a reader sees: {english}"
+    );
+
+    // No substitution on this side either: the recovery re-asks the very
+    // participant that was refused, about the very post it was refused over.
+    space.read_with(cx, |s, _| {
+        let failed = s.failed_turn().expect("a re-ask is recorded");
+        assert_eq!(
+            failed.participant_id, "agent-b",
+            "Retry re-asks the participant that was refused, not another one"
+        );
+        assert_eq!(failed.target_action_id, "a1");
+        assert!(
+            s.can_retry(),
+            "picking a different model is what makes the next press work, so Retry stands"
+        );
+    });
+
+    // The sentence is chosen in the reader's locale; the model id is not a
+    // sentence and travels through it unchanged.
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    cx.run_until_parked();
+    let french = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert_ne!(
+        french, english,
+        "the refusal is localized, not an English literal beside the match"
+    );
+    assert!(
+        french.contains("gemma4-31b@eidola"),
+        "the model id survives translation verbatim: {french}"
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
 /// **An affordance that cannot succeed is worse than none.**
 ///
 /// Archival is what closes a conversation and there is no unarchive door
