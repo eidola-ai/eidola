@@ -1385,9 +1385,16 @@ impl SpaceView {
     /// Run every frame a session is open rather than invalidated by hand: the
     /// scope is a function of the *selected path*, which the branch scrollers
     /// decide at render time, so there is no event a "recompute now" could
-    /// hang off that a wheel gesture would not miss. The cost is the scan, not
-    /// the projections — those are cached per node against the content they
-    /// were built from, so an unchanged post is a string comparison.
+    /// hang off that a wheel gesture would not miss.
+    ///
+    /// What that costs is bounded by the memo rather than by the text: the
+    /// projections are cached per node against the content they were built
+    /// from, and the hits against the query they answered, so an unchanged
+    /// post on an unchanged query is a comparison and a slice read. A node
+    /// whose text moved really is re-projected and re-scanned here, on the
+    /// frame and outside any budget — deliberately, because the highlights and
+    /// the index describe the branch the reader is looking at *now*, and the
+    /// visible branch is the one scope that cannot be deferred.
     pub(crate) fn sync_find(
         &mut self,
         tree: &[TreeNode],
