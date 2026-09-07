@@ -6241,13 +6241,19 @@ impl Inner {
                     flush_attestations(&attestation_log, &db_conn, &provider_id, &base_url, now)
                         .await?;
 
+                // The catalog is allowed to shrink, and removing a row does not
+                // un-pick the participant, router or recorded model that names
+                // it. A stale selection is refused **by name**, here — ahead of
+                // the credential and ahead of any completion request — because
+                // the only thing worse than this failure is quietly answering
+                // with a different model. See [`AppError::ModelUnavailable`].
                 let model_entry =
                     models
                         .data
                         .iter()
                         .find(|m| m.id == wire_model)
-                        .ok_or_else(|| AppError::NotConfigured {
-                            message: format!("model not found: {model}"),
+                        .ok_or_else(|| AppError::ModelUnavailable {
+                            model: model.to_string(),
                         })?;
                 let pricing = (
                     model_entry.pricing.per_prompt_token.value as u128,

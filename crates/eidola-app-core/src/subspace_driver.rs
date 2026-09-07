@@ -347,6 +347,7 @@ impl DelegationFailure {
             | AppError::ProvisioningTimeout { .. }
             | AppError::TermsAcceptanceRequired { .. } => Self::Funding,
             AppError::NotConfigured { .. }
+            | AppError::ModelUnavailable { .. }
             | AppError::Config { .. }
             | AppError::NotAParticipant { .. }
             | AppError::WrongPostKind { .. }

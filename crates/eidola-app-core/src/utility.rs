@@ -212,12 +212,18 @@ impl Inner {
                 // but a chore call writes no rows to hang a record from.
                 let client = self.build_client(&eidola, None).await?;
                 let models = fetch_models(&client, &eidola.base_url).await?;
+                // A chore's model reference goes stale exactly as a turn's
+                // does, and takes the same refusal (see
+                // [`AppError::ModelUnavailable`]). What each chore then does
+                // with it is its own doctrine — the router degrades and lets
+                // the post through, unrefined, rather than routing through
+                // some other model.
                 let entry = models
                     .data
                     .iter()
                     .find(|m| m.id == target.model)
-                    .ok_or_else(|| AppError::NotConfigured {
-                        message: format!("{} model not found: {}", target.chore, target.canonical),
+                    .ok_or_else(|| AppError::ModelUnavailable {
+                        model: target.canonical.clone(),
                     })?;
                 Ok(UtilityRoute {
                     client,

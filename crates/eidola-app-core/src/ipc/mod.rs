@@ -1107,6 +1107,7 @@ impl WireError {
             AppError::RegenerationInFlight { item_id } => {
                 ("RegenerationInFlight", json!({ "item_id": item_id }))
             }
+            AppError::ModelUnavailable { model } => ("ModelUnavailable", json!({ "model": model })),
         };
         Self::build(kind, e.to_string(), fields)
     }
@@ -1199,6 +1200,7 @@ impl WireError {
             "RegenerationInFlight" => AppError::RegenerationInFlight {
                 item_id: s("item_id")?,
             },
+            "ModelUnavailable" => AppError::ModelUnavailable { model: s("model")? },
             _ => return None,
         })
     }
@@ -1936,6 +1938,9 @@ mod tests {
             },
             AppError::Attestation {
                 message: "bad measurement".into(),
+            },
+            AppError::ModelUnavailable {
+                model: "gemma4-31b".into(),
             },
         ];
         for e in &cases {

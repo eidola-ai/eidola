@@ -3745,6 +3745,157 @@ fn blocking_setup_failure_leaves_the_saved_post() {
 }
 
 // ===========================================================================
+// A stale selection: the catalog stopped listing a model something still
+// names. Removing a row does not un-pick the participant that chose it, so the
+// selection simply goes stale, and the one behaviour worse than failing is
+// answering with a different model behind the reader's back. Every turn path
+// therefore refuses by name, before any request is sent.
+// ===========================================================================
+
+/// The turn a participant takes on a model the catalog has retired.
+#[test]
+fn a_turn_whose_model_left_the_catalog_is_refused_by_name() {
+    run(|| {
+        let omissions = chat_harness::catalog_omissions();
+        let (mock, core, _dir) = setup(MockConfig {
+            catalog_omits: omissions.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // The model was there when the space was made — a first turn proves it.
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the model is in the catalog");
+        let sent_before = mock.chat_hits();
+        assert_eq!(sent_before, 1);
+
+        // Now the row goes away. Nothing un-picks the participant.
+        omissions.lock().expect("omissions").push(MODEL.into());
+
+        let res = core.runtime().block_on(core.chat(
+            "and the neap tides?".into(),
+            MODEL.into(),
+            Some(first.space_id.clone()),
+        ));
+        match &res {
+            Err(AppError::ModelUnavailable { model }) => {
+                assert_eq!(model, MODEL, "the refusal names what was asked for");
+            }
+            other => panic!("expected a typed refusal naming the model; got {other:?}"),
+        }
+        assert_eq!(
+            mock.chat_hits(),
+            sent_before,
+            "no completion request at all — nothing could have been substituted"
+        );
+
+        // The post survived (it commits before `prepare_turn`), and no answer
+        // was written under it.
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(first.space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.iter().filter(|m| m.role == "user").count(),
+            2,
+            "both asks are saved; got {messages:#?}"
+        );
+        assert_eq!(
+            messages.iter().filter(|m| m.role == "assistant").count(),
+            1,
+            "only the first ask was answered; got {messages:#?}"
+        );
+    });
+}
+
+/// The streaming transport shares `prepare_turn`, so it must refuse the same
+/// way and just as early — before a single delta reaches the reader.
+#[test]
+fn a_streaming_turn_whose_model_left_the_catalog_is_refused_by_name() {
+    run(|| {
+        let omissions = chat_harness::catalog_omissions();
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            catalog_omits: omissions.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        omissions.lock().expect("omissions").push(MODEL.into());
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, deltas) = core.runtime().block_on(async {
+            let run = core.chat_stream("Hello".into(), MODEL.into(), None, tx);
+            tokio::join!(run, collect_deltas(events_rx))
+        });
+        match &res {
+            Err(AppError::ModelUnavailable { model }) => {
+                assert_eq!(model, MODEL, "the refusal names what was asked for");
+            }
+            other => panic!("expected a typed refusal naming the model; got {other:?}"),
+        }
+        assert_eq!(
+            deltas,
+            (String::new(), String::new()),
+            "nothing was streamed"
+        );
+        assert_eq!(mock.chat_hits(), 0, "no completion request was sent");
+    });
+}
+
+/// A regeneration replays the model the post recorded, so a retired row
+/// reaches it exactly as it reaches a fresh turn — and the answer it would
+/// have replaced is untouched.
+#[test]
+fn a_regeneration_replaying_a_retired_catalog_row_is_refused_by_name() {
+    run(|| {
+        let omissions = chat_harness::catalog_omissions();
+        let (mock, core, _dir) = setup(MockConfig {
+            catalog_omits: omissions.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let original = block_text(&tree[1]);
+        let sent_before = mock.chat_hits();
+
+        omissions.lock().expect("omissions").push(MODEL.into());
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let res = core.runtime().block_on(async {
+            let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+            let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+            res
+        });
+        match &res {
+            Err(AppError::ModelUnavailable { model }) => {
+                assert_eq!(model, MODEL, "the refusal names what was asked for");
+            }
+            other => panic!("expected a typed refusal naming the model; got {other:?}"),
+        }
+        assert_eq!(mock.chat_hits(), sent_before, "no request was sent");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "no successor post; got {tree:#?}");
+        assert_eq!(block_text(&tree[1]), original, "the answer is intact");
+        assert_eq!(tree[1].generation_count, 1, "and it gained no generation");
+    });
+}
+
+// ===========================================================================
 // Refund-recovery variants: succeed vs fail on the non-2xx path
 // ===========================================================================
 
