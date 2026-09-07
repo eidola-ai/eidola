@@ -52,7 +52,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{SubscriptionState, TermsDocument};
+use eidola_app_core::{CheckoutMint, SubscriptionState, TermsDocument};
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, IsZero, ParentElement, Pixels, Render, ScrollHandle, SharedString,
@@ -654,10 +654,10 @@ impl OnboardingView {
         self.checkout_error = None;
         cx.notify();
 
-        // Which account this checkout would fund. The reader can go back from
-        // the Purchase slide and link a different account while the request is
-        // in flight, so the answer is re-asked when it lands.
-        let minted_for = self.account_identity(cx);
+        // The reader can go back from the Purchase slide and link a different
+        // account while the request is in flight, so which credentials the
+        // mint actually ran under is checked against this profile when the
+        // link lands — see `mint_is_current`.
         let Some(rx) = self.stores.account.read(cx).request_checkout(price_id) else {
             return;
         };
@@ -667,24 +667,19 @@ impl OnboardingView {
                     message: "checkout task cancelled".into(),
                 })
             });
-            let _ = this.update(cx, |this, cx| this.finish_checkout(minted_for, res, cx));
+            let _ = this.update(cx, |this, cx| this.finish_checkout(res, cx));
         }));
     }
 
     /// Land a checkout mint. Public so behavior tests drive the same path the
     /// request's own task does.
-    pub fn finish_checkout(
-        &mut self,
-        minted_for: Option<String>,
-        res: Result<String, AppError>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn finish_checkout(&mut self, res: Result<CheckoutMint, AppError>, cx: &mut Context<Self>) {
         self.checkout_pending = None;
         self.checkout_task = None;
         match res {
-            Ok(url) => {
-                if self.mint_is_current(&minted_for, cx) {
-                    cx.open_url(&url);
+            Ok(mint) => {
+                if self.mint_is_current(&mint.minted_for, cx) {
+                    cx.open_url(&mint.url);
                 } else {
                     self.checkout_error = Some(crate::account::STALE_MINT.to_string());
                 }
@@ -718,30 +713,23 @@ impl OnboardingView {
         self.checkout_error = None;
     }
 
-    /// The account a checkout started now would fund. Read past the
-    /// `ConfigStore` cache — see [`crate::stores::AccountStore::account_identity`].
-    fn account_identity(&self, cx: &App) -> Option<String> {
-        let fallback = self.cached_account_id(cx);
-        self.stores
-            .account
-            .read(cx)
-            .account_identity(fallback.as_deref())
+    fn cached_credentials(&self, cx: &App) -> Option<(String, String)> {
+        let config = self.stores.config.read(cx);
+        let state = config.state()?;
+        Some((state.account_id.clone()?, state.account_secret.clone()?))
     }
 
-    fn cached_account_id(&self, cx: &App) -> Option<String> {
-        self.stores
-            .config
-            .read(cx)
-            .state()
-            .and_then(|s| s.account_id.clone())
-    }
-
-    fn mint_is_current(&self, minted_for: &Option<String>, cx: &App) -> bool {
-        let fallback = self.cached_account_id(cx);
-        self.stores
-            .account
-            .read(cx)
-            .mint_is_current(minted_for.as_deref(), fallback.as_deref())
+    /// The Account pane's guard, on the slide that makes the same money
+    /// decision (`AccountView::mint_is_current` carries the reasoning): the
+    /// mint says which credentials it signed with, and that is compared
+    /// against a fingerprint of the config read fresh here, past the
+    /// `ConfigStore` cache.
+    fn mint_is_current(&self, minted_for: &str, cx: &App) -> bool {
+        let fallback = self.cached_credentials(cx);
+        self.stores.account.read(cx).mint_is_current(
+            minted_for,
+            fallback.as_ref().map(|(i, s)| (i.as_str(), s.as_str())),
+        )
     }
 }
 

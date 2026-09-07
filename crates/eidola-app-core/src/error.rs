@@ -236,6 +236,33 @@ pub enum AppError {
     #[error("the model used its whole completion budget without writing an answer")]
     ResponseTruncated { output_tokens: Option<i64> },
 
+    /// A selection names a model its backend's catalog no longer offers.
+    ///
+    /// The catalog is what the backend sells, and it is allowed to shrink: a
+    /// row retired upstream simply stops being listed. **Nothing un-picks the
+    /// thing that chose it** — a participant's `model_ref`, a space's router
+    /// model, the model a post recorded and a regeneration replays — so the
+    /// selection goes stale in place and is met here, at the next turn.
+    ///
+    /// **The refusal is the whole behaviour, and the alternative is worse than
+    /// the failure.** Answering with some other model would put words a reader
+    /// attributes to one model in the mouth of another, and bill for it; there
+    /// is no substitution anywhere on this path, and none may be added. The
+    /// refusal lands in `prepare_turn` before the credential and before any
+    /// request, so nothing is spent and nothing is written — the post a
+    /// combined ask already committed stands, and the answer a regeneration
+    /// would have replaced is untouched.
+    ///
+    /// Distinct from [`AppError::NotConfigured`] so a surface can say which
+    /// model went away and point at the picker, rather than render a
+    /// log-shaped sentence with the id buried in it.
+    ///
+    /// **Data, not prose.** `model` is the selection as it was persisted (the
+    /// canonical qualified id); the sentence a reader sees is chosen in their
+    /// own locale by the presentation layer.
+    #[error("the backend no longer offers the model `{model}`")]
+    ModelUnavailable { model: String },
+
     /// A second regeneration of the same post was asked for while one is still
     /// running in this process.
     ///

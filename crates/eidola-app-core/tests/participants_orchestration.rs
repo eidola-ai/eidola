@@ -1384,6 +1384,60 @@ fn a_remote_routers_hold_is_settled_when_the_body_read_fails() {
     });
 }
 
+/// A space's router model can go stale exactly as a participant's can — the
+/// catalog stops listing the row and nothing un-picks the space.
+///
+/// **The router's answer to that is its answer to every failure: degrade,
+/// never block, and never substitute.** A post is not worth blocking on a
+/// routing decision, so the mechanical candidate set stands unrefined; what
+/// must not happen is the refinement quietly running against some *other*
+/// model, which would let a retired row silently change who answers. Asserted
+/// by the request log: not one chat request was sent.
+#[test]
+fn a_router_whose_model_left_the_catalog_degrades_without_substituting() {
+    run(|| {
+        let omissions = chat_harness::catalog_omissions();
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            catalog_omits: omissions.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (space, post) = space_with_two_candidates(&core);
+        // A *remote* router: the eidola backend, whose catalog is the one that
+        // can lose a row.
+        core.runtime()
+            .block_on(core.set_space_router_model(
+                space.clone(),
+                Some(chat_harness::ROUTER_REMOTE_MODEL.into()),
+            ))
+            .expect("set remote router model");
+        omissions
+            .lock()
+            .expect("omissions")
+            .push(chat_harness::ROUTER_REMOTE_MODEL.into());
+
+        let mechanical = mechanical_turns(&core, &space, &post);
+        assert_eq!(
+            planned(&core, &space, &post),
+            NotificationPlan::Turns(mechanical),
+            "a stale router model degrades like any other router failure"
+        );
+        assert!(
+            mock.chat_bodies().is_empty(),
+            "no model was asked to route in its place; got {:?}",
+            mock.chat_bodies()
+        );
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("wallet lifecycle");
+        assert!(
+            lifecycle.iter().all(|c| c.state != "spending"),
+            "the refusal lands before any hold; got {lifecycle:?}"
+        );
+    });
+}
+
 /// The router picks *who answers*, so a post whose meaning lives in a quoted
 /// passage has to reach it as that passage — the same `post_body` rendering
 /// `read_thread` gives a model, not the literal `{{ embed N }}` marker (which

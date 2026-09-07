@@ -320,6 +320,16 @@ pub fn tool_script() -> ToolScript {
     Arc::new(std::sync::Mutex::new(Vec::new()))
 }
 
+/// The model ids the mock's catalog leaves out (see
+/// [`MockConfig::catalog_omits`]). Shared + interior-mutable so a row can be
+/// retired mid-test, after something has already selected it.
+pub type CatalogOmissions = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A fresh catalog with nothing left out.
+pub fn catalog_omissions() -> CatalogOmissions {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
 /// Whether the refund endpoints (inline + recovery) actually mint a successor
 /// credential, or fail. Lets refund-recovery-succeeds vs -fails be selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,6 +365,14 @@ pub struct MockConfig {
     /// the original PR #218 screenshot failed on) before the turn's own error
     /// wrapping exists.
     pub models_status: Option<u16>,
+    /// Model ids `GET /v1/models` leaves out of an otherwise healthy catalog.
+    ///
+    /// Shared and interior-mutable so a test can retire a row **after** a
+    /// selection has been made against it, which is the only order the real
+    /// case ever happens in: a catalog row goes away and nothing un-picks the
+    /// participant, the space router or the recorded model a regeneration
+    /// replays. Empty by default, so every other test sees the full catalog.
+    pub catalog_omits: CatalogOmissions,
     /// The calls [`ChatBehavior::ToolScript`] serves (ignored otherwise).
     pub tool_script: ToolScript,
     /// What `GET /v1/models` declares about [`MODEL`]'s tool calling.
@@ -388,6 +406,7 @@ impl Default for MockConfig {
             refund: RefundMode::Succeed,
             balance: 10_000_000,
             models_status: None,
+            catalog_omits: catalog_omissions(),
             tool_script: tool_script(),
             declared_tool_calling: None,
             chat_delay_ms: 0,
@@ -1963,17 +1982,27 @@ fn models_body(config: &MockConfig) -> String {
         primary["max_output_tokens"] = serde_json::json!(4096u64);
         primary["output_budget_class"] = serde_json::json!("standard");
     }
-    serde_json::json!({
-        "data": [primary, {
-            "id": ROUTER_REMOTE_MODEL,
-            "context_length": 8192u64,
-            "pricing": {
-                "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },
-                "per_completion_token": { "value": 1u64, "scale_factor": 1u64 }
-            }
-        }]
-    })
-    .to_string()
+    let router = serde_json::json!({
+        "id": ROUTER_REMOTE_MODEL,
+        "context_length": 8192u64,
+        "pricing": {
+            "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },
+            "per_completion_token": { "value": 1u64, "scale_factor": 1u64 }
+        }
+    });
+    let omitted = config
+        .catalog_omits
+        .lock()
+        .expect("catalog omissions lock poisoned")
+        .clone();
+    let listed: Vec<serde_json::Value> = [primary, router]
+        .into_iter()
+        .filter(|entry| {
+            let id = entry["id"].as_str().unwrap_or_default();
+            !omitted.iter().any(|o| o == id)
+        })
+        .collect();
+    serde_json::json!({ "data": listed }).to_string()
 }
 
 fn keys_body(issuer: &Issuer) -> String {

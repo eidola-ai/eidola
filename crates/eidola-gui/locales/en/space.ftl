@@ -55,6 +55,17 @@ space-regenerating = Regenerating…
 # length allowance on its own reasoning and never began an answer. Nothing was
 # recorded and nothing was replaced, so the answer already there is untouched.
 space-error-response-truncated = The model used its whole length allowance thinking and never started an answer. No answer was added or replaced — try again, or ask a shorter question.
+# Shown in the conversation's recovery notice when the model this turn would
+# have used is no longer in its backend's catalog — a row retired there, while
+# whoever answers here still names it. Two things carry the sentence, and both
+# are load-bearing: **the model is named**, because "a model" is not something
+# a reader can go and change, and **nothing answered in its place**, because
+# quietly using a different model is the one outcome worse than the failure and
+# the reader has to know it did not happen. Retry stays offered — picking a
+# different model is what makes the next press work.
+# TRANSLATORS: $model is the selection exactly as it was saved, an id rather
+# than a display name. Leave it verbatim; it is what the reader looks for.
+space-error-model-unavailable = { $model } is no longer offered by its backend, and nothing will answer in its place. Nothing was sent and nothing was charged — pick a different model, then try again.
 # A quiet marker beneath a response a regeneration was asked for while one was
 # already running against it somewhere this window cannot see. Not a failure:
 # the first one is still going, and its result will arrive here.

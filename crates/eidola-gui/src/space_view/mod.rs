@@ -2721,6 +2721,14 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
         AppError::ResponseTruncated { .. } => {
             crate::i18n::msg::space_error_response_truncated(cx).to_string()
         }
+        // The model this turn would have used has left its backend's catalog.
+        // The variant carries the selection and no sentence, so the copy is
+        // built here — and it names the model, because the reader's only way
+        // out is to change it, and says nothing answered in its place, because
+        // that is the promise the refusal exists to keep.
+        AppError::ModelUnavailable { model } => {
+            crate::i18n::msg::space_error_model_unavailable(cx, model.clone()).to_string()
+        }
         other => other.to_string(),
     }
 }
