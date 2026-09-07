@@ -606,17 +606,6 @@ impl SpaceView {
                 let screen_top = doc_y + scroll_y;
 
                 let mut row = h_flex().w_full().h(row_h).gap(MINIMAP_COL_GAP);
-                // Whether *this* level's cells can hold a numeral. Asked per
-                // level, because both of its dimensions are per level: the
-                // sibling count divides the strip's width, and the row's height
-                // is this post's share of the document.
-                let numeral_fits = branch_count_fits(
-                    strip_w.as_f32(),
-                    sibs.len(),
-                    MINIMAP_COL_GAP.as_f32(),
-                    row_h.as_f32(),
-                    rem,
-                );
                 for (i, sib) in sibs.iter().enumerate() {
                     let is_active = i == *active;
                     // **What an inactive sibling carries: the matches
@@ -626,6 +615,21 @@ impl SpaceView {
                     // is indistinguishable from a right one), and where the
                     // branch holds nothing.
                     let branch_count = (!is_active).then(|| self.find_branch_count(sib)).flatten();
+                    // Whether *this cell* can hold *this number*. Two of its
+                    // three inputs are the level's (the sibling count divides
+                    // the strip's width, the row's height is this post's share
+                    // of the document) and the third is the cell's own, which
+                    // is why the question is asked here rather than once a row.
+                    let numeral_fits = branch_count.is_some_and(|n| {
+                        branch_count_fits(
+                            strip_w.as_f32(),
+                            sibs.len(),
+                            MINIMAP_COL_GAP.as_f32(),
+                            row_h.as_f32(),
+                            rem,
+                            n,
+                        )
+                    });
                     // Drafts use `info`; everything else the scroll colors.
                     let (on, off, flat) = if matches!(sib.src, NodeSrc::Draft) {
                         (info.opacity(0.78), info.opacity(0.45), info.opacity(0.22))
@@ -974,16 +978,38 @@ impl SpaceView {
 /// match's position in the post, in the same wash the highlight paints.
 const MATCH_TICK_H: f32 = 2.0;
 
-/// The narrowest sibling cell a match count's **numeral** is drawn in, as a
-/// multiple of the root font size.
+/// One digit of the numeral at the cell's `text_xs` (0.75 rem), as a multiple
+/// of the root font size.
 ///
-/// Two digits at the cell's `text_xs` (0.75 rem) need roughly this much before
-/// the glyphs touch the column edges, and a numeral that has to be squinted at
-/// is worse than none. **In rems rather than pixels because the type scale is
-/// the reader's choice**: a fixed pixel floor is right at one scale and wrong
-/// at the two ends of the range this app supports, and at 2.0 it would paint a
-/// numeral wider than its own column.
-const MATCH_COUNT_MIN_CELL_W_REMS: f32 = 1.3;
+/// **In rems rather than pixels because the type scale is the reader's
+/// choice**: a fixed pixel floor is right at one scale and wrong at the two
+/// ends of the range this app supports, and at 2.0 it would paint a numeral
+/// wider than its own column.
+const MATCH_COUNT_DIGIT_REMS: f32 = 0.5;
+
+/// The breathing room either side of the numeral, on the same terms — what
+/// keeps the glyphs off the column edges, a numeral that has to be squinted at
+/// being worse than none.
+const MATCH_COUNT_SIDE_REMS: f32 = 0.3;
+
+/// The narrowest sibling cell **this count's** numeral is drawn in.
+///
+/// A width floor is a fact about the glyphs that will be painted, not about
+/// numerals in general. Sized once for two digits, it passes a cell of ~21px
+/// (four columns of the widened strip at the default scale) and then paints
+/// `247` straight through its own column edges and over the levels either side
+/// — which is the mistake the height axis already made, one dimension along.
+/// So the term is a function of the count actually rendered, and a count too
+/// wide for its cell falls back to the tint with the exact number still in the
+/// cell's accessible name.
+///
+/// Arithmetic rather than `shape_line`, deliberately: the predicate stays pure
+/// and unit-testable, and a per-digit advance credited generously errs toward
+/// the tint rather than toward a numeral that overflows.
+fn numeral_width_rems(count: usize) -> f32 {
+    let digits = count.max(1).ilog10() + 1;
+    digits as f32 * MATCH_COUNT_DIGIT_REMS + MATCH_COUNT_SIDE_REMS
+}
 
 /// The shortest **row** the numeral is drawn in, on the same terms.
 ///
@@ -998,24 +1024,29 @@ const MATCH_COUNT_MIN_CELL_W_REMS: f32 = 1.3;
 /// fallback has to answer to all of them.
 const MATCH_COUNT_MIN_CELL_H_REMS: f32 = 1.125;
 
-/// Whether a level's sibling cells have room for a numeral — in **both**
+/// Whether a sibling cell has room for **this count's** numeral — in both
 /// directions, and at the reader's own type scale.
 ///
 /// Pure, so the presentation constraint the widened strip exists for is stated
 /// as arithmetic rather than as a hope. Where it says no the cell falls back to
 /// a tint, and the count is in the cell's accessible name either way, exactly.
+///
+/// It is asked per **cell** rather than per level, because `count` is the one
+/// input that is not shared down a row: two siblings of one fork can hold 3 and
+/// 247 matches, and only the second overflows.
 pub(crate) fn branch_count_fits(
     strip_w: f32,
     columns: usize,
     gap: f32,
     row_h: f32,
     rem: f32,
+    count: usize,
 ) -> bool {
     if columns == 0 {
         return false;
     }
     let cell_w = (strip_w - gap * (columns.saturating_sub(1)) as f32) / columns as f32;
-    cell_w >= rem * MATCH_COUNT_MIN_CELL_W_REMS && row_h >= rem * MATCH_COUNT_MIN_CELL_H_REMS
+    cell_w >= rem * numeral_width_rems(count) && row_h >= rem * MATCH_COUNT_MIN_CELL_H_REMS
 }
 
 /// One selected-branch minimap column: a full-height column split into medium
@@ -1171,26 +1202,26 @@ mod tests {
 
         // At rest a fork of two leaves ~16px a column, and three leaves ~9px.
         assert!(
-            !branch_count_fits(rest, 2, gap, tall, rem),
+            !branch_count_fits(rest, 2, gap, tall, rem, 12),
             "36px / two columns"
         );
         assert!(
-            !branch_count_fits(rest, 3, gap, tall, rem),
+            !branch_count_fits(rest, 3, gap, tall, rem, 12),
             "…and worse with three"
         );
         // Widened, a fork carries its numbers — and so does a four-way one
         // (96px less three 4px gaps is 21px a column).
         for columns in 2..=4 {
             assert!(
-                branch_count_fits(open, columns, gap, tall, rem),
+                branch_count_fits(open, columns, gap, tall, rem, 12),
                 "{columns} columns of the widened strip"
             );
         }
         // Past that the tint takes over — which is why the exact count is in
         // the cell's accessible name whatever the width.
-        assert!(!branch_count_fits(open, 5, gap, tall, rem));
+        assert!(!branch_count_fits(open, 5, gap, tall, rem, 12));
         // A level with no columns is not a level.
-        assert!(!branch_count_fits(open, 0, gap, tall, rem));
+        assert!(!branch_count_fits(open, 0, gap, tall, rem, 12));
 
         // **A short row refuses a numeral however wide its column is.** A
         // row's height is its post's share of the document, so a long branch
@@ -1198,18 +1229,36 @@ mod tests {
         // numeral centred in a cell shorter than one line paints outside it,
         // over the levels either side.
         assert!(
-            !branch_count_fits(open, 2, gap, rem * 0.9, rem),
+            !branch_count_fits(open, 2, gap, rem * 0.9, rem, 12),
             "shorter than one line of the numeral's own type"
         );
-        assert!(branch_count_fits(open, 2, gap, rem * 1.5, rem));
+        assert!(branch_count_fits(open, 2, gap, rem * 1.5, rem, 12));
 
         // **And both floors follow the type scale.** A geometry that fits at
         // the default fails at 2.0, where the same glyphs are twice the size.
-        assert!(branch_count_fits(open, 4, gap, 20.0, 14.0));
+        assert!(branch_count_fits(open, 4, gap, 20.0, 14.0, 12));
         assert!(
-            !branch_count_fits(open, 4, gap, 20.0, 28.0),
+            !branch_count_fits(open, 4, gap, 20.0, 28.0, 12),
             "the reader's zoom is the third axis"
         );
+
+        // **And the width floor is the width of *this number*.** One geometry,
+        // three counts: the four-way widened fork's 21px column holds one and
+        // two digits and refuses three, where a floor sized once for two
+        // digits would have painted `247` through its own column edges.
+        assert!(branch_count_fits(open, 4, gap, tall, rem, 7), "one digit");
+        assert!(branch_count_fits(open, 4, gap, tall, rem, 47), "two digits");
+        assert!(
+            !branch_count_fits(open, 4, gap, tall, rem, 247),
+            "three digits do not fit a 21px column"
+        );
+        assert!(
+            !branch_count_fits(open, 4, gap, tall, rem, 2471),
+            "…nor, a fortiori, four"
+        );
+        // A wider column takes the longer number: two columns of the widened
+        // strip are ~46px, which holds four digits at the default scale.
+        assert!(branch_count_fits(open, 2, gap, tall, rem, 2471));
     }
 
     #[test]

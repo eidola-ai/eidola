@@ -630,13 +630,20 @@ pub(crate) struct CountKey {
 /// The whole-space pass: every post's own match count, how far the walk has
 /// got, and whether it has finished.
 ///
-/// **[`Self::settled`] is the only field the readout may believe.** While it
+/// **[`Self::is_settled`] is the only thing the readout may believe.** While it
 /// is false the total is not knowable and the bar says exactly that — never a
 /// partial sum, which on screen is indistinguishable from a right one, and
 /// never the previous query's total, which is the same lie with a longer fuse.
 /// The sibling counts on the minimap are withheld on the same flag, for the
 /// same reason: "3 more in this branch" while the pass is still walking is a
 /// number a reader would act on.
+///
+/// **Two halves make it up, because the two have different invalidations.**
+/// The posts walk once per [`CountKey`] and are done; a **retained draft's**
+/// text moves with no transcript rebuild behind it, so no key can say it is
+/// stale and every frame re-asks. Either half being unfinished means the total
+/// is not a number yet — which is the whole of what
+/// [`SpaceView::count_retained_drafts`] owes for having become budgeted.
 #[derive(Default)]
 pub(crate) struct SpaceCount {
     /// What [`Self::counts`] is an answer about, once a pass has begun.
@@ -645,8 +652,12 @@ pub(crate) struct SpaceCount {
     counts: HashMap<SharedString, usize>,
     /// The next index into `SpaceView::posts` the walk will take.
     next: usize,
-    /// Whether the walk has reached the end of the space for [`Self::key`].
-    settled: bool,
+    /// Whether the walk has reached the end of the **posts** for [`Self::key`].
+    posts_done: bool,
+    /// Whether a **draft** the count reaches is waiting on a later chunk —
+    /// which is to say, whether the last pass over them stopped for budget
+    /// rather than for having finished.
+    drafts_pending: bool,
     /// The settled total over this frame's effective tree, recomputed in
     /// `sync_find` and held as an **integer** — the readout formats the words,
     /// because a localized string in state is a cached render decision that a
@@ -661,13 +672,14 @@ impl SpaceCount {
         self.key = Some(key);
         self.counts.clear();
         self.next = 0;
-        self.settled = false;
+        self.posts_done = false;
+        self.drafts_pending = false;
         self.total = None;
     }
 
     /// Whether the count is a number anything may show.
     pub(crate) fn is_settled(&self) -> bool {
-        self.settled
+        self.posts_done && !self.drafts_pending
     }
 }
 
@@ -719,8 +731,10 @@ pub(crate) struct FindSession {
     pub(crate) count_task: Option<gpui::Task<()>>,
     /// Per-node searchable projections, keyed by node id, each remembered with
     /// the content it was built from so a post whose text changed re-projects
-    /// and one that did not is free.
-    pub(crate) projections: HashMap<SharedString, (ProjectionSeed, Projection)>,
+    /// and one that did not is free — and with the hits it last answered, so
+    /// one that did not is free to *scan* as well as to project
+    /// ([`CachedProjection`]).
+    pub(crate) projections: HashMap<SharedString, CachedProjection>,
     /// A reveal waiting for its post to render for real.
     pub(crate) pending_reveal: Option<PendingReveal>,
     /// **A reveal a new query is owed, once the search has said what the first
@@ -1002,6 +1016,87 @@ impl ScopeNode {
             embeds: self.embeds.clone(),
             render_cursor: self.render_cursor,
         }
+    }
+}
+
+/// One node's projection, the seed it was built from, and **the hits it last
+/// answered with**.
+///
+/// The seed keeps the projection honest about the *text*; `hits` keeps the
+/// **scan** from happening again for text and a query that have both stood
+/// still. That second half is not an optimization detail: `Query::find_in`
+/// folds case by building a whole new [`Projection`] of the haystack, so an
+/// un-memoized `projection.find(&query)` is O(bytes) *with an allocation*, and
+/// three callers ran one per node per frame — the visible branch's match pass,
+/// the whole-space post pass, and the retained-draft pass — with nothing about
+/// the conversation or the query having moved. The memo makes an unchanged node
+/// cost a comparison and a slice read, which is what leaves the per-frame work
+/// proportional to the matches actually shown rather than to the text.
+pub(crate) struct CachedProjection {
+    /// What [`Self::projection`] is a projection *of*.
+    seed: ProjectionSeed,
+    projection: Projection,
+    /// The last query this node was scanned for, and what it found. Held with
+    /// the query rather than cleared on a query change, so the memo cannot go
+    /// stale by someone forgetting to invalidate it.
+    hits: Option<(Query, Vec<Range<usize>>)>,
+}
+
+/// The source ranges `query` matches in `node`'s projection, scanning only when
+/// the memo cannot answer.
+///
+/// A free function over the map rather than a method on [`FindSession`],
+/// because its caller in `sync_find` pushes into `session.matches` while
+/// holding the returned slice — two disjoint fields, which the borrow checker
+/// allows only when the borrow names the field.
+fn hits_of<'a>(
+    projections: &'a mut HashMap<SharedString, CachedProjection>,
+    node: &SharedString,
+    query: &Query,
+    scans: &std::cell::Cell<usize>,
+) -> Option<&'a [Range<usize>]> {
+    let entry = projections.get_mut(node)?;
+    if !entry.hits.as_ref().is_some_and(|(q, _)| q == query) {
+        scans.set(scans.get() + 1);
+        let hits = entry.projection.find(query);
+        entry.hits = Some((query.clone(), hits));
+    }
+    Some(&entry.hits.as_ref().expect("just filled").1)
+}
+
+/// What one retained draft needs from this chunk.
+enum DraftWork {
+    /// No text: zero, with nothing to project and nothing to scan.
+    Empty,
+    /// Its projection is the one its text and cursor call for, and its hits are
+    /// already memoized for this query — free.
+    Memoized,
+    /// A scan, and a projection first when `seed` is `Some`. Spends budget.
+    Scan {
+        seed: Option<ProjectionSeed>,
+        bytes: usize,
+    },
+}
+
+/// One chunk's allowance, shared by both halves of the whole-space pass.
+///
+/// Two numbers because the two costs differ by an order of magnitude:
+/// **projecting** is a parse plus a render pass ([`PROJECTION_CHUNK`]), and
+/// **scanning** an already-projected node is a substring walk over its bytes
+/// ([`SCAN_CHUNK_BYTES`]). One budget across drafts and posts rather than one
+/// each, so a chunk's ceiling is a single stated number however the work is
+/// divided between them.
+#[derive(Default)]
+struct ChunkBudget {
+    built: usize,
+    scanned: usize,
+}
+
+impl ChunkBudget {
+    /// Whether this chunk has spent its allowance and owes the rest to the
+    /// next one.
+    fn spent(&self) -> bool {
+        self.built >= PROJECTION_CHUNK || self.scanned >= SCAN_CHUNK_BYTES
     }
 }
 
@@ -1328,7 +1423,7 @@ impl SpaceView {
                 let cached = session
                     .projections
                     .get(&entry.node)
-                    .is_some_and(|(built_from, _)| entry.frozen || built_from == &seed);
+                    .is_some_and(|c| entry.frozen || c.seed == seed);
                 if !cached {
                     if entry.frozen {
                         continue;
@@ -1336,15 +1431,29 @@ impl SpaceView {
                     let projection =
                         searchable_projection(&entry.content, &entry.embeds, entry.render_cursor);
                     self.projections_built.set(self.projections_built.get() + 1);
-                    session
-                        .projections
-                        .insert(entry.node.clone(), (seed, projection));
+                    session.projections.insert(
+                        entry.node.clone(),
+                        CachedProjection {
+                            seed,
+                            projection,
+                            hits: None,
+                        },
+                    );
                 }
-                let Some((_, projection)) = session.projections.get(&entry.node) else {
+                // The scan happens here only when the memo cannot answer — a
+                // node whose text and query have both stood still costs a
+                // comparison, where scanning it again is O(bytes) plus the
+                // fold's own allocation, every frame the bar is open.
+                let Some(hits) = hits_of(
+                    &mut session.projections,
+                    &entry.node,
+                    &query,
+                    &self.scans_run,
+                ) else {
                     continue;
                 };
                 let len = entry.content.len().max(1) as f32;
-                for (ordinal, source) in projection.find(&query).into_iter().enumerate() {
+                for (ordinal, source) in hits.iter().cloned().enumerate() {
                     session.matches.push(Match {
                         node: entry.node.clone(),
                         item_id: entry.item_id.clone(),
@@ -1366,7 +1475,6 @@ impl SpaceView {
         // The visible branch is settled for this frame; the rest of the space
         // is the count's business, and it may take several.
         self.sync_space_count(cx);
-        self.count_retained_drafts(cx);
         // One walk of the effective tree per frame, held as an integer for the
         // readout — and `None` for as long as the pass has not finished.
         let total = self.find_space_total(tree);
@@ -1390,19 +1498,35 @@ impl SpaceView {
     /// moment the reader visited that branch with nothing about the
     /// conversation having changed.
     ///
-    /// **On the frame rather than in the chunked pass**, because a draft's text
-    /// moves with no transcript rebuild behind it: it has no honest place in
-    /// [`CountKey`], so it is recomputed each frame instead — bounded by one
-    /// draft per leaf, each short, each cached against its own seed like every
-    /// other projection, and an empty one (the common case) costs a comparison
-    /// and no allocation at all. The composition guard is kept for symmetry
-    /// with the scope; an unfocused editor cannot in fact be composing.
-    fn count_retained_drafts(&mut self, cx: &mut Context<Self>) {
+    /// **Asked every frame, but budgeted like everything else.** A draft's text
+    /// moves with no transcript rebuild behind it, so it has no honest place in
+    /// [`CountKey`] and no key can say it is stale — every frame therefore
+    /// re-asks. What that costs is a comparison per draft: an empty one, and
+    /// one whose content, cursor and embed map are the ones its projection was
+    /// built from *and* whose hits are already memoized for this query, are
+    /// both answered without touching a byte of text.
+    ///
+    /// A draft that is *not* one of those is a scan, and a scan is O(bytes)
+    /// with the case fold's own allocation on top — so the **first** look at a
+    /// large pasted draft is real work, and it spends the chunk's budget like
+    /// any post. Past the budget the rest are deferred to a later chunk, which
+    /// is what [`SpaceCount::drafts_pending`] records: while one is owed the
+    /// count is **not settled**, the readout says it is counting, and no total
+    /// is shown. A budgeted count that still claimed to be settled would be the
+    /// partial sum this whole pass exists to refuse.
+    ///
+    /// The composition guard is kept for symmetry with the scope; an unfocused
+    /// editor cannot in fact be composing.
+    ///
+    /// Returns whether every retained draft is counted — `false` means it
+    /// stopped for budget, never that a draft was skipped.
+    fn count_retained_drafts(&mut self, budget: &mut ChunkBudget, cx: &mut Context<Self>) -> bool {
         let Some(query) = self.find.as_ref().and_then(|s| s.query.clone()) else {
-            return;
+            return true;
         };
-        let mut empty: Vec<SharedString> = Vec::new();
-        let mut work: Vec<(SharedString, ProjectionSeed, bool)> = Vec::new();
+        // Two passes, because deciding what each draft needs reads its editor
+        // entity while doing the work needs `&mut self`.
+        let mut plan: Vec<(SharedString, DraftWork)> = Vec::new();
         for draft in &self.drafts {
             if self
                 .find
@@ -1413,54 +1537,90 @@ impl SpaceView {
             }
             let editor = draft.editor.read(cx);
             if editor.value().is_empty() {
-                empty.push(draft.id.clone());
+                plan.push((draft.id.clone(), DraftWork::Empty));
                 continue;
             }
-            work.push((
-                draft.id.clone(),
-                ProjectionSeed {
-                    content: SharedString::from(editor.value().to_string()),
-                    embeds: EmbedMap::new(draft.embed_map()),
-                    // Every draft renders enabled, on its own branch as much as
-                    // on the selected one — the same reason `draft_scope_node`
-                    // passes a cursor rather than asking.
-                    render_cursor: Some(editor.selection()),
-                },
-                editor.is_composing(),
-            ));
-        }
-        for node in empty {
-            if let Some(session) = self.find.as_mut() {
-                session.space.counts.insert(node, 0);
-            }
-        }
-        for (node, seed, frozen) in work {
+            let frozen = editor.is_composing();
             let cached = self
                 .find
                 .as_ref()
-                .and_then(|s| s.projections.get(&node))
-                .filter(|(built_from, _)| frozen || built_from == &seed);
-            let count = match cached {
-                Some((_, projection)) => projection.find(&query).len(),
+                .and_then(|s| s.projections.get(&draft.id));
+            // The freshness question, asked without copying the draft's text:
+            // a `SharedString` seed compares against the editor's `&str`
+            // directly, so an unchanged draft never allocates its own content.
+            let projection_fresh = cached.is_some_and(|c| {
+                frozen
+                    || (c.seed.content.as_ref() == editor.value()
+                        && c.seed.render_cursor == Some(editor.selection())
+                        && c.seed.embeds == EmbedMap::new(draft.embed_map()))
+            });
+            let memoized = projection_fresh
+                && cached.is_some_and(|c| matches!(&c.hits, Some((q, _)) if q == &query));
+            if memoized {
+                plan.push((draft.id.clone(), DraftWork::Memoized));
+                continue;
+            }
+            if frozen && !projection_fresh {
                 // Composing with nothing cached: not searched yet, exactly as
                 // in the scope. Leaving no entry is the honest state, and the
                 // pass's own settling is untouched (drafts are not posts).
-                None if frozen => continue,
-                None => {
-                    let projection =
-                        searchable_projection(&seed.content, &seed.embeds, seed.render_cursor);
-                    self.projections_built.set(self.projections_built.get() + 1);
-                    let count = projection.find(&query).len();
+                continue;
+            }
+            let bytes = editor.value().len();
+            let seed = (!projection_fresh).then(|| ProjectionSeed {
+                content: SharedString::from(editor.value().to_string()),
+                embeds: EmbedMap::new(draft.embed_map()),
+                // Every draft renders enabled, on its own branch as much as on
+                // the selected one — the same reason `draft_scope_node` passes
+                // a cursor rather than asking.
+                render_cursor: Some(editor.selection()),
+            });
+            plan.push((draft.id.clone(), DraftWork::Scan { seed, bytes }));
+        }
+        for (node, work) in plan {
+            let seed = match work {
+                DraftWork::Empty => {
                     if let Some(session) = self.find.as_mut() {
-                        session.projections.insert(node.clone(), (seed, projection));
+                        session.space.counts.insert(node, 0);
                     }
-                    count
+                    continue;
+                }
+                DraftWork::Memoized => None,
+                DraftWork::Scan { seed, bytes } => {
+                    if budget.spent() {
+                        // The rest are a later chunk's, and the count says so
+                        // rather than settling over them.
+                        return false;
+                    }
+                    budget.scanned += bytes;
+                    seed
                 }
             };
+            if let Some(seed) = seed {
+                budget.built += 1;
+                let projection =
+                    searchable_projection(&seed.content, &seed.embeds, seed.render_cursor);
+                self.projections_built.set(self.projections_built.get() + 1);
+                if let Some(session) = self.find.as_mut() {
+                    session.projections.insert(
+                        node.clone(),
+                        CachedProjection {
+                            seed,
+                            projection,
+                            hits: None,
+                        },
+                    );
+                }
+            }
+            let scans = &self.scans_run;
             if let Some(session) = self.find.as_mut() {
-                session.space.counts.insert(node, count);
+                let count = hits_of(&mut session.projections, &node, &query, scans).map(<[_]>::len);
+                if let Some(count) = count {
+                    session.space.counts.insert(node, count);
+                }
             }
         }
+        true
     }
 
     /// The node ids a cached projection may be kept for: this frame's visible
@@ -1524,15 +1684,18 @@ impl SpaceView {
             session.count_task = None;
             session.space.restart(key);
         }
-        if session.space.settled {
-            return;
-        }
         if session.query.is_none() {
             // Nothing to count. Settled before it starts, and the readout shows
             // no total at all rather than a zero.
-            session.space.settled = true;
+            session.space.posts_done = true;
+            session.space.drafts_pending = false;
             return;
         }
+        // **No settled early-return.** The posts half remembers that it has
+        // finished (`count_posts` returns at once), but a retained draft's text
+        // moves with nothing in `CountKey` to show for it, so the drafts half
+        // has to be re-asked on every frame — which is cheap by construction:
+        // an unchanged draft is answered by the memo without a scan.
         if self.count_chunk(cx) {
             return;
         }
@@ -1565,23 +1728,41 @@ impl SpaceView {
         }
     }
 
-    /// One yield's worth of the whole-space pass. Returns whether it reached
-    /// the end of the space.
+    /// One yield's worth of the whole-space pass — the retained drafts, then
+    /// the posts, under one [`ChunkBudget`]. Returns whether both halves are
+    /// finished.
     ///
-    /// Two budgets, because the two costs are different by an order of
-    /// magnitude: **projecting** a post is a parse plus a render pass, so at
-    /// most [`PROJECTION_CHUNK`] of them happen per chunk; **scanning** an
-    /// already-projected one is a substring walk, so up to
-    /// [`SCAN_CHUNK_BYTES`] of warm text goes in the same chunk. A re-scan of
-    /// a warm conversation under that threshold therefore finishes in the one
-    /// chunk `sync_space_count` runs on the frame, and never reaches the task
-    /// at all.
+    /// Drafts go first because they are few and short and are re-asked every
+    /// frame, so a long conversation's posts can never starve them out of a
+    /// chunk; the budget they leave is what the posts walk with.
     fn count_chunk(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut budget = ChunkBudget::default();
+        let drafts_done = self.count_retained_drafts(&mut budget, cx);
+        if let Some(session) = self.find.as_mut() {
+            session.space.drafts_pending = !drafts_done;
+        }
+        let posts_done = self.count_posts(&mut budget, cx);
+        drafts_done && posts_done
+    }
+
+    /// The posts half of the pass. Returns whether the walk has reached the end
+    /// of the space.
+    ///
+    /// A re-scan of a warm conversation under [`SCAN_CHUNK_BYTES`] finishes in
+    /// the one chunk `sync_space_count` runs on the frame and never reaches the
+    /// task at all — the "below the threshold the scan stays on the frame" half
+    /// of the cost model.
+    fn count_posts(&mut self, budget: &mut ChunkBudget, cx: &mut Context<Self>) -> bool {
+        if self
+            .find
+            .as_ref()
+            .is_some_and(|session| session.space.posts_done)
+        {
+            return true;
+        }
         let Some(query) = self.find.as_ref().and_then(|s| s.query.clone()) else {
             return true;
         };
-        let mut built = 0usize;
-        let mut scanned = 0usize;
         loop {
             let Some(session) = self.find.as_ref() else {
                 return true;
@@ -1589,11 +1770,11 @@ impl SpaceView {
             let i = session.space.next;
             if i >= self.posts.len() {
                 if let Some(session) = self.find.as_mut() {
-                    session.space.settled = true;
+                    session.space.posts_done = true;
                 }
                 return true;
             }
-            if built >= PROJECTION_CHUNK || scanned >= SCAN_CHUNK_BYTES {
+            if budget.spent() {
                 return false;
             }
             let node = super::model::node_id(&self.posts, i);
@@ -1609,42 +1790,60 @@ impl SpaceView {
             let count = if excluded {
                 0
             } else {
-                scanned += post.content.len();
                 let seed = ProjectionSeed {
                     content: post.content.clone(),
                     embeds: post_embed_map(post),
                     render_cursor: None,
                 };
-                let cached = self
-                    .find
-                    .as_ref()
-                    .and_then(|s| s.projections.get(&node))
-                    .filter(|(built_from, _)| built_from == &seed);
-                match cached {
-                    Some((_, projection)) => projection.find(&query).len(),
-                    None => {
-                        built += 1;
-                        let projection = searchable_projection(
-                            &seed.content.clone(),
-                            &seed.embeds.clone(),
-                            None,
-                        );
+                // **The one node whose projection is not the cache's.** A post
+                // under inline edit is cached as the reader has it — live
+                // buffer, cursor-aware render — and that is what the branch
+                // pass and the highlight layers read. Overwriting it with the
+                // published render would make the two thrash each other every
+                // frame, so the count's own projection is built and discarded
+                // instead, memo and all. At most one node, once per pass.
+                let editing = self.editing.as_ref().is_some_and(|e| e.node_id == node);
+                let entry = self.find.as_ref().and_then(|s| s.projections.get(&node));
+                let fresh = entry.is_some_and(|c| c.seed == seed);
+                let memoized = !editing
+                    && fresh
+                    && entry.is_some_and(|c| matches!(&c.hits, Some((q, _)) if q == &query));
+                // Bytes are charged where bytes are read: a post the memo can
+                // answer for costs nothing, which is what lets a whole-space
+                // re-count over warm projections and an unchanged query finish
+                // on the frame its `CountKey` moved.
+                if !memoized {
+                    budget.scanned += post.content.len();
+                }
+                if editing {
+                    budget.built += 1;
+                    let projection = searchable_projection(&seed.content, &seed.embeds, None);
+                    self.projections_built.set(self.projections_built.get() + 1);
+                    self.scans_run.set(self.scans_run.get() + 1);
+                    projection.find(&query).len()
+                } else {
+                    if !fresh {
+                        budget.built += 1;
+                        let projection = searchable_projection(&seed.content, &seed.embeds, None);
                         self.projections_built.set(self.projections_built.get() + 1);
-                        let count = projection.find(&query).len();
-                        // **The one node whose projection is not the cache's.**
-                        // A post under inline edit is cached as the reader has
-                        // it — live buffer, cursor-aware render — and that is
-                        // what the branch pass and the highlight layers read.
-                        // Overwriting it with the published render would make
-                        // the two thrash each other every frame, so the count's
-                        // own projection is built and discarded instead. At
-                        // most one node, once per pass.
-                        let editing = self.editing.as_ref().is_some_and(|e| e.node_id == node);
-                        if !editing && let Some(session) = self.find.as_mut() {
-                            session.projections.insert(node.clone(), (seed, projection));
+                        if let Some(session) = self.find.as_mut() {
+                            session.projections.insert(
+                                node.clone(),
+                                CachedProjection {
+                                    seed,
+                                    projection,
+                                    hits: None,
+                                },
+                            );
                         }
-                        count
                     }
+                    let scans = &self.scans_run;
+                    self.find
+                        .as_mut()
+                        .and_then(|s| {
+                            hits_of(&mut s.projections, &node, &query, scans).map(<[_]>::len)
+                        })
+                        .unwrap_or(0)
                 }
             };
             if let Some(session) = self.find.as_mut() {
@@ -1891,7 +2090,7 @@ impl SpaceView {
         let session = self.find.as_ref()?;
         session
             .space
-            .settled
+            .is_settled()
             .then(|| tree.iter().map(|root| self.subtree_match_count(root)).sum())
     }
 
@@ -1903,7 +2102,7 @@ impl SpaceView {
         let session = self.find.as_ref()?;
         session
             .space
-            .settled
+            .is_settled()
             .then(|| self.subtree_match_count(node))
             .filter(|n| *n > 0)
     }
@@ -3210,7 +3409,7 @@ mod tests {
         space.restart(key("kestrel"));
         space.counts.insert("a1".into(), 3);
         space.next = 1;
-        space.settled = true;
+        space.posts_done = true;
         space.total = Some(3);
 
         space.restart(key("hawk"));
@@ -3218,6 +3417,30 @@ mod tests {
         assert_eq!(space.total, None, "and it shows no number while it walks");
         assert!(space.counts.is_empty());
         assert_eq!(space.next, 0);
+    }
+
+    #[test]
+    fn a_draft_still_waiting_on_its_scan_is_not_a_settled_count() {
+        // The budget's honesty clause: a draft deferred to a later chunk is
+        // work owed, so the count is *not* a number anything may show — the
+        // same rule the posts half obeys, said about the half that has no
+        // `CountKey` to be restarted by.
+        let mut space = SpaceCount::default();
+        space.restart(CountKey {
+            query: Some("kestrel".into()),
+            posts: 0,
+            revising: Vec::new(),
+        });
+        space.posts_done = true;
+        assert!(space.is_settled(), "the posts are the usual whole of it");
+
+        space.drafts_pending = true;
+        assert!(
+            !space.is_settled(),
+            "a draft owed a scan is a total that is not knowable yet"
+        );
+        space.drafts_pending = false;
+        assert!(space.is_settled(), "and it comes back when the scan lands");
     }
 
     /// One match, named by node/item/ordinal — the identity the anchor is

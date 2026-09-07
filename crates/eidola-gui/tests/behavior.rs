@@ -21829,3 +21829,161 @@ fn space_find_counts_a_draft_left_on_a_branch_the_reader_left(cx: &mut TestAppCo
          three on a6, and the draft left on a6's composer"
     );
 }
+
+#[gpui::test]
+fn space_find_scans_a_node_once_for_a_query_it_has_already_answered(cx: &mut TestAppContext) {
+    // **The count is memoized, not merely the projection.** Three passes ask a
+    // per-node question on every frame a session is open — the visible
+    // branch's match list, the whole-space post walk, and the retained drafts
+    // — and each of them called `Projection::find`, which is O(bytes) *and*
+    // allocates a whole folded copy of the haystack for a case-insensitive
+    // query. So a reader who opened the bar and then merely scrolled, or
+    // watched a reveal animate, paid for the entire visible branch and every
+    // off-branch draft again on every frame, with nothing about the
+    // conversation or the query having moved.
+    //
+    // Builds cannot show this: the projection is in the cache either way. The
+    // scans are what is counted.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // A draft on a branch the reader is not on — the retained-draft pass's own
+    // subject, and the site the finding named.
+    let elsewhere = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a6"))
+        .expect("every leaf has a tail draft");
+    elsewhere.update(&mut vcx, |e, cx| {
+        e.set_value("one more kestrel, written over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    let after_search = view.read_with(&vcx, |v, _| v.find_scans_run_for_test());
+    assert!(
+        after_search > 0,
+        "precondition: the search really scanned something"
+    );
+
+    // Four more frames with the bar open and nothing changed. `sync_find` runs
+    // on every one of them — that is deliberate, since the scope is a function
+    // of the selected branch — so this is exactly the idle cost the memo is
+    // about.
+    for _ in 0..4 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_scans_run_for_test()),
+        after_search,
+        "a node whose text and query have both stood still is never scanned again"
+    );
+
+    // And the memo is keyed on what it is an answer about: move the draft's
+    // text and it is scanned again, with the new count reaching the total.
+    elsewhere.update(&mut vcx, |e, cx| {
+        e.set_value("two kestrel and one kestrel over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    settle_find_count(&mut vcx);
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_scans_run_for_test()) > after_search,
+        "a draft that moved is scanned for real"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(10),
+        "eight in the posts and the draft's two"
+    );
+}
+
+#[gpui::test]
+fn space_find_budgets_the_first_scan_of_a_large_draft(cx: &mut TestAppContext) {
+    // The other half of the same finding. Memoizing makes an *unchanged* draft
+    // free; the **first** look at a large one is real work — a projection plus
+    // a scan over every byte — and it used to land whole on the frame the
+    // query committed, outside the budget the post walk has obeyed all along.
+    //
+    // So the retained drafts join the chunk, under the same allowance, and the
+    // count says so: while one is owed there is **no total**, exactly as while
+    // the posts are still walking. A budgeted pass that still claimed to be
+    // settled would be the partial sum the whole design refuses.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // One draft past `SCAN_CHUNK_BYTES` on its own, and a small one behind it:
+    // the first spends the chunk's whole allowance, so the second is deferred.
+    // (The budget bounds how many items a chunk takes, never how long one
+    // item's own scan runs — `Projection::find` has no resumable form. That
+    // residual is the post walk's too.)
+    let big = format!("{} one kestrel over here", "words ".repeat(25_000));
+    assert!(
+        big.len() > 128 * 1024,
+        "precondition: past the scan budget on its own"
+    );
+    let far = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a6"))
+        .expect("every leaf has a tail draft");
+    far.update(&mut vcx, |e, cx| e.set_value(big, cx));
+    let near = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a5"))
+        .expect("every leaf has a tail draft");
+    near.update(&mut vcx, |e, cx| {
+        e.set_value("a kestrel on the other leaf".to_string(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    // One keystroke and no settling — the frame the query landed on, with the
+    // work deliberately unfinished. `dispatch_keystroke` rather than
+    // `simulate_keystrokes`, which runs the executor until parked and would
+    // fuse the whole pass onto the press.
+    vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("k").unwrap(), cx);
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "the chunk spent its allowance on the large draft and owes the rest"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            None,
+            "so there is no total to show — a draft still owed a scan is not a \
+             settled count"
+        );
+    });
+
+    // Still owed after everything the executor can run without moving the
+    // clock: the remainder really is suspended on the chunk timer, not held on
+    // the frame.
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(v.find_counting_for_test(), "the frame was given up");
+    });
+
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "and the deferred work lands");
+        // The query is the single letter the one keystroke committed, so the
+        // arithmetic is over `k`s rather than kestrels: eight kestrels plus
+        // the `k` on the end of a3's "fork", and one in each retained draft.
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(11),
+            "the deferred draft's own matches are in the total that lands"
+        );
+    });
+}

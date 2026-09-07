@@ -895,6 +895,16 @@ pub struct SpaceView {
     /// show that none was built — only that none is kept. This counts the
     /// builds.
     pub(crate) projections_built: Cell<usize>,
+    /// How many times this window has **scanned** a projection for a query.
+    ///
+    /// The sibling seam to [`Self::projections_built`], and it exists because
+    /// the two costs are separate: a projection is built once per text, while
+    /// the scan is what `Query::find_in` does over every byte — folding case by
+    /// allocating a whole new projection of the haystack — and three passes
+    /// asked for one per node per frame. Reuse is not visible in the cache
+    /// either (the projection is there whether or not it was scanned again),
+    /// so the scans are counted.
+    pub(crate) scans_run: Cell<usize>,
 
     /// Whether this window's **inspector** (the per-space settings panel) is
     /// open. Per-window by design — two windows on one space are two vantage
@@ -1168,6 +1178,7 @@ impl SpaceView {
             find: None,
             posts_generation: 0,
             projections_built: Cell::new(0),
+            scans_run: Cell::new(0),
             inspector_open: false,
             inspector_scroll: ScrollHandle::new(),
             inspector_title: None,
@@ -1535,6 +1546,13 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn projections_built_for_test(&self) -> usize {
         self.projections_built.get()
+    }
+
+    /// How many times this window has scanned a projection for a query — the
+    /// seam for the memo (see [`Self::scans_run`]).
+    #[doc(hidden)]
+    pub fn find_scans_run_for_test(&self) -> usize {
+        self.scans_run.get()
     }
 
     /// Whether a find session is open.
