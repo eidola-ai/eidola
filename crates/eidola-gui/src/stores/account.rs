@@ -16,9 +16,11 @@
 
 use std::sync::Arc;
 
+use eidola_app_core::config;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AccountCreateResult, AppCore, BalancesResult, PriceInfo, SubscriptionInfo, TermsDocument,
+    AccountCreateResult, AppCore, BalancesResult, CheckoutMint, PortalMint, PriceInfo,
+    SubscriptionInfo, TermsDocument,
 };
 use gpui::{Context, Task};
 use tokio::sync::oneshot;
@@ -246,8 +248,8 @@ impl AccountStore {
         self.refresh_subscription(cx);
     }
 
-    /// The account this machine speaks for **right now**, read straight from
-    /// app-core's config.
+    /// The name of the credentials this machine speaks for **right now**,
+    /// read straight from app-core's config.
     ///
     /// Deliberately not `ConfigStore`: that snapshot is a *cache* refreshed
     /// from the bus, and every write here commits to config synchronously and
@@ -257,18 +259,25 @@ impl AccountStore {
     /// to the configured account has to read past that lag, or it is asking
     /// the stale copy about the staleness it exists to detect.
     ///
-    /// `fallback` answers on a stub store, which has no config to read.
-    pub fn account_identity(&self, fallback: Option<&str>) -> Option<String> {
+    /// `fallback` — the caller's cached `(id, secret)` — answers on a stub
+    /// store, which has no config to read.
+    ///
+    /// **The pair, not the account id.** A profile can be reset and
+    /// reconfigured with the same id under a different secret, and an id-only
+    /// answer calls those two the same thing — so the name is
+    /// [`eidola_app_core::config::account_fingerprint`], which is also the
+    /// name the mint reports itself by, making the two comparable.
+    pub fn account_fingerprint(&self, fallback: Option<(&str, &str)>) -> Option<String> {
         match self.app_core.as_ref() {
-            Some(core) => core.config_state().account_id,
-            None => fallback.map(str::to_string),
+            Some(core) => core.account_fingerprint(),
+            None => fallback.map(|(id, secret)| config::fingerprint_of(id, secret)),
         }
     }
 
-    /// Whether a URL minted while `minted_for` was configured may still be
-    /// opened — that is, whether the configured account is still that one.
-    pub fn mint_is_current(&self, minted_for: Option<&str>, fallback: Option<&str>) -> bool {
-        self.account_identity(fallback).as_deref() == minted_for
+    /// Whether a link the mint says it signed for `minted_for` may still be
+    /// opened — that is, whether this profile still holds those credentials.
+    pub fn mint_is_current(&self, minted_for: &str, fallback: Option<(&str, &str)>) -> bool {
+        self.account_fingerprint(fallback).as_deref() == Some(minted_for)
     }
 
     /// Test-only: put the subscription cell in an arbitrary state, so a
@@ -297,16 +306,19 @@ impl AccountStore {
 
     /// Create a checkout session for `price_id`; the caller awaits the
     /// returned receiver inside its own task. `None` on a stub.
+    ///
+    /// **The whole mint travels, never the URL alone.** The link and the
+    /// identity it was signed under are one answer, and a caller that could
+    /// hold the first without the second is a caller that can open a link it
+    /// cannot vouch for — see [`CheckoutMint`].
     pub fn request_checkout(
         &self,
         price_id: String,
-    ) -> Option<oneshot::Receiver<Result<String, AppError>>> {
+    ) -> Option<oneshot::Receiver<Result<CheckoutMint, AppError>>> {
         let core = self.app_core.clone()?;
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {
-            // The view keeps its own before-and-after identity guard, so
-            // only the link is passed on.
-            let _ = tx.send(core.account_checkout(price_id).await.map(|m| m.url));
+            let _ = tx.send(core.account_checkout(price_id).await);
         });
         Some(rx)
     }
@@ -368,9 +380,10 @@ impl AccountStore {
     /// Mint a billing-portal session for the click that is about to open it.
     /// The link is short-lived, so it is asked for at the moment of use
     /// rather than held from whenever the pane last read — the same shape as
-    /// `request_checkout`. The caller awaits inside its own slot. `None` on a
-    /// stub.
-    pub fn request_portal(&self) -> Option<oneshot::Receiver<Result<String, AppError>>> {
+    /// `request_checkout`, down to the mint carrying the identity it was
+    /// signed under ([`PortalMint`]). The caller awaits inside its own slot.
+    /// `None` on a stub.
+    pub fn request_portal(&self) -> Option<oneshot::Receiver<Result<PortalMint, AppError>>> {
         let core = self.app_core.clone()?;
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {

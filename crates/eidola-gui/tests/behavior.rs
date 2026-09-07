@@ -17,9 +17,9 @@ use eidola_app_core::updates::{
     Claim, ClaimDelta, ClaimsComparison, UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease,
 };
 use eidola_app_core::{
-    AttestationDetail, AttestationInfo, BalancesResult, ConfigState, CredentialLifecycleInfo,
-    PostBlock, PostNode, PostParticipant, PostTrace, RequestDetail, RequestInfo, SpaceInfo,
-    SpaceMessage, TraceEntry,
+    AttestationDetail, AttestationInfo, BalancesResult, CheckoutMint, ConfigState,
+    CredentialLifecycleInfo, PortalMint, PostBlock, PostNode, PostParticipant, PostTrace,
+    RequestDetail, RequestInfo, SpaceInfo, SpaceMessage, TraceEntry,
 };
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
@@ -2055,10 +2055,10 @@ fn a_reset_disowns_a_pending_link_before_the_bus_catches_up(cx: &mut TestAppCont
     });
     draw_window(cx, window);
 
-    let minted_for = Some(gpui::SharedString::from("acct-a"));
+    let minted_for = eidola_app_core::config::fingerprint_of("acct-a", "secret-a");
 
     // The account is forgotten. Nothing is pumped, so the cache still says
-    // "acct-a" — which is precisely the state the old guard trusted.
+    // "acct-a" — which is precisely the state a cache-reading guard trusts.
     core.reset_account().expect("reset");
     stores.config.read_with(cx, |c, _| {
         assert_eq!(
@@ -2070,8 +2070,10 @@ fn a_reset_disowns_a_pending_link_before_the_bus_catches_up(cx: &mut TestAppCont
 
     view.update(cx, |v, cx| {
         v.finish_manage(
-            minted_for,
-            Ok("https://billing.example/portal/disowned".into()),
+            Ok(PortalMint {
+                url: "https://billing.example/portal/disowned".into(),
+                minted_for,
+            }),
             cx,
         )
     });
@@ -2101,17 +2103,15 @@ fn a_payment_link_minted_for_a_replaced_account_is_never_opened(cx: &mut TestApp
     });
     draw_window(cx, window);
 
-    let minted_for = Some(gpui::SharedString::from(
-        config_state(true)
-            .account_id
-            .expect("fixture has an account"),
-    ));
+    let minted_for = fingerprint_of_state(&config_state(true));
 
     // The account is unchanged: the link opens.
     view.update(cx, |v, cx| {
         v.finish_manage(
-            minted_for.clone(),
-            Ok("https://billing.example/portal/current".into()),
+            Ok(PortalMint {
+                url: "https://billing.example/portal/current".into(),
+                minted_for: minted_for.clone(),
+            }),
             cx,
         )
     });
@@ -2133,8 +2133,10 @@ fn a_payment_link_minted_for_a_replaced_account_is_never_opened(cx: &mut TestApp
 
     view.update(cx, |v, cx| {
         v.finish_manage(
-            minted_for.clone(),
-            Ok("https://billing.example/portal/stale".into()),
+            Ok(PortalMint {
+                url: "https://billing.example/portal/stale".into(),
+                minted_for: minted_for.clone(),
+            }),
             cx,
         )
     });
@@ -2154,8 +2156,10 @@ fn a_payment_link_minted_for_a_replaced_account_is_never_opened(cx: &mut TestApp
     // Checkout is the same door with the same hazard — money, not a portal.
     view.update(cx, |v, cx| {
         v.finish_checkout(
-            minted_for,
-            Ok("https://checkout.example/session/stale".into()),
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/stale".into(),
+                minted_for,
+            }),
             cx,
         )
     });
@@ -2170,6 +2174,153 @@ fn a_payment_link_minted_for_a_replaced_account_is_never_opened(cx: &mut TestApp
                 .is_some_and(|e| e.contains("account changed"))
         );
     });
+}
+
+#[gpui::test]
+fn a_payment_link_minted_for_an_account_swapped_away_and_back_is_never_opened(
+    cx: &mut TestAppContext,
+) {
+    // The two holes a before-and-after look of this profile cannot see, on
+    // both billing doors. The identity therefore comes from the answering
+    // side — `CheckoutMint::minted_for` / `PortalMint::minted_for`, computed
+    // where the request was signed — and is compared against the credentials
+    // configured when the link lands.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores.clone(), window, cx))
+    });
+    draw_window(cx, window);
+
+    let here = fingerprint_of_state(&config_state(true));
+
+    // The account still configured opens, on both doors — asserted first, or
+    // everything below is satisfied by a guard that refuses everything.
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/current".into(),
+                minted_for: here.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://checkout.example/session/current"),
+        "the configured account's checkout must open"
+    );
+    view.read_with(cx, |v, _| assert!(v.checkout_error().is_none()));
+
+    view.update(cx, |v, cx| {
+        v.finish_manage(
+            Ok(PortalMint {
+                url: "https://billing.example/portal/current".into(),
+                minted_for: here.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "the configured account's portal must open"
+    );
+    view.read_with(cx, |v, _| assert!(v.manage_error().is_none()));
+
+    // (1) Swapped away and back. The account configured before the click and
+    // the account configured when the link lands are the same one, so a
+    // before-and-after comparison finds them equal and opens — but the mint
+    // ran while a third account was configured, so the link belongs to that
+    // one.
+    let mid_flight = {
+        let mut other = config_state(true);
+        other.account_id = Some("00000000-0000-7000-8000-000000000222".into());
+        other.account_secret = Some("a-third-accounts-secret".into());
+        fingerprint_of_state(&other)
+    };
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/aba".into(),
+                minted_for: mid_flight.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "a checkout signed under an account swapped away and back must not open"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.checkout_error()
+                .is_some_and(|e| e.contains("account changed"))
+        );
+    });
+
+    view.update(cx, |v, cx| {
+        v.finish_manage(
+            Ok(PortalMint {
+                url: "https://billing.example/portal/aba".into(),
+                minted_for: mid_flight,
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "a portal signed under an account swapped away and back must not open"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.manage_error()
+                .is_some_and(|e| e.contains("account changed"))
+        );
+    });
+
+    // (2) Reset and reconfigured with the *same id* under a different secret.
+    // An id-only comparison calls those two the same account; the fingerprint
+    // is over the pair, so it does not.
+    let same_id_new_secret = {
+        let mut rekeyed = config_state(true);
+        rekeyed.account_secret = Some("the-same-account-re-keyed".into());
+        fingerprint_of_state(&rekeyed)
+    };
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/rekeyed".into(),
+                minted_for: same_id_new_secret.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "a checkout signed under a secret this profile no longer holds must not open"
+    );
+
+    view.update(cx, |v, cx| {
+        v.finish_manage(
+            Ok(PortalMint {
+                url: "https://billing.example/portal/rekeyed".into(),
+                minted_for: same_id_new_secret.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "a portal signed under a secret this profile no longer holds must not open"
+    );
+    assert_ne!(
+        same_id_new_secret, here,
+        "and the refusal above must be the secret, not the id"
+    );
 }
 
 #[gpui::test]
@@ -2610,6 +2761,19 @@ fn config_state(has_account: bool) -> ConfigState {
         font_scale: 1.0,
         language: None,
     }
+}
+
+/// The name a mint made under `state`'s credentials would report itself by —
+/// the same digest app-core computes where it signs the request, so the two
+/// are comparable (`eidola_app_core::config::account_fingerprint`).
+fn fingerprint_of_state(state: &ConfigState) -> String {
+    eidola_app_core::config::fingerprint_of(
+        state.account_id.as_deref().expect("fixture has an id"),
+        state
+            .account_secret
+            .as_deref()
+            .expect("fixture has a secret"),
+    )
 }
 
 /// The eidola connection + trust bundle fixture (moved off `ConfigState`);
@@ -7297,12 +7461,14 @@ fn onboarding_checkout_will_not_fund_an_account_linked_over(cx: &mut TestAppCont
     });
     let (_w, view) = open_onboarding(cx, &stores);
 
-    let minted_for = config_state(true).account_id;
+    let minted_for = fingerprint_of_state(&config_state(true));
 
     view.update(cx, |v, cx| {
         v.finish_checkout(
-            minted_for.clone(),
-            Ok("https://checkout.example/session/current".into()),
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/current".into(),
+                minted_for: minted_for.clone(),
+            }),
             cx,
         )
     });
@@ -7322,8 +7488,10 @@ fn onboarding_checkout_will_not_fund_an_account_linked_over(cx: &mut TestAppCont
 
     view.update(cx, |v, cx| {
         v.finish_checkout(
-            minted_for,
-            Ok("https://checkout.example/session/stale".into()),
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/stale".into(),
+                minted_for,
+            }),
             cx,
         )
     });
@@ -7338,6 +7506,92 @@ fn onboarding_checkout_will_not_fund_an_account_linked_over(cx: &mut TestAppCont
                 .is_some_and(|e| e.contains("account changed"))
         );
     });
+}
+
+#[gpui::test]
+fn onboarding_checkout_will_not_fund_an_account_swapped_away_and_back(cx: &mut TestAppContext) {
+    // The Purchase slide takes the Account pane's guard whole, so it answers
+    // the same two cases a before-and-after look of this profile cannot see.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+    });
+    let (_w, view) = open_onboarding(cx, &stores);
+
+    let here = fingerprint_of_state(&config_state(true));
+
+    // The account still configured opens — asserted first, or everything
+    // below is satisfied by a guard that refuses everything.
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/current".into(),
+                minted_for: here.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://checkout.example/session/current"),
+        "the configured account's checkout must open"
+    );
+    view.read_with(cx, |v, _| assert!(v.checkout_error().is_none()));
+
+    // Linked over and linked back: the account before the press and the
+    // account when the link lands are the same, and the mint ran under a
+    // third one in between.
+    let mid_flight = {
+        let mut other = config_state(true);
+        other.account_id = Some("00000000-0000-7000-8000-000000000333".into());
+        other.account_secret = Some("a-linked-accounts-secret".into());
+        fingerprint_of_state(&other)
+    };
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/aba".into(),
+                minted_for: mid_flight,
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://checkout.example/session/current"),
+        "a checkout signed under an account linked over and back must not open"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.checkout_error()
+                .is_some_and(|e| e.contains("account changed"))
+        );
+    });
+
+    // The same id under a secret this profile no longer holds is a different
+    // credential pair, and the fingerprint says so.
+    let same_id_new_secret = {
+        let mut rekeyed = config_state(true);
+        rekeyed.account_secret = Some("the-same-account-re-keyed".into());
+        fingerprint_of_state(&rekeyed)
+    };
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/rekeyed".into(),
+                minted_for: same_id_new_secret.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://checkout.example/session/current"),
+        "a checkout signed under a secret this profile no longer holds must not open"
+    );
+    assert_ne!(
+        same_id_new_secret, here,
+        "and the refusal above must be the secret, not the id"
+    );
 }
 
 #[gpui::test]

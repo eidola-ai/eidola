@@ -145,8 +145,17 @@ pub enum LightCharacter {
 /// reversed — which is what lets the answer travel to a caller that has no
 /// business holding credentials.
 pub fn account_fingerprint(cfg: &Config) -> Option<String> {
-    use sha2::{Digest, Sha256};
     let (id, secret) = (cfg.account_id.as_ref()?, cfg.account_secret.as_ref()?);
+    Some(fingerprint_of(id, secret))
+}
+
+/// [`account_fingerprint`] over a pair held somewhere other than a [`Config`]
+/// — same digest, same domain separation, so the two answers are comparable.
+///
+/// A caller that already holds the pair (a client's own credential snapshot)
+/// needs the name without assembling a config around it.
+pub fn fingerprint_of(id: &str, secret: &str) -> String {
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     // Domain-separated, and length-prefixed so no two different pairs can
     // hash the same bytes by moving the boundary between them.
@@ -161,7 +170,7 @@ pub fn account_fingerprint(cfg: &Config) -> Option<String> {
         use std::fmt::Write;
         let _ = write!(out, "{b:02x}");
     }
-    Some(out)
+    out
 }
 
 /// Returns the default config file path: `<config_dir>/eidola/config.toml`.

@@ -614,6 +614,23 @@ pub struct CheckoutMint {
     pub minted_for: String,
 }
 
+/// A minted billing-portal session link, and the credentials the mint
+/// actually ran under.
+///
+/// The portal door is the same hazard as checkout wearing a different label:
+/// a network round trip the reader can outrun, and a session opened for the
+/// previous identity puts one account's billing history in front of someone
+/// holding another's credentials. So it answers the same way — see
+/// [`CheckoutMint`] for why the *signing* side is the only one that can.
+#[derive(Clone, Debug)]
+pub struct PortalMint {
+    /// The URL to open.
+    pub url: String,
+    /// [`config::account_fingerprint`] of the credentials this session was
+    /// minted under, taken at the moment the request was signed.
+    pub minted_for: String,
+}
+
 /// **Serialized by the local control protocol** ([`crate::ipc`]): a field
 /// rename here is a wire change.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -3037,11 +3054,15 @@ impl Inner {
     /// Its own call, matching its own endpoint: the session is a write the
     /// payment processor performs and it expires quickly, so it is asked
     /// for at the moment the reader is about to open it and never held.
-    async fn account_portal(&self) -> Result<String, AppError> {
+    async fn account_portal(&self) -> Result<PortalMint, AppError> {
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
+        // Taken from the very config the request is about to be signed with,
+        // for the reason [`PortalMint`] gives.
+        let minted_for = config::account_fingerprint(&cfg)
+            .expect("credentials just required are credentials to name");
 
         let client = self.build_client(&eidola, None).await?;
         let resp = client
@@ -3058,7 +3079,10 @@ impl Inner {
             serde_json::from_str(&body).map_err(|e| AppError::Network {
                 message: format!("failed to parse response: {e}"),
             })?;
-        Ok(portal.portal_url)
+        Ok(PortalMint {
+            url: portal.portal_url,
+            minted_for,
+        })
     }
 
     async fn account_balances(&self) -> Result<BalancesResult, AppError> {
@@ -9534,6 +9558,24 @@ impl AppCore {
         }
     }
 
+    /// The name of the credential pair this profile holds **right now**, or
+    /// `None` when no account is configured
+    /// ([`config::account_fingerprint`]).
+    ///
+    /// Read from the config file on every call, because the question it
+    /// answers is about *now*: anything checking whether a minted link still
+    /// belongs here has to read past every cached copy, since a cache
+    /// refreshed after the fact is the stale answer the check exists to
+    /// catch. Synchronous and lock-free, so a caller landing a round trip on
+    /// its own thread can take it on the spot.
+    ///
+    /// The **pair**, not the account id: a profile can be reset and
+    /// reconfigured with the same id under a different secret, and an
+    /// id-only answer calls those two the same thing.
+    pub fn account_fingerprint(&self) -> Option<String> {
+        config::account_fingerprint(&self.inner.load_config())
+    }
+
     /// The transitional resolved default inference model (see the
     /// `default_model` note in the docs): the default template's first agent
     /// participant's `model_ref`, falling back to [`config::DEFAULT_MODEL`].
@@ -10006,9 +10048,10 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// A billing-portal URL to open in a browser. Minted on demand and
-    /// never held — see [`Inner::account_portal`].
-    pub async fn account_portal(&self) -> Result<String, AppError> {
+    /// A billing-portal session to open in a browser, with the identity the
+    /// mint ran under. Minted on demand and never held — see
+    /// [`Inner::account_portal`] and [`PortalMint`].
+    pub async fn account_portal(&self) -> Result<PortalMint, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.account_portal().await })
