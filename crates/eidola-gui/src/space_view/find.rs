@@ -1706,6 +1706,14 @@ impl SpaceView {
         if self.count_chunk(cx) {
             return;
         }
+        // **The slot answers "is a worker running", so a finished one gives it
+        // back** (below). A completed `Task` left sitting here reads exactly
+        // like a live one, and this guard would then arm nothing for work a
+        // later chunk deferred — the bar stuck on "Counting…" with no total
+        // until some unrelated repaint happened along and drained it a chunk
+        // at a time. Reachable because the drafts half is re-asked every frame:
+        // the posts settle once, and a draft changing afterwards is what asks
+        // for a second worker on a slot the first never returned.
         if self
             .find
             .as_ref()
@@ -1716,10 +1724,28 @@ impl SpaceView {
         let task = cx.spawn(async move |this: gpui::WeakEntity<Self>, cx| {
             loop {
                 // The suspension between chunks. See [`COUNT_YIELD`] for why it
-                // cannot be zero.
+                // cannot be zero. It is also what makes clearing the slot below
+                // safe: the future always suspends before it can touch the
+                // field, so it can never run ahead of the assignment that puts
+                // it there.
                 cx.background_executor().timer(COUNT_YIELD).await;
                 let finished = this.update(cx, |this, cx| {
                     let finished = this.count_chunk(cx);
+                    if finished && let Some(session) = this.find.as_mut() {
+                        // **A finished worker hands its slot back, in the same
+                        // update it finishes in** — `STATE.md`'s own shape
+                        // (`this.balances_task = None` inside the task's
+                        // continuation), and the reason that doctrine needs no
+                        // generation counter: replace-cancels makes an occupied
+                        // slot mean "the current operation", so a slot that
+                        // outlives its operation is the one way the invariant
+                        // can be broken. A flag beside the slot would answer
+                        // the same question twice and is exactly the counter
+                        // the doctrine retires. Dropping this task from inside
+                        // itself is safe because nothing awaits after it: the
+                        // `break` below ends the future in this same poll.
+                        session.count_task = None;
+                    }
                     // Every chunk moves a number the bar is showing — the
                     // progress while counting, the total when it lands.
                     cx.notify();

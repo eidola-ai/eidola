@@ -21987,3 +21987,84 @@ fn space_find_budgets_the_first_scan_of_a_large_draft(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+fn space_find_arms_a_worker_for_work_deferred_after_the_count_had_settled(cx: &mut TestAppContext) {
+    // **A completed task is not a live one, and the slot has to say which.**
+    // The chunk loop arms a worker only when nothing is already running, and
+    // the question is asked of `count_task.is_some()` — so a multi-chunk pass
+    // that ran to the end left a finished `Task` sitting in the slot, and the
+    // *next* time a chunk deferred work the guard read that corpse as a live
+    // worker and armed nothing. The reader is then left on "Counting…" with no
+    // total until some unrelated repaint happens to drain it a chunk at a
+    // time. `STATE.md`'s own house example is the cure: the worker clears its
+    // slot in the same update it finishes in.
+    //
+    // Reachable exactly because the drafts half is re-asked every frame: the
+    // posts settle once, and a draft changing afterwards is what asks for a
+    // second worker on a slot the first one never gave back.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_countable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // A conversation big enough that this pass really needs the worker — which
+    // is what leaves a finished task in the slot to be mistaken for a live one.
+    // One character, because each further keystroke restarts the pass and a
+    // restart clears the slot: the stale one is what a *settled* pass leaves.
+    run_find(&view, window, &mut vcx, "k");
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "precondition: the pass landed");
+        assert_eq!(v.find_space_total_for_test(), Some(36));
+    });
+
+    // Now dirty two retained drafts, each past the scan budget on its own, in
+    // **one** update — so a single frame sees both and has to defer the
+    // second. Two separate updates would each get their own frame, and the
+    // first draft would be memoized by the time the second arrived.
+    let bulk = |lead: &str| format!("{} {lead}", "words ".repeat(25_000));
+    // Both off the selected path — a3 is the branch the reader is on, and its
+    // draft is in the search scope rather than in the retained-draft pass.
+    let far = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a4"))
+        .expect("every leaf has a tail draft");
+    let near = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a5"))
+        .expect("every leaf has a tail draft");
+    vcx.update(|_, cx| {
+        far.update(cx, |e, cx| e.set_value(bulk("one kestrel over here"), cx));
+        near.update(cx, |e, cx| {
+            e.set_value(bulk("a kestrel on the other leaf"), cx)
+        });
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "precondition: the frame deferred one of the two drafts"
+        );
+    });
+
+    // Nothing but the clock from here — no refresh, no keystroke — and only
+    // far enough for the chunk timer. A whole second would also fire the
+    // minimap's hide timer, whose repaint runs a chunk of its own and drains
+    // the deferral by hand: that is exactly the "until an unrelated repaint
+    // happens along" accident that hides this defect in the wild, so the
+    // instrument must not reproduce it.
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_millis(50));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.find_counting_for_test(),
+            "the deferred work was handed to a worker that actually wakes"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(38),
+            "thirty-six in the posts and one in each retained draft"
+        );
+    });
+}
