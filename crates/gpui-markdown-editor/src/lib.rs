@@ -41,6 +41,7 @@ pub use editor::{
     ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft, ShiftWordRight, Tab,
     ToggleBold, ToggleItalic, Undo, Up, WordLeft, WordRight, init,
 };
+pub use element::math_overlay_typesets;
 pub use embed::{EmbedMap, embed_marker, parse_embed_text};
 pub use event::{EditorEvent, MarkdownEditorEvent};
 pub use formatting::InlineFormat;

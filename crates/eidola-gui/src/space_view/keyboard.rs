@@ -45,7 +45,7 @@
 //! walk up to the nearest fork — and Right on one likewise. See
 //! [`tree_target`] for the exact rule.
 
-use gpui::{App, Context, FocusHandle, SharedString, Window};
+use gpui::{App, Context, FocusHandle, Focusable, SharedString, Window};
 
 use super::POST_PAD_Y;
 use super::SpaceView;
@@ -305,7 +305,7 @@ impl SpaceView {
         }
         // Transient overlays speak before the tree does; the context menu's
         // Escape ownership is the view root's and is untouched by this.
-        if self.transient_overlay_open() {
+        if self.transient_overlay_open(window, cx) {
             return false;
         }
         // A focused inspector field owns the keyboard the way a composing
@@ -365,22 +365,57 @@ impl SpaceView {
     }
 
     /// **Where the keyboard belongs when a surface that borrowed it closes** —
-    /// the reader's own place in the conversation if they have one, else the
-    /// view root.
+    /// the reader's own place in the conversation if they have one, then the
+    /// composing session that owns the keyboard if one is open, else the view
+    /// root.
     ///
-    /// The same answer [`SpaceView::sync_tree_focus`]'s falling edge gives, so
-    /// a close that hands the keyboard back explicitly (the quote-destination
-    /// picker, which *takes* focus when it opens and so owes it back) agrees
-    /// with the observation that runs a frame later rather than fighting it:
-    /// restoring the level's own handle leaves that edge's `live` check true
-    /// and the level intact, and restoring the root when there is no level
-    /// leaves it early-returning as it always has.
-    pub(crate) fn keyboard_home(&self) -> FocusHandle {
+    /// The tree arms are the same answer [`SpaceView::sync_tree_focus`]'s
+    /// falling edge gives, so a close that hands the keyboard back explicitly
+    /// (the quote-destination picker, which *takes* focus when it opens and so
+    /// owes it back) agrees with the observation that runs a frame later
+    /// rather than fighting it: restoring the level's own handle leaves that
+    /// edge's `live` check true and the level intact.
+    ///
+    /// **The composing arm exists because the view root is a dead end while a
+    /// draft or an edit session is open**, and it is exactly the state
+    /// [`SpaceView::handle_conversation_key`] refuses to act in: "a composing
+    /// session owns the keyboard entirely", so it yields every printable —
+    /// including type-to-compose, the one thing that would otherwise recover.
+    /// Hand the keyboard to the view root there and the window goes quiet: the
+    /// arrows reach nothing, Escape reaches nothing, and typing does nothing
+    /// until the reader clicks back into the composer. Whatever ⌘F (or any
+    /// other surface that borrows the keyboard) was opened over, this is the
+    /// one destination that leaves the reader able to go on writing. So the
+    /// two functions read one predicate from opposite ends: what the handler
+    /// yields to is what this answers with.
+    ///
+    /// **Derived, never captured.** The handle comes from the editor entity
+    /// that *is* the session at the moment of the question, so it cannot be
+    /// the dead slot a handle recorded when the surface opened would be — a
+    /// draft retired while the bar stood open simply is not the answer any
+    /// more, because there is no `active_draft` to name it.
+    pub(crate) fn keyboard_home(&self, cx: &App) -> FocusHandle {
         match self.tree_focus.as_ref().map(|f| f.level.clone()) {
             Some(FocusLevel::Post) => self.post_focus.clone(),
             Some(FocusLevel::Affordance(i)) => self.affordance_slot_or_post(i),
-            None => self.focus_handle.clone(),
+            None => self
+                .composing_focus(cx)
+                .unwrap_or_else(|| self.focus_handle.clone()),
         }
+    }
+
+    /// The editor of the composing session that owns the keyboard, if one is
+    /// open: an inline edit session first (it retires any active draft, so the
+    /// two cannot both be the reader's place), then the active draft.
+    fn composing_focus(&self, cx: &App) -> Option<FocusHandle> {
+        if let Some(editing) = self.editing.as_ref()
+            && let Some(editor) = self.bodies.get(&editing.node_id)
+        {
+            return Some(editor.read(cx).focus_handle(cx));
+        }
+        let active = self.active_draft.as_ref()?;
+        let draft = self.drafts.iter().find(|d| &d.id == active)?;
+        Some(draft.editor.read(cx).focus_handle(cx))
     }
 
     /// Which affordance slot the window's focus is actually on, if any — the
@@ -445,8 +480,17 @@ impl SpaceView {
     /// somewhere the reader cannot see. Sharing the predicate is what keeps the
     /// two from disagreeing about who owns the keyboard, which is the property
     /// [`Self::sync_tree_focus`]'s park-and-restore already depended on.
-    pub(crate) fn transient_overlay_open(&self) -> bool {
-        self.context_menu.is_some()
+    pub(crate) fn transient_overlay_open(&self, window: &Window, cx: &gpui::App) -> bool {
+        // **The find bar is a member only while it holds the keyboard**, which
+        // is why this predicate takes a window at all. Every other member is a
+        // popover that exists to be typed into and dismissed, so "open" and
+        // "owns the keyboard" are the same question; the bar deliberately
+        // outlives its own focus — a reader steps through matches, clicks back
+        // into the conversation, and goes on reading with it up. Asking
+        // "is it open" there would leave the arrows and every printable
+        // yielded to a field nobody is in.
+        self.find_holds_focus(window, cx)
+            || self.context_menu.is_some()
             || self.band_menu.is_some()
             || self.highlight_picker.is_some()
             // The quote-destination picker is one too, and for the sharper
@@ -923,7 +967,7 @@ impl SpaceView {
     /// restoring would yank focus out of the very thing the reader asked the
     /// menu for.
     pub(crate) fn sync_tree_focus(&mut self, window: &mut Window, cx: &mut App) {
-        let overlay = self.transient_overlay_open();
+        let overlay = self.transient_overlay_open(window, cx);
         if overlay {
             // Remember *who* the overlay left holding the keyboard, so the
             // falling edge can tell a borrow it never returned from a claim

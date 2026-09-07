@@ -82,14 +82,14 @@ theme_colors! {
         gpui::hsla(0.115, 0.85, 0.55, 0.16)
     };
     HighlightOverlay => highlight_overlay_color, |theme: &Theme| if theme.mode.is_dark() {
-        gpui::hsla(0.115, 0.55, 0.55, 0.32)
+        gpui::hsla(0.085, 0.42, 0.54, 0.24)
     } else {
-        gpui::hsla(0.115, 0.85, 0.55, 0.30)
+        gpui::hsla(0.095, 0.80, 0.60, 0.28)
     };
     HighlightAccent => highlight_accent_color, |theme: &Theme| if theme.mode.is_dark() {
-        gpui::hsla(0.115, 0.70, 0.60, 0.55)
+        gpui::hsla(0.080, 0.52, 0.55, 0.40)
     } else {
-        gpui::hsla(0.115, 0.90, 0.55, 0.52)
+        gpui::hsla(0.085, 0.92, 0.56, 0.58)
     };
     CodeBlockBackground => code_block_background, |theme: &Theme| theme.muted;
     CodeBlockContentBackground => code_block_content_background,
@@ -222,9 +222,17 @@ pub struct MarkdownStyle {
     /// Wash for [`crate::highlight::HighlightLayer::Overlay`] — the same warm
     /// family, one step stronger, so a range on the layer above the base
     /// reads as a distinct decoration rather than a deeper merge.
+    ///
+    /// **Night is not day at a lower alpha.** A saturated yellow over a cool
+    /// dark ground reads as olive and fights warm-grey body text, which is why
+    /// the dark values sit closer to the warm-orange end of the family at a
+    /// much lower saturation: the reader should see a mark on the words, not a
+    /// block behind them.
     pub highlight_overlay_color: Hsla,
     /// Wash for [`crate::highlight::HighlightLayer::Accent`] — the strongest
-    /// of the three, for the one range a host singles out among many.
+    /// of the three, for the one range a host singles out among many. Its gap
+    /// from the overlay above is what carries "*this* one of the several", so
+    /// it is a real step rather than a nudge.
     pub highlight_accent_color: Hsla,
 
     /// Font family for *inline* code spans. Defaults to

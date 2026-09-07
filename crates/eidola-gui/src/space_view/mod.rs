@@ -29,6 +29,7 @@
 
 pub mod composer;
 pub mod context_menu;
+pub mod find;
 pub mod inspector;
 pub mod inspector_participants;
 pub mod keyboard;
@@ -159,9 +160,37 @@ impl SpaceView {
     /// callers are exactly the seams that cancel a navigation glide, plus the
     /// glide door itself: the reader's own motions, and the navigations they
     /// asked for.
+    /// **The reader is moving the page, so the reader owns it.** One door for
+    /// both halves of the takeover — the glide in flight and the reveal still
+    /// owed — because they are separable and every site that took only one
+    /// took the wrong one.
+    ///
+    /// `cancel_page_glide` ends a motion; `demote_tail_pin_for_reader` drops
+    /// the *pending* one. `set_page_scroll_y` folds in the first and
+    /// `glide_page_to` the second, so a site reaching a motion through either
+    /// helper alone is silently half-covered, and a site reaching one through
+    /// neither — a branch-dot click, which writes no page offset at all — is
+    /// covered not at all. This class has now produced four instances (the
+    /// composer's arming, an inline edit, a read-only selection, a branch dot),
+    /// so the seam is named rather than re-derived: a reader-driven navigation
+    /// calls this, and the audit in `crates/eidola-gui/AGENTS.md` says which
+    /// entry points are which.
+    pub(crate) fn reader_takes_the_page(&mut self) {
+        self.cancel_page_glide();
+        self.demote_tail_pin_for_reader();
+    }
+
     pub(crate) fn demote_tail_pin_for_reader(&mut self) {
         if self.tail_pin.forced() {
             self.tail_pin = TailPin::Observing;
+        }
+        // A find reveal waiting for its post to render is the reader being
+        // taken somewhere too, so it obeys the same rule: whoever moves the
+        // page last owns it. The correction would otherwise land frames later,
+        // pulling a reader who had scrolled on back to a match they had
+        // already left.
+        if let Some(session) = self.find.as_mut() {
+            session.pending_reveal = None;
         }
     }
 }
@@ -831,6 +860,24 @@ pub struct SpaceView {
     /// outlive neither.
     pub(crate) marks_seen: HashSet<SharedString>,
 
+    /// The open **find** session (⌘F), if any — the query field, the match
+    /// set over the visible branch, and the projection cache.
+    ///
+    /// Window-local for the reason the composer draft is: two windows on one
+    /// space are two cursors, so they are two searches (`STATE.md`'s scoping
+    /// table). The cache living *inside* the session is what makes "no
+    /// projection is ever built while no find session is open" structural
+    /// rather than remembered — there is nowhere else to keep one.
+    pub(crate) find: Option<find::FindSession>,
+    /// How many searchable projections this window has ever built.
+    ///
+    /// A test seam, in the class of [`Self::docked_caret_slot_offset`]: the
+    /// lazy-activation invariant is that a closed find bar costs nothing on an
+    /// ordinary edit keystroke, and no amount of looking at the *cache* can
+    /// show that none was built — only that none is kept. This counts the
+    /// builds.
+    pub(crate) projections_built: Cell<usize>,
+
     /// Whether this window's **inspector** (the per-space settings panel) is
     /// open. Per-window by design — two windows on one space are two vantage
     /// points, and the panel is a way of looking, not a property of the space
@@ -1100,6 +1147,8 @@ impl SpaceView {
             truncated_posts: HashSet::new(),
             regenerating_elsewhere: HashSet::new(),
             marks_seen: HashSet::new(),
+            find: None,
+            projections_built: Cell::new(0),
             inspector_open: false,
             inspector_scroll: ScrollHandle::new(),
             inspector_title: None,
@@ -1445,6 +1494,67 @@ impl SpaceView {
     /// The document's top reserve — so a test can state a document position
     /// relative to it instead of restating the constant.
     #[doc(hidden)]
+    /// How many searchable projections this window has ever built — the seam
+    /// for the lazy-activation invariant (see [`Self::projections_built`]).
+    #[doc(hidden)]
+    pub fn projections_built_for_test(&self) -> usize {
+        self.projections_built.get()
+    }
+
+    /// Whether a find session is open.
+    #[doc(hidden)]
+    pub fn find_open_for_test(&self) -> bool {
+        self.find.is_some()
+    }
+
+    /// The find bar's query field, for driving real keystrokes through it.
+    #[doc(hidden)]
+    pub fn find_input_for_test(&self) -> Option<Entity<gpui_component::input::InputState>> {
+        self.find.as_ref().map(|f| f.input.clone())
+    }
+
+    /// Every match on the visible branch as `(node id, source range)`, in
+    /// document order, plus the current one's 1-based index.
+    #[doc(hidden)]
+    pub fn find_matches_for_test(
+        &self,
+    ) -> (Vec<(SharedString, std::ops::Range<usize>)>, Option<usize>) {
+        let Some(session) = self.find.as_ref() else {
+            return (Vec::new(), None);
+        };
+        (
+            session
+                .matches
+                .iter()
+                .map(|m| (m.node.clone(), m.source.clone()))
+                .collect(),
+            session.current_index(),
+        )
+    }
+
+    /// The node and source offset a two-phase reveal is still waiting to
+    /// correct, if one is pending — what pins that it follows the anchor
+    /// through an edit or a regeneration.
+    #[doc(hidden)]
+    pub fn find_pending_reveal_for_test(&self) -> Option<(SharedString, usize)> {
+        self.find
+            .as_ref()?
+            .pending_reveal
+            .as_ref()
+            .map(|p| (p.node.clone(), p.source.start))
+    }
+
+    /// The projections this window is currently holding, by node id.
+    #[doc(hidden)]
+    pub fn find_projection_nodes_for_test(&self) -> Vec<SharedString> {
+        let Some(session) = self.find.as_ref() else {
+            return Vec::new();
+        };
+        let mut nodes: Vec<SharedString> = session.projections.keys().cloned().collect();
+        nodes.sort();
+        nodes
+    }
+
     pub fn doc_reserve_for_test(&self) -> f32 {
         self.doc_reserve()
     }
@@ -2281,12 +2391,27 @@ impl SpaceView {
                     // Track this post's selection: a read-only body is where
                     // a quote is *made*, so its `SelectionChanged` is the
                     // only signal that gates the Edit menu's Quote items.
+                    //
+                    // **And selecting is the reader claiming the page where it
+                    // stands.** A find reveal is a multi-frame glide toward an
+                    // off-screen match, and a selection is anchored to document
+                    // positions, so a page sliding under the pointer smears the
+                    // drag across text the reader never aimed at — and phase 2
+                    // could still pull the page onto the match afterwards. Only
+                    // a drag that reaches a viewport edge passed through the
+                    // motion seam before (`autoscroll_selection`), which leaves
+                    // every ordinary click and mid-page drag out. The editor
+                    // emits this on a real caret move alone — `set_value`
+                    // announces `Change` and never this — so a transcript
+                    // re-seed cannot fire it.
                     let sub_id = id.clone();
                     let sub = cx.subscribe(&editor, move |this, _editor, event, cx| {
                         if matches!(
                             event,
                             gpui_markdown_editor::MarkdownEditorEvent::SelectionChanged
                         ) {
+                            this.cancel_page_glide();
+                            this.demote_tail_pin_for_reader();
                             this.note_body_selection(&sub_id, cx);
                         }
                     });
@@ -2565,9 +2690,6 @@ impl Render for SpaceView {
             page_layout.gutters,
         );
         self.sync_bodies(window, cx);
-        // Keep each post's embed map + highlight set current, and request the
-        // incoming-reference index for the posts that rendered last frame.
-        self.sync_references(cx);
         // Ask the space for its trace index (idempotent; the entity owns it).
         self.sync_traces(cx);
         // Keep a docked tail draft at the end of every branch (the always-present
@@ -2615,6 +2737,17 @@ impl Render for SpaceView {
                 PendingSettle::Stay => {}
             }
         }
+
+        // Recompute the find bar's matches against **this frame's** selected
+        // path, then paint them. Both run here rather than beside the other
+        // per-frame syncs because the scope is a function of the selected
+        // branch, which the scrollers only decide once `sync_scrolls` and any
+        // pending selection have run.
+        self.sync_find(&tree, page_width, window, cx);
+        // Keep each post's embed map + highlight sets current (quoted
+        // passages, find matches, the current match), and request the
+        // incoming-reference index for the posts that rendered last frame.
+        self.sync_references(cx);
 
         // Sync one read-only editor per in-flight turn to its live partial
         // (skip unchanged buffers), pruning editors whose turn has ended.
@@ -2822,6 +2955,11 @@ impl Render for SpaceView {
             // the `MarkdownEditor` beneath it, which then dragged out a
             // selection while the window moved (task 32). It stays ahead of the
             // composer and minimap, which paint over it as before.
+            // The find bar, painted **before** the drag band: its surface
+            // spans from the window top so it reads as one panel, and the band
+            // — registered after it — keeps the clicks in its own strip, so
+            // window dragging still works exactly where the reader expects.
+            .children(self.render_find_bar(window, cx))
             .child(self.render_title_bar(window, cx))
             // The stale-read line, floating just under the title band — chrome
             // over the page, so it is on screen at every scroll offset (the
@@ -2875,6 +3013,9 @@ impl Render for SpaceView {
             // `CloseWindow`, so the item targets the focused space and macOS
             // greys it when no space window is open.
             .on_action(cx.listener(Self::toggle_inspector))
+            // Edit → Find in Conversation (⌘F). Registered per-view like
+            // `ToggleInspector`, so macOS greys it with no space window open.
+            .on_action(cx.listener(Self::open_find))
             // Edit → Quote / Quote in Reply. Registered **only while a
             // quotable post selection exists**, so `is_action_available` is
             // false otherwise and macOS greys both items — the same
@@ -2925,6 +3066,12 @@ impl Render for SpaceView {
                     // …and its Participants section's model dropdown, which is
                     // the same kind of overlay over the same panel.
                     if this.close_inspector_participant_picker(cx) {
+                        return;
+                    }
+                    // …and the find bar — **gated on focus being inside it**,
+                    // so an Escape in the composer still deactivates the draft
+                    // rather than closing a bar the reader was not in.
+                    if this.find_holds_focus(window, cx) && this.close_find(window, cx) {
                         return;
                     }
                 }
@@ -3476,13 +3623,23 @@ impl SpaceView {
     /// paused cascade), each a card that has to be dismissed and ordered against
     /// the others, while a stale read is a standing property of the page with
     /// nothing to acknowledge — it ends when the read succeeds.
+    ///
+    /// **It hangs off the document's top reserve, not the title band's share of
+    /// it.** Every other surface that covers the document's top reads
+    /// [`Self::doc_reserve`], which is the one accessor that knows what chrome
+    /// is standing — and this strip is painted *after* the find bar, so a
+    /// constant here put its centred pill over the query field and won the
+    /// hit-test for it: part of the find controls obscured, and the field
+    /// unclickable, in a window whose reader had just asked to search. Reading
+    /// the same accessor is what makes the two surfaces unable to overlap,
+    /// whatever chrome the reserve grows next.
     fn render_transcript_refresh_failure(&self, cx: &Context<Self>) -> Option<AnyElement> {
         self.space.read(cx).transcript_refresh_failure()?;
         let theme = cx.theme();
         Some(
             div()
                 .absolute()
-                .top(TITLE_BAR_RESERVE)
+                .top(px(self.doc_reserve()))
                 .left_0()
                 .right_0()
                 .flex()
@@ -3729,7 +3886,8 @@ impl SpaceView {
     /// so a reader typing beside a notice keeps their caret.
     fn hand_back_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
         if held {
-            window.focus(&self.keyboard_home(), cx);
+            let back = self.keyboard_home(cx);
+            window.focus(&back, cx);
         }
     }
 

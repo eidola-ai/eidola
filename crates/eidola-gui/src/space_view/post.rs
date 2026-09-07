@@ -763,11 +763,33 @@ impl SpaceView {
 
         let original = editor.read(cx).value().to_string();
         let sub = cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
-            if let gpui_markdown_editor::MarkdownEditorEvent::PressEnter {
-                secondary: true, ..
-            } = event
-            {
-                this.commit_edit(window, cx);
+            match event {
+                gpui_markdown_editor::MarkdownEditorEvent::PressEnter {
+                    secondary: true, ..
+                } => this.commit_edit(window, cx),
+                // **Editing a post is the reader acting, so it takes the page.**
+                // The composer reaches this through `arm_composer_caret_scroll`;
+                // an inline edit has no caret-into-view of its own to arm, but
+                // the half that is not about the caret applies unchanged — a
+                // find reveal armed at an off-screen match is a motion the
+                // reader has now superseded, and phase 2 would otherwise pull
+                // the page onto that match while they type here.
+                //
+                // Both arms are the reader: an edit is a buffer change (a live
+                // preedit keystroke included, which *is* typing), and
+                // `SelectionChanged` is emitted only where the caret moved.
+                //
+                // No `notify` — the editor's own one already invalidates this
+                // window, because the frame reads that entity and gpui
+                // invalidates every window tracking it. That is what keeps the
+                // search itself following this buffer, and it is not something
+                // this subscription has to arrange.
+                gpui_markdown_editor::MarkdownEditorEvent::Change
+                | gpui_markdown_editor::MarkdownEditorEvent::SelectionChanged => {
+                    this.cancel_page_glide();
+                    this.demote_tail_pin_for_reader();
+                }
+                _ => {}
             }
         });
         self.editing = Some(super::EditingPost {

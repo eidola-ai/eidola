@@ -333,6 +333,48 @@ impl SpaceView {
 
     // -- Test seams --------------------------------------------------------
 
+    /// The **text input** in this section that holds the keyboard, weakly.
+    ///
+    /// The companion to [`Self::inspector_participant_field_focused`], and
+    /// deliberately a different shape of question. That one is a *predicate*,
+    /// so it asks containment: a form is its fields, its chips, its verbs and
+    /// its dropdown, and a listed predicate would answer "not held" for
+    /// everything the list forgot. This one names a *destination*, where a
+    /// forgotten input is not a wrong answer but a fall-through to
+    /// [`SpaceView::keyboard_home`] — so listing them is safe here in the way
+    /// it is not there.
+    ///
+    /// **Weak, because that is the liveness answer a `FocusHandle` cannot
+    /// give.** A handle tracked on no element still reports itself focused
+    /// (this window's whole dead-slot family), while an `InputState` entity
+    /// dies with the form that owns it — so a form retired while some other
+    /// surface held the keyboard simply fails to upgrade.
+    pub(crate) fn inspector_participant_focused_input(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Option<gpui::WeakEntity<InputState>> {
+        let held = |input: &Entity<InputState>| {
+            gpui::Focusable::focus_handle(input.read(cx), cx)
+                .is_focused(window)
+                .then(|| input.downgrade())
+        };
+        let edit = self.inspector_participant_edit.as_ref();
+        let add = self.inspector_participant_add.as_ref();
+        edit.and_then(|e| held(&e.label))
+            .or_else(|| edit.and_then(|e| held(&e.system_prompt)))
+            .or_else(|| add.and_then(|a| held(&a.label)))
+            .or_else(|| add.and_then(|a| held(&a.system_prompt)))
+            .or_else(|| {
+                self.inspector_template_form
+                    .as_ref()
+                    .and_then(|t| held(&t.title))
+            })
+        // The invite form carries no text input — its rows and verbs are the
+        // whole of it — so a reader standing in it has no field to be put back
+        // into, and the caller falls through.
+    }
+
     /// Which participant's disclosure is open, if any.
     #[doc(hidden)]
     pub fn inspector_editing_participant(&self) -> Option<&str> {

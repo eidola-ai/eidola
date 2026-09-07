@@ -502,6 +502,11 @@ impl SpaceView {
             container = container.contain_mouse(Overlay::Fade);
         }
 
+        // The find ticks read the editor's own match washes, so a tick and the
+        // highlight it points at are the same colour in both palettes.
+        let match_wash = super::prose_style(cx).highlight_overlay_color;
+        let match_current = super::prose_style(cx).highlight_accent_color;
+
         let levels = self.selected_levels(roots, page_width);
         // The same top headroom the scrollable document uses (zero for an empty
         // notebook), so the map's scale matches the real scroll range exactly —
@@ -563,6 +568,20 @@ impl SpaceView {
                     } else {
                         div().w_full().h_full().bg(flat)
                     };
+                    // **Find ticks, on the selected column only.** The minimap
+                    // is a spatial map of *this* branch, and a tick says where
+                    // in the document a match is — which is a question only the
+                    // selected column's cells can answer, since a sibling's
+                    // cell is a flat topological block with no interior
+                    // geometry. Positioned by the match's byte fraction, the
+                    // same honest estimate the reveal's first phase takes: it
+                    // moves once the post is really measured, exactly as the
+                    // cells themselves do under the warm pass.
+                    let ticks: Vec<(f32, bool)> = if is_active {
+                        self.find_ticks(&sib.id)
+                    } else {
+                        Vec::new()
+                    };
 
                     // Each column is a selectable entry in the map's "table of
                     // contents" — a labelled button that, on mousedown, either
@@ -597,9 +616,21 @@ impl SpaceView {
                         // (task 12); the arrow keys over the post tree are the
                         // conversation's navigation surface today.
                         .when(!interactive, |d| d.tab_stop(false))
+                        .relative()
                         .flex_1()
                         .h_full()
-                        .child(cell);
+                        .child(cell)
+                        .children(ticks.into_iter().map(|(fraction, current)| {
+                            let y = (row_h.as_f32() * fraction - MATCH_TICK_H / 2.0)
+                                .clamp(0.0, (row_h.as_f32() - MATCH_TICK_H).max(0.0));
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .top(px(y))
+                                .h(px(MATCH_TICK_H))
+                                .bg(if current { match_current } else { match_wash })
+                        }));
                     if interactive {
                         // Snapshot this cell's rendered geometry (its level's
                         // document top and the row height, both shared across the
@@ -832,6 +863,10 @@ impl SpaceView {
         }
     }
 }
+
+/// A find match's tick on the selected column: a thin full-width rule at the
+/// match's position in the post, in the same wash the highlight paints.
+const MATCH_TICK_H: f32 = 2.0;
 
 /// One selected-branch minimap column: a full-height column split into medium
 /// (scrolled-off) and dark (on-screen) spans, from the block's on-screen
