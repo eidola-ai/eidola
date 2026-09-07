@@ -2263,13 +2263,22 @@ impl SpaceView {
             }
         };
 
+        // **The controls stop where the map begins.** The minimap is painted
+        // after the bar, so anything under it is covered — and it *widens* while
+        // a session is open, precisely so a sibling column can hold a number, so
+        // a flat inset would have put the new total readout behind the strip
+        // exactly when the strip grew to meet it. Read from the one accessor,
+        // the two cannot overlap whatever width the map takes next.
+        let map_inset = px(self.minimap_width().as_f32() + BAR_EDGE_PAD);
+
         let controls = h_flex()
             .absolute()
             .top(TITLE_BAR_RESERVE)
             .left_0()
             .right_0()
             .h(px(FIND_BAR_H))
-            .px_3()
+            .pl(px(BAR_EDGE_PAD))
+            .pr(map_inset)
             .gap_2()
             .items_center()
             // The glyph a sighted reader sees and the sentence a screen reader
@@ -2487,6 +2496,11 @@ const FIND_REVEAL_MARGIN: f32 = 24.0;
 /// first phase only. One prose line is close enough to place the scroll; the
 /// correction replaces it as soon as the post paints.
 const FIND_ESTIMATED_LINE_H: f32 = 28.0;
+
+/// The bar's own breathing room at each end of its control row — `px_3`'s
+/// value, named because the right-hand inset is the minimap's width *plus*
+/// this rather than this alone.
+const BAR_EDGE_PAD: f32 = 12.0;
 
 /// How many posts one chunk of the whole-space pass will **project**.
 ///

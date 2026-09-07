@@ -8191,6 +8191,67 @@ fn space_find_bar_probes_its_field_verbs_and_readout(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// The bar's controls stop where the map begins. The minimap is painted after
+/// the find bar, so anything under it is covered — and it widens while a
+/// session is open, precisely so a sibling column can hold a number, which is
+/// exactly when a flat right inset would have put the new total readout behind
+/// the strip.
+#[gpui::test]
+fn the_find_bars_controls_stand_clear_of_the_map(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers")], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let entries = fresh_entries(cx, window);
+    let map = entries
+        .iter()
+        .find(|(n, _)| n == "space/minimap")
+        .map(|(_, e)| e.bounds)
+        .expect("the map paints beside the conversation");
+    let total = entries
+        .iter()
+        .find(|(n, _)| n == "space/find/total")
+        .map(|(_, e)| e.bounds)
+        .expect("the cross-branch total paints");
+
+    assert!(
+        total.right() <= map.origin.x,
+        "the readout the map would cover stands clear of it: total {total:?}, map {map:?}"
+    );
+    // …and the map really is the widened one, or the assertion above would be
+    // measuring against a strip that never grew.
+    assert!(
+        view.read_with(cx, |v, _| v.minimap_width_for_test()) > 36.0,
+        "precondition: the strip widened for the session"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 /// **The cross-branch counts, where a reader meets them.** A sibling column of
 /// the map carries the matches reachable only by taking that branch — its own
 /// and its whole subtree's — and carries the *exact* number in its accessible
