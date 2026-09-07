@@ -2288,10 +2288,6 @@ fn a_payment_link_minted_for_an_account_swapped_away_and_back_is_never_opened(
         rekeyed.account_secret = Some("the-same-account-re-keyed".into());
         fingerprint_of_state(&rekeyed)
     };
-    assert_ne!(
-        same_id_new_secret, here,
-        "the name must be over the pair, or this case is invisible"
-    );
     view.update(cx, |v, cx| {
         v.finish_checkout(
             Ok(CheckoutMint {
@@ -2311,7 +2307,7 @@ fn a_payment_link_minted_for_an_account_swapped_away_and_back_is_never_opened(
         v.finish_manage(
             Ok(PortalMint {
                 url: "https://billing.example/portal/rekeyed".into(),
-                minted_for: same_id_new_secret,
+                minted_for: same_id_new_secret.clone(),
             }),
             cx,
         )
@@ -2320,6 +2316,10 @@ fn a_payment_link_minted_for_an_account_swapped_away_and_back_is_never_opened(
         cx.opened_url().as_deref(),
         Some("https://billing.example/portal/current"),
         "a portal signed under a secret this profile no longer holds must not open"
+    );
+    assert_ne!(
+        same_id_new_secret, here,
+        "and the refusal above must be the secret, not the id"
     );
 }
 
@@ -7574,15 +7574,11 @@ fn onboarding_checkout_will_not_fund_an_account_swapped_away_and_back(cx: &mut T
         rekeyed.account_secret = Some("the-same-account-re-keyed".into());
         fingerprint_of_state(&rekeyed)
     };
-    assert_ne!(
-        same_id_new_secret, here,
-        "the name must be over the pair, or this case is invisible"
-    );
     view.update(cx, |v, cx| {
         v.finish_checkout(
             Ok(CheckoutMint {
                 url: "https://checkout.example/session/rekeyed".into(),
-                minted_for: same_id_new_secret,
+                minted_for: same_id_new_secret.clone(),
             }),
             cx,
         )
@@ -7591,6 +7587,10 @@ fn onboarding_checkout_will_not_fund_an_account_swapped_away_and_back(cx: &mut T
         cx.opened_url().as_deref(),
         Some("https://checkout.example/session/current"),
         "a checkout signed under a secret this profile no longer holds must not open"
+    );
+    assert_ne!(
+        same_id_new_secret, here,
+        "and the refusal above must be the secret, not the id"
     );
 }
 
