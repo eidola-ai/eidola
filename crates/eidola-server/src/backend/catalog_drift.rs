@@ -21,8 +21,13 @@
 //! three:**
 //!
 //! 1. A sold row whose upstream value moved (`Drift::Moved`).
-//! 2. An upstream id that is neither sold nor recorded as deliberately unsold
-//!    (`Drift::Unrecorded`) — "we missed it".
+//! 2. A published model nothing here accounts for (`Drift::Unrecorded`) — "we
+//!    missed it". Either an id in neither list, or one whose omission record
+//!    has stopped describing it: a route-bound record says the model lives on
+//!    an endpoint this server does not expose, so upstream moving it onto the
+//!    chat route makes it reachable and the record wrong. Same class, because
+//!    it is the same situation for a reader and takes the same two cures —
+//!    sell it, or write down why not.
 //! 3. A sold row, or an omission record, naming an id upstream no longer
 //!    publishes (`Drift::Gone`) — a stale row, or a stale omission.
 //!
@@ -39,9 +44,10 @@
 //!   describe an unrecorded id in the report.
 //! - **Output modalities, names and descriptions.** Upstream publishes no
 //!   output-modality list, and the catalog's prose is ours to write.
-//! - **What an unsold model's upstream row says.** Every omission reason here
-//!   is about a route *this server* does not expose, so no upstream value can
-//!   make one wrong; only the id vanishing can.
+//! - **Everything else an unsold model's upstream row says.** Its window,
+//!   prices and capabilities are not claims this tree makes, so they cannot be
+//!   wrong here. Only its id and its route are read, because only those two
+//!   are what the omission record asserts.
 
 use std::fmt;
 
@@ -118,11 +124,18 @@ enum Drift {
         catalog: String,
         upstream: String,
     },
-    /// Upstream publishes an id that is in neither list.
+    /// Upstream publishes a model nothing here accounts for: either an id in
+    /// neither list, or one whose omission record no longer describes the
+    /// published row. Both are the same thing to a reader — a model we are
+    /// probably meant to be selling, with no current reason on file — and the
+    /// same two answers cure them: sell it, or write down why not.
     Unrecorded {
         id: String,
         kind: String,
         endpoints: Vec<String>,
+        /// The recorded reason, when there was one and it has stopped
+        /// describing the row.
+        stale_reason: Option<&'static str>,
     },
     /// An id this tree names that upstream no longer publishes.
     Gone { id: String, role: Role },
@@ -144,10 +157,22 @@ impl fmt::Display for Drift {
                 id,
                 kind,
                 endpoints,
+                stale_reason: None,
             } => write!(
                 f,
                 "{id}: published upstream (type {kind}, endpoints {}) but neither sold nor \
                  recorded in NOT_SOLD_UPSTREAM_MODELS",
+                endpoints.join(", ")
+            ),
+            Drift::Unrecorded {
+                id,
+                kind,
+                endpoints,
+                stale_reason: Some(reason),
+            } => write!(
+                f,
+                "{id}: published upstream (type {kind}, endpoints {}); not sold because \
+                 \"{reason}\", which no longer describes it",
                 endpoints.join(", ")
             ),
             Drift::Gone {
@@ -277,11 +302,35 @@ fn drift_against(
     }
 
     for record in unsold {
-        if !upstream.iter().any(|m| m.id == record.id) {
+        let Some(live) = upstream.iter().find(|m| m.id == record.id) else {
             drifts.push(Drift::Gone {
                 id: record.id.to_string(),
                 role: Role::RecordedUnsold,
             });
+            continue;
+        };
+
+        // Presence alone is not the whole of an omission staying true. A
+        // route-bound record says the model lives on some endpoint this server
+        // does not expose; upstream moving it onto the chat route makes it
+        // reachable and the record wrong, and nothing else here would notice —
+        // the sweep below sees a recorded id and stays quiet.
+        //
+        // `upstream_route: None` is the record that survives either way, and
+        // it is why this reads the route rather than the presence of the chat
+        // endpoint alone: `websearch` is published *on* the chat route today
+        // and is still a tool rather than a model.
+        if let Some(route) = record.upstream_route {
+            let where_recorded = live.endpoints.iter().any(|e| e == route);
+            let reachable_here = live.endpoints.iter().any(|e| e == CHAT_ENDPOINT);
+            if reachable_here || !where_recorded {
+                drifts.push(Drift::Unrecorded {
+                    id: live.id.clone(),
+                    kind: live.kind.clone(),
+                    endpoints: live.endpoints.clone(),
+                    stale_reason: Some(record.reason),
+                });
+            }
         }
     }
 
@@ -293,6 +342,7 @@ fn drift_against(
                 id: live.id.clone(),
                 kind: live.kind.clone(),
                 endpoints: live.endpoints.clone(),
+                stale_reason: None,
             });
         }
     }
@@ -312,7 +362,8 @@ fn report(drifts: &[Drift]) -> String {
     out.push_str(
         "\nEvery line is a decision, not a chore: correct the row in MODEL_CATALOG \
          (crates/eidola-server/src/backend.rs), or record the id in \
-         NOT_SOLD_UPSTREAM_MODELS with the reason it is not sold.\n",
+         NOT_SOLD_UPSTREAM_MODELS with the route it is served on and the reason \
+         it is not sold.\n",
     );
     out
 }
@@ -380,8 +431,10 @@ mod tests {
         }
     }
 
-    /// A row for an id we deliberately do not sell. Nothing about it is
-    /// compared, so only its presence matters.
+    /// A row for an id we deliberately do not sell, serving it where the
+    /// record says it is served — including on the chat route for the record
+    /// that names none, which is where upstream publishes `websearch`.
+    /// Everything else about the row is uncompared and arbitrary.
     fn unsold_row(record: &UnsoldModel) -> UpstreamModel {
         UpstreamModel {
             id: record.id.to_string(),
@@ -390,7 +443,7 @@ mod tests {
             tool_calling: false,
             reasoning: false,
             multimodal: false,
-            endpoints: vec!["/v1/embeddings".to_string()],
+            endpoints: vec![record.upstream_route.unwrap_or(CHAT_ENDPOINT).to_string()],
             pricing: UpstreamPricing {
                 input_per_m: 0.0,
                 output_per_m: 0.0,
@@ -510,12 +563,124 @@ mod tests {
         let drifts = drift(&list);
         assert_eq!(drifts.len(), 1, "{drifts:?}");
         match &drifts[0] {
-            Drift::Unrecorded { id, .. } => {
+            Drift::Unrecorded {
+                id,
+                stale_reason: None,
+                ..
+            } => {
                 assert_eq!(id, "a-model-nobody-here-has-heard-of");
             }
             other => panic!("expected an unrecorded id, got {other:?}"),
         }
         assert!(report(&drifts).contains("a-model-nobody-here-has-heard-of"));
+    }
+
+    /// Class (b), the other way in: a deliberate omission whose record has
+    /// stopped describing the published row. Presence alone would pass and the
+    /// sweep would see a recorded id and stay quiet, so a newly reachable
+    /// model would hide behind a reason written about a route it has left.
+    #[test]
+    fn an_omission_whose_record_no_longer_describes_it_is_reported() {
+        let record = NOT_SOLD_UPSTREAM_MODELS
+            .iter()
+            .find(|r| r.upstream_route.is_some())
+            .expect("a route-bound omission to perturb");
+
+        for (case, endpoints) in [
+            // Upstream moves it onto the route this server routes to.
+            ("gained the chat route", vec![CHAT_ENDPOINT.to_string()]),
+            // Or off the route the record was written about.
+            (
+                "left its recorded route",
+                vec!["/v1/somewhere-else".to_string()],
+            ),
+        ] {
+            let mut list = a_faithful_list();
+            for row in list.iter_mut() {
+                if row.id == record.id {
+                    row.endpoints = endpoints.clone();
+                }
+            }
+
+            let drifts = drift(&list);
+            assert_eq!(drifts.len(), 1, "{case}: {drifts:?}");
+            match &drifts[0] {
+                Drift::Unrecorded {
+                    id,
+                    stale_reason: Some(reason),
+                    ..
+                } => {
+                    assert_eq!(id, record.id, "{case}: named the wrong model");
+                    assert_eq!(*reason, record.reason, "{case}: quoted the wrong reason");
+                }
+                other => panic!("{case}: expected a stale record, got {other:?}"),
+            }
+            assert!(
+                report(&drifts).contains(record.id),
+                "{case}: report omits it"
+            );
+        }
+    }
+
+    /// The other half of the same field, and the reason it is a route rather
+    /// than a flag: an omission that was never about routing survives the chat
+    /// route. Upstream publishes `websearch` there today, and a rule keyed on
+    /// the chat endpoint alone would report it every day until someone muted
+    /// the check.
+    #[test]
+    fn an_omission_that_names_no_route_survives_the_chat_route() {
+        let published = vec![UpstreamModel {
+            id: "an-upstream-tool".to_string(),
+            kind: "tool".to_string(),
+            context_window: None,
+            tool_calling: false,
+            reasoning: false,
+            multimodal: false,
+            endpoints: vec![CHAT_ENDPOINT.to_string()],
+            pricing: UpstreamPricing {
+                input_per_m: 0.0,
+                output_per_m: 0.0,
+                per_request_usd: 0.05,
+            },
+        }];
+
+        let not_about_routing = [UnsoldModel {
+            id: "an-upstream-tool",
+            upstream_route: None,
+            reason: "a tool rather than a model, wherever it is served",
+        }];
+        assert_eq!(
+            drift_against(&published, &[], &not_about_routing),
+            Vec::new()
+        );
+
+        // The same published row against a record that *is* about routing.
+        let about_routing = [UnsoldModel {
+            id: "an-upstream-tool",
+            upstream_route: Some("/v1/embeddings"),
+            reason: "embeddings only",
+        }];
+        assert_eq!(
+            drift_against(&published, &[], &about_routing).len(),
+            1,
+            "a route-bound record must not survive the chat route"
+        );
+    }
+
+    /// A record that named the chat route would be saying the model is
+    /// reachable here and not sold for that reason, which is not a reason.
+    #[test]
+    fn a_route_bound_omission_never_names_the_chat_route() {
+        for record in NOT_SOLD_UPSTREAM_MODELS {
+            if let Some(route) = record.upstream_route {
+                assert_ne!(
+                    route, CHAT_ENDPOINT,
+                    "{} is recorded as unsold because of the one route this \
+                     server does expose",
+                    record.id
+                );
+            }
+        }
     }
 
     /// Class (c), first half: a sold row upstream has retired. Selling an id
