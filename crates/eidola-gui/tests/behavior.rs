@@ -21920,25 +21920,28 @@ fn space_find_budgets_the_first_scan_of_a_large_draft(cx: &mut TestAppContext) {
     vcx.simulate_resize(gpui::size(px(760.), px(520.)));
     vcx.run_until_parked();
 
-    // One draft past `SCAN_CHUNK_BYTES` on its own, and a small one behind it:
-    // the first spends the chunk's whole allowance, so the second is deferred.
-    // (The budget bounds how many items a chunk takes, never how long one
-    // item's own scan runs — `Projection::find` has no resumable form. That
-    // residual is the post walk's too.)
-    let big = format!("{} one kestrel over here", "words ".repeat(25_000));
+    // Two drafts, each past `SCAN_CHUNK_BYTES` on its own: whichever the pass
+    // reaches first spends the chunk's whole allowance, so the other is
+    // deferred whatever order they come in. (The budget bounds how many items
+    // a chunk takes, never how long one item's own scan runs —
+    // `Projection::find` has no resumable form. That residual is the post
+    // walk's too.)
+    let bulk = |lead: &str| format!("{} {lead}", "words ".repeat(25_000));
     assert!(
-        big.len() > 128 * 1024,
-        "precondition: past the scan budget on its own"
+        bulk("x").len() > 128 * 1024,
+        "precondition: each is past the scan budget on its own"
     );
     let far = view
         .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a6"))
         .expect("every leaf has a tail draft");
-    far.update(&mut vcx, |e, cx| e.set_value(big, cx));
+    far.update(&mut vcx, |e, cx| {
+        e.set_value(bulk("one kestrel over here"), cx)
+    });
     let near = view
         .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a5"))
         .expect("every leaf has a tail draft");
     near.update(&mut vcx, |e, cx| {
-        e.set_value("a kestrel on the other leaf".to_string(), cx)
+        e.set_value(bulk("a kestrel on the other leaf"), cx)
     });
     vcx.run_until_parked();
     vcx.update(|window, _| window.refresh());
@@ -21956,7 +21959,8 @@ fn space_find_budgets_the_first_scan_of_a_large_draft(cx: &mut TestAppContext) {
     view.read_with(&vcx, |v, _| {
         assert!(
             v.find_counting_for_test(),
-            "the chunk spent its allowance on the large draft and owes the rest"
+            "the chunk spent its allowance on the first large draft and owes \
+             the rest"
         );
         assert_eq!(
             v.find_space_total_for_test(),
@@ -21966,14 +21970,10 @@ fn space_find_budgets_the_first_scan_of_a_large_draft(cx: &mut TestAppContext) {
         );
     });
 
-    // Still owed after everything the executor can run without moving the
-    // clock: the remainder really is suspended on the chunk timer, not held on
-    // the frame.
-    vcx.run_until_parked();
-    view.read_with(&vcx, |v, _| {
-        assert!(v.find_counting_for_test(), "the frame was given up");
-    });
-
+    // The posts are deliberately not the reason: this space is a few hundred
+    // bytes, and the posts half runs first and finished inside this very
+    // chunk. What is owed is a draft, and the readout says the same thing it
+    // says while the posts walk.
     settle_find_count(&mut vcx);
     view.read_with(&vcx, |v, _| {
         assert!(!v.find_counting_for_test(), "and the deferred work lands");

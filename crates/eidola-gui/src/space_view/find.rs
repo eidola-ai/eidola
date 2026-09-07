@@ -1728,21 +1728,25 @@ impl SpaceView {
         }
     }
 
-    /// One yield's worth of the whole-space pass — the retained drafts, then
-    /// the posts, under one [`ChunkBudget`]. Returns whether both halves are
-    /// finished.
+    /// One yield's worth of the whole-space pass — the posts, then the
+    /// retained drafts, under one [`ChunkBudget`]. Returns whether both halves
+    /// are finished.
     ///
-    /// Drafts go first because they are few and short and are re-asked every
-    /// frame, so a long conversation's posts can never starve them out of a
-    /// chunk; the budget they leave is what the posts walk with.
+    /// **The posts go first because that half remembers it is finished.** Once
+    /// they are done [`Self::count_posts`] returns at once and spends nothing,
+    /// so the steady state — a reader typing into a composer with the bar open
+    /// — hands the drafts the whole allowance. The other order starves nobody
+    /// either (nothing is shown until both halves land) but it lets a draft's
+    /// spend exhaust the chunk *before* the posts are asked, which makes a
+    /// chunk's stopping point unattributable to the half that caused it.
     fn count_chunk(&mut self, cx: &mut Context<Self>) -> bool {
         let mut budget = ChunkBudget::default();
+        let posts_done = self.count_posts(&mut budget, cx);
         let drafts_done = self.count_retained_drafts(&mut budget, cx);
         if let Some(session) = self.find.as_mut() {
             session.space.drafts_pending = !drafts_done;
         }
-        let posts_done = self.count_posts(&mut budget, cx);
-        drafts_done && posts_done
+        posts_done && drafts_done
     }
 
     /// The posts half of the pass. Returns whether the walk has reached the end
