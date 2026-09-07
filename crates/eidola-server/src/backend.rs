@@ -209,7 +209,7 @@ struct CatalogEntry {
 /// the per-request models), before `PRICING_MARKUP`.
 ///
 /// **Cached input is not modeled.** Tinfoil quotes a discounted cached-input
-/// price for some of these models — `glm-5-2` at $0.375/M against its $1.50
+/// price for some of these models — `glm-5-3` at $0.45/M against its $1.80
 /// full input price, for one — but the pricing contract (`eidola-common`, and
 /// the `ModelPricing` shape clients read from `/v1/models`) has a single
 /// prompt-token rate with no cache-hit term. Charging every prompt token at
@@ -219,18 +219,33 @@ struct CatalogEntry {
 /// contract change on both sides.
 const MODEL_CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
-        id: "glm-5-2",
-        name: "GLM-5.2",
-        description: "Advanced language model with strong reasoning and multilingual capabilities",
-        context_length: 393_216,
+        id: "glm-5-3",
+        name: "GLM-5.3",
+        description: "Flagship model for agentic coding and long-horizon tasks, with a 1M-token context window",
+        context_length: 1_048_576,
         tool_calling: true,
         reasoning: true,
         input_modalities: &[Modality::Text],
         output_modalities: &[Modality::Text],
         max_output_tokens: Some(32_768),
         output_budget_class: OutputBudgetClass::Reasoning,
-        input_per_m: 1.5,
-        output_per_m: 5.25,
+        input_per_m: 1.80,
+        output_per_m: 5.75,
+        per_request_usd: 0.0,
+    },
+    CatalogEntry {
+        id: "glm-5-3-flash",
+        name: "GLM-5.3 Flash",
+        description: "Fast multimodal mixture-of-experts model with a 1M-token context window, image input, reasoning, and tool calling",
+        context_length: 1_048_576,
+        tool_calling: true,
+        reasoning: true,
+        input_modalities: &[Modality::Text, Modality::Image],
+        output_modalities: &[Modality::Text],
+        max_output_tokens: Some(32_768),
+        output_budget_class: OutputBudgetClass::Reasoning,
+        input_per_m: 0.40,
+        output_per_m: 1.25,
         per_request_usd: 0.0,
     },
     CatalogEntry {
@@ -244,8 +259,8 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         output_modalities: &[Modality::Text],
         max_output_tokens: Some(32_768),
         output_budget_class: OutputBudgetClass::Reasoning,
-        input_per_m: 0.70,
-        output_per_m: 1.90,
+        input_per_m: 0.30,
+        output_per_m: 0.70,
         per_request_usd: 0.0,
     },
     CatalogEntry {
@@ -311,7 +326,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "voxtral-small-24b",
         name: "Voxtral Small 24B",
-        description: "Audio-capable model built on Mistral Small 3 for transcription, translation, and spoken queries",
+        description: "Audio-capable model built on Mistral Small 3.1 for transcription, translation, and spoken queries",
         context_length: 32_768,
         // The one row in this catalog that declares **no** tool calling, and
         // the reason a declaration is worth carrying at all: offering it tools
@@ -793,10 +808,10 @@ mod tests {
 
     #[test]
     fn test_usd_per_m_to_scaled_credits() {
-        // glm-5-2 input: $1.5/M tokens with 1.5x markup
+        // glm-5-3 input: $1.8/M tokens with 1.5x markup
         // The 1e6 factors (USD→µ$ and /M→/token) cancel:
-        // scaled = 1.5 * 1.5 * 1_000_000 = 2_250_000
-        assert_eq!(usd_per_m_to_scaled_credits(1.5, 1.5), 2_250_000);
+        // scaled = 1.8 * 1.5 * 1_000_000 = 2_700_000
+        assert_eq!(usd_per_m_to_scaled_credits(1.8, 1.5), 2_700_000);
 
         // gpt-oss-120b input: $0.15/M with 1.5x markup
         // scaled = 0.15 * 1.5 * 1_000_000 = 225_000
@@ -1116,6 +1131,7 @@ mod tests {
         // still asks for one should get an honest 404 rather than a price.
         assert!(backend.lookup_model("kimi-k2-6").is_none());
         assert!(backend.lookup_model("deepseek-v4-pro").is_none());
+        assert!(backend.lookup_model("glm-5-2").is_none());
         // Nor may a model this server has no route for. These are live
         // upstream ids; not selling them is the decision, and a 404 is what
         // that decision has to look like from outside.
