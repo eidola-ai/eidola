@@ -1,0 +1,67 @@
+name: Model Catalog Drift
+
+# `MODEL_CATALOG` (crates/eidola-server/src/backend.rs) hand-transcribes what
+# Tinfoil publishes per model — ids, context windows, prices, capability flags.
+# Upstream republishes on its own clock, so a row that was right when it was
+# written stops being right with nothing in this tree changing, and no in-repo
+# test can see that: it would be comparing the catalog to another equally stale
+# copy of itself. The second copy has to be the live list.
+#
+# So this is deliberately NOT a PR gate, for the same reason advisories.yml is
+# not one: an upstream change is not something a pull request introduced, and a
+# gate that failed unrelated work for it would be muted within a week. It runs
+# daily against the default branch (plus on demand) and a drifted value shows
+# up as a red scheduled run.
+#
+# The comparison itself lives in Rust beside the catalog it reads
+# (`backend::catalog_drift`) and is unit-tested offline in the ordinary PR
+# gate; only the fetch is here.
+on:
+  schedule:
+    # Daily; minute/hour chosen off the whole-hour spikes GitHub asks
+    # schedules to avoid, and off advisories.yml's slot.
+    - cron: "47 9 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  catalog-drift:
+    name: Catalog drift
+    runs-on: ubuntu-24.04
+    # Generous for a COLD-cache run: eidola-server's dep tree builds at
+    # opt-level 2 (root Cargo.toml dev profile). Warm runs are minutes.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        # Job-scoped key (no shared-key), so this cache holds only the
+        # eidola-server lib test build and the daily run keeps it warm.
+        # Schedule and dispatch both run on the default branch, so saving
+        # here never thrashes per-PR.
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Diff the catalog against the published list
+        shell: bash
+        env:
+          # The one `#[ignore]`d test that reaches the network. Named exactly,
+          # so no other ignored test in this crate (the Stripe ones) is run.
+          DRIFT_TEST: backend::catalog_drift::the_live_upstream_list_still_matches_the_catalog
+        run: |
+          cargo test -p eidola-server --lib -- \
+            --exact --ignored --nocapture "$DRIFT_TEST" 2>&1 | tee drift.log
+          # A filter that matches nothing exits 0, so a renamed or un-ignored
+          # test would leave this workflow permanently green while checking
+          # nothing. Require that exactly one test actually ran.
+          python3 -c 'import sys; log = open(sys.argv[2]).read(); sys.exit(0 if "test result: ok. 1 passed" in log else sys.argv[1] + " ran no test: has it been renamed or un-ignored?")' \
+            "$DRIFT_TEST" drift.log

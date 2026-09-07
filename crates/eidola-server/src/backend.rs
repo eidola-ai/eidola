@@ -411,6 +411,16 @@ pub const NOT_SOLD_UPSTREAM_MODELS: &[UnsoldModel] = &[
     },
 ];
 
+/// The two lists above against the published list they were transcribed from.
+///
+/// Test-only, and its live half is `#[ignore]`d: the fetch belongs to a
+/// scheduled workflow rather than to `cargo test`, because upstream moving a
+/// value is not something a pull request introduced. It sits in this module's
+/// tree so it reads `MODEL_CATALOG` and `NOT_SOLD_UPSTREAM_MODELS` themselves
+/// rather than a restatement of them.
+#[cfg(test)]
+mod catalog_drift;
+
 /// Convert USD per million tokens to scaled integer credits, applying markup.
 ///
 /// The 1e6 (USD→µ$) and /1e6 (per-M→per-token) factors cancel, leaving:
