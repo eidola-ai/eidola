@@ -610,6 +610,67 @@ pub(crate) struct PendingReveal {
     pub(crate) source: Range<usize>,
 }
 
+/// What the whole-space count is an answer **about**.
+///
+/// A total that is merely old is a settled number that is wrong, so the pass
+/// starts over whenever any of this moves rather than letting the readout
+/// stand on an answer about a conversation that has changed underneath it.
+/// Three inputs, and each is a real one: the committed query; the transcript
+/// ([`SpaceView::posts_generation`], bumped by every `rebuild`); and the posts
+/// whose answer is being replaced, which is the one exclusion that moves with
+/// **no** rebuild behind it — a regeneration begins by pushing a turn, not by
+/// writing a row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CountKey {
+    query: Option<SharedString>,
+    posts: u64,
+    revising: Vec<SharedString>,
+}
+
+/// The whole-space pass: every post's own match count, how far the walk has
+/// got, and whether it has finished.
+///
+/// **[`Self::settled`] is the only field the readout may believe.** While it
+/// is false the total is not knowable and the bar says exactly that — never a
+/// partial sum, which on screen is indistinguishable from a right one, and
+/// never the previous query's total, which is the same lie with a longer fuse.
+/// The sibling counts on the minimap are withheld on the same flag, for the
+/// same reason: "3 more in this branch" while the pass is still walking is a
+/// number a reader would act on.
+#[derive(Default)]
+pub(crate) struct SpaceCount {
+    /// What [`Self::counts`] is an answer about, once a pass has begun.
+    key: Option<CountKey>,
+    /// Own match counts per **post** node, filled in as the walk proceeds.
+    counts: HashMap<SharedString, usize>,
+    /// The next index into `SpaceView::posts` the walk will take.
+    next: usize,
+    /// Whether the walk has reached the end of the space for [`Self::key`].
+    settled: bool,
+    /// The settled total over this frame's effective tree, recomputed in
+    /// `sync_find` and held as an **integer** — the readout formats the words,
+    /// because a localized string in state is a cached render decision that a
+    /// locale change would leave standing (the localization doctrine's rule).
+    pub(crate) total: Option<usize>,
+}
+
+impl SpaceCount {
+    /// Start over for `key`: no counts, no progress, no total, and — the
+    /// load-bearing half — not settled.
+    fn restart(&mut self, key: CountKey) {
+        self.key = Some(key);
+        self.counts.clear();
+        self.next = 0;
+        self.settled = false;
+        self.total = None;
+    }
+
+    /// Whether the count is a number anything may show.
+    pub(crate) fn is_settled(&self) -> bool {
+        self.settled
+    }
+}
+
 /// Everything one window holds while its find bar is open.
 ///
 /// Window-local by the same rule the composer draft is: two windows on one
@@ -638,6 +699,24 @@ pub(crate) struct FindSession {
     pub(crate) matches: MatchSet,
     /// Which match the readout counts as current.
     pub(crate) anchor: Option<MatchAnchor>,
+    /// This frame's **visible-branch** node ids.
+    ///
+    /// Two answers exist for a node's own match count and they are not
+    /// interchangeable: the branch pass reads what is on screen (an inline
+    /// edit's unsaved buffer, a draft's live text), the whole-space pass reads
+    /// the persisted post. This says which of them is authoritative for a
+    /// node, so the total, the sibling counts and the highlight layers can
+    /// never describe different text (see [`SpaceView::own_match_count`]).
+    pub(crate) branch_nodes: HashSet<SharedString>,
+    /// The whole-space count and its honest in-progress state.
+    pub(crate) space: SpaceCount,
+    /// The chunked pass that fills [`Self::space`].
+    ///
+    /// A task on the session, per `STATE.md`: replace = cancel, and dropping
+    /// the session drops the task — which is what keeps "no session, no work"
+    /// structural rather than remembered, exactly as the projection cache's
+    /// placement does.
+    pub(crate) count_task: Option<gpui::Task<()>>,
     /// Per-node searchable projections, keyed by node id, each remembered with
     /// the content it was built from so a post whose text changed re-projects
     /// and one that did not is free.
@@ -941,8 +1020,22 @@ impl ScopeNode {
 /// selected — a projection lives while its node is still in scope, and the
 /// cache is still bounded by the scope, which is what keeps closing the bar the
 /// thing that drops every projection.
-fn live_scope_nodes(scope: &[ScopeNode]) -> HashSet<&SharedString> {
-    scope.iter().map(|entry| &entry.node).collect()
+fn live_scope_nodes(scope: &[ScopeNode]) -> HashSet<SharedString> {
+    scope.iter().map(|entry| entry.node.clone()).collect()
+}
+
+/// A post's embed map: the ordinals whose quoted passage still resolves.
+///
+/// An input to the projection rather than a detail of it — a marker is hidden
+/// wholesale only when its ordinal is *mapped*, and ordinary literal text when
+/// it is not — so both passes that project a post build it the same way.
+fn post_embed_map(post: &super::model::PostData) -> EmbedMap {
+    EmbedMap::new(post.references.iter().filter_map(|r| {
+        Some((
+            u64::try_from(r.ordinal).ok().filter(|o| *o > 0)?,
+            r.snippet.clone()?,
+        ))
+    }))
 }
 
 impl SpaceView {
@@ -1025,6 +1118,9 @@ impl SpaceView {
             query: None,
             matches: MatchSet::default(),
             anchor: None,
+            branch_nodes: HashSet::new(),
+            space: SpaceCount::default(),
+            count_task: None,
             projections: HashMap::new(),
             pending_reveal: None,
             reveal_when_anchored: false,
@@ -1216,7 +1312,8 @@ impl SpaceView {
             )
         });
         session.matches.clear();
-        let live = live_scope_nodes(&scope);
+        session.branch_nodes = live_scope_nodes(&scope);
+        let live = self.live_projection_nodes(&session.branch_nodes);
         session.projections.retain(|node, _| live.contains(node));
 
         if let Some(query) = session.query.clone() {
@@ -1266,10 +1363,210 @@ impl SpaceView {
         // anchor, and the readout says so instead.
         let owed = std::mem::take(&mut session.reveal_when_anchored) && session.current().is_some();
         self.find = Some(session);
+        // The visible branch is settled for this frame; the rest of the space
+        // is the count's business, and it may take several.
+        self.sync_space_count(cx);
+        // One walk of the effective tree per frame, held as an integer for the
+        // readout — and `None` for as long as the pass has not finished.
+        let total = self.find_space_total(tree);
+        if let Some(session) = self.find.as_mut() {
+            session.space.total = total;
+        }
         if owed {
             self.reveal_current_match(tree, page_width, window, cx);
         }
         self.correct_find_reveal(tree, page_width, window, cx);
+    }
+
+    /// The node ids a cached projection may be kept for: this frame's visible
+    /// branch, **plus every post in the space**.
+    ///
+    /// The cache is the whole space's now, because a post off the selected
+    /// branch is exactly what the cross-branch count is about — so the prune's
+    /// membership set grew to match. It is still bounded by what exists, which
+    /// is what keeps closing the bar the thing that drops every projection.
+    fn live_projection_nodes(&self, branch: &HashSet<SharedString>) -> HashSet<SharedString> {
+        let mut live: HashSet<SharedString> = (0..self.posts.len())
+            .map(|i| super::model::node_id(&self.posts, i))
+            .collect();
+        live.extend(branch.iter().cloned());
+        live
+    }
+
+    /// What this frame's whole-space count would be an answer about.
+    fn find_count_key(&self, cx: &gpui::App) -> CountKey {
+        let revising: Vec<SharedString> = self
+            .space
+            .read(cx)
+            .streams()
+            .iter()
+            .filter(|t| t.revising)
+            .filter_map(|t| t.target_action_id.clone().map(SharedString::from))
+            .collect();
+        CountKey {
+            query: self
+                .find
+                .as_ref()
+                .filter(|s| s.query.is_some())
+                .map(|s| SharedString::from(s.text.clone())),
+            posts: self.posts_generation,
+            revising,
+        }
+    }
+
+    /// Bring the whole-space count up to date with this frame — restarting it
+    /// when it is an answer about something else, and moving it along when it
+    /// is not finished.
+    ///
+    /// **The frame gets one chunk and no more.** A conversation small enough —
+    /// or one whose projections are all warm and whose remaining text is under
+    /// [`SCAN_CHUNK_BYTES`] — finishes inside that chunk, which is the "below
+    /// the threshold the scan stays on the frame" half of the cost model. One
+    /// that does not finish hands the rest to a task on the session, a chunk
+    /// per yield, and the readout says "counting" until it lands.
+    fn sync_space_count(&mut self, cx: &mut Context<Self>) {
+        let key = self.find_count_key(cx);
+        let Some(session) = self.find.as_mut() else {
+            return;
+        };
+        if session.space.key.as_ref() != Some(&key) {
+            // Replace = cancel: whatever the pass in flight was counting, it
+            // was counting something else.
+            session.count_task = None;
+            session.space.restart(key);
+        }
+        if session.space.settled {
+            return;
+        }
+        if session.query.is_none() {
+            // Nothing to count. Settled before it starts, and the readout shows
+            // no total at all rather than a zero.
+            session.space.settled = true;
+            return;
+        }
+        if self.count_chunk(cx) {
+            return;
+        }
+        if self
+            .find
+            .as_ref()
+            .is_some_and(|session| session.count_task.is_some())
+        {
+            return;
+        }
+        let task = cx.spawn(async move |this: gpui::WeakEntity<Self>, cx| {
+            loop {
+                // A zero timer is this executor's yield: it lets the frame the
+                // task was armed on finish, and under the test scheduler it
+                // expires on the next tick, so `run_until_parked` drives the
+                // whole pass with no clock to advance.
+                cx.background_executor()
+                    .timer(std::time::Duration::ZERO)
+                    .await;
+                let finished = this.update(cx, |this, cx| {
+                    let finished = this.count_chunk(cx);
+                    // Every chunk moves a number the bar is showing — the
+                    // progress while counting, the total when it lands.
+                    cx.notify();
+                    finished
+                });
+                if !matches!(finished, Ok(false)) {
+                    break;
+                }
+            }
+        });
+        if let Some(session) = self.find.as_mut() {
+            session.count_task = Some(task);
+        }
+    }
+
+    /// One yield's worth of the whole-space pass. Returns whether it reached
+    /// the end of the space.
+    ///
+    /// Two budgets, because the two costs are different by an order of
+    /// magnitude: **projecting** a post is a parse plus a render pass, so at
+    /// most [`PROJECTION_CHUNK`] of them happen per chunk; **scanning** an
+    /// already-projected one is a substring walk, so up to
+    /// [`SCAN_CHUNK_BYTES`] of warm text goes in the same chunk. A re-scan of
+    /// a warm conversation under that threshold therefore finishes in the one
+    /// chunk `sync_space_count` runs on the frame, and never reaches the task
+    /// at all.
+    fn count_chunk(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(query) = self.find.as_ref().and_then(|s| s.query.clone()) else {
+            return true;
+        };
+        let mut built = 0usize;
+        let mut scanned = 0usize;
+        loop {
+            let Some(session) = self.find.as_ref() else {
+                return true;
+            };
+            let i = session.space.next;
+            if i >= self.posts.len() {
+                if let Some(session) = self.find.as_mut() {
+                    session.space.settled = true;
+                }
+                return true;
+            }
+            if built >= PROJECTION_CHUNK || scanned >= SCAN_CHUNK_BYTES {
+                return false;
+            }
+            let node = super::model::node_id(&self.posts, i);
+            let post = &self.posts[i];
+            // The streaming rule, reaching the whole space: an answer being
+            // replaced is not text the reader can see, so it is out of the
+            // count exactly as it is out of the branch's match set. Its
+            // exclusion is in `CountKey`, so the pass restarts when it moves.
+            let excluded = post
+                .action_id
+                .as_deref()
+                .is_some_and(|id| self.space.read(cx).revising_seq(id).is_some());
+            let count = if excluded {
+                0
+            } else {
+                scanned += post.content.len();
+                let seed = ProjectionSeed {
+                    content: post.content.clone(),
+                    embeds: post_embed_map(post),
+                    render_cursor: None,
+                };
+                let cached = self
+                    .find
+                    .as_ref()
+                    .and_then(|s| s.projections.get(&node))
+                    .filter(|(built_from, _)| built_from == &seed);
+                match cached {
+                    Some((_, projection)) => projection.find(&query).len(),
+                    None => {
+                        built += 1;
+                        let projection = searchable_projection(
+                            &seed.content.clone(),
+                            &seed.embeds.clone(),
+                            None,
+                        );
+                        self.projections_built.set(self.projections_built.get() + 1);
+                        let count = projection.find(&query).len();
+                        // **The one node whose projection is not the cache's.**
+                        // A post under inline edit is cached as the reader has
+                        // it — live buffer, cursor-aware render — and that is
+                        // what the branch pass and the highlight layers read.
+                        // Overwriting it with the published render would make
+                        // the two thrash each other every frame, so the count's
+                        // own projection is built and discarded instead. At
+                        // most one node, once per pass.
+                        let editing = self.editing.as_ref().is_some_and(|e| e.node_id == node);
+                        if !editing && let Some(session) = self.find.as_mut() {
+                            session.projections.insert(node.clone(), (seed, projection));
+                        }
+                        count
+                    }
+                }
+            };
+            if let Some(session) = self.find.as_mut() {
+                session.space.counts.insert(node, count);
+                session.space.next = i + 1;
+            }
+        }
     }
 
     /// The nodes the search covers, in document order.
@@ -1321,12 +1618,7 @@ impl SpaceView {
                     {
                         continue;
                     }
-                    let embeds = EmbedMap::new(post.references.iter().filter_map(|r| {
-                        Some((
-                            u64::try_from(r.ordinal).ok().filter(|o| *o > 0)?,
-                            r.snippet.clone()?,
-                        ))
-                    }));
+                    let embeds = post_embed_map(post);
                     let (content, frozen, render_cursor) = self.post_scope_text(&node.id, post, cx);
                     seen.push(node.id.clone());
                     scope.push(ScopeNode {
@@ -1472,6 +1764,79 @@ impl SpaceView {
             .enumerate()
             .map(|(i, m)| (m.fraction, Some(i) == current))
             .collect()
+    }
+
+    /// One node's **own** match count, over the whole space.
+    ///
+    /// Two answers exist and they are not interchangeable, so the branch's
+    /// wins wherever it exists: it reads what is on screen — an inline edit's
+    /// unsaved buffer, a draft's live text — where the whole-space pass reads
+    /// the persisted post. Everything derived from this (the total, a
+    /// sibling's subtree count) therefore describes exactly the text the
+    /// highlight layers paint, rather than two readings of one conversation.
+    pub(crate) fn own_match_count(&self, node: &SharedString) -> usize {
+        let Some(session) = self.find.as_ref() else {
+            return 0;
+        };
+        if session.branch_nodes.contains(node) {
+            return session.matches.of(node).len();
+        }
+        session.space.counts.get(node).copied().unwrap_or(0)
+    }
+
+    /// The matches reachable through one node: its own plus every
+    /// descendant's — "*n* more matches reachable only through this branch".
+    pub(crate) fn subtree_match_count(&self, node: &TreeNode) -> usize {
+        subtree_matches(node, &|id| self.own_match_count(id))
+    }
+
+    /// The whole space's total, or `None` while the pass is still walking.
+    ///
+    /// `None` is the honest in-progress state and the only alternative to a
+    /// number: a partial sum reads on screen exactly like a settled one, and
+    /// the previous query's total is the same lie with a longer fuse.
+    ///
+    /// One walk of the tree, once per frame a session is open — deliberately
+    /// the *same* walk the map's sibling counts take, because it is that
+    /// identity that makes the exactness invariant true by construction rather
+    /// than by two definitions agreeing. It costs a hash lookup or two per post
+    /// (~100 µs at a thousand posts), which buys a number that cannot disagree
+    /// with the numbers beside it.
+    pub(crate) fn find_space_total(&self, tree: &[TreeNode]) -> Option<usize> {
+        let session = self.find.as_ref()?;
+        session
+            .space
+            .settled
+            .then(|| tree.iter().map(|root| self.subtree_match_count(root)).sum())
+    }
+
+    /// The count a minimap **sibling** cell carries: the matches reachable
+    /// only through that branch. `None` while no session is open, while the
+    /// pass has not settled, or where the branch holds nothing — a cell says
+    /// nothing rather than "0".
+    pub(crate) fn find_branch_count(&self, node: &TreeNode) -> Option<usize> {
+        let session = self.find.as_ref()?;
+        session
+            .space
+            .settled
+            .then(|| self.subtree_match_count(node))
+            .filter(|n| *n > 0)
+    }
+
+    /// The left-hand side of the **exactness invariant**: the selected path's
+    /// own matches, plus every shown sibling's whole subtree.
+    ///
+    /// This is what the minimap adds up in front of the reader — the active
+    /// column's matches at each level and a number on each inactive one — and
+    /// it must equal [`Self::find_space_total`] exactly, because
+    /// `selected_levels` exhausts the space: take any post off the selected
+    /// path, walk up to the first ancestor that is on it, and the post lies in
+    /// the subtree of exactly one non-active child of that ancestor — which is
+    /// exactly one of the siblings the map draws.
+    pub(crate) fn find_levels_account(&self, tree: &[TreeNode], page_width: Pixels) -> usize {
+        levels_account(&self.selected_levels(tree, page_width), &|id| {
+            self.own_match_count(id)
+        })
     }
 
     /// Phase 1 of the reveal, from a caller with no tree in hand (the step
@@ -1788,6 +2153,42 @@ impl SpaceView {
     }
 }
 
+/// Post-order accumulation over the render tree: a node's own matches plus
+/// every descendant's.
+///
+/// The whole space is already in `SpaceView::posts` — `get_space_tree` is
+/// `LIMIT`-free and branch-unfiltered — so a per-branch total is one walk over
+/// the tree the view already builds, never a database question. The same shape
+/// as `subtree_has_draft_content` beside it.
+fn subtree_matches(node: &TreeNode, own: &impl Fn(&SharedString) -> usize) -> usize {
+    own(&node.id)
+        + node
+            .children
+            .iter()
+            .map(|child| subtree_matches(child, own))
+            .sum::<usize>()
+}
+
+/// The selected path's own matches plus every shown sibling's whole subtree —
+/// what the minimap adds up in front of the reader, and the left-hand side of
+/// the exactness invariant (see [`SpaceView::find_levels_account`]).
+fn levels_account(
+    levels: &[(Vec<&TreeNode>, usize)],
+    own: &impl Fn(&SharedString) -> usize,
+) -> usize {
+    let mut total = 0;
+    for (sibs, active) in levels {
+        for (i, sib) in sibs.iter().enumerate() {
+            total += if i == *active {
+                own(&sib.id)
+            } else {
+                subtree_matches(sib, own)
+            };
+        }
+    }
+    total
+}
+
 /// Which surface a reveal moves, and the span it has to bring into view.
 ///
 /// Two, because the search scope has two kinds of node in it: everything on the
@@ -1840,6 +2241,27 @@ impl SpaceView {
             (true, None) => crate::i18n::msg::find_no_results(cx),
         };
         let steppable = total > 0;
+
+        // **The cross-branch total, and its honest in-progress state.** A
+        // different number from the index's: that one counts the branch the
+        // reader is looking at, this one the whole conversation. While the
+        // whole-space pass is still walking there is no number to show —
+        // `None` from [`SpaceView::find_space_total`] — and the readout says
+        // *that*, because a partial sum reads on screen exactly like a settled
+        // one and the previous query's total is the same lie with a longer
+        // fuse. A settled zero shows nothing at all: "No results" beside it
+        // has already said so, on both counts.
+        let space_total = self.find.as_ref().and_then(|s| s.space.total);
+        let settled_total = space_total.filter(|n| *n > 0);
+        let total_readout: Option<SharedString> = if !has_query {
+            None
+        } else {
+            match space_total {
+                Some(n) if n > 0 => Some(crate::i18n::msg::find_total(cx, n)),
+                Some(_) => None,
+                None => Some(crate::i18n::msg::find_total_counting(cx)),
+            }
+        };
 
         let controls = h_flex()
             .absolute()
@@ -1913,7 +2335,48 @@ impl SpaceView {
                     .text_sm()
                     .text_color(muted)
                     .child(readout),
-            );
+            )
+            .children(total_readout.map(|sentence| {
+                h_flex()
+                    .id("space-find-total")
+                    // One node, one sentence, label and value alike — the
+                    // readout's own shape. The chevron beside it is painted
+                    // separately and says nothing of its own.
+                    .probe_value(
+                        "space/find/total",
+                        gpui::Role::Label,
+                        sentence.clone(),
+                        sentence.clone(),
+                    )
+                    .flex_none()
+                    .gap_1()
+                    .items_center()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(sentence)
+                    .children(settled_total.map(|_| {
+                        // **The disclosure, rendered and inert.** What it will
+                        // open — the Find-all overlay — is a later wave, and a
+                        // `Role::Button` with no listener is a control
+                        // VoiceOver offers, activates and silently does nothing
+                        // with (`find_step_button`'s rule). So it carries no
+                        // a11y node at all: a registry-only probe, exactly as
+                        // the highlight picker's ordinal does, because the
+                        // sentence above already speaks the number and a node
+                        // here would say it twice.
+                        div()
+                            .id("space-find-total-disclosure")
+                            .probe_bounds(
+                                "space/find/total/disclosure",
+                                gpui::Role::Label,
+                                "Find all",
+                            )
+                            .flex_none()
+                            .text_xs()
+                            .text_color(muted.opacity(0.7))
+                            .child("▲")
+                    }))
+            }));
 
         Some(
             crate::chrome::round_top_client_corners(div(), window)
@@ -2024,6 +2487,48 @@ const FIND_REVEAL_MARGIN: f32 = 24.0;
 /// first phase only. One prose line is close enough to place the scroll; the
 /// correction replaces it as soon as the post paints.
 const FIND_ESTIMATED_LINE_H: f32 = 28.0;
+
+/// How many posts one chunk of the whole-space pass will **project**.
+///
+/// Measured on an M-series Mac over 200 synthetic posts averaging 1.1 KB of
+/// ordinary markdown (headings, a link, emphasis, a list, fenced text), the
+/// projection being `parse` + `render_readonly` + the walk in
+/// [`searchable_projection`]:
+///
+/// | build | `--release` | dev profile |
+/// |---|---|---|
+/// | per post | 11.1 µs | 34.4 µs |
+/// | per byte | 10.1 ns | 31.2 ns |
+///
+/// Sixteen posts is ~0.18 ms released (~0.55 ms in dev) at that size, and ~0.35
+/// ms for the 2 KB posts the cost model is written against — comfortably inside
+/// a frame beside everything else the frame does, while still coarse enough
+/// that a thousand-post conversation settles in tens of yields rather than
+/// hundreds. Counted in posts rather than bytes because the parse dominates and
+/// scales with structure, not length; the residual is a single pathological
+/// post, which costs its own chunk and nothing more.
+const PROJECTION_CHUNK: usize = 16;
+
+/// How many bytes of post text one chunk will **scan** — and therefore the
+/// threshold under which a whole re-scan stays on the frame, because
+/// [`SpaceView::sync_space_count`] runs one chunk there before it arms the
+/// task.
+///
+/// Same corpus, scanning warm projections for a lower-case (so
+/// case-insensitive, so case-folding) query:
+///
+/// | scan | `--release` | dev profile |
+/// |---|---|---|
+/// | per byte | 8.5 ns | 147 ns |
+///
+/// 128 KB is therefore ~1.1 ms released — one frame's worth of a keystroke, on
+/// the keystroke that asked for it. A conversation under that re-counts inside
+/// the frame its query changed on and never shows the counting state at all; a
+/// 2 MB one takes sixteen yields and does. (The dev profile is ~17× slower here
+/// because the fold is a per-character walk in an unoptimized crate; the
+/// threshold serves the shipped binary, and dev pays a dropped frame, which is
+/// the trade the dev profile already documents.)
+const SCAN_CHUNK_BYTES: usize = 128 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -2418,6 +2923,168 @@ mod tests {
         // And a node the branch no longer carries does not, which is what
         // keeps the cache bounded by the scope.
         assert!(!live.contains(&SharedString::from("a3")));
+    }
+
+    /// A node with children, for the accumulation tests.
+    fn node(id: &str, children: Vec<TreeNode>) -> TreeNode {
+        TreeNode {
+            src: NodeSrc::Msg(0),
+            id: id.into(),
+            children,
+        }
+    }
+
+    /// A deliberately gnarly forest: two thread roots, forks at every depth,
+    /// a level whose active child is itself forked, and leaves at three
+    /// different depths.
+    fn gnarly_forest() -> Vec<TreeNode> {
+        vec![
+            node(
+                "r1",
+                vec![
+                    node(
+                        "a",
+                        vec![node("a1", vec![node("a1a", vec![])]), node("a2", vec![])],
+                    ),
+                    node(
+                        "b",
+                        vec![
+                            node("b1", vec![]),
+                            node("b2", vec![node("b2a", vec![]), node("b2b", vec![])]),
+                        ],
+                    ),
+                    node("c", vec![]),
+                ],
+            ),
+            node("r2", vec![node("r2a", vec![])]),
+        ]
+    }
+
+    /// `selected_levels`' rule, stated over an explicit list of active
+    /// indices: level 0 is the roots, and each level after it is the previous
+    /// level's active node's children.
+    fn levels_of<'a>(roots: &'a [TreeNode], actives: &[usize]) -> Vec<(Vec<&'a TreeNode>, usize)> {
+        let mut levels: Vec<(Vec<&'a TreeNode>, usize)> = Vec::new();
+        if roots.is_empty() {
+            return levels;
+        }
+        let mut active = actives.first().copied().unwrap_or(0) % roots.len();
+        levels.push((roots.iter().collect(), active));
+        let mut node = &roots[active];
+        let mut depth = 1;
+        while !node.children.is_empty() {
+            active = actives.get(depth).copied().unwrap_or(0) % node.children.len();
+            levels.push((node.children.iter().collect(), active));
+            node = &node.children[active];
+            depth += 1;
+        }
+        levels
+    }
+
+    #[test]
+    fn the_selected_path_and_its_shown_siblings_account_for_the_whole_space() {
+        // **The exactness invariant.** `selected_levels` gives, at level 0, all
+        // thread roots, and at each level after it all children of the previous
+        // level's active node. Take any post off the selected path and walk up
+        // to the first ancestor that is on it: the post lies in the subtree of
+        // exactly one *non-active* child of that ancestor — which is exactly one
+        // of the siblings the minimap draws. So the path's own matches plus
+        // those siblings' whole subtrees is the space's total, exactly and
+        // without double counting.
+        let roots = gnarly_forest();
+        // Uneven counts, several zeroes, and a node with matches at every
+        // depth — so a walk that skipped a level or double-counted one could
+        // not come out equal by luck.
+        let counts: HashMap<&str, usize> = [
+            ("r1", 2),
+            ("a", 3),
+            ("a1", 1),
+            ("a1a", 4),
+            ("a2", 0),
+            ("b", 5),
+            ("b1", 0),
+            ("b2", 2),
+            ("b2a", 7),
+            ("b2b", 1),
+            ("c", 0),
+            ("r2", 6),
+            ("r2a", 9),
+        ]
+        .into_iter()
+        .collect();
+        let own = |id: &SharedString| counts.get(id.as_ref()).copied().unwrap_or(0);
+        let total: usize = roots.iter().map(|r| subtree_matches(r, &own)).sum();
+        assert_eq!(
+            total,
+            counts.values().sum::<usize>(),
+            "the forest is the space"
+        );
+
+        // Every branch the reader could be on, not one of them.
+        let mut checked = 0;
+        for r in 0..2 {
+            for l1 in 0..3 {
+                for l2 in 0..3 {
+                    for l3 in 0..3 {
+                        let levels = levels_of(&roots, &[r, l1, l2, l3]);
+                        assert_eq!(
+                            levels_account(&levels, &own),
+                            total,
+                            "path {:?} does not account for the space",
+                            levels
+                                .iter()
+                                .map(|(sibs, active)| sibs[*active].id.as_ref())
+                                .collect::<Vec<_>>()
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 54, "every combination was walked");
+    }
+
+    #[test]
+    fn a_subtree_count_is_a_node_and_everything_under_it() {
+        let roots = gnarly_forest();
+        let counts: HashMap<&str, usize> = [("b", 5), ("b1", 0), ("b2", 2), ("b2a", 7), ("b2b", 1)]
+            .into_iter()
+            .collect();
+        let own = |id: &SharedString| counts.get(id.as_ref()).copied().unwrap_or(0);
+        let b = &roots[0].children[1];
+        assert_eq!(b.id, SharedString::from("b"));
+        assert_eq!(
+            subtree_matches(b, &own),
+            15,
+            "5 of its own plus 0 + 2 + 7 + 1 beneath it"
+        );
+        // A leaf is its own subtree, and a node nothing matched in contributes
+        // nothing rather than being absent.
+        assert_eq!(subtree_matches(&roots[1], &own), 0);
+    }
+
+    #[test]
+    fn a_restarted_count_is_not_a_settled_one() {
+        // The honest-states rule at its smallest: whatever the pass had, it was
+        // an answer about something else, so the number goes with it — never
+        // left standing while the walk starts over.
+        let key = |q: &str| CountKey {
+            query: Some(q.into()),
+            posts: 0,
+            revising: Vec::new(),
+        };
+        let mut space = SpaceCount::default();
+        space.restart(key("kestrel"));
+        space.counts.insert("a1".into(), 3);
+        space.next = 1;
+        space.settled = true;
+        space.total = Some(3);
+
+        space.restart(key("hawk"));
+        assert!(!space.is_settled(), "a new question is not answered yet");
+        assert_eq!(space.total, None, "and it shows no number while it walks");
+        assert!(space.counts.is_empty());
+        assert_eq!(space.next, 0);
     }
 
     /// One match, named by node/item/ordinal — the identity the anchor is

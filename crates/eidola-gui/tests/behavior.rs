@@ -21054,3 +21054,301 @@ fn space_find_does_not_push_a_followed_reference_under_its_own_bar(cx: &mut Test
          way ({closed} closed, {open} open)"
     );
 }
+
+/// A conversation that forks twice, with matches on branches the reader is not
+/// looking at. `a1` is the root; `a2`/`a3` fork under it; `a4`/`a5` fork under
+/// `a2`; `a6` hangs off `a3`.
+fn cross_branch_posts() -> Vec<PostNode> {
+    let child = |id: &str, parent: &str, text: &str| {
+        let mut p = fixture_assistant_post(id, text);
+        p.parent_action_id = Some(parent.into());
+        p
+    };
+    vec![
+        fixture_user_post("a1", "one kestrel at the root"),
+        child("a2", "a1", "no birds here"),
+        child("a4", "a2", "a kestrel and another kestrel"),
+        child("a5", "a2", "one more kestrel"),
+        child("a3", "a1", "a kestrel on the other fork"),
+        child("a6", "a3", "kestrel, kestrel, kestrel"),
+    ]
+}
+
+/// A conversation too big for one chunk of the cross-branch pass to finish:
+/// five spine posts, each carrying six replies, thirty-six in all, one match
+/// apiece. Shallow and wide rather than deep — the view renders one nested
+/// scroller per level, so depth is the expensive axis in a fixture and breadth
+/// is the free one.
+fn wide_countable_posts() -> Vec<PostNode> {
+    // ~4 KB a post, so the space is also past `SCAN_CHUNK_BYTES`: a re-scan of
+    // warm projections cannot finish in one chunk either, which is what makes
+    // a needless restart visible rather than merely wasteful.
+    let filler = "words ".repeat(650);
+    let body = |lead: &str| format!("{lead}. {filler}");
+    let mut posts = vec![fixture_user_post("a1", &body("one kestrel to start"))];
+    let mut n = 2u32;
+    let mut parent = String::from("a1");
+    for _ in 0..5 {
+        let spine = format!("a{n}");
+        n += 1;
+        let mut p = fixture_assistant_post(&spine, &body("a kestrel further down the spine"));
+        p.parent_action_id = Some(parent.clone());
+        posts.push(p);
+        for _ in 0..6 {
+            let leaf = format!("a{n}");
+            n += 1;
+            let mut p = fixture_assistant_post(&leaf, &body("one kestrel on a branch"));
+            p.parent_action_id = Some(spine.clone());
+            posts.push(p);
+        }
+        parent = spine;
+    }
+    assert_eq!(posts.len(), 36, "bigger than one chunk of the pass");
+    posts
+}
+
+#[gpui::test]
+fn space_find_counts_the_whole_space_and_the_map_accounts_for_it(cx: &mut TestAppContext) {
+    // The cross-branch half of ⌘F. The index still counts the branch the
+    // reader is on; the total counts every branch — and the two are tied
+    // together by the exactness invariant, which is what lets a reader add up
+    // the map in front of them: the path's own matches plus every shown
+    // sibling's whole subtree is the space's total, exactly.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    let (branch_total, space_total, account) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+            )
+        })
+    });
+    assert_eq!(
+        space_total,
+        Some(8),
+        "one at the root, two under a4, one under a5, one on a3 and three \
+         under a6 — every branch, not the visible one"
+    );
+    assert!(
+        branch_total < 8,
+        "the visible branch holds fewer than the space does ({branch_total})"
+    );
+    assert_eq!(
+        account,
+        space_total.expect("settled"),
+        "the path's own matches plus every shown sibling's subtree is the \
+         space's total, exactly"
+    );
+
+    // …and it stays exact from wherever the reader stands. Take the other
+    // fork and ask again: a different path, different siblings, same sum.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_effective_path_for_test("a6", window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let (moved_branch, moved_total, moved_account) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+            )
+        })
+    });
+    assert_eq!(moved_total, Some(8), "the space did not change");
+    assert_ne!(
+        moved_branch, branch_total,
+        "precondition: the reader really is on another branch"
+    );
+    assert_eq!(moved_account, 8, "and the map still accounts for all of it");
+}
+
+#[gpui::test]
+fn space_find_says_it_is_counting_rather_than_showing_a_number_on_its_way(cx: &mut TestAppContext) {
+    // The honest-states rule, which is the whole reason the cross-branch pass
+    // is chunked at all. A conversation too long to project inside one frame
+    // finishes over several, and until it does there is **no number** — not a
+    // partial sum, which on screen is indistinguishable from a settled one.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_countable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    // One keystroke, and **no** settling: `dispatch_keystroke` rather than
+    // `simulate_keystrokes`, which runs the executor until parked and would
+    // fuse the whole pass onto the press. This is the frame the query landed
+    // on, with the pass still walking.
+    vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("k").unwrap(), cx);
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "the cross-branch pass has not finished in the frame it started"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            None,
+            "so there is no total to show — never a partial sum"
+        );
+    });
+
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "the pass lands");
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(36),
+            "…with the whole conversation counted"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_takes_its_total_back_when_the_conversation_moves(cx: &mut TestAppContext) {
+    // A total that is merely old is a settled number that is wrong. `rebuild`
+    // replaces the snapshot the count was an answer about, so the pass starts
+    // over — and the readout says "counting", not the previous transcript's
+    // number.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(8)
+    );
+
+    // A branch gains a post carrying two more.
+    let mut posts = cross_branch_posts();
+    let mut a7 = fixture_assistant_post("a7", "kestrel and kestrel again");
+    a7.parent_action_id = Some("a5".into());
+    posts.push(a7);
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(posts, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(10),
+        "the count is an answer about the transcript it was taken on"
+    );
+}
+
+#[gpui::test]
+fn space_find_widens_the_map_without_moving_the_page(cx: &mut TestAppContext) {
+    // The strip widens while a session is open, because a sibling column then
+    // has a number to carry and 36px split between two of them has no room for
+    // one. It is free: the map's scroll image is `strip_h / total_h` and the
+    // strip overlays the right gutter rather than taking width from the page,
+    // so nothing about the reading column moves — which the height cache is the
+    // witness for, being keyed on exactly that width.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    let (rest_w, clears_before) = view.read_with(&vcx, |v, _| {
+        (v.minimap_width_for_test(), v.layout_clears_for_test())
+    });
+    assert_eq!(rest_w, 36.0, "the resting strip");
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let (open_w, clears_after) = view.read_with(&vcx, |v, _| {
+        (v.minimap_width_for_test(), v.layout_clears_for_test())
+    });
+    assert!(
+        open_w > rest_w,
+        "the map is in a different mode and says so ({rest_w} -> {open_w})"
+    );
+    assert_eq!(
+        clears_after, clears_before,
+        "the reading column never moved: the height cache is keyed on its \
+         width and was not invalidated"
+    );
+
+    // …and it goes back when the bar does.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.close_find(window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.minimap_width_for_test()),
+        rest_w,
+        "closing the bar takes the width back with it"
+    );
+}
+
+#[gpui::test]
+fn space_find_does_not_recount_a_transcript_that_has_not_moved(cx: &mut TestAppContext) {
+    // `rebuild` runs on every `StreamDelta` — once per token of every turn —
+    // while the persisted transcript it reads does not move during a stream at
+    // all. A generation that bumped on every rebuild would restart the
+    // cross-branch pass on every token, so a reader searching beside a live
+    // reply would watch the total go back to "counting" and stay there for the
+    // length of the answer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_countable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(36),
+        "precondition: the pass landed"
+    );
+
+    // The rebuild any unrelated space change causes — a sibling turn's delta,
+    // a memory write, a background summary pass. Deliberately **not** settled
+    // afterwards: the assertion is about the very next frame, which is where a
+    // restart would show, and this fixture is too big to re-settle in one.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.rebuild_for_test(cx));
+    });
+    vcx.update(|window, _| window.refresh());
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.find_counting_for_test(),
+            "nothing about the conversation's text moved, so nothing is recounted"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(36),
+            "…and the total stands"
+        );
+    });
+}

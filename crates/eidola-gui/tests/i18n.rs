@@ -262,6 +262,7 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("n", 2);
                 args.set("index", 1);
                 args.set("total", 3);
+                args.set("count", 5);
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),
