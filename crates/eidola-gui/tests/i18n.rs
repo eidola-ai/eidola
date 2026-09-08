@@ -262,6 +262,13 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("n", 2);
                 args.set("index", 1);
                 args.set("total", 3);
+                args.set("name", "Privacy Policy");
+                args.set("credits", "1,250");
+                // A plural selector reads this as a number, so it is one — a
+                // string here would select `*[other]` in every locale and the
+                // `[one]` variants would never be exercised at all.
+                args.set("count", 1);
+                args.set("unlinkability", "https://example.invalid/unlinkability");
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),
