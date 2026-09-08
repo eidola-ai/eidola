@@ -42,7 +42,7 @@ use gpui_component::{
 use gpui_component::{h_flex, label::Label};
 
 use crate::i18n::msg;
-use crate::participants::{error_banner, ghost_button, ghost_button_labeled, load_error_panel};
+use crate::participants::{ghost_button, ghost_button_labeled, load_error_panel};
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, ProxyStore, Stores};
 
@@ -297,7 +297,7 @@ impl Render for ProxySettingsView {
                                 gpui::Role::Alert,
                                 msg::proxy_listen_failed(cx, message.clone()),
                             )
-                            .child(error_banner(&msg::proxy_listen_failed(cx, message), cx)),
+                            .child(notice_band(msg::proxy_listen_failed(cx, message), cx)),
                     )
                 }),
         ));
@@ -317,7 +317,7 @@ impl Render for ProxySettingsView {
                         gpui::Role::Alert,
                         msg::proxy_exposed_warning(cx),
                     )
-                    .child(error_banner(&msg::proxy_exposed_warning(cx), cx)),
+                    .child(notice_band(msg::proxy_exposed_warning(cx), cx)),
             );
         }
 
@@ -448,7 +448,7 @@ impl Render for ProxySettingsView {
                 div()
                     .id("proxy-error")
                     .probe("settings/proxy/error", gpui::Role::Alert, message.clone())
-                    .child(error_banner(&message, cx)),
+                    .child(notice_band(SharedString::from(message), cx)),
             );
         }
         col
@@ -714,6 +714,29 @@ impl ProxySettingsView {
                     )),
             )
     }
+}
+
+/// A danger band whose message **wraps**.
+///
+/// `participants::error_banner` lays its label out in an `h_flex` with no
+/// width discipline, which is right for the one-line refusals every other pane
+/// puts in it and wrong for a sentence: this pane's two bands are a whole
+/// explanation each, and an unwrapped one runs off the edge of the panel.
+/// Written locally rather than by widening the shared helper, because the
+/// helper's callers are sized around its current shape and a sentence is this
+/// surface's problem.
+fn notice_band(message: SharedString, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .w_full()
+        .max_w(px(520.))
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .bg(theme.danger.opacity(0.08))
+        .text_color(theme.danger)
+        .text_xs()
+        .child(message)
 }
 
 fn section_header(label: SharedString, cx: &App) -> impl IntoElement {
