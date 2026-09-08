@@ -1837,6 +1837,66 @@ fn the_consent_surface_speaks_the_readers_language(cx: &mut TestAppContext) {
     }
 }
 
+/// **A probe name is a selector, so it does not move with the reader.**
+///
+/// The credential rows used to derive both their probe names and their element
+/// ids from their labels, which was harmless while the labels were `&'static
+/// str` and a defect the moment they localized: a driver selector translated
+/// per locale, and a per-element identity — hence an accessibility node id —
+/// reminted on a language change. The names are keyed by the row now; only the
+/// labels follow the reader.
+#[gpui::test]
+fn the_credential_rows_keep_their_names_and_localize_their_labels(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+        v.reveal(Slide::CreateAccount, Slide::NewAccount, cx);
+    });
+
+    for (tag, id_copy, secret_copy) in [
+        ("en", "Copy Account ID", "Copy Account Secret"),
+        (
+            "fr",
+            "Copier Identifiant du compte",
+            "Copier Secret du compte",
+        ),
+        ("en", "Copy Account ID", "Copy Account Secret"),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(
+            &entries,
+            "onboarding/copy/account-id",
+            gpui::Role::Button,
+            id_copy,
+        );
+        assert_probe(
+            &entries,
+            "onboarding/copy/account-secret",
+            gpui::Role::Button,
+            secret_copy,
+        );
+        // And the input rows on the other branch, whose element ids used to
+        // carry a label too.
+        assert!(
+            entries
+                .iter()
+                .all(|(name, _)| name.is_ascii() && !name.contains(' ')),
+            "{tag}: a probe name must stay a stable slash-scoped selector; recorded: {:?}",
+            entries.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// **The quiet third choice says one thing, once.** Its visible sentence and
 /// its accessible name used to differ by a full stop — the failure the a11y
 /// rule names, invisible in English. One message serves both, and the label
