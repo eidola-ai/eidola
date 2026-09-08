@@ -8263,8 +8263,12 @@ fn onboarding_says_what_happened_in_the_readers_language(cx: &mut TestAppContext
 #[gpui::test]
 fn onboarding_slide_prose_follows_the_reader(cx: &mut TestAppContext) {
     let stores = stub_stores(cx, |_| {});
-    let (_w, _view) = open_onboarding(cx, &stores);
+    let (window, view) = open_onboarding(cx, &stores);
 
+    // **The buffer, not the message.** A slide's editor is minted on the frame
+    // its slide is first revealed; if the body were seeded there rather than
+    // pushed on every frame, the message below would move with the locale and
+    // the text on the page would not.
     for (tag, opening) in [
         ("en", "## *Pause here*"),
         ("fr", "## *Faites une pause*"),
@@ -8272,10 +8276,22 @@ fn onboarding_slide_prose_follows_the_reader(cx: &mut TestAppContext) {
         ("en", "## *Pause here*"),
     ] {
         cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+
         let body = cx.update(|cx| OnboardingView::slide_body_for_test(Slide::Pause, cx));
         assert!(
             body.starts_with(opening),
-            "{tag}: the first slide's heading must be the reader's; got {body:?}"
+            "{tag}: the first slide's message must be the reader's; got {body:?}"
+        );
+        let painted = view
+            .read_with(cx, |v, cx| v.slide_prose_for_test(Slide::Pause, cx))
+            .expect("the first slide is revealed from the start");
+        assert_eq!(
+            painted,
+            body.to_string(),
+            "{tag}: the editor holds what the render chose — nothing was seeded once"
         );
     }
 

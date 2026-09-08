@@ -59,19 +59,19 @@ pub(super) type OnToggle = Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>;
 /// "Pause here" — Eidola is not the same as the hosted assistants.
 #[derive(IntoElement)]
 pub(super) struct Pause {
+    pub prose: Entity<MarkdownEditorState>,
     pub on_advance: OnClick,
 }
 
 impl RenderOnce for Pause {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let body = slide_body(Slide::Pause, cx);
         let cta = cta_button(
             "pause",
             crate::i18n::msg::onboarding_cta_pause(cx),
             self.on_advance,
         )
         .into_any_element();
-        slide_frame("pause", body, None, cta, window, cx)
+        slide_frame(&self.prose, None, cta, window, cx)
     }
 }
 
@@ -80,19 +80,19 @@ impl RenderOnce for Pause {
 /// "Eidola is your tool" — the CD-era sovereignty analogy.
 #[derive(IntoElement)]
 pub(super) struct Tool {
+    pub prose: Entity<MarkdownEditorState>,
     pub on_advance: OnClick,
 }
 
 impl RenderOnce for Tool {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let body = slide_body(Slide::Tool, cx);
         let cta = cta_button(
             "tool",
             crate::i18n::msg::onboarding_cta_understood(cx),
             self.on_advance,
         )
         .into_any_element();
-        slide_frame("tool", body, None, cta, window, cx)
+        slide_frame(&self.prose, None, cta, window, cx)
     }
 }
 
@@ -101,12 +101,12 @@ impl RenderOnce for Tool {
 /// "Your control" — no operator can read, retain, or change it. Links to the repo.
 #[derive(IntoElement)]
 pub(super) struct Control {
+    pub prose: Entity<MarkdownEditorState>,
     pub on_advance: OnClick,
 }
 
 impl RenderOnce for Control {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let body = slide_body(Slide::Control, cx);
         let extras = link_row(
             "the-eidola-code-repository",
             crate::i18n::msg::onboarding_link_repository(cx),
@@ -120,7 +120,7 @@ impl RenderOnce for Control {
             self.on_advance,
         )
         .into_any_element();
-        slide_frame("control", body, Some(extras), cta, window, cx)
+        slide_frame(&self.prose, Some(extras), cta, window, cx)
     }
 }
 
@@ -129,19 +129,19 @@ impl RenderOnce for Control {
 /// "Your responsibility" — models are fallible; effects are yours.
 #[derive(IntoElement)]
 pub(super) struct Responsibility {
+    pub prose: Entity<MarkdownEditorState>,
     pub on_advance: OnClick,
 }
 
 impl RenderOnce for Responsibility {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let body = slide_body(Slide::Responsibility, cx);
         let cta = cta_button(
             "responsibility",
             crate::i18n::msg::onboarding_cta_understood(cx),
             self.on_advance,
         )
         .into_any_element();
-        slide_frame("responsibility", body, None, cta, window, cx)
+        slide_frame(&self.prose, None, cta, window, cx)
     }
 }
 
@@ -151,6 +151,7 @@ impl RenderOnce for Responsibility {
 /// quiet third way: no account at all (on-device inference only).
 #[derive(IntoElement)]
 pub(super) struct GetStarted {
+    pub prose: Entity<MarkdownEditorState>,
     pub on_new_account: OnClick,
     pub on_existing_account: OnClick,
     pub on_skip_account: OnClick,
@@ -163,7 +164,6 @@ impl RenderOnce for GetStarted {
         // The unlinkability link's target is the app's, not the translation's:
         // a URL living inside prose is a thing a translator can retarget, and
         // this one is a privacy claim's evidence.
-        let body = slide_body(Slide::GetStarted, cx);
         // One sentence, said once. The visible text and the accessible name
         // used to differ by a full stop, which is the failure the a11y-label
         // rule names — invisible in English, audible everywhere else — and it
@@ -199,7 +199,7 @@ impl RenderOnce for GetStarted {
                     .on_click(self.on_skip_account),
             )
             .into_any_element();
-        slide_frame("get-started", body, None, ctas, window, cx)
+        slide_frame(&self.prose, None, ctas, window, cx)
     }
 }
 
@@ -216,6 +216,7 @@ impl RenderOnce for GetStarted {
 /// has arrived there is nothing to agree to, and the CTA stays disabled.
 #[derive(IntoElement)]
 pub(super) struct CreateAccount {
+    pub prose: Entity<MarkdownEditorState>,
     /// The documents whose acceptance creating an account will record, or
     /// `None` while the snapshot has not arrived. An empty list is a loaded
     /// answer — a server running no acceptance gate — and the published
@@ -373,8 +374,7 @@ impl RenderOnce for CreateAccount {
             );
 
         slide_frame(
-            "create-account",
-            slide_body(Slide::CreateAccount, cx),
+            &self.prose,
             Some(extras.into_any_element()),
             cta.into_any_element(),
             window,
@@ -388,6 +388,7 @@ impl RenderOnce for CreateAccount {
 /// New-account branch: the freshly-minted id + secret to save.
 #[derive(IntoElement)]
 pub(super) struct NewAccount {
+    pub prose: Entity<MarkdownEditorState>,
     pub id: SharedString,
     pub secret: SharedString,
     pub on_saved: OnClick,
@@ -423,8 +424,7 @@ impl RenderOnce for NewAccount {
         )
         .into_any_element();
         slide_frame(
-            "new-account",
-            slide_body(Slide::NewAccount, cx),
+            &self.prose,
             Some(extras.into_any_element()),
             cta,
             window,
@@ -439,6 +439,7 @@ impl RenderOnce for NewAccount {
 /// account verifies, the verify CTA is replaced by purchase/done choices.
 #[derive(IntoElement)]
 pub(super) struct ExistingAccount {
+    pub prose: Entity<MarkdownEditorState>,
     pub id_input: Entity<InputState>,
     pub secret_input: Entity<InputState>,
     /// Whether a verification request is in flight.
@@ -516,8 +517,7 @@ impl RenderOnce for ExistingAccount {
         };
 
         slide_frame(
-            "existing-account",
-            slide_body(Slide::ExistingAccount, cx),
+            &self.prose,
             Some(extras.into_any_element()),
             ctas,
             window,
@@ -531,6 +531,7 @@ impl RenderOnce for ExistingAccount {
 /// Either branch: choose a plan / add credit via Stripe checkout.
 #[derive(IntoElement)]
 pub(super) struct Purchase {
+    pub prose: Entity<MarkdownEditorState>,
     /// The plans this account may actually buy — already narrowed to
     /// one-time top-ups when `subscribed`.
     pub prices: Vec<PriceInfo>,
@@ -612,14 +613,7 @@ impl RenderOnce for Purchase {
             self.on_later,
         )
         .into_any_element();
-        slide_frame(
-            "purchase",
-            slide_body(Slide::Purchase, cx),
-            Some(extras),
-            cta,
-            window,
-            cx,
-        )
+        slide_frame(&self.prose, Some(extras), cta, window, cx)
     }
 }
 
@@ -665,42 +659,23 @@ const SLIDE_BOTTOM_PAD: Pixels = px(56.);
 /// prose region, which spilled onto the CTAs and — under mandatory whole-window
 /// snapping — left the spill unreachable.)
 fn slide_frame(
-    key: &'static str,
-    markdown: SharedString,
+    prose_state: &Entity<MarkdownEditorState>,
     extras: Option<AnyElement>,
     ctas: AnyElement,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    // The prose editor is element-owned state (the `useState` analogue):
-    // keyed per slide, initialized once, and evicted by the framework the
-    // frame after the slide stops rendering (a branch truncation) — the
-    // lifecycle the view's `bodies` map used to hand-roll. This is safe
-    // *only because* every revealed slide paints every frame (a plain
-    // `flex_col` stack, no virtualization); if the slides ever render
-    // conditionally or through `list()`, lift this state back onto the view
-    // (the retired chat view's `text_states` map, which died with an
-    // unmounted `list()` item, was the lesson here).
-    let prose_state = window.use_keyed_state(
-        SharedString::from(format!("onboarding-prose-{key}")),
-        cx,
-        |window, cx| {
-            let mut s = MarkdownEditorState::new(window, cx);
-            s.set_value(markdown.to_string(), cx);
-            s
-        },
-    );
-    // **The prose is a localized string living in state, so it is pushed, not
-    // seeded.** `use_keyed_state` initializes once and hands the same editor
-    // back on every later frame, and `i18n::apply` replaces no view state — it
-    // only refreshes windows — so a locale change would repaint every slide in
-    // the language the window opened in. Comparing against the buffer is the
-    // whole test: the editor is disabled, so nothing but this can move it, and
-    // an unchanged locale costs one string comparison.
-    if prose_state.read(cx).value() != markdown.as_ref() {
-        prose_state.update(cx, |s, cx| s.set_value(markdown.to_string(), cx));
-    }
-    let prose = MarkdownEditor::new(&prose_state)
+    // **The prose editor is the view's, not the element's.** It used to be
+    // element-owned state (`use_keyed_state`, keyed per slide, initialized
+    // once and evicted by the framework a frame after the slide stopped
+    // rendering), which was right while the body was a `const`. It is not
+    // right for a localized one: `use_keyed_state` seeds on the first frame
+    // and `i18n::apply` replaces no state — it only refreshes windows — so
+    // every slide would go on reading in the language the window opened in.
+    // The rule this module already stated covers it: state the view must
+    // *write* is lifted. `OnboardingView::sync_prose` owns the minting, the
+    // push and the pruning; this only renders what it is handed.
+    let prose = MarkdownEditor::new(prose_state)
         .style(prose_style(cx))
         .disabled(true)
         .into_any_element();
