@@ -23,7 +23,8 @@ use crate::probe::Probe as _;
 
 use super::model::{NodeSrc, TreeNode};
 use super::{
-    BAND_HEIGHT, MINIMAP_COL_GAP, MINIMAP_FADE, MINIMAP_HIDE_DELAY, MINIMAP_WIDTH, SpaceView,
+    BAND_HEIGHT, MINIMAP_COL_GAP, MINIMAP_FADE, MINIMAP_FIND_WIDTH, MINIMAP_HIDE_DELAY,
+    MINIMAP_WIDTH, SpaceView,
 };
 
 // ---------------------------------------------------------------------------
@@ -345,6 +346,45 @@ fn code_span_body(inner: &[char]) -> Vec<char> {
 }
 
 impl SpaceView {
+    /// How wide the strip is drawn this frame.
+    ///
+    /// [`MINIMAP_WIDTH`] at rest; while a find session is open it widens toward
+    /// [`MINIMAP_FIND_WIDTH`], because a sibling column then has a number to
+    /// carry and 36px split between two of them has no room for one.
+    ///
+    /// **Bounded by the gutter it overlays, because that is what makes the
+    /// widening free.** No *document* geometry reads this width — the map's
+    /// scroll image is `scale = strip_h / total_h`, the drag maps a window-space
+    /// *y*, and the page never subtracted the strip — but the strip is painted
+    /// over the page and contains the mouse while it is up, so its **footprint**
+    /// is not free at all. Beyond the reading column's own margin it covers
+    /// prose: at the narrowest window this app opens (480px), the compact layout
+    /// leaves a 40px inset either side of a 400px column, and a 96px strip
+    /// reaches 56px into the text — obscuring line ends and taking their clicks
+    /// from selection and from links. The resting 36px strip always fit, and
+    /// clamping restores exactly that property for the widened one.
+    ///
+    /// The numerals compose with the clamp rather than fighting it: a narrower
+    /// strip simply fails [`branch_count_fits`] sooner and the cells fall back
+    /// to the tint, with the exact count still in every cell's accessible name.
+    /// So the exactness surface is honest at every width — which is the half
+    /// that must not be traded away — and only the numeral is a function of the
+    /// room available. Never narrower than at rest, so the widening can only
+    /// ever add.
+    pub(crate) fn minimap_width(&self, page_width: gpui::Pixels) -> gpui::Pixels {
+        if self.find.is_none() {
+            return MINIMAP_WIDTH;
+        }
+        // The margin between the reading column and the window edge — half of
+        // whatever the page has beyond its column, in either gutter scheme.
+        let gutter =
+            (page_width.as_f32() - super::layout::page_layout(page_width).body_width) / 2.0;
+        px(MINIMAP_FIND_WIDTH
+            .as_f32()
+            .min(gutter)
+            .max(MINIMAP_WIDTH.as_f32()))
+    }
+
     /// Record a scroll event for the minimap's show/hide. `moved` is whether the
     /// position actually changed. Called for every scroll event, whichever
     /// container handled it.
@@ -476,6 +516,14 @@ impl SpaceView {
         // rectangular): inset both ends by the corner radius and scale the
         // map into the reduced run. Zero inset when no corner is rounded.
         let clearance = crate::chrome::corner_clearance(window);
+        // **The strip widens while a find session is open**, because a sibling
+        // column has a number to carry and 36px split `flex_1` leaves no room
+        // for one — bounded by the gutter it overlays, so it never reaches into
+        // prose (see [`SpaceView::minimap_width`]). Only vertical geometry is
+        // load-bearing for the map itself: nothing about the document, the 1:1
+        // scroll image or the drag reads this width.
+        let strip_w = self.minimap_width(page_width);
+        let rem = window.rem_size().as_f32();
         let mut container = div()
             .id("space-minimap")
             // A navigation landmark, not a plain group: the strip *is* this
@@ -491,7 +539,7 @@ impl SpaceView {
             .right_0()
             .pt(clearance)
             .pb(clearance)
-            .w(MINIMAP_WIDTH);
+            .w(strip_w);
         // Translucent chrome over live content (see `crate::overlay`), and
         // **only while the map is up**: a press on a visible cell is the map's
         // own (it navigates or drags), but a faded-out 36px strip must contain
@@ -506,6 +554,9 @@ impl SpaceView {
         // highlight it points at are the same colour in both palettes.
         let match_wash = super::prose_style(cx).highlight_overlay_color;
         let match_current = super::prose_style(cx).highlight_accent_color;
+        // The numeral sits on the wash, so it takes the reading foreground
+        // rather than the scrollbar hue.
+        let count_fg = cx.theme().foreground;
 
         let levels = self.selected_levels(roots, page_width);
         // The same top headroom the scrollable document uses (zero for an empty
@@ -557,6 +608,28 @@ impl SpaceView {
                 let mut row = h_flex().w_full().h(row_h).gap(MINIMAP_COL_GAP);
                 for (i, sib) in sibs.iter().enumerate() {
                     let is_active = i == *active;
+                    // **What an inactive sibling carries: the matches
+                    // reachable only through that branch** — its own and its
+                    // whole subtree's. `None` while no session is open, while
+                    // the whole-space pass has not settled (a number on its way
+                    // is indistinguishable from a right one), and where the
+                    // branch holds nothing.
+                    let branch_count = (!is_active).then(|| self.find_branch_count(sib)).flatten();
+                    // Whether *this cell* can hold *this number*. Two of its
+                    // three inputs are the level's (the sibling count divides
+                    // the strip's width, the row's height is this post's share
+                    // of the document) and the third is the cell's own, which
+                    // is why the question is asked here rather than once a row.
+                    let numeral_fits = branch_count.is_some_and(|n| {
+                        branch_count_fits(
+                            strip_w.as_f32(),
+                            sibs.len(),
+                            MINIMAP_COL_GAP.as_f32(),
+                            row_h.as_f32(),
+                            rem,
+                            n,
+                        )
+                    });
                     // Drafts use `info`; everything else the scroll colors.
                     let (on, off, flat) = if matches!(sib.src, NodeSrc::Draft) {
                         (info.opacity(0.78), info.opacity(0.45), info.opacity(0.22))
@@ -565,6 +638,15 @@ impl SpaceView {
                     };
                     let cell = if is_active {
                         selected_column(Some((screen_top, h)), viewport_h.as_f32(), row_h, on, off)
+                    } else if branch_count.is_some() {
+                        // **The tint is the fallback where the numeral does not
+                        // fit, and the signal where it does.** A sibling with
+                        // matches reads in the highlight's own wash — the same
+                        // colour the ticks and the editor's match layer paint —
+                        // so the map says "there is something down there" at
+                        // every width, and the numeral adds *how much* when the
+                        // column is wide enough to say it legibly.
+                        div().w_full().h_full().bg(match_wash)
                     } else {
                         div().w_full().h_full().bg(flat)
                     };
@@ -594,7 +676,20 @@ impl SpaceView {
                         .probe(
                             SharedString::from(format!("space/minimap/cell/{level}/{i}")),
                             gpui::Role::Button,
-                            self.node_label(sib, cx),
+                            // **The exact count is always in the name**, even
+                            // where the numeral does not fit in the cell — the
+                            // tint says "something is down there" and this says
+                            // how much. `node_label` is already the label
+                            // source, so this is a string change on a node that
+                            // has a role, a name and a listener already.
+                            match branch_count {
+                                Some(n) => format!(
+                                    "{}. {}",
+                                    self.node_label(sib, cx),
+                                    crate::i18n::msg::find_branch_count(cx, n)
+                                ),
+                                None => self.node_label(sib, cx),
+                            },
                         )
                         .aria_selected(is_active)
                         // **A faded-out strip contributes no tab stops.** The
@@ -630,6 +725,21 @@ impl SpaceView {
                                 .top(px(y))
                                 .h(px(MATCH_TICK_H))
                                 .bg(if current { match_current } else { match_wash })
+                        }))
+                        // The numeral, where the column is wide enough for one.
+                        // Registry-free and role-free: the cell above already
+                        // speaks the exact count as part of its own name, so a
+                        // node here would say it twice.
+                        .children(branch_count.filter(|_| numeral_fits).map(|n| {
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_xs()
+                                .text_color(count_fg)
+                                .child(SharedString::from(n.to_string()))
                         }));
                     if interactive {
                         // Snapshot this cell's rendered geometry (its level's
@@ -868,6 +978,77 @@ impl SpaceView {
 /// match's position in the post, in the same wash the highlight paints.
 const MATCH_TICK_H: f32 = 2.0;
 
+/// One digit of the numeral at the cell's `text_xs` (0.75 rem), as a multiple
+/// of the root font size.
+///
+/// **In rems rather than pixels because the type scale is the reader's
+/// choice**: a fixed pixel floor is right at one scale and wrong at the two
+/// ends of the range this app supports, and at 2.0 it would paint a numeral
+/// wider than its own column.
+const MATCH_COUNT_DIGIT_REMS: f32 = 0.5;
+
+/// The breathing room either side of the numeral, on the same terms — what
+/// keeps the glyphs off the column edges, a numeral that has to be squinted at
+/// being worse than none.
+const MATCH_COUNT_SIDE_REMS: f32 = 0.3;
+
+/// The narrowest sibling cell **this count's** numeral is drawn in.
+///
+/// A width floor is a fact about the glyphs that will be painted, not about
+/// numerals in general. Sized once for two digits, it passes a cell of ~21px
+/// (four columns of the widened strip at the default scale) and then paints
+/// `247` straight through its own column edges and over the levels either side
+/// — which is the mistake the height axis already made, one dimension along.
+/// So the term is a function of the count actually rendered, and a count too
+/// wide for its cell falls back to the tint with the exact number still in the
+/// cell's accessible name.
+///
+/// Arithmetic rather than `shape_line`, deliberately: the predicate stays pure
+/// and unit-testable, and a per-digit advance credited generously errs toward
+/// the tint rather than toward a numeral that overflows.
+fn numeral_width_rems(count: usize) -> f32 {
+    let digits = count.max(1).ilog10() + 1;
+    digits as f32 * MATCH_COUNT_DIGIT_REMS + MATCH_COUNT_SIDE_REMS
+}
+
+/// The shortest **row** the numeral is drawn in, on the same terms.
+///
+/// A row's height is its post's real height scaled into the strip, so it
+/// shrinks with the conversation's length and with nothing about the strip's
+/// width: a long branch of short posts can leave a row thinner than one line of
+/// `text_xs`, and the numeral — absolutely positioned and centred in its cell —
+/// then paints outside the cell and over the levels either side of it. Width
+/// alone therefore does not decide whether a numeral fits, which is the same
+/// mistake the strip's own width made about the page (see
+/// [`SpaceView::minimap_width`]): geometry has three axes here, and the
+/// fallback has to answer to all of them.
+const MATCH_COUNT_MIN_CELL_H_REMS: f32 = 1.125;
+
+/// Whether a sibling cell has room for **this count's** numeral — in both
+/// directions, and at the reader's own type scale.
+///
+/// Pure, so the presentation constraint the widened strip exists for is stated
+/// as arithmetic rather than as a hope. Where it says no the cell falls back to
+/// a tint, and the count is in the cell's accessible name either way, exactly.
+///
+/// It is asked per **cell** rather than per level, because `count` is the one
+/// input that is not shared down a row: two siblings of one fork can hold 3 and
+/// 247 matches, and only the second overflows.
+pub(crate) fn branch_count_fits(
+    strip_w: f32,
+    columns: usize,
+    gap: f32,
+    row_h: f32,
+    rem: f32,
+    count: usize,
+) -> bool {
+    if columns == 0 {
+        return false;
+    }
+    let cell_w = (strip_w - gap * (columns.saturating_sub(1)) as f32) / columns as f32;
+    cell_w >= rem * numeral_width_rems(count) && row_h >= rem * MATCH_COUNT_MIN_CELL_H_REMS
+}
+
 /// One selected-branch minimap column: a full-height column split into medium
 /// (scrolled-off) and dark (on-screen) spans, from the block's on-screen
 /// `(top, height)` clipped against the visible region `[0, vis_bot]`.
@@ -1005,6 +1186,79 @@ mod tests {
         // Arithmetic, not emphasis: air on both sides, and unpaired.
         assert_eq!(spoken_snippet("2 * 3 = 6", &[], 56), "2 * 3 = 6");
         assert_eq!(spoken_snippet("2*3", &[], 56), "2*3");
+    }
+
+    #[test]
+    fn a_branch_count_needs_room_in_both_directions() {
+        // The presentation constraint the widening exists for, as arithmetic
+        // rather than as a hope — and over all three axes it actually has:
+        // the strip's width, the level's sibling count, and the row's height,
+        // each measured against the reader's own type scale.
+        let gap = MINIMAP_COL_GAP.as_f32();
+        let rest = MINIMAP_WIDTH.as_f32();
+        let open = MINIMAP_FIND_WIDTH.as_f32();
+        let rem = 14.0;
+        let tall = 200.0;
+
+        // At rest a fork of two leaves ~16px a column, and three leaves ~9px.
+        assert!(
+            !branch_count_fits(rest, 2, gap, tall, rem, 12),
+            "36px / two columns"
+        );
+        assert!(
+            !branch_count_fits(rest, 3, gap, tall, rem, 12),
+            "…and worse with three"
+        );
+        // Widened, a fork carries its numbers — and so does a four-way one
+        // (96px less three 4px gaps is 21px a column).
+        for columns in 2..=4 {
+            assert!(
+                branch_count_fits(open, columns, gap, tall, rem, 12),
+                "{columns} columns of the widened strip"
+            );
+        }
+        // Past that the tint takes over — which is why the exact count is in
+        // the cell's accessible name whatever the width.
+        assert!(!branch_count_fits(open, 5, gap, tall, rem, 12));
+        // A level with no columns is not a level.
+        assert!(!branch_count_fits(open, 0, gap, tall, rem, 12));
+
+        // **A short row refuses a numeral however wide its column is.** A
+        // row's height is its post's share of the document, so a long branch
+        // of short posts squeezes it independently of the strip — and a
+        // numeral centred in a cell shorter than one line paints outside it,
+        // over the levels either side.
+        assert!(
+            !branch_count_fits(open, 2, gap, rem * 0.9, rem, 12),
+            "shorter than one line of the numeral's own type"
+        );
+        assert!(branch_count_fits(open, 2, gap, rem * 1.5, rem, 12));
+
+        // **And both floors follow the type scale.** A geometry that fits at
+        // the default fails at 2.0, where the same glyphs are twice the size.
+        assert!(branch_count_fits(open, 4, gap, 20.0, 14.0, 12));
+        assert!(
+            !branch_count_fits(open, 4, gap, 20.0, 28.0, 12),
+            "the reader's zoom is the third axis"
+        );
+
+        // **And the width floor is the width of *this number*.** One geometry,
+        // three counts: the four-way widened fork's 21px column holds one and
+        // two digits and refuses three, where a floor sized once for two
+        // digits would have painted `247` through its own column edges.
+        assert!(branch_count_fits(open, 4, gap, tall, rem, 7), "one digit");
+        assert!(branch_count_fits(open, 4, gap, tall, rem, 47), "two digits");
+        assert!(
+            !branch_count_fits(open, 4, gap, tall, rem, 247),
+            "three digits do not fit a 21px column"
+        );
+        assert!(
+            !branch_count_fits(open, 4, gap, tall, rem, 2471),
+            "…nor, a fortiori, four"
+        );
+        // A wider column takes the longer number: two columns of the widened
+        // strip are ~46px, which holds four digits at the default scale.
+        assert!(branch_count_fits(open, 2, gap, tall, rem, 2471));
     }
 
     #[test]
