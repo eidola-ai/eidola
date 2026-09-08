@@ -3282,3 +3282,198 @@ fn a_drain_that_times_out_never_lets_go_of_the_runtime(cx: &mut TestAppContext) 
          now the last one and will drop the runtime from its own worker"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The local inference proxy's store
+// ---------------------------------------------------------------------------
+
+/// A free loopback port, chosen by binding one and letting it go.
+///
+/// The stored binding cannot be port 0 — a config file whose address changes on
+/// every restart is one that lies — so a test that wants the *store* to bind
+/// something has to name a port. Asking the OS for one and releasing it is the
+/// nearest thing to ephemeral that a durable setting allows.
+fn a_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    listener.local_addr().expect("addr").port()
+}
+
+/// REGRESSION: **the invariant is "no live row whose secret was never shown."**
+///
+/// A proxy key's value exists for exactly one render — app-core stores a digest
+/// and nothing else — so a second generation started while one was pending
+/// inserted a second live row and then replaced the banner: one of the two keys
+/// authenticates requests forever and nobody holds it, nobody can recognise it,
+/// and revoking it is guesswork. The same is true of a press made while a
+/// minted key is still standing unread.
+///
+/// The cure is a predicate rather than a courtesy: `can_create_key` decides the
+/// press *and* whether the pane paints the verb at all, so an accepted press
+/// and an offered verb cannot disagree.
+#[gpui::test]
+fn a_second_key_generation_waits_for_the_first_to_be_read(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    stores.proxy.update(cx, |s, cx| {
+        s.create_key("first".into(), cx);
+        // The press a reader makes while the first is still travelling.
+        s.create_key("second".into(), cx);
+    });
+
+    wait_until(cx, "the first key is minted", |cx| {
+        stores.proxy.read_with(cx, |s, _| s.minted().is_some())
+    });
+    let keys = core
+        .runtime()
+        .block_on(core.proxy_keys())
+        .expect("the listing");
+    assert_eq!(
+        keys.len(),
+        1,
+        "a second generation while one is pending would leave a live key nobody ever saw: {keys:?}"
+    );
+
+    // And a press made while the minted key stands unread is refused for the
+    // same reason — the banner can only show one.
+    stores
+        .proxy
+        .update(cx, |s, cx| s.create_key("third".into(), cx));
+    cx.run_until_parked();
+    assert_eq!(
+        core.runtime()
+            .block_on(core.proxy_keys())
+            .expect("the listing")
+            .len(),
+        1,
+        "the standing banner is the reason, and it is still standing"
+    );
+
+    // Acknowledging it is what gives the verb back.
+    stores.proxy.update(cx, |s, cx| s.dismiss_minted(cx));
+    assert!(stores.proxy.read_with(cx, |s, _| s.can_create_key()));
+    stores
+        .proxy
+        .update(cx, |s, cx| s.create_key("fourth".into(), cx));
+    wait_until(cx, "the second key is minted", |cx| {
+        core.runtime()
+            .block_on(core.proxy_keys())
+            .map(|k| k.len() == 2)
+            .unwrap_or(false)
+    });
+}
+
+/// REGRESSION: **a superseded write settles nothing, and takes no slot away.**
+///
+/// Two presses of one control are one keyboard's work apart — a reader turning
+/// the proxy on and immediately off, a binding corrected a beat after it was
+/// typed — and they land in the same keyed slot. The successor chains behind
+/// the predecessor so the two writes reach the database in the order they were
+/// made; what this pins is the other half. The predecessor settles *first*, and
+/// if it is allowed to settle it removes the slot — which by then belongs to
+/// its successor, whose `Task` is dropped and whose write therefore never
+/// happens. The reader's last press is silently lost, and the store adopts the
+/// value they took back.
+///
+/// Only the current generation settles, so the predecessor returns quietly.
+#[gpui::test]
+fn the_second_press_of_a_proxy_control_is_the_one_that_stands(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    stores.proxy.update(cx, |s, cx| {
+        s.set_enabled(true, cx);
+        s.set_enabled(false, cx);
+    });
+
+    // Waiting on the *store* rather than on the database: the write lands
+    // first and its continuation a moment later, so a wait on the row would
+    // read the store mid-settle and say nothing about either.
+    wait_until(cx, "the batch settles", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.op_error().is_some() || !s.writing())
+    });
+    assert_eq!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.enabled)),
+        Some(false),
+        "the store shows what the reader last asked for"
+    );
+    assert_eq!(
+        core.runtime()
+            .block_on(core.proxy_settings())
+            .expect("the stored settings")
+            .enabled,
+        false,
+        "and so does the database — the second press is what was written last"
+    );
+}
+
+/// REGRESSION: **a listener that gave up says why, and is started again.**
+///
+/// The accept loop stops after sixteen consecutive refused accepts. Nothing
+/// pushes that fact anywhere — it happens on the core's runtime — so the store
+/// has to *derive* it: `listen_error` asks the handle rather than reporting only
+/// the last bind failure it recorded, and the reconcile finds no address where
+/// the settings want one and starts the socket again. Neither half is a special
+/// case; both fall out of the handle answering with what the loop learned.
+#[gpui::test]
+fn a_proxy_that_stopped_accepting_says_why_and_is_reconciled_again(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let port = a_free_port();
+
+    stores.proxy.update(cx, |s, cx| {
+        s.set_binding("127.0.0.1".into(), port, cx);
+    });
+    wait_until(cx, "the binding lands", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.bind_port))
+            == Some(port)
+    });
+    stores.proxy.update(cx, |s, cx| s.set_enabled(true, cx));
+    wait_until(cx, "the reconcile binds the socket", |cx| {
+        stores.proxy.read_with(cx, |s, _| s.is_running())
+    });
+    assert_eq!(stores.proxy.read_with(cx, |s, _| s.listen_error()), None);
+
+    let handle = stores.proxy.read_with(cx, |s, _| s.handle());
+    handle.fail_accepting_for_test("too many open files");
+
+    assert!(
+        !stores.proxy.read_with(cx, |s, _| s.is_running()),
+        "a socket that admits nobody is not somewhere to point a tool"
+    );
+    assert_eq!(
+        stores.proxy.read_with(cx, |s, _| s.listen_error()),
+        Some("too many open files".to_string()),
+        "no write failed, so only the loop's own reason can explain this"
+    );
+
+    // Reconcilable: the settings still want a listener and nothing is bound, so
+    // an ordinary refresh starts it. It may take more than one — the socket the
+    // dead loop held is released when its aborted task is dropped, which is the
+    // runtime's business and not this thread's — and that is exactly why the
+    // recovery is a *reconcile* rather than a one-shot repair.
+    let mut restarted = false;
+    for _ in 0..80 {
+        stores.proxy.update(cx, |s, cx| s.refresh(cx));
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        if stores.proxy.read_with(cx, |s, _| s.is_running()) {
+            restarted = true;
+            break;
+        }
+    }
+    assert!(restarted, "a reconcile starts a listener that gave up");
+    assert_eq!(stores.proxy.read_with(cx, |s, _| s.listen_error()), None);
+
+    // Teardown: an accept loop is a task holding the core, so the drain barrier
+    // would wait on it forever. Stopping the handle is what the disable path
+    // does asynchronously, taken directly because the test is over.
+    handle.stop();
+    cx.run_until_parked();
+}

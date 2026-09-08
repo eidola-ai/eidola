@@ -176,6 +176,58 @@ fn a_binding_the_system_refuses_is_reported_rather_than_pretended() {
     assert!(proxy::serve(&core, &elsewhere).is_err());
 }
 
+/// REGRESSION: **a listener that has given up is not a listener.**
+///
+/// The accept loop returns after sixteen consecutive refused accepts and the
+/// socket goes with it, but the handle went on holding the `ProxyServer` — so
+/// `address()` kept naming a port nothing was accepting on, the pane kept
+/// saying it was listening, and every later reconciliation saw the wanted
+/// address already bound and refused to start it again. Terminal in the one
+/// place a terminal state is worst: silently, on the door a reader pointed a
+/// tool at.
+///
+/// The cure is that the handle answers with what the loop learned, which makes
+/// the recovery fall out of the reconcile rather than needing a second
+/// mechanism: no address means nothing is bound where the settings want
+/// something, so the next reconcile starts it again.
+#[test]
+fn a_listener_that_gave_up_stops_claiming_an_address_and_can_be_started_again() {
+    let (core, _dir) = core();
+    let handle = proxy::ProxyHandle::default();
+    let first = handle.start(&core, &ephemeral()).expect("start");
+    assert_eq!(handle.address(), Some(first));
+    assert!(handle.is_running());
+    assert_eq!(handle.accept_failure(), None);
+
+    handle.fail_accepting_for_test("too many open files");
+
+    assert_eq!(
+        handle.address(),
+        None,
+        "a socket that admits nobody is not somewhere to point a tool"
+    );
+    assert!(
+        !handle.is_running(),
+        "and the pane must not say it is running"
+    );
+    assert_eq!(
+        handle.accept_failure().as_deref(),
+        Some("too many open files"),
+        "the reason is carried out, so the surface can say more than 'stopped'"
+    );
+
+    // Reconcilable again: nothing special-cases the terminal state — a
+    // reconcile sees no address where the settings want one and starts it.
+    let second = handle.start(&core, &ephemeral()).expect("restart");
+    assert_eq!(handle.address(), Some(second));
+    assert_eq!(
+        handle.accept_failure(),
+        None,
+        "the fresh listener answers for itself"
+    );
+    handle.stop();
+}
+
 #[test]
 fn a_restart_leaves_nothing_answering_on_the_address_it_left() {
     let (core, _dir) = core();

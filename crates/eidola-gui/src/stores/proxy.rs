@@ -145,6 +145,13 @@ impl ProxyStore {
         self.op_error.as_deref()
     }
 
+    /// Whether any write is still in flight. What the resolving read waits for,
+    /// and the one honest thing a test can wait on: the database row moves
+    /// before the continuation that adopts it does.
+    pub fn writing(&self) -> bool {
+        !self.op_tasks.is_empty()
+    }
+
     /// Why nothing is listening, when the reader asked for something to be.
     ///
     /// **Derived, never only cached.** A listener whose accept loop gave up
@@ -202,10 +209,23 @@ impl ProxyStore {
 
     /// Re-read the settings and the key listing, then bring the listener into
     /// line with what the settings say.
+    ///
+    /// **A refresh defers to a write in flight.** Every write emits its own
+    /// `Change::Proxy`, which comes back through the bus as a refresh — so a
+    /// read issued while a *second* write is still travelling reads the
+    /// database between the two and lands after the second settled, replacing
+    /// what the reader last asked for with the value they took back. The
+    /// deferral loses nothing, because the last write of a batch always takes
+    /// the resolving read on its way out (`start_op`): "applied last" is not
+    /// "read last", and issuing the read once `op_tasks` is empty is what makes
+    /// the difference a property of *when* it is taken.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(core) = self.app_core.clone() else {
             return;
         };
+        if !self.op_tasks.is_empty() {
+            return;
+        }
         self.settings = std::mem::take(&mut self.settings).to_loading();
         let settings_core = core.clone();
         self.settings_task = Some(cx.spawn(async move |this, cx| {
@@ -346,11 +366,11 @@ impl ProxyStore {
             move |core| async move {
                 bridge(core, |c| async move { c.create_proxy_key(label).await }).await
             },
-            |this, result, cx| match result {
-                Ok(minted) => {
-                    this.minted = Some(minted);
-                    this.refresh(cx);
-                }
+            // The listing the new row belongs in is not read here: the
+            // batch-end read below covers it, and covers it *after* every write
+            // still in flight rather than after this one.
+            |this, result, _cx| match result {
+                Ok(minted) => this.minted = Some(minted),
                 Err(e) => this.op_error = Some(e.to_string()),
             },
         );
@@ -366,8 +386,8 @@ impl ProxyStore {
             move |core| async move {
                 bridge(core, |c| async move { c.revoke_proxy_key(id).await }).await
             },
-            |this, result, cx| match result {
-                Ok(_) => this.refresh(cx),
+            |this, result, _cx| match result {
+                Ok(_) => {}
                 Err(e) => this.op_error = Some(e.to_string()),
             },
         );
@@ -415,6 +435,12 @@ impl ProxyStore {
         Fut: std::future::Future<Output = T> + 'static,
     {
         let Some(core) = self.begin_op() else { return };
+        // Take over the read for the duration of the write: a refresh already
+        // travelling would otherwise land after this settles, carrying a
+        // snapshot from before the write. The debt is discharged below, where
+        // the last write of the batch issues the resolving read.
+        self.settings_task = None;
+        self.keys_task = None;
         self.next_op_gen += 1;
         let generation = self.next_op_gen;
         let previous = self.op_tasks.remove(&key).map(|(_, task)| task);
@@ -430,6 +456,14 @@ impl ProxyStore {
                 }
                 this.op_tasks.remove(&slot);
                 settle(this, result, cx);
+                // **The resolving read is taken after the last write.** Every
+                // op adopts or reports its own outcome; only once nothing is
+                // still writing does the store ask the database what it now
+                // says — and `refresh` re-arms the rule, since a write starting
+                // during that read defers it again.
+                if this.op_tasks.is_empty() {
+                    this.refresh(cx);
+                }
                 cx.notify();
             });
         });
@@ -453,10 +487,9 @@ impl ProxyStore {
             Err(e) => {
                 self.op_error = Some(e.to_string());
                 // A refused write changed nothing, so nothing about the
-                // listener has to move — but the snapshot is re-read anyway,
-                // because a refusal is also the moment a stale cache is most
-                // likely to be showing.
-                self.refresh(cx);
+                // listener has to move — and the batch-end read that follows is
+                // what puts a stale cache right, which a refusal is the moment
+                // most likely to be showing.
             }
         }
         cx.notify();

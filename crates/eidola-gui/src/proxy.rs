@@ -178,6 +178,18 @@ impl ProxyServer {
         self.ended.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Test-only: put the listener into the state its accept loop reaches after
+    /// [`MAX_CONSECUTIVE_ACCEPT_FAILURES`].
+    ///
+    /// That state is real and unreachable from a test — it takes an operating
+    /// system that refuses sixteen accepts in a row — so the seam exists to
+    /// exercise what the *handle* then answers, which is the half this crate
+    /// owns.
+    #[doc(hidden)]
+    pub fn fail_accepting_for_test(&self, reason: &str) {
+        *self.ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.to_string());
+    }
+
     /// Stop serving.
     ///
     /// Ends the accept loop and the connections it accepted. Ending a
@@ -379,6 +391,14 @@ impl ProxyHandle {
     /// Whether the listener is running.
     pub fn is_running(&self) -> bool {
         self.address().is_some()
+    }
+
+    /// Test-only: see [`ProxyServer::fail_accepting_for_test`].
+    #[doc(hidden)]
+    pub fn fail_accepting_for_test(&self, reason: &str) {
+        if let Some(server) = self.0.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            server.fail_accepting_for_test(reason);
+        }
     }
 }
 
