@@ -121,6 +121,34 @@ pub enum Slide {
     Purchase,
 }
 
+/// Why a credential check could not confirm an account.
+///
+/// **A value, not a sentence.** `i18n::apply` refreshes every window, so a
+/// formatted string held here would repaint in the old language until
+/// something else replaced it — the rule the space window's typed `AppError`
+/// already states (`AGENTS.md` → Localization). The words are chosen at render
+/// by [`verify_error_copy`].
+#[derive(Clone, Debug)]
+pub enum VerifyFailure {
+    /// One of the two fields was left blank. Refused here, before any request:
+    /// half a credential can confirm nothing.
+    MissingCredentials,
+    /// The request was made and the account was not confirmed.
+    Refused(AppError),
+}
+
+/// Why a checkout link was not opened. Same rule as [`VerifyFailure`]: the view
+/// holds what happened and [`checkout_error_copy`] chooses the words.
+#[derive(Clone, Debug)]
+pub enum CheckoutFailure {
+    /// The link came back minted for credentials this profile no longer holds,
+    /// so it was discarded rather than opened — funding an account the reader
+    /// has walked away from is the outcome that prevents.
+    StaleMint,
+    /// The mint itself failed.
+    Refused(AppError),
+}
+
 /// An in-flight vertical snap glide of the page toward a slide boundary.
 #[derive(Clone, Debug)]
 struct VSnap {
@@ -160,20 +188,26 @@ pub struct OnboardingView {
     creating: bool,
     /// The freshly created (id, secret) to present on [`Slide::NewAccount`].
     created: Option<(SharedString, SharedString)>,
-    create_error: Option<String>,
+    /// Why creation was refused, as the typed error itself — the words are
+    /// chosen at render, never frozen here (see [`VerifyFailure`]).
+    create_error: Option<AppError>,
     create_task: Option<Task<()>>,
 
     // -- Existing-account verification ------------------------------------
     id_input: Entity<InputState>,
     secret_input: Entity<InputState>,
+    /// The placeholders the two fields were last seeded with. They live inside
+    /// the field's own state rather than being chosen at render, so a locale
+    /// change has to push new ones in — the find bar's rule.
+    seeded_placeholders: Option<(SharedString, SharedString)>,
     verifying: bool,
-    /// `Ok(available_credits)` once verified, or `Err(message)` on failure.
-    verify_result: Option<Result<i64, String>>,
+    /// `Ok(available_credits)` once verified, or why it could not be.
+    verify_result: Option<Result<i64, VerifyFailure>>,
     verify_task: Option<Task<()>>,
 
     // -- Checkout (purchase slide) ----------------------------------------
     checkout_pending: Option<String>,
-    checkout_error: Option<String>,
+    checkout_error: Option<CheckoutFailure>,
     checkout_task: Option<Task<()>>,
 
     // -- Scroll + snap -----------------------------------------------------
@@ -203,9 +237,13 @@ pub struct OnboardingView {
 impl OnboardingView {
     pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        let id_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("00000000-0000-0000-0000-…"));
-        let secret_input = cx.new(|cx| InputState::new(window, cx).placeholder("account secret"));
+        let placeholders = (
+            crate::i18n::msg::onboarding_account_id_placeholder(cx),
+            crate::i18n::msg::onboarding_account_secret_placeholder(cx),
+        );
+        let id_input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholders.0.clone()));
+        let secret_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(placeholders.1.clone()));
 
         let _subs = vec![
             cx.observe(&stores.account, |_, _, cx| cx.notify()),
@@ -226,6 +264,7 @@ impl OnboardingView {
             create_task: None,
             id_input,
             secret_input,
+            seeded_placeholders: Some(placeholders),
             verifying: false,
             verify_result: None,
             verify_task: None,
@@ -297,10 +336,40 @@ impl OnboardingView {
             .map(|(id, secret)| (id.to_string(), secret.to_string()))
     }
 
-    /// The last verification result (Ok(balance) / Err(message)), if any.
+    /// The last verification result (Ok(balance) / why not), if any.
     #[doc(hidden)]
-    pub fn verify_result_for_test(&self) -> Option<Result<i64, String>> {
+    pub fn verify_result_for_test(&self) -> Option<Result<i64, VerifyFailure>> {
         self.verify_result.clone()
+    }
+
+    /// What the reader is told about the last credential check, in the active
+    /// locale — the render's own reading, so a test that switches locale
+    /// without re-emitting the failure proves nothing was cached.
+    #[doc(hidden)]
+    pub fn verify_message_for_test(&self, cx: &App) -> Option<SharedString> {
+        match self.verify_result.as_ref()? {
+            Ok(available) => Some(crate::i18n::msg::onboarding_verified_balance(
+                cx,
+                *available,
+                plans::format_credits(*available),
+            )),
+            Err(failure) => Some(verify_error_copy(failure, cx)),
+        }
+    }
+
+    /// What the reader is told about the last refused checkout, in the active
+    /// locale.
+    #[doc(hidden)]
+    pub fn checkout_message_for_test(&self, cx: &App) -> Option<SharedString> {
+        Some(checkout_error_copy(self.checkout_error.as_ref()?, cx))
+    }
+
+    /// What the reader is told about a refused account creation, in the active
+    /// locale. The typed error's own English text — the recorded residual at
+    /// the app-core boundary, pinned here so it stays a decision.
+    #[doc(hidden)]
+    pub fn create_message_for_test(&self) -> Option<String> {
+        self.create_error.as_ref().map(|e| e.to_string())
     }
 
     /// The existing-account input editors (tests set their values directly).
@@ -570,7 +639,7 @@ impl OnboardingView {
                         });
                         this.reveal(Slide::CreateAccount, Slide::NewAccount, cx);
                     }
-                    Err(e) => this.create_error = Some(e.to_string()),
+                    Err(e) => this.create_error = Some(e),
                 }
                 cx.notify();
             });
@@ -588,7 +657,7 @@ impl OnboardingView {
         let id = self.id_input.read(cx).value().trim().to_string();
         let secret = self.secret_input.read(cx).value().trim().to_string();
         if id.is_empty() || secret.is_empty() {
-            self.verify_result = Some(Err("Enter both an account ID and secret.".into()));
+            self.verify_result = Some(Err(VerifyFailure::MissingCredentials));
             cx.notify();
             return;
         }
@@ -640,7 +709,7 @@ impl OnboardingView {
                 });
                 self.verify_result = Some(Ok(available));
             }
-            Err(e) => self.verify_result = Some(Err(verify_error_copy(&e))),
+            Err(e) => self.verify_result = Some(Err(VerifyFailure::Refused(e))),
         }
         cx.notify();
     }
@@ -681,16 +750,16 @@ impl OnboardingView {
                 if self.mint_is_current(&mint.minted_for, cx) {
                     cx.open_url(&mint.url);
                 } else {
-                    self.checkout_error = Some(crate::account::STALE_MINT.to_string());
+                    self.checkout_error = Some(CheckoutFailure::StaleMint);
                 }
             }
-            Err(e) => self.checkout_error = Some(e.to_string()),
+            Err(e) => self.checkout_error = Some(CheckoutFailure::Refused(e)),
         }
         cx.notify();
     }
 
-    pub fn checkout_error(&self) -> Option<&str> {
-        self.checkout_error.as_deref()
+    pub fn checkout_error(&self) -> Option<&CheckoutFailure> {
+        self.checkout_error.as_ref()
     }
 
     pub fn checkout_pending(&self) -> Option<&str> {
@@ -724,6 +793,26 @@ impl OnboardingView {
     /// mint says which credentials it signed with, and that is compared
     /// against a fingerprint of the config read fresh here, past the
     /// `ConfigStore` cache.
+    /// Re-seed the credential fields' placeholders when the wording moves. A
+    /// placeholder lives inside the field's own state rather than being chosen
+    /// at render, so a locale change — which refreshes every window but
+    /// replaces no state — would otherwise leave both fields prompting in the
+    /// language the window opened in. The find bar's `sync_find_placeholder`
+    /// is the same fix on the same shape.
+    fn sync_placeholders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fresh = (
+            crate::i18n::msg::onboarding_account_id_placeholder(cx),
+            crate::i18n::msg::onboarding_account_secret_placeholder(cx),
+        );
+        if self.seeded_placeholders.as_ref() == Some(&fresh) {
+            return;
+        }
+        self.seeded_placeholders = Some(fresh.clone());
+        let (id_input, secret_input) = (self.id_input.clone(), self.secret_input.clone());
+        id_input.update(cx, |s, cx| s.set_placeholder(fresh.0, window, cx));
+        secret_input.update(cx, |s, cx| s.set_placeholder(fresh.1, window, cx));
+    }
+
     fn mint_is_current(&self, minted_for: &str, cx: &App) -> bool {
         let fallback = self.cached_credentials(cx);
         self.stores.account.read(cx).mint_is_current(
@@ -745,6 +834,8 @@ impl Render for OnboardingView {
         let bg = theme.background;
         let fg = theme.foreground;
         let font_family = theme.font_family.clone();
+
+        self.sync_placeholders(window, cx);
 
         // Kick off the animate-scroll to a freshly-revealed slide now that we
         // have `window` (the reveal itself just recorded the target index).
@@ -952,7 +1043,9 @@ impl OnboardingView {
                     (
                         terms.value().cloned(),
                         terms.is_loading(),
-                        terms.error().map(|e| e.to_string()),
+                        // The typed error travels; the sentence is chosen where
+                        // it is drawn.
+                        terms.error().cloned(),
                     )
                 };
                 slides::CreateAccount {
@@ -1028,17 +1121,34 @@ impl OnboardingView {
     }
 }
 
-/// Map a verification failure to honest user-facing copy. The server collapses
-/// "no such account" and "wrong secret" into one `401` (to avoid account
-/// enumeration), so those are indistinguishable and share one message; other
-/// failures (network, attestation) surface their real reason.
-fn verify_error_copy(e: &AppError) -> String {
-    match e {
-        AppError::Server {
+/// Turn a credential check's failure into the sentence a reader sees.
+///
+/// The server collapses "no such account" and "wrong secret" into one `401`
+/// (so the endpoint cannot be used to discover which account ids exist), so
+/// those are indistinguishable here and share one message. Everything else
+/// surfaces the typed error's own text, which is written for a log and is
+/// English in every locale — the same accepted residual `SpaceView::error_copy`
+/// carries, and for the same reason: app-core is locale-free, and inventing a
+/// sentence per variant is a decision this surface does not get to make alone.
+pub(crate) fn verify_error_copy(failure: &VerifyFailure, cx: &App) -> SharedString {
+    match failure {
+        VerifyFailure::MissingCredentials => {
+            crate::i18n::msg::onboarding_verify_missing_credentials(cx)
+        }
+        VerifyFailure::Refused(AppError::Server {
             status: 401 | 403, ..
-        } => "We couldn't verify that account. Check the ID and secret, or create a new account \
-              instead."
-            .to_string(),
-        other => other.to_string(),
+        }) => crate::i18n::msg::onboarding_verify_unverifiable(cx),
+        VerifyFailure::Refused(other) => SharedString::from(other.to_string()),
+    }
+}
+
+/// Turn a refused checkout into the sentence a reader sees. Same shape, same
+/// residual: the one case this layer has words of its own for is the stale
+/// mint, which is a decision *this* surface made rather than a failure app-core
+/// reported.
+pub(crate) fn checkout_error_copy(failure: &CheckoutFailure, cx: &App) -> SharedString {
+    match failure {
+        CheckoutFailure::StaleMint => crate::i18n::msg::onboarding_checkout_stale_mint(cx),
+        CheckoutFailure::Refused(e) => SharedString::from(e.to_string()),
     }
 }

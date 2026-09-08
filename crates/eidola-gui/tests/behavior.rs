@@ -26,7 +26,7 @@ use eidola_gui::account::AccountView;
 use eidola_gui::actions::{PostOnly, Send};
 use eidola_gui::agents_settings::AgentsSettingsView;
 use eidola_gui::library::LibraryView;
-use eidola_gui::onboarding::{OnboardingView, Slide};
+use eidola_gui::onboarding::{CheckoutFailure, OnboardingView, Slide, VerifyFailure};
 use eidola_gui::participants::EditMode;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
@@ -7502,8 +7502,8 @@ fn onboarding_checkout_will_not_fund_an_account_linked_over(cx: &mut TestAppCont
     );
     view.read_with(cx, |v, _| {
         assert!(
-            v.checkout_error()
-                .is_some_and(|e| e.contains("account changed"))
+            matches!(v.checkout_error(), Some(CheckoutFailure::StaleMint)),
+            "the link is discarded as minted for another account, and says so"
         );
     });
 }
@@ -7562,8 +7562,8 @@ fn onboarding_checkout_will_not_fund_an_account_swapped_away_and_back(cx: &mut T
     );
     view.read_with(cx, |v, _| {
         assert!(
-            v.checkout_error()
-                .is_some_and(|e| e.contains("account changed"))
+            matches!(v.checkout_error(), Some(CheckoutFailure::StaleMint)),
+            "the link is discarded as minted for another account, and says so"
         );
     });
 
@@ -8050,10 +8050,14 @@ fn onboarding_verify_requires_both_fields(cx: &mut TestAppContext) {
     let stores = stub_stores(cx, |_| {});
     let (_w, view) = open_onboarding(cx, &stores);
 
-    // Both inputs blank: verification refuses with a message, no request.
+    // Both inputs blank: verification refuses before any request, and the
+    // refusal is the typed reason rather than a sentence frozen at the refusal.
     view.update(cx, |v, cx| v.begin_verify(cx));
     view.read_with(cx, |v, _| {
-        assert!(matches!(v.verify_result_for_test(), Some(Err(_))));
+        assert!(matches!(
+            v.verify_result_for_test(),
+            Some(Err(VerifyFailure::MissingCredentials))
+        ));
     });
 }
 
