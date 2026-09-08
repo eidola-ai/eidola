@@ -1837,6 +1837,197 @@ fn the_consent_surface_speaks_the_readers_language(cx: &mut TestAppContext) {
     }
 }
 
+/// **A localized slide localizes the shared component inside it.**
+///
+/// The Purchase slide's payment choices come from `plans::plan_rows`, which
+/// used to hard-code its list name, its in-flight price line and both expiry
+/// disclosures — so a reader who had just read four French slides met English
+/// where the money is. The rows now take the locale their host names, read
+/// again after a switch with nothing re-emitted.
+#[gpui::test]
+fn the_purchase_slides_plans_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+
+    for (tag, list, one_time, recurring) in [
+        (
+            "en",
+            "Available plans",
+            "5,000,000 credits, expire one year after purchase",
+            "10,000,000 credits, expire at the end of each billing period — Recurring top-up",
+        ),
+        (
+            "fr",
+            "Formules disponibles",
+            "5,000,000 crédits, expirent un an après l'achat",
+            "10,000,000 crédits, expirent à la fin de chaque période de facturation — Recurring \
+             top-up",
+        ),
+        (
+            "zh-Hans",
+            "可选方案",
+            "5,000,000 点额度，自购买之日起一年后过期",
+            "10,000,000 点额度，在每个计费周期结束时过期 —— Recurring top-up",
+        ),
+        (
+            "en",
+            "Available plans",
+            "5,000,000 credits, expire one year after purchase",
+            "10,000,000 credits, expire at the end of each billing period — Recurring top-up",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(&entries, "onboarding/plans", gpui::Role::ListBox, list);
+        // The rows are ordered as the fixture lists them: the recurring plan,
+        // then the one-time top-up.
+        assert_probe_value(
+            &entries,
+            "onboarding/plan/0",
+            gpui::Role::ListBoxOption,
+            "Monthly — $10/mo",
+            recurring,
+        );
+        assert_probe_value(
+            &entries,
+            "onboarding/plan/1",
+            gpui::Role::ListBoxOption,
+            "One-time — $5",
+            one_time,
+        );
+    }
+}
+
+/// **One credit is one credit, and a request in flight says so.**
+///
+/// The credits line used to be a number with `" credits, "` and an expiry
+/// clause appended, which reads "1 credits" and cannot inflect in any other
+/// language; it is one sentence per plan kind now, agreeing with the count.
+/// The pending price line is the other string the shared component used to
+/// hard-code.
+#[gpui::test]
+fn a_single_credit_reads_as_one_and_a_pending_plan_says_it_is_opening(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.prices = vec![
+            eidola_app_core::PriceInfo {
+                id: "price_one".into(),
+                product_name: "A single credit".into(),
+                product_description: None,
+                amount_display: "$0.01".into(),
+                recurrence: String::new(),
+                credits: 1,
+            },
+            eidola_app_core::PriceInfo {
+                id: "price_many".into(),
+                product_name: "Many".into(),
+                product_description: None,
+                amount_display: "$5".into(),
+                recurrence: String::new(),
+                credits: 2,
+            },
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/0",
+        gpui::Role::ListBoxOption,
+        "A single credit — $0.01",
+        "1 credit, expires one year after purchase",
+    );
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/1",
+        gpui::Role::ListBoxOption,
+        "Many — $5",
+        "2 credits, expire one year after purchase",
+    );
+
+    // A checkout request is out for the first plan: its price line says so, in
+    // the reader's language, and the other row is untouched.
+    view.update(cx, |v, cx| v.begin_checkout("price_one".into(), cx));
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/0",
+        gpui::Role::ListBoxOption,
+        "A single credit — Ouverture du paiement…",
+        "1 crédit, expire un an après l'achat",
+    );
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/1",
+        gpui::Role::ListBoxOption,
+        "Many — $5",
+        "2 crédits, expirent un an après l'achat",
+    );
+}
+
+/// **The Account pane's rows stay English while its page does.**
+///
+/// The other half of the caller-supplied rule: a shared component that
+/// localized unconditionally would put translated plan rows inside an
+/// otherwise-English Settings page — the failure the wholesale-menu rule names.
+/// `PlanLabels::english()` pins them, and this is what an accidental
+/// `localized(cx)` there would fail.
+#[gpui::test]
+fn the_account_panes_plans_stay_english_with_its_page(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    for tag in ["en", "fr", "zh-Hans"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(
+            &entries,
+            "settings/account/plans",
+            gpui::Role::ListBox,
+            "Available plans",
+        );
+        assert_probe_value(
+            &entries,
+            "settings/account/plan/1",
+            gpui::Role::ListBoxOption,
+            "One-time — $5",
+            "5,000,000 credits, expire one year after purchase",
+        );
+    }
+}
+
 /// **A probe name is a selector, so it does not move with the reader.**
 ///
 /// The credential rows used to derive both their probe names and their element

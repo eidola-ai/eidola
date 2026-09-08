@@ -590,11 +590,14 @@ impl RenderOnce for Purchase {
                         .text_color(theme.muted_foreground)
                         .child(crate::i18n::msg::onboarding_purchase_checkout_note(cx)),
                 )
+                // The whole slide around these rows is localized, so the rows
+                // are too — a shared component says nothing on its own.
                 .child(plans::plan_rows(
                     &self.prices,
                     self.checkout_pending.as_deref(),
                     self.on_select,
                     "onboarding",
+                    plans::PlanLabels::localized(cx),
                     cx,
                 ))
                 .when_some(self.checkout_error, |el, err| {

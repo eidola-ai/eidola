@@ -6,6 +6,8 @@
 # locale, and the id placeholder is a shape rather than words. They fall back to
 # the English source.
 
+onboarding-window-title = 开始使用
+
 onboarding-pause-body =
     ## *请先停一下*
 

@@ -21,6 +21,13 @@
 -terms-of-service = Terms of Service
 -privacy-policy = Privacy Policy
 
+# The window's OS-level name. It paints nothing (the title bar is transparent)
+# but it names the window in the macOS Window menu, the window switcher and
+# VoiceOver's window chooser, and labels the accessibility tree's root node —
+# so it is part of the window's accessible surface. Keep it short: it is read
+# in a list beside every other open window.
+onboarding-window-title = Get Started
+
 # -- Slide bodies ------------------------------------------------------------
 
 # "Pause here" — the first thing a reader sees. The point is the contrast, so

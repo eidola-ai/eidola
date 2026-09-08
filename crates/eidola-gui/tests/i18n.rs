@@ -194,6 +194,75 @@ fn a_locale_change_notifies_global_observers(cx: &mut TestAppContext) {
     assert_eq!(changes.get(), baseline + 1, "a no-op apply must not notify");
 }
 
+/// **Every window title fed from the resources is re-applied on a locale
+/// change.**
+///
+/// A title is set once, at open, and lives outside any render — so it does not
+/// follow a locale change the way a drawn string does, and `retitle_windows` is
+/// the observer that puts it right. The doctrine states that any newly
+/// localized title joins it; this makes the rule structural rather than a thing
+/// to remember, by reading `lib.rs` for the two halves and comparing them.
+///
+/// It is a source scan because the title has no readable seam: gpui's test
+/// platform keeps `PlatformWindow::get_title`'s empty default, and
+/// `retitle_windows` returns early with no `AppGlobal` — which only production
+/// installs. The trigger side is covered by
+/// `a_locale_change_notifies_global_observers` above.
+#[test]
+fn every_localized_window_title_is_re_applied_on_a_locale_change() {
+    let src = include_str!("../src/lib.rs");
+
+    // The titles set from the resources, wherever a window opens.
+    let mut localized: Vec<&str> = Vec::new();
+    for (i, _) in src.match_indices("set_window_title(&i18n::msg::") {
+        let rest = &src[i + "set_window_title(&i18n::msg::".len()..];
+        let name = &rest[..rest.find('(').expect("an accessor call")];
+        localized.push(name);
+    }
+    localized.sort_unstable();
+    localized.dedup();
+    assert!(
+        localized.len() >= 2,
+        "the scan found no localized window titles — it has stopped measuring anything"
+    );
+
+    // The body of the observer that re-applies them.
+    let start = src
+        .find("fn retitle_windows(")
+        .expect("retitle_windows must exist");
+    let body = &src[start..];
+    let end = body.find("\n}\n").expect("a closing brace") + 2;
+    let body = &body[..end];
+
+    for name in localized {
+        assert!(
+            body.contains(&format!("i18n::msg::{name}(")),
+            "`{name}` titles a window from the resources but `retitle_windows` never re-applies \
+             it — the window would keep the language it opened in"
+        );
+    }
+}
+
+/// The onboarding window's own title moves with the reader, which is what makes
+/// the re-application above worth doing.
+#[gpui::test]
+fn the_onboarding_windows_title_speaks_the_readers_language(cx: &mut TestAppContext) {
+    cx.update(|cx| i18n::install(cx));
+    for (tag, expected) in [
+        ("en", "Get Started"),
+        ("fr", "Commencer"),
+        ("zh-Hant", "開始使用"),
+        ("en", "Get Started"),
+    ] {
+        cx.update(|cx| i18n::apply(tag, cx));
+        assert_eq!(
+            cx.update(|cx| i18n::msg::onboarding_window_title(cx)),
+            expected,
+            "{tag} names the window in the Window menu, the switcher and VoiceOver"
+        );
+    }
+}
+
 /// A translated message may reference an **untranslated** one, and the
 /// reference has to resolve across that boundary.
 ///
@@ -269,6 +338,8 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 // `[one]` variants would never be exercised at all.
                 args.set("count", 1);
                 args.set("unlinkability", "https://example.invalid/unlinkability");
+                args.set("line", "5,000,000 credits, expire one year after purchase");
+                args.set("description", "the seller's own words");
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),

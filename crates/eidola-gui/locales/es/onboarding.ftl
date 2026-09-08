@@ -6,6 +6,8 @@
 # locale, and the id placeholder is a shape rather than words. They fall back to
 # the English source.
 
+onboarding-window-title = Empezar
+
 onboarding-pause-body =
     ## *Detente un momento*
 
