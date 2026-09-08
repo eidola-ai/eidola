@@ -33,6 +33,8 @@ proxy-keys-note = Un outil envoie sa clé comme jeton bearer. Eidola n'en conser
 proxy-keys-empty = Aucune clé pour l'instant — rien ne peut atteindre le proxy tant que vous n'en créez pas une.
 proxy-key-label-placeholder = Qu'est-ce qui utilisera cette clé ?
 proxy-key-create = Générer une clé
+proxy-key-creating = Génération…
+proxy-key-show-first = Copiez la clé ci-dessus et appuyez d'abord sur Terminé.
 proxy-key-revoked = révoquée
 proxy-key-unused = jamais utilisée
 proxy-key-used = utilisée
@@ -45,3 +47,6 @@ proxy-key-done = Terminé
 
 proxy-failed = Impossible de lire les réglages du proxy.
 proxy-retry = Réessayer
+proxy-keys-failed = Impossible de lister les clés d'API.
+proxy-loading = Chargement…
+proxy-stale = Impossible d'actualiser — dernière réponse affichée.

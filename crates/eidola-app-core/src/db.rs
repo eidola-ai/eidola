@@ -8596,7 +8596,8 @@ pub async fn list_credential_lifecycle(
 // The local inference proxy
 // ---------------------------------------------------------------------------
 
-/// The `proxy_settings` singleton, as stored.
+/// The `proxy_settings` singleton, as stored. Read-only: writes go through
+/// [`update_proxy_settings`], which moves columns rather than rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxySettingsRow {
     pub enabled: bool,
@@ -8641,24 +8642,48 @@ pub async fn get_proxy_settings(conn: &Connection) -> Result<Option<ProxySetting
     }
 }
 
-/// Write the proxy settings singleton.
-pub async fn upsert_proxy_settings(
+/// Move the columns a write actually names, and no others.
+///
+/// **Column-partial, in one statement, because two controls are two writes.**
+/// A read-modify-write of the whole row lets two settings changes made before
+/// the first settles both read the same snapshot, and whichever commits last
+/// silently restores the other's old value — the reader watches a switch they
+/// flipped flip back. `COALESCE` over a `NULL` parameter is what makes each
+/// write touch only its own column, so the interleaving is not merely unlikely
+/// but unrepresentable: two writes to two columns compose whatever order they
+/// land in, and two writes to *one* column are last-writer-wins, which is the
+/// honest meaning of pressing one control twice.
+///
+/// The literals in the insert arm are the compiled-in defaults a row that has
+/// never been written resolves to; they must stay in step with
+/// `proxy::DEFAULT_BIND_ADDRESS` / `DEFAULT_BIND_PORT` and
+/// `LocalExposure::default`.
+pub async fn update_proxy_settings(
     conn: &Connection,
-    row: &ProxySettingsRow,
+    enabled: Option<bool>,
+    bind_address: Option<&str>,
+    bind_port: Option<i64>,
+    local_exposure: Option<&str>,
     now: i64,
 ) -> Result<(), AppError> {
+    let opt_int = |v: Option<i64>| v.map(Value::Integer).unwrap_or(Value::Null);
+    let opt_str = |v: Option<&str>| v.map(|s| Value::Text(s.to_string())).unwrap_or(Value::Null);
     conn.execute(
         "INSERT INTO proxy_settings \
              (id, enabled, bind_address, bind_port, local_exposure, created_at, updated_at) \
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?5) \
+         VALUES (1, COALESCE(?1, 0), COALESCE(?2, '127.0.0.1'), COALESCE(?3, 11437), \
+                 COALESCE(?4, 'loaded'), ?5, ?5) \
          ON CONFLICT(id) DO UPDATE SET \
-             enabled = ?1, bind_address = ?2, bind_port = ?3, local_exposure = ?4, \
+             enabled = COALESCE(?1, enabled), \
+             bind_address = COALESCE(?2, bind_address), \
+             bind_port = COALESCE(?3, bind_port), \
+             local_exposure = COALESCE(?4, local_exposure), \
              updated_at = ?5",
         (
-            Value::Integer(i64::from(row.enabled)),
-            Value::Text(row.bind_address.clone()),
-            Value::Integer(row.bind_port),
-            Value::Text(row.local_exposure.clone()),
+            opt_int(enabled.map(i64::from)),
+            opt_str(bind_address),
+            opt_int(bind_port),
+            opt_str(local_exposure),
             Value::Integer(now),
         ),
     )

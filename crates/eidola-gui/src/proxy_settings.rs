@@ -213,12 +213,14 @@ impl Render for ProxySettingsView {
         let store = self.proxy.read(cx);
         let settings = store.settings().clone();
         let op_error = store.op_error().map(str::to_string);
-        let listen_error = store.listen_error().map(str::to_string);
+        let listen_error = store.listen_error();
         let address = store.address().map(|a| a.to_string());
         let minted = store
             .minted()
             .map(|m| (m.key.clone(), m.info.label.clone()));
-        let keys: Vec<ProxyKeyInfo> = store.key_list().to_vec();
+        let keys = store.keys().clone();
+        let can_create_key = store.can_create_key();
+        let create_key_pending = store.create_key_pending();
         let backends: Vec<BackendInfo> = self.backends.read(cx).list().to_vec();
 
         let mut col = v_flex()
@@ -244,9 +246,24 @@ impl Render for ProxySettingsView {
                 cx.listener(|this, _, _, cx| this.refresh(cx)),
             ));
         }
+        // A refresh that failed over a snapshot we still hold keeps the rows and
+        // says so quietly — "Failed is not empty", and its mirror: a read still
+        // in flight is not an empty configuration either, so it says *that*
+        // rather than painting a pane with nothing in it.
+        let stale_settings = matches!(
+            &settings,
+            crate::loadable::Loadable::Failed { prior: Some(_), .. }
+        );
         let Some(settings) = settings.value().cloned() else {
-            return col;
+            return col.child(loading_line(
+                "settings/proxy/loading",
+                msg::proxy_loading(cx),
+                cx,
+            ));
         };
+        if stale_settings {
+            col = col.child(self.stale_strip("settings/proxy/stale", cx));
+        }
 
         col = col.child(
             div()
@@ -397,22 +414,54 @@ impl Render for ProxySettingsView {
         if let Some((key, label)) = minted {
             col = col.child(self.minted_banner(&key, &label, cx));
         }
-        if keys.is_empty() {
-            col = col.child(
-                div()
-                    .id("proxy-keys-empty")
-                    .probe(
-                        "settings/proxy/keys/empty",
-                        gpui::Role::Label,
-                        msg::proxy_keys_empty(cx),
-                    )
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(msg::proxy_keys_empty(cx)),
-            );
-        }
-        for (index, key) in keys.iter().enumerate() {
-            col = col.child(self.key_row(index, key, cx));
+        // The listing's four states read apart. A key cell that has not answered
+        // is not "no keys": that sentence, over a proxy that in fact has live
+        // keys, invites the reader to generate another — and a failed read left
+        // nothing on the page that could ever cause a second one.
+        match &keys {
+            crate::loadable::Loadable::Failed { error, prior: None } => {
+                col = col.child(load_error_panel(
+                    "settings/proxy/keys/retry",
+                    msg::proxy_keys_failed(cx),
+                    &error.to_string(),
+                    msg::proxy_retry(cx),
+                    cx,
+                    cx.listener(|this, _, _, cx| this.refresh(cx)),
+                ));
+            }
+            crate::loadable::Loadable::NotLoaded | crate::loadable::Loadable::Loading => {
+                col = col.child(loading_line(
+                    "settings/proxy/keys/loading",
+                    msg::proxy_loading(cx),
+                    cx,
+                ));
+            }
+            _ => {
+                if matches!(
+                    &keys,
+                    crate::loadable::Loadable::Failed { prior: Some(_), .. }
+                ) {
+                    col = col.child(self.stale_strip("settings/proxy/keys/stale", cx));
+                }
+                let rows: &[ProxyKeyInfo] = keys.value().map(|v| v.as_slice()).unwrap_or(&[]);
+                if rows.is_empty() {
+                    col = col.child(
+                        div()
+                            .id("proxy-keys-empty")
+                            .probe(
+                                "settings/proxy/keys/empty",
+                                gpui::Role::Label,
+                                msg::proxy_keys_empty(cx),
+                            )
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(msg::proxy_keys_empty(cx)),
+                    );
+                }
+                for (index, key) in rows.iter().enumerate() {
+                    col = col.child(self.key_row(index, key, cx));
+                }
+            }
         }
         col = col.child(
             h_flex()
@@ -433,14 +482,35 @@ impl Render for ProxySettingsView {
                                 .aria_label(msg::proxy_key_label_placeholder(cx)),
                         ),
                 )
-                .child(ghost_button(
-                    SharedString::from("proxy-key-create"),
-                    SharedString::from("settings/proxy/keys/create"),
-                    msg::proxy_key_create(cx),
-                    true,
-                    cx,
-                    cx.listener(|this, _, window, cx| this.create_key(window, cx)),
-                )),
+                // **A control over a settled decision is not a control.** While
+                // a generation is in flight, or a minted key is still waiting to
+                // be read, the verb is replaced by the reason — no id, no probe,
+                // so no tab stop and nothing to activate. One predicate decides
+                // the press and the painting alike, so an offered verb and an
+                // accepted press cannot disagree.
+                .child(if can_create_key {
+                    ghost_button(
+                        SharedString::from("proxy-key-create"),
+                        SharedString::from("settings/proxy/keys/create"),
+                        msg::proxy_key_create(cx),
+                        true,
+                        cx,
+                        cx.listener(|this, _, window, cx| this.create_key(window, cx)),
+                    )
+                    .into_any_element()
+                } else {
+                    let reason = if create_key_pending {
+                        msg::proxy_key_creating(cx)
+                    } else {
+                        msg::proxy_key_show_first(cx)
+                    };
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(reason)
+                        .into_any_element()
+                }),
         );
 
         if let Some(message) = op_error {
@@ -657,6 +727,39 @@ impl ProxySettingsView {
             })
     }
 
+    /// The quiet strip over a cell whose *refresh* failed.
+    ///
+    /// The Library's line, not its panel: the values are still on screen and
+    /// still worth reading, so what is owed is the fact that they are as of the
+    /// last successful read, plus a way to ask again — nothing in this pane
+    /// re-reads on its own between bus events.
+    fn stale_strip(
+        &self,
+        probe_name: &'static str,
+        cx: &Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .id(probe_name)
+                    .probe(probe_name, gpui::Role::Label, msg::proxy_stale(cx))
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(msg::proxy_stale(cx)),
+            )
+            .child(ghost_button(
+                SharedString::from(format!("{probe_name}/retry")),
+                SharedString::from(format!("{probe_name}-retry")),
+                msg::proxy_retry(cx),
+                false,
+                cx,
+                cx.listener(|this, _, _, cx| this.refresh(cx)),
+            ))
+    }
+
     /// The one moment a key exists in full.
     fn minted_banner(
         &self,
@@ -714,6 +817,21 @@ impl ProxySettingsView {
                     )),
             )
     }
+}
+
+/// A read that has not answered, said plainly.
+///
+/// The Participants section's idiom: a cell in flight renders a quiet line, not
+/// the empty state it will not necessarily land on. It carries its own `Label`
+/// node, because the sentence *is* what the surface says here.
+fn loading_line(probe_name: &'static str, message: SharedString, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .id(probe_name)
+        .probe(probe_name, gpui::Role::Label, message.clone())
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(message)
 }
 
 /// A danger band whose message **wraps**.

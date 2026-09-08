@@ -28,6 +28,10 @@ use crate::bridge::bridge;
 use crate::loadable::Loadable;
 use crate::proxy::ProxyHandle;
 
+/// The one slot a key generation ever occupies. Named, because the re-entry
+/// refusal and the operation itself have to mean the same slot.
+const CREATE_KEY_SLOT: &str = "create-key";
+
 pub struct ProxyStore {
     app_core: Option<Arc<AppCore>>,
     settings: Loadable<ProxySettings>,
@@ -39,8 +43,12 @@ pub struct ProxyStore {
     keys_task: Option<Task<()>>,
     /// Keyed per-operation slots — the pane offers several verbs at once
     /// (a toggle, a per-backend checkbox, a per-key revoke), and a store-wide
-    /// slot would drop one of them.
-    op_tasks: HashMap<String, Task<()>>,
+    /// slot would drop one of them. Two writes on the **same** key are
+    /// **chained**, not replaced; the generation beside each task is what tells
+    /// a settling op whether it is still the current one. See
+    /// [`Self::start_op`].
+    op_tasks: HashMap<String, (u64, Task<()>)>,
+    next_op_gen: u64,
     op_error: Option<String>,
     /// Why the listener is not running, when the reader asked for it to be.
     /// Separate from `op_error` because the write succeeded — what failed is
@@ -61,6 +69,7 @@ impl ProxyStore {
             settings_task: None,
             keys_task: None,
             op_tasks: HashMap::new(),
+            next_op_gen: 0,
             op_error: None,
             listen_error: None,
             minted: None,
@@ -85,6 +94,7 @@ impl ProxyStore {
             settings_task: None,
             keys_task: None,
             op_tasks: HashMap::new(),
+            next_op_gen: 0,
             op_error: None,
             listen_error: None,
             minted: None,
@@ -135,13 +145,45 @@ impl ProxyStore {
         self.op_error.as_deref()
     }
 
-    pub fn listen_error(&self) -> Option<&str> {
-        self.listen_error.as_deref()
+    /// Why nothing is listening, when the reader asked for something to be.
+    ///
+    /// **Derived, never only cached.** A listener whose accept loop gave up
+    /// stops answering an address without any write having failed, so the
+    /// handle's own reason outranks the last bind failure recorded here: the
+    /// pane's question is "why is nothing listening", and the loop that stopped
+    /// is the truest answer available. A bind that failed left no listener at
+    /// all, so the two can never both answer.
+    pub fn listen_error(&self) -> Option<String> {
+        self.handle
+            .accept_failure()
+            .or_else(|| self.listen_error.clone())
     }
 
     /// The key just generated, if one is waiting to be read.
     pub fn minted(&self) -> Option<&MintedProxyKey> {
         self.minted.as_ref()
+    }
+
+    /// Whether generating a key is something the reader can ask for now.
+    ///
+    /// **The invariant is "no live row whose secret was never shown."** A key's
+    /// value exists for exactly one render — only its digest is stored — so a
+    /// second generation while one is pending, or while a minted key still
+    /// stands unacknowledged, would insert a live row whose secret nothing ever
+    /// displayed: the banner shows one key, and the other is a credential
+    /// authenticating requests that nobody holds and nobody can revoke by
+    /// recognising it. Both states therefore withhold the verb, and this one
+    /// predicate decides the press *and* whether the control is painted at all,
+    /// so an accepted press and an offered verb cannot disagree.
+    pub fn can_create_key(&self) -> bool {
+        self.minted.is_none() && !self.op_tasks.contains_key(CREATE_KEY_SLOT)
+    }
+
+    /// Whether a key is being generated right now — the pending half of
+    /// [`Self::can_create_key`], which the pane words differently from the
+    /// unacknowledged half.
+    pub fn create_key_pending(&self) -> bool {
+        self.op_tasks.contains_key(CREATE_KEY_SLOT)
     }
 
     /// Acknowledge the generated key. **The value is gone after this** — only
@@ -196,6 +238,13 @@ impl ProxyStore {
     /// click in this one does — and a restart is idempotent, because the
     /// question asked is "is what is bound what the settings describe" rather
     /// than "did something just change".
+    ///
+    /// **A listener that gave up is reconcilable again, and that falls out of
+    /// the same question.** The accept loop stops after sixteen consecutive
+    /// refused accepts, and a stopped loop answers no address — so the
+    /// comparison below misses, and this restarts it. Nothing special-cases the
+    /// terminal state; what makes it recoverable is that the handle stops
+    /// claiming an address the moment it stops accepting on one.
     fn reconcile_listener(&mut self, cx: &mut Context<Self>) {
         let Some(core) = self.app_core.clone() else {
             return;
@@ -268,84 +317,124 @@ impl ProxyStore {
 
     /// Expose or withdraw one backend.
     pub fn set_backend_exposed(&mut self, id: String, exposed: bool, cx: &mut Context<Self>) {
-        let Some(core) = self.begin_op() else { return };
-        cx.notify();
-        let key = format!("backend:{id}");
-        let slot = key.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let result = bridge(core, move |c| async move {
-                c.set_proxy_backend_exposed(id, exposed).await
-            })
-            .await;
-            let _ = this.update(cx, |this, cx| {
-                this.op_tasks.remove(&slot);
-                this.settle(result, cx);
-            });
-        });
-        self.op_tasks.insert(key, task);
+        let slot = format!("backend:{id}");
+        self.start_op(
+            slot,
+            cx,
+            move |core| async move {
+                bridge(core, move |c| async move {
+                    c.set_proxy_backend_exposed(id, exposed).await
+                })
+                .await
+            },
+            |this, result, cx| this.settle(result, cx),
+        );
     }
 
     /// Generate a key. **Its secret reaches `minted` and nowhere else.**
+    ///
+    /// Refused while another generation is pending or while a minted key is
+    /// still waiting to be read — see [`Self::can_create_key`] for why that is
+    /// an invariant about live rows rather than a courtesy to the reader.
     pub fn create_key(&mut self, label: String, cx: &mut Context<Self>) {
-        let Some(core) = self.begin_op() else { return };
-        cx.notify();
-        let key = "create-key".to_string();
-        let slot = key.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let result = bridge(core, |c| async move { c.create_proxy_key(label).await }).await;
-            let _ = this.update(cx, |this, cx| {
-                this.op_tasks.remove(&slot);
-                match result {
-                    Ok(minted) => {
-                        this.minted = Some(minted);
-                        this.refresh(cx);
-                    }
-                    Err(e) => this.op_error = Some(e.to_string()),
+        if !self.can_create_key() {
+            return;
+        }
+        self.start_op(
+            CREATE_KEY_SLOT.to_string(),
+            cx,
+            move |core| async move {
+                bridge(core, |c| async move { c.create_proxy_key(label).await }).await
+            },
+            |this, result, cx| match result {
+                Ok(minted) => {
+                    this.minted = Some(minted);
+                    this.refresh(cx);
                 }
-                cx.notify();
-            });
-        });
-        self.op_tasks.insert(key, task);
+                Err(e) => this.op_error = Some(e.to_string()),
+            },
+        );
     }
 
     /// Revoke a key. Keyed per key, because the pane offers the verb on every
     /// row at once and a store-wide slot would drop one of two presses.
     pub fn revoke_key(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(core) = self.begin_op() else { return };
-        cx.notify();
-        let key = format!("revoke:{id}");
-        let slot = key.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let result = bridge(core, |c| async move { c.revoke_proxy_key(id).await }).await;
-            let _ = this.update(cx, |this, cx| {
-                this.op_tasks.remove(&slot);
-                match result {
-                    Ok(_) => this.refresh(cx),
-                    Err(e) => this.op_error = Some(e.to_string()),
-                }
-                cx.notify();
-            });
-        });
-        self.op_tasks.insert(key, task);
+        let slot = format!("revoke:{id}");
+        self.start_op(
+            slot,
+            cx,
+            move |core| async move {
+                bridge(core, |c| async move { c.revoke_proxy_key(id).await }).await
+            },
+            |this, result, cx| match result {
+                Ok(_) => this.refresh(cx),
+                Err(e) => this.op_error = Some(e.to_string()),
+            },
+        );
     }
 
     fn write_settings(&mut self, key: &str, update: ProxySettingsUpdate, cx: &mut Context<Self>) {
+        self.start_op(
+            key.to_string(),
+            cx,
+            move |core| async move {
+                bridge(
+                    core,
+                    |c| async move { c.update_proxy_settings(update).await },
+                )
+                .await
+            },
+            |this, result, cx| this.settle(result, cx),
+        );
+    }
+
+    /// Start a keyed operation, **chained behind any predecessor on that key**.
+    ///
+    /// Dropping a predecessor's `Task` cancels only its gpui half — `bridge`
+    /// leaves the core write running — so a superseded write could reach the
+    /// database *after* its successor, or, unpolled, never run at all. Here that
+    /// is not hypothetical: two presses of the enable switch, or a binding
+    /// change over a switch still settling, are one keyboard's work apart, and
+    /// the column each writes is the one the pane then reads back. Owning the
+    /// predecessor and awaiting it makes the successor start strictly after that
+    /// round trip, so last-wins is true by sequencing rather than by hope
+    /// (`AgentsStore::write_then_settle`'s rule, and app-core's column-partial
+    /// write is the other half — two *different* columns never contend at all).
+    ///
+    /// **Only the current generation settles.** A superseded op reports nothing
+    /// and removes no slot: the slot is its successor's by then, and dropping it
+    /// would cancel the very write it just sequenced.
+    fn start_op<T, Fut>(
+        &mut self,
+        key: String,
+        cx: &mut Context<Self>,
+        op: impl FnOnce(Arc<AppCore>) -> Fut + 'static,
+        settle: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+    ) where
+        T: 'static,
+        Fut: std::future::Future<Output = T> + 'static,
+    {
         let Some(core) = self.begin_op() else { return };
-        cx.notify();
-        let key = key.to_string();
+        self.next_op_gen += 1;
+        let generation = self.next_op_gen;
+        let previous = self.op_tasks.remove(&key).map(|(_, task)| task);
         let slot = key.clone();
         let task = cx.spawn(async move |this, cx| {
-            let result = bridge(
-                core,
-                |c| async move { c.update_proxy_settings(update).await },
-            )
-            .await;
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let result = op(core).await;
             let _ = this.update(cx, |this, cx| {
+                if this.op_tasks.get(&slot).map(|(g, _)| *g) != Some(generation) {
+                    return;
+                }
                 this.op_tasks.remove(&slot);
-                this.settle(result, cx);
+                settle(this, result, cx);
+                cx.notify();
             });
         });
-        self.op_tasks.insert(key, task);
+        self.op_tasks.insert(key, (generation, task));
+        cx.notify();
     }
 
     /// A settings write's landing: adopt what the core answered — which is the

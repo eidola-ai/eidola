@@ -140,17 +140,42 @@ enum Admitted {
 
 type Connections = Arc<Mutex<Serving>>;
 
+/// Why the accept loop stopped, when it stopped on its own.
+///
+/// **A listener that has given up is not a listener.** The loop returns after
+/// [`MAX_CONSECUTIVE_ACCEPT_FAILURES`] and the socket goes with it, but the
+/// handle would go on holding a `ProxyServer` — so `address()` kept naming a
+/// port nothing was accepting on, the pane kept saying it was listening, and
+/// every later reconciliation saw the wanted address already bound and refused
+/// to start it again. The state is therefore shared rather than local to the
+/// task: what the loop learns, the handle answers with.
+type AcceptEnded = Arc<Mutex<Option<String>>>;
+
 /// A bound listener, held for as long as the proxy is running.
 pub struct ProxyServer {
     address: SocketAddr,
     accepting: tokio::task::JoinHandle<()>,
     connections: Connections,
+    ended: AcceptEnded,
 }
 
 impl ProxyServer {
-    /// The address this listener actually bound.
-    pub fn address(&self) -> SocketAddr {
+    /// The address this listener bound, or `None` once it has stopped
+    /// accepting — a socket that admits nobody is not somewhere to point a
+    /// tool.
+    pub fn address(&self) -> Option<SocketAddr> {
+        self.accept_failure().is_none().then_some(self.address)
+    }
+
+    /// The address it bound, whatever has become of it. What a diagnostic
+    /// names; never what a reader is told to point at.
+    pub fn bound_address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Why accepting stopped, if it has.
+    pub fn accept_failure(&self) -> Option<String> {
+        self.ended.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Stop serving.
@@ -185,16 +210,19 @@ pub fn serve(core: &Arc<AppCore>, settings: &ProxySettings) -> Result<ProxyServe
         .unwrap_or_else(|e| e.into_inner())
         .shutdown
         .clone();
+    let ended: AcceptEnded = Default::default();
     let accepting = core.runtime().spawn(accept_loop(
         Arc::clone(core),
         listener,
         Arc::clone(&connections),
         shutdown,
+        Arc::clone(&ended),
     ));
     Ok(ProxyServer {
         address,
         accepting,
         connections,
+        ended,
     })
 }
 
@@ -209,11 +237,18 @@ async fn accept_loop(
     listener: std::net::TcpListener,
     connections: Connections,
     shutdown: Shutdown,
+    ended: AcceptEnded,
 ) {
+    // Every way out of this loop that is not a deliberate close records why,
+    // so the handle can stop claiming to be listening.
+    let give_up = |reason: String| {
+        eprintln!("eidola-gui: the local inference proxy stopped accepting: {reason}");
+        *ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+    };
     let listener = match tokio::net::TcpListener::from_std(listener) {
         Ok(listener) => listener,
         Err(e) => {
-            eprintln!("eidola-gui: the local inference proxy could not start: {e}");
+            give_up(e.to_string());
             return;
         }
     };
@@ -227,7 +262,7 @@ async fn accept_loop(
             Err(e) => {
                 failures += 1;
                 if failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES {
-                    eprintln!("eidola-gui: the local inference proxy stopped accepting: {e}");
+                    give_up(e.to_string());
                     return;
                 }
                 tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
@@ -295,7 +330,9 @@ impl ProxyHandle {
             running.close();
         }
         let server = serve(core, settings)?;
-        let address = server.address();
+        // The bound address — a listener a frame old has not given up, and
+        // `bound_address` is the one that always answers.
+        let address = server.bound_address();
         *held = Some(server);
         Ok(address)
     }
@@ -318,7 +355,25 @@ impl ProxyHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(ProxyServer::address)
+            .and_then(ProxyServer::address)
+    }
+
+    /// Why the listener stopped accepting, if it did.
+    ///
+    /// **Read at the reconcile, which is also where it is acted on**: a
+    /// listener that gave up answers no address, so the next reconciliation
+    /// sees nothing bound where the settings want something and starts it
+    /// again. Nothing here pushes — the accept loop runs on the core's runtime
+    /// and the bus is app-core's to emit on — so the pane learns at its next
+    /// notify. Sixteen consecutive refused accepts is an operating system that
+    /// has stopped answering, so the honest cost is that a reader may see the
+    /// stale line until something else moves.
+    pub fn accept_failure(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(ProxyServer::accept_failure)
     }
 
     /// Whether the listener is running.

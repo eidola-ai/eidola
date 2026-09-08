@@ -33,6 +33,8 @@ proxy-keys-note = Una herramienta envía su clave como token bearer. Eidola solo
 proxy-keys-empty = Todavía no hay claves — nada puede llegar al proxy hasta que crees una.
 proxy-key-label-placeholder = ¿Qué va a usar esta clave?
 proxy-key-create = Generar una clave
+proxy-key-creating = Generando…
+proxy-key-show-first = Copia la clave de arriba y pulsa Listo primero.
 proxy-key-revoked = revocada
 proxy-key-unused = sin usar
 proxy-key-used = usada
@@ -45,3 +47,6 @@ proxy-key-done = Hecho
 
 proxy-failed = No se pudieron leer los ajustes del proxy.
 proxy-retry = Reintentar
+proxy-keys-failed = No se pudieron listar las claves de API.
+proxy-loading = Cargando…
+proxy-stale = No se pudo actualizar — se muestra la última respuesta.

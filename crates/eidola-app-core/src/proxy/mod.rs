@@ -326,22 +326,21 @@ impl Inner {
             });
         }
 
-        let current = self.proxy_settings().await?;
-        let row = db::ProxySettingsRow {
-            enabled: update.enabled.unwrap_or(current.enabled),
-            bind_address: update
-                .bind_address
-                .map(|a| a.trim().to_string())
-                .unwrap_or(current.bind_address),
-            bind_port: i64::from(update.bind_port.unwrap_or(current.bind_port)),
-            local_exposure: update
-                .local_exposure
-                .unwrap_or(current.local_exposure)
-                .as_str()
-                .to_string(),
-        };
+        // **No read-modify-write.** Each field moves its own column or none
+        // at all, so two controls used before the first settles cannot restore
+        // each other's old values — see [`db::update_proxy_settings`].
+        let bind_address = update.bind_address.map(|a| a.trim().to_string());
+        let local_exposure = update.local_exposure.map(|e| e.as_str().to_string());
         let conn = self.db_conn().await?;
-        db::upsert_proxy_settings(&conn, &row, now_ms()).await?;
+        db::update_proxy_settings(
+            &conn,
+            update.enabled,
+            bind_address.as_deref(),
+            update.bind_port.map(i64::from),
+            local_exposure.as_deref(),
+            now_ms(),
+        )
+        .await?;
         drop(conn);
         self.bus.emit(Change::Proxy);
         self.proxy_settings().await

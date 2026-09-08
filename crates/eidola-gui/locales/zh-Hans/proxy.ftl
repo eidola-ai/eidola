@@ -33,6 +33,8 @@ proxy-keys-note = 工具以 bearer 令牌发送密钥。Eidola 只保存它的�
 proxy-keys-empty = 尚无密钥 —— 在你创建之前，任何东西都无法访问代理。
 proxy-key-label-placeholder = 什么将使用这个密钥？
 proxy-key-create = 生成密钥
+proxy-key-creating = 正在生成…
+proxy-key-show-first = 请先复制上面的密钥并按“完成”。
 proxy-key-revoked = 已吊销
 proxy-key-unused = 从未使用
 proxy-key-used = 已使用
@@ -45,3 +47,6 @@ proxy-key-done = 完成
 
 proxy-failed = 无法读取代理的设置。
 proxy-retry = 重试
+proxy-keys-failed = 无法列出 API 密钥。
+proxy-loading = 加载中…
+proxy-stale = 无法刷新 — 显示的是上次的结果。

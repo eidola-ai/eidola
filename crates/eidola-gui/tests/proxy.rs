@@ -73,7 +73,7 @@ fn a_bound_proxy_answers_a_real_client_where_it_says_it_is() {
         .key;
 
     let server = proxy::serve(&core, &ephemeral()).expect("bind");
-    let address = server.address();
+    let address = server.address().expect("a listener that has not given up");
     assert!(
         address.ip().is_loopback() && address.port() != 0,
         "the address reported is the one actually bound: {address}"
@@ -96,7 +96,7 @@ fn closing_takes_the_door_away_from_a_client_that_was_already_connected() {
         .expect("mint")
         .key;
     let server = proxy::serve(&core, &ephemeral()).expect("bind");
-    let address = server.address();
+    let address = server.bound_address();
 
     // A client that is connected and has not yet asked for anything. Closing
     // means closed to everyone, not only to newcomers — the control socket's

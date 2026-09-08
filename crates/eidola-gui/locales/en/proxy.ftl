@@ -54,6 +54,11 @@ proxy-keys-note = A tool sends its key as a bearer token. Eidola keeps only a ha
 proxy-keys-empty = No keys yet — nothing can reach the proxy until you make one.
 proxy-key-label-placeholder = What will use this key?
 proxy-key-create = Generate a key
+# A key's value exists for exactly one render, so a second generation may not
+# start while one is pending or while a minted key is still unread — the verb is
+# replaced by whichever of those is true.
+proxy-key-creating = Generating…
+proxy-key-show-first = Copy the key above and press Done first.
 proxy-key-revoked = revoked
 proxy-key-unused = never used
 proxy-key-used = used
@@ -69,4 +74,9 @@ proxy-key-done = Done
 # here to act on, so the way back is a retry rather than a plausible-looking
 # empty pane.
 proxy-failed = Couldn't read the proxy's settings.
+proxy-keys-failed = Couldn't list the API keys.
 proxy-retry = Retry
+# A read still in flight is not an empty configuration, and a refresh that
+# failed over values still on screen is not a fresh read of them.
+proxy-loading = Loading…
+proxy-stale = Couldn't refresh — showing the last answer.

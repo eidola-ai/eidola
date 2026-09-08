@@ -810,6 +810,46 @@ fn the_settings_round_trip_and_refuse_what_cannot_be_bound() {
 }
 
 #[test]
+fn two_settings_writes_each_move_only_their_own_column() {
+    run(|| {
+        // **Two controls used before the first settles are two writes**, and a
+        // read-modify-write of the whole row lets the last one restore the
+        // other's old value — the reader watches a switch they flipped flip
+        // back. Each write names its own column and nothing else, so the two
+        // compose whatever order they land in.
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let runtime = core.runtime();
+
+        let (enabled, exposure) = runtime.block_on(async {
+            tokio::join!(
+                core.update_proxy_settings(ProxySettingsUpdate {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
+                core.update_proxy_settings(ProxySettingsUpdate {
+                    local_exposure: Some(eidola_app_core::proxy::LocalExposure::Downloaded),
+                    ..Default::default()
+                }),
+            )
+        });
+        enabled.expect("enable");
+        exposure.expect("exposure");
+
+        let settled = runtime.block_on(core.proxy_settings()).expect("settings");
+        assert!(settled.enabled, "the enable survived the exposure write");
+        assert_eq!(
+            settled.local_exposure,
+            eidola_app_core::proxy::LocalExposure::Downloaded,
+            "and the exposure survived the enable"
+        );
+        assert_eq!(
+            settled.bind_address, "127.0.0.1",
+            "a column nothing named keeps its value"
+        );
+    });
+}
+
+#[test]
 fn a_key_is_shown_once_and_stored_only_as_a_digest() {
     run(|| {
         let (_mock, core, _dir) = core_for(MockConfig::default());
