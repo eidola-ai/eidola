@@ -102,6 +102,16 @@ fn closing_takes_the_door_away_from_a_client_that_was_already_connected() {
     // means closed to everyone, not only to newcomers — the control socket's
     // rule, and it exists here for the same reason: this door starts billed
     // work, and everything after the close is teardown.
+    //
+    // **What this has teeth for is the outcome, and deliberately so.** Three
+    // layers produce it and they compose rather than overlap: the `closed`
+    // flag refuses an accept arriving from here on, the shutdown latch stops a
+    // connection already inside from dispatching, and the abort ends the task.
+    // Which of them got there first is a scheduling question no test can pin
+    // without becoming a race, so each is pinned alone by its own unit test
+    // (`proxy::tests::{a_connection_arriving_after_the_sweep_is_refused,
+    // shutting_reaches_the_connections_already_inside}`) and this one asserts
+    // the only thing that matters to the peer: it is not served.
     let mut established = TcpStream::connect(address).expect("connect");
     // Give the accept loop a moment to take the connection on, so the close
     // below is genuinely ending an established one rather than racing it.
