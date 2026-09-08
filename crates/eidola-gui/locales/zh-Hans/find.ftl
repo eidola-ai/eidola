@@ -7,3 +7,7 @@ find-next = 下一个匹配项
 find-close = 关闭查找
 find-count = 第 { $index } 个，共 { $total } 个
 find-no-results = 没有结果
+find-total = 共 { $total } 个
+find-total-counting = 正在统计…
+find-branch-count = 此分支中还有 { $count } 个
+find-no-results-in-branch = 此分支中没有结果

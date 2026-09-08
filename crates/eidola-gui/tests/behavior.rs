@@ -19398,6 +19398,20 @@ fn findable_posts() -> Vec<PostNode> {
 /// never ran. It also exercises the routing: a printable reaching the query
 /// field at all depends on the conversation's key handler yielding while the
 /// bar holds the keyboard, or type-to-compose would swallow every character.
+/// Let the cross-branch count finish.
+///
+/// `run_until_parked` cannot: the pass suspends on a real timer between chunks
+/// (`find::COUNT_YIELD`, which must not be zero — a zero duration is
+/// `Task::ready` at our gpui pin and would not suspend at all), and gpui's test
+/// scheduler expires a timer only once the clock reaches it. Advancing is
+/// therefore how a test says "let it land" — and it is what makes the
+/// *unfinished* state observable in the first place.
+fn settle_find_count(vcx: &mut VisualTestContext) {
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    vcx.run_until_parked();
+}
+
 fn run_find(
     view: &Entity<SpaceView>,
     window: AnyWindowHandle,
@@ -20178,6 +20192,95 @@ fn space_find_reveals_a_match_in_the_off_branch_composer(cx: &mut TestAppContext
             v.composer_scroll_offset_y_for_test()
         );
     });
+}
+
+#[gpui::test]
+fn space_find_does_not_count_the_floating_composer_as_elsewhere(cx: &mut TestAppContext) {
+    // **The floating composer is on the visible side of the exactness
+    // equation.** The active draft is in scope whatever branch it belongs to,
+    // because it floats over whatever is showing — that is the whole reason
+    // `MatchReveal::Composer` exists. But `effective_tree` still attaches it
+    // beneath its own inactive sibling, so the sibling's subtree aggregate
+    // reached it too: a query matching only that draft read "1 of 1" and
+    // "1 total" beside a map cell announcing "1 more in this branch" — a match
+    // that is not *more*, it is the one on screen, and the reader was invited
+    // to go and look for it where it already is.
+    //
+    // "Reachable only through this branch" has to mean **not currently
+    // visible**, so the number the map carries excludes it and the visible
+    // side takes it — which is what keeps the total, the index and the map
+    // describing one conversation.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut left = fixture_assistant_post("a2", "the left branch, which the page is showing");
+    left.parent_action_id = Some("a1".into());
+    let mut right = fixture_assistant_post("a3", "the right branch, off to one side");
+    right.parent_action_id = Some("a1".into());
+    space.update(cx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", "the fork"), left, right], cx)
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    let right_index = view
+        .read_with(&vcx, |v, _| v.draft_parents_for_test())
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a3"))
+        .expect("the right branch has a tail draft");
+    // Activating a draft does not select its branch — the page stays on the
+    // left one, so this composer floats over a branch it is not part of.
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(right_index, cx));
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the off-branch draft is the active composer");
+    editor.update(&mut vcx, |e, cx| {
+        e.set_value("one kestrel, typed over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+
+    let (matches, total, account, siblings) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+                v.minimap_branch_counts_for_test(window, cx),
+            )
+        })
+    });
+
+    assert_eq!(matches, 1, "the floating draft is searched where it stands");
+    assert_eq!(
+        total,
+        Some(1),
+        "and it is in the space's total — excluding it from the sibling must \
+         not make it count nowhere"
+    );
+    let far = siblings
+        .iter()
+        .find(|(id, _)| id == "a3")
+        .map(|(_, n)| *n)
+        .expect("the other fork is a shown sibling");
+    assert_eq!(
+        far, None,
+        "the branch the composer belongs to holds nothing the reader cannot \
+         already see, so its cell says nothing rather than 'one more'"
+    );
+    assert_eq!(
+        account,
+        total.expect("settled"),
+        "and the map still accounts for the whole space — the draft moved to \
+         the visible side of the sum, it did not leave it"
+    );
 }
 
 #[gpui::test]
@@ -21398,4 +21501,747 @@ fn space_find_does_not_push_a_followed_reference_under_its_own_bar(cx: &mut Test
         "the followed post rests the same distance below the chrome either \
          way ({closed} closed, {open} open)"
     );
+}
+
+/// A conversation that forks twice, with matches on branches the reader is not
+/// looking at. `a1` is the root; `a2`/`a3` fork under it; `a4`/`a5` fork under
+/// `a2`; `a6` hangs off `a3`.
+fn cross_branch_posts() -> Vec<PostNode> {
+    let child = |id: &str, parent: &str, text: &str| {
+        let mut p = fixture_assistant_post(id, text);
+        p.parent_action_id = Some(parent.into());
+        p
+    };
+    vec![
+        fixture_user_post("a1", "one kestrel at the root"),
+        child("a2", "a1", "no birds here"),
+        child("a4", "a2", "a kestrel and another kestrel"),
+        child("a5", "a2", "one more kestrel"),
+        child("a3", "a1", "a kestrel on the other fork"),
+        child("a6", "a3", "kestrel, kestrel, kestrel"),
+    ]
+}
+
+/// A conversation too big for one chunk of the cross-branch pass to finish:
+/// five spine posts, each carrying six replies, thirty-six in all, one match
+/// apiece. Shallow and wide rather than deep — the view renders one nested
+/// scroller per level, so depth is the expensive axis in a fixture and breadth
+/// is the free one.
+fn wide_countable_posts() -> Vec<PostNode> {
+    // ~4 KB a post, so the space is also past `SCAN_CHUNK_BYTES`: a re-scan of
+    // warm projections cannot finish in one chunk either, which is what makes
+    // a needless restart visible rather than merely wasteful.
+    let filler = "words ".repeat(650);
+    let body = |lead: &str| format!("{lead}. {filler}");
+    let mut posts = vec![fixture_user_post("a1", &body("one kestrel to start"))];
+    let mut n = 2u32;
+    let mut parent = String::from("a1");
+    for _ in 0..5 {
+        let spine = format!("a{n}");
+        n += 1;
+        let mut p = fixture_assistant_post(&spine, &body("a kestrel further down the spine"));
+        p.parent_action_id = Some(parent.clone());
+        posts.push(p);
+        for _ in 0..6 {
+            let leaf = format!("a{n}");
+            n += 1;
+            let mut p = fixture_assistant_post(&leaf, &body("one kestrel on a branch"));
+            p.parent_action_id = Some(spine.clone());
+            posts.push(p);
+        }
+        parent = spine;
+    }
+    assert_eq!(posts.len(), 36, "bigger than one chunk of the pass");
+    posts
+}
+
+#[gpui::test]
+fn space_find_counts_the_whole_space_and_the_map_accounts_for_it(cx: &mut TestAppContext) {
+    // The cross-branch half of ⌘F. The index still counts the branch the
+    // reader is on; the total counts every branch — and the two are tied
+    // together by the exactness invariant, which is what lets a reader add up
+    // the map in front of them: the path's own matches plus every shown
+    // sibling's whole subtree is the space's total, exactly.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    let (branch_total, space_total, account) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+            )
+        })
+    });
+    assert_eq!(
+        space_total,
+        Some(8),
+        "one at the root, two under a4, one under a5, one on a3 and three \
+         under a6 — every branch, not the visible one"
+    );
+    assert!(
+        branch_total < 8,
+        "the visible branch holds fewer than the space does ({branch_total})"
+    );
+    assert_eq!(
+        account,
+        space_total.expect("settled"),
+        "the path's own matches plus every shown sibling's subtree is the \
+         space's total, exactly"
+    );
+
+    // …and it stays exact from wherever the reader stands. Take the other
+    // fork and ask again: a different path, different siblings, same sum.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_effective_path_for_test("a6", window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let (moved_branch, moved_total, moved_account) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+            )
+        })
+    });
+    assert_eq!(moved_total, Some(8), "the space did not change");
+    assert_ne!(
+        moved_branch, branch_total,
+        "precondition: the reader really is on another branch"
+    );
+    assert_eq!(moved_account, 8, "and the map still accounts for all of it");
+}
+
+#[gpui::test]
+fn space_find_says_it_is_counting_rather_than_showing_a_number_on_its_way(cx: &mut TestAppContext) {
+    // The honest-states rule, which is the whole reason the cross-branch pass
+    // is chunked at all. A conversation too long to project inside one frame
+    // finishes over several, and until it does there is **no number** — not a
+    // partial sum, which on screen is indistinguishable from a settled one.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_countable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    // One keystroke, and **no** settling: `dispatch_keystroke` rather than
+    // `simulate_keystrokes`, which runs the executor until parked and would
+    // fuse the whole pass onto the press. This is the frame the query landed
+    // on, with the pass still walking.
+    vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("k").unwrap(), cx);
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "the cross-branch pass has not finished in the frame it started"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            None,
+            "so there is no total to show — never a partial sum"
+        );
+    });
+
+    // **And it really suspends between chunks.** `run_until_parked` runs every
+    // task the executor can run without moving the clock, so a loop that merely
+    // *looked* like it yielded — an await on a already-ready task — would come
+    // back finished here. Still counting is the proof that the frame was given
+    // up rather than held for the length of the pass.
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "the pass gives the frame up between chunks rather than running \
+             them all in one poll"
+        );
+        assert_eq!(v.find_space_total_for_test(), None);
+    });
+
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "the pass lands");
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(36),
+            "…with the whole conversation counted"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_takes_its_total_back_when_the_conversation_moves(cx: &mut TestAppContext) {
+    // A total that is merely old is a settled number that is wrong. `rebuild`
+    // replaces the snapshot the count was an answer about, so the pass starts
+    // over — and the readout says "counting", not the previous transcript's
+    // number.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(8)
+    );
+
+    // A branch gains a post carrying two more.
+    let mut posts = cross_branch_posts();
+    let mut a7 = fixture_assistant_post("a7", "kestrel and kestrel again");
+    a7.parent_action_id = Some("a5".into());
+    posts.push(a7);
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(posts, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(10),
+        "the count is an answer about the transcript it was taken on"
+    );
+}
+
+#[gpui::test]
+fn space_find_widens_the_map_only_as_far_as_the_gutter(cx: &mut TestAppContext) {
+    // The strip widens while a session is open, because a sibling column then
+    // has a number to carry and 36px split between two of them has no room for
+    // one — **bounded by the gutter it overlays**. The map's own geometry is
+    // vertical (`strip_h / total_h`) and the page never subtracted the strip,
+    // so no document layout reads this width; but the strip is painted over the
+    // page and contains the mouse while it is up, so a width past the reading
+    // column's margin covers prose and takes its clicks.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    // `(strip width, reading-column width, page width, height-cache clears)`.
+    let read = |vcx: &mut VisualTestContext| {
+        vcx.update(|window, cx| view.read(cx).minimap_width_for_test(window));
+        vcx.update(|window, cx| {
+            let v = view.read(cx);
+            (
+                v.minimap_width_for_test(window),
+                v.body_width_for_test(window),
+                v.page_width_for_test(window),
+                v.layout_clears_for_test(),
+            )
+        })
+    };
+
+    // A window wide enough that the gutter has room to spare.
+    vcx.simulate_resize(gpui::size(px(1000.), px(700.)));
+    vcx.run_until_parked();
+    let (rest_w, _, _, clears_before) = read(&mut vcx);
+    assert_eq!(rest_w, 36.0, "the resting strip");
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let (wide_w, wide_body, wide_page, clears_after) = read(&mut vcx);
+    assert_eq!(
+        wide_w, 96.0,
+        "with the gutter to spare the strip takes its full width"
+    );
+    assert!(
+        wide_w <= (wide_page - wide_body) / 2.0,
+        "…and still stands clear of the reading column \
+         (strip {wide_w}, column {wide_body} of {wide_page})"
+    );
+    assert_eq!(
+        clears_after, clears_before,
+        "the reading column never moved: the height cache is keyed on its \
+         width and was not invalidated"
+    );
+
+    // The narrowest window this app opens. The compact layout leaves a 40px
+    // inset either side, so an unclamped 96px strip reached 56px into the text.
+    vcx.simulate_resize(gpui::size(px(480.), px(700.)));
+    vcx.run_until_parked();
+    let (narrow_w, narrow_body, narrow_page, _) = read(&mut vcx);
+    let gutter = (narrow_page - narrow_body) / 2.0;
+    assert!(
+        narrow_w <= gutter,
+        "the strip never reaches into prose (strip {narrow_w}, gutter {gutter})"
+    );
+    assert!(
+        narrow_w < 96.0,
+        "precondition: this window really is too narrow for the full strip"
+    );
+    assert!(
+        narrow_w >= 36.0,
+        "…and the widening can only ever add ({narrow_w})"
+    );
+
+    // …and it all goes back when the bar does.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.close_find(window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        read(&mut vcx).0,
+        36.0,
+        "closing the bar takes the width back with it"
+    );
+}
+
+#[gpui::test]
+fn space_find_does_not_recount_a_transcript_that_has_not_moved(cx: &mut TestAppContext) {
+    // `rebuild` runs on every `StreamDelta` — once per token of every turn —
+    // while the persisted transcript it reads does not move during a stream at
+    // all. A generation that bumped on every rebuild would restart the
+    // cross-branch pass on every token, so a reader searching beside a live
+    // reply would watch the total go back to "counting" and stay there for the
+    // length of the answer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_countable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(36),
+        "precondition: the pass landed"
+    );
+
+    // The rebuild any unrelated space change causes — a sibling turn's delta,
+    // a memory write, a background summary pass. Deliberately **not** settled
+    // afterwards: the assertion is about the very next frame, which is where a
+    // restart would show, and this fixture is too big to re-settle in one.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.rebuild_for_test(cx));
+    });
+    vcx.update(|window, _| window.refresh());
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.find_counting_for_test(),
+            "nothing about the conversation's text moved, so nothing is recounted"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(36),
+            "…and the total stands"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_counts_a_draft_left_on_a_branch_the_reader_left(cx: &mut TestAppContext) {
+    // A tail draft is minted for **every leaf of the whole tree**, and a
+    // non-empty one is never pruned — so a reader who writes on one branch and
+    // walks to another leaves prose behind. It is in the effective tree, but
+    // not in `posts` and not in the search scope, so the cross-branch count
+    // reached neither: its matches were missing from the sibling number and
+    // from the total, and appeared the moment the reader visited that branch
+    // with nothing about the conversation having changed.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Write in the far fork's composer — a6 is that branch's leaf — and leave
+    // it there. The draft is inactive and off the selected path from here on.
+    let elsewhere = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a6"))
+        .expect("every leaf has a tail draft");
+    elsewhere.update(&mut vcx, |e, cx| {
+        e.set_value("one more kestrel, written over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    let (branch, total, account, siblings) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+                v.minimap_branch_counts_for_test(window, cx),
+            )
+        })
+    });
+
+    assert_eq!(
+        total,
+        Some(9),
+        "eight in the posts and one in the draft nobody is looking at"
+    );
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()) || branch < 9,
+        "precondition: the reader is not on that branch"
+    );
+    assert_eq!(
+        account, 9,
+        "the map still accounts for the whole space, draft included"
+    );
+    let far = siblings
+        .iter()
+        .find(|(id, _)| id == "a3")
+        .map(|(_, n)| *n)
+        .expect("the far fork is a shown sibling");
+    assert_eq!(
+        far,
+        Some(5),
+        "the sibling names what is only reachable through it: one on a3, \
+         three on a6, and the draft left on a6's composer"
+    );
+}
+
+#[gpui::test]
+fn space_find_scans_a_node_once_for_a_query_it_has_already_answered(cx: &mut TestAppContext) {
+    // **The count is memoized, not merely the projection.** Three passes ask a
+    // per-node question on every frame a session is open — the visible
+    // branch's match list, the whole-space post walk, and the retained drafts
+    // — and each of them called `Projection::find`, which is O(bytes) *and*
+    // allocates a whole folded copy of the haystack for a case-insensitive
+    // query. So a reader who opened the bar and then merely scrolled, or
+    // watched a reveal animate, paid for the entire visible branch and every
+    // off-branch draft again on every frame, with nothing about the
+    // conversation or the query having moved.
+    //
+    // Builds cannot show this: the projection is in the cache either way. The
+    // scans are what is counted.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // A draft on a branch the reader is not on — the retained-draft pass's own
+    // subject, and the site the finding named.
+    let elsewhere = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a6"))
+        .expect("every leaf has a tail draft");
+    elsewhere.update(&mut vcx, |e, cx| {
+        e.set_value("one more kestrel, written over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    let after_search = view.read_with(&vcx, |v, _| v.find_scans_run_for_test());
+    assert!(
+        after_search > 0,
+        "precondition: the search really scanned something"
+    );
+
+    // Four more frames with the bar open and nothing changed. `sync_find` runs
+    // on every one of them — that is deliberate, since the scope is a function
+    // of the selected branch — so this is exactly the idle cost the memo is
+    // about.
+    for _ in 0..4 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_scans_run_for_test()),
+        after_search,
+        "a node whose text and query have both stood still is never scanned again"
+    );
+
+    // And the memo is keyed on what it is an answer about: move the draft's
+    // text and it is scanned again, with the new count reaching the total.
+    elsewhere.update(&mut vcx, |e, cx| {
+        e.set_value("two kestrel and one kestrel over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    settle_find_count(&mut vcx);
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_scans_run_for_test()) > after_search,
+        "a draft that moved is scanned for real"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(10),
+        "eight in the posts and the draft's two"
+    );
+}
+
+#[gpui::test]
+fn space_find_budgets_the_first_scan_of_a_large_draft(cx: &mut TestAppContext) {
+    // The other half of the same finding. Memoizing makes an *unchanged* draft
+    // free; the **first** look at a large one is real work — a projection plus
+    // a scan over every byte — and it used to land whole on the frame the
+    // query committed, outside the budget the post walk has obeyed all along.
+    //
+    // So the retained drafts join the chunk, under the same allowance, and the
+    // count says so: while one is owed there is **no total**, exactly as while
+    // the posts are still walking. A budgeted pass that still claimed to be
+    // settled would be the partial sum the whole design refuses.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Two drafts, each past `SCAN_CHUNK_BYTES` on its own: whichever the pass
+    // reaches first spends the chunk's whole allowance, so the other is
+    // deferred whatever order they come in. (The budget bounds how many items
+    // a chunk takes, never how long one item's own scan runs —
+    // `Projection::find` has no resumable form. That residual is the post
+    // walk's too.)
+    let bulk = |lead: &str| format!("{} {lead}", "words ".repeat(25_000));
+    assert!(
+        bulk("x").len() > 128 * 1024,
+        "precondition: each is past the scan budget on its own"
+    );
+    let far = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a6"))
+        .expect("every leaf has a tail draft");
+    far.update(&mut vcx, |e, cx| {
+        e.set_value(bulk("one kestrel over here"), cx)
+    });
+    let near = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a5"))
+        .expect("every leaf has a tail draft");
+    near.update(&mut vcx, |e, cx| {
+        e.set_value(bulk("a kestrel on the other leaf"), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    // One keystroke and no settling — the frame the query landed on, with the
+    // work deliberately unfinished. `dispatch_keystroke` rather than
+    // `simulate_keystrokes`, which runs the executor until parked and would
+    // fuse the whole pass onto the press.
+    vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("k").unwrap(), cx);
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "the chunk spent its allowance on the first large draft and owes \
+             the rest"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            None,
+            "so there is no total to show — a draft still owed a scan is not a \
+             settled count"
+        );
+    });
+
+    // The posts are deliberately not the reason: this space is a few hundred
+    // bytes, and the posts half runs first and finished inside this very
+    // chunk. What is owed is a draft, and the readout says the same thing it
+    // says while the posts walk.
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "and the deferred work lands");
+        // The query is the single letter the one keystroke committed, so the
+        // arithmetic is over `k`s rather than kestrels: eight kestrels plus
+        // the `k` on the end of a3's "fork", and one in each retained draft.
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(11),
+            "the deferred draft's own matches are in the total that lands"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_copies_only_the_draft_the_chunk_admits(cx: &mut TestAppContext) {
+    // **A plan says what work is owed; it must not do the work.** The
+    // retained-draft pass is split in two — deciding what each draft needs
+    // reads its editor entity, doing it needs `&mut self` — and the planning
+    // half visited *every* off-branch draft before the admission loop's first
+    // budget check. A `ProjectionSeed` owns a copy of the draft's whole body,
+    // so building one there meant a frame copied the entire stale corpus and
+    // then deferred all but the first of them: the budget bounded the scans
+    // and not the copying that came before them.
+    //
+    // The freshness question was already answered against *borrowed* content,
+    // so nothing about the decision needed a copy — only the seed did, and the
+    // seed is what moved past the budget check. The posts half never had this
+    // shape: it checks its budget at the top of each iteration rather than
+    // planning ahead.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Three large stale drafts, one per leaf — and **two** of them are
+    // *retained* drafts: the reader's own branch is a1 → a2 → a4, so a4's
+    // composer is on the selected path and belongs to the branch pass
+    // (`find_scope`), which is deliberately not deferred. a5 and a6 are the
+    // off-branch pair this pass owns, each past the scan budget on its own, so
+    // whichever it reaches first spends the whole allowance and the other is
+    // deferred. Both used to be copied anyway.
+    let bulk = |lead: &str| format!("{} {lead}", "words ".repeat(25_000));
+    assert!(
+        bulk("x").len() > 128 * 1024,
+        "precondition: each is past the scan budget on its own"
+    );
+    for (parent, lead) in [
+        ("a4", "one kestrel over here"),
+        ("a5", "a kestrel on the other leaf"),
+        ("a6", "and a kestrel further out"),
+    ] {
+        let editor = view
+            .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test(parent))
+            .expect("every leaf has a tail draft");
+        editor.update(&mut vcx, |e, cx| e.set_value(bulk(lead), cx));
+    }
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let before = view.read_with(&vcx, |v, _| v.find_draft_seeds_built_for_test());
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    // One keystroke and no settling: this is the frame the query landed on,
+    // with two of the three drafts deliberately unfinished.
+    vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("k").unwrap(), cx);
+    });
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "precondition: the chunk deferred what it could not afford"
+        );
+        assert_eq!(
+            v.find_draft_seeds_built_for_test() - before,
+            1,
+            "the frame copies the one draft it admitted, not the corpus it \
+             planned over"
+        );
+    });
+
+    // And the deferred copies are owed, not lost: the pass settles with every
+    // draft counted once the worker has had its chunks.
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "the deferred work lands");
+        assert_eq!(
+            v.find_draft_seeds_built_for_test() - before,
+            2,
+            "each retained draft is copied exactly once, in the chunk that \
+             admits it"
+        );
+        // One `k` per draft, plus nine in the posts (eight kestrels and the
+        // `k` ending a3's "fork").
+        assert_eq!(v.find_space_total_for_test(), Some(12));
+    });
+}
+
+#[gpui::test]
+fn space_find_arms_a_worker_for_work_deferred_after_the_count_had_settled(cx: &mut TestAppContext) {
+    // **A completed task is not a live one, and the slot has to say which.**
+    // The chunk loop arms a worker only when nothing is already running, and
+    // the question is asked of `count_task.is_some()` — so a multi-chunk pass
+    // that ran to the end left a finished `Task` sitting in the slot, and the
+    // *next* time a chunk deferred work the guard read that corpse as a live
+    // worker and armed nothing. The reader is then left on "Counting…" with no
+    // total until some unrelated repaint happens to drain it a chunk at a
+    // time. `STATE.md`'s own house example is the cure: the worker clears its
+    // slot in the same update it finishes in.
+    //
+    // Reachable exactly because the drafts half is re-asked every frame: the
+    // posts settle once, and a draft changing afterwards is what asks for a
+    // second worker on a slot the first one never gave back.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_countable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // A conversation big enough that this pass really needs the worker — which
+    // is what leaves a finished task in the slot to be mistaken for a live one.
+    // One character, because each further keystroke restarts the pass and a
+    // restart clears the slot: the stale one is what a *settled* pass leaves.
+    run_find(&view, window, &mut vcx, "k");
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "precondition: the pass landed");
+        assert_eq!(v.find_space_total_for_test(), Some(36));
+    });
+
+    // Now dirty two retained drafts, each past the scan budget on its own, in
+    // **one** update — so a single frame sees both and has to defer the
+    // second. Two separate updates would each get their own frame, and the
+    // first draft would be memoized by the time the second arrived.
+    let bulk = |lead: &str| format!("{} {lead}", "words ".repeat(25_000));
+    // Both off the selected path — a3 is the branch the reader is on, and its
+    // draft is in the search scope rather than in the retained-draft pass.
+    let far = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a4"))
+        .expect("every leaf has a tail draft");
+    let near = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a5"))
+        .expect("every leaf has a tail draft");
+    vcx.update(|_, cx| {
+        far.update(cx, |e, cx| e.set_value(bulk("one kestrel over here"), cx));
+        near.update(cx, |e, cx| {
+            e.set_value(bulk("a kestrel on the other leaf"), cx)
+        });
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "precondition: the frame deferred one of the two drafts"
+        );
+    });
+
+    // Nothing but the clock from here — no refresh, no keystroke — and only
+    // far enough for the chunk timer. A whole second would also fire the
+    // minimap's hide timer, whose repaint runs a chunk of its own and drains
+    // the deferral by hand: that is exactly the "until an unrelated repaint
+    // happens along" accident that hides this defect in the wild, so the
+    // instrument must not reproduce it.
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_millis(50));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.find_counting_for_test(),
+            "the deferred work was handed to a worker that actually wakes"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(38),
+            "thirty-six in the posts and one in each retained draft"
+        );
+    });
 }
