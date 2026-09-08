@@ -905,6 +905,17 @@ pub struct SpaceView {
     /// either (the projection is there whether or not it was scanned again),
     /// so the scans are counted.
     pub(crate) scans_run: Cell<usize>,
+    /// How many times this window has **copied a draft's text** to build a
+    /// `ProjectionSeed` for it.
+    ///
+    /// The third seam beside [`Self::projections_built`] and
+    /// [`Self::scans_run`], and it exists because the copy is its own cost at
+    /// its own moment: a seed owns the draft's whole body, so building one is
+    /// O(bytes) before any projecting or scanning happens. Neither sibling
+    /// counter can see it — a seed built for a draft the chunk then defers is
+    /// never projected and never scanned, so both stay flat while the frame
+    /// copies the corpus.
+    pub(crate) draft_seeds_built: Cell<usize>,
 
     /// Whether this window's **inspector** (the per-space settings panel) is
     /// open. Per-window by design — two windows on one space are two vantage
@@ -1179,6 +1190,7 @@ impl SpaceView {
             posts_generation: 0,
             projections_built: Cell::new(0),
             scans_run: Cell::new(0),
+            draft_seeds_built: Cell::new(0),
             inspector_open: false,
             inspector_scroll: ScrollHandle::new(),
             inspector_title: None,
@@ -1553,6 +1565,13 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn find_scans_run_for_test(&self) -> usize {
         self.scans_run.get()
+    }
+
+    /// How many draft seeds this window has built — the seam for the
+    /// copy-at-admission rule (see [`Self::draft_seeds_built`]).
+    #[doc(hidden)]
+    pub fn find_draft_seeds_built_for_test(&self) -> usize {
+        self.draft_seeds_built.get()
     }
 
     /// Whether a find session is open.

@@ -1094,17 +1094,25 @@ fn hits_of<'a>(
 }
 
 /// What one retained draft needs from this chunk.
+///
+/// **A plan says what work is owed; it never carries the work itself.** A
+/// `ProjectionSeed` owns a copy of the draft's whole body, so building one is
+/// O(bytes) — and the planning pass visits *every* off-branch draft before the
+/// admission loop's first budget check, so seeds built here meant one frame
+/// copying the entire stale draft corpus and then deferring all but the first
+/// of them. The budget bounded the scans and not the copying that preceded
+/// them. So a stale draft is planned as the *fact* that it is stale, and the
+/// seed is constructed at admission, where the bytes have already been charged
+/// — the same rule the posts half gets for free by checking its budget at the
+/// top of each iteration rather than planning ahead.
 enum DraftWork {
     /// No text: zero, with nothing to project and nothing to scan.
     Empty,
     /// Its projection is the one its text and cursor call for, and its hits are
     /// already memoized for this query — free.
     Memoized,
-    /// A scan, and a projection first when `seed` is `Some`. Spends budget.
-    Scan {
-        seed: Option<ProjectionSeed>,
-        bytes: usize,
-    },
+    /// A scan, and a projection first when `stale`. Spends budget.
+    Scan { stale: bool, bytes: usize },
 }
 
 /// One chunk's allowance, shared by both halves of the whole-space pass.
@@ -1607,36 +1615,46 @@ impl SpaceView {
                 // pass's own settling is untouched (drafts are not posts).
                 continue;
             }
+            // **The plan records that a seed is owed, never the seed.** The
+            // freshness question above is already answered against *borrowed*
+            // content (`c.seed.content.as_ref() == editor.value()`), so
+            // nothing here has to copy anything to decide; building the owned
+            // seed is deferred to admission, below.
             let bytes = editor.value().len();
-            let seed = (!projection_fresh).then(|| ProjectionSeed {
-                content: SharedString::from(editor.value().to_string()),
-                embeds: EmbedMap::new(draft.embed_map()),
-                // Every draft renders enabled, on its own branch as much as on
-                // the selected one — the same reason `draft_scope_node` passes
-                // a cursor rather than asking.
-                render_cursor: Some(editor.selection()),
-            });
-            plan.push((draft.id.clone(), DraftWork::Scan { seed, bytes }));
+            plan.push((
+                draft.id.clone(),
+                DraftWork::Scan {
+                    stale: !projection_fresh,
+                    bytes,
+                },
+            ));
         }
         for (node, work) in plan {
-            let seed = match work {
+            let stale = match work {
                 DraftWork::Empty => {
                     if let Some(session) = self.find.as_mut() {
                         session.space.counts.insert(node, 0);
                     }
                     continue;
                 }
-                DraftWork::Memoized => None,
-                DraftWork::Scan { seed, bytes } => {
+                DraftWork::Memoized => false,
+                DraftWork::Scan { stale, bytes } => {
                     if budget.spent() {
-                        // The rest are a later chunk's, and the count says so
+                        // The rest are a later chunk's — their seeds unbuilt
+                        // and their text uncopied — and the count says so
                         // rather than settling over them.
                         return false;
                     }
                     budget.scanned += bytes;
-                    seed
+                    stale
                 }
             };
+            // **The copy happens here, past the budget check**, so a chunk
+            // copies exactly the drafts it is going to project. Reading the
+            // editor again is reading the same value the plan measured:
+            // `count_chunk` has no await in it, so nothing can type between
+            // the two loops.
+            let seed = stale.then(|| self.draft_seed(&node, cx)).flatten();
             if let Some(seed) = seed {
                 budget.built += 1;
                 let projection =
@@ -1662,6 +1680,28 @@ impl SpaceView {
             }
         }
         true
+    }
+
+    /// Build the owned seed for one retained draft — the copy, at the moment
+    /// the chunk has agreed to pay for it.
+    ///
+    /// `None` for a draft that has left `self.drafts` since the plan was made,
+    /// which cannot happen inside one `count_chunk` (nothing between the two
+    /// loops mutates it) but is the honest answer rather than a panic. Looked
+    /// up by **id** and not by the plan's position, the doctrine's own rule: a
+    /// reference into a collection is an identity, never a slot.
+    fn draft_seed(&self, node: &SharedString, cx: &gpui::App) -> Option<ProjectionSeed> {
+        let draft = self.drafts.iter().find(|d| &d.id == node)?;
+        let editor = draft.editor.read(cx);
+        self.draft_seeds_built.set(self.draft_seeds_built.get() + 1);
+        Some(ProjectionSeed {
+            content: SharedString::from(editor.value().to_string()),
+            embeds: EmbedMap::new(draft.embed_map()),
+            // Every draft renders enabled, on its own branch as much as on the
+            // selected one — the same reason `draft_scope_node` passes a cursor
+            // rather than asking.
+            render_cursor: Some(editor.selection()),
+        })
     }
 
     /// The node ids a cached projection may be kept for: this frame's visible

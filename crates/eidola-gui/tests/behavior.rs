@@ -22078,6 +22078,94 @@ fn space_find_budgets_the_first_scan_of_a_large_draft(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_find_copies_only_the_draft_the_chunk_admits(cx: &mut TestAppContext) {
+    // **A plan says what work is owed; it must not do the work.** The
+    // retained-draft pass is split in two — deciding what each draft needs
+    // reads its editor entity, doing it needs `&mut self` — and the planning
+    // half visited *every* off-branch draft before the admission loop's first
+    // budget check. A `ProjectionSeed` owns a copy of the draft's whole body,
+    // so building one there meant a frame copied the entire stale corpus and
+    // then deferred all but the first of them: the budget bounded the scans
+    // and not the copying that came before them.
+    //
+    // The freshness question was already answered against *borrowed* content,
+    // so nothing about the decision needed a copy — only the seed did, and the
+    // seed is what moved past the budget check. The posts half never had this
+    // shape: it checks its budget at the top of each iteration rather than
+    // planning ahead.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Three large stale drafts, one per leaf — and **two** of them are
+    // *retained* drafts: the reader's own branch is a1 → a2 → a4, so a4's
+    // composer is on the selected path and belongs to the branch pass
+    // (`find_scope`), which is deliberately not deferred. a5 and a6 are the
+    // off-branch pair this pass owns, each past the scan budget on its own, so
+    // whichever it reaches first spends the whole allowance and the other is
+    // deferred. Both used to be copied anyway.
+    let bulk = |lead: &str| format!("{} {lead}", "words ".repeat(25_000));
+    assert!(
+        bulk("x").len() > 128 * 1024,
+        "precondition: each is past the scan budget on its own"
+    );
+    for (parent, lead) in [
+        ("a4", "one kestrel over here"),
+        ("a5", "a kestrel on the other leaf"),
+        ("a6", "and a kestrel further out"),
+    ] {
+        let editor = view
+            .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test(parent))
+            .expect("every leaf has a tail draft");
+        editor.update(&mut vcx, |e, cx| e.set_value(bulk(lead), cx));
+    }
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let before = view.read_with(&vcx, |v, _| v.find_draft_seeds_built_for_test());
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    // One keystroke and no settling: this is the frame the query landed on,
+    // with two of the three drafts deliberately unfinished.
+    vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("k").unwrap(), cx);
+    });
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "precondition: the chunk deferred what it could not afford"
+        );
+        assert_eq!(
+            v.find_draft_seeds_built_for_test() - before,
+            1,
+            "the frame copies the one draft it admitted, not the corpus it \
+             planned over"
+        );
+    });
+
+    // And the deferred copies are owed, not lost: the pass settles with every
+    // draft counted once the worker has had its chunks.
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "the deferred work lands");
+        assert_eq!(
+            v.find_draft_seeds_built_for_test() - before,
+            2,
+            "each retained draft is copied exactly once, in the chunk that \
+             admits it"
+        );
+        // One `k` per draft, plus nine in the posts (eight kestrels and the
+        // `k` ending a3's "fork").
+        assert_eq!(v.find_space_total_for_test(), Some(12));
+    });
+}
+
+#[gpui::test]
 fn space_find_arms_a_worker_for_work_deferred_after_the_count_had_settled(cx: &mut TestAppContext) {
     // **A completed task is not a live one, and the slot has to say which.**
     // The chunk loop arms a worker only when nothing is already running, and
