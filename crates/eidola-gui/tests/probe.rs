@@ -8165,6 +8165,261 @@ fn space_find_bar_probes_its_field_verbs_and_readout(cx: &mut TestAppContext) {
         "1 of 3",
         "1 of 3",
     );
+    // The cross-branch total, beside the index. One node, one sentence, label
+    // and value alike — the readout's own shape. Here the whole space *is* the
+    // visible branch, so it agrees with the index's denominator; what it says
+    // is that it was counted, not that it is the same question.
+    assert_probe_value(
+        &entries,
+        "space/find/total",
+        gpui::Role::Label,
+        "3 total",
+        "3 total",
+    );
+    // Its disclosure is painted and inert: what it will open is a later wave,
+    // and a `Role::Button` with no listener is a control VoiceOver offers,
+    // activates and silently does nothing with. Registry-only, so the driver
+    // can see it and the a11y tree does not gain a second voice for a number
+    // the sentence above already speaks.
+    assert!(
+        entries
+            .iter()
+            .any(|(n, _)| n == "space/find/total/disclosure"),
+        "the disclosure affordance is painted"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The bar's controls stop where the map begins. The minimap is painted after
+/// the find bar, so anything under it is covered — and it widens while a
+/// session is open, precisely so a sibling column can hold a number, which is
+/// exactly when a flat right inset would have put the new total readout behind
+/// the strip.
+#[gpui::test]
+fn the_find_bars_controls_stand_clear_of_the_map(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers")], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let entries = fresh_entries(cx, window);
+    let map = entries
+        .iter()
+        .find(|(n, _)| n == "space/minimap")
+        .map(|(_, e)| e.bounds)
+        .expect("the map paints beside the conversation");
+    let total = entries
+        .iter()
+        .find(|(n, _)| n == "space/find/total")
+        .map(|(_, e)| e.bounds)
+        .expect("the cross-branch total paints");
+
+    assert!(
+        total.right() <= map.origin.x,
+        "the readout the map would cover stands clear of it: total {total:?}, map {map:?}"
+    );
+    // …and the map really is the widened one, or the assertion above would be
+    // measuring against a strip that never grew.
+    let strip_w = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).minimap_width_for_test(window)
+        })
+        .unwrap();
+    assert!(
+        strip_w > 36.0,
+        "precondition: the strip widened for the session"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **An empty branch beside a space that is not empty says which it means.**
+/// "No results" standing next to "1 total" is a contradiction on its face, and
+/// the two are separate `Label` nodes, so a screen reader meets them one after
+/// the other with nothing placing them in one breath.
+#[gpui::test]
+fn the_find_bar_qualifies_an_empty_branch_when_the_space_is_not(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    // The selected branch (a1 → a2, the first child) holds nothing; the fork
+    // beside it does.
+    let mut a2 = probe_post("a2", "still nothing to see on this fork");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = probe_post("a3", "a kestrel over on the other fork");
+    a3.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the opening question"), a2, a3], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let type_query = |cx: &mut TestAppContext, keys: &[&str]| {
+        cx.update_window(window, |_, window, cx| {
+            for key in keys {
+                window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    type_query(cx, &["k", "e", "s", "t", "r", "e", "l"]);
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "None on this branch",
+        "None on this branch",
+    );
+    assert_probe_value(
+        &entries,
+        "space/find/total",
+        gpui::Role::Label,
+        "1 total",
+        "1 total",
+    );
+
+    // …and the unqualified sentence stays for what it is true of: a query
+    // nothing anywhere matches, which shows no total beside it either.
+    type_query(cx, &["backspace"; 7]);
+    type_query(cx, &["w", "r", "e", "n"]);
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "No results",
+        "No results",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/find/total"),
+        "a settled zero shows no total at all"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **The cross-branch counts, where a reader meets them.** A sibling column of
+/// the map carries the matches reachable only by taking that branch — its own
+/// and its whole subtree's — and carries the *exact* number in its accessible
+/// name whether or not the numeral fits in the cell.
+#[gpui::test]
+fn a_find_sibling_column_says_how_many_matches_that_branch_holds(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    // a1 forks into a2 (nothing) and a3 (one), with a4 under a3 (two more).
+    let mut a2 = probe_post("a2", "nothing to see on this fork");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = probe_post("a3", "a kestrel on the far fork");
+    a3.parent_action_id = Some("a1".into());
+    let mut a4 = probe_post("a4", "a kestrel, and one more kestrel");
+    a4.parent_action_id = Some("a3".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![probe_post("a1", "a kestrel at the root"), a2, a3, a4],
+                cx,
+            )
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    let label = |name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, e)| e.label.to_string())
+            .unwrap_or_else(|| {
+                let names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+                panic!("probe {name:?} missing; recorded: {names:?}")
+            })
+    };
+    // Level 1 is a1's children: [a2, a3], the first selected. The far fork's
+    // cell speaks its whole subtree — one on a3 plus two on a4.
+    let far = label("space/minimap/cell/1/1");
+    assert!(
+        far.ends_with("3 more in this branch"),
+        "the inactive sibling names the matches only it can reach: {far:?}"
+    );
+    // A branch with nothing in it says nothing rather than "0 more".
+    let near = label("space/minimap/cell/1/0");
+    assert!(
+        !near.contains("more in this branch"),
+        "the branch the reader is on is not a place to go: {near:?}"
+    );
+    // …and neither does one whose subtree the query never reached, which is
+    // what makes the clause a fact rather than decoration.
+    let root = label("space/minimap/cell/0/0");
+    assert!(
+        !root.contains("more in this branch"),
+        "the selected column carries ticks, not a count: {root:?}"
+    );
 
     probe::set_probes_enabled(false);
 }
@@ -8309,6 +8564,16 @@ fn the_find_bars_readout_and_verbs_speak_the_readers_language(cx: &mut TestAppCo
         gpui::Role::Label,
         "1 sur 1",
         "1 sur 1",
+    );
+    // The cross-branch total speaks it too — a readout whose label is its own
+    // text is exactly where an English literal beside the accessor hides, and
+    // it hides in English.
+    assert_probe_value(
+        &entries,
+        "space/find/total",
+        gpui::Role::Label,
+        "1 au total",
+        "1 au total",
     );
     cx.update(|cx| eidola_gui::i18n::apply("en", cx));
     probe::set_probes_enabled(false);

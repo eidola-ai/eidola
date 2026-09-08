@@ -7,3 +7,7 @@ find-next = Occurrence suivante
 find-close = Fermer la recherche
 find-count = { $index } sur { $total }
 find-no-results = Aucun résultat
+find-total = { $total } au total
+find-total-counting = Comptage…
+find-branch-count = { $count } de plus dans cette branche
+find-no-results-in-branch = Aucun sur cette branche

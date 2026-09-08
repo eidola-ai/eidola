@@ -116,6 +116,16 @@ pub(crate) const COMPOSER_MAX_FRACTION: f32 = 0.5;
 /// Width of the topology minimap pinned to the right edge, and the gap between
 /// sibling columns within a minimap row.
 pub(crate) const MINIMAP_WIDTH: Pixels = px(36.);
+/// The strip's width **while a find session is open**.
+///
+/// 36px split `flex_1` between two siblings leaves ~16px a column, and three
+/// leaves ~9px: no numeral fits, and the sibling counts are the whole point of
+/// the cross-branch surface. Widening is free — the strip is `absolute` on the
+/// right edge and the mapping math (`scale = strip_h / total_h`) is purely
+/// vertical, so nothing about the document's layout or the scrollbar-style drag
+/// depends on how wide it is — and it doubles as an honest signal that the map
+/// is in a different mode. See [`space_view::minimap`].
+pub(crate) const MINIMAP_FIND_WIDTH: Pixels = px(96.);
 pub(crate) const MINIMAP_COL_GAP: Pixels = px(4.);
 /// How long the minimap lingers after scrolling stops before it fades, and the
 /// fade-out duration once hiding begins (mirrors macOS overlay scrollbars).
@@ -869,6 +879,14 @@ pub struct SpaceView {
     /// projection is ever built while no find session is open" structural
     /// rather than remembered — there is nowhere else to keep one.
     pub(crate) find: Option<find::FindSession>,
+    /// How many times [`Self::rebuild`] has replaced [`Self::posts`].
+    ///
+    /// The cheap half of the find count's validity key: the whole-space pass
+    /// answers a question about *this* transcript, and `Change::Space` fires
+    /// on every post, turn, memory write and background summary pass — so the
+    /// pass needs to know that the snapshot moved without comparing a thousand
+    /// posts to find out. A counter, because identity is all that is asked.
+    pub(crate) posts_generation: u64,
     /// How many searchable projections this window has ever built.
     ///
     /// A test seam, in the class of [`Self::docked_caret_slot_offset`]: the
@@ -877,6 +895,27 @@ pub struct SpaceView {
     /// show that none was built — only that none is kept. This counts the
     /// builds.
     pub(crate) projections_built: Cell<usize>,
+    /// How many times this window has **scanned** a projection for a query.
+    ///
+    /// The sibling seam to [`Self::projections_built`], and it exists because
+    /// the two costs are separate: a projection is built once per text, while
+    /// the scan is what `Query::find_in` does over every byte — folding case by
+    /// allocating a whole new projection of the haystack — and three passes
+    /// asked for one per node per frame. Reuse is not visible in the cache
+    /// either (the projection is there whether or not it was scanned again),
+    /// so the scans are counted.
+    pub(crate) scans_run: Cell<usize>,
+    /// How many times this window has **copied a draft's text** to build a
+    /// `ProjectionSeed` for it.
+    ///
+    /// The third seam beside [`Self::projections_built`] and
+    /// [`Self::scans_run`], and it exists because the copy is its own cost at
+    /// its own moment: a seed owns the draft's whole body, so building one is
+    /// O(bytes) before any projecting or scanning happens. Neither sibling
+    /// counter can see it — a seed built for a draft the chunk then defers is
+    /// never projected and never scanned, so both stay flat while the frame
+    /// copies the corpus.
+    pub(crate) draft_seeds_built: Cell<usize>,
 
     /// Whether this window's **inspector** (the per-space settings panel) is
     /// open. Per-window by design — two windows on one space are two vantage
@@ -1148,7 +1187,10 @@ impl SpaceView {
             regenerating_elsewhere: HashSet::new(),
             marks_seen: HashSet::new(),
             find: None,
+            posts_generation: 0,
             projections_built: Cell::new(0),
+            scans_run: Cell::new(0),
+            draft_seeds_built: Cell::new(0),
             inspector_open: false,
             inspector_scroll: ScrollHandle::new(),
             inspector_title: None,
@@ -1219,6 +1261,23 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn tail_draft_state_for_test(&self) -> Option<Entity<MarkdownEditorState>> {
         self.drafts.last().map(|d| d.editor.clone())
+    }
+
+    /// One **named** branch's tail-draft editor — the draft replying to
+    /// `parent`, whether or not it is the active one or on the selected path.
+    ///
+    /// `tail_draft_state_for_test` answers with the last draft minted, which is
+    /// the trailing one of the branch the reader is on; a test about a draft the
+    /// reader has *left behind* needs to name the branch instead.
+    #[doc(hidden)]
+    pub fn draft_editor_for_parent_for_test(
+        &self,
+        parent: &str,
+    ) -> Option<Entity<MarkdownEditorState>> {
+        self.drafts
+            .iter()
+            .find(|d| d.parent.as_deref() == Some(parent))
+            .map(|d| d.editor.clone())
     }
 
     /// Leave the composing session (the Escape gesture), so a test can reach
@@ -1501,6 +1560,20 @@ impl SpaceView {
         self.projections_built.get()
     }
 
+    /// How many times this window has scanned a projection for a query — the
+    /// seam for the memo (see [`Self::scans_run`]).
+    #[doc(hidden)]
+    pub fn find_scans_run_for_test(&self) -> usize {
+        self.scans_run.get()
+    }
+
+    /// How many draft seeds this window has built — the seam for the
+    /// copy-at-admission rule (see [`Self::draft_seeds_built`]).
+    #[doc(hidden)]
+    pub fn find_draft_seeds_built_for_test(&self) -> usize {
+        self.draft_seeds_built.get()
+    }
+
     /// Whether a find session is open.
     #[doc(hidden)]
     pub fn find_open_for_test(&self) -> bool {
@@ -1542,6 +1615,70 @@ impl SpaceView {
             .pending_reveal
             .as_ref()
             .map(|p| (p.node.clone(), p.source.start))
+    }
+
+    /// The whole-space total the bar is showing, or `None` while the
+    /// cross-branch pass has not settled — the honest-states seam.
+    #[doc(hidden)]
+    pub fn find_space_total_for_test(&self) -> Option<usize> {
+        self.find.as_ref().and_then(|s| s.space.total)
+    }
+
+    /// Whether a find session is open with its whole-space pass still walking.
+    /// Distinguishes "no total yet" from "no session", which the total alone
+    /// cannot.
+    #[doc(hidden)]
+    pub fn find_counting_for_test(&self) -> bool {
+        self.find.as_ref().is_some_and(|s| !s.space.is_settled())
+    }
+
+    /// The left-hand side of the exactness invariant, over this frame's real
+    /// selected path: the path's own matches plus every shown sibling's whole
+    /// subtree. Must equal [`Self::find_space_total_for_test`] exactly.
+    #[doc(hidden)]
+    pub fn find_levels_account_for_test(&self, window: &Window, cx: &gpui::App) -> usize {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        self.find_levels_account(&tree, page_width)
+    }
+
+    /// What each **inactive** sibling column of the map carries, as
+    /// `(node id, count)` in level-then-column order. `None` where the cell
+    /// shows nothing.
+    #[doc(hidden)]
+    pub fn minimap_branch_counts_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, Option<usize>)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let mut out = Vec::new();
+        for (sibs, active) in self.selected_levels(&tree, page_width) {
+            for (i, sib) in sibs.iter().enumerate() {
+                if i == active {
+                    continue;
+                }
+                out.push((sib.id.to_string(), self.find_branch_count(sib)));
+            }
+        }
+        out
+    }
+
+    /// The strip's rendered width this frame — 36px at rest, wider while the
+    /// find bar stands, never past the gutter it overlays.
+    #[doc(hidden)]
+    pub fn minimap_width_for_test(&self, window: &Window) -> f32 {
+        self.minimap_width(self.page_size(window).width).as_f32()
+    }
+
+    /// The reading column's own width this frame — what the map's clamp is
+    /// measured against.
+    #[doc(hidden)]
+    pub fn body_width_for_test(&self, window: &Window) -> f32 {
+        layout::page_layout(self.page_size(window).width).body_width
     }
 
     /// The projections this window is currently holding, by node id.
@@ -1989,6 +2126,15 @@ impl SpaceView {
         self.rethread_drafts(&posts);
         self.retarget_tree_focus(&posts);
         self.prune_post_marks(&posts);
+        // **The generation moves only when the *text* did.** `rebuild` runs on
+        // every `StreamDelta` — once per token of every turn — while the
+        // persisted transcript it reads does not move during a stream at all,
+        // so bumping unconditionally would restart the find bar's whole-space
+        // count on every token and leave the readout saying "counting" for the
+        // length of a reply.
+        if post_text_moved(&self.posts, &posts) {
+            self.posts_generation = self.posts_generation.wrapping_add(1);
+        }
         self.posts = posts;
     }
 
@@ -2545,6 +2691,25 @@ pub(crate) fn selection_autoscroll_delta(my: f32, h: f32, margin: f32, max_speed
     } else {
         0.0
     }
+}
+
+/// Whether the new snapshot differs in a way anything derived from **post
+/// text** has to be recomputed for — today the find bar's whole-space count
+/// (`find::CountKey`), which is an answer about the transcript it was taken on.
+///
+/// The three fields are exactly what a searchable projection is a function of,
+/// plus the node identity that keys it: `content`, and the `references` its
+/// embed map is built from (a marker is hidden wholesale only when its ordinal
+/// is *mapped*, so a stored quote whose range stops resolving changes the
+/// projection with the content unmoved). The references are compared whole
+/// rather than as the map derived from them — stricter and cheaper, and an
+/// over-invalidation costs a re-scan of warm projections rather than a wrong
+/// number. **A new input to `find::searchable_projection` belongs here too.**
+fn post_text_moved(old: &[PostData], new: &[PostData]) -> bool {
+    old.len() != new.len()
+        || old.iter().zip(new).any(|(a, b)| {
+            a.action_id != b.action_id || a.content != b.content || a.references != b.references
+        })
 }
 
 /// Project one transcript row into the render snapshot. The byline pair is

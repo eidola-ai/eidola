@@ -264,6 +264,7 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("total", 3);
                 args.set("address", "127.0.0.1:11437");
                 args.set("backend", "Eidola");
+                args.set("count", 5);
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),

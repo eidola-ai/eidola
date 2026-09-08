@@ -25,3 +25,23 @@ find-count = { $index } of { $total }
 # The same readout when the query matches nothing on the visible branch.
 # Deliberately not "0 of 0", which reads as a position that exists.
 find-no-results = No results
+# The **cross-branch** total, beside the index. A different number: the index
+# counts the branch the reader is looking at, this counts the whole
+# conversation, every branch included — so it is never smaller.
+find-total = { $total } total
+# The same readout while the cross-branch pass is still walking the space. It
+# has to exist and it must not be a number: a partial sum reads on screen
+# exactly like a settled one, and the previous query's total is the same lie
+# with a longer fuse.
+find-total-counting = Counting…
+# A minimap sibling column's accessible name gains this: the matches reachable
+# only by taking that branch, its whole subtree included. The numeral is painted
+# in the cell where it fits and a tint stands in where it does not — this is
+# what a screen reader hears either way, and it is always the exact count.
+find-branch-count = { $count } more in this branch
+# The same readout when the visible branch holds nothing but the conversation
+# does. "No results" beside "3 total" is a contradiction on its face — and the
+# two are separate nodes, so a screen reader meets them one after the other with
+# nothing placing them in one breath. The unqualified line above stays for a
+# query nothing anywhere matches.
+find-no-results-in-branch = None on this branch
