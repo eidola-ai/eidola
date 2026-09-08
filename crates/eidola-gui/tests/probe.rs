@@ -8313,3 +8313,182 @@ fn the_find_bars_readout_and_verbs_speak_the_readers_language(cx: &mut TestAppCo
     cx.update(|cx| eidola_gui::i18n::apply("en", cx));
     probe::set_probes_enabled(false);
 }
+
+/// A proxy configured the way a reader who has just set it up would have it:
+/// on, loopback, one backend ticked, one key live and one revoked.
+fn proxy_settings_fixture(enabled: bool, address: &str) -> eidola_app_core::proxy::ProxySettings {
+    eidola_app_core::proxy::ProxySettings {
+        enabled,
+        bind_address: address.into(),
+        bind_port: 11437,
+        local_exposure: eidola_app_core::proxy::LocalExposure::Loaded,
+        backends: vec!["eidola".into()],
+        exposed_ids: vec!["eidola".into()],
+        live_key_count: 1,
+    }
+}
+
+fn proxy_keys_fixture() -> Vec<eidola_app_core::proxy::ProxyKeyInfo> {
+    vec![
+        eidola_app_core::proxy::ProxyKeyInfo {
+            id: "k-live".into(),
+            label: "My editor".into(),
+            prefix: "eid-Ab3xQ9".into(),
+            created_at: 0,
+            last_used_at: None,
+            revoked_at: None,
+        },
+        eidola_app_core::proxy::ProxyKeyInfo {
+            id: "k-dead".into(),
+            label: "An old script".into(),
+            prefix: "eid-Zz00Kk".into(),
+            created_at: 0,
+            last_used_at: Some(1),
+            revoked_at: Some(2),
+        },
+    ]
+}
+
+#[gpui::test]
+fn proxy_pane_probes_its_switch_binding_backends_and_keys(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    for expected in [
+        "settings/proxy/pane",
+        "settings/proxy/serve",
+        "settings/proxy/status",
+        "settings/proxy/binding/change",
+        "settings/proxy/backends/eidola",
+        "settings/proxy/backends/local",
+        "settings/proxy/backends/my-box",
+        "settings/proxy/exposure/loaded",
+        "settings/proxy/exposure/downloaded",
+        "settings/proxy/keys/0",
+        "settings/proxy/keys/0/revoke",
+        "settings/proxy/keys/1",
+        "settings/proxy/keys/label",
+        "settings/proxy/keys/create",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "proxy pane probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // **The status reads the listener, not the setting.** A stub store binds
+    // nothing, so a pane whose settings say "enabled" still says it is not
+    // listening — which is the honest answer and the whole reason the two are
+    // read apart.
+    assert_probe_value(
+        &entries,
+        "settings/proxy/status",
+        gpui::Role::Label,
+        "Not listening",
+        "Not listening",
+    );
+
+    // A revoked key keeps its row — the label is what tells a reader which
+    // tool lost access — and loses only its verb.
+    assert!(
+        !names.contains(&"settings/proxy/keys/1/revoke".to_string()),
+        "a revoked key offers no second revocation: {names:?}"
+    );
+    let live = entries
+        .iter()
+        .find(|(n, _)| n == "settings/proxy/keys/0")
+        .expect("the live key's row");
+    assert!(
+        live.1
+            .value
+            .as_ref()
+            .is_some_and(|v| v.contains("eid-Ab3xQ9")),
+        "the row shows enough of the key to tell rows apart: {:?}",
+        live.1.value
+    );
+    assert!(
+        !names.iter().any(|n| n == "settings/proxy/keys/minted"),
+        "nothing is revealed until a key is generated: {names:?}"
+    );
+
+    // The binding row is display-then-editor: the value stands until a verb
+    // swaps the fields in.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_binding_edit(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/proxy/binding/address",
+        "settings/proxy/binding/port",
+        "settings/proxy/binding/save",
+        "settings/proxy/binding/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "binding editor probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/proxy/binding/change".to_string()),
+        "the verb the editor replaced is gone while it stands: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_proxy_bound_off_loopback_says_what_that_costs(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+
+    // Loopback: nothing to warn about.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"settings/proxy/exposed-warning".to_string()),
+        "a loopback bind is the shape this is safe in: {names:?}"
+    );
+
+    // A routable address is a plaintext inference endpoint on the network, and
+    // nothing underneath refuses it — this band *is* the honesty.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "0.0.0.0"));
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let entries = fresh_entries(cx, window);
+    let warning = entries
+        .iter()
+        .find(|(n, _)| n == "settings/proxy/exposed-warning")
+        .expect("the danger band");
+    assert_eq!(warning.1.role, gpui::Role::Alert);
+    assert!(
+        warning.1.label.contains("in the clear"),
+        "the band names what it costs: {:?}",
+        warning.1.label
+    );
+
+    probe::set_probes_enabled(false);
+}

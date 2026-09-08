@@ -1,0 +1,201 @@
+//! The inference proxy's listener, over a real TCP socket with a real client.
+//!
+//! The wire conversation itself is app-core's (`tests/proxy.rs`, over an
+//! in-memory duplex). What only this tier can show is the part that is about
+//! the *socket*: that a bound listener answers a real client on the address it
+//! reports, that closing takes the door away for a client that was already
+//! connected, and that a bind the OS refuses is reported rather than silently
+//! leaving the reader thinking their tool has somewhere to point.
+//!
+//! Every test binds **port 0** and reads the address back off the listener,
+//! which is why the whole suite can run in parallel with everything else: it
+//! never claims a fixed port, and the reported address is what a client dials.
+//! (Port 0 is deliberately *not* something the settings surface accepts — a
+//! stored binding that changes on every restart is a config file that lies —
+//! so these tests hand `serve` a `ProxySettings` value directly, which is the
+//! seam that exists for exactly this.)
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::Arc;
+
+use eidola_app_core::AppCore;
+use eidola_app_core::proxy::{LocalExposure, ProxySettings};
+use eidola_gui::proxy;
+
+/// A real `AppCore` over tempdirs. Nothing here reaches the network.
+fn core() -> (Arc<AppCore>, tempfile::TempDir) {
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_dir = dir.path().to_path_buf();
+    let data_dir = dir.path().join("data");
+    let core = AppCore::new(config_dir, data_dir).expect("open core");
+    (Arc::new(core), dir)
+}
+
+/// Settings that bind an ephemeral loopback port.
+fn ephemeral() -> ProxySettings {
+    ProxySettings {
+        enabled: true,
+        bind_address: "127.0.0.1".into(),
+        bind_port: 0,
+        local_exposure: LocalExposure::Loaded,
+        backends: Vec::new(),
+        exposed_ids: Vec::new(),
+        live_key_count: 0,
+    }
+}
+
+/// One request over a real socket; the whole response as text.
+fn ask(address: std::net::SocketAddr, request: &str) -> String {
+    let mut stream = TcpStream::connect(address).expect("connect");
+    stream.write_all(request.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+    let mut text = String::new();
+    stream.read_to_string(&mut text).expect("read");
+    text
+}
+
+fn get(path: &str, key: Option<&str>) -> String {
+    let auth = key
+        .map(|k| format!("Authorization: Bearer {k}\r\n"))
+        .unwrap_or_default();
+    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{auth}\r\n")
+}
+
+#[test]
+fn a_bound_proxy_answers_a_real_client_where_it_says_it_is() {
+    let (core, _dir) = core();
+    let key = core
+        .runtime()
+        .block_on(core.create_proxy_key("a tool".into()))
+        .expect("mint")
+        .key;
+
+    let server = proxy::serve(&core, &ephemeral()).expect("bind");
+    let address = server.address();
+    assert!(
+        address.ip().is_loopback() && address.port() != 0,
+        "the address reported is the one actually bound: {address}"
+    );
+
+    // A key the reader generated gets in; anything else does not, and both
+    // answers come over a real socket rather than a duplex.
+    assert!(ask(address, &get("/v1/models", Some(&key))).starts_with("HTTP/1.1 200"));
+    assert!(ask(address, &get("/v1/models", None)).starts_with("HTTP/1.1 401"));
+
+    server.close();
+}
+
+#[test]
+fn closing_takes_the_door_away_from_a_client_that_was_already_connected() {
+    let (core, _dir) = core();
+    let key = core
+        .runtime()
+        .block_on(core.create_proxy_key("a tool".into()))
+        .expect("mint")
+        .key;
+    let server = proxy::serve(&core, &ephemeral()).expect("bind");
+    let address = server.address();
+
+    // A client that is connected and has not yet asked for anything. Closing
+    // means closed to everyone, not only to newcomers — the control socket's
+    // rule, and it exists here for the same reason: this door starts billed
+    // work, and everything after the close is teardown.
+    let mut established = TcpStream::connect(address).expect("connect");
+    // Give the accept loop a moment to take the connection on, so the close
+    // below is genuinely ending an established one rather than racing it.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    server.close();
+
+    established
+        .write_all(get("/v1/models", Some(&key)).as_bytes())
+        .expect("the socket is still writable until the peer notices");
+    let _ = established.flush();
+    let mut text = String::new();
+    let _ = established.read_to_string(&mut text);
+    assert!(
+        !text.contains("HTTP/1.1 200"),
+        "a connection the close swept must not be served: {text:?}"
+    );
+
+    // And nothing new gets in either.
+    assert!(
+        TcpStream::connect(address)
+            .and_then(|mut s| {
+                s.write_all(get("/v1/models", Some(&key)).as_bytes())?;
+                let mut t = String::new();
+                s.read_to_string(&mut t)?;
+                Ok(t)
+            })
+            .map(|t| !t.contains("HTTP/1.1 200"))
+            .unwrap_or(true),
+        "the listener is gone"
+    );
+}
+
+#[test]
+fn a_binding_the_system_refuses_is_reported_rather_than_pretended() {
+    let (core, _dir) = core();
+
+    // Hold the port, then ask the proxy for it.
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("squat");
+    let taken = squatter.local_addr().expect("addr").port();
+    let settings = ProxySettings {
+        bind_port: taken,
+        ..ephemeral()
+    };
+    let refused = proxy::serve(&core, &settings);
+    assert!(
+        refused.is_err(),
+        "a port already held is a refusal, not a silent no-op"
+    );
+    let message = refused.err().expect("the error").to_string();
+    assert!(
+        message.contains(&taken.to_string()),
+        "the refusal names the address the reader chose: {message}"
+    );
+
+    // An address this machine does not have is refused the same way — the
+    // pane's `listen_error` is what carries either of these.
+    let elsewhere = ProxySettings {
+        bind_address: "203.0.113.1".into(),
+        ..ephemeral()
+    };
+    assert!(proxy::serve(&core, &elsewhere).is_err());
+}
+
+#[test]
+fn a_restart_leaves_nothing_answering_on_the_address_it_left() {
+    let (core, _dir) = core();
+    let handle = proxy::ProxyHandle::default();
+    assert!(!handle.is_running(), "nothing is bound until it is started");
+
+    let first = handle.start(&core, &ephemeral()).expect("start");
+    assert_eq!(handle.address(), Some(first));
+
+    // **A restart, not a reconfigure**: a bound socket's address cannot move,
+    // so the running listener is closed before the new one binds.
+    let second = handle.start(&core, &ephemeral()).expect("restart");
+    assert_ne!(first, second, "an ephemeral rebind lands somewhere new");
+    assert_eq!(handle.address(), Some(second));
+    assert!(
+        TcpStream::connect(first)
+            .and_then(|mut s| {
+                s.write_all(get("/v1/models", None).as_bytes())?;
+                let mut t = String::new();
+                s.read_to_string(&mut t)?;
+                Ok(t)
+            })
+            .map(|t| t.is_empty())
+            .unwrap_or(true),
+        "the address it left answers nothing"
+    );
+
+    handle.stop();
+    assert!(!handle.is_running());
+    // Idempotent: stopping what is not running is not an error.
+    handle.stop();
+    assert_eq!(handle.address(), None);
+}
