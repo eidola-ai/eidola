@@ -113,6 +113,14 @@ impl ProxyStore {
         self.keys = keys;
     }
 
+    /// Test-only: stand a minted key in front of the reader. A stub store has
+    /// no core to generate one with, and what the pane does *while* one stands
+    /// is exactly what wants pinning.
+    #[doc(hidden)]
+    pub fn set_minted_for_test(&mut self, minted: MintedProxyKey) {
+        self.minted = Some(minted);
+    }
+
     pub fn settings(&self) -> &Loadable<ProxySettings> {
         &self.settings
     }
