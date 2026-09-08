@@ -639,7 +639,7 @@ pub fn check_locale(primary: &LocaleDef, base: Option<&LocaleDef>) -> Result<(),
 pub const FIXED_TERM_PREFIX: &str = "fixed-";
 
 pub fn check_translation(en: &LocaleDef, other: &LocaleDef) -> Result<(), String> {
-    // Rule 15. Checked before the message walk because it is about the resource
+    // Rule 14. Checked before the message walk because it is about the resource
     // as a whole: a fixed term is refused whether or not anything in *this*
     // locale references it, since the source's own sentences do.
     for term in &other.terms {
