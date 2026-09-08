@@ -3366,7 +3366,7 @@ fn a_second_key_generation_waits_for_the_first_to_be_read(cx: &mut TestAppContex
     stores
         .proxy
         .update(cx, |s, cx| s.create_key("fourth".into(), cx));
-    wait_until(cx, "the second key is minted", |cx| {
+    wait_until(cx, "the second key is minted", |_cx| {
         core.runtime()
             .block_on(core.proxy_keys())
             .map(|k| k.len() == 2)
@@ -3412,12 +3412,12 @@ fn the_second_press_of_a_proxy_control_is_the_one_that_stands(cx: &mut TestAppCo
         Some(false),
         "the store shows what the reader last asked for"
     );
-    assert_eq!(
-        core.runtime()
+    assert!(
+        !core
+            .runtime()
             .block_on(core.proxy_settings())
             .expect("the stored settings")
             .enabled,
-        false,
         "and so does the database — the second press is what was written last"
     );
 }
