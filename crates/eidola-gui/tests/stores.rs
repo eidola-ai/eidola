@@ -3349,6 +3349,17 @@ fn a_second_key_generation_waits_for_the_first_to_be_read(cx: &mut TestAppContex
         "the standing banner is the reason, and it is still standing"
     );
 
+    // **The listing the new row belongs in is read after the batch, not by the
+    // write that made it.** No operation here carries a listing — each adopts
+    // or reports its own outcome — and the resolving read is issued once
+    // nothing is still writing, so what the pane shows is the database after
+    // every press rather than after whichever one settled last.
+    wait_until(cx, "the listing catches up with the key", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.key_list().iter().any(|k| k.label == "first"))
+    });
+
     // Acknowledging it is what gives the verb back.
     stores.proxy.update(cx, |s, cx| s.dismiss_minted(cx));
     assert!(stores.proxy.read_with(cx, |s, _| s.can_create_key()));
