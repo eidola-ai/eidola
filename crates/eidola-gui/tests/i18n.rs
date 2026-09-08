@@ -204,7 +204,7 @@ fn a_locale_change_notifies_global_observers(cx: &mut TestAppContext) {
 /// built bundle can never go stale and the cache is never invalidated.
 #[gpui::test]
 fn an_explicit_locale_builds_its_bundle_once(cx: &mut TestAppContext) {
-    cx.update(|cx| i18n::install(cx));
+    cx.update(i18n::install);
 
     // Warm whatever the first lookup in each locale has to build.
     for tag in ["en", "fr"] {
@@ -291,7 +291,7 @@ fn every_localized_window_title_is_re_applied_on_a_locale_change() {
 /// the re-application above worth doing.
 #[gpui::test]
 fn the_onboarding_windows_title_speaks_the_readers_language(cx: &mut TestAppContext) {
-    cx.update(|cx| i18n::install(cx));
+    cx.update(i18n::install);
     for (tag, expected) in [
         ("en", "Get Started"),
         ("fr", "Commencer"),
