@@ -23,7 +23,7 @@
 
 mod chat_harness;
 
-use chat_harness::{ChatBehavior, MODEL, MockConfig, core_for, with_account};
+use chat_harness::{ChatBehavior, MODEL, MockConfig, RefundMode, core_for, with_account};
 use eidola_app_core::AppCore;
 use eidola_app_core::ipc::Shutdown;
 use eidola_app_core::proxy::{ProxySettingsUpdate, http};
@@ -167,6 +167,101 @@ fn a_revoked_key_stops_working_and_a_live_one_does_not() {
 
         let (status, _) = runtime.block_on(exchange(&core, &get("/v1/models", Some(&key))));
         assert_eq!(status, 401, "the key the reader took away no longer works");
+    });
+}
+
+#[test]
+fn a_keys_first_use_is_announced_and_its_second_is_not() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let key = armed(&core);
+        let runtime = core.runtime();
+        let mut rx = core.subscribe_changes();
+        // The exposure and the mint above have already been announced.
+        while rx.try_recv().is_ok() {}
+
+        assert!(
+            runtime
+                .block_on(core.authenticate_proxy_key(key.clone()))
+                .expect("auth")
+        );
+        let announced: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.change)
+            .collect();
+        assert!(
+            announced.contains(&eidola_app_core::changes::Change::Proxy),
+            "the pane says \"never used\" until something tells it otherwise: {announced:?}"
+        );
+
+        // **And exactly once.** The pane renders used-or-never and nothing
+        // finer, so every later authentication moves no rendered value — while
+        // announcing each one would put a bus event on every proxied request,
+        // costing every window two reads and a listener reconcile.
+        assert!(
+            runtime
+                .block_on(core.authenticate_proxy_key(key))
+                .expect("auth")
+        );
+        let announced: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.change)
+            .collect();
+        assert!(
+            announced.is_empty(),
+            "a key already used announces nothing: {announced:?}"
+        );
+    });
+}
+
+#[test]
+fn a_latched_process_starts_no_work_for_a_key_it_would_admit() {
+    run(|| {
+        // The latch is asked twice — once before the request is looked at, and
+        // again on the last line before dispatch, because authentication is a
+        // real await the latch can be thrown across. **That interleaving
+        // cannot be scheduled from a test**: the stretch from the auth landing
+        // to the dispatch has no seam to land on, which is the same honest
+        // limit `crates/eidola-gui/src/ipc.rs` records for its own sweep. What
+        // *is* testable is the outcome the second ask exists to produce — a
+        // latched process serves a perfectly good key nothing at all, and
+        // starts no billed work doing it.
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let shutdown = Shutdown::default();
+        shutdown.latch();
+        let answer = runtime.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let serving = tokio::spawn(http::serve_connection(
+                Arc::clone(&core),
+                server,
+                shutdown.clone(),
+            ));
+            let (mut reader, mut writer) = tokio::io::split(client);
+            let request = post(
+                "/v1/chat/completions",
+                &key,
+                &format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#),
+            );
+            writer.write_all(request.as_bytes()).await.expect("write");
+            writer.flush().await.expect("flush");
+            let mut raw = Vec::new();
+            reader.read_to_end(&mut raw).await.expect("read");
+            let _ = serving.await;
+            String::from_utf8_lossy(&raw).to_string()
+        });
+        assert!(answer.contains("503"), "{answer}");
+        assert_eq!(
+            mock.chat_hits(),
+            0,
+            "nothing went upstream, so nothing was billed"
+        );
     });
 }
 
@@ -462,6 +557,138 @@ fn a_streaming_completion_forwards_the_upstreams_own_events() {
             requests.iter().any(|r| r.path == "/v1/chat/completions"),
             "a streamed exchange lands in the Record too"
         );
+    });
+}
+
+#[test]
+fn a_streaming_refund_that_arrives_in_band_is_the_one_that_settles() {
+    run(|| {
+        // **The one case where the in-band token is the only copy.** The
+        // server sends its terminal metadata event carrying the refund even
+        // when its own best-effort persistence of that token failed — and that
+        // failure is exactly what makes the recovery endpoint unable to
+        // answer. `RefundMode::Fail` is that server: recovery 500s, and the
+        // event still carries a usable token. Discarding it and asking
+        // recovery would strand the credential in `spending` for good.
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::StreamingWithMetadataRefund,
+            refund: RefundMode::Fail,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 200, "{body}");
+
+        // The metadata event still reaches the tool — it is Eidola's own
+        // metadata and a standard client ignores it — but stripped of the one
+        // thing that may not travel.
+        assert!(
+            body.contains("eidola.chat.completion.metadata"),
+            "the event itself is forwarded: {body}"
+        );
+        assert!(
+            !body.contains("\"refund\""),
+            "no credential material travels downstream: {body}"
+        );
+
+        let wallet = runtime.block_on(core.wallet_lifecycle()).expect("wallet");
+        assert!(
+            wallet.iter().any(|c| c.state == "spent"),
+            "the in-band token settled the hold: {wallet:?}"
+        );
+        assert!(
+            !wallet.iter().any(|c| c.state == "spending"),
+            "nothing is stranded mid-spend: {wallet:?}"
+        );
+        // And recovery was asked for nothing, because nothing was missing.
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "recovery is the fallback for an absent token, not the first move"
+        );
+    });
+}
+
+#[test]
+fn a_stream_that_carries_no_refund_still_falls_back_to_recovery() {
+    run(|| {
+        // The other half of the same rule, so the fix is not "always in-band":
+        // a stream with no metadata event settles through recovery exactly as
+        // it did before.
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, _) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 200);
+        assert!(
+            mock.refund_hits() >= 1,
+            "with no token in the stream, recovery is what settles it"
+        );
+    });
+}
+
+#[test]
+fn a_successful_answer_that_is_not_json_is_a_gateway_failure() {
+    run(|| {
+        // A truncated response or an intermediary's HTML page arriving with a
+        // `2xx` must not reach a tool as an apparent success carrying a
+        // fabricated body.
+        let (_mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkNonJsonBody,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#),
+            ),
+        ));
+        assert_eq!(status, 502, "{body}");
+        assert!(body.contains("not JSON"), "{body}");
+
+        // The exchange is still in the Record — the whole point of keeping raw
+        // bodies is the failure nobody can otherwise diagnose.
+        let requests = runtime.block_on(core.list_requests(20, 0)).expect("record");
+        let completion = requests
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is recorded");
+        assert_eq!(completion.response_status, Some(200));
     });
 }
 

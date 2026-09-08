@@ -279,8 +279,15 @@ struct ProxyRoute {
     external_auth: Option<String>,
     /// The connection row this request will be recorded against — present
     /// only where an attestation was verified, which is the whole point of
-    /// recording it.
+    /// recording it. **Not final at open**: the completion can ride a *new*
+    /// TLS connection (the server may close the listing one), and that
+    /// handshake's attestation is flushed after the send — see
+    /// [`ProxyRoute::flush_new_attestations`].
     connection_id: Option<String>,
+    /// The observer's capture buffer, and what a flush needs to turn it into
+    /// rows. `None` for a route that verifies no enclave (engine-backed and
+    /// external backends), where there is never anything to flush.
+    attestations: Option<AttestationSink>,
     /// The largest completion the backend declares this model may be asked
     /// for; `None` when nothing was declared, which is never read as a zero.
     declared_max_output: Option<u64>,
@@ -288,6 +295,53 @@ struct ProxyRoute {
     /// it.
     #[allow(dead_code)]
     engine_lease: Option<local_models::EngineLease>,
+}
+
+/// Everything a post-send attestation flush needs.
+struct AttestationSink {
+    log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>>,
+    provider_id: String,
+    base_url: String,
+}
+
+impl ProxyRoute {
+    /// Persist any attestation captured since the last flush, adopting the
+    /// connection it opened.
+    ///
+    /// **The turn path's `flush_new_attestations`, and it is here for the same
+    /// reason.** A route opens by fetching the catalog, which verifies a
+    /// handshake and writes its connection row — but the completion that
+    /// follows may travel on a *different* TLS connection, because the server
+    /// is free to close the one the listing used. That second handshake's
+    /// attestation would otherwise sit in the observer and never be persisted,
+    /// while the Record named the listing's connection as the one that carried
+    /// the prompt. Both are wrong in the same way: the Record has to identify
+    /// the connection the request actually went down.
+    ///
+    /// Returns whether a row was written, so the caller can announce it.
+    async fn flush_new_attestations(&mut self, db_conn: &turso::Connection) -> bool {
+        let Some(sink) = self.attestations.as_ref() else {
+            return false;
+        };
+        match flush_attestations(
+            &sink.log,
+            db_conn,
+            &sink.provider_id,
+            &sink.base_url,
+            now_ms(),
+        )
+        .await
+        {
+            Ok(Some(connection_id)) => {
+                self.connection_id = Some(connection_id);
+                true
+            }
+            // Nothing new to flush, or the write failed. A failed flush is
+            // best-effort like every other Record write on this path: it costs
+            // the connection row, never the answer the caller paid for.
+            _ => false,
+        }
+    }
 }
 
 /// What one non-streaming proxied request produced.
@@ -336,16 +390,17 @@ impl Inner {
             let Ok(models) = self.backend_models(backend_id).await else {
                 continue;
             };
-            let engine_backed = db::get_backend(&self.db_conn().await?, backend_id)
-                .await?
+            let row = db::get_backend(&self.db_conn().await?, backend_id).await?;
+            let engine_backed = row
+                .as_ref()
                 .and_then(|row| backends::BackendKind::parse(&row.kind))
                 .map(|kind| kind.is_engine_backed())
                 .unwrap_or(false);
+            let starts_on_demand = row.map(|row| row.auto_start).unwrap_or(false);
+            let loaded_only =
+                offers_running_engines_only(settings.local_exposure, starts_on_demand);
             for model in models {
-                if engine_backed
-                    && settings.local_exposure == LocalExposure::Loaded
-                    && !running.contains(&model.id)
-                {
+                if engine_backed && loaded_only && !running.contains(&model.id) {
                     continue;
                 }
                 out.push(model);
@@ -434,6 +489,7 @@ impl Inner {
                     pricing: None,
                     external_auth: None,
                     connection_id: None,
+                    attestations: None,
                     declared_max_output: None,
                     engine_lease: Some(lease),
                 })
@@ -454,6 +510,7 @@ impl Inner {
                     pricing: None,
                     external_auth: backend.api_key.as_ref().map(|k| format!("Bearer {k}")),
                     connection_id: None,
+                    attestations: None,
                     declared_max_output: None,
                     engine_lease: None,
                 })
@@ -503,6 +560,11 @@ impl Inner {
                     )),
                     external_auth: None,
                     connection_id,
+                    attestations: Some(AttestationSink {
+                        log,
+                        provider_id,
+                        base_url: eidola.base_url.clone(),
+                    }),
                     declared_max_output: entry.max_output_tokens,
                     engine_lease: None,
                 })
@@ -625,7 +687,7 @@ impl Inner {
     ) -> Result<ProxyChatResponse, AppError> {
         let settings = self.proxy_settings().await?;
         let target = self.resolve_proxy_target(&settings, &request.model).await?;
-        let route = self.open_proxy_route(&settings, &target).await?;
+        let mut route = self.open_proxy_route(&settings, &target).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(&request, route.declared_max_output);
         let body = Self::proxy_request_body(
@@ -698,6 +760,11 @@ impl Inner {
                 return Err(error);
             }
         };
+        // The completion may have opened a connection of its own; the Record
+        // must name the one it actually went down.
+        if route.flush_new_attestations(&db_conn).await {
+            self.bus.emit(Change::Record);
+        }
         let status = response.status();
         let text = match response.text().await {
             Ok(text) => text,
@@ -726,9 +793,21 @@ impl Inner {
             }
         };
         let response_at = now_ms();
-        let mut parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, parsed.get("refund"))
-            .await;
+        // **A body that does not parse is not an answer.** Coercing it to JSON
+        // `null` and keeping the upstream's `2xx` would hand a downstream tool
+        // an apparent success carrying a fabricated body — a truncated
+        // response or an intermediary's HTML error page reads as "the model
+        // said nothing". The exchange is still recorded and the hold still
+        // settles below; only the *answer* becomes the gateway failure it is.
+        let parsed: Option<Value> = serde_json::from_str(&text).ok();
+        self.settle_proxy_refund(
+            &db_conn,
+            &spend,
+            &auth_value,
+            &route,
+            parsed.as_ref().and_then(|body| body.get("refund")),
+        )
+        .await;
         self.record_proxy_request(
             &route,
             &headers,
@@ -749,6 +828,15 @@ impl Inner {
             });
         }
 
+        let Some(mut parsed) = parsed else {
+            return Err(AppError::Network {
+                message: format!(
+                    "`{}` answered {} with a body that is not JSON",
+                    route.backend_id,
+                    status.as_u16()
+                ),
+            });
+        };
         if let Some(object) = parsed.as_object_mut() {
             // **The credential artifact never reaches downstream.** Eidola's
             // answer carries a `refund` this app consumes to mint the
@@ -773,13 +861,13 @@ impl Inner {
     pub(crate) async fn proxy_chat_stream(
         &self,
         request: ProxyChatRequest,
-        sender: tokio::sync::mpsc::UnboundedSender<ProxyStreamEvent>,
+        sender: tokio::sync::mpsc::Sender<ProxyStreamEvent>,
     ) -> Result<(), AppError> {
         use futures_util::StreamExt;
 
         let settings = self.proxy_settings().await?;
         let target = self.resolve_proxy_target(&settings, &request.model).await?;
-        let route = self.open_proxy_route(&settings, &target).await?;
+        let mut route = self.open_proxy_route(&settings, &target).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(&request, route.declared_max_output);
         let body = Self::proxy_request_body(
@@ -850,6 +938,11 @@ impl Inner {
                 return Err(error);
             }
         };
+        // Same as the blocking transport: the prompt may have travelled down a
+        // connection the catalog fetch never opened.
+        if route.flush_new_attestations(&db_conn).await {
+            self.bus.emit(Change::Record);
+        }
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -874,12 +967,14 @@ impl Inner {
         }
 
         // Only now is there going to be a `200` downstream.
-        let _ = sender.send(ProxyStreamEvent::Open);
+        let _ = sender.send(ProxyStreamEvent::Open).await;
 
         let mut byte_stream = response.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut raw: Vec<u8> = Vec::new();
         let mut read_error: Option<AppError> = None;
+        // The refund the upstream closed the stream with, if it sent one.
+        let mut inline_refund: Option<Value> = None;
         while let Some(chunk) = byte_stream.next().await {
             let bytes = match chunk {
                 Ok(bytes) => bytes,
@@ -896,13 +991,31 @@ impl Inner {
                 let event: Vec<u8> = buf.drain(..pos).collect();
                 let boundary_len = if buf.starts_with(b"\r\n\r\n") { 4 } else { 2 };
                 let terminator: Vec<u8> = buf.drain(..boundary_len.min(buf.len())).collect();
-                let mut out = forward_sse_event(&event);
+                let (mut out, refund) = forward_sse_event(&event);
+                if refund.is_some() {
+                    inline_refund = refund;
+                }
                 out.extend_from_slice(&terminator);
-                if sender.send(ProxyStreamEvent::Chunk(out)).is_err() {
-                    // Nobody is listening any more. The turn is upstream and
-                    // paid for either way, so the pump stops and the settle
-                    // below still runs — a caller loses its delivery, never
-                    // this app's accounting.
+                // **Awaited, on a bounded queue** — that is what makes a
+                // client which stops reading stop being served rather than be
+                // buffered at, and it is what bounds what this process holds
+                // for one connection. The pressure travels outward: the pump
+                // waits on the queue, the queue waits on hyper, hyper waits on
+                // the socket, and the only place that can relieve it is the
+                // caller reading. Nothing waits on anything behind it.
+                //
+                // **It always terminates, and the taxonomy is one line:** a
+                // caller that goes away drops hyper's body, which drops the
+                // receiver, which fails this send immediately — the pump
+                // stops, and the settle and the Record row below still run.
+                // The turn is upstream and paid for either way, so what a
+                // vanished caller loses is delivery, never this app's
+                // accounting. A caller that stalls without going away holds
+                // the pump, which is deliberate backpressure and delays the
+                // settlement rather than losing it: the hold stays `spending`
+                // with a live request behind it, which is exactly what
+                // `LiveSpend` keeps recovery out of.
+                if sender.send(ProxyStreamEvent::Chunk(out)).await.is_err() {
                     break;
                 }
             }
@@ -910,14 +1023,26 @@ impl Inner {
         // Whatever is left is a partial event; forward it so a downstream
         // parser sees exactly the bytes the upstream sent.
         if !buf.is_empty() {
-            let _ = sender.send(ProxyStreamEvent::Chunk(forward_sse_event(&buf)));
+            let (out, refund) = forward_sse_event(&buf);
+            if refund.is_some() {
+                inline_refund = refund;
+            }
+            let _ = sender.send(ProxyStreamEvent::Chunk(out)).await;
         }
 
-        // SSE carries no inline refund — the token has no body to ride — so a
-        // streaming spend always settles through the recovery endpoint, the
-        // same as every streaming turn this app makes.
-        self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
-            .await;
+        // **The in-band token first, recovery only for its absence.** The
+        // server closes an Eidola stream with a metadata event carrying the
+        // refund, and sends it even when its own persistence of that token
+        // failed — the one case where recovery can never answer. See
+        // [`forward_sse_event`].
+        self.settle_proxy_refund(
+            &db_conn,
+            &spend,
+            &auth_value,
+            &route,
+            inline_refund.as_ref(),
+        )
+        .await;
         self.record_proxy_request(
             &route,
             &headers,
@@ -981,30 +1106,56 @@ impl Inner {
     }
 }
 
-/// One SSE event on its way downstream.
+/// Whether an engine-backed backend contributes only the models whose engine
+/// is already running.
+///
+/// **`auto_start` is the backend's own rule and exposure does not override
+/// it.** A `llamacpp` backend with auto-start off refuses a request-triggered
+/// load before any spawn (app-core's local-model doctrine), and a proxied
+/// request *is* a request — so under `Downloaded` such a backend's unloaded
+/// models would be advertised and then deterministically refused at open, with
+/// the listing promising what the route can never serve. Exposure is a
+/// permission the reader grants the proxy *over* a backend; it is not a licence
+/// to break that backend's own configuration. So a backend that will not start
+/// an engine on demand takes the running-engine filter whatever the exposure
+/// setting says, which is what keeps the listing and the route agreeing.
+fn offers_running_engines_only(exposure: LocalExposure, starts_on_demand: bool) -> bool {
+    exposure == LocalExposure::Loaded || !starts_on_demand
+}
+
+/// One SSE event on its way downstream, and the refund it was carrying.
 ///
 /// **Byte-identical unless there is a credential in it.** The answer a model
 /// gave is not this app's to reformat, so an event whose payloads carry
 /// nothing of ours is passed through exactly as it arrived. The one thing that
 /// may not travel is a `refund` — wallet material this app consumes — and
-/// removing it is the only reason an event is ever rebuilt. (Today the Eidola
-/// server puts no refund in a stream, which is *why* streaming spends settle
-/// through the recovery endpoint; this is the outbound half of the same
-/// allowlist discipline the headers take, so a server that later grew one
-/// could not leak it through here by default.)
-fn forward_sse_event(event: &[u8]) -> Vec<u8> {
+/// removing it is the only reason an event is ever rebuilt. This is the
+/// outbound half of the same allowlist discipline the headers take.
+///
+/// **And the token is taken, not merely dropped.** The Eidola server closes a
+/// stream with a metadata event (`object == "eidola.chat.completion.metadata"`)
+/// carrying the refund, immediately before `[DONE]` — and it sends that event
+/// *even when its own best-effort persistence of the token failed*, which is
+/// exactly the case where the recovery endpoint can never answer. Discarding
+/// the token and asking recovery for it would then strand the credential in
+/// `spending` for good, with the one usable copy having arrived in-band and
+/// been thrown away. So the filter hands it back and recovery becomes the
+/// fallback for its *absence* — the order the blocking path already keeps.
+/// The object handed back is `RefundInfo` (`{refund, issuer_key_id}`), the
+/// same shape [`process_refund`] reads from a blocking body.
+fn forward_sse_event(event: &[u8]) -> (Vec<u8>, Option<Value>) {
     let Ok(text) = std::str::from_utf8(event) else {
-        return event.to_vec();
+        return (event.to_vec(), None);
     };
-    let carries_refund = text.lines().any(|line| {
+    let refund = text.lines().find_map(|line| {
         line.trim_end_matches('\r')
             .strip_prefix("data:")
             .map(str::trim_start)
             .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-            .is_some_and(|value| value.get("refund").is_some())
+            .and_then(|value| value.get("refund").cloned())
     });
-    if !carries_refund {
-        return event.to_vec();
+    if refund.is_none() {
+        return (event.to_vec(), None);
     }
     let mut out = String::with_capacity(text.len());
     for (index, line) in text.split('\n').enumerate() {
@@ -1031,7 +1182,7 @@ fn forward_sse_event(event: &[u8]) -> Vec<u8> {
             out.push('\r');
         }
     }
-    out.into_bytes()
+    (out.into_bytes(), refund)
 }
 
 #[cfg(test)]
@@ -1178,23 +1329,152 @@ mod tests {
     #[test]
     fn an_sse_event_is_forwarded_byte_for_byte() {
         let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
+        let (out, refund) = forward_sse_event(event);
         assert_eq!(
-            forward_sse_event(event),
+            out,
             event.to_vec(),
             "nothing this app does may alter what the model said"
         );
-        assert_eq!(forward_sse_event(b"data: [DONE]"), b"data: [DONE]".to_vec());
+        assert!(refund.is_none());
+        assert_eq!(
+            forward_sse_event(b"data: [DONE]").0,
+            b"data: [DONE]".to_vec()
+        );
         // A non-UTF-8 event still travels.
-        assert_eq!(forward_sse_event(&[0xff, 0xfe]), vec![0xff, 0xfe]);
+        assert_eq!(forward_sse_event(&[0xff, 0xfe]).0, vec![0xff, 0xfe]);
     }
 
     #[test]
-    fn an_sse_event_carrying_a_refund_loses_only_the_refund() {
-        let out = forward_sse_event(b"data: {\"id\":\"x\",\"refund\":\"credential-material\"}");
+    fn an_sse_event_carrying_a_refund_yields_it_and_loses_it() {
+        // The server's real terminal event: Eidola's own metadata, with the
+        // refund nested as `RefundInfo` — the shape `process_refund` reads.
+        let (out, refund) = forward_sse_event(
+            br#"data: {"object":"eidola.chat.completion.metadata","id":"x","refund":{"refund":"credential-material","issuer_key_id":"ab"}}"#,
+        );
         let text = String::from_utf8(out).expect("utf-8");
         assert!(!text.contains("credential-material"), "{text}");
         assert!(text.contains("\"id\":\"x\""), "{text}");
         assert!(text.starts_with("data: "), "{text}");
+
+        // **And the token is handed back rather than dropped** — the server
+        // sends it even when its own persistence failed, which is the one case
+        // where recovery can never answer.
+        let refund = refund.expect("the refund the event carried");
+        assert_eq!(refund["refund"], "credential-material");
+        assert_eq!(refund["issuer_key_id"], "ab");
+    }
+
+    #[test]
+    fn a_backend_that_will_not_start_an_engine_offers_only_what_runs() {
+        // The managed `local` singleton always starts on demand, so the
+        // exposure setting is the whole answer for it.
+        assert!(offers_running_engines_only(LocalExposure::Loaded, true));
+        assert!(!offers_running_engines_only(
+            LocalExposure::Downloaded,
+            true
+        ));
+        // A `llamacpp` backend with auto-start off refuses the load, so
+        // "all downloaded" cannot mean "all downloaded" there — advertising
+        // them would promise what the route deterministically refuses.
+        assert!(offers_running_engines_only(LocalExposure::Loaded, false));
+        assert!(
+            offers_running_engines_only(LocalExposure::Downloaded, false),
+            "exposure is a permission over a backend, not a licence to break its own rule"
+        );
+    }
+
+    /// The route the flush is about: an eidola-shaped one whose observer has
+    /// captured a handshake the listing never wrote a row for.
+    fn route_with_pending_attestation(provider_id: &str, base_url: &str) -> ProxyRoute {
+        // The route holds a client it never uses here; building one needs the
+        // provider `AppCore::new` installs in production. Idempotent.
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        log.lock()
+            .unwrap()
+            .push(tinfoil_verifier::VerifiedAttestation {
+                platform: tinfoil_verifier::Platform::SevSnp,
+                matched_measurement: tinfoil_verifier::MatchedMeasurement::SevSnp("a".repeat(96)),
+                attestation_hash: "second-handshake".into(),
+                attestation_doc: b"report".to_vec(),
+                pcr_digest: "b".repeat(96),
+                peer_spki_hash: "c".repeat(64),
+            });
+        ProxyRoute {
+            client: reqwest::Client::builder()
+                .build()
+                .expect("a client with no TLS work to do"),
+            base_url: base_url.to_string(),
+            wire_model: "m".into(),
+            canonical: "m".into(),
+            backend_id: "eidola".into(),
+            pricing: None,
+            external_auth: None,
+            // What the *listing's* handshake wrote.
+            connection_id: Some("listing-connection".into()),
+            attestations: Some(AttestationSink {
+                log,
+                provider_id: provider_id.to_string(),
+                base_url: base_url.to_string(),
+            }),
+            declared_max_output: None,
+            engine_lease: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_handshake_is_recorded_and_the_request_follows_it() {
+        // **The completion can ride a connection the catalog fetch never
+        // opened** — the server is free to close the listing's. That
+        // handshake's attestation would otherwise sit in the observer
+        // unpersisted while the Record named the listing's connection as the
+        // one that carried the prompt.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::open(dir.path()).await.expect("open");
+        let conn = crate::db::connect(&db).await.expect("connect");
+        let provider_id = crate::db::ensure_provider(&conn, "eidola", "inference", 1)
+            .await
+            .expect("provider");
+
+        let mut route = route_with_pending_attestation(&provider_id, "https://example.invalid");
+        assert!(
+            route.flush_new_attestations(&conn).await,
+            "a captured handshake is a row to write"
+        );
+        assert_ne!(
+            route.connection_id.as_deref(),
+            Some("listing-connection"),
+            "the request now names the connection that actually carried it"
+        );
+        let attestations = crate::db::list_attestations(&conn, 10, 0)
+            .await
+            .expect("attestations");
+        assert!(
+            attestations.iter().any(|a| a.hash == "second-handshake"),
+            "the second handshake is in the Record"
+        );
+
+        // Idempotent: nothing captured since means nothing to adopt, and the
+        // connection the request is attached to does not move.
+        let adopted = route.connection_id.clone();
+        assert!(!route.flush_new_attestations(&conn).await);
+        assert_eq!(route.connection_id, adopted);
+    }
+
+    #[tokio::test]
+    async fn a_route_that_verifies_no_enclave_has_nothing_to_flush() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::open(dir.path()).await.expect("open");
+        let conn = crate::db::connect(&db).await.expect("connect");
+        let mut route = route_with_pending_attestation("p", "https://example.invalid");
+        route.attestations = None;
+        route.connection_id = None;
+        assert!(
+            !route.flush_new_attestations(&conn).await,
+            "an engine-backed or external route never has a handshake to record"
+        );
+        assert_eq!(route.connection_id, None);
     }
 
     #[test]

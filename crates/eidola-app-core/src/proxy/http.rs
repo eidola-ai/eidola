@@ -58,6 +58,25 @@ use crate::ipc::Shutdown;
 /// should not be able to ask this process for unbounded memory.
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
+/// How many upstream events may sit waiting for the downstream socket.
+///
+/// **The queue has to be bounded, or the connection cap bounds nothing that
+/// matters.** The pump reads the upstream as fast as it arrives; with an
+/// unbounded channel a client that authenticates and then stops reading has
+/// the whole answer accumulate in this process — per connection, times
+/// [`MAX_CONNECTIONS`](../../../eidola_gui/proxy/constant.MAX_CONNECTIONS.html)
+/// — and against an external backend with no declared output ceiling there is
+/// nothing else to stop it.
+///
+/// Eight, on the control socket's argument for the same shape: the queue
+/// exists to decouple the pump from the socket, not to warehouse an answer. A
+/// handful of events in flight already keeps the pipeline full.
+///
+/// **What it bounds is the count, honestly.** One event is one upstream SSE
+/// frame, whose size is the backend's decision; this is the same residual the
+/// turn path carries, and no capacity here can change it.
+const STREAM_QUEUE_EVENTS: usize = 8;
+
 /// A response body, either complete or streaming.
 type ProxyBody = BoxBody<Bytes, Infallible>;
 
@@ -93,32 +112,31 @@ async fn answer(
     shutdown: Shutdown,
 ) -> Response<ProxyBody> {
     if shutdown.is_latched() {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "Eidola is shutting down",
-            None,
-        );
+        return shutting_down_response();
     }
 
-    let presented = bearer_token(&request);
-    let authenticated = match presented {
-        Some(key) => core
-            .authenticate_proxy_key(key.clone())
-            .await
-            .unwrap_or(false),
-        None => false,
+    let lookup = match bearer_token(&request) {
+        Some(key) => Some(core.authenticate_proxy_key(key).await),
+        None => None,
     };
-    if !authenticated {
-        // One answer for "no key", "wrong key" and "revoked key". Which of the
-        // three it was is not something a caller holding the wrong one is owed,
-        // and the reader can see every key's standing in Settings.
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "invalid_request_error",
-            "Invalid API key. Generate one in Eidola under Settings ▸ Proxy.",
-            Some("invalid_api_key"),
-        );
+    match admit(lookup) {
+        Admission::Admit => {}
+        Admission::InvalidKey => return invalid_key_response(),
+        Admission::Failed(e) => return app_error_response(&e),
+    }
+
+    // **Asked again, on the last line before any work starts.** The
+    // authentication above is a real await on the core's runtime, so the latch
+    // can be thrown while it completes — and the dispatch below reaches
+    // `proxy_chat`/`proxy_chat_stream`, which spend. Aborting the connection
+    // afterwards cannot help: an abort lands at an await point, and the
+    // stretch from here to the dispatch passes only awaits that are typically
+    // already ready. This is the control protocol's own idiom (`ipc::serve`
+    // re-asks after its permit wait for exactly this reason): the answer to
+    // "is this process still here" has to be as fresh as the decision it
+    // gates.
+    if shutdown.is_latched() {
+        return shutting_down_response();
     }
 
     let path = request.uri().path().to_string();
@@ -136,6 +154,59 @@ async fn answer(
             None,
         ),
     }
+}
+
+/// What the door said about one request's credential.
+#[derive(Debug)]
+pub(crate) enum Admission {
+    Admit,
+    /// No key, a key nothing matches, or a revoked one.
+    InvalidKey,
+    /// The lookup could not be performed at all.
+    Failed(AppError),
+}
+
+/// Read a key lookup, as a decision.
+///
+/// **A storage failure is not a bad key**, and the difference is what a client
+/// does next. `Err` means the local database could not answer — an operational
+/// failure worth retrying — while collapsing it into the same `401` tells a
+/// client holding a perfectly good key that its key is wrong, and a
+/// well-behaved one then stops using it. Only a lookup that *answered*, and
+/// answered no, is an invalid key.
+///
+/// `None` is "the request presented no bearer token", which is the invalid-key
+/// answer: an absent credential and a wrong one are the same thing to a caller
+/// that is not owed the difference.
+pub(crate) fn admit(lookup: Option<Result<bool, AppError>>) -> Admission {
+    match lookup {
+        Some(Ok(true)) => Admission::Admit,
+        Some(Ok(false)) | None => Admission::InvalidKey,
+        Some(Err(e)) => Admission::Failed(e),
+    }
+}
+
+/// One answer for "no key", "wrong key" and "revoked key". Which of the three
+/// it was is not something a caller holding the wrong one is owed, and the
+/// reader can see every key's standing in Settings.
+fn invalid_key_response() -> Response<ProxyBody> {
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "invalid_request_error",
+        "Invalid API key. Generate one in Eidola under Settings ▸ Proxy.",
+        Some("invalid_api_key"),
+    )
+}
+
+/// The process is going away. Written from two places — before the request is
+/// looked at, and again before it is dispatched — so the two cannot drift.
+fn shutting_down_response() -> Response<ProxyBody> {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_error",
+        "Eidola is shutting down",
+        None,
+    )
 }
 
 /// The bearer token a request presents, if it presents one in that form.
@@ -266,7 +337,7 @@ async fn completions_response(
     // or a failure would arrive as a `200` with an empty body — so the turn is
     // started and the first event decides. `ProxyStreamEvent::Open` is that
     // decision, sent once and only after the upstream's status is known.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProxyStreamEvent>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ProxyStreamEvent>(STREAM_QUEUE_EVENTS);
     let streaming = tokio::spawn(async move { core.proxy_chat_stream(parsed, tx).await });
     match rx.recv().await {
         Some(ProxyStreamEvent::Open) => {
@@ -483,6 +554,32 @@ mod tests {
                 message: "gone".into()
             }),
             StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[test]
+    fn a_storage_failure_is_not_a_bad_key() {
+        assert!(matches!(admit(Some(Ok(true))), Admission::Admit));
+        assert!(matches!(admit(Some(Ok(false))), Admission::InvalidKey));
+        assert!(
+            matches!(admit(None), Admission::InvalidKey),
+            "an absent credential and a wrong one are the same to a caller"
+        );
+        let failed = admit(Some(Err(AppError::Database {
+            message: "the local database is unavailable".into(),
+        })));
+        assert!(
+            matches!(failed, Admission::Failed(_)),
+            "a lookup that could not be performed is not an answer about the key"
+        );
+        // And it reaches the caller as a retryable server failure rather than
+        // as "replace your key".
+        let Admission::Failed(e) = failed else {
+            unreachable!()
+        };
+        assert_eq!(
+            app_error_response(&e).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

@@ -8798,14 +8798,23 @@ pub async fn revoke_proxy_key(conn: &Connection, id: &str, now: i64) -> Result<b
     Ok(affected > 0)
 }
 
-/// The id of the live key with this hash, if any. The lookup is by digest, so
-/// nothing here ever holds a presented secret beyond the caller's own frame.
+/// The live key with this hash — its id, and when it was last used. The lookup
+/// is by digest, so nothing here ever holds a presented secret beyond the
+/// caller's own frame.
+///
+/// The `last_used_at` rides along because the caller has to know whether the
+/// stamp it is about to write *changes what any surface shows*: the pane draws
+/// "used" or "never used" and nothing finer, so a key already used needs no
+/// invalidation and one being used for the first time needs exactly one. Read
+/// here rather than in a second query, because the row is already in hand.
 pub async fn find_live_proxy_key(
     conn: &Connection,
     key_hash: &str,
-) -> Result<Option<String>, AppError> {
+) -> Result<Option<(String, Option<i64>)>, AppError> {
     let mut stmt = conn
-        .prepare("SELECT id FROM proxy_key WHERE key_hash = ?1 AND revoked_at IS NULL")
+        .prepare(
+            "SELECT id, last_used_at FROM proxy_key WHERE key_hash = ?1 AND revoked_at IS NULL",
+        )
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -8813,7 +8822,10 @@ pub async fn find_live_proxy_key(
         .await
         .map_err(AppError::db)?;
     match rows.next().await.map_err(AppError::db)? {
-        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<Option<i64>>(1).map_err(AppError::db)?,
+        ))),
         None => Ok(None),
     }
 }

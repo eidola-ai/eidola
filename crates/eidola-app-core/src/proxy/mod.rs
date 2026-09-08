@@ -431,12 +431,27 @@ impl Inner {
     /// The digest is what is compared, so a presented secret never reaches the
     /// database and never appears in a query. The touch is best-effort: a
     /// write failure must not cost a request that has already authenticated.
+    ///
+    /// **The stamp announces itself exactly once per key.** A durable write
+    /// that no surface hears about leaves the pane saying "never used"
+    /// indefinitely — the store loads its listing at launch and nothing else
+    /// invalidates it. But emitting per authentication would put a `Change` on
+    /// the bus for every proxied request, and each one costs every window two
+    /// reads and a listener reconcile. The pane renders "used" or "never used"
+    /// and nothing finer, so the only moment the rendered value moves is the
+    /// **first** use: that is when the invalidation is emitted, and the
+    /// prior value comes back with the lookup, so asking costs no second query.
     pub(crate) async fn authenticate_proxy_key(&self, presented: &str) -> Result<bool, AppError> {
         let conn = self.db_conn().await?;
-        let Some(id) = db::find_live_proxy_key(&conn, &key_digest(presented)).await? else {
+        let Some((id, last_used_at)) =
+            db::find_live_proxy_key(&conn, &key_digest(presented)).await?
+        else {
             return Ok(false);
         };
-        let _ = db::touch_proxy_key(&conn, &id, now_ms()).await;
+        let stamped = db::touch_proxy_key(&conn, &id, now_ms()).await.is_ok();
+        if stamped && last_used_at.is_none() {
+            self.bus.emit(Change::Proxy);
+        }
         Ok(true)
     }
 }
@@ -547,7 +562,7 @@ impl AppCore {
     pub async fn proxy_chat_stream(
         &self,
         request: route::ProxyChatRequest,
-        sender: tokio::sync::mpsc::UnboundedSender<route::ProxyStreamEvent>,
+        sender: tokio::sync::mpsc::Sender<route::ProxyStreamEvent>,
     ) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime

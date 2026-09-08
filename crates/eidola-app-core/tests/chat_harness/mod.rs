@@ -80,8 +80,23 @@ pub enum ChatBehavior {
     /// 200 JSON completion **without** an inline refund (forces the body-refund
     /// fallback to go through `/v1/credentials/refund`).
     OkBlockingNoInlineRefund,
+    /// A `200` whose body is not JSON at all — a truncated answer, or an
+    /// intermediary's HTML error page. What a client must never read as a
+    /// successful completion.
+    OkNonJsonBody,
     /// 200 SSE stream: content + reasoning deltas, usage, `[DONE]`.
     OkStreaming,
+    /// The **real server's** streaming shape: content, a usage chunk, then a
+    /// terminal metadata event (`object == "eidola.chat.completion.metadata"`)
+    /// carrying the refund, then `[DONE]`.
+    ///
+    /// The refund rides that event **whatever [`RefundMode`] says**, because
+    /// that is what the server does: its persistence of the token is
+    /// best-effort and its failure is exactly what makes the recovery endpoint
+    /// unable to answer, while the in-band copy still goes out. Pairing this
+    /// with `RefundMode::Fail` is therefore the honest model of the one case
+    /// where the in-band token is the *only* copy.
+    StreamingWithMetadataRefund,
     /// A plain success in **whichever transport asked** — SSE for a streaming
     /// request, JSON for a blocking one. One behaviour for a test that must
     /// exercise both twins against one upstream, which is otherwise impossible:
@@ -1199,7 +1214,25 @@ async fn handle_chat(
             // all reqwest surfaces a transport error from `send`.
             Ok(())
         }
+        ChatBehavior::OkNonJsonBody => {
+            write_raw(
+                stream,
+                200,
+                "text/html",
+                "<html><body>502 Bad Gateway</body></html>",
+            )
+            .await
+        }
         ChatBehavior::OkStreaming => write_sse_stream(stream, true, &[STREAM_CONTENT]).await,
+        ChatBehavior::StreamingWithMetadataRefund => {
+            let refund = auth
+                .and_then(Issuer::spend_proof_from_auth)
+                .and_then(|sp| issuer.refund_for(&sp))
+                .map(|refund_b64| {
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                });
+            write_sse_stream_with_metadata(stream, &[STREAM_CONTENT], refund).await
+        }
         ChatBehavior::OkStreamingWithHeader => {
             write_sse_stream(
                 stream,
@@ -1904,6 +1937,74 @@ async fn write_sse_unterminated_stream(
 
     // The body ends properly. No `[DONE]`, and nothing ever named a
     // `finish_reason` — the connection simply stopped having more to say.
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// The server's real streaming close: the ordinary chunks, then one metadata
+/// event carrying the refund, then `[DONE]`. See
+/// [`ChatBehavior::StreamingWithMetadataRefund`].
+/// A response with an arbitrary content type and body — for the shapes that
+/// are not JSON at all.
+async fn write_raw(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body.as_bytes()).await?;
+    stream.flush().await
+}
+
+async fn write_sse_stream_with_metadata(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+    refund: Option<serde_json::Value>,
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let send_event = |payload: String| -> Vec<u8> {
+        let event = format!("data: {payload}\n\n");
+        let mut out = format!("{:x}\r\n", event.len()).into_bytes();
+        out.extend_from_slice(event.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "choices": [{ "delta": { "content": chunk } }]
+        });
+        stream.write_all(&send_event(content.to_string())).await?;
+        stream.flush().await?;
+    }
+    let usage = serde_json::json!({
+        "choices": [],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 5 }
+    });
+    stream.write_all(&send_event(usage.to_string())).await?;
+
+    let mut metadata = serde_json::json!({
+        "object": "eidola.chat.completion.metadata",
+        "id": "chatcmpl-mock",
+    });
+    if let Some(refund) = refund {
+        metadata["refund"] = refund;
+    }
+    stream.write_all(&send_event(metadata.to_string())).await?;
+    stream.write_all(&send_event("[DONE]".to_string())).await?;
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())
