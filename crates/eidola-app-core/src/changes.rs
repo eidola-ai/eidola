@@ -108,6 +108,14 @@ pub enum Change {
     /// *additionally* when set-as-default writes the `default_template`
     /// config key.
     Templates,
+    /// The local inference proxy's configuration changed: its settings row,
+    /// the set of backends it exposes, or its API keys. Subscribers
+    /// re-snapshot via `AppCore::proxy_settings` / `AppCore::proxy_keys`.
+    /// One variant for all three because they are one settings surface and
+    /// one store (the STATE.md 1:1 variant↔store rule) — and because the
+    /// listener re-reads its whole configuration whenever any part of it
+    /// moves.
+    Proxy,
 }
 
 /// Identifies a single conversation space.  String form matches the UUIDs

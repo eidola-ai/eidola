@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 11;
+const LATEST_VERSION: i64 = 12;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -8590,6 +8590,258 @@ pub async fn list_credential_lifecycle(
         });
     }
     Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// The local inference proxy
+// ---------------------------------------------------------------------------
+
+/// The `proxy_settings` singleton, as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxySettingsRow {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub bind_port: i64,
+    pub local_exposure: String,
+}
+
+/// One `proxy_key` row. The key itself is not here and never was — see the
+/// table's comment in `schema.sql`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyKeyRow {
+    pub id: String,
+    pub label: String,
+    pub prefix: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+/// Read the proxy settings, or `None` when the singleton has never been
+/// written. A profile that has never opened the pane has no row, and that is
+/// not an error: the caller resolves the compiled-in defaults instead, exactly
+/// as `Config`'s `*_override` resolvers do.
+pub async fn get_proxy_settings(conn: &Connection) -> Result<Option<ProxySettingsRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT enabled, bind_address, bind_port, local_exposure \
+             FROM proxy_settings WHERE id = 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(ProxySettingsRow {
+            enabled: row.get::<i64>(0).map_err(AppError::db)? != 0,
+            bind_address: row.get::<String>(1).map_err(AppError::db)?,
+            bind_port: row.get::<i64>(2).map_err(AppError::db)?,
+            local_exposure: row.get::<String>(3).map_err(AppError::db)?,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Write the proxy settings singleton.
+pub async fn upsert_proxy_settings(
+    conn: &Connection,
+    row: &ProxySettingsRow,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO proxy_settings \
+             (id, enabled, bind_address, bind_port, local_exposure, created_at, updated_at) \
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?5) \
+         ON CONFLICT(id) DO UPDATE SET \
+             enabled = ?1, bind_address = ?2, bind_port = ?3, local_exposure = ?4, \
+             updated_at = ?5",
+        (
+            Value::Integer(i64::from(row.enabled)),
+            Value::Text(row.bind_address.clone()),
+            Value::Integer(row.bind_port),
+            Value::Text(row.local_exposure.clone()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// The backend ids the proxy exposes, in registry order (the same order
+/// `list_backends` presents, so the pane and the listing agree). Backends
+/// soft-removed or disabled since they were exposed are **not** returned:
+/// exposure is a permission, and a permission over something that is not
+/// there offers nothing.
+pub async fn list_proxy_backends(conn: &Connection) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.id FROM proxy_backend p \
+             JOIN backend b ON b.id = p.backend_id \
+             WHERE b.removed_at IS NULL AND b.enabled = 1 \
+             ORDER BY CASE b.kind WHEN 'eidola' THEN 0 WHEN 'local' THEN 1 ELSE 2 END, \
+             b.created_at, b.id",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        ids.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(ids)
+}
+
+/// Every exposure row, live backend or not — what the settings pane's
+/// checkboxes read, so a backend the user disabled still shows its exposure
+/// choice rather than silently losing it.
+pub async fn list_proxy_backend_rows(conn: &Connection) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT backend_id FROM proxy_backend ORDER BY backend_id")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        ids.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(ids)
+}
+
+/// Expose or withdraw one backend. Idempotent in both directions.
+pub async fn set_proxy_backend(
+    conn: &Connection,
+    backend_id: &str,
+    exposed: bool,
+    now: i64,
+) -> Result<(), AppError> {
+    if exposed {
+        conn.execute(
+            "INSERT INTO proxy_backend (backend_id, created_at) VALUES (?1, ?2) \
+             ON CONFLICT(backend_id) DO NOTHING",
+            (Value::Text(backend_id.to_string()), Value::Integer(now)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    } else {
+        conn.execute(
+            "DELETE FROM proxy_backend WHERE backend_id = ?1",
+            (Value::Text(backend_id.to_string()),),
+        )
+        .await
+        .map_err(AppError::db)?;
+    }
+    Ok(())
+}
+
+/// Every key ever generated, newest first — live ones and revoked ones alike,
+/// because a revoked row's label is what tells a reader which tool lost access.
+pub async fn list_proxy_keys(conn: &Connection) -> Result<Vec<ProxyKeyRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, label, prefix, created_at, last_used_at, revoked_at \
+             FROM proxy_key ORDER BY created_at DESC, id DESC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut keys = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        keys.push(ProxyKeyRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            label: row.get::<String>(1).map_err(AppError::db)?,
+            prefix: row.get::<String>(2).map_err(AppError::db)?,
+            created_at: row.get::<i64>(3).map_err(AppError::db)?,
+            last_used_at: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+            revoked_at: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+        });
+    }
+    Ok(keys)
+}
+
+/// Record a newly generated key. `key_hash` is the one-way digest; the key is
+/// the caller's to display once and then forget.
+pub async fn insert_proxy_key(
+    conn: &Connection,
+    id: &str,
+    label: &str,
+    prefix: &str,
+    key_hash: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO proxy_key (id, label, prefix, key_hash, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(label.to_string()),
+            Value::Text(prefix.to_string()),
+            Value::Text(key_hash.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Revoke one key. Answers whether a live row was actually revoked, so the
+/// caller reports what happened rather than assuming (the decide-at-the-write
+/// rule).
+pub async fn revoke_proxy_key(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
+    let affected = conn
+        .execute(
+            "UPDATE proxy_key SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            (Value::Text(id.to_string()), Value::Integer(now)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(affected > 0)
+}
+
+/// The id of the live key with this hash, if any. The lookup is by digest, so
+/// nothing here ever holds a presented secret beyond the caller's own frame.
+pub async fn find_live_proxy_key(
+    conn: &Connection,
+    key_hash: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM proxy_key WHERE key_hash = ?1 AND revoked_at IS NULL")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(key_hash.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+        None => Ok(None),
+    }
+}
+
+/// How many keys are live — what decides whether the proxy has anyone to let
+/// in at all.
+pub async fn live_proxy_key_count(conn: &Connection) -> Result<i64, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM proxy_key WHERE revoked_at IS NULL")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(row.get::<i64>(0).map_err(AppError::db)?),
+        None => Ok(0),
+    }
+}
+
+/// Stamp a key's last use. Best-effort telemetry for the pane — a failure here
+/// must never cost a request that was already authenticated.
+pub async fn touch_proxy_key(conn: &Connection, id: &str, now: i64) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE proxy_key SET last_used_at = ?2 WHERE id = ?1",
+        (Value::Text(id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
