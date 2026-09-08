@@ -1155,6 +1155,7 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
                 SettingsPane::Backends,
                 SettingsPane::Templates,
                 SettingsPane::Agents,
+                SettingsPane::Proxy,
                 SettingsPane::Account,
                 SettingsPane::Wallet,
             ],
@@ -1178,6 +1179,11 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
                 SettingsPane::Backends,
                 SettingsPane::Templates,
                 SettingsPane::Agents,
+                // **The proxy is not gated on the account.** It can serve
+                // on-device models to a local tool with no Eidola backend at
+                // all, so hiding it here would withhold a working feature from
+                // exactly the reader who chose "no account, on-device only".
+                SettingsPane::Proxy,
             ],
             "eidola disabled hides Account and Wallet"
         );
