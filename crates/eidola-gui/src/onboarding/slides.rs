@@ -597,7 +597,7 @@ impl RenderOnce for Purchase {
                     self.checkout_pending.as_deref(),
                     self.on_select,
                     "onboarding",
-                    plans::PlanLabels::localized(cx),
+                    plans::PlanLabels::localized(),
                     cx,
                 ))
                 .when_some(self.checkout_error, |el, err| {

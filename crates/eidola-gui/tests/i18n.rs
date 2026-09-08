@@ -194,6 +194,50 @@ fn a_locale_change_notifies_global_observers(cx: &mut TestAppContext) {
     assert_eq!(changes.get(), baseline + 1, "a no-op apply must not notify");
 }
 
+/// **A bundle is built once per locale, not once per lookup.**
+///
+/// Building one re-parses every embedded FTL resource — the source locale's and
+/// the requested one's. That was affordable while `format_in`'s only caller was
+/// the startup alert; it stopped being affordable when a *rendered* surface
+/// began naming its locale (`plans::PlanLabels` under Settings ▸ Account, once
+/// per label per row per frame). The resources are compile-time constants, so a
+/// built bundle can never go stale and the cache is never invalidated.
+#[gpui::test]
+fn an_explicit_locale_builds_its_bundle_once(cx: &mut TestAppContext) {
+    cx.update(|cx| i18n::install(cx));
+
+    // Warm whatever the first lookup in each locale has to build.
+    for tag in ["en", "fr"] {
+        let _ = i18n::format_in(tag, "plans-list", None);
+    }
+    let warm = i18n::bundles_built_for_test();
+
+    // A hundred more lookups across both locales build nothing further.
+    for _ in 0..50 {
+        for tag in ["en", "fr"] {
+            let _ = i18n::format_in(tag, "plans-list", None);
+            let _ = i18n::format_in(tag, "plans-opening-checkout", None);
+        }
+    }
+    assert_eq!(
+        i18n::bundles_built_for_test(),
+        warm,
+        "an explicit-locale lookup must reuse the bundle its locale already built"
+    );
+
+    // And the active-locale path reaches the installed global, which is not a
+    // bundle this cache has to hold at all.
+    let before = i18n::bundles_built_for_test();
+    for _ in 0..50 {
+        let _ = cx.update(|cx| i18n::format(cx, "plans-list", None));
+    }
+    assert_eq!(
+        i18n::bundles_built_for_test(),
+        before,
+        "the active locale is answered by the installed global, not by a fresh bundle"
+    );
+}
+
 /// **Every window title fed from the resources is re-applied on a locale
 /// change.**
 ///
@@ -339,6 +383,9 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("count", 1);
                 args.set("unlinkability", "https://example.invalid/unlinkability");
                 args.set("line", "5,000,000 credits, expire one year after purchase");
+                // The upstream's own interval name — selected on, never shown.
+                args.set("interval", "month");
+                args.set("amount", "10.00 USD");
                 args.set("description", "the seller's own words");
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(

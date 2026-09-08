@@ -20,32 +20,42 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
-use eidola_app_core::PriceInfo;
+use eidola_app_core::{PriceCadence, PriceInfo};
 
 use crate::probe::Probe;
 
 /// Handler invoked with the clicked plan's price id.
 pub type PlanSelectHandler = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
-/// Which locale a host wants its plan rows worded in.
+/// Which voice a host wants its plan rows in.
 ///
-/// **A tag, never a formatted string.** The credits line takes the plan's own
-/// amount, so it cannot be pre-rendered — and a sentence held across frames
-/// would be the cached-render decision the localization doctrine forbids
-/// (`AGENTS.md` → "A localized string must not be cached in state"). Both
-/// constructors are called *at render*, and everything is formatted inside
-/// [`plan_rows`] from what they name.
+/// **Never a formatted string, and never even a tag for the common case.** The
+/// credits line takes the plan's own amount, so it cannot be pre-rendered — and
+/// a sentence held across frames would be the cached-render decision the
+/// localization doctrine forbids (`AGENTS.md` → "A localized string must not be
+/// cached in state"). [`PlanLabels::localized`] therefore records only *that*
+/// the reader's language is wanted and asks the installed global at render, the
+/// path every other localized surface takes; a captured tag would be one more
+/// thing that could disagree with the global it was copied from.
 #[derive(Clone, Copy, Debug)]
 pub struct PlanLabels {
-    locale: &'static str,
+    voice: Voice,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Voice {
+    /// Whatever the reader's active locale is, asked for at render.
+    Active,
+    /// One locale, named — for a host still English around these rows.
+    Fixed(&'static str),
 }
 
 impl PlanLabels {
     /// The reader's active locale — for a host whose whole surface is
     /// localized.
-    pub fn localized(cx: &App) -> Self {
+    pub fn localized() -> Self {
         Self {
-            locale: crate::i18n::active_locale(cx),
+            voice: Voice::Active,
         }
     }
 
@@ -56,16 +66,22 @@ impl PlanLabels {
     /// Its extraction swaps this for [`PlanLabels::localized`] and nothing else.
     pub fn english() -> Self {
         Self {
-            locale: crate::i18n::SOURCE_LOCALE,
+            voice: Voice::Fixed(crate::i18n::SOURCE_LOCALE),
         }
     }
 
-    fn list(&self) -> SharedString {
-        crate::i18n::msg_in::plans_list(self.locale)
+    fn list(&self, cx: &App) -> SharedString {
+        match self.voice {
+            Voice::Active => crate::i18n::msg::plans_list(cx),
+            Voice::Fixed(tag) => crate::i18n::msg_in::plans_list(tag),
+        }
     }
 
-    fn opening_checkout(&self) -> SharedString {
-        crate::i18n::msg_in::plans_opening_checkout(self.locale)
+    fn opening_checkout(&self, cx: &App) -> SharedString {
+        match self.voice {
+            Voice::Active => crate::i18n::msg::plans_opening_checkout(cx),
+            Voice::Fixed(tag) => crate::i18n::msg_in::plans_opening_checkout(tag),
+        }
     }
 
     /// The credits line for one plan: how many, and when they expire.
@@ -75,21 +91,59 @@ impl PlanLabels {
     /// **grouping itself stays a comma** (see [`format_credits`]): locale-aware
     /// number formatting is a decision above this batch, and guessing at it
     /// here would be a second answer to it.
-    fn credits(&self, credits: i64, recurring: bool) -> SharedString {
+    fn credits(&self, credits: i64, recurring: bool, cx: &App) -> SharedString {
         let amount = format_credits(credits);
-        if recurring {
-            crate::i18n::msg_in::plans_credits_recurring(self.locale, credits, amount)
-        } else {
-            crate::i18n::msg_in::plans_credits_one_time(self.locale, credits, amount)
+        match (self.voice, recurring) {
+            (Voice::Active, true) => crate::i18n::msg::plans_credits_recurring(cx, credits, amount),
+            (Voice::Active, false) => crate::i18n::msg::plans_credits_one_time(cx, credits, amount),
+            (Voice::Fixed(tag), true) => {
+                crate::i18n::msg_in::plans_credits_recurring(tag, credits, amount)
+            }
+            (Voice::Fixed(tag), false) => {
+                crate::i18n::msg_in::plans_credits_one_time(tag, credits, amount)
+            }
         }
     }
 
-    fn with_description(&self, line: SharedString, description: &str) -> SharedString {
-        crate::i18n::msg_in::plans_credits_described(
-            self.locale,
-            line.to_string(),
-            description.to_string(),
-        )
+    /// A price's own line: what it costs, and how often.
+    ///
+    /// **The amount is not re-formatted here** — `amount_display` is the
+    /// upstream's figure already written out, and how a locale groups digits
+    /// and places its currency symbol is the same deferred decision
+    /// [`format_credits`] names. What *is* localized is the words around it: the
+    /// cadence, and the one case that is a word rather than a number.
+    fn price(&self, price: &PriceInfo, cx: &App) -> SharedString {
+        if price.amount.is_none() {
+            return match self.voice {
+                Voice::Active => crate::i18n::msg::plans_free(cx),
+                Voice::Fixed(tag) => crate::i18n::msg_in::plans_free(tag),
+            };
+        }
+        let amount = price.amount_display.clone();
+        match &price.cadence {
+            PriceCadence::OneTime => SharedString::from(amount),
+            PriceCadence::Every { interval, count } => {
+                let (interval, count) = (interval.clone(), *count);
+                match self.voice {
+                    Voice::Active => {
+                        crate::i18n::msg::plans_price_cadence(cx, count, interval, amount)
+                    }
+                    Voice::Fixed(tag) => {
+                        crate::i18n::msg_in::plans_price_cadence(tag, count, interval, amount)
+                    }
+                }
+            }
+        }
+    }
+
+    fn with_description(&self, line: SharedString, description: &str, cx: &App) -> SharedString {
+        let (line, description) = (line.to_string(), description.to_string());
+        match self.voice {
+            Voice::Active => crate::i18n::msg::plans_credits_described(cx, line, description),
+            Voice::Fixed(tag) => {
+                crate::i18n::msg_in::plans_credits_described(tag, line, description)
+            }
+        }
     }
 }
 
@@ -102,12 +156,13 @@ impl PlanLabels {
 /// unaffected and stay offered, which is why this filters rather than
 /// hiding the list.
 ///
-/// `recurrence` is empty exactly for one-time prices (`account_prices`
-/// derives it from the price's recurring interval), so it is the test.
+/// The test is [`PriceCadence::OneTime`] — the typed half, not the rendered
+/// `recurrence` string it is derived from: a presentation string is the wrong
+/// thing to branch on, and this one is about to be worded per locale.
 pub fn offered_plans(prices: &[PriceInfo], subscribed: bool) -> Vec<PriceInfo> {
     prices
         .iter()
-        .filter(|p| !subscribed || p.recurrence.is_empty())
+        .filter(|p| !subscribed || p.cadence == PriceCadence::OneTime)
         .cloned()
         .collect()
 }
@@ -131,22 +186,26 @@ pub fn plan_rows(
     // addressable in both the onboarding and Settings hosts.
     let mut list = v_flex()
         .id(SharedString::from(format!("{name_prefix}/plans")))
-        .probe(format!("{name_prefix}/plans"), Role::ListBox, labels.list())
+        .probe(
+            format!("{name_prefix}/plans"),
+            Role::ListBox,
+            labels.list(cx),
+        )
         .w_full();
 
     for (idx, price) in prices.iter().enumerate() {
         let price_line = if pending == Some(price.id.as_str()) {
-            labels.opening_checkout()
+            labels.opening_checkout(cx)
         } else {
-            SharedString::from(format!("{}{}", price.amount_display, price.recurrence))
+            labels.price(price, cx)
         };
         // Conspicuous expiry disclosure at the point of purchase — must stay
         // consistent with the published terms (www/pages/terms.md) and the
-        // server's webhook expiry logic (period end vs. one year). `recurrence`
-        // is empty exactly for one-time prices, so it is the test.
-        let mut subline = labels.credits(price.credits, !price.recurrence.is_empty());
+        // server's webhook expiry logic (period end vs. one year).
+        let recurring = price.cadence != PriceCadence::OneTime;
+        let mut subline = labels.credits(price.credits, recurring, cx);
         if let Some(desc) = price.product_description.as_deref() {
-            subline = labels.with_description(subline, desc);
+            subline = labels.with_description(subline, desc, cx);
         }
         let price_id = price.id.clone();
         let on_select = on_select.clone();
@@ -223,29 +282,50 @@ pub fn format_credits(credits: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{format_credits, offered_plans};
-    use eidola_app_core::PriceInfo;
+    use eidola_app_core::{PriceAmount, PriceCadence, PriceInfo};
 
-    fn price(id: &str, recurrence: &str) -> PriceInfo {
+    fn price(id: &str, cadence: PriceCadence) -> PriceInfo {
         PriceInfo {
             id: id.to_string(),
             product_name: id.to_string(),
             product_description: None,
             amount_display: "10.00 USD".to_string(),
-            recurrence: recurrence.to_string(),
+            recurrence: match &cadence {
+                PriceCadence::OneTime => String::new(),
+                PriceCadence::Every { interval, .. } => format!("/{interval}"),
+            },
             credits: 10_000_000,
+            amount: Some(PriceAmount {
+                minor_units: 1_000,
+                currency: "USD".to_string(),
+            }),
+            cadence,
+        }
+    }
+
+    fn monthly() -> PriceCadence {
+        PriceCadence::Every {
+            interval: "month".to_string(),
+            count: 1,
         }
     }
 
     #[test]
     fn without_a_subscription_every_plan_is_offered() {
-        let prices = [price("topup", ""), price("monthly", "/month")];
+        let prices = [
+            price("topup", PriceCadence::OneTime),
+            price("monthly", monthly()),
+        ];
         let offered = offered_plans(&prices, false);
         assert_eq!(offered.len(), 2);
     }
 
     #[test]
     fn with_a_subscription_only_one_time_top_ups_are_offered() {
-        let prices = [price("topup", ""), price("monthly", "/month")];
+        let prices = [
+            price("topup", PriceCadence::OneTime),
+            price("monthly", monthly()),
+        ];
         let offered = offered_plans(&prices, true);
         assert_eq!(offered.len(), 1);
         assert_eq!(offered[0].id, "topup");

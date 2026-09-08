@@ -17,6 +17,38 @@ plans-list = Available plans
 # the failure is reported.
 plans-opening-checkout = Opening checkout…
 
+# A price that costs nothing. A word, so it is said in the reader's language;
+# the amounts beside it are numbers, and stay as the server states them.
+plans-free = Free
+# What a recurring price is charged with: the amount, then how often. The
+# upstream names the interval, so this selects on its own vocabulary and keeps
+# a fourth answer for one this build has never seen — a cadence the reader is
+# owed even when the app cannot spell it.
+# TRANSLATORS: $count is how many intervals make one billing period (usually 1);
+# $interval is the upstream's own word and is never shown, only selected on.
+# The single-interval English is byte-for-byte what this app rendered before the
+# cadence was localized, so the surfaces still English around these rows did not
+# move; the multi-interval arm says it in words instead of the old "/2xmonth".
+plans-price-cadence =
+    { $count ->
+        [1]
+            { $interval ->
+                [day] { $amount }/day
+                [week] { $amount }/week
+                [month] { $amount }/month
+                [year] { $amount }/year
+               *[other] { $amount }/{ $interval }
+            }
+       *[other]
+            { $interval ->
+                [day] { $amount } every { $count } days
+                [week] { $amount } every { $count } weeks
+                [month] { $amount } every { $count } months
+                [year] { $amount } every { $count } years
+               *[other] { $amount } every { $count } { $interval }
+            }
+    }
+
 # **The conspicuous expiry disclosure, at the point of purchase.** It must stay
 # consistent with the published terms and with the server's own webhook expiry
 # logic (period end vs. one year) — so translate what it says exactly, and never

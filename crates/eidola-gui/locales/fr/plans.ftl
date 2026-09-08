@@ -3,6 +3,27 @@
 plans-list = Formules disponibles
 plans-opening-checkout = Ouverture du paiement…
 
+plans-free = Gratuit
+plans-price-cadence =
+    { $count ->
+        [1]
+            { $interval ->
+                [day] { $amount }/jour
+                [week] { $amount }/semaine
+                [month] { $amount }/mois
+                [year] { $amount }/an
+               *[other] { $amount }/{ $interval }
+            }
+       *[other]
+            { $interval ->
+                [day] { $amount } tous les { $count } jours
+                [week] { $amount } toutes les { $count } semaines
+                [month] { $amount } tous les { $count } mois
+                [year] { $amount } tous les { $count } ans
+               *[other] { $amount } tous les { $count } { $interval }
+            }
+    }
+
 plans-credits-one-time =
     { $count ->
         [one] { $credits } crédit, expire un an après l'achat

@@ -890,6 +890,11 @@ fn account_balance_pools_and_plan_sublines_carry_their_values(cx: &mut TestAppCo
             product_description: None,
             amount_display: "$5".into(),
             recurrence: "".into(),
+            amount: Some(eidola_app_core::PriceAmount {
+                minor_units: 500,
+                currency: "USD".into(),
+            }),
+            cadence: eidola_app_core::PriceCadence::OneTime,
             credits: 5_000_000,
         }];
         s.backends = backends_fixture();
@@ -1180,7 +1185,15 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
                 product_name: "Monthly".into(),
                 product_description: Some("Recurring top-up".into()),
                 amount_display: "$10".into(),
-                recurrence: "/mo".into(),
+                recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 10_000_000,
             },
             PriceInfo {
@@ -1189,6 +1202,11 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
                 product_description: None,
                 amount_display: "$5".into(),
                 recurrence: "".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
                 credits: 5_000_000,
             },
         ];
@@ -1861,31 +1879,38 @@ fn the_purchase_slides_plans_speak_the_readers_language(cx: &mut TestAppContext)
         v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
     });
 
-    for (tag, list, one_time, recurring) in [
+    // Each row: the list's name, the recurring row's own name (the cadence,
+    // which app-core hands over as data and this layer words) and subline, and
+    // the one-time row's subline.
+    for (tag, list, recurring_name, recurring, one_time) in [
         (
             "en",
             "Available plans",
-            "5,000,000 credits, expire one year after purchase",
+            "Monthly — $10/month",
             "10,000,000 credits, expire at the end of each billing period — Recurring top-up",
+            "5,000,000 credits, expire one year after purchase",
         ),
         (
             "fr",
             "Formules disponibles",
-            "5,000,000 crédits, expirent un an après l'achat",
+            "Monthly — $10/mois",
             "10,000,000 crédits, expirent à la fin de chaque période de facturation — Recurring \
              top-up",
+            "5,000,000 crédits, expirent un an après l'achat",
         ),
         (
             "zh-Hans",
             "可选方案",
-            "5,000,000 点额度，自购买之日起一年后过期",
+            "Monthly — $10/月",
             "10,000,000 点额度，在每个计费周期结束时过期 —— Recurring top-up",
+            "5,000,000 点额度，自购买之日起一年后过期",
         ),
         (
             "en",
             "Available plans",
-            "5,000,000 credits, expire one year after purchase",
+            "Monthly — $10/month",
             "10,000,000 credits, expire at the end of each billing period — Recurring top-up",
+            "5,000,000 credits, expire one year after purchase",
         ),
     ] {
         cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
@@ -1897,16 +1922,138 @@ fn the_purchase_slides_plans_speak_the_readers_language(cx: &mut TestAppContext)
             &entries,
             "onboarding/plan/0",
             gpui::Role::ListBoxOption,
-            "Monthly — $10/mo",
+            recurring_name,
             recurring,
         );
         assert_probe_value(
             &entries,
             "onboarding/plan/1",
             gpui::Role::ListBoxOption,
+            // A one-time price has no cadence to say, so its line is the
+            // amount alone — the same in every locale.
             "One-time — $5",
             one_time,
         );
+    }
+}
+
+/// **The cadence is data across the boundary and words on this side.**
+///
+/// `PriceInfo::recurrence` is English composed in app-core (`/month`), so every
+/// recurring row ended in English inside a fully localized slide. The typed
+/// `PriceCadence` crosses instead and this layer words it — including a free
+/// price, whose amount app-core spells as the word "free", and a cadence this
+/// build has never seen, which still has to say something.
+#[gpui::test]
+fn the_plan_cadence_and_the_free_price_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.prices = vec![
+            eidola_app_core::PriceInfo {
+                id: "price_quarterly".into(),
+                product_name: "Quarterly".into(),
+                product_description: None,
+                amount_display: "27.00 USD".into(),
+                recurrence: "/3xmonth".into(),
+                credits: 30_000_000,
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 2_700,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 3,
+                },
+            },
+            eidola_app_core::PriceInfo {
+                id: "price_free".into(),
+                product_name: "Sampler".into(),
+                product_description: None,
+                // What app-core spells for a price with no amount.
+                amount_display: "free".into(),
+                recurrence: String::new(),
+                credits: 1_000,
+                amount: None,
+                cadence: eidola_app_core::PriceCadence::OneTime,
+            },
+            eidola_app_core::PriceInfo {
+                id: "price_odd".into(),
+                product_name: "Fortnightly".into(),
+                product_description: None,
+                amount_display: "4.00 USD".into(),
+                recurrence: "/fortnight".into(),
+                credits: 4_000,
+                // An interval name this build has never heard of: the reader is
+                // still owed a cadence, so the catch-all says it with the
+                // upstream's own word.
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 400,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "fortnight".into(),
+                    count: 1,
+                },
+            },
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+
+    for (tag, quarterly, free, odd) in [
+        (
+            "en",
+            "Quarterly — 27.00 USD every 3 months",
+            "Sampler — Free",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+        (
+            "fr",
+            "Quarterly — 27.00 USD tous les 3 mois",
+            "Sampler — Gratuit",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+        (
+            "zh-Hans",
+            "Quarterly — 每 3 个月 27.00 USD",
+            "Sampler — 免费",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+        (
+            "en",
+            "Quarterly — 27.00 USD every 3 months",
+            "Sampler — Free",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        for (name, expected) in [
+            ("onboarding/plan/0", quarterly),
+            ("onboarding/plan/1", free),
+            ("onboarding/plan/2", odd),
+        ] {
+            let (_, entry) = entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(
+                entry.label.as_ref(),
+                expected,
+                "{tag}: {name} must say what it costs and how often"
+            );
+        }
     }
 }
 
@@ -1930,6 +2077,11 @@ fn a_single_credit_reads_as_one_and_a_pending_plan_says_it_is_opening(cx: &mut T
                 product_description: None,
                 amount_display: "$0.01".into(),
                 recurrence: String::new(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
                 credits: 1,
             },
             eidola_app_core::PriceInfo {
@@ -1938,6 +2090,11 @@ fn a_single_credit_reads_as_one_and_a_pending_plan_says_it_is_opening(cx: &mut T
                 product_description: None,
                 amount_display: "$5".into(),
                 recurrence: String::new(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
                 credits: 2,
             },
         ];
@@ -2680,7 +2837,15 @@ fn account_backends_stores(cx: &mut TestAppContext) -> Stores {
                 product_name: "Monthly".into(),
                 product_description: Some("Recurring top-up".into()),
                 amount_display: "$10".into(),
-                recurrence: "/mo".into(),
+                recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 10_000_000,
             },
             PriceInfo {
@@ -2689,6 +2854,11 @@ fn account_backends_stores(cx: &mut TestAppContext) -> Stores {
                 product_description: None,
                 amount_display: "$5".into(),
                 recurrence: "".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
                 credits: 5_000_000,
             },
         ];
