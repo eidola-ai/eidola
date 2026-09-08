@@ -25,6 +25,10 @@ pub mod overlay;
 pub mod participants;
 mod plans;
 pub mod probe;
+/// The local inference proxy's listener — the second door this process opens.
+/// TCP rather than a Unix socket, because the point is that another tool
+/// reaches it the way it reaches any OpenAI-compatible server.
+pub mod proxy;
 pub mod record;
 pub mod scrollbar;
 pub mod settings;

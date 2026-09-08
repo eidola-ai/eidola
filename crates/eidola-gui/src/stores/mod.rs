@@ -26,6 +26,7 @@ pub mod config;
 pub mod local_models;
 pub mod models;
 pub mod participants;
+pub mod proxy;
 pub mod record;
 pub mod space_settings;
 pub mod spaces;
@@ -47,6 +48,7 @@ pub use config::ConfigStore;
 pub use local_models::LocalModelsStore;
 pub use models::{BackendCatalog, ModelsStore};
 pub use participants::ParticipantsStore;
+pub use proxy::ProxyStore;
 pub use record::RecordStore;
 pub use space_settings::SpaceSettingsStore;
 pub use spaces::SpacesStore;
@@ -87,6 +89,11 @@ pub struct Stores {
     /// Per-space settings (cascade limit, router model) — the space
     /// inspector's data source; refreshed on `Change::Space`.
     pub space_settings: Entity<SpaceSettingsStore>,
+    /// The local inference proxy's configuration **and** its listener — one
+    /// store, because "what the reader asked for" and "what is bound" are one
+    /// question asked twice (see `stores/proxy.rs`). Refreshed on
+    /// `Change::Proxy`.
+    pub proxy: Entity<ProxyStore>,
     /// Bus-relay only — owns no rows. Record listings live in window-scoped
     /// reader entities (`RecordView`), which observe this store to learn
     /// that the local trail grew (see `stores/record.rs`).
@@ -178,6 +185,7 @@ impl Stores {
         let templates = cx.new(|_| TemplatesStore::stub(fixture.templates));
         let agents = cx.new(|_| AgentsStore::stub(fixture.agents));
         let space_settings = cx.new(|_| SpaceSettingsStore::stub(fixture.space_settings));
+        let proxy = cx.new(|_| ProxyStore::stub(fixture.proxy_settings, fixture.proxy_keys));
         let record = cx.new(|_| RecordStore::new());
         Self {
             app_core: None,
@@ -193,6 +201,7 @@ impl Stores {
             templates,
             agents,
             space_settings,
+            proxy,
             record,
         }
     }
@@ -218,6 +227,7 @@ impl Stores {
         let templates = cx.new(|_| TemplatesStore::new(app_core.clone()));
         let agents = cx.new(|_| AgentsStore::new(app_core.clone()));
         let space_settings = cx.new(|_| SpaceSettingsStore::new(app_core.clone()));
+        let proxy = cx.new(|_| ProxyStore::new(app_core.clone()));
         let record = cx.new(|_| RecordStore::new());
         Self {
             app_core,
@@ -233,6 +243,7 @@ impl Stores {
             templates,
             agents,
             space_settings,
+            proxy,
             record,
         }
     }
@@ -284,6 +295,11 @@ pub struct StoresStub {
     pub agents: Option<Vec<eidola_app_core::GlobalAgentInfo>>,
     /// One space's fixture settings (the space inspector's scene).
     pub space_settings: Option<(String, eidola_app_core::SpaceSettings)>,
+    /// The local inference proxy's fixture configuration (the Proxy settings
+    /// pane's scene). `None` leaves the cell `NotLoaded`.
+    pub proxy_settings: Option<eidola_app_core::proxy::ProxySettings>,
+    /// Fixture proxy keys. An empty list leaves the listing `NotLoaded`.
+    pub proxy_keys: Vec<eidola_app_core::proxy::ProxyKeyInfo>,
 }
 
 /// Install the single app-lifetime bus bridge: a task on `AppCore`'s tokio
@@ -569,6 +585,14 @@ fn dispatch_change(stores: &Stores, change: Change, origin: ChangeOrigin, seq: u
                 .spaces
                 .update(cx, |s, cx| s.notify_participants_changed(cx));
         }
+        // The proxy's settings, its exposed backends, or its keys moved. The
+        // store re-reads both cells **and reconciles its listener** against
+        // what it read, so a proxy enabled or rebound in another window moves
+        // this process's socket too — the socket lives here, wherever the
+        // click happened.
+        Change::Proxy => {
+            stores.proxy.update(cx, |s, cx| s.refresh(cx));
+        }
     }
 }
 
@@ -598,6 +622,7 @@ fn refresh_everything(stores: &Stores, cx: &mut App) {
     stores.participants.update(cx, |s, cx| s.refresh_all(cx));
     stores.agents.update(cx, |s, cx| s.refresh(cx));
     stores.space_settings.update(cx, |s, cx| s.refresh_all(cx));
+    stores.proxy.update(cx, |s, cx| s.refresh(cx));
     // A dropped change may have been a Record write — let open Record
     // windows mark themselves stale.
     stores.record.update(cx, |s, cx| s.notify_changed(cx));
