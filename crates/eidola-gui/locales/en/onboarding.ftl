@@ -16,10 +16,16 @@
 # The two legal documents are named by their **published titles**, which stay
 # English in every locale because that is the text the reader is agreeing to and
 # the name they will find at the other end of the link. The sentences around
-# them are chrome and do localize. Terms, not messages, so a locale cannot
-# translate one by accident.
--terms-of-service = Terms of Service
--privacy-policy = Privacy Policy
+# them are chrome and do localize.
+#
+# The `-fixed-` prefix is what makes that a rule rather than a hope: a locale
+# resource defining a term whose id begins `-fixed-` is a **build error**
+# (codegen rule 14). Without it a translation could define its own
+# `-terms-of-service`, override the source's through `add_resource_overriding`,
+# and rename the document inside the sentence a reader affirms — with nothing
+# refusing it.
+-fixed-terms-of-service = Terms of Service
+-fixed-privacy-policy = Privacy Policy
 
 # The window's OS-level name. It paints nothing (the title bar is transparent)
 # but it names the window in the macOS Window menu, the window switcher and
@@ -87,7 +93,7 @@ onboarding-get-started-body =
 onboarding-create-account-body =
     ## Create an account
 
-    Please read and understand our { -terms-of-service } and { -privacy-policy }.
+    Please read and understand our { -fixed-terms-of-service } and { -fixed-privacy-policy }.
 
 onboarding-new-account-body =
     ## Your new account
@@ -130,7 +136,7 @@ onboarding-cta-skip-account = Continue without an account — on-device models o
 # affirm, so translate it plainly and completely — no abbreviation, no
 # rewording of what is being agreed to. The two document names are terms and
 # stay in English (see the note at the top).
-onboarding-consent-agree = I agree to the { -terms-of-service } and { -privacy-policy }.
+onboarding-consent-agree = I agree to the { -fixed-terms-of-service } and { -fixed-privacy-policy }.
 # Shown while the current documents are being fetched. Their versions are what
 # acceptance is recorded against, so the slide waits rather than guessing.
 onboarding-terms-loading = Checking the current documents…
@@ -144,8 +150,8 @@ onboarding-link-repository = The Eidola code repository
 # The two published policies, linked when the server names no documents of its
 # own. Their titles do not translate; these exist so the link rows and the
 # consent sentence read one name from one place.
-onboarding-link-terms-of-service = { -terms-of-service }
-onboarding-link-privacy-policy = { -privacy-policy }
+onboarding-link-terms-of-service = { -fixed-terms-of-service }
+onboarding-link-privacy-policy = { -fixed-privacy-policy }
 # A required document's link label: its published name plus the version
 # acceptance will be recorded for. One message rather than a name with a
 # version appended, so a locale can put the two in its own order.

@@ -65,7 +65,20 @@
 //!     to fill.
 //! 13. **No duplicate message or term ids.** A later definition silently shadows
 //!     the earlier one, so it is refused instead.
-//! 14. **No message may resolve past Fluent's placeable limit**
+//! 14. **A term the source marks fixed may not be redefined by a translation**
+//!     ([`FIXED_TERM_PREFIX`]). An id beginning `-fixed-` names text that is
+//!     deliberately identical in every locale — a published legal document's
+//!     title, a wordmark — and the sentences around it localize while it does
+//!     not. Nothing else refuses one: rule 4 walks *messages*, so a translation
+//!     defining such a term passed every check and then won at runtime, because
+//!     the bundle is built with `add_resource_overriding`. A locale could
+//!     therefore rename the Terms of Service inside the sentence a reader
+//!     affirms, silently, with no build error and no test asserting that exact
+//!     sentence in that exact locale.
+//!
+//! *Cost*
+//!
+//! 15. **No message may resolve past Fluent's placeable limit**
 //!     ([`MAX_PLACEABLES`]). The resolver counts placeables *through* reference
 //!     expansion on one per-format counter and bails at 100, returning the
 //!     message truncated or with raw ids in it — so a legal, acyclic chain that
@@ -617,7 +630,31 @@ pub fn check_locale(primary: &LocaleDef, base: Option<&LocaleDef>) -> Result<(),
 /// translate it, so the variables it needs are English's, not this locale's; a
 /// check that looked only inside the translation would pass and the runtime
 /// would render an unfilled placeable.
+/// Terms whose text is deliberately the same in every locale are marked by this
+/// prefix on their id, and rule 14 refuses a translation that defines one.
+///
+/// A convention rather than a list in this file: what is fixed is a product
+/// decision (a published document's title, a wordmark), the FTL is where that
+/// decision is legible, and a new one then needs no build change.
+pub const FIXED_TERM_PREFIX: &str = "fixed-";
+
 pub fn check_translation(en: &LocaleDef, other: &LocaleDef) -> Result<(), String> {
+    // Rule 15. Checked before the message walk because it is about the resource
+    // as a whole: a fixed term is refused whether or not anything in *this*
+    // locale references it, since the source's own sentences do.
+    for term in &other.terms {
+        if let Some(name) = term.id.strip_prefix(FIXED_TERM_PREFIX) {
+            return Err(format!(
+                "{}: term `-{}` is fixed — `-{}` names text that is deliberately the same in \
+                 every locale (a published document's title, a wordmark), and the sentences \
+                 around it are what localize. A locale that defines it overrides the source's \
+                 through `add_resource_overriding`, silently renaming it inside every message \
+                 that references it. Translate the sentence, not the name.",
+                other.tag, term.id, name
+            ));
+        }
+    }
+
     for message in &other.messages {
         let Some(source) = en.message(&message.id) else {
             return Err(format!(

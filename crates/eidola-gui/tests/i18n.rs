@@ -569,6 +569,58 @@ fn attributes_and_duplicates_are_refused_rather_than_quietly_ignored() {
     assert!(err.contains("duplicate"), "{err}");
 }
 
+/// **A translation may not redefine a term the source marks fixed** (rule 14).
+///
+/// `-fixed-*` names text deliberately identical in every locale — a published
+/// legal document's title, a wordmark — while the sentences around it localize.
+/// Nothing else refused one: `check_translation` walks *messages*, so a locale
+/// defining such a term passed the build and then won at runtime, because the
+/// bundle is `add_resource_overriding`. That is a locale renaming the Terms of
+/// Service inside the sentence a reader affirms.
+#[test]
+fn a_translation_may_not_redefine_a_fixed_term() {
+    let en = parse(
+        "en",
+        "-fixed-terms-of-service = Terms of Service
+consent = I agree to the          { -fixed-terms-of-service }.
+",
+    );
+
+    // The whole point: this parses, resolves, and would have shipped.
+    let fr = parse(
+        "fr",
+        "-fixed-terms-of-service = Conditions inventées
+consent = J'accepte les          { -fixed-terms-of-service }.
+",
+    );
+    codegen::check_locale(&fr, Some(&en)).expect("it resolves — which is why it needed refusing");
+
+    let err = codegen::check_translation(&en, &fr).expect_err("a fixed term must be refused");
+    assert!(
+        err.contains("-fixed-terms-of-service") && err.contains("fr"),
+        "the refusal must name the term and the locale: {err}"
+    );
+
+    // An ordinary term is still a translation's to override — only the marked
+    // ones are fixed.
+    let en = parse(
+        "en",
+        "-tone = calm
+line = Stay { -tone }.
+",
+    );
+    let fr = parse(
+        "fr",
+        "-tone = calme
+line = Restez { -tone }.
+",
+    );
+    codegen::check_translation(&en, &fr).expect("an unmarked term may be translated");
+    // The shipped tree is held to the same rule by
+    // `the_shipped_locales_satisfy_the_contract`, which runs every locale
+    // through `check_translation`.
+}
+
 /// A term has its own scope, so a variable in a term body can never be filled.
 #[test]
 fn a_term_reading_a_message_variable_is_refused() {

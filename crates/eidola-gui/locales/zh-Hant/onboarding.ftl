@@ -1,6 +1,6 @@
 # The onboarding window (src/onboarding/), Traditional Chinese.
 #
-# `-terms-of-service`, `-privacy-policy`, `onboarding-link-terms-of-service`,
+# `-fixed-terms-of-service`, `-fixed-privacy-policy`, `onboarding-link-terms-of-service`,
 # `onboarding-link-privacy-policy` and `onboarding-account-id-placeholder` are
 # deliberately absent: the two published document titles stay English in every
 # locale, and the id placeholder is a shape rather than words. They fall back to
@@ -53,7 +53,7 @@ onboarding-get-started-body =
 onboarding-create-account-body =
     ## 建立帳戶
 
-    請閱讀並理解我們的 { -terms-of-service } 與 { -privacy-policy }。
+    請閱讀並理解我們的 { -fixed-terms-of-service } 與 { -fixed-privacy-policy }。
 
 onboarding-new-account-body =
     ## 你的新帳戶
@@ -80,7 +80,7 @@ onboarding-cta-new-account = 我需要一個新帳戶。
 onboarding-cta-existing-account = 我已經有帳戶了。
 onboarding-cta-skip-account = 不使用帳戶繼續——僅使用裝置上的模型。
 
-onboarding-consent-agree = 我同意 { -terms-of-service } 與 { -privacy-policy }。
+onboarding-consent-agree = 我同意 { -fixed-terms-of-service } 與 { -fixed-privacy-policy }。
 onboarding-terms-loading = 正在檢查目前的文件…
 onboarding-terms-retry = 重試
 

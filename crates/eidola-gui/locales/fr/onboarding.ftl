@@ -1,6 +1,6 @@
 # The onboarding window (src/onboarding/), French.
 #
-# `-terms-of-service`, `-privacy-policy`, `onboarding-link-terms-of-service`,
+# `-fixed-terms-of-service`, `-fixed-privacy-policy`, `onboarding-link-terms-of-service`,
 # `onboarding-link-privacy-policy` and `onboarding-account-id-placeholder` are
 # deliberately absent: the two published document titles stay English in every
 # locale, and the id placeholder is a shape rather than words. They fall back to
@@ -53,7 +53,7 @@ onboarding-get-started-body =
 onboarding-create-account-body =
     ## Créer un compte
 
-    Veuillez lire et comprendre nos { -terms-of-service } et { -privacy-policy }.
+    Veuillez lire et comprendre nos { -fixed-terms-of-service } et { -fixed-privacy-policy }.
 
 onboarding-new-account-body =
     ## Votre nouveau compte
@@ -80,7 +80,7 @@ onboarding-cta-new-account = J'ai besoin d'un nouveau compte.
 onboarding-cta-existing-account = J'ai déjà un compte.
 onboarding-cta-skip-account = Continuer sans compte — modèles sur l'appareil uniquement.
 
-onboarding-consent-agree = J'accepte les { -terms-of-service } et la { -privacy-policy }.
+onboarding-consent-agree = J'accepte les { -fixed-terms-of-service } et la { -fixed-privacy-policy }.
 onboarding-terms-loading = Vérification des documents actuels…
 onboarding-terms-retry = Réessayer
 
