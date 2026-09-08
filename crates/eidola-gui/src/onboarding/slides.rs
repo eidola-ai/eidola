@@ -32,7 +32,7 @@ use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorState};
 use eidola_app_core::error::AppError;
 use eidola_app_core::{PriceInfo, TermsDocument};
 
-use super::{CheckoutFailure, VerifyFailure};
+use super::{CheckoutFailure, Slide, VerifyFailure};
 use crate::plans::{self, format_credits};
 use crate::probe::Probe as _;
 use crate::space_view::{TITLE_BAR_RESERVE, prose_style};
@@ -64,7 +64,7 @@ pub(super) struct Pause {
 
 impl RenderOnce for Pause {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let body = crate::i18n::msg::onboarding_pause_body(cx);
+        let body = slide_body(Slide::Pause, cx);
         let cta = cta_button(
             "pause",
             crate::i18n::msg::onboarding_cta_pause(cx),
@@ -85,7 +85,7 @@ pub(super) struct Tool {
 
 impl RenderOnce for Tool {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let body = crate::i18n::msg::onboarding_tool_body(cx);
+        let body = slide_body(Slide::Tool, cx);
         let cta = cta_button(
             "tool",
             crate::i18n::msg::onboarding_cta_understood(cx),
@@ -106,7 +106,7 @@ pub(super) struct Control {
 
 impl RenderOnce for Control {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let body = crate::i18n::msg::onboarding_control_body(cx);
+        let body = slide_body(Slide::Control, cx);
         let extras = link_row(
             "the-eidola-code-repository",
             crate::i18n::msg::onboarding_link_repository(cx),
@@ -134,7 +134,7 @@ pub(super) struct Responsibility {
 
 impl RenderOnce for Responsibility {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let body = crate::i18n::msg::onboarding_responsibility_body(cx);
+        let body = slide_body(Slide::Responsibility, cx);
         let cta = cta_button(
             "responsibility",
             crate::i18n::msg::onboarding_cta_understood(cx),
@@ -163,7 +163,7 @@ impl RenderOnce for GetStarted {
         // The unlinkability link's target is the app's, not the translation's:
         // a URL living inside prose is a thing a translator can retarget, and
         // this one is a privacy claim's evidence.
-        let body = crate::i18n::msg::onboarding_get_started_body(cx, UNLINKABILITY_URL);
+        let body = slide_body(Slide::GetStarted, cx);
         // One sentence, said once. The visible text and the accessible name
         // used to differ by a full stop, which is the failure the a11y-label
         // rule names — invisible in English, audible everywhere else — and it
@@ -374,7 +374,7 @@ impl RenderOnce for CreateAccount {
 
         slide_frame(
             "create-account",
-            crate::i18n::msg::onboarding_create_account_body(cx),
+            slide_body(Slide::CreateAccount, cx),
             Some(extras.into_any_element()),
             cta.into_any_element(),
             window,
@@ -424,7 +424,7 @@ impl RenderOnce for NewAccount {
         .into_any_element();
         slide_frame(
             "new-account",
-            crate::i18n::msg::onboarding_new_account_body(cx),
+            slide_body(Slide::NewAccount, cx),
             Some(extras.into_any_element()),
             cta,
             window,
@@ -517,7 +517,7 @@ impl RenderOnce for ExistingAccount {
 
         slide_frame(
             "existing-account",
-            crate::i18n::msg::onboarding_existing_account_body(cx),
+            slide_body(Slide::ExistingAccount, cx),
             Some(extras.into_any_element()),
             ctas,
             window,
@@ -614,12 +614,33 @@ impl RenderOnce for Purchase {
         .into_any_element();
         slide_frame(
             "purchase",
-            crate::i18n::msg::onboarding_purchase_body(cx),
+            slide_body(Slide::Purchase, cx),
             Some(extras),
             cta,
             window,
             cx,
         )
+    }
+}
+
+/// The prose a slide shows, in the reader's active locale.
+///
+/// **One function, so the render and any test agree about which message a slide
+/// carries.** It also keeps the one argument-bearing body honest: the
+/// unlinkability link's target is supplied here rather than written into the
+/// translation, so no locale can send a reader somewhere else for the evidence
+/// behind a privacy claim.
+pub(super) fn slide_body(slide: Slide, cx: &App) -> SharedString {
+    match slide {
+        Slide::Pause => crate::i18n::msg::onboarding_pause_body(cx),
+        Slide::Tool => crate::i18n::msg::onboarding_tool_body(cx),
+        Slide::Control => crate::i18n::msg::onboarding_control_body(cx),
+        Slide::Responsibility => crate::i18n::msg::onboarding_responsibility_body(cx),
+        Slide::GetStarted => crate::i18n::msg::onboarding_get_started_body(cx, UNLINKABILITY_URL),
+        Slide::CreateAccount => crate::i18n::msg::onboarding_create_account_body(cx),
+        Slide::NewAccount => crate::i18n::msg::onboarding_new_account_body(cx),
+        Slide::ExistingAccount => crate::i18n::msg::onboarding_existing_account_body(cx),
+        Slide::Purchase => crate::i18n::msg::onboarding_purchase_body(cx),
     }
 }
 

@@ -372,6 +372,22 @@ impl OnboardingView {
         self.create_error.as_ref().map(|e| e.to_string())
     }
 
+    /// The prose a slide carries, in the active locale — the same call the
+    /// render makes, so the two cannot disagree about which message a slide
+    /// shows.
+    #[doc(hidden)]
+    pub fn slide_body_for_test(slide: Slide, cx: &App) -> SharedString {
+        slides::slide_body(slide, cx)
+    }
+
+    /// Record a refused creation without a backend, so a test can watch what
+    /// the reader is told about it.
+    #[doc(hidden)]
+    pub fn set_create_error_for_test(&mut self, error: AppError, cx: &mut Context<Self>) {
+        self.create_error = Some(error);
+        cx.notify();
+    }
+
     /// The existing-account input editors (tests set their values directly).
     #[doc(hidden)]
     pub fn existing_inputs_for_test(&self) -> (Entity<InputState>, Entity<InputState>) {

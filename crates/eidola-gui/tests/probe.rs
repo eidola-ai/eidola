@@ -1755,6 +1755,132 @@ fn onboarding_consent_slide_links_the_documents_it_will_submit(cx: &mut TestAppC
     );
 }
 
+/// **The consent surface speaks the reader's language — labels included.**
+///
+/// This is the one screen in the app where somebody affirms something, and the
+/// accessible name *is* the localized string: an English literal beside a
+/// translated accessor is invisible in English and audible everywhere else.
+/// So the locale is switched with nothing re-emitted and the recorded labels
+/// are read again.
+///
+/// The two document titles deliberately do **not** move: they are the published
+/// names of the texts being agreed to, and the name a reader will find at the
+/// other end of the link. Only the sentence around them localizes.
+#[gpui::test]
+fn the_consent_surface_speaks_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_terms_for_test(
+            eidola_gui::loadable::Loadable::loaded(vec![eidola_app_core::TermsDocument {
+                document: "privacy_policy".into(),
+                version: 7,
+                url: "https://example.invalid/privacy/".into(),
+                sha256: "b".repeat(64),
+            }]),
+            cx,
+        );
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+    });
+
+    for (tag, consent, create, document) in [
+        (
+            "en",
+            "I agree to the Terms of Service and Privacy Policy.",
+            "Create a new account.",
+            "Privacy Policy (version 7)",
+        ),
+        (
+            "fr",
+            "J'accepte les Terms of Service et la Privacy Policy.",
+            "Créer un nouveau compte.",
+            "Privacy Policy (version 7)",
+        ),
+        (
+            "zh-Hant",
+            "我同意 Terms of Service 與 Privacy Policy。",
+            "建立一個新帳戶。",
+            "Privacy Policy（版本 7）",
+        ),
+        (
+            "en",
+            "I agree to the Terms of Service and Privacy Policy.",
+            "Create a new account.",
+            "Privacy Policy (version 7)",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(&entries, "onboarding/agree", gpui::Role::CheckBox, consent);
+        assert_probe(
+            &entries,
+            "onboarding/cta/create",
+            gpui::Role::Button,
+            create,
+        );
+        assert_probe(
+            &entries,
+            "onboarding/link/privacy-policy",
+            gpui::Role::Link,
+            document,
+        );
+    }
+}
+
+/// **The quiet third choice says one thing, once.** Its visible sentence and
+/// its accessible name used to differ by a full stop — the failure the a11y
+/// rule names, invisible in English. One message serves both, and the label
+/// follows the reader.
+#[gpui::test]
+fn the_account_free_choice_reads_the_same_to_everyone(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+    });
+
+    for (tag, label) in [
+        ("en", "Continue without an account — on-device models only."),
+        (
+            "fr",
+            "Continuer sans compte — modèles sur l'appareil uniquement.",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(
+            &entries,
+            "onboarding/cta/skip-account",
+            gpui::Role::Button,
+            label,
+        );
+        assert_probe(&entries, "onboarding/back/1", gpui::Role::Button, {
+            if tag == "en" {
+                "Go to the previous slide"
+            } else {
+                "Aller à la diapositive précédente"
+            }
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Record window — the raw local trail. Listing rows, section tabs, refresh,
 // and the load-more affordance are all probed (indexed row names so a driver
