@@ -79,6 +79,24 @@ const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4096;
 /// rather than changed from here.
 const RECORD_BODY_MAX_BYTES: usize = 1 << 20;
 
+/// The most of one upstream answer this app will read at all.
+///
+/// **The retention cap's other half, and the one the process feels.**
+/// [`RECORD_BODY_MAX_BYTES`] bounds what a `request` row keeps; it cannot bound
+/// what reading the answer costs, because a blocking transport buffers the
+/// whole body before anything can seal it. An exposed backend declares no
+/// ceiling of its own and a downstream caller names its own `max_tokens`, so
+/// one request against a backend that answers without end — or an intermediary
+/// streaming an enormous error page — would cost this process the whole answer
+/// in memory, times however many callers the listener admits.
+///
+/// Eight megabytes is far past any completion a model produces (a 128k-token
+/// answer is around half a megabyte) and far short of a size worth holding. A
+/// body that reaches it is not an answer this app can use — it will not parse —
+/// so the read stops there, the exchange is recorded as the truncation it is,
+/// and the caller gets the gateway failure.
+const MAX_RESPONSE_BYTES: usize = 8 << 20;
+
 /// How long one backend has to answer `/v1/models` before it is treated as
 /// unavailable for this listing.
 ///
@@ -133,10 +151,9 @@ impl RecordedBody {
     /// The bytes to record for a stream, with the note when they are not all
     /// of them and the note for how the stream ended.
     ///
-    /// **Streams are the only accumulating bodies**: the blocking transports
-    /// have their whole text in hand and go through [`seal_recorded_body`]
-    /// directly, so there is no unqualified `seal` here to reach for by
-    /// accident — an ending is not optional information about a stream.
+    /// **Neither transport has an unqualified `seal` to reach for**: an ending
+    /// is not optional information about a body, and a blocking read has an
+    /// ending of its own now that it is bounded — see [`RecordedBody::seal_blocking`].
     fn seal_stream(self, delivery: StreamDelivery) -> Vec<u8> {
         let mut out = seal_recorded_body(self.kept, self.received);
         if let Some(note) = delivery.note() {
@@ -144,6 +161,109 @@ impl RecordedBody {
         }
         out
     }
+
+    /// The bytes to record for a blocking answer, with the note when the
+    /// ceiling — not the upstream — is why the read stopped.
+    fn seal_blocking(self, read: BodyRead) -> Vec<u8> {
+        let mut out = seal_recorded_body(self.kept, self.received);
+        if let Some(note) = read.note() {
+            out.extend_from_slice(note.as_bytes());
+        }
+        out
+    }
+}
+
+/// How a blocking answer's read ended.
+///
+/// The same rule the stream's [`StreamDelivery`] states, on the transport that
+/// now needs it for the same reason: a read this app ended at its own ceiling
+/// looks byte-for-byte like an upstream that finished, so a row carrying no
+/// marker would be a partial claiming to be whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyRead {
+    /// The upstream closed on its own and everything it sent was read.
+    Complete,
+    /// [`MAX_RESPONSE_BYTES`] stopped the read. What is recorded stops where
+    /// this app stopped reading, not where the upstream stopped sending.
+    CeilingReached,
+}
+
+impl BodyRead {
+    fn note(self) -> Option<String> {
+        match self {
+            BodyRead::Complete => None,
+            BodyRead::CeilingReached => Some(format!(
+                "\n\n[eidola: the read stopped at the {MAX_RESPONSE_BYTES}-byte ceiling this app \
+                 holds for one answer. What is above is everything this app received; the rest \
+                 was never read, and no answer was passed on.]\n"
+            )),
+        }
+    }
+}
+
+/// One blocking upstream answer, read under [`MAX_RESPONSE_BYTES`].
+#[derive(Default)]
+struct CappedBody {
+    /// What was read, to the ceiling.
+    bytes: Vec<u8>,
+    /// How much arrived — larger than `bytes` only where the ceiling stopped
+    /// the read part-way through a chunk.
+    received: usize,
+    /// Whether the ceiling is why the read stopped.
+    over_ceiling: bool,
+}
+
+impl CappedBody {
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.bytes)
+    }
+
+    /// What the Record keeps of this answer, stating both the retention cap
+    /// and the ceiling where either applied.
+    fn recorded(&self) -> Vec<u8> {
+        let mut kept = RecordedBody::default();
+        kept.push(&self.bytes);
+        // The ceiling can stop the read part-way through a chunk, so more
+        // arrived than was kept to parse; the Record states the larger number.
+        kept.received = self.received;
+        kept.seal_blocking(if self.over_ceiling {
+            BodyRead::CeilingReached
+        } else {
+            BodyRead::Complete
+        })
+    }
+}
+
+/// Read a blocking answer, bounded **as the bytes arrive**.
+///
+/// `Response::text()` buffers whatever the upstream sends before anything can
+/// cap it, which is the blocking twin of the defect the stream's
+/// [`RecordedBody`] already answers — one rule, both transports. The ceiling
+/// here is [`MAX_RESPONSE_BYTES`] rather than the retention cap: what the
+/// Record keeps and what this app may hold to answer a caller are different
+/// numbers, and only the second one bounds the process.
+async fn read_capped_body(response: reqwest::Response) -> Result<CappedBody, AppError> {
+    use futures_util::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut body = CappedBody::default();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AppError::Network {
+            message: format!(
+                "failed to read the response: {}",
+                crate::error::request_error_text(e)
+            ),
+        })?;
+        body.received += chunk.len();
+        let room = MAX_RESPONSE_BYTES.saturating_sub(body.bytes.len());
+        if chunk.len() > room {
+            body.bytes.extend_from_slice(&chunk[..room]);
+            body.over_ceiling = true;
+            break;
+        }
+        body.bytes.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// How a proxied stream ended, as the Record has to state it.
@@ -982,15 +1102,9 @@ impl Inner {
             self.bus.emit(Change::Record);
         }
         let status = response.status();
-        let text = match response.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                let error = AppError::Network {
-                    message: format!(
-                        "failed to read the response: {}",
-                        crate::error::request_error_text(e)
-                    ),
-                };
+        let answer = match read_capped_body(response).await {
+            Ok(answer) => answer,
+            Err(error) => {
                 self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
                     .await;
                 self.record_proxy_request(
@@ -1009,12 +1123,15 @@ impl Inner {
             }
         };
         let response_at = now_ms();
+        let text = answer.text();
         // **A body that does not parse is not an answer.** Coercing it to JSON
         // `null` and keeping the upstream's `2xx` would hand a downstream tool
         // an apparent success carrying a fabricated body — a truncated
         // response or an intermediary's HTML error page reads as "the model
         // said nothing". The exchange is still recorded and the hold still
         // settles below; only the *answer* becomes the gateway failure it is.
+        // A body the ceiling stopped lands here too, and by the same route: it
+        // is a fragment, so it does not parse, so it is not an answer.
         let parsed: Option<Value> = serde_json::from_str(&text).ok();
         self.settle_proxy_refund(
             &db_conn,
@@ -1029,7 +1146,7 @@ impl Inner {
             &headers,
             &body,
             Some(status.as_u16()),
-            seal_recorded_body(text.as_bytes().to_vec(), text.len()),
+            answer.recorded(),
             None,
             nonce,
             request_at,
@@ -1161,7 +1278,11 @@ impl Inner {
         }
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            // Bounded like every other blocking read on this path: an error
+            // body is a body, and an intermediary's is the one most likely to
+            // be enormous.
+            let answer = read_capped_body(response).await.unwrap_or_default();
+            let text = answer.text();
             // **A stream that never opened can still carry its refund.** The
             // server spends the credential before it dispatches, so every
             // failure after the nullifier is recorded — request validation,
@@ -1185,7 +1306,7 @@ impl Inner {
                 &headers,
                 &body,
                 Some(status.as_u16()),
-                seal_recorded_body(text.as_bytes().to_vec(), text.len()),
+                answer.recorded(),
                 None,
                 nonce,
                 request_at,
@@ -1219,7 +1340,8 @@ impl Inner {
         // completion, refund and all — the credential is spent either way, so
         // the body is read for its token before this fails.
         if !is_event_stream(response.headers()) {
-            let text = response.text().await.unwrap_or_default();
+            let answer = read_capped_body(response).await.unwrap_or_default();
+            let text = answer.text();
             let inline = serde_json::from_str::<Value>(&text)
                 .ok()
                 .and_then(|body| body.get("refund").cloned());
@@ -1230,7 +1352,7 @@ impl Inner {
                 &headers,
                 &body,
                 Some(status.as_u16()),
-                seal_recorded_body(text.as_bytes().to_vec(), text.len()),
+                answer.recorded(),
                 None,
                 nonce,
                 request_at,
@@ -1742,6 +1864,78 @@ mod tests {
         // The note is the only thing past the cap, and it names itself.
         assert!(sealed.len() > RECORD_BODY_MAX_BYTES);
         assert!(sealed.len() < RECORD_BODY_MAX_BYTES + 1024);
+    }
+
+    /// A one-shot loopback HTTP server answering with `body`. The reads this
+    /// module bounds happen on a `reqwest::Response`, so the only honest way to
+    /// hold the bound is against a real one.
+    async fn serving_once(body: Vec<u8>) -> std::net::SocketAddr {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
+            let _ = socket.shutdown().await;
+        });
+        addr
+    }
+
+    /// **The ceiling bounds what the read holds, not only what is written
+    /// down.** The retention cap keeps a `request` row honest while the process
+    /// still buffers the whole answer — which is the half a caller naming its
+    /// own ceiling against a backend that declares none can spend. So the read
+    /// stops as the bytes arrive, and the Record says that is why it stopped.
+    #[tokio::test]
+    async fn a_blocking_answer_is_bounded_as_it_arrives() {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let client = reqwest::Client::builder().build().expect("client");
+
+        let addr = serving_once(vec![b'x'; MAX_RESPONSE_BYTES + 4096]).await;
+        let response = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("send");
+        let answer = read_capped_body(response).await.expect("read");
+        assert!(
+            answer.bytes.len() <= MAX_RESPONSE_BYTES,
+            "the read is bounded while it runs, not after: {} bytes",
+            answer.bytes.len()
+        );
+        assert!(answer.over_ceiling, "and it knows why it stopped");
+        let recorded = String::from_utf8_lossy(&answer.recorded()).to_string();
+        assert!(
+            recorded.contains("keeps the first"),
+            "the retention cap still speaks"
+        );
+        assert!(
+            recorded.contains("never read"),
+            "and a read this app ended is not an upstream that finished"
+        );
+
+        // An ordinary answer is read whole and claims nothing.
+        let addr = serving_once(br#"{"ok":true}"#.to_vec()).await;
+        let response = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("send");
+        let answer = read_capped_body(response).await.expect("read");
+        assert_eq!(answer.text(), r#"{"ok":true}"#);
+        assert!(!answer.over_ceiling);
+        assert_eq!(answer.recorded(), br#"{"ok":true}"#.to_vec());
     }
 
     /// **The cap was the first face of "a partial must never claim to be
