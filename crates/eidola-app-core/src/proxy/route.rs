@@ -1743,6 +1743,96 @@ mod tests {
         assert!(sealed.len() < RECORD_BODY_MAX_BYTES + 1024);
     }
 
+    /// **The cap was the first face of "a partial must never claim to be
+    /// whole"; the ending is the second.** Neither of the two ways a stream
+    /// stops short is visible in `received` versus `kept`: an upstream read
+    /// ended on purpose looks byte-for-byte like an upstream that finished, and
+    /// a delivery that stopped short looks like one that did not. Recorded with
+    /// no marker, a deliberate partial reads as a complete answer — and on the
+    /// zero-spend exit that is exactly what happened, since the read ends the
+    /// moment the caller does and `received == kept`.
+    #[test]
+    fn a_stream_that_stopped_short_says_which_way_it_stopped() {
+        assert_eq!(stream_delivery(false, false), StreamDelivery::Complete);
+        assert_eq!(
+            stream_delivery(true, false),
+            StreamDelivery::CallerGoneReadOn,
+            "the caller went, the read went on to the refund in the tail"
+        );
+        assert_eq!(
+            stream_delivery(true, true),
+            StreamDelivery::CallerGoneReadEnded,
+            "nothing to settle, so the read ended with the caller"
+        );
+
+        // A complete delivery adds nothing; either partial names itself.
+        let whole = |ending| {
+            let mut body = RecordedBody::default();
+            body.push(
+                b"data: hello
+
+",
+            );
+            String::from_utf8(body.seal_stream(ending)).expect("utf-8")
+        };
+        assert_eq!(
+            whole(StreamDelivery::Complete),
+            "data: hello
+
+"
+        );
+        assert!(
+            whole(StreamDelivery::CallerGoneReadEnded).contains("stops where this app stopped"),
+            "a read this app ended is not the upstream's ending"
+        );
+        assert!(
+            whole(StreamDelivery::CallerGoneReadOn).contains("is not what was delivered"),
+            "a whole upstream answer nobody received says so"
+        );
+
+        // And the two markers compose: an over-cap body that was also cut
+        // short carries both facts.
+        let mut big = RecordedBody::default();
+        big.push(&vec![b'x'; RECORD_BODY_MAX_BYTES + 4096]);
+        let sealed = String::from_utf8_lossy(&big.seal_stream(StreamDelivery::CallerGoneReadEnded))
+            .to_string();
+        assert!(sealed.contains("keeps the first"), "the cap still speaks");
+        assert!(
+            sealed.contains("stops where this app stopped"),
+            "and so does the ending"
+        );
+    }
+
+    #[test]
+    fn a_response_that_is_not_server_sent_events_is_not_taken_for_one() {
+        use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_str(value).expect("header"));
+            is_event_stream(&headers)
+        };
+        assert!(with("text/event-stream"));
+        assert!(
+            with("text/event-stream; charset=utf-8"),
+            "parameters are the sender's business"
+        );
+        assert!(
+            with("Text/Event-Stream"),
+            "the media type is case-insensitive"
+        );
+        // The two shapes this exists for.
+        assert!(
+            !with("application/json"),
+            "a backend that ignored `stream: true`"
+        );
+        assert!(!with("text/html"), "an intermediary's error page");
+        // Permissive where the rule cannot help: an unlabelled body is left
+        // alone rather than refused, since a compliant SSE server always sets
+        // the header and the cases above both name one.
+        assert!(is_event_stream(&HeaderMap::new()));
+    }
+
     #[test]
     fn a_backend_that_will_not_start_an_engine_offers_only_what_runs() {
         // The managed `local` singleton always starts on demand, so the

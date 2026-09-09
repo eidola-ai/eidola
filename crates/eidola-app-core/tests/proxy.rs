@@ -1068,3 +1068,274 @@ fn a_ready_engine_whose_file_vanished_is_still_offered() {
         assert_eq!(listed, 1, "one ready engine, one entry: {body}");
     });
 }
+
+/// REGRESSION: **the latch is asked where the spending starts, not where the
+/// request arrives.**
+///
+/// This function grew an `await` between the check and the dispatch twice —
+/// authentication, then `Limited::collect()` reading a body a slow client is
+/// still uploading — and each time the gap re-opened: a request that had passed
+/// every check resumed after teardown began and went on to spend. A third point
+/// check would only move the next gap, so the authoritative question is asked
+/// inside `completions_response`, on the last line before either dispatch.
+///
+/// **And this interleaving *is* schedulable**, unlike the authentication one
+/// the earlier round could only pin by outcome: the body arrives in two writes
+/// and the latch is thrown between them, which is exactly a slow uploader
+/// riding into a teardown.
+#[test]
+fn a_latch_thrown_while_the_body_uploads_starts_no_work() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let shutdown = Shutdown::default();
+        let answer = runtime.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let serving = tokio::spawn(http::serve_connection(
+                Arc::clone(&core),
+                server,
+                shutdown.clone(),
+            ));
+            let (mut reader, mut writer) = tokio::io::split(client);
+
+            let body =
+                format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#);
+            // Headers and the first half of the body: the request is admitted,
+            // authenticated, and then parked inside `Limited::collect()`.
+            let (head, tail) = body.split_at(body.len() / 2);
+            writer
+                .write_all(
+                    format!(
+                        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\
+                         Connection: close\r\nAuthorization: Bearer {key}\r\n\
+                         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{head}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write the head");
+            writer.flush().await.expect("flush");
+            // Let the connection reach the body read before teardown begins.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            shutdown.latch();
+
+            writer
+                .write_all(tail.as_bytes())
+                .await
+                .expect("write the tail");
+            writer.flush().await.expect("flush");
+            let mut raw = Vec::new();
+            let _ = reader.read_to_end(&mut raw).await;
+            let _ = serving.await;
+            String::from_utf8_lossy(&raw).to_string()
+        });
+
+        assert!(
+            answer.contains("503"),
+            "a process that has begun teardown serves nothing, however far the request had got: \
+             {answer}"
+        );
+        assert_eq!(
+            mock.chat_hits(),
+            0,
+            "and it starts no billed work on the way to saying so"
+        );
+    });
+}
+
+/// REGRESSION: **a socket that says nothing must not hold a slot for ever.**
+///
+/// Admission happens before authentication — the key is in a header nobody has
+/// sent yet — so a peer that opens a connection and writes nothing occupies one
+/// of the listener's slots with no credential and no request. hyper *has* a
+/// thirty-second default here and it is **inert without a timer**: `Time::Empty`
+/// turns the default into `None` and logs "timeout has default, but no timer
+/// set", so the builder has to be given one.
+///
+/// The property is that the connection ends on its own. Its slot is then reaped
+/// by the listener's own `try_join_next` sweep, which is what lets the next
+/// caller in.
+#[test]
+fn a_connection_that_says_nothing_is_reaped() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        // The seam moves the number, never the mechanism — the same builder,
+        // the same timer, the same arming site.
+        http::set_header_read_timeout_for_test(150);
+        let ended = runtime.block_on(async {
+            let (client, server) = tokio::io::duplex(1024);
+            let serving = tokio::spawn(http::serve_connection(
+                Arc::clone(&core),
+                server,
+                Shutdown::default(),
+            ));
+            // A peer that holds its end open and writes nothing at all.
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), serving).await;
+            drop(client);
+            outcome.is_ok()
+        });
+        http::set_header_read_timeout_for_test(0);
+
+        assert!(
+            ended,
+            "a silent connection must give its slot back rather than hold it against every \
+             legitimate client"
+        );
+    });
+}
+
+/// REGRESSION: **a `200` is not an answer until it is the shape that was asked
+/// for.**
+///
+/// Opening downstream commits the response to `200 text/event-stream` and the
+/// head cannot be taken back — so a backend that ignored `stream: true` and
+/// answered a normal JSON completion, or an intermediary that answered an HTML
+/// page, had its body forwarded as an unterminated SSE fragment under a status
+/// saying everything went well. That is the blocking transport's malformed-2xx
+/// rule read on the other transport, where the wrong shape is *not* JSON.
+///
+/// **And it is a fifth arm of the refund class**: a backend that ignored the
+/// flag may well have answered with a whole completion, refund and all — the
+/// credential is spent either way, so the body is read for its token before
+/// this fails. `OkBlocking` answers JSON whatever transport asked, which is
+/// precisely the fixture.
+#[test]
+fn a_streamed_ask_answered_with_json_is_a_gateway_failure() {
+    run(|| {
+        // `RefundMode::Succeed` so the body the backend sent really carries a
+        // token — the point being that it is *that* one which settles. With
+        // recovery working too, the load-bearing assertion is that it was
+        // never asked.
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+                ),
+            ),
+        ));
+        assert_eq!(
+            status, 502,
+            "a client must meet a gateway failure, not an apparent success it cannot parse: {body}"
+        );
+        assert!(
+            !body.contains("data:"),
+            "and nothing was framed as server-sent events: {body}"
+        );
+
+        // The exchange is still evidence, and the credential still settles from
+        // the token that body carried.
+        let wallet = runtime.block_on(core.wallet_lifecycle()).expect("wallet");
+        assert!(
+            wallet.iter().any(|c| c.state == "spent"),
+            "the completion the backend did send carried the refund: {wallet:?}"
+        );
+        assert!(
+            !wallet.iter().any(|c| c.state == "spending"),
+            "nothing is stranded mid-spend: {wallet:?}"
+        );
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "the token the body carried settled the hold; recovery is for its absence"
+        );
+        let requests = runtime.block_on(core.list_requests(20, 0)).expect("record");
+        assert!(
+            requests.iter().any(|r| r.path == "/v1/chat/completions"),
+            "and the exchange is in the Record"
+        );
+    });
+}
+
+/// REGRESSION: **one wedged backend must not take the listing with it.**
+///
+/// `plain_http_client` sets no request timeout, so a backend that accepts the
+/// connection and then says nothing left the catalog `await` outstanding for
+/// ever: `.ok()` only isolates a future that *resolves*, so `/v1/models` never
+/// answered at all and every healthy backend's models went with it. Awaiting
+/// them one after another made the endpoint's latency the sum of every
+/// backend's besides — the same defect measured in seconds rather than in
+/// forever — so they are asked at once, each with its own deadline.
+#[test]
+fn a_backend_that_never_answers_does_not_take_the_listing_with_it() {
+    run(|| {
+        // A listener that accepts and then says nothing, for ever.
+        let wedged = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let wedged_port = wedged.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = wedged.accept() {
+                held.push(stream);
+            }
+        });
+
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let key = core.runtime().block_on(async {
+            core.add_backend(eidola_app_core::NewBackend {
+                id: "wedged".into(),
+                kind: eidola_app_core::BackendKind::OpenAi,
+                display_name: "A wedged server".into(),
+                base_url: Some(format!("http://127.0.0.1:{wedged_port}")),
+                api_key: None,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+            })
+            .await
+            .expect("add the wedged backend");
+            core.set_proxy_backend_exposed("eidola".to_string(), true)
+                .await
+                .expect("expose eidola");
+            core.set_proxy_backend_exposed("wedged".to_string(), true)
+                .await
+                .expect("expose the wedged one");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        eidola_app_core::proxy::route::set_model_list_timeout_for_test(300);
+        let started = std::time::Instant::now();
+        let (status, body) = runtime.block_on(exchange(&core, &get("/v1/models", Some(&key))));
+        let elapsed = started.elapsed();
+        eidola_app_core::proxy::route::set_model_list_timeout_for_test(0);
+
+        assert_eq!(status, 200, "the listing answers: {body}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "and it answers on its own deadline rather than the wedged backend's: {elapsed:?}"
+        );
+        assert!(
+            body.contains(MODEL),
+            "a healthy backend's models are not lost to an unhealthy one's silence: {body}"
+        );
+    });
+}
