@@ -1295,6 +1295,77 @@ fn a_streamed_ask_answered_with_json_is_a_gateway_failure() {
     });
 }
 
+/// REGRESSION: **every exit past the hold settles it and records the
+/// exchange** — including the one building the request opened.
+///
+/// Making the header set exact made the build fallible, which put a new early
+/// return between `acquire_spend` and the send: a `?` there leaves a credential
+/// `spending` with nothing in the Record to say why. The reachable arm is an
+/// **external** backend, whose key is user-typed and can carry a value no
+/// header may hold; it spends nothing, so what is held here is the other half
+/// of the same arm — the refusal is recorded rather than returned bare, which
+/// is what proves the exit is taken instead of `?`.
+#[test]
+fn a_request_that_cannot_be_built_is_still_recorded() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let key = core.runtime().block_on(async {
+            core.add_backend(eidola_app_core::NewBackend {
+                id: "acme".into(),
+                kind: eidola_app_core::BackendKind::OpenAi,
+                display_name: "Acme".into(),
+                base_url: Some("http://127.0.0.1:1".into()),
+                // A newline cannot travel in a header value, so the request
+                // refuses at the build — after the route is open.
+                api_key: Some("bad\nkey".into()),
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+            })
+            .await
+            .expect("add");
+            core.set_proxy_backend_exposed("acme".to_string(), true)
+                .await
+                .expect("expose");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        ));
+        assert_eq!(
+            status, 400,
+            "the caller is told what could not be sent: {body}"
+        );
+
+        let requests = runtime.block_on(core.list_requests(20, 0)).expect("record");
+        let refused = requests
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("an exit past the route's opening is recorded, never returned bare");
+        assert_eq!(
+            refused.response_status, None,
+            "nothing was sent, so there is no status to claim"
+        );
+        assert!(
+            refused.error.is_some(),
+            "and the row says what happened: {:?}",
+            refused.error
+        );
+    });
+}
+
 /// REGRESSION: **exposure is granted to a backend, not to a name.**
 ///
 /// Removal is soft (`request.backend_id` keeps a resolvable target) and
