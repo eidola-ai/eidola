@@ -21,3 +21,4 @@ find-map-node-matches = { $byline } — contient des occurrences
 find-results-label = Résultats
 find-result-draft = Brouillon
 find-overlay-empty = Aucune occurrence dans cette conversation
+find-result-name = { $byline } : { $snippet }

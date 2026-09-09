@@ -2900,6 +2900,17 @@ impl Focusable for SpaceView {
 
 impl Render for SpaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // **The Find-all overlay covers this window, so it takes the tab order
+        // with it** ([`crate::focus::Covered`]). Painting on top removes
+        // nothing from the frame's tab map, so without this Tab walked out of
+        // the overlay into the conversation's own affordances — a Post, an Ask,
+        // a Regenerate the reader cannot see, each one press from running. The
+        // guard stands for the whole render and the two surfaces that are *not*
+        // covered take it off again for their own subtrees: the find bar (whose
+        // controls the overlay hangs off, and which paints above it) and the
+        // overlay itself. The inspector does the same, being a column beside
+        // the conversation pane rather than under it.
+        let _covered = crate::focus::Covered::new(self.find_overlay_open());
         let theme = cx.theme();
         let bg = theme.background;
         let fg = theme.foreground;

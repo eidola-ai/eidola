@@ -21673,6 +21673,34 @@ fn space_find_says_it_is_counting_rather_than_showing_a_number_on_its_way(cx: &m
         assert_eq!(v.find_space_total_for_test(), None);
     });
 
+    // **And the disclosure stays mounted while it counts.** Painting it only on
+    // a settled total took the focused control out from under a keyboard reader
+    // for the length of the scan — a background write restarting a large count
+    // is enough — leaving the window on a dead slot with no way to open the
+    // overlay until the pass landed. The overlay it opens has its own honest
+    // counting state, so the control is as true here as after.
+    {
+        let _probes = probes_on();
+        eidola_gui::probe::clear_window(window.window_id().as_u64());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        let entries = eidola_gui::probe::window_entries(window.window_id().as_u64());
+        let (_, disclosure) = entries
+            .iter()
+            .find(|(n, _)| n == "space/find/total/disclosure")
+            .expect("the disclosure is painted while the count is still walking");
+        assert_eq!(disclosure.role, gpui::Role::Button);
+        let (_, total) = entries
+            .iter()
+            .find(|(n, _)| n == "space/find/total")
+            .expect("the readout beside it");
+        assert_eq!(
+            total.value.as_deref(),
+            Some("Counting…"),
+            "precondition: this really is the counting state"
+        );
+    }
+
     settle_find_count(&mut vcx);
     view.read_with(&vcx, |v, _| {
         assert!(!v.find_counting_for_test(), "the pass lands");
@@ -22578,6 +22606,135 @@ fn space_find_escape_collapses_the_overlay_before_the_bar(cx: &mut TestAppContex
     assert!(
         !view.read_with(&vcx, |v, _| v.find_open_for_test()),
         "the second ends the search"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_map_press_takes_the_cursor_to_the_group_it_reveals(cx: &mut TestAppContext) {
+    // The map scrolls the list; the cursor is where the keyboard and assistive
+    // technology think the reader is. Moving one without the other left the
+    // list's active descendant on a fragment now outside the viewport band — a
+    // sized placeholder with nothing to announce — and the reader's next arrow
+    // scrolled the viewport back toward it, undoing the press.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Short enough that the groups really do overflow the list.
+    vcx.simulate_resize(gpui::size(px(900.), px(400.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_result_cursor_for_test()),
+        Some(0),
+        "precondition: the cursor starts on the first result"
+    );
+
+    // The last map node that holds matches — far enough down that its group is
+    // below the fold.
+    let map = vcx.update(|window, cx| view.read_with(cx, |v, cx| v.find_map_for_test(window, cx)));
+    let groups =
+        vcx.update(|window, cx| view.read_with(cx, |v, cx| v.find_results_for_test(window, cx)));
+    let last_group = groups.last().expect("results").0.clone();
+    let index = map
+        .iter()
+        .position(|(node, _, _)| *node == last_group)
+        .expect("the group's node is on the map");
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.press_find_map_node_for_test(index, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let scrolled = view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test());
+    assert!(
+        scrolled > 0.0,
+        "the press took the list to that group ({scrolled})"
+    );
+    let cursor = view
+        .read_with(&vcx, |v, _| v.find_result_cursor_for_test())
+        .expect("a session is open");
+    let expected: usize = groups
+        .iter()
+        .take_while(|(node, _)| *node != last_group)
+        .map(|(_, fragments)| fragments.len())
+        .sum();
+    assert_eq!(
+        cursor, expected,
+        "…and the cursor with it, onto that group's first fragment"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_card_keeps_a_selection_instead_of_opening(cx: &mut TestAppContext) {
+    // A card's editor is read-only *and selectable* — that is the read-only
+    // editor's own contract, and the I-beam over it says so. A drag inside one
+    // ends with the pointer released over the card, which the ancestor's click
+    // read as "open this result": the overlay collapsed and took the passage
+    // away before it could be copied.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let editor = vcx
+        .update(|window, cx| {
+            view.read_with(cx, |v, cx| v.find_result_editor_for_test(0, window, cx))
+        })
+        .expect("the first card has painted, so it has an editor");
+    // A selection, as a drag would leave one.
+    vcx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.perform(gpui_markdown_editor::EditorCommand::SelectAll, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(|_, cx| editor.read(cx).selection().is_collapsed()),
+        "precondition: the card really holds a selection"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.press_find_result_for_test(0, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the press that ended a selection keeps the overlay — and the passage — \
+         where the reader can copy it"
+    );
+
+    // The positive control: a card nobody has selected in still navigates, so
+    // this is a claim about the selection rather than about the press.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.press_find_result_for_test(1, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "…and a press on a card with nothing selected opens the result"
     );
 }
 

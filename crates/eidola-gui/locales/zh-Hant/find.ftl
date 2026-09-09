@@ -21,3 +21,4 @@ find-map-node-matches = { $byline }——包含符合項
 find-results-label = 結果
 find-result-draft = 草稿
 find-overlay-empty = 這個對話中沒有任何符合項
+find-result-name = { $byline }：{ $snippet }

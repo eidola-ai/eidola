@@ -8274,6 +8274,23 @@ fn the_find_overlay_probes_its_map_and_its_results(cx: &mut TestAppContext) {
         "You: a kestrel hovers",
     );
 
+    // **And the join between the two is the translation's to choose.** Its
+    // parts are data, but the punctuation and the order are not — the Chinese
+    // locales set a full-width colon — so a hard-coded `": "` is the
+    // concatenation the localization doctrine bans however few English words it
+    // contains, and it is invisible in English, which is why this is pinned in
+    // a locale where the two spellings differ.
+    cx.update(|cx| eidola_gui::i18n::apply("zh-Hans", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/result/0",
+        gpui::Role::ListItem,
+        "You：a kestrel hovers",
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    let entries = fresh_entries(cx, window);
+
     // **And the list is a real tab stop.** `Role::List` is deliberately not in
     // the focusable set the probe derives, so the element carrying it takes
     // focus only because the handle says so: without that the list could be
@@ -8703,5 +8720,88 @@ fn the_find_bars_readout_and_verbs_speak_the_readers_language(cx: &mut TestAppCo
         "1 au total",
     );
     cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    probe::set_probes_enabled(false);
+}
+/// **A surface that covers the window takes the tab order with it.** gpui
+/// builds the frame's tab map from what painted, and painting on top removes
+/// nothing — so with the Find-all overlay expanded, Tab walked out of it into
+/// the conversation underneath: a band's `+`, a docked draft's row, the
+/// composer's own verbs, each reachable and activatable while the reader could
+/// not see any of them. `crate::focus::Covered` is the cure, applied where a
+/// role becomes a stop.
+#[gpui::test]
+fn the_find_overlay_keeps_the_tab_order_to_itself(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "another kestrel here");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers"), a2], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    // The find surface's own stops, counted from what actually painted rather
+    // than written down: every probed control in it whose role derives a stop,
+    // plus the two that are stops without being probed controls — the query
+    // `Input`, which owns its own focus handle (the two-regime rule), and the
+    // results list, whose handle carries the stop because `Role::List` does
+    // not.
+    let find_probe_stops = |cx: &mut TestAppContext| {
+        fresh_entries(cx, window)
+            .iter()
+            .filter(|(name, e)| {
+                name.starts_with("space/find/") && eidola_gui::focus::is_tab_stop(e.role)
+            })
+            .count()
+    };
+
+    // With the overlay closed the conversation contributes stops of its own —
+    // which is what makes the assertion below a claim about suppression rather
+    // than about an empty page.
+    let closed = tab_stop_count(cx, window);
+    let bar_only = find_probe_stops(cx) + 2;
+    assert!(
+        closed > bar_only,
+        "precondition: the covered conversation really does hold tab stops \
+         ({closed} reachable, {bar_only} of them the bar's own)"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let expected = find_probe_stops(cx) + 2;
+    let reachable = tab_stop_count(cx, window);
+    assert_eq!(
+        reachable, expected,
+        "every reachable stop belongs to the find surface — nothing under the \
+         overlay is in the tab order"
+    );
+
     probe::set_probes_enabled(false);
 }

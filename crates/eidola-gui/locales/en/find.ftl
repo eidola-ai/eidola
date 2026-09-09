@@ -72,3 +72,7 @@ find-result-draft = Draft
 # matching while the surface is open, since the disclosure that opens it
 # appears with the total.
 find-overlay-empty = Nothing matches anywhere in this conversation
+# A result row, spoken as who wrote it and the opening of what it says.
+# Joined here rather than in code so the punctuation and the order are the
+# translation's to choose.
+find-result-name = { $byline }: { $snippet }

@@ -21,3 +21,4 @@ find-map-node-matches = { $byline }: contiene coincidencias
 find-results-label = Resultados
 find-result-draft = Borrador
 find-overlay-empty = No hay coincidencias en esta conversación
+find-result-name = { $byline }: { $snippet }

@@ -432,6 +432,11 @@ impl SpaceView {
         if layout == InspectorLayout::Hidden {
             return Vec::new();
         }
+        // The panel is a column *beside* the conversation pane (and, in the
+        // floating form, painted over it), so the Find-all overlay — which
+        // lives inside that pane — never covers it: its controls keep their
+        // place in the tab order ([`crate::focus::Covered`]).
+        let _uncovered = crate::focus::Covered::new(false);
         self.sync_inspector_title(window, cx);
         // The panel meets the window's right edge in both forms, so it owns
         // those corner notches under Linux CSD (no-ops elsewhere).

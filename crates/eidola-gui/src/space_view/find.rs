@@ -2826,6 +2826,10 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         self.find.as_ref()?;
+        // The bar is *above* the overlay it opens, so its own controls stay in
+        // the tab order while the overlay covers everything else
+        // ([`crate::focus::Covered`]).
+        let _uncovered = crate::focus::Covered::new(false);
         self.sync_find_placeholder(window, cx);
         let (bg, border, muted) = {
             let theme = cx.theme();
@@ -2985,7 +2989,19 @@ impl SpaceView {
                     .text_sm()
                     .text_color(muted)
                     .child(sentence)
-                    .children(settled_total.map(|_| {
+                    // **The disclosure lives with the readout, not with the
+                    // number.** Mounting it only on a settled total meant a
+                    // background write that restarted a large count took the
+                    // focused control out from under a keyboard reader for the
+                    // length of the scan — ordinary keys reaching nothing, Tab
+                    // recovering from a dead slot — and left no way to open the
+                    // overlay while the pass ran. The overlay's own honest
+                    // counting state is what it opens onto, so the control is
+                    // as true while counting as after. What it is *not* offered
+                    // for is a settled **zero**, which shows no readout either:
+                    // that is the one state where there is nothing to show, and
+                    // `total_readout` is already exactly that predicate.
+                    .children(std::iter::once(()).map(|_| {
                         // **The disclosure is a real control now**, because it
                         // finally does something: it expands the Find-all
                         // overlay. It was a registry-only probe while the

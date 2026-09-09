@@ -689,9 +689,71 @@ impl SpaceView {
         groups
     }
 
+    /// **A pointer press opens a result only when nothing is selected in it.**
+    ///
+    /// A card's editor is read-only *and selectable* — the read-only editor's
+    /// own contract, and the I-beam over it says so — so a drag inside one ends
+    /// with the pointer released over the card, and the ancestor's click read
+    /// that as "open this result": the overlay collapsed and took the passage
+    /// away before it could be copied. A plain click has already collapsed the
+    /// selection by the time it lands (the press places the caret), so
+    /// click-to-navigate is untouched; a **double-click** selects a word and
+    /// therefore does not navigate, deliberately — the gesture asked for the
+    /// word, and a card whose meaning changed with the click count would be the
+    /// worse surprise.
+    ///
+    /// The **keyboard** path deliberately does not ask: Enter on the roving
+    /// cursor is an unambiguous request to open, whatever some card happens to
+    /// have selected.
+    pub(crate) fn click_find_result(
+        &mut self,
+        fragment: ResultFragment,
+        editor: &Entity<MarkdownEditorState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !editor.read(cx).selection().is_collapsed() {
+            return;
+        }
+        self.open_find_result(fragment, window, cx);
+    }
+
+    /// Press the `index`-th result card the way a pointer would, guard and all
+    /// — the seam a test uses, because a card's painted bounds depend on where
+    /// the list has been scrolled.
+    #[doc(hidden)]
+    pub fn press_find_result_for_test(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        let Some(fragment) = self
+            .find_results(&map, &post_index(&self.posts), cx)
+            .into_iter()
+            .flat_map(|g| g.fragments)
+            .nth(index)
+        else {
+            return;
+        };
+        let Some(editor) = self
+            .find
+            .as_ref()
+            .and_then(|s| s.overlay.bodies.get(&fragment.id).cloned())
+        else {
+            return;
+        };
+        self.click_find_result(fragment, &editor, window, cx);
+    }
+
     /// Take the reader to the `index`-th result the overlay is showing — the
-    /// pointer's own path, reached by index because a test cannot press a card
-    /// whose bounds depend on where the list has been scrolled.
+    /// keyboard's own path (Enter on the roving cursor), reached by index
+    /// because a test cannot press a card whose bounds depend on where the list
+    /// has been scrolled.
     #[doc(hidden)]
     pub fn open_find_result_for_test(
         &mut self,
@@ -873,6 +935,89 @@ impl SpaceView {
         cx.notify();
     }
 
+    /// What a press on a map node does: take the results list to that node's
+    /// group, and **take the roving cursor with it**.
+    ///
+    /// Scrolling alone left the cursor on whatever fragment it was on, so the
+    /// list's active descendant then named a card outside the viewport band — a
+    /// sized placeholder with nothing for assistive technology to read — and
+    /// the reader's next arrow scrolled the viewport back toward it, undoing
+    /// the press they had just made. The group's **first** fragment is exactly
+    /// where the cursor's own reveal scrolls to (`nth == 0` reveals from the
+    /// group's top), so the two agree by construction rather than by a second
+    /// scroll here.
+    pub(crate) fn reveal_find_group(
+        &mut self,
+        node: &SharedString,
+        first_fragment: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((top, _)) = self
+            .find
+            .as_ref()
+            .and_then(|s| s.overlay.tops.get(node).copied())
+        else {
+            return;
+        };
+        self.scroll_find_results_to(top);
+        if let (Some(index), Some(session)) = (first_fragment, self.find.as_mut()) {
+            session.overlay.cursor = index;
+        }
+        cx.notify();
+    }
+
+    /// Press the map's `index`-th node the way a pointer would — the seam a
+    /// test uses, because a dot's painted bounds depend on where the map has
+    /// been scrolled.
+    #[doc(hidden)]
+    pub fn press_find_map_node_for_test(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        let Some(node) = map.get(index).map(|n| n.node.clone()) else {
+            return;
+        };
+        let groups = self.find_results(&map, &post_index(&self.posts), cx);
+        let mut at = 0usize;
+        let mut first = None;
+        for group in &groups {
+            if group.node == node {
+                first = Some(at);
+                break;
+            }
+            at += group.fragments.len();
+        }
+        self.reveal_find_group(&node, first, cx);
+    }
+
+    /// The editor one result card paints through — the seam a test needs to put
+    /// a selection in a card the way a drag would.
+    #[doc(hidden)]
+    pub fn find_result_editor_for_test(
+        &self,
+        index: usize,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Option<Entity<MarkdownEditorState>> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        let id = self
+            .find_results(&map, &post_index(&self.posts), cx)
+            .into_iter()
+            .flat_map(|g| g.fragments)
+            .nth(index)?
+            .id;
+        self.find.as_ref()?.overlay.bodies.get(&id).cloned()
+    }
+
     /// Scroll the results list so `top` is at the top of its viewport — what a
     /// map press does, and what following the cursor does.
     pub(crate) fn scroll_find_results_to(&mut self, top: f32) {
@@ -903,6 +1048,10 @@ impl SpaceView {
         if !self.find_overlay_open() {
             return None;
         }
+        // The surface doing the covering builds its own controls in the clear
+        // ([`crate::focus::Covered`]) — the map's dots and the results list are
+        // the tab stops a reader is meant to reach while it stands.
+        let _uncovered = crate::focus::Covered::new(false);
         let map = map_layout(tree, &|node| self.find_map_includes(node, cx));
         let posts = post_index(&self.posts);
         let groups = self.find_results(&map, &posts, cx);
@@ -980,6 +1129,19 @@ impl SpaceView {
             )
         };
         let with_matches: HashSet<SharedString> = groups.iter().map(|g| g.node.clone()).collect();
+        // Where each group's **first** fragment sits in the flat result list —
+        // what a press on that node's dot moves the roving cursor to.
+        let first_fragment: HashMap<SharedString, usize> = {
+            let mut at = 0usize;
+            groups
+                .iter()
+                .map(|g| {
+                    let here = at;
+                    at += g.fragments.len();
+                    (g.node.clone(), here)
+                })
+                .collect()
+        };
         let in_view = self
             .find
             .as_ref()
@@ -1094,17 +1256,11 @@ impl SpaceView {
                 dot = dot.border_1().border_color(accent);
             }
             if has {
+                let cursor_to = first_fragment.get(&node.node).copied();
                 dot = dot
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _window, cx| {
-                        let top = this
-                            .find
-                            .as_ref()
-                            .and_then(|s| s.overlay.tops.get(&target).copied());
-                        if let Some((top, _)) = top {
-                            this.scroll_find_results_to(top);
-                            cx.notify();
-                        }
+                        this.reveal_find_group(&target, cursor_to, cx);
                     }));
             } else {
                 dot = dot.tab_stop(false);
@@ -1412,7 +1568,19 @@ impl SpaceView {
         let editor = self.find_fragment_editor(fragment, window, cx);
         let style = prose_style(cx);
         let opener = fragment.clone();
-        let label = self.find_fragment_label(fragment);
+        let label = self.find_fragment_label(fragment, cx);
+        // **A selection is not a click.** A card's editor is read-only *and
+        // selectable* — that is the whole read-only editor contract, and the
+        // I-beam over it says so — so a drag inside one ends with the pointer
+        // released over the card, which the ancestor handler read as "open this
+        // result": the overlay collapsed and took the passage away before it
+        // could be copied. The editor's own selection is the discriminator, and
+        // a plain click has already collapsed it (a press places the caret), so
+        // click-to-navigate is untouched. A **double-click** selects a word and
+        // therefore does not navigate — deliberately: the gesture asked for the
+        // word, and a card whose meaning changed with the click count would be
+        // the worse surprise.
+        let selection = editor.clone();
         div()
             // Keyed by the fragment, not by its seat: the results are re-cut on
             // every frame and a background write reorders them, so an
@@ -1442,7 +1610,7 @@ impl SpaceView {
             .pb(px(FRAGMENT_GAP))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_find_result(opener.clone(), window, cx);
+                this.click_find_result(opener.clone(), &selection, window, cx);
             }))
             .child(
                 div()
@@ -1479,7 +1647,12 @@ impl SpaceView {
     /// beside it, because that header is a sibling `Label`: a reader met the
     /// card through the list's active descendant, heard the snippet alone, and
     /// could not tell two similar results by different participants apart.
-    fn find_fragment_label(&self, fragment: &ResultFragment) -> SharedString {
+    /// **The join is a message, not a `format!`.** Its parts are data, but the
+    /// punctuation between them and the order they read in are not: the
+    /// Chinese locales want a full-width colon, and a hard-coded `": "` is the
+    /// concatenation the localization doctrine bans however few English words
+    /// it contains.
+    fn find_fragment_label(&self, fragment: &ResultFragment, cx: &gpui::App) -> SharedString {
         let text = fragment
             .content
             .get(fragment.range.clone())
@@ -1487,7 +1660,7 @@ impl SpaceView {
         // No references: a fragment's own bytes are what it paints, and an
         // embed marker inside one is hidden there exactly as it is in the post.
         let snippet = super::minimap::spoken_snippet(text, &[], FRAGMENT_LABEL_CHARS);
-        SharedString::from(format!("{}: {snippet}", fragment.byline))
+        crate::i18n::msg::find_result_name(cx, fragment.byline.to_string(), snippet)
     }
 
     /// The editor state one fragment paints through, minted on first sight.
