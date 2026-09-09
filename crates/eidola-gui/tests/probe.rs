@@ -8746,18 +8746,6 @@ fn the_find_overlay_keeps_the_tab_order_to_itself(cx: &mut TestAppContext) {
     });
     draw(cx, window);
 
-    // Enter a post's affordance row first. That verb is the one tab stop under
-    // the overlay that rides a **tracked** handle rather than a probe-derived
-    // one, so gpui reads the handle's own `tab_stop` and the guard — which acts
-    // where a role becomes a stop — cannot reach it: a reader standing on Edit
-    // who then opened the overlay left it reachable behind the surface.
-    cx.update_window(window, |_, window, cx| {
-        view.update(cx, |v, cx| v.focus_affordance_for_test("a1", 0, window, cx));
-    })
-    .unwrap();
-    cx.run_until_parked();
-    draw(cx, window);
-
     let focus = view.read_with(cx, |v, _| v.focus_handle());
     cx.update_window(window, |_, window, cx| {
         focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
@@ -8799,12 +8787,33 @@ fn the_find_overlay_keeps_the_tab_order_to_itself(cx: &mut TestAppContext) {
          ({closed} reachable, {bar_only} of them the bar's own)"
     );
 
+    // Put the reader on a post's action gutter — *after* the count above, whose
+    // traversal would move focus straight off it. That verb is the one tab stop
+    // under the overlay riding a **tracked** handle rather than a probe-derived
+    // one, and gpui reads a tracked handle's own `tab_stop`, so the guard —
+    // which acts where a *role* becomes a stop — cannot reach it: the verb
+    // stayed reachable behind the surface covering it. The level survives the
+    // open because `sync_tree_focus` parks its observation while a transient
+    // overlay stands.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_affordance_for_test("a1", 0, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
     })
     .unwrap();
     cx.run_until_parked();
     draw(cx, window);
+    assert!(
+        fresh_entries(cx, window)
+            .iter()
+            .any(|(name, _)| name == "space/post/0/edit"),
+        "precondition: the covered post's verb really is still painted"
+    );
 
     let expected = find_probe_stops(cx) + 2;
     let reachable = tab_stop_count(cx, window);
