@@ -130,12 +130,13 @@ impl RecordedBody {
         }
     }
 
-    /// The bytes to record, with the note when they are not all of them.
-    fn seal(self) -> Vec<u8> {
-        seal_recorded_body(self.kept, self.received)
-    }
-
-    /// The bytes to record for a *stream*, saying how it ended.
+    /// The bytes to record for a stream, with the note when they are not all
+    /// of them and the note for how the stream ended.
+    ///
+    /// **Streams are the only accumulating bodies**: the blocking transports
+    /// have their whole text in hand and go through [`seal_recorded_body`]
+    /// directly, so there is no unqualified `seal` here to reach for by
+    /// accident — an ending is not optional information about a stream.
     fn seal_stream(self, delivery: StreamDelivery) -> Vec<u8> {
         let mut out = seal_recorded_body(self.kept, self.received);
         if let Some(note) = delivery.note() {
@@ -1731,7 +1732,7 @@ mod tests {
         let received = body.received;
         assert_eq!(received, 40 * chunk.len(), "and it counts what really came");
 
-        let sealed = body.seal();
+        let sealed = body.seal_stream(StreamDelivery::Complete);
         let text = String::from_utf8_lossy(&sealed);
         assert!(
             text.contains(&format!("{received}-byte response")),
