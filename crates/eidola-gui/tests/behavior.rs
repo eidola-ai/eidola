@@ -22245,3 +22245,338 @@ fn space_find_arms_a_worker_for_work_deferred_after_the_count_had_settled(cx: &m
         );
     });
 }
+
+#[gpui::test]
+fn space_find_shows_every_result_in_depth_then_lane_order(cx: &mut TestAppContext) {
+    // The overlay's whole reason for existing: the same matches the bar
+    // counted, presented in a **different orientation** from the transcript's.
+    // Depth from the root first, then left to right as the map lays them out —
+    // deliberately not the pre-order the conversation itself reads in, because
+    // agreeing with the transcript is the failure mode rather than the goal.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the disclosure's verb expanded the surface"
+    );
+
+    let (map, results) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_map_for_test(window, cx),
+                v.find_results_for_test(window, cx),
+            )
+        })
+    });
+
+    // The map is the whole space, one node per post, with the spine keeping
+    // lane 0 and each later branch opening one of its own.
+    assert_eq!(
+        map,
+        vec![
+            ("a1".into(), 0, 0),
+            ("a2".into(), 1, 0),
+            ("a3".into(), 1, 1),
+            ("a4".into(), 2, 0),
+            ("a6".into(), 2, 1),
+            ("a5".into(), 2, 2),
+        ],
+        "every post, laid out depth down and lanes across — and the fork's two \
+         children are adjacent lanes, which is the reservation rule: with lanes \
+         taken on the way down, a3 would sit right of a5 because a2's subtree \
+         opened one first"
+    );
+
+    // The results are the nodes of that map that hold matches, in that order —
+    // `a2` is absent because it holds none. The transcript's own pre-order
+    // would have read a1, a2, a4, a5, a3, a6.
+    let order: Vec<&str> = results.iter().map(|(node, _)| node.as_str()).collect();
+    assert_eq!(
+        order,
+        vec!["a1", "a3", "a4", "a6", "a5"],
+        "depth first, then left to right — a5 opened the rightmost lane, so \
+         it reads last even though the transcript puts it before a3"
+    );
+    assert_eq!(
+        results.len(),
+        5,
+        "five groups, and none for the post that matched nothing"
+    );
+    // And what the overlay draws is what the bar counted, node for node: a
+    // fragment per matching block, cut from the same projection cache.
+    let total = view.read_with(&vcx, |v, _| v.find_space_total_for_test());
+    assert_eq!(total, Some(8), "precondition: the bar counted eight");
+    assert!(
+        results.iter().all(|(_, frags)| !frags.is_empty()),
+        "a group with no fragment would be a post the overlay claims and \
+         cannot show"
+    );
+}
+
+#[gpui::test]
+fn space_find_opening_a_result_takes_the_reader_to_its_branch(cx: &mut TestAppContext) {
+    // **The one place find spends branch selection**, and only because the
+    // reader asked for this result by name. Everything after the branch switch
+    // is the machinery the bar already owns: the anchor is set by identity and
+    // the reveal is the ordinary two-phase one, armed as a debt `sync_find`
+    // discharges once the new branch's match list exists.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The branch the reader is *not* on. `a6` hangs off the other fork, so its
+    // matches are in the total and not in the index.
+    let branch_before = view.read_with(&vcx, |v, _| {
+        v.find_matches_for_test()
+            .0
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        !branch_before.iter().any(|n| n == "a6"),
+        "precondition: a6 is on a branch the reader is not looking at \
+         ({branch_before:?})"
+    );
+    let index = vcx
+        .update(|window, cx| {
+            view.read_with(cx, |v, cx| {
+                v.find_results_for_test(window, cx)
+                    .iter()
+                    .position(|(node, _)| node == "a6")
+            })
+        })
+        .expect("a6 holds matches, so it is a group");
+    // The flat fragment index the pointer would press: every group before it
+    // contributes its own fragments first.
+    let flat = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            v.find_results_for_test(window, cx)
+                .iter()
+                .take(index)
+                .map(|(_, frags)| frags.len())
+                .sum::<usize>()
+        })
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.open_find_result_for_test(flat, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the overlay collapses — the reader asked to be taken somewhere"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…and the bar it hangs off stays, because the search has not ended"
+    );
+    let (matches, current) = view.read_with(&vcx, |v, _| v.find_matches_for_test());
+    let branch_after: Vec<String> = matches.iter().map(|(n, _)| n.to_string()).collect();
+    assert!(
+        branch_after.iter().any(|n| n == "a6"),
+        "the branch really moved: a6's matches are on the visible branch now \
+         ({branch_after:?})"
+    );
+    let current = current.expect("a match is current");
+    assert_eq!(
+        matches[current - 1].0,
+        "a6",
+        "and the current match is the one that was clicked, not the first of \
+         the new branch"
+    );
+}
+
+#[gpui::test]
+fn space_find_keeps_the_overlays_place_until_the_query_moves(cx: &mut TestAppContext) {
+    // Position retention, the task's own rule: reopening the overlay without
+    // changing the query puts the reader back where they were. A position in
+    // one search's results means nothing in another's, so a new query is where
+    // it ends.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Short enough that five groups of results really do overflow it — a list
+    // with nothing to scroll would let this test pass vacuously.
+    vcx.simulate_resize(gpui::size(px(900.), px(400.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // Scroll the results list, then collapse and reopen. Read the offset back
+    // rather than asserting the value asked for: a scroll handle clamps to the
+    // content it actually has, and what retention is about is that the number
+    // survives, not what it is.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| {
+            v.find_overlay_scroll_to_for_test(120.0);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let scrolled = view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test());
+    assert!(
+        scrolled > 0.0,
+        "precondition: the reader scrolled ({scrolled})"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        scrolled,
+        "reopening on the same query puts the reader back where they were"
+    );
+
+    // A new query, and it is gone — along with the measured heights and the
+    // editor states of fragments that no longer exist. Collapse first, which
+    // hands the keyboard back to the field the query is typed into.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.close_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("backspace");
+    vcx.run_until_parked();
+    settle_find_count(&mut vcx);
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        0.0,
+        "a new query starts at the top of a list about something else"
+    );
+}
+
+#[gpui::test]
+fn space_an_open_find_overlay_keeps_printables_out_of_the_conversation(cx: &mut TestAppContext) {
+    // The overlay covers the conversation, so a printable behind it would start
+    // a draft on a page nobody can see — the exact defect
+    // `space_an_open_picker_keeps_printables_out_of_the_conversation` pins,
+    // reached through a surface that happens to fill the window. Unlike the bar
+    // above it, membership is unconditional rather than focus-gated: the bar is
+    // a row of chrome a reader goes on reading past.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    // Leave nothing composing, so a stray printable would be visible as a jump.
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Focus the conversation itself, so nothing about the *bar* is what yields.
+    let root = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| window.focus(&root, cx));
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "precondition: nothing is composing"
+    );
+
+    vcx.simulate_keystrokes("z");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "a printable behind the overlay starts no draft"
+    );
+
+    // …and the conversation takes them back the moment the overlay collapses.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.close_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.focus(&root, cx));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("z");
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "with the overlay gone the same press reaches the composer"
+    );
+}
+
+#[gpui::test]
+fn space_find_escape_collapses_the_overlay_before_the_bar(cx: &mut TestAppContext) {
+    // Innermost first: one Escape backs out one rung, so a reader reading the
+    // results does not lose the whole search to a press meant for the surface
+    // in front of them.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the first Escape collapses the overlay"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…and leaves the bar, with the query the reader typed"
+    );
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "the second ends the search"
+    );
+}

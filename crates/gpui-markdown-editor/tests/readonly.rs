@@ -34,9 +34,11 @@ const NON_CANONICAL: &str = "### heading\nbody text directly under the heading\n
     **Note:**\n> a quoted line right after a paragraph\n\n\
     | left | right |\n| --- | --- |\n| cell one | cell two |";
 
-/// Host view rendering the editor `disabled` (the read-only post surface).
+/// Host view rendering the editor `disabled` (the read-only post surface),
+/// optionally narrowed to one **fragment** of the document.
 struct ReadonlyHarness {
     state: Entity<MarkdownEditorState>,
+    fragment: Option<std::ops::Range<usize>>,
 }
 
 impl gpui::Render for ReadonlyHarness {
@@ -45,13 +47,25 @@ impl gpui::Render for ReadonlyHarness {
         _: &mut gpui::Window,
         _: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
-        MarkdownEditor::new(&self.state).disabled(true)
+        let editor = MarkdownEditor::new(&self.state).disabled(true);
+        match self.fragment.clone() {
+            Some(range) => editor.fragment(range),
+            None => editor,
+        }
     }
 }
 
 fn open_readonly_editor(
     cx: &mut TestAppContext,
     markdown: &str,
+) -> (VisualTestContext, Entity<MarkdownEditorState>) {
+    open_readonly_fragment(cx, markdown, None)
+}
+
+fn open_readonly_fragment(
+    cx: &mut TestAppContext,
+    markdown: &str,
+    fragment: Option<std::ops::Range<usize>>,
 ) -> (VisualTestContext, Entity<MarkdownEditorState>) {
     let state = EditorState::with_markdown(markdown);
     let (handle, editor) = cx.update(|cx| {
@@ -72,6 +86,7 @@ fn open_readonly_editor(
                     inner = Some(editor.clone());
                     let harness = cx.new(|_| ReadonlyHarness {
                         state: editor.clone(),
+                        fragment: fragment.clone(),
                     });
                     cx.new(|cx| Root::new(harness, window, cx))
                 },
@@ -367,4 +382,70 @@ fn a_wrapping_paragraph_has_no_horizontal_reveal(cx: &mut TestAppContext) {
         e.reveal_range_horizontally(&(far..far + 7), cx)
     });
     assert!(!moved, "a wrapping block never scrolls sideways");
+}
+
+/// A **fragment** lays out only the blocks intersecting its range, and each one
+/// keeps the chrome its container chain earns — which is the whole reason a
+/// host filters the document's own render rather than re-parsing the block on
+/// its own. The standalone path has no source ranges at all, so a fragment
+/// through it takes no highlight quads; here the offsets are still the
+/// document's, which is what a highlight and a per-offset geometry need.
+#[gpui::test]
+fn a_fragment_lays_out_only_its_blocks_and_keeps_their_containers(cx: &mut TestAppContext) {
+    let markdown = "an opening paragraph\n\n\
+        - a list item\n\n  > a quote inside the item\n\n\
+        a closing paragraph";
+    let quote = markdown
+        .find("a quote inside the item")
+        .expect("the passage is in the source");
+
+    // The whole document first: every block is laid out, and the nested one
+    // sits indented under the two containers above it.
+    let (vcx, editor) = open_readonly_editor(cx, markdown);
+    let whole = editor.read_with(&vcx, |e, _| e.debug_line_source_geometry());
+    assert!(
+        whole.len() >= 4,
+        "the document lays out every block ({} lines)",
+        whole.len()
+    );
+    let nested_x = whole
+        .iter()
+        .find(|(start, end, ..)| *start <= quote && *end >= quote)
+        .map(|(_, _, x, ..)| *x)
+        .unwrap_or_else(|| panic!("the nested paragraph is laid out: {whole:?}"));
+    let opening_x = whole
+        .first()
+        .map(|(_, _, x, ..)| *x)
+        .expect("the opening paragraph is laid out");
+    assert!(
+        nested_x > opening_x,
+        "precondition: the container chain indents it ({nested_x} vs {opening_x})"
+    );
+    drop(vcx);
+
+    // Now the same document narrowed to that one block. It is the only thing
+    // laid out — and it is laid out at the same indent, because the block still
+    // carries its own container chain.
+    let (vcx, editor) = open_readonly_fragment(cx, markdown, Some(quote..quote + 4));
+    let fragment = editor.read_with(&vcx, |e, _| e.debug_line_source_geometry());
+    assert_eq!(
+        fragment.len(),
+        1,
+        "only the block the range names is laid out ({fragment:?})"
+    );
+    let (start, end, x, ..) = fragment[0];
+    assert!(
+        start <= quote && end >= quote,
+        "…and it is the block that holds the passage ({start}..{end})"
+    );
+    assert_eq!(
+        x, nested_x,
+        "…still inside its blockquote inside its list item"
+    );
+    // The offsets are the *document's*, which is what makes a highlight over a
+    // source range land — the property the standalone render path loses.
+    assert!(
+        start > 0,
+        "the fragment's own line still addresses the whole document ({start})"
+    );
 }

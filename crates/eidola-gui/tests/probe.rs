@@ -8176,16 +8176,98 @@ fn space_find_bar_probes_its_field_verbs_and_readout(cx: &mut TestAppContext) {
         "3 total",
         "3 total",
     );
-    // Its disclosure is painted and inert: what it will open is a later wave,
-    // and a `Role::Button` with no listener is a control VoiceOver offers,
-    // activates and silently does nothing with. Registry-only, so the driver
-    // can see it and the a11y tree does not gain a second voice for a number
-    // the sentence above already speaks.
-    assert!(
-        entries
-            .iter()
-            .any(|(n, _)| n == "space/find/total/disclosure"),
-        "the disclosure affordance is painted"
+    // Its disclosure is a real control now, because it opens the Find-all
+    // overlay — the role tracks whether a handler attaches, and its name says
+    // what the click does rather than naming the chevron.
+    assert_probe(
+        &entries,
+        "space/find/total/disclosure",
+        gpui::Role::Button,
+        "Show every result",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The Find-all overlay's accessible surface: a named landmark, a `Group` of
+/// map nodes whose role tracks whether pressing one does anything, and the
+/// results as **one** list with its rows as managed descendants.
+#[gpui::test]
+fn the_find_overlay_probes_its_map_and_its_results(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    // Two posts, one of which holds nothing — so the map has a node of each
+    // kind and the role difference is a fact about this fixture rather than a
+    // fact about an empty one.
+    let mut a2 = probe_post("a2", "nothing to see in this one");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers"), a2], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    // Open it through the disclosure the reader would press.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/overlay",
+        gpui::Role::Region,
+        "Every result",
+    );
+    assert_probe(
+        &entries,
+        "space/find/map",
+        gpui::Role::Group,
+        "Conversation map",
+    );
+    assert_probe(&entries, "space/find/results", gpui::Role::List, "Results");
+    // The map's first node holds the match and is pressable; the second holds
+    // nothing, so it is a `Label` — the role tracks whether a handler
+    // attaches, exactly as the bar's step arrows do.
+    assert_probe(
+        &entries,
+        "space/find/map/0",
+        gpui::Role::Button,
+        "You — has matches",
+    );
+    assert_probe(&entries, "space/find/map/1", gpui::Role::Label, "You");
+    // One result, and it is a managed descendant of the list rather than a tab
+    // stop of its own — a card per stop would describe an order that does not
+    // contain the results nobody scrolled to.
+    assert_probe(
+        &entries,
+        "space/find/result/0",
+        gpui::Role::ListItem,
+        "a kestrel hovers",
     );
 
     probe::set_probes_enabled(false);

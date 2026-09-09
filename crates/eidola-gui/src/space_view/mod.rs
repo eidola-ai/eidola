@@ -1633,6 +1633,69 @@ impl SpaceView {
         self.find.as_ref().is_some_and(|s| !s.space.is_settled())
     }
 
+    /// Whether the Find-all overlay is expanded.
+    #[doc(hidden)]
+    pub fn find_overlay_open_for_test(&self) -> bool {
+        self.find_overlay_open()
+    }
+
+    /// Where the overlay's results list stands, as a positive offset from the
+    /// top — the retention seam.
+    #[doc(hidden)]
+    pub fn find_overlay_scroll_for_test(&self) -> f32 {
+        self.find
+            .as_ref()
+            .map_or(0.0, |s| -s.overlay.scroll.offset().y.as_f32())
+    }
+
+    /// Scroll the overlay's results list, as a map press or the roving cursor
+    /// would.
+    #[doc(hidden)]
+    pub fn find_overlay_scroll_to_for_test(&mut self, top: f32) {
+        self.scroll_find_results_to(top);
+    }
+
+    /// The overlay's map, in the order it lays the space out and the results
+    /// read: `(node id, depth, lane)` sorted depth-then-lane.
+    #[doc(hidden)]
+    pub fn find_map_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, usize, usize)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        find_overlay::map_layout(&tree, &|node| self.find_map_includes_for_test(node, cx))
+            .into_iter()
+            .map(|n| (n.node.to_string(), n.depth, n.lane))
+            .collect()
+    }
+
+    /// The overlay's results, in the order it draws them: one entry per group
+    /// as `(node id, fragment source ranges)`.
+    #[doc(hidden)]
+    pub fn find_results_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, Vec<std::ops::Range<usize>>)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map =
+            find_overlay::map_layout(&tree, &|node| self.find_map_includes_for_test(node, cx));
+        self.find_results_for_map_for_test(&map, cx)
+            .into_iter()
+            .map(|g| {
+                (
+                    g.node.to_string(),
+                    g.fragments.iter().map(|f| f.range.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
     /// The left-hand side of the exactness invariant, over this frame's real
     /// selected path: the path's own matches plus every shown sibling's whole
     /// subtree. Must equal [`Self::find_space_total_for_test`] exactly.

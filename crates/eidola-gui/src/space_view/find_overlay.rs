@@ -146,16 +146,38 @@ pub(crate) struct MapNode {
 pub(crate) fn map_layout(roots: &[TreeNode], include: &dyn Fn(&TreeNode) -> bool) -> Vec<MapNode> {
     let mut out = Vec::new();
     let mut next_lane = 0usize;
-    for root in roots.iter().filter(|n| include(n)) {
-        // Allocated here rather than up front, so a later root's lane sits to
-        // the right of every branch the earlier ones opened.
-        let lane = next_lane;
-        next_lane += 1;
+    let kept: Vec<&TreeNode> = roots.iter().filter(|n| include(n)).collect();
+    let lanes = reserve_lanes(kept.len(), None, &mut next_lane);
+    for (root, lane) in kept.into_iter().zip(lanes) {
         lay_out_node(root, 0, lane, None, &mut next_lane, include, &mut out);
     }
     // The result order, and the reading order of the map itself.
     out.sort_by_key(|n| (n.depth, n.lane));
     out
+}
+
+/// Lanes for one node's children (or for the thread roots, where `own` is
+/// `None`): the first continues its parent's, and each of the rest opens a new
+/// one.
+///
+/// **Reserved for the whole sibling set before any of them is descended into**,
+/// which is the difference between a map whose forks read as forks and one
+/// whose branches are ordered by how deep their neighbours happen to run: with
+/// lanes allocated on the way down, a branch off the root lands to the *right*
+/// of a branch two levels below it, simply because the earlier subtree opened
+/// its lanes first. Siblings are the thing a reader is comparing, so siblings
+/// are what stay adjacent.
+fn reserve_lanes(count: usize, own: Option<usize>, next_lane: &mut usize) -> Vec<usize> {
+    (0..count)
+        .map(|i| match (i, own) {
+            (0, Some(lane)) => lane,
+            _ => {
+                let l = *next_lane;
+                *next_lane += 1;
+                l
+            }
+        })
+        .collect()
 }
 
 fn lay_out_node(
@@ -173,16 +195,9 @@ fn lay_out_node(
         lane,
         parent,
     });
-    let mut first = true;
-    for child in node.children.iter().filter(|c| include(c)) {
-        let child_lane = if first {
-            first = false;
-            lane
-        } else {
-            let l = *next_lane;
-            *next_lane += 1;
-            l
-        };
+    let kids: Vec<&TreeNode> = node.children.iter().filter(|c| include(c)).collect();
+    let lanes = reserve_lanes(kids.len(), Some(lane), next_lane);
+    for (child, child_lane) in kids.into_iter().zip(lanes) {
         lay_out_node(
             child,
             depth + 1,
@@ -374,7 +389,8 @@ impl SpaceView {
     }
 
     /// The disclosure's verb: expand the overlay, or collapse it again.
-    pub(crate) fn toggle_find_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    #[doc(hidden)]
+    pub fn toggle_find_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.find_overlay_open() {
             self.close_find_overlay(window, cx);
             return;
@@ -402,11 +418,8 @@ impl SpaceView {
     /// on a handle nobody paints. Only from an overlay that is actually holding
     /// the keyboard — a pointer press on the disclosure takes nothing from a
     /// reader composing elsewhere.
-    pub(crate) fn close_find_overlay(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    #[doc(hidden)]
+    pub fn close_find_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(session) = self.find.as_mut() else {
             return false;
         };
@@ -432,6 +445,20 @@ impl SpaceView {
     /// at every leaf, and drawing fifty of them would bury the shape the map
     /// exists to show. Both are leaves, so leaving them out changes nothing
     /// about the topology of what remains.
+    pub(crate) fn find_map_includes_for_test(&self, node: &TreeNode, cx: &gpui::App) -> bool {
+        self.find_map_includes(node, cx)
+    }
+
+    /// The results for a map this caller already laid out — the test seam's
+    /// half of [`Self::find_results`].
+    pub(crate) fn find_results_for_map_for_test(
+        &self,
+        map: &[MapNode],
+        cx: &gpui::App,
+    ) -> Vec<ResultGroup> {
+        self.find_results(map, cx)
+    }
+
     fn find_map_includes(&self, node: &TreeNode, cx: &gpui::App) -> bool {
         match node.src {
             NodeSrc::Msg(_) => true,
@@ -498,6 +525,31 @@ impl SpaceView {
             });
         }
         groups
+    }
+
+    /// Take the reader to the `index`-th result the overlay is showing — the
+    /// pointer's own path, reached by index because a test cannot press a card
+    /// whose bounds depend on where the list has been scrolled.
+    #[doc(hidden)]
+    pub fn open_find_result_for_test(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        let Some(fragment) = self
+            .find_results(&map, cx)
+            .into_iter()
+            .flat_map(|g| g.fragments)
+            .nth(index)
+        else {
+            return;
+        };
+        self.open_find_result(fragment, window, cx);
     }
 
     /// The transcript row a node id names, if it names one at all (a draft does
@@ -625,7 +677,7 @@ impl SpaceView {
 
     /// Scroll the results list so `top` is at the top of its viewport — what a
     /// map press does, and what following the cursor does.
-    fn scroll_find_results_to(&mut self, top: f32) {
+    pub(crate) fn scroll_find_results_to(&mut self, top: f32) {
         let Some(session) = self.find.as_mut() else {
             return;
         };
@@ -1310,16 +1362,17 @@ mod tests {
                 n.lane
             );
         }
-        // And a later root sits to the right of every branch the earlier one
-        // opened, rather than colliding with one of them.
-        let r2 = laid.iter().find(|n| n.node == "r2").expect("present");
-        let widest = laid
-            .iter()
-            .filter(|n| n.node.starts_with(['r', 'a', 'b']) && n.node != "r2")
-            .map(|n| n.lane)
-            .max()
-            .unwrap_or(0);
-        assert!(r2.lane > widest, "r2 opened a fresh lane");
+        // And siblings stay adjacent: the two thread roots are lanes 0 and 1,
+        // and the branches either one opens are to the right of both — which
+        // is the reservation rule, not an accident of which subtree is deeper.
+        let lane_of = |id: &str| laid.iter().find(|n| n.node == id).expect("present").lane;
+        assert_eq!((lane_of("r1"), lane_of("r2")), (0, 1));
+        assert!(
+            lane_of("a") == 0 && lane_of("b") > 1,
+            "r1's own fork opens past both roots (a {}, b {})",
+            lane_of("a"),
+            lane_of("b")
+        );
     }
 
     #[test]
@@ -1353,13 +1406,24 @@ mod tests {
 
     #[test]
     fn a_fragment_records_the_first_match_inside_it() {
-        let blocks = vec![0..10, 20..30];
-        let hits = vec![25..26, 3..4];
+        // Two fragments with an unmatched block between them, and hits that
+        // arrive in the *other* order — a projection reports them in source
+        // order, but the ordinal a fragment hands the anchor is the hit's own
+        // index in that list, never its position among the fragments.
+        let blocks = vec![0..10, 10..20, 20..30];
+        let hits = vec![3..4, 25..26];
         let runs = fragment_runs(&blocks, &hits);
-        // Ordered by block, and each run names the lowest hit index it holds —
-        // which is the ordinal the click hands the anchor, not a position in
-        // the list.
-        assert_eq!(runs, vec![(0..10, 1), (20..30, 0)]);
+        assert_eq!(runs, vec![(0..10, 0), (20..30, 1)]);
+    }
+
+    #[test]
+    fn adjacent_blocks_consolidate_even_across_the_gap_between_them() {
+        // "Contiguous" is a fact about the *render*, not about the bytes: two
+        // blocks with nothing laid out between them are one thing on the page,
+        // and the whitespace separating them in the source is not a third.
+        let blocks = vec![0..10, 20..30];
+        let hits = vec![3..4, 25..26];
+        assert_eq!(fragment_runs(&blocks, &hits), vec![(0..30, 0)]);
     }
 
     #[test]
