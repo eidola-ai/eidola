@@ -22571,6 +22571,91 @@ fn space_an_open_find_overlay_keeps_printables_out_of_the_conversation(cx: &mut 
     );
 }
 
+/// Fourteen branches off one root, every one of them matching: wide and
+/// shallow, so the map runs off the right of its own column (`map_lane_x`
+/// squeezes to the lane floor and then states the real x) while the fixture
+/// stays cheap — depth is the expensive axis for this view, breadth the free
+/// one.
+fn wide_map_posts() -> Vec<PostNode> {
+    let mut posts = vec![fixture_user_post("a1", "a kestrel at the root")];
+    for i in 0..14 {
+        let mut p = fixture_assistant_post(&format!("b{i}"), "another kestrel");
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+    posts
+}
+
+#[gpui::test]
+fn space_find_reveals_a_map_dot_the_keyboard_lands_on(cx: &mut TestAppContext) {
+    // Past thirteen lanes a dot sits beyond the column's own width, and every
+    // dot with matches is a real tab stop — so Tab could put the keyboard on
+    // one with no visible ring, and Enter would then scroll the results to a
+    // group chosen out of sight. The column scrolls to it, minimally, the way
+    // the results cursor reveals its card.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_map_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()),
+        (0.0, 0.0),
+        "precondition: the map opens at its origin"
+    );
+
+    // The last node in depth-then-lane order is the right-most lane — the one
+    // the column clips.
+    let last =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx))) - 1;
+    assert!(
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.focus_find_map_node_for_test(last, window, cx))
+        }),
+        "precondition: the right-most dot is a tab stop"
+    );
+    vcx.run_until_parked();
+    let (x, y) = view.read_with(&vcx, |v, _| v.find_map_scroll_for_test());
+    assert!(
+        x < 0.0,
+        "the column scrolled to bring the clipped dot into view (x = {x})"
+    );
+    assert_eq!(y, 0.0, "and moved on no axis it did not have to");
+
+    // A dot already in view leaves the reader's place alone…
+    assert!(vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.focus_find_map_node_for_test(last - 1, window, cx)
+        })
+    }));
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()).0,
+        x,
+        "a dot beside it is already showing, so nothing moves"
+    );
+
+    // …and walking back to the root brings the near edge with it.
+    assert!(vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.focus_find_map_node_for_test(0, window, cx))
+    }));
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()),
+        (0.0, 0.0),
+        "the root's dot is at the origin, so the column returns to it"
+    );
+}
+
 #[gpui::test]
 fn space_an_open_find_overlay_withholds_the_quote_verbs(cx: &mut TestAppContext) {
     // Menu dispatch is not traversal, so the overlay's tab-order suppression

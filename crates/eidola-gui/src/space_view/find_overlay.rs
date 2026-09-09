@@ -325,6 +325,34 @@ pub(crate) fn map_lane_x(lane: usize, lanes: usize) -> f32 {
     lane as f32 * map_lane_width(lanes)
 }
 
+/// The scroll offset that brings `[start, start + extent)` inside a viewport of
+/// `viewport`, moving as little as possible — one axis of the map's reveal.
+///
+/// `offset` is gpui's own sign convention (zero at the content's origin, going
+/// negative as the content moves up/left under the viewport), so the visible
+/// content span is `[-offset, -offset + viewport)`. Already-visible spans are
+/// left exactly where the reader put them; the result is clamped into
+/// `[-max, 0]`, so a viewport wider than its content never scrolls at all.
+pub(crate) fn map_reveal_axis(
+    start: f32,
+    extent: f32,
+    viewport: f32,
+    offset: f32,
+    max: f32,
+) -> f32 {
+    if viewport <= 0.0 {
+        return offset;
+    }
+    let wanted = if start < -offset {
+        -start
+    } else if start + extent > -offset + viewport {
+        viewport - (start + extent)
+    } else {
+        offset
+    };
+    wanted.clamp(-max.max(0.0), 0.0)
+}
+
 /// Every post's node id, resolved **once**.
 ///
 /// Both halves of the overlay ask "which transcript row is this node?" — the
@@ -454,6 +482,19 @@ pub(crate) struct FindOverlay {
     /// The nodes whose group is in the list's viewport this frame — the map's
     /// `aria_selected` set, derived rather than stored as state of its own.
     in_view: HashSet<SharedString>,
+    /// One **tracked** focus handle per map dot that is a tab stop, keyed by
+    /// the post it represents — the same key its element id takes, and for the
+    /// same reason (a background write reshapes the tree, and a slot keyed by
+    /// position would hand the reader's focus to another post's dot).
+    ///
+    /// It exists so the view can ask *which* dot the keyboard is on. A
+    /// probe-derived stop rides gpui's **implicit** handle, which this crate
+    /// never receives, and the focused element's bounds are crate-private — so
+    /// there is no other way to know a dot is off-screen, which is exactly the
+    /// gap the "Tab does not reveal an off-screen control" note names. The
+    /// handle carries `tab_index(0)`, reproducing what `probe` derives, so the
+    /// tab order is unchanged; only the *question* is newly answerable.
+    map_slots: HashMap<SharedString, gpui::FocusHandle>,
 }
 
 impl FindOverlay {
@@ -481,6 +522,7 @@ impl FindOverlay {
             bodies: HashMap::new(),
             tops: HashMap::new(),
             in_view: HashSet::new(),
+            map_slots: HashMap::new(),
         }
     }
 
@@ -508,6 +550,25 @@ impl FindOverlay {
         self.bodies.clear();
         self.tops.clear();
         self.in_view.clear();
+        self.map_slots.clear();
+    }
+
+    /// Hand back the handle for a map dot that is a tab stop, minting one the
+    /// first time, and drop the slots of every node this frame's map no longer
+    /// has one for. Same shape as [`Self::retain_results`]: a slot map is only
+    /// bounded by pruning it against what actually painted.
+    fn map_slots_for(
+        &mut self,
+        live: &HashSet<SharedString>,
+        cx: &mut gpui::App,
+    ) -> &HashMap<SharedString, gpui::FocusHandle> {
+        self.map_slots.retain(|id, _| live.contains(id));
+        for id in live {
+            self.map_slots
+                .entry(id.clone())
+                .or_insert_with(|| cx.focus_handle().tab_index(0).tab_stop(true));
+        }
+        &self.map_slots
     }
 
     /// Whether the overlay owns the keyboard — its list, or anything else
@@ -996,6 +1057,58 @@ impl SpaceView {
         self.reveal_find_group(&node, first, cx);
     }
 
+    /// Put the keyboard on the *i*-th map dot, as Tab would — the seam a test
+    /// needs, because a probe-derived stop rides gpui's implicit handle and a
+    /// test cannot name one. Answers whether that dot is a stop at all (only
+    /// the nodes with matches are). The slot map is filled during the map's
+    /// render, so this is asked after a frame.
+    #[doc(hidden)]
+    pub fn focus_find_map_node_for_test(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        let Some(node) = map.get(index).map(|n| n.node.clone()) else {
+            return false;
+        };
+        let Some(handle) = self
+            .find
+            .as_ref()
+            .and_then(|s| s.overlay.map_slots.get(&node))
+            .cloned()
+        else {
+            return false;
+        };
+        window.focus(&handle, cx);
+        true
+    }
+
+    /// How many nodes the map draws, in depth-then-lane order.
+    #[doc(hidden)]
+    pub fn find_map_nodes_for_test(&mut self, window: &Window, cx: &mut Context<Self>) -> usize {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        map_layout(&tree, &|node| self.find_map_includes(node, cx)).len()
+    }
+
+    /// The map column's scroll offset — what a reveal moves.
+    #[doc(hidden)]
+    pub fn find_map_scroll_for_test(&self) -> (f32, f32) {
+        self.find
+            .as_ref()
+            .map(|s| {
+                let o = s.overlay.map_scroll.offset();
+                (o.x.as_f32(), o.y.as_f32())
+            })
+            .unwrap_or((0.0, 0.0))
+    }
+
     /// The editor one result card paints through — the seam a test needs to put
     /// a selection in a card the way a drag would.
     #[doc(hidden)]
@@ -1073,7 +1186,7 @@ impl SpaceView {
         };
 
         let list = self.render_find_results(&groups, viewport_h, settled, window, cx);
-        let map_column = self.render_find_map(&map, &groups, &posts, cx);
+        let map_column = self.render_find_map(&map, &groups, &posts, window, cx);
 
         let focus = self.find.as_ref().expect("checked").overlay.focus.clone();
         Some(
@@ -1116,6 +1229,7 @@ impl SpaceView {
         map: &[MapNode],
         groups: &[ResultGroup],
         posts: &HashMap<SharedString, usize>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (muted, border, wash, accent) = {
@@ -1161,6 +1275,63 @@ impl SpaceView {
         let depths = map.iter().map(|n| n.depth + 1).max().unwrap_or(1);
         let x = |lane: usize| map_lane_x(lane, lanes);
         let y = |depth: usize| depth as f32 * MAP_ROW_H;
+
+        // **A dot the keyboard reaches is a dot the reader can see.** Only the
+        // nodes with matches are tab stops, and the column clips on both axes —
+        // a deep conversation carries dots below the fold, and past thirteen
+        // lanes `map_lane_x` states an x beyond the column's own width rather
+        // than folding it back — so Tab could land on a dot with no visible
+        // ring and Enter then scroll the list to a group chosen out of sight.
+        // Revealed the way the results cursor reveals its card: minimally, so a
+        // dot already in view is left exactly where the reader put it.
+        //
+        // Deliberately **not** a roving cursor like the list beside it. That
+        // idiom exists because a virtualized list cannot have a stop per row;
+        // every dot here paints, and the map is a *graph* — the minimap, this
+        // app's other topology map, likewise gives each node its own stop, and
+        // collapsing them onto one would make the map a second linear walk of
+        // the sequence the list already is.
+        let handle = self
+            .find
+            .as_ref()
+            .expect("checked")
+            .overlay
+            .map_scroll
+            .clone();
+        let slots = {
+            let overlay = &mut self.find.as_mut().expect("checked").overlay;
+            overlay.map_slots_for(&with_matches, cx).clone()
+        };
+        if let Some(node) = map
+            .iter()
+            .find(|n| slots.get(&n.node).is_some_and(|h| h.is_focused(window)))
+        {
+            // The viewport is the scroller's own painted box less its padding;
+            // both come from the last paint, which is what "where the reader is
+            // looking" means. Before the first one there is nothing to reveal
+            // into, and `max_offset` is zero, so the clamp answers "stay".
+            let view = handle.bounds().size;
+            let (offset, max) = (handle.offset(), handle.max_offset());
+            let target = gpui::point(
+                px(map_reveal_axis(
+                    x(node.lane),
+                    MAP_DOT,
+                    view.width.as_f32() - 2.0 * MAP_PAD,
+                    offset.x.as_f32(),
+                    max.x.as_f32(),
+                )),
+                px(map_reveal_axis(
+                    y(node.depth),
+                    MAP_DOT,
+                    view.height.as_f32() - 2.0 * MAP_PAD,
+                    offset.y.as_f32(),
+                    max.y.as_f32(),
+                )),
+            );
+            if target != offset {
+                handle.set_offset(target);
+            }
+        }
 
         // **Excess lanes run off the edge and are scrolled to, never folded
         // onto one x.** Past thirteen lanes the minimum stride carries the last
@@ -1258,6 +1429,12 @@ impl SpaceView {
             if has {
                 let cursor_to = first_fragment.get(&node.node).copied();
                 dot = dot
+                    // The view's own handle for this dot, so a reveal can ask
+                    // where the keyboard is. `probe` has already made the
+                    // element a stop at index 0; gpui reads a *tracked*
+                    // handle's own flags instead, and the handle carries the
+                    // same pair, so the tab order does not move.
+                    .track_focus(&slots[&node.node])
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.reveal_find_group(&target, cursor_to, cx);
@@ -1268,13 +1445,6 @@ impl SpaceView {
             canvas = canvas.child(dot);
         }
 
-        let handle = self
-            .find
-            .as_ref()
-            .expect("checked")
-            .overlay
-            .map_scroll
-            .clone();
         // The scroller and its indicator are **siblings inside a `relative`
         // ancestor** — the house rule, because an overlay painted as a child of
         // the scrolling element scrolls away with the content. Floating rather
@@ -2033,6 +2203,46 @@ mod tests {
         // A narrow graph still spreads to the full stride.
         assert_eq!(map_lane_width(1), MAP_LANE_W);
         assert_eq!(map_lane_width(2), MAP_LANE_W);
+    }
+
+    #[test]
+    fn a_reveal_moves_the_map_as_little_as_it_can() {
+        // The dot the keyboard is on has to be inside the column, and nothing
+        // else may move: a reader who scrolled the map somewhere keeps that
+        // place for every dot already showing.
+        let view = MAP_WIDTH - 2.0 * MAP_PAD;
+        let max = 60.0;
+
+        // Already in view, at either end of the visible span: unchanged.
+        assert_eq!(map_reveal_axis(0.0, MAP_DOT, view, 0.0, max), 0.0);
+        assert_eq!(
+            map_reveal_axis(view - MAP_DOT, MAP_DOT, view, 0.0, max),
+            0.0,
+            "a dot ending exactly at the edge is in view"
+        );
+
+        // Past the far edge: scrolled just far enough to end at the edge.
+        let past = view + 4.0;
+        let o = map_reveal_axis(past, MAP_DOT, view, 0.0, max);
+        assert_eq!(o, view - (past + MAP_DOT));
+        assert!(
+            past >= -o && past + MAP_DOT <= -o + view,
+            "…and that really does bring the whole dot inside"
+        );
+
+        // Behind the near edge: scrolled to sit exactly on it, never past it.
+        assert_eq!(map_reveal_axis(10.0, MAP_DOT, view, -40.0, max), -10.0);
+
+        // The clamp is gpui's own range, so a viewport with nothing to scroll
+        // answers "stay" rather than inventing an offset.
+        assert_eq!(map_reveal_axis(400.0, MAP_DOT, view, 0.0, 0.0), 0.0);
+        assert_eq!(
+            map_reveal_axis(400.0, MAP_DOT, view, 0.0, max),
+            -max,
+            "and a dot past the content's own end stops at the end"
+        );
+        // Before the first paint there is no viewport to reveal into.
+        assert_eq!(map_reveal_axis(400.0, MAP_DOT, 0.0, -7.0, max), -7.0);
     }
 
     #[test]
