@@ -924,6 +924,12 @@ fn retitle_windows(cx: &mut App) {
             .update(cx, |_, window, _| window.set_window_title(&title))
             .ok();
     }
+    if let Some(handle) = cx.global::<AppGlobal>().onboarding_window {
+        let title = i18n::msg::onboarding_window_title(cx);
+        handle
+            .update(cx, |_, window, _| window.set_window_title(&title))
+            .ok();
+    }
 }
 
 /// Open the About window — a small singleton (~360×420). Shows the wordmark,
@@ -1148,7 +1154,7 @@ fn open_onboarding_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        window.set_window_title("Get Started");
+        window.set_window_title(&i18n::msg::onboarding_window_title(cx));
         let view = cx.new(|cx| OnboardingView::new(stores.clone(), window, cx));
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))

@@ -194,6 +194,119 @@ fn a_locale_change_notifies_global_observers(cx: &mut TestAppContext) {
     assert_eq!(changes.get(), baseline + 1, "a no-op apply must not notify");
 }
 
+/// **A bundle is built once per locale, not once per lookup.**
+///
+/// Building one re-parses every embedded FTL resource — the source locale's and
+/// the requested one's. That was affordable while `format_in`'s only caller was
+/// the startup alert; it stopped being affordable when a *rendered* surface
+/// began naming its locale (`plans::PlanLabels` under Settings ▸ Account, once
+/// per label per row per frame). The resources are compile-time constants, so a
+/// built bundle can never go stale and the cache is never invalidated.
+#[gpui::test]
+fn an_explicit_locale_builds_its_bundle_once(cx: &mut TestAppContext) {
+    cx.update(i18n::install);
+
+    // Warm whatever the first lookup in each locale has to build.
+    for tag in ["en", "fr"] {
+        let _ = i18n::format_in(tag, "plans-list", None);
+    }
+    let warm = i18n::bundles_built_for_test();
+
+    // A hundred more lookups across both locales build nothing further.
+    for _ in 0..50 {
+        for tag in ["en", "fr"] {
+            let _ = i18n::format_in(tag, "plans-list", None);
+            let _ = i18n::format_in(tag, "plans-opening-checkout", None);
+        }
+    }
+    assert_eq!(
+        i18n::bundles_built_for_test(),
+        warm,
+        "an explicit-locale lookup must reuse the bundle its locale already built"
+    );
+
+    // And the active-locale path reaches the installed global, which is not a
+    // bundle this cache has to hold at all.
+    let before = i18n::bundles_built_for_test();
+    for _ in 0..50 {
+        let _ = cx.update(|cx| i18n::format(cx, "plans-list", None));
+    }
+    assert_eq!(
+        i18n::bundles_built_for_test(),
+        before,
+        "the active locale is answered by the installed global, not by a fresh bundle"
+    );
+}
+
+/// **Every window title fed from the resources is re-applied on a locale
+/// change.**
+///
+/// A title is set once, at open, and lives outside any render — so it does not
+/// follow a locale change the way a drawn string does, and `retitle_windows` is
+/// the observer that puts it right. The doctrine states that any newly
+/// localized title joins it; this makes the rule structural rather than a thing
+/// to remember, by reading `lib.rs` for the two halves and comparing them.
+///
+/// It is a source scan because the title has no readable seam: gpui's test
+/// platform keeps `PlatformWindow::get_title`'s empty default, and
+/// `retitle_windows` returns early with no `AppGlobal` — which only production
+/// installs. The trigger side is covered by
+/// `a_locale_change_notifies_global_observers` above.
+#[test]
+fn every_localized_window_title_is_re_applied_on_a_locale_change() {
+    let src = include_str!("../src/lib.rs");
+
+    // The titles set from the resources, wherever a window opens.
+    let mut localized: Vec<&str> = Vec::new();
+    for (i, _) in src.match_indices("set_window_title(&i18n::msg::") {
+        let rest = &src[i + "set_window_title(&i18n::msg::".len()..];
+        let name = &rest[..rest.find('(').expect("an accessor call")];
+        localized.push(name);
+    }
+    localized.sort_unstable();
+    localized.dedup();
+    assert!(
+        localized.len() >= 2,
+        "the scan found no localized window titles — it has stopped measuring anything"
+    );
+
+    // The body of the observer that re-applies them.
+    let start = src
+        .find("fn retitle_windows(")
+        .expect("retitle_windows must exist");
+    let body = &src[start..];
+    let end = body.find("\n}\n").expect("a closing brace") + 2;
+    let body = &body[..end];
+
+    for name in localized {
+        assert!(
+            body.contains(&format!("i18n::msg::{name}(")),
+            "`{name}` titles a window from the resources but `retitle_windows` never re-applies \
+             it — the window would keep the language it opened in"
+        );
+    }
+}
+
+/// The onboarding window's own title moves with the reader, which is what makes
+/// the re-application above worth doing.
+#[gpui::test]
+fn the_onboarding_windows_title_speaks_the_readers_language(cx: &mut TestAppContext) {
+    cx.update(i18n::install);
+    for (tag, expected) in [
+        ("en", "Get Started"),
+        ("fr", "Commencer"),
+        ("zh-Hant", "開始使用"),
+        ("en", "Get Started"),
+    ] {
+        cx.update(|cx| i18n::apply(tag, cx));
+        assert_eq!(
+            cx.update(|cx| i18n::msg::onboarding_window_title(cx)),
+            expected,
+            "{tag} names the window in the Window menu, the switcher and VoiceOver"
+        );
+    }
+}
+
 /// A translated message may reference an **untranslated** one, and the
 /// reference has to resolve across that boundary.
 ///
@@ -262,7 +375,18 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("n", 2);
                 args.set("index", 1);
                 args.set("total", 3);
-                args.set("count", 5);
+                args.set("name", "Privacy Policy");
+                args.set("credits", "1,250");
+                // A plural selector reads this as a number, so it is one — a
+                // string here would select `*[other]` in every locale and the
+                // `[one]` variants would never be exercised at all.
+                args.set("count", 1);
+                args.set("unlinkability", "https://example.invalid/unlinkability");
+                args.set("line", "5,000,000 credits, expire one year after purchase");
+                // The upstream's own interval name — selected on, never shown.
+                args.set("interval", "month");
+                args.set("amount", "10.00 USD");
+                args.set("description", "the seller's own words");
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),
@@ -443,6 +567,58 @@ fn attributes_and_duplicates_are_refused_rather_than_quietly_ignored() {
     let err =
         codegen::parse_locale("en", "hello = Hello\nhello = Hi\n").expect_err("should refuse");
     assert!(err.contains("duplicate"), "{err}");
+}
+
+/// **A translation may not redefine a term the source marks fixed** (rule 14).
+///
+/// `-fixed-*` names text deliberately identical in every locale — a published
+/// legal document's title, a wordmark — while the sentences around it localize.
+/// Nothing else refused one: `check_translation` walks *messages*, so a locale
+/// defining such a term passed the build and then won at runtime, because the
+/// bundle is `add_resource_overriding`. That is a locale renaming the Terms of
+/// Service inside the sentence a reader affirms.
+#[test]
+fn a_translation_may_not_redefine_a_fixed_term() {
+    let en = parse(
+        "en",
+        "-fixed-terms-of-service = Terms of Service
+consent = I agree to the          { -fixed-terms-of-service }.
+",
+    );
+
+    // The whole point: this parses, resolves, and would have shipped.
+    let fr = parse(
+        "fr",
+        "-fixed-terms-of-service = Conditions inventées
+consent = J'accepte les          { -fixed-terms-of-service }.
+",
+    );
+    codegen::check_locale(&fr, Some(&en)).expect("it resolves — which is why it needed refusing");
+
+    let err = codegen::check_translation(&en, &fr).expect_err("a fixed term must be refused");
+    assert!(
+        err.contains("-fixed-terms-of-service") && err.contains("fr"),
+        "the refusal must name the term and the locale: {err}"
+    );
+
+    // An ordinary term is still a translation's to override — only the marked
+    // ones are fixed.
+    let en = parse(
+        "en",
+        "-tone = calm
+line = Stay { -tone }.
+",
+    );
+    let fr = parse(
+        "fr",
+        "-tone = calme
+line = Restez { -tone }.
+",
+    );
+    codegen::check_translation(&en, &fr).expect("an unmarked term may be translated");
+    // The shipped tree is held to the same rule by
+    // `the_shipped_locales_satisfy_the_contract`, which runs every locale
+    // through `check_translation`.
 }
 
 /// A term has its own scope, so a variable in a term body can never be filled.

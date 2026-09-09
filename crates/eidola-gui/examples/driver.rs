@@ -1863,6 +1863,14 @@ mod driver {
                 product_description: Some("A month of casual questions".into()),
                 amount_display: "5.00 USD".into(),
                 recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 5_000_000,
             },
             PriceInfo {
@@ -1871,6 +1879,14 @@ mod driver {
                 product_description: Some("Daily thinking, long documents".into()),
                 amount_display: "20.00 USD".into(),
                 recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 2000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 20_000_000,
             },
             // A one-time price, so the plans surfaces show both kinds — it is
@@ -1881,6 +1897,11 @@ mod driver {
                 product_description: Some("Credit that keeps for a year".into()),
                 amount_display: "10.00 USD".into(),
                 recurrence: "".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
                 credits: 10_000_000,
             },
         ]

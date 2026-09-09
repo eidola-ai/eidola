@@ -26,7 +26,7 @@ use eidola_gui::account::AccountView;
 use eidola_gui::actions::{PostOnly, Send};
 use eidola_gui::agents_settings::AgentsSettingsView;
 use eidola_gui::library::LibraryView;
-use eidola_gui::onboarding::{OnboardingView, Slide};
+use eidola_gui::onboarding::{CheckoutFailure, OnboardingView, Slide, VerifyFailure};
 use eidola_gui::participants::EditMode;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
@@ -7502,8 +7502,8 @@ fn onboarding_checkout_will_not_fund_an_account_linked_over(cx: &mut TestAppCont
     );
     view.read_with(cx, |v, _| {
         assert!(
-            v.checkout_error()
-                .is_some_and(|e| e.contains("account changed"))
+            matches!(v.checkout_error(), Some(CheckoutFailure::StaleMint)),
+            "the link is discarded as minted for another account, and says so"
         );
     });
 }
@@ -7562,8 +7562,8 @@ fn onboarding_checkout_will_not_fund_an_account_swapped_away_and_back(cx: &mut T
     );
     view.read_with(cx, |v, _| {
         assert!(
-            v.checkout_error()
-                .is_some_and(|e| e.contains("account changed"))
+            matches!(v.checkout_error(), Some(CheckoutFailure::StaleMint)),
+            "the link is discarded as minted for another account, and says so"
         );
     });
 
@@ -8050,10 +8050,14 @@ fn onboarding_verify_requires_both_fields(cx: &mut TestAppContext) {
     let stores = stub_stores(cx, |_| {});
     let (_w, view) = open_onboarding(cx, &stores);
 
-    // Both inputs blank: verification refuses with a message, no request.
+    // Both inputs blank: verification refuses before any request, and the
+    // refusal is the typed reason rather than a sentence frozen at the refusal.
     view.update(cx, |v, cx| v.begin_verify(cx));
     view.read_with(cx, |v, _| {
-        assert!(matches!(v.verify_result_for_test(), Some(Err(_))));
+        assert!(matches!(
+            v.verify_result_for_test(),
+            Some(Err(VerifyFailure::MissingCredentials))
+        ));
     });
 }
 
@@ -8080,6 +8084,235 @@ fn onboarding_verify_with_inputs_is_backend_gated_on_stub(cx: &mut TestAppContex
             "a stub backend yields no verification result, and no field error"
         );
     });
+}
+
+/// **Onboarding holds what happened, and chooses the words at render.**
+///
+/// Four slots used to hold a formatted sentence — the creation refusal, the
+/// terms-fetch failure, the credential check's result and the refused checkout
+/// — and a sentence in state is a cached render decision: `i18n::apply`
+/// refreshes every window but replaces no state, so the old language would
+/// repaint until something else replaced it.
+///
+/// The locale is switched **without re-emitting any of them**, which is the
+/// whole of the test: a cache would pass the first assertion of each group and
+/// fail every one after it.
+#[gpui::test]
+fn onboarding_says_what_happened_in_the_readers_language(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+    });
+    let (_w, view) = open_onboarding(cx, &stores);
+
+    // -- The refusal this surface makes itself, before any request ---------
+    view.update(cx, |v, cx| v.begin_verify(cx));
+    for (tag, expected) in [
+        ("en", "Enter both an account ID and secret."),
+        (
+            "fr",
+            "Saisissez à la fois un identifiant et un secret de compte.",
+        ),
+        ("zh-Hans", "请同时填写账户 ID 和密钥。"),
+        ("en", "Enter both an account ID and secret."),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.verify_message_for_test(cx)),
+            Some(expected.into()),
+            "{tag} repaints the refusal already standing — nothing was re-emitted"
+        );
+    }
+
+    // -- The one server refusal this layer has words of its own for --------
+    view.update(cx, |v, cx| {
+        v.finish_verify(
+            Err(AppError::Server {
+                status: 401,
+                message: "unauthorized".into(),
+            }),
+            cx,
+        )
+    });
+    for (tag, expected) in [
+        (
+            "en",
+            "We couldn't verify that account. Check the ID and secret, or create a new account \
+             instead.",
+        ),
+        (
+            "fr",
+            "Nous n'avons pas pu vérifier ce compte. Vérifiez l'identifiant et le secret, ou créez \
+             plutôt un nouveau compte.",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.verify_message_for_test(cx)),
+            Some(expected.into()),
+            "{tag} repaints the credential refusal already standing"
+        );
+    }
+
+    // -- And the balance it reports, whose noun agrees with the number -----
+    view.update(cx, |v, cx| {
+        v.finish_verify(
+            Ok(eidola_app_core::BalancesResult {
+                available: 1,
+                pools: Vec::new(),
+            }),
+            cx,
+        )
+    });
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.verify_message_for_test(cx)),
+        Some("This account is valid and has a balance of 1 credit.".into()),
+        "one credit is one credit, not \"1 credits\""
+    );
+    view.update(cx, |v, cx| {
+        v.finish_verify(
+            Ok(eidola_app_core::BalancesResult {
+                available: 1_250,
+                pools: Vec::new(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.verify_message_for_test(cx)),
+        Some("This account is valid and has a balance of 1,250 credits.".into()),
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.verify_message_for_test(cx)),
+        Some("Ce compte est valide et dispose d'un solde de 1,250 crédits.".into()),
+        "the balance already on screen follows the locale too"
+    );
+
+    // -- The checkout link this surface itself declined to open ------------
+    let minted_for = fingerprint_of_state(&config_state(true));
+    stores.config.update(cx, |c, _| {
+        let mut state = config_state(true);
+        state.account_id = Some("00000000-0000-7000-8000-000000000444".into());
+        c.set_state_for_test(Some(state));
+    });
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/stale".into(),
+                minted_for,
+            }),
+            cx,
+        )
+    });
+    for (tag, expected) in [
+        (
+            "en",
+            "The account changed while that was being prepared, so nothing was opened. Try again.",
+        ),
+        (
+            "zh-Hant",
+            "準備期間帳戶發生了變更，因此沒有開啟任何頁面。請重試。",
+        ),
+        (
+            "en",
+            "The account changed while that was being prepared, so nothing was opened. Try again.",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.checkout_message_for_test(cx)),
+            Some(expected.into()),
+            "{tag} repaints the discarded link's explanation"
+        );
+    }
+
+    // -- And the boundary this extraction deliberately leaves alone --------
+    //
+    // A creation refusal carries no copy of ours, so what the reader is shown
+    // is the typed error's own text: English in every locale, because app-core
+    // is locale-free and the payload a faithful translation would need is not
+    // in the variant to read. Pinned so it stays a decision rather than an
+    // oversight — the day a variant earns a sentence here, this changes with it.
+    view.update(cx, |v, cx| {
+        v.set_create_error_for_test(
+            AppError::Server {
+                status: 503,
+                message: "temporarily unavailable".into(),
+            },
+            cx,
+        )
+    });
+    let english = view.read_with(cx, |v, _| v.create_message_for_test());
+    for tag in ["fr", "zh-Hans"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.create_message_for_test()),
+            english,
+            "the typed error's own words are what this surface still shows in {tag}"
+        );
+    }
+}
+
+/// **The slide prose is chosen at render, not seeded once.**
+///
+/// Each slide's editor is element-owned state initialised on its first frame,
+/// so a body written in once would repaint in the language the window opened
+/// in for the rest of the session. `slide_body` is the one call both the render
+/// and this test make.
+#[gpui::test]
+fn onboarding_slide_prose_follows_the_reader(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_onboarding(cx, &stores);
+
+    // **The buffer, not the message.** A slide's editor is minted on the frame
+    // its slide is first revealed; if the body were seeded there rather than
+    // pushed on every frame, the message below would move with the locale and
+    // the text on the page would not.
+    for (tag, opening) in [
+        ("en", "## *Pause here*"),
+        ("fr", "## *Faites une pause*"),
+        ("zh-Hans", "## *请先停一下*"),
+        ("en", "## *Pause here*"),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+
+        let body = cx.update(|cx| OnboardingView::slide_body_for_test(Slide::Pause, cx));
+        assert!(
+            body.starts_with(opening),
+            "{tag}: the first slide's message must be the reader's; got {body:?}"
+        );
+        let painted = view
+            .read_with(cx, |v, cx| v.slide_prose_for_test(Slide::Pause, cx))
+            .expect("the first slide is revealed from the start");
+        assert_eq!(
+            painted,
+            body.to_string(),
+            "{tag}: the editor holds what the render chose — nothing was seeded once"
+        );
+    }
+
+    // The paragraph structure survives the trip through FTL — a body that
+    // collapsed into one paragraph would render as one run-on line.
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    let tool = cx.update(|cx| OnboardingView::slide_body_for_test(Slide::Tool, cx));
+    assert!(
+        tool.contains("\n\n- Its behavior"),
+        "the bullet list must still stand apart from the paragraph above it: {tool:?}"
+    );
+
+    // The one link target inside a body is the app's, not the translation's.
+    for tag in ["en", "fr", "zh-Hant"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let started = cx.update(|cx| OnboardingView::slide_body_for_test(Slide::GetStarted, cx));
+        assert!(
+            started.contains("(https://www.eidola.ai/docs/privacy-guarantees/#2-unlinkability)"),
+            "{tag} must link the same evidence: {started:?}"
+        );
+    }
 }
 
 #[gpui::test]

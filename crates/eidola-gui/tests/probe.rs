@@ -890,6 +890,11 @@ fn account_balance_pools_and_plan_sublines_carry_their_values(cx: &mut TestAppCo
             product_description: None,
             amount_display: "$5".into(),
             recurrence: "".into(),
+            amount: Some(eidola_app_core::PriceAmount {
+                minor_units: 500,
+                currency: "USD".into(),
+            }),
+            cadence: eidola_app_core::PriceCadence::OneTime,
             credits: 5_000_000,
         }];
         s.backends = backends_fixture();
@@ -1180,7 +1185,15 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
                 product_name: "Monthly".into(),
                 product_description: Some("Recurring top-up".into()),
                 amount_display: "$10".into(),
-                recurrence: "/mo".into(),
+                recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 10_000_000,
             },
             PriceInfo {
@@ -1189,6 +1202,11 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
                 product_description: None,
                 amount_display: "$5".into(),
                 recurrence: "".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
                 credits: 5_000_000,
             },
         ];
@@ -1755,6 +1773,522 @@ fn onboarding_consent_slide_links_the_documents_it_will_submit(cx: &mut TestAppC
     );
 }
 
+/// **The consent surface speaks the reader's language — labels included.**
+///
+/// This is the one screen in the app where somebody affirms something, and the
+/// accessible name *is* the localized string: an English literal beside a
+/// translated accessor is invisible in English and audible everywhere else.
+/// So the locale is switched with nothing re-emitted and the recorded labels
+/// are read again.
+///
+/// The two document titles deliberately do **not** move: they are the published
+/// names of the texts being agreed to, and the name a reader will find at the
+/// other end of the link. Only the sentence around them localizes.
+#[gpui::test]
+fn the_consent_surface_speaks_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_terms_for_test(
+            eidola_gui::loadable::Loadable::loaded(vec![eidola_app_core::TermsDocument {
+                document: "privacy_policy".into(),
+                version: 7,
+                url: "https://example.invalid/privacy/".into(),
+                sha256: "b".repeat(64),
+            }]),
+            cx,
+        );
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+    });
+
+    for (tag, consent, create, document) in [
+        (
+            "en",
+            "I agree to the Terms of Service and Privacy Policy.",
+            "Create a new account.",
+            "Privacy Policy (version 7)",
+        ),
+        (
+            "fr",
+            "J'accepte les Terms of Service et la Privacy Policy.",
+            "Créer un nouveau compte.",
+            "Privacy Policy (version 7)",
+        ),
+        (
+            "zh-Hant",
+            "我同意 Terms of Service 與 Privacy Policy。",
+            "建立一個新帳戶。",
+            "Privacy Policy（版本 7）",
+        ),
+        (
+            "en",
+            "I agree to the Terms of Service and Privacy Policy.",
+            "Create a new account.",
+            "Privacy Policy (version 7)",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(&entries, "onboarding/agree", gpui::Role::CheckBox, consent);
+        assert_probe(
+            &entries,
+            "onboarding/cta/create",
+            gpui::Role::Button,
+            create,
+        );
+        assert_probe(
+            &entries,
+            "onboarding/link/privacy-policy",
+            gpui::Role::Link,
+            document,
+        );
+    }
+}
+
+/// **A localized slide localizes the shared component inside it.**
+///
+/// The Purchase slide's payment choices come from `plans::plan_rows`, which
+/// used to hard-code its list name, its in-flight price line and both expiry
+/// disclosures — so a reader who had just read four French slides met English
+/// where the money is. The rows now take the locale their host names, read
+/// again after a switch with nothing re-emitted.
+#[gpui::test]
+fn the_purchase_slides_plans_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+
+    // Each row: the list's name, the recurring row's own name (the cadence,
+    // which app-core hands over as data and this layer words) and subline, and
+    // the one-time row's subline.
+    for (tag, list, recurring_name, recurring, one_time) in [
+        (
+            "en",
+            "Available plans",
+            "Monthly — $10/month",
+            "10,000,000 credits, expire at the end of each billing period — Recurring top-up",
+            "5,000,000 credits, expire one year after purchase",
+        ),
+        (
+            "fr",
+            "Formules disponibles",
+            "Monthly — $10/mois",
+            "10,000,000 crédits, expirent à la fin de chaque période de facturation — Recurring \
+             top-up",
+            "5,000,000 crédits, expirent un an après l'achat",
+        ),
+        (
+            "zh-Hans",
+            "可选方案",
+            "Monthly — $10/月",
+            "10,000,000 点额度，在每个计费周期结束时过期 —— Recurring top-up",
+            "5,000,000 点额度，自购买之日起一年后过期",
+        ),
+        (
+            "en",
+            "Available plans",
+            "Monthly — $10/month",
+            "10,000,000 credits, expire at the end of each billing period — Recurring top-up",
+            "5,000,000 credits, expire one year after purchase",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(&entries, "onboarding/plans", gpui::Role::ListBox, list);
+        // The rows are ordered as the fixture lists them: the recurring plan,
+        // then the one-time top-up.
+        assert_probe_value(
+            &entries,
+            "onboarding/plan/0",
+            gpui::Role::ListBoxOption,
+            recurring_name,
+            recurring,
+        );
+        assert_probe_value(
+            &entries,
+            "onboarding/plan/1",
+            gpui::Role::ListBoxOption,
+            // A one-time price has no cadence to say, so its line is the
+            // amount alone — the same in every locale.
+            "One-time — $5",
+            one_time,
+        );
+    }
+}
+
+/// **The cadence is data across the boundary and words on this side.**
+///
+/// `PriceInfo::recurrence` is English composed in app-core (`/month`), so every
+/// recurring row ended in English inside a fully localized slide. The typed
+/// `PriceCadence` crosses instead and this layer words it — including a free
+/// price, whose amount app-core spells as the word "free", and a cadence this
+/// build has never seen, which still has to say something.
+#[gpui::test]
+fn the_plan_cadence_and_the_free_price_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.prices = vec![
+            eidola_app_core::PriceInfo {
+                id: "price_quarterly".into(),
+                product_name: "Quarterly".into(),
+                product_description: None,
+                amount_display: "27.00 USD".into(),
+                recurrence: "/3xmonth".into(),
+                credits: 30_000_000,
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 2_700,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 3,
+                },
+            },
+            eidola_app_core::PriceInfo {
+                id: "price_free".into(),
+                product_name: "Sampler".into(),
+                product_description: None,
+                // What app-core spells for a price with no amount.
+                amount_display: "free".into(),
+                recurrence: String::new(),
+                credits: 1_000,
+                amount: None,
+                cadence: eidola_app_core::PriceCadence::OneTime,
+            },
+            eidola_app_core::PriceInfo {
+                id: "price_odd".into(),
+                product_name: "Fortnightly".into(),
+                product_description: None,
+                amount_display: "4.00 USD".into(),
+                recurrence: "/fortnight".into(),
+                credits: 4_000,
+                // An interval name this build has never heard of: the reader is
+                // still owed a cadence, so the catch-all says it with the
+                // upstream's own word.
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 400,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "fortnight".into(),
+                    count: 1,
+                },
+            },
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+
+    for (tag, quarterly, free, odd) in [
+        (
+            "en",
+            "Quarterly — 27.00 USD every 3 months",
+            "Sampler — Free",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+        (
+            "fr",
+            "Quarterly — 27.00 USD tous les 3 mois",
+            "Sampler — Gratuit",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+        (
+            "zh-Hans",
+            "Quarterly — 每 3 个月 27.00 USD",
+            "Sampler — 免费",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+        (
+            "en",
+            "Quarterly — 27.00 USD every 3 months",
+            "Sampler — Free",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        for (name, expected) in [
+            ("onboarding/plan/0", quarterly),
+            ("onboarding/plan/1", free),
+            ("onboarding/plan/2", odd),
+        ] {
+            let (_, entry) = entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(
+                entry.label.as_ref(),
+                expected,
+                "{tag}: {name} must say what it costs and how often"
+            );
+        }
+    }
+}
+
+/// **One credit is one credit, and a request in flight says so.**
+///
+/// The credits line used to be a number with `" credits, "` and an expiry
+/// clause appended, which reads "1 credits" and cannot inflect in any other
+/// language; it is one sentence per plan kind now, agreeing with the count.
+/// The pending price line is the other string the shared component used to
+/// hard-code.
+#[gpui::test]
+fn a_single_credit_reads_as_one_and_a_pending_plan_says_it_is_opening(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.prices = vec![
+            eidola_app_core::PriceInfo {
+                id: "price_one".into(),
+                product_name: "A single credit".into(),
+                product_description: None,
+                amount_display: "$0.01".into(),
+                recurrence: String::new(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
+                credits: 1,
+            },
+            eidola_app_core::PriceInfo {
+                id: "price_many".into(),
+                product_name: "Many".into(),
+                product_description: None,
+                amount_display: "$5".into(),
+                recurrence: String::new(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
+                credits: 2,
+            },
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/0",
+        gpui::Role::ListBoxOption,
+        "A single credit — $0.01",
+        "1 credit, expires one year after purchase",
+    );
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/1",
+        gpui::Role::ListBoxOption,
+        "Many — $5",
+        "2 credits, expire one year after purchase",
+    );
+
+    // A checkout request is out for the first plan: its price line says so, in
+    // the reader's language, and the other row is untouched.
+    view.update(cx, |v, cx| v.begin_checkout("price_one".into(), cx));
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/0",
+        gpui::Role::ListBoxOption,
+        "A single credit — Ouverture du paiement…",
+        "1 crédit, expire un an après l'achat",
+    );
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/1",
+        gpui::Role::ListBoxOption,
+        "Many — $5",
+        "2 crédits, expirent un an après l'achat",
+    );
+}
+
+/// **The Account pane's rows stay English while its page does.**
+///
+/// The other half of the caller-supplied rule: a shared component that
+/// localized unconditionally would put translated plan rows inside an
+/// otherwise-English Settings page — the failure the wholesale-menu rule names.
+/// `PlanLabels::english()` pins them, and this is what an accidental
+/// `localized(cx)` there would fail.
+#[gpui::test]
+fn the_account_panes_plans_stay_english_with_its_page(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    for tag in ["en", "fr", "zh-Hans"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(
+            &entries,
+            "settings/account/plans",
+            gpui::Role::ListBox,
+            "Available plans",
+        );
+        assert_probe_value(
+            &entries,
+            "settings/account/plan/1",
+            gpui::Role::ListBoxOption,
+            "One-time — $5",
+            "5,000,000 credits, expire one year after purchase",
+        );
+    }
+}
+
+/// **A probe name is a selector, so it does not move with the reader.**
+///
+/// The credential rows used to derive both their probe names and their element
+/// ids from their labels, which was harmless while the labels were `&'static
+/// str` and a defect the moment they localized: a driver selector translated
+/// per locale, and a per-element identity — hence an accessibility node id —
+/// reminted on a language change. The names are keyed by the row now; only the
+/// labels follow the reader.
+#[gpui::test]
+fn the_credential_rows_keep_their_names_and_localize_their_labels(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+        v.reveal(Slide::CreateAccount, Slide::NewAccount, cx);
+    });
+
+    for (tag, id_copy, secret_copy) in [
+        ("en", "Copy Account ID", "Copy Account Secret"),
+        (
+            "fr",
+            "Copier Identifiant du compte",
+            "Copier Secret du compte",
+        ),
+        ("en", "Copy Account ID", "Copy Account Secret"),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(
+            &entries,
+            "onboarding/copy/account-id",
+            gpui::Role::Button,
+            id_copy,
+        );
+        assert_probe(
+            &entries,
+            "onboarding/copy/account-secret",
+            gpui::Role::Button,
+            secret_copy,
+        );
+        // And the input rows on the other branch, whose element ids used to
+        // carry a label too.
+        assert!(
+            entries
+                .iter()
+                .all(|(name, _)| name.is_ascii() && !name.contains(' ')),
+            "{tag}: a probe name must stay a stable slash-scoped selector; recorded: {:?}",
+            entries.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// **The quiet third choice says one thing, once.** Its visible sentence and
+/// its accessible name used to differ by a full stop — the failure the a11y
+/// rule names, invisible in English. One message serves both, and the label
+/// follows the reader.
+#[gpui::test]
+fn the_account_free_choice_reads_the_same_to_everyone(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+    });
+
+    for (tag, label) in [
+        ("en", "Continue without an account — on-device models only."),
+        (
+            "fr",
+            "Continuer sans compte — modèles sur l'appareil uniquement.",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(
+            &entries,
+            "onboarding/cta/skip-account",
+            gpui::Role::Button,
+            label,
+        );
+        assert_probe(&entries, "onboarding/back/1", gpui::Role::Button, {
+            if tag == "en" {
+                "Go to the previous slide"
+            } else {
+                "Aller à la diapositive précédente"
+            }
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Record window — the raw local trail. Listing rows, section tabs, refresh,
 // and the load-more affordance are all probed (indexed row names so a driver
@@ -2303,7 +2837,15 @@ fn account_backends_stores(cx: &mut TestAppContext) -> Stores {
                 product_name: "Monthly".into(),
                 product_description: Some("Recurring top-up".into()),
                 amount_display: "$10".into(),
-                recurrence: "/mo".into(),
+                recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 10_000_000,
             },
             PriceInfo {
@@ -2312,6 +2854,11 @@ fn account_backends_stores(cx: &mut TestAppContext) -> Stores {
                 product_description: None,
                 amount_display: "$5".into(),
                 recurrence: "".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
                 credits: 5_000_000,
             },
         ];
