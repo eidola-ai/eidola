@@ -1329,16 +1329,22 @@ fn a_backend_that_never_answers_does_not_take_the_listing_with_it() {
         let runtime = core.runtime();
 
         eidola_app_core::proxy::route::set_model_list_timeout_for_test(300);
-        let started = std::time::Instant::now();
-        let (status, body) = runtime.block_on(exchange(&core, &get("/v1/models", Some(&key))));
-        let elapsed = started.elapsed();
+        // **The wait is bounded here too**, because the defect's own shape is
+        // that the endpoint never answers: without a per-backend deadline this
+        // test would hang rather than fail, and a hang says nothing.
+        let answered = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                exchange(&core, &get("/v1/models", Some(&key))),
+            )
+            .await
+        });
         eidola_app_core::proxy::route::set_model_list_timeout_for_test(0);
 
-        assert_eq!(status, 200, "the listing answers: {body}");
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "and it answers on its own deadline rather than the wedged backend's: {elapsed:?}"
+        let (status, body) = answered.expect(
+            "the listing answers on its own deadline rather than waiting out a wedged backend",
         );
+        assert_eq!(status, 200, "the listing answers: {body}");
         assert!(
             body.contains(MODEL),
             "a healthy backend's models are not lost to an unhealthy one's silence: {body}"
