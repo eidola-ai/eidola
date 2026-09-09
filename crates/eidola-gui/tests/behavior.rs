@@ -22582,6 +22582,187 @@ fn space_find_escape_collapses_the_overlay_before_the_bar(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn space_find_shows_no_result_for_an_answer_being_regenerated(cx: &mut TestAppContext) {
+    // The overlay reads the projection cache, and a cache entry is keyed on the
+    // seed it was built from — not on the count's own key. So a post that
+    // matched and *then* began regenerating kept its memo: the whole-space
+    // total dropped it (the revising set is in `CountKey` precisely because
+    // that exclusion moves with no rebuild behind it), the conversation showed
+    // the pending revision in its place, and the overlay went on offering the
+    // superseded answer as a result to click.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let before =
+        vcx.update(|window, cx| view.read_with(cx, |v, cx| v.find_results_for_test(window, cx)));
+    assert_eq!(
+        before.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["a1", "a2"],
+        "both posts carry the word to begin with"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let after = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            assert!(
+                v.space().read(cx).revising_seq("a2").is_some(),
+                "the regeneration is pending on the post it replaces"
+            );
+            v.find_results_for_test(window, cx)
+        })
+    });
+    assert_eq!(
+        after.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["a1"],
+        "the answer being replaced is off screen, so the overlay does not offer it"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_card_measures_against_the_text_it_is_showing(cx: &mut TestAppContext) {
+    // A measured height stands in for a card that has scrolled out of the
+    // viewport band, so it has to belong to the text it was measured against. A
+    // post mints a new action id whenever its text changes, but a **draft**
+    // does not: its node id, and the block start under it, both stand still
+    // while the reader types — and a key built from those alone handed the new
+    // card the old card's height, moving every group top below it (and with
+    // them the map's scroll targets and the list's own extent) until the reader
+    // happened to bring the card back into the band.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    let draft = view
+        .read_with(&vcx, |v, _| v.tail_draft_state_for_test())
+        .expect("a docked tail draft");
+    draft.update(&mut vcx, |e, cx| {
+        e.set_value("a kestrel of my own".to_string(), cx)
+    });
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let first = vcx
+        .update(|window, cx| view.read_with(cx, |v, cx| v.find_result_cards_for_test(window, cx)));
+    let draft_card = |cards: &[(String, std::ops::Range<usize>, Vec<std::ops::Range<usize>>)]| {
+        cards
+            .iter()
+            .find(|(id, _, _)| id.starts_with("draft"))
+            .map(|(id, range, _)| (id.clone(), range.clone()))
+            .expect("the draft is a result of its own")
+    };
+    let (before_id, before_range) = draft_card(&first);
+
+    // Type ahead of the match. The block starts where it always did and the
+    // draft is the same node, so the id has nothing but the text to move on.
+    draft.update(&mut vcx, |e, cx| {
+        e.set_value(
+            "a longer preamble and then a kestrel of my own".to_string(),
+            cx,
+        )
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let (after_id, after_range) =
+        draft_card(&vcx.update(|window, cx| {
+            view.read_with(cx, |v, cx| v.find_result_cards_for_test(window, cx))
+        }));
+    assert_eq!(
+        (before_range.start, after_range.start),
+        (0, 0),
+        "precondition: the block the card paints starts where it did, and the \
+         key is built from that start — so neither it nor the node id can tell \
+         the two apart"
+    );
+    assert_ne!(
+        before_range.end, after_range.end,
+        "precondition: the text really did move"
+    );
+    assert_ne!(
+        before_id, after_id,
+        "the card's measurement key moved with the text it is showing"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_card_carries_only_the_matches_it_can_paint(cx: &mut TestAppContext) {
+    // A node with several separated matching blocks becomes several cards, and
+    // giving each of them the node's whole hit list materialized that vector
+    // once per card before any of them was virtualized — then every visible
+    // card rebuilt its highlight set from the oversized copy. The painted
+    // result is the same set either way (a card lays out no line the other
+    // hits could land on), so what the partition costs is nothing and what it
+    // buys is a bound.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let long = "a kestrel hovers\n\nnothing here\n\nand a kestrel again\n\nnothing here either\n\none last kestrel";
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", long)]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let cards = vcx
+        .update(|window, cx| view.read_with(cx, |v, cx| v.find_result_cards_for_test(window, cx)));
+    assert_eq!(cards.len(), 3, "three separated blocks, three cards");
+    let mut seen = 0usize;
+    for (id, range, hits) in &cards {
+        assert_eq!(hits.len(), 1, "{id} paints the one match inside it");
+        for hit in hits {
+            assert!(
+                range.start <= hit.start && hit.end <= range.end,
+                "{id} owns only hits inside the span it paints ({hit:?} in {range:?})"
+            );
+        }
+        seen += hits.len();
+    }
+    assert_eq!(
+        seen, 3,
+        "and between them the cards still account for every match"
+    );
+}
+
+#[gpui::test]
 fn space_find_results_cursor_brings_its_card_into_view(cx: &mut TestAppContext) {
     // A virtualized list is **one** tab stop with a roving cursor, and what
     // makes that equivalent to a stop per card is the scroll: a fragment

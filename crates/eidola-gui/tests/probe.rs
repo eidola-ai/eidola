@@ -8262,12 +8262,57 @@ fn the_find_overlay_probes_its_map_and_its_results(cx: &mut TestAppContext) {
     assert_probe(&entries, "space/find/map/1", gpui::Role::Label, "You");
     // One result, and it is a managed descendant of the list rather than a tab
     // stop of its own — a card per stop would describe an order that does not
-    // contain the results nobody scrolled to.
+    // contain the results nobody scrolled to. **Its name carries the
+    // attribution**, because the group header above it is a sibling `Label`: a
+    // reader meeting the card as the list's active descendant would otherwise
+    // hear the snippet with nobody's name on it, and could not tell two
+    // similar results by two participants apart.
     assert_probe(
         &entries,
         "space/find/result/0",
         gpui::Role::ListItem,
-        "a kestrel hovers",
+        "You: a kestrel hovers",
+    );
+
+    // **And the list is a real tab stop.** `Role::List` is deliberately not in
+    // the focusable set the probe derives, so the element carrying it takes
+    // focus only because the handle says so: without that the list could be
+    // focused once — opening the overlay does exactly that — and never again,
+    // so a reader who tabbed onto a map node had no way back to the results
+    // cursor but to close the surface and reopen it.
+    let list = view
+        .read_with(cx, |v, _| v.find_results_focus_for_test())
+        .expect("the overlay is open");
+    let wanted = format!("{list:?}");
+    let mut reached = false;
+    let mut prev = cx
+        .update_window(window, |_, window, cx| {
+            window.focused(cx).map(|h| format!("{h:?}"))
+        })
+        .unwrap();
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        cx.update_window(window, |_, window, cx| window.focus_next(cx))
+            .unwrap();
+        let id = cx
+            .update_window(window, |_, window, cx| {
+                window.focused(cx).map(|h| format!("{h:?}"))
+            })
+            .unwrap();
+        if id == prev {
+            break;
+        }
+        let Some(id) = id else { break };
+        if seen.contains(&id) {
+            break;
+        }
+        reached |= id == wanted;
+        seen.push(id.clone());
+        prev = Some(id);
+    }
+    assert!(
+        reached,
+        "Tab reaches the results list ({wanted}); the cycle held {seen:?}"
     );
 
     probe::set_probes_enabled(false);

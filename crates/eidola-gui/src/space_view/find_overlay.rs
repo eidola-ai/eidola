@@ -1787,6 +1787,46 @@ mod tests {
     }
 
     #[test]
+    fn the_post_index_answers_what_a_scan_would() {
+        // The map labels every dot and the results attribute every group, so
+        // both ask "which row is this node?" once per node per frame. That was
+        // a linear scan recomputing each candidate's id on the way past —
+        // quadratic in the conversation, ahead of any virtualization. The index
+        // is pinned against the scan it replaced, over rows of both kinds: a
+        // persisted one that names itself by its action id, and an optimistic
+        // one with none, which `node_id` names by its seat.
+        let row = |action: Option<&str>| super::super::model::PostData {
+            action_id: action.map(SharedString::from),
+            item_id: None,
+            parent_action_id: None,
+            role: "user".into(),
+            byline: "You".into(),
+            byline_backend: None,
+            time: "".into(),
+            content: "".into(),
+            model: None,
+            generation_count: 1,
+            reasoning: None,
+            reasoning_expanded: false,
+            references: Vec::new(),
+            blocks: Vec::new(),
+            regenerable: false,
+            truncated: false,
+        };
+        let posts = vec![row(Some("a1")), row(None), row(Some("a3")), row(None)];
+        let index = post_index(&posts);
+        for i in 0..posts.len() {
+            let id = super::super::model::node_id(&posts, i);
+            let scanned = (0..posts.len())
+                .find(|j| super::super::model::node_id(&posts, *j) == id)
+                .expect("the scan finds what it just named");
+            assert_eq!(index.get(&id).copied(), Some(scanned), "row {i} ({id})");
+        }
+        assert_eq!(index.len(), posts.len(), "one entry per row, and no more");
+        assert_eq!(index.get(&SharedString::from("nobody")), None);
+    }
+
+    #[test]
     fn a_lane_past_the_columns_edge_keeps_its_own_x() {
         // Lanes squeeze to the floor and no further, so a wide graph runs off
         // the column and is scrolled to. Clamping the excess instead stacked

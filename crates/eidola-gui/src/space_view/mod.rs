@@ -1709,6 +1709,27 @@ impl SpaceView {
             .collect()
     }
 
+    /// The overlay's result **cards**, flat and in the order the list draws
+    /// them: `(measurement id, source range, the hits that card paints)`.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn find_result_cards_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, std::ops::Range<usize>, Vec<std::ops::Range<usize>>)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map =
+            find_overlay::map_layout(&tree, &|node| self.find_map_includes_for_test(node, cx));
+        self.find_results_for_map_for_test(&map, cx)
+            .into_iter()
+            .flat_map(|g| g.fragments)
+            .map(|f| (f.id.to_string(), f.range.clone(), f.hits.clone()))
+            .collect()
+    }
+
     /// The left-hand side of the exactness invariant, over this frame's real
     /// selected path: the path's own matches plus every shown sibling's whole
     /// subtree. Must equal [`Self::find_space_total_for_test`] exactly.
