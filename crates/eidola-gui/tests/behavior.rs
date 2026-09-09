@@ -22636,12 +22636,17 @@ fn space_an_open_find_overlay_withholds_the_quote_verbs(cx: &mut TestAppContext)
         );
     }
 
-    // And the other door: an action dispatched through the window anyway — the
-    // context menu's rows reach these handlers without passing registration.
-    for action in verbs() {
-        vcx.update(|window, cx| root.dispatch_action(action.as_ref(), window, cx));
-        vcx.run_until_parked();
-    }
+    // And the other door: the context menu's rows call these handlers
+    // **directly**, bypassing registration, so each is asked the same question
+    // where it acts.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx);
+            v.quote(&eidola_gui::actions::Quote, window, cx);
+            v.quote_in_reply(&eidola_gui::actions::QuoteInReply, window, cx);
+        });
+    });
+    vcx.run_until_parked();
     assert_eq!(
         view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
         None,
