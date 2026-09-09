@@ -48,5 +48,6 @@ proxy-key-done = Terminé
 proxy-failed = Impossible de lire les réglages du proxy.
 proxy-retry = Réessayer
 proxy-keys-failed = Impossible de lister les clés d'API.
+proxy-backends-failed = Impossible de lire le registre des fournisseurs.
 proxy-loading = Chargement…
 proxy-stale = Impossible d'actualiser — dernière réponse affichée.

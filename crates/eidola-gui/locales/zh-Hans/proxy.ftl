@@ -48,5 +48,6 @@ proxy-key-done = 完成
 proxy-failed = 无法读取代理的设置。
 proxy-retry = 重试
 proxy-keys-failed = 无法列出 API 密钥。
+proxy-backends-failed = 无法读取后端注册表。
 proxy-loading = 加载中…
 proxy-stale = 无法刷新 — 显示的是上次的结果。

@@ -75,6 +75,7 @@ proxy-key-done = Done
 # empty pane.
 proxy-failed = Couldn't read the proxy's settings.
 proxy-keys-failed = Couldn't list the API keys.
+proxy-backends-failed = Couldn't read the backend registry.
 proxy-retry = Retry
 # A read still in flight is not an empty configuration, and a refresh that
 # failed over values still on screen is not a fresh read of them.

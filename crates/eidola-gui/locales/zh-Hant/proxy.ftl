@@ -48,5 +48,6 @@ proxy-key-done = 完成
 proxy-failed = 無法讀取代理的設定。
 proxy-retry = 重試
 proxy-keys-failed = 無法列出 API 金鑰。
+proxy-backends-failed = 無法讀取後端登錄。
 proxy-loading = 載入中…
 proxy-stale = 無法重新整理 — 顯示的是上次的結果。

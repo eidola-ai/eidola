@@ -8579,6 +8579,100 @@ fn the_find_bars_readout_and_verbs_speak_the_readers_language(cx: &mut TestAppCo
     probe::set_probes_enabled(false);
 }
 
+/// REGRESSION: **a registry that has not answered is not "no backends".**
+///
+/// `BackendsStore::list` answers `&[]` for a read in flight and for a failed
+/// one exactly as it does for a registry that is really empty, so the pane said
+/// "No backends are configured yet" over a proxy whose own settings may name
+/// several exposed ones it is serving this minute — hiding what is reachable
+/// and offering nothing that could cause a second read. The registry's read is
+/// independent of the proxy's, so it fails independently too.
+#[gpui::test]
+fn the_proxy_panes_backend_cell_reads_its_states_apart(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.backends = backends_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+
+    // A read in flight.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::Loading);
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/loading".to_string()),
+        "a read in flight says so: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/backends/empty".to_string()),
+        "and does not describe the reader's registry: {names:?}"
+    );
+
+    // A failed initial read: the way back is a retry, not a sentence about
+    // backends nobody has read.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: None,
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/retry".to_string()),
+        "a failed read offers the only thing that can cause another: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/backends/empty".to_string()),
+        "'Failed is not empty': {names:?}"
+    );
+
+    // A failed refresh over rows we hold: the checkboxes stay, and the line
+    // says they are as of the last successful read.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: Some(backends_fixture()),
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/eidola".to_string()),
+        "a re-fetch never blanks a page: {names:?}"
+    );
+    assert!(
+        names.contains(&"settings/proxy/backends/stale".to_string()),
+        "and says what it is showing: {names:?}"
+    );
+
+    // Only an answered, empty registry is the sentence.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::loaded(Vec::new()));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/empty".to_string()),
+        "an answered empty registry is the one state that says there are none: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/backends/loading".to_string()),
+        "and it is not still loading: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 /// A proxy configured the way a reader who has just set it up would have it:
 /// on, loopback, one backend ticked, one key live and one revoked.
 fn proxy_settings_fixture(enabled: bool, address: &str) -> eidola_app_core::proxy::ProxySettings {

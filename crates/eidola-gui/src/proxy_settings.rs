@@ -51,17 +51,23 @@ use crate::stores::{BackendsStore, ProxyStore, Stores};
 
 /// The subtrees a verb in this pane can unmount from under the keyboard.
 ///
-/// **The class is "a verb whose press removes the verb"**, and it has five
-/// members here rather than the two the binding editor and the minted banner
-/// make obvious: Revoke takes its own row's only verb away (the row stays and
-/// the button goes), Generate is replaced by the reason it is unavailable, and
-/// either Retry replaces the surface it stands in with the load it started.
+/// **The class is "a verb whose press removes the verb"**, and it has more
+/// members here than the two the binding editor and the minted banner make
+/// obvious: Revoke takes its own row's only verb away (the row stays and the
+/// button goes), Generate is replaced by the reason it is unavailable, and each
+/// Retry — the settings', the keys', the registry's — replaces the surface it
+/// stands in with the load it started.
 /// Each needs a handle on the subtree that disappears, because that is the only
 /// thing that can answer whether the keyboard was in it.
 pub const BINDING_SLOT: &str = "binding";
 pub const MINTED_SLOT: &str = "minted";
 pub const CREATE_SLOT: &str = "create";
 pub const RETRY_SLOT: &str = "retry";
+/// The backend registry's own retry. **Its own slot, not [`RETRY_SLOT`]**: the
+/// settings failure returns early so nothing can paint beside it, but a failed
+/// registry read and a failed key listing are two independent reads and one
+/// frame can carry both.
+pub const BACKENDS_RETRY_SLOT: &str = "backends-retry";
 
 /// One key row's slot — its Revoke verb is the only tab stop in it.
 fn key_slot(id: &str) -> String {
@@ -277,6 +283,14 @@ impl ProxySettingsView {
         self.proxy.update(cx, |s, cx| s.refresh(cx));
         cx.notify();
     }
+
+    /// Re-read the **backend registry**, whose read is its own and can fail
+    /// while the proxy's settings answer perfectly well.
+    fn refresh_backends(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hand_back_focus_from(BACKENDS_RETRY_SLOT, window, cx);
+        self.backends.update(cx, |s, cx| s.refresh(cx));
+        cx.notify();
+    }
 }
 
 impl Focusable for ProxySettingsView {
@@ -299,7 +313,12 @@ impl Render for ProxySettingsView {
         let keys = store.keys().clone();
         let can_create_key = store.can_create_key();
         let create_key_pending = store.create_key_pending();
-        let backends: Vec<BackendInfo> = self.backends.read(cx).list().to_vec();
+        // The registry is a **separate read** with a state of its own, and
+        // `list()` flattens all of them to an empty slice — so a failed
+        // registry read rendered "no backends are configured" over a proxy that
+        // may be serving several, with nothing on the page that could cause a
+        // second read. Kept whole here and read apart below.
+        let backends = self.backends.read(cx).state().clone();
 
         let mut col = v_flex()
             .id("proxy-pane")
@@ -434,22 +453,59 @@ impl Render for ProxySettingsView {
                 .text_color(theme.muted_foreground.opacity(0.8))
                 .child(msg::proxy_backends_note(cx)),
         );
-        if backends.is_empty() {
-            col = col.child(
-                div()
-                    .id("proxy-backends-empty")
-                    .probe(
-                        "settings/proxy/backends/empty",
-                        gpui::Role::Label,
-                        msg::proxy_backends_empty(cx),
-                    )
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(msg::proxy_backends_empty(cx)),
-            );
-        }
-        for backend in &backends {
-            col = col.child(self.backend_row(backend, &settings, cx));
+        // Four readings, the key cell's own. "No backends are configured" is
+        // the worst of them to be wrong about here: it describes the reader's
+        // registry, and a proxy the settings say is serving exposed backends
+        // would be standing beside a sentence saying there are none.
+        match &backends {
+            crate::loadable::Loadable::Failed { error, prior: None } => {
+                col = col.child(
+                    div()
+                        .id("proxy-backends-retry-slot")
+                        .track_focus(&self.slot(BACKENDS_RETRY_SLOT, cx))
+                        .child(load_error_panel(
+                            "settings/proxy/backends/retry",
+                            msg::proxy_backends_failed(cx),
+                            &error.to_string(),
+                            msg::proxy_retry(cx),
+                            cx,
+                            cx.listener(|this, _, window, cx| this.refresh_backends(window, cx)),
+                        )),
+                );
+            }
+            crate::loadable::Loadable::NotLoaded | crate::loadable::Loadable::Loading => {
+                col = col.child(loading_line(
+                    "settings/proxy/backends/loading",
+                    msg::proxy_loading(cx),
+                    cx,
+                ));
+            }
+            _ => {
+                if matches!(
+                    &backends,
+                    crate::loadable::Loadable::Failed { prior: Some(_), .. }
+                ) {
+                    col = col.child(self.stale_strip("settings/proxy/backends/stale", cx));
+                }
+                let rows: &[BackendInfo] = backends.value().map(|v| v.as_slice()).unwrap_or(&[]);
+                if rows.is_empty() {
+                    col = col.child(
+                        div()
+                            .id("proxy-backends-empty")
+                            .probe(
+                                "settings/proxy/backends/empty",
+                                gpui::Role::Label,
+                                msg::proxy_backends_empty(cx),
+                            )
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(msg::proxy_backends_empty(cx)),
+                    );
+                }
+                for backend in rows {
+                    col = col.child(self.backend_row(backend, &settings, cx));
+                }
+            }
         }
 
         // --- 4. What an on-device backend offers -----------------------------
