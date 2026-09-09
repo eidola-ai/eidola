@@ -74,11 +74,32 @@ use crate::probe::Probe;
 /// only when its ordinal is **mapped**, and is ordinary literal text when it
 /// is not. Passing the post's own map is what keeps the projection agreeing
 /// with the post's own editor.
+/// A node's searchable text **and the blocks the render laid it out in**.
+///
+/// The two come out of one pass because they are two readings of the same
+/// render: the projection is what a query is scanned against, and the block
+/// ranges are the units the Find-all overlay cuts a *fragment* out of (see
+/// [`super::find_overlay`]). Deriving the blocks a second time would be a
+/// second parse of every post, and — worse — a second answer to "what does this
+/// post render as", which is exactly the drift the projection exists to remove.
+pub(crate) struct NodeProjection {
+    pub(crate) projection: Projection,
+    /// Each rendered block's source range, in document order.
+    pub(crate) blocks: Vec<Range<usize>>,
+}
+
+impl NodeProjection {
+    /// The source ranges `query` matches — the projection's own answer.
+    pub(crate) fn find(&self, query: &Query) -> Vec<Range<usize>> {
+        self.projection.find(query)
+    }
+}
+
 pub(crate) fn searchable_projection(
     content: &str,
     embeds: &EmbedMap,
     cursor: Option<Selection>,
-) -> Projection {
+) -> NodeProjection {
     let mut state = gpui_markdown_editor::EditorState::with_markdown(content);
     state.embeds = embeds.clone();
     let tree = gpui_markdown_editor::parse(&state.markdown);
@@ -99,12 +120,14 @@ pub(crate) fn searchable_projection(
     };
 
     let mut builder = ProjectionBuilder::new(content);
+    let mut blocks: Vec<Range<usize>> = Vec::new();
     let mut prev_end: Option<usize> = None;
     for block in &spec.blocks {
         let block_range = clamp(&block.source_range, content.len());
         if block_range.start >= block_range.end {
             continue;
         }
+        blocks.push(block_range.clone());
         // **A barrier between blocks.** Two adjacent paragraphs are two
         // separate things on the page, so a query must not match across the
         // gap between them — but the gap's bytes are not a run of their own,
@@ -122,7 +145,10 @@ pub(crate) fn searchable_projection(
         append_block(&mut builder, content, block, block_range.clone());
         prev_end = Some(block_range.end.max(prev_end.unwrap_or(0)));
     }
-    builder.finish()
+    NodeProjection {
+        projection: builder.finish(),
+        blocks,
+    }
 }
 
 /// What the walk over one block's source finds at a given byte.
@@ -1064,7 +1090,7 @@ impl ScopeNode {
 pub(crate) struct CachedProjection {
     /// What [`Self::projection`] is a projection *of*.
     seed: ProjectionSeed,
-    projection: Projection,
+    projection: NodeProjection,
     /// The last query this node was scanned for, and what it found. Held with
     /// the query rather than cleared on a query change, so the memo cannot go
     /// stale by someone forgetting to invalidate it.
@@ -3065,14 +3091,14 @@ mod tests {
     use super::*;
 
     fn project(source: &str) -> Projection {
-        searchable_projection(source, &EmbedMap::default(), None)
+        searchable_projection(source, &EmbedMap::default(), None).projection
     }
 
     /// The projection of a node whose editor is *enabled* with its cursor at
     /// `at` — an inline edit or a draft, which is what the reader is looking
     /// at when they search one.
     fn project_editing(source: &str, at: usize) -> Projection {
-        searchable_projection(source, &EmbedMap::default(), Some(Selection::Cursor(at)))
+        searchable_projection(source, &EmbedMap::default(), Some(Selection::Cursor(at))).projection
     }
 
     /// How many math overlays the read-only render puts on this source.

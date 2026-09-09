@@ -2439,6 +2439,7 @@ pub struct MarkdownEditor {
     style: Option<MarkdownStyle>,
     disabled: bool,
     min_height: Option<Pixels>,
+    fragment: Option<Range<usize>>,
     on_embed_click: Option<EmbedClickHandler>,
     on_highlight_click: Option<HighlightClickHandler>,
     on_context_menu: Option<ContextMenuHandler>,
@@ -2452,6 +2453,7 @@ impl MarkdownEditor {
             style: None,
             disabled: false,
             min_height: None,
+            fragment: None,
             on_embed_click: None,
             on_highlight_click: None,
             on_context_menu: None,
@@ -2485,6 +2487,35 @@ impl MarkdownEditor {
     /// container from the text without feeding its own floor back in.
     pub fn min_height(mut self, height: Pixels) -> Self {
         self.min_height = Some(height);
+        self
+    }
+
+    /// Lay out **only the blocks intersecting `range`**, leaving the document
+    /// itself whole.
+    ///
+    /// A host that wants to show one part of a document — a search result
+    /// beside the passage it came from, say — needs the block still wearing its
+    /// own chrome: this inner paragraph, but still as a child of its blockquote
+    /// inside its list item. That chrome is not something to synthesize.
+    /// [`RenderBlock::containers`] already carries the whole ancestor chain and
+    /// the element layer derives every indent and decoration from it, so
+    /// **filtering the block list is the whole of it**: each survivor knows
+    /// what it sits inside, and the offsets stay the document's own, so
+    /// highlights ([`MarkdownEditorState::set_highlights_in`]) and per-offset
+    /// geometry ([`MarkdownEditorState::content_y_for_offset`]) go on answering
+    /// for what is painted.
+    ///
+    /// Deliberately **not** the standalone-render path an embed takes: an
+    /// embedded piece carries no source range and no display-to-source map, so
+    /// it has no hit test and takes no highlight quads at all — which is the
+    /// one thing a fragment shown *because* it matched must not lose.
+    ///
+    /// Neighbour-dependent spacing follows the filtered list, so a fragment's
+    /// first and last blocks read as document edges. The intersection is
+    /// strict, so a zero-width block (an injected empty paragraph) joins only
+    /// when it falls strictly inside the range.
+    pub fn fragment(mut self, range: Range<usize>) -> Self {
+        self.fragment = Some(range);
         self
     }
 
@@ -2697,7 +2728,19 @@ impl RenderOnce for MarkdownEditor {
                 );
         }
 
-        let spec_blocks = spec.blocks;
+        // **The fragment filter** (see [`MarkdownEditor::fragment`]): the
+        // document is whole, and only the blocks the caller asked for are laid
+        // out. Applied here, before the neighbour chains are snapshotted, so a
+        // fragment's edges read as document edges rather than borrowing the
+        // spacing of blocks that are not painted.
+        let spec_blocks = match &self.fragment {
+            Some(range) => spec
+                .blocks
+                .into_iter()
+                .filter(|b| b.source_range.start < range.end && b.source_range.end > range.start)
+                .collect(),
+            None => spec.blocks,
+        };
         let block_count = spec_blocks.len();
         let block_starts: Vec<usize> = spec_blocks.iter().map(|b| b.source_range.start).collect();
         // Snapshot each block's container chain *before* moving the blocks
