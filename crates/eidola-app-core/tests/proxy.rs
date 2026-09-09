@@ -1466,6 +1466,13 @@ fn a_proxied_completion_carries_no_user_agent() {
             vec!["content-type", "accept", "host", "content-length"],
             "the proxy sends the set it enumerates and nothing else: {head}"
         );
+        // And the `Accept` is the one the allowlist names, not the `*/*`
+        // reqwest inserts where a request states none — the name alone cannot
+        // tell the two apart, which is what made the header easy to miss.
+        assert!(
+            lower.contains("accept: application/json"),
+            "the blocking transport says what it will take back: {head}"
+        );
     });
 }
 
