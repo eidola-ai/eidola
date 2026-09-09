@@ -1133,6 +1133,13 @@ impl Inner {
         // A body the ceiling stopped lands here too, and by the same route: it
         // is a fragment, so it does not parse, so it is not an answer.
         let parsed: Option<Value> = serde_json::from_str(&text).ok();
+        // **A refusal this app made belongs in the row it made it about.** The
+        // upstream's status is the upstream's claim; a `2xx` this proxy would
+        // not accept is recorded as an error too, or the Record shows the
+        // exchange as the success the caller was explicitly not given. A
+        // non-2xx needs no such column — its status already says what happened.
+        let refusal = (status.is_success() && parsed.is_none())
+            .then(|| malformed_json_answer(&route.backend_id, status.as_u16()));
         self.settle_proxy_refund(
             &db_conn,
             &spend,
@@ -1147,7 +1154,7 @@ impl Inner {
             &body,
             Some(status.as_u16()),
             answer.recorded(),
-            None,
+            refusal.as_ref().map(ToString::to_string),
             nonce,
             request_at,
             response_at,
@@ -1161,14 +1168,10 @@ impl Inner {
             });
         }
 
+        // This is the arm `refusal` was built for — the status is a success and
+        // the body did not parse — so the caller is told what the row says.
         let Some(mut parsed) = parsed else {
-            return Err(AppError::Network {
-                message: format!(
-                    "`{}` answered {} with a body that is not JSON",
-                    route.backend_id,
-                    status.as_u16()
-                ),
-            });
+            return Err(malformed_json_answer(&route.backend_id, status.as_u16()));
         };
         if let Some(object) = parsed.as_object_mut() {
             // **The credential artifact never reaches downstream.** Eidola's
@@ -1345,6 +1348,10 @@ impl Inner {
             let inline = serde_json::from_str::<Value>(&text)
                 .ok()
                 .and_then(|body| body.get("refund").cloned());
+            // The refusal is this app's, so the row carries it: the upstream
+            // said `200` and nothing was forwarded, which a row holding only
+            // that status would present as an answered request.
+            let refusal = malformed_stream_answer(&route.backend_id, status.as_u16());
             self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
@@ -1353,20 +1360,13 @@ impl Inner {
                 &body,
                 Some(status.as_u16()),
                 answer.recorded(),
-                None,
+                Some(refusal.to_string()),
                 nonce,
                 request_at,
                 now_ms(),
             )
             .await;
-            return Err(AppError::Network {
-                message: format!(
-                    "`{}` answered {} to a streaming request with a body that is not \
-                     server-sent events",
-                    route.backend_id,
-                    status.as_u16()
-                ),
-            });
+            return Err(refusal);
         }
 
         // Only now is there going to be a `200` downstream. **A caller that
@@ -1569,6 +1569,28 @@ fn engine_model_info(engine: &local_models::RunningEngine) -> ModelInfo {
 
 fn offers_running_engines_only(exposure: LocalExposure, starts_on_demand: bool) -> bool {
     exposure == LocalExposure::Loaded || !starts_on_demand
+}
+
+/// The gateway failure a `2xx` whose body is not JSON becomes.
+///
+/// **Built once and used twice**, because the caller's answer and the Record's
+/// `error` column have to be the same sentence: a row carrying only `200` shows
+/// a refusal this app made as the success it was not, and a row whose wording
+/// drifts from what the tool was told is worse than either.
+fn malformed_json_answer(backend_id: &str, status: u16) -> AppError {
+    AppError::Network {
+        message: format!("`{backend_id}` answered {status} with a body that is not JSON"),
+    }
+}
+
+/// The streaming twin: a `2xx` that is not server-sent events.
+fn malformed_stream_answer(backend_id: &str, status: u16) -> AppError {
+    AppError::Network {
+        message: format!(
+            "`{backend_id}` answered {status} to a streaming request with a body that is not \
+             server-sent events"
+        ),
+    }
 }
 
 /// Whether a response's own headers say it is server-sent events.

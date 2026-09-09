@@ -687,6 +687,17 @@ fn a_successful_answer_that_is_not_json_is_a_gateway_failure() {
             .find(|r| r.path == "/v1/chat/completions")
             .expect("the exchange is recorded");
         assert_eq!(completion.response_status, Some(200));
+        // **And the refusal is in the row that made it.** The upstream's `200`
+        // is the upstream's claim; a row carrying only that shows a request the
+        // caller was refused as the success it was not.
+        assert!(
+            completion
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not JSON")),
+            "the row says what this app would not accept: {:?}",
+            completion.error
+        );
     });
 }
 
@@ -1268,9 +1279,18 @@ fn a_streamed_ask_answered_with_json_is_a_gateway_failure() {
             "the token the body carried settled the hold; recovery is for its absence"
         );
         let requests = runtime.block_on(core.list_requests(20, 0)).expect("record");
+        let completion = requests
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("and the exchange is in the Record");
+        assert_eq!(completion.response_status, Some(200));
         assert!(
-            requests.iter().any(|r| r.path == "/v1/chat/completions"),
-            "and the exchange is in the Record"
+            completion
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("server-sent events")),
+            "recorded as the refusal it was, not as the 200 the backend claimed: {:?}",
+            completion.error
         );
     });
 }
