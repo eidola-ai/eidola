@@ -29,8 +29,10 @@ use gpui_component::{
 };
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorState};
 
+use eidola_app_core::error::AppError;
 use eidola_app_core::{PriceInfo, TermsDocument};
 
+use super::{CheckoutFailure, Slide, VerifyFailure};
 use crate::plans::{self, format_credits};
 use crate::probe::Probe as _;
 use crate::space_view::{TITLE_BAR_RESERVE, prose_style};
@@ -39,6 +41,10 @@ use crate::space_view::{TITLE_BAR_RESERVE, prose_style};
 const REPO_URL: &str = "https://github.com/eidola-ai/eidola";
 const TERMS_URL: &str = "https://www.eidola.ai/terms/";
 const PRIVACY_URL: &str = "https://www.eidola.ai/privacy/";
+/// The link inside the "Get started" prose. It lives here rather than in the
+/// FTL body so a translation cannot change where the reader is sent for the
+/// evidence behind an unlinkability claim.
+const UNLINKABILITY_URL: &str = "https://www.eidola.ai/docs/privacy-guarantees/#2-unlinkability";
 
 /// The reading column width for slide content (left-aligned prose, like a post).
 const COLUMN_WIDTH: Pixels = px(560.);
@@ -53,24 +59,19 @@ pub(super) type OnToggle = Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>;
 /// "Pause here" — Eidola is not the same as the hosted assistants.
 #[derive(IntoElement)]
 pub(super) struct Pause {
+    pub prose: Entity<MarkdownEditorState>,
     pub on_advance: OnClick,
-}
-
-impl Pause {
-    const MARKDOWN: &'static str =
-        "## *Pause here*\n\nEidola is *not* the same as ChatGPT, Claude or Gemini.";
 }
 
 impl RenderOnce for Pause {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        slide_frame(
+        let cta = cta_button(
             "pause",
-            Self::MARKDOWN,
-            None,
-            cta_button("pause", "OK, you have my attention.", self.on_advance).into_any_element(),
-            window,
-            cx,
+            crate::i18n::msg::onboarding_cta_pause(cx),
+            self.on_advance,
         )
+        .into_any_element();
+        slide_frame(&self.prose, None, cta, window, cx)
     }
 }
 
@@ -79,29 +80,19 @@ impl RenderOnce for Pause {
 /// "Eidola is your tool" — the CD-era sovereignty analogy.
 #[derive(IntoElement)]
 pub(super) struct Tool {
+    pub prose: Entity<MarkdownEditorState>,
     pub on_advance: OnClick,
-}
-
-impl Tool {
-    const MARKDOWN: &'static str = "## Eidola is *your* tool\n\nIn years past, an application was delivered to your \
-         computer on a CD:\n\n- Its behavior *couldn't* spontaneously change without your \
-         involvement.\n- Your files, plans, usage patterns, and insights were *yours alone*, \
-         undiscoverable by any third party.\n- The **structure** of the technology — *not* some \
-         company's promises — enforced these properties.\n\nEidola approximates this \
-         approach as closely as possible, structurally maximizing end-user sovereignty even \
-         for workloads that are best run in a data center.";
 }
 
 impl RenderOnce for Tool {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        slide_frame(
+        let cta = cta_button(
             "tool",
-            Self::MARKDOWN,
-            None,
-            cta_button("tool", "I understand.", self.on_advance).into_any_element(),
-            window,
-            cx,
+            crate::i18n::msg::onboarding_cta_understood(cx),
+            self.on_advance,
         )
+        .into_any_element();
+        slide_frame(&self.prose, None, cta, window, cx)
     }
 }
 
@@ -110,39 +101,26 @@ impl RenderOnce for Tool {
 /// "Your control" — no operator can read, retain, or change it. Links to the repo.
 #[derive(IntoElement)]
 pub(super) struct Control {
+    pub prose: Entity<MarkdownEditorState>,
     pub on_advance: OnClick,
-}
-
-impl Control {
-    const MARKDOWN: &'static str = "## *Your* control\n\nYou and only you are in control — not us, not the operators who run the \
-         hardware.:\n\n- **Only you can read, retain, or profile your interactions.** Your data is \
-         decrypted only inside sealed, hardware-attested enclaves that keep nothing, and \
-         the side of Eidola that handles payment is cryptographically separated from the \
-         side that serves your requests.\n- **Only you can update Eidola — on your \
-         device the server.** Nothing changes until your \
-         client verifies a new version and you decide to trust it.\n\nDon't blindly trust our claims; verify them. If you don't know how \
-         to evaluate our code and architecture, **request the opinion of the most technical \
-         person you already trust**.";
 }
 
 impl RenderOnce for Control {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        slide_frame(
-            "control",
-            Self::MARKDOWN,
-            Some(
-                link_row(
-                    "the-eidola-code-repository",
-                    "The Eidola code repository",
-                    REPO_URL,
-                    cx,
-                )
-                .into_any_element(),
-            ),
-            cta_button("control", "I understand.", self.on_advance).into_any_element(),
-            window,
+        let extras = link_row(
+            "the-eidola-code-repository",
+            crate::i18n::msg::onboarding_link_repository(cx),
+            REPO_URL,
             cx,
         )
+        .into_any_element();
+        let cta = cta_button(
+            "control",
+            crate::i18n::msg::onboarding_cta_understood(cx),
+            self.on_advance,
+        )
+        .into_any_element();
+        slide_frame(&self.prose, Some(extras), cta, window, cx)
     }
 }
 
@@ -151,34 +129,19 @@ impl RenderOnce for Control {
 /// "Your responsibility" — models are fallible; effects are yours.
 #[derive(IntoElement)]
 pub(super) struct Responsibility {
+    pub prose: Entity<MarkdownEditorState>,
     pub on_advance: OnClick,
-}
-
-impl Responsibility {
-    const MARKDOWN: &'static str = "## *Your* responsibility\n\nEidola is a tool that makes it easier for *you* to run \
-         AI models without highly-specialized technical skills or expensive hardware. Nobody \
-         is looking over your shoulder, so it's critical that you understand:\n\n- You will \
-         be running AI models, which are at their core collections of probabilities. The \
-         models that run in Eidola are freely available to download and use with or without \
-         Eidola.\n- Even the very best models are fallible. They can be amazingly useful, but \
-         do make mistakes and can exhibit unexpected behavior. It is mathematically \
-         impossible to evaluate how a large model will behave in every possible scenario.\n- \
-         The models themselves have no intrinsic memory or ability to cause external effects; \
-         they can only evaluate data and take actions that you make available to them. Eidola \
-         makes it easy to understand and configure access, but the results — both good and \
-         bad — are ultimately your responsibility.";
 }
 
 impl RenderOnce for Responsibility {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        slide_frame(
+        let cta = cta_button(
             "responsibility",
-            Self::MARKDOWN,
-            None,
-            cta_button("responsibility", "I understand.", self.on_advance).into_any_element(),
-            window,
-            cx,
+            crate::i18n::msg::onboarding_cta_understood(cx),
+            self.on_advance,
         )
+        .into_any_element();
+        slide_frame(&self.prose, None, cta, window, cx)
     }
 }
 
@@ -188,62 +151,55 @@ impl RenderOnce for Responsibility {
 /// quiet third way: no account at all (on-device inference only).
 #[derive(IntoElement)]
 pub(super) struct GetStarted {
+    pub prose: Entity<MarkdownEditorState>,
     pub on_new_account: OnClick,
     pub on_existing_account: OnClick,
     pub on_skip_account: OnClick,
-}
-
-impl GetStarted {
-    const MARKDOWN: &'static str = "## Get started\n\nYou'll need some credits to run models.\n\nYour account is just a \
-         random id — buying credit is the only step that touches a payment method, and even \
-         then [we are structurally unable to link your requests back to it](https://www.eidola.ai/docs/privacy-guarantees/#2-unlinkability).";
 }
 
 impl RenderOnce for GetStarted {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let fg = cx.theme().muted_foreground;
         let fg_hover = cx.theme().foreground;
-        slide_frame(
-            "get-started",
-            Self::MARKDOWN,
-            None,
-            v_flex()
-                .items_center()
-                .gap_3()
-                .child(cta_button(
-                    "new-account",
-                    "I need a new account.",
-                    self.on_new_account,
-                ))
-                .child(cta_button(
-                    "existing-account",
-                    "I already have an account.",
-                    self.on_existing_account,
-                ))
-                // The account-free path: quiet by design — a real choice,
-                // not a promoted one. It disables the Eidola backend, so
-                // asks route only to on-device (and self-configured)
-                // backends and onboarding stops auto-opening.
-                .child(
-                    div()
-                        .id("onboarding-skip-account")
-                        .probe(
-                            "onboarding/cta/skip-account",
-                            Role::Button,
-                            "Continue without an account — on-device models only",
-                        )
-                        .mt_2()
-                        .cursor_pointer()
-                        .text_sm()
-                        .text_color(fg)
-                        .hover(move |s| s.text_color(fg_hover))
-                        .child("Continue without an account — on-device models only.")
-                        .on_click(self.on_skip_account),
-                )
-                .into_any_element(),
-            window,
-            cx,
-        )
+        // The unlinkability link's target is the app's, not the translation's:
+        // a URL living inside prose is a thing a translator can retarget, and
+        // this one is a privacy claim's evidence.
+        // One sentence, said once. The visible text and the accessible name
+        // used to differ by a full stop, which is the failure the a11y-label
+        // rule names — invisible in English, audible everywhere else — and it
+        // was accidental rather than a deliberate spelling of the subject.
+        let skip = crate::i18n::msg::onboarding_cta_skip_account(cx);
+        let ctas = v_flex()
+            .items_center()
+            .gap_3()
+            .child(cta_button(
+                "new-account",
+                crate::i18n::msg::onboarding_cta_new_account(cx),
+                self.on_new_account,
+            ))
+            .child(cta_button(
+                "existing-account",
+                crate::i18n::msg::onboarding_cta_existing_account(cx),
+                self.on_existing_account,
+            ))
+            // The account-free path: quiet by design — a real choice,
+            // not a promoted one. It disables the Eidola backend, so
+            // asks route only to on-device (and self-configured)
+            // backends and onboarding stops auto-opening.
+            .child(
+                div()
+                    .id("onboarding-skip-account")
+                    .probe("onboarding/cta/skip-account", Role::Button, skip.clone())
+                    .mt_2()
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(fg)
+                    .hover(move |s| s.text_color(fg_hover))
+                    .child(skip)
+                    .on_click(self.on_skip_account),
+            )
+            .into_any_element();
+        slide_frame(&self.prose, None, ctas, window, cx)
     }
 }
 
@@ -260,6 +216,7 @@ impl RenderOnce for GetStarted {
 /// has arrived there is nothing to agree to, and the CTA stays disabled.
 #[derive(IntoElement)]
 pub(super) struct CreateAccount {
+    pub prose: Entity<MarkdownEditorState>,
     /// The documents whose acceptance creating an account will record, or
     /// `None` while the snapshot has not arrived. An empty list is a loaded
     /// answer — a server running no acceptance gate — and the published
@@ -267,8 +224,9 @@ pub(super) struct CreateAccount {
     pub documents: Option<Vec<TermsDocument>>,
     /// Set while the snapshot is being fetched (the initial load only).
     pub loading_documents: bool,
-    /// Why the snapshot could not be read, if it could not be.
-    pub documents_error: Option<String>,
+    /// Why the snapshot could not be read, if it could not be — the typed
+    /// error, so the line is worded where it is drawn.
+    pub documents_error: Option<AppError>,
     /// Whether the agreement box reads as checked — derived by the parent
     /// from whether the reader's consent still covers `documents`, never a
     /// stored flag. False therefore also covers "agreed to an earlier
@@ -276,15 +234,11 @@ pub(super) struct CreateAccount {
     pub agreed: bool,
     /// Whether an account-create request is in flight.
     pub creating: bool,
-    pub error: Option<String>,
+    /// Why creation was refused, typed for the same reason.
+    pub error: Option<AppError>,
     pub on_toggle_agree: OnToggle,
     pub on_create: OnClick,
     pub on_retry_documents: OnClick,
-}
-
-impl CreateAccount {
-    const MARKDOWN: &'static str = "## Create an account\n\nPlease read and understand our Terms of Service and Privacy \
-         Policy.";
 }
 
 impl RenderOnce for CreateAccount {
@@ -299,50 +253,54 @@ impl RenderOnce for CreateAccount {
                 extras = extras
                     .child(link_row(
                         "terms-of-service",
-                        "Terms of Service",
+                        crate::i18n::msg::onboarding_link_terms_of_service(cx),
                         TERMS_URL,
                         cx,
                     ))
                     .child(link_row(
                         "privacy-policy",
-                        "Privacy Policy",
+                        crate::i18n::msg::onboarding_link_privacy_policy(cx),
                         PRIVACY_URL,
                         cx,
                     ));
             }
             Some(docs) => {
                 for doc in docs {
-                    let (slug, label) = document_link(doc);
+                    let (slug, label) = document_link(doc, cx);
                     extras = extras.child(link_row(&slug, label, doc.url.clone(), cx));
                 }
             }
             None if self.loading_documents => {
+                let loading = crate::i18n::msg::onboarding_terms_loading(cx);
                 extras = extras.child(
                     div()
                         .id("onboarding-terms-loading")
-                        .probe(
-                            "onboarding/terms/loading",
-                            Role::Label,
-                            "Checking the current documents…",
-                        )
+                        .probe("onboarding/terms/loading", Role::Label, loading.clone())
                         .text_color(theme.muted_foreground)
-                        .child("Checking the current documents…"),
+                        .child(loading),
                 );
             }
             None => {}
         }
         if let Some(err) = self.documents_error {
-            extras = extras.child(error_line("terms", err, cx)).child(
-                div()
-                    .id("onboarding-terms-retry")
-                    .probe("onboarding/terms/retry", Role::Button, "Try again")
-                    .cursor_pointer()
-                    .text_color(theme.link)
-                    .hover(|s| s.underline())
-                    .child("Try again")
-                    .on_click(self.on_retry_documents),
-            );
+            let retry = crate::i18n::msg::onboarding_terms_retry(cx);
+            extras = extras
+                .child(error_line("terms", err.to_string(), cx))
+                .child(
+                    div()
+                        .id("onboarding-terms-retry")
+                        .probe("onboarding/terms/retry", Role::Button, retry.clone())
+                        .cursor_pointer()
+                        .text_color(theme.link)
+                        .hover(|s| s.underline())
+                        .child(retry)
+                        .on_click(self.on_retry_documents),
+                );
         }
+        // The sentence a reader is asked to affirm, read once and spent twice:
+        // it is the checkbox's visible label *and* its accessible name, so the
+        // two can never say different things.
+        let consent = crate::i18n::msg::onboarding_consent_agree(cx);
         let extras = extras
             .child(
                 // Required consent — the "Create a new account." button
@@ -354,11 +312,7 @@ impl RenderOnce for CreateAccount {
                 div()
                     .id("onboarding-agree")
                     .pt_10()
-                    .probe(
-                        "onboarding/agree",
-                        Role::CheckBox,
-                        "I agree to the Terms of Service and Privacy Policy.",
-                    )
+                    .probe("onboarding/agree", Role::CheckBox, consent.clone())
                     // A checkbox's state is `toggled`, not `selected` — the
                     // macOS adapter reads `accessibilityValue` off `toggled()`
                     // and consults `is_selected()` only for `Role::Tab`.
@@ -375,7 +329,7 @@ impl RenderOnce for CreateAccount {
                     .child(
                         Checkbox::new("onboarding-agree-box")
                             .role(None)
-                            .label("I agree to the Terms of Service and Privacy Policy.")
+                            .label(consent)
                             .checked(self.agreed)
                             .disabled(!have_documents)
                             .tab_stop(false)
@@ -383,13 +337,13 @@ impl RenderOnce for CreateAccount {
                     ),
             )
             .when_some(self.error, |el, err| {
-                el.child(error_line("create", err, cx))
+                el.child(error_line("create", err.to_string(), cx))
             });
 
         let label = if self.creating {
-            "Creating your anonymous account…"
+            crate::i18n::msg::onboarding_cta_create_pending(cx)
         } else {
-            "Create a new account."
+            crate::i18n::msg::onboarding_cta_create(cx)
         };
         // `agreed` is derived from the consent binding, not a stored flag:
         // it is true only while the reader's agreement covers the snapshot
@@ -398,7 +352,7 @@ impl RenderOnce for CreateAccount {
         let enabled = self.agreed && !self.creating;
         let cta = div()
             .id("onboarding-cta-create")
-            .probe("onboarding/cta/create", Role::Button, label)
+            .probe("onboarding/cta/create", Role::Button, label.clone())
             // One predicate decides both the tab stop and the activation, so a
             // wrapper focused when the CTA disables itself cannot re-invoke on
             // a second Enter (`Button` stops propagation on mouse-down while
@@ -420,8 +374,7 @@ impl RenderOnce for CreateAccount {
             );
 
         slide_frame(
-            "create-account",
-            Self::MARKDOWN,
+            &self.prose,
             Some(extras.into_any_element()),
             cta.into_any_element(),
             window,
@@ -435,37 +388,45 @@ impl RenderOnce for CreateAccount {
 /// New-account branch: the freshly-minted id + secret to save.
 #[derive(IntoElement)]
 pub(super) struct NewAccount {
+    pub prose: Entity<MarkdownEditorState>,
     pub id: SharedString,
     pub secret: SharedString,
     pub on_saved: OnClick,
-}
-
-impl NewAccount {
-    const MARKDOWN: &'static str = "## Your new account\n\nYour new account has been created:";
 }
 
 impl RenderOnce for NewAccount {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let extras = v_flex()
             .gap_4()
-            .child(credential_row("Account ID", self.id, cx))
-            .child(credential_row("Account Secret", self.secret, cx))
+            .child(credential_row(
+                "account-id",
+                crate::i18n::msg::onboarding_account_id(cx),
+                self.id,
+                cx,
+            ))
+            .child(credential_row(
+                "account-secret",
+                crate::i18n::msg::onboarding_account_secret(cx),
+                self.secret,
+                cx,
+            ))
             .child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "This is used only to add and consume credits. If the account \
-                         secret is lost, it cannot be recovered, and you will need to \
-                         create a new account.",
-                    ),
+                    .child(crate::i18n::msg::onboarding_new_account_note(cx)),
             );
 
+        let cta = cta_button(
+            "saved",
+            crate::i18n::msg::onboarding_cta_saved(cx),
+            self.on_saved,
+        )
+        .into_any_element();
         slide_frame(
-            "new-account",
-            Self::MARKDOWN,
+            &self.prose,
             Some(extras.into_any_element()),
-            cta_button("saved", "I've saved this somewhere.", self.on_saved).into_any_element(),
+            cta,
             window,
             cx,
         )
@@ -478,19 +439,17 @@ impl RenderOnce for NewAccount {
 /// account verifies, the verify CTA is replaced by purchase/done choices.
 #[derive(IntoElement)]
 pub(super) struct ExistingAccount {
+    pub prose: Entity<MarkdownEditorState>,
     pub id_input: Entity<InputState>,
     pub secret_input: Entity<InputState>,
     /// Whether a verification request is in flight.
     pub verifying: bool,
-    /// `Ok(available_credits)` once verified, or `Err(message)` on failure.
-    pub verify_result: Option<Result<i64, String>>,
+    /// `Ok(available_credits)` once verified, or why it could not be — the
+    /// typed failure, worded at render.
+    pub verify_result: Option<Result<i64, VerifyFailure>>,
     pub on_verify: OnClick,
     pub on_purchase: OnClick,
     pub on_done: OnClick,
-}
-
-impl ExistingAccount {
-    const MARKDOWN: &'static str = "## Your existing account\n\nEnter your account details:";
 }
 
 impl RenderOnce for ExistingAccount {
@@ -500,23 +459,33 @@ impl RenderOnce for ExistingAccount {
         let mut extras = v_flex()
             .gap_3()
             .child(labeled_input(
-                "Account ID",
+                crate::i18n::msg::onboarding_account_id(cx),
                 "onboarding/input/account-id",
                 &self.id_input,
             ))
             .child(labeled_input(
-                "Account Secret",
+                crate::i18n::msg::onboarding_account_secret(cx),
                 "onboarding/input/account-secret",
                 &self.secret_input,
             ));
         extras = match &self.verify_result {
+            // The balance is one sentence with the noun inside it rather than
+            // a number with "credits" appended: "1 credits" is a bug in
+            // English and the agreement rule differs in every other language.
+            // `$credits` is grouped for reading; the raw count rides beside it
+            // only so the select can choose.
             Some(Ok(available)) => extras.child(div().text_color(theme.foreground).child(
-                SharedString::from(format!(
-                    "This account is valid and has a balance of {} credits.",
-                    format_credits(*available)
-                )),
+                crate::i18n::msg::onboarding_verified_balance(
+                    cx,
+                    *available,
+                    format_credits(*available),
+                ),
             )),
-            Some(Err(msg)) => extras.child(error_line("verify", msg.clone(), cx)),
+            Some(Err(failure)) => extras.child(error_line(
+                "verify",
+                super::verify_error_copy(failure, cx).to_string(),
+                cx,
+            )),
             None => extras,
         };
 
@@ -526,21 +495,21 @@ impl RenderOnce for ExistingAccount {
                 .gap_3()
                 .child(cta_button(
                     "existing-purchase",
-                    "I want to purchase more credits.",
+                    crate::i18n::msg::onboarding_cta_existing_purchase(cx),
                     self.on_purchase,
                 ))
                 .child(cta_button(
                     "existing-done",
-                    "This looks good.",
+                    crate::i18n::msg::onboarding_cta_existing_done(cx),
                     self.on_done,
                 ))
                 .into_any_element(),
             _ => cta_button(
                 "verify",
                 if self.verifying {
-                    "Checking…"
+                    crate::i18n::msg::onboarding_cta_verify_pending(cx)
                 } else {
-                    "Check account balance."
+                    crate::i18n::msg::onboarding_cta_verify(cx)
                 },
                 self.on_verify,
             )
@@ -548,8 +517,7 @@ impl RenderOnce for ExistingAccount {
         };
 
         slide_frame(
-            "existing-account",
-            Self::MARKDOWN,
+            &self.prose,
             Some(extras.into_any_element()),
             ctas,
             window,
@@ -563,6 +531,7 @@ impl RenderOnce for ExistingAccount {
 /// Either branch: choose a plan / add credit via Stripe checkout.
 #[derive(IntoElement)]
 pub(super) struct Purchase {
+    pub prose: Entity<MarkdownEditorState>,
     /// The plans this account may actually buy — already narrowed to
     /// one-time top-ups when `subscribed`.
     pub prices: Vec<PriceInfo>,
@@ -573,15 +542,11 @@ pub(super) struct Purchase {
     pub loading: bool,
     /// The plan whose checkout request is currently in flight, if any.
     pub checkout_pending: Option<String>,
-    pub checkout_error: Option<String>,
+    /// Why the last checkout link was not opened, typed for the same reason as
+    /// every other slot here.
+    pub checkout_error: Option<CheckoutFailure>,
     pub on_select: plans::PlanSelectHandler,
     pub on_later: OnClick,
-}
-
-impl Purchase {
-    const MARKDOWN: &'static str = "## Add credit\n\nChoose a plan or purchase credits directly. We use Stripe to \
-         process payments.\n\nSubscription credits last their billing period; one-time purchases last a \
-         year. Unused, unexpired credits are refundable on request.";
 }
 
 impl RenderOnce for Purchase {
@@ -595,10 +560,7 @@ impl RenderOnce for Purchase {
             div()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child(
-                    "This account already has a subscription — manage it in Settings ▸ \
-                     Account. You can still add one-time credit here.",
-                )
+                .child(crate::i18n::msg::onboarding_purchase_subscribed_note(cx))
                 .into_any_element()
         });
 
@@ -610,11 +572,11 @@ impl RenderOnce for Purchase {
                     div()
                         .text_color(theme.muted_foreground)
                         .child(if self.loading {
-                            "Loading plans…"
+                            crate::i18n::msg::onboarding_purchase_loading(cx)
                         } else if self.subscribed {
-                            "No one-time top-ups are available right now."
+                            crate::i18n::msg::onboarding_purchase_none_topups(cx)
                         } else {
-                            "No plans are available right now."
+                            crate::i18n::msg::onboarding_purchase_none_plans(cx)
                         }),
                 )
                 .into_any_element()
@@ -626,34 +588,56 @@ impl RenderOnce for Purchase {
                     div()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child("Checkout opens in your browser; credit lands on this account."),
+                        .child(crate::i18n::msg::onboarding_purchase_checkout_note(cx)),
                 )
+                // The whole slide around these rows is localized, so the rows
+                // are too — a shared component says nothing on its own.
                 .child(plans::plan_rows(
                     &self.prices,
                     self.checkout_pending.as_deref(),
                     self.on_select,
                     "onboarding",
+                    plans::PlanLabels::localized(),
                     cx,
                 ))
                 .when_some(self.checkout_error, |el, err| {
-                    el.child(error_line("checkout", err, cx))
+                    el.child(error_line(
+                        "checkout",
+                        super::checkout_error_copy(&err, cx).to_string(),
+                        cx,
+                    ))
                 })
                 .into_any_element()
         };
 
-        slide_frame(
-            "purchase",
-            Self::MARKDOWN,
-            Some(extras),
-            cta_button(
-                "purchase-later",
-                "I will purchase credits later.",
-                self.on_later,
-            )
-            .into_any_element(),
-            window,
-            cx,
+        let cta = cta_button(
+            "purchase-later",
+            crate::i18n::msg::onboarding_cta_purchase_later(cx),
+            self.on_later,
         )
+        .into_any_element();
+        slide_frame(&self.prose, Some(extras), cta, window, cx)
+    }
+}
+
+/// The prose a slide shows, in the reader's active locale.
+///
+/// **One function, so the render and any test agree about which message a slide
+/// carries.** It also keeps the one argument-bearing body honest: the
+/// unlinkability link's target is supplied here rather than written into the
+/// translation, so no locale can send a reader somewhere else for the evidence
+/// behind a privacy claim.
+pub(super) fn slide_body(slide: Slide, cx: &App) -> SharedString {
+    match slide {
+        Slide::Pause => crate::i18n::msg::onboarding_pause_body(cx),
+        Slide::Tool => crate::i18n::msg::onboarding_tool_body(cx),
+        Slide::Control => crate::i18n::msg::onboarding_control_body(cx),
+        Slide::Responsibility => crate::i18n::msg::onboarding_responsibility_body(cx),
+        Slide::GetStarted => crate::i18n::msg::onboarding_get_started_body(cx, UNLINKABILITY_URL),
+        Slide::CreateAccount => crate::i18n::msg::onboarding_create_account_body(cx),
+        Slide::NewAccount => crate::i18n::msg::onboarding_new_account_body(cx),
+        Slide::ExistingAccount => crate::i18n::msg::onboarding_existing_account_body(cx),
+        Slide::Purchase => crate::i18n::msg::onboarding_purchase_body(cx),
     }
 }
 
@@ -678,32 +662,23 @@ const SLIDE_BOTTOM_PAD: Pixels = px(56.);
 /// prose region, which spilled onto the CTAs and — under mandatory whole-window
 /// snapping — left the spill unreachable.)
 fn slide_frame(
-    key: &'static str,
-    markdown: &'static str,
+    prose_state: &Entity<MarkdownEditorState>,
     extras: Option<AnyElement>,
     ctas: AnyElement,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    // The prose editor is element-owned state (the `useState` analogue):
-    // keyed per slide, initialized once, and evicted by the framework the
-    // frame after the slide stops rendering (a branch truncation) — the
-    // lifecycle the view's `bodies` map used to hand-roll. This is safe
-    // *only because* every revealed slide paints every frame (a plain
-    // `flex_col` stack, no virtualization); if the slides ever render
-    // conditionally or through `list()`, lift this state back onto the view
-    // (the retired chat view's `text_states` map, which died with an
-    // unmounted `list()` item, was the lesson here).
-    let prose_state = window.use_keyed_state(
-        SharedString::from(format!("onboarding-prose-{key}")),
-        cx,
-        |window, cx| {
-            let mut s = MarkdownEditorState::new(window, cx);
-            s.set_value(markdown.to_string(), cx);
-            s
-        },
-    );
-    let prose = MarkdownEditor::new(&prose_state)
+    // **The prose editor is the view's, not the element's.** It used to be
+    // element-owned state (`use_keyed_state`, keyed per slide, initialized
+    // once and evicted by the framework a frame after the slide stopped
+    // rendering), which was right while the body was a `const`. It is not
+    // right for a localized one: `use_keyed_state` seeds on the first frame
+    // and `i18n::apply` replaces no state — it only refreshes windows — so
+    // every slide would go on reading in the language the window opened in.
+    // The rule this module already stated covers it: state the view must
+    // *write* is lifted. `OnboardingView::sync_prose` owns the minting, the
+    // push and the pruning; this only renders what it is handed.
+    let prose = MarkdownEditor::new(prose_state)
         .style(prose_style(cx))
         .disabled(true)
         .into_any_element();
@@ -801,7 +776,7 @@ pub(super) fn back_button(
                 .probe(
                     SharedString::from(format!("onboarding/back/{key}")),
                     Role::Button,
-                    "Go to the previous slide",
+                    crate::i18n::msg::onboarding_back(cx),
                 )
                 .flex()
                 .items_center()
@@ -839,29 +814,50 @@ fn link_row(
         .cursor_pointer()
         .text_color(theme.link)
         .hover(|s| s.underline())
-        .child(SharedString::from(format!("{label} ↗")))
+        .child(crate::i18n::msg::onboarding_link_external(
+            cx,
+            label.to_string(),
+        ))
         .on_click(move |_, _, cx| cx.open_url(url.as_ref()))
 }
 
 /// Slug and display label for a required document. The **slug is derived from
 /// the document key**, which is the wire identifier and does not move; the
 /// label carries the version, which does.
-fn document_link(doc: &TermsDocument) -> (String, String) {
+///
+/// The name is the document's **published title** and stays English in every
+/// locale — it is the text acceptance is recorded against and the heading the
+/// reader will find at the other end of the link. Only the wrapper around it
+/// localizes, and it does so as one message rather than a name with a version
+/// appended, so a locale can order the two as its own grammar wants.
+fn document_link(doc: &TermsDocument, cx: &App) -> (String, SharedString) {
     let slug: String = doc
         .document
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let name = match doc.document.as_str() {
-        "terms_of_service" => "Terms of Service".to_string(),
-        "privacy_policy" => "Privacy Policy".to_string(),
-        other => other.replace('_', " "),
+        "terms_of_service" => crate::i18n::msg::onboarding_link_terms_of_service(cx),
+        "privacy_policy" => crate::i18n::msg::onboarding_link_privacy_policy(cx),
+        other => SharedString::from(other.replace('_', " ")),
     };
-    (slug, format!("{name} (version {})", doc.version))
+    let label = crate::i18n::msg::onboarding_document_version(cx, name.to_string(), doc.version);
+    (slug, label)
 }
 
 /// A labeled single-line credential value in mono, with a Copy affordance.
-fn credential_row(label: &'static str, value: SharedString, cx: &App) -> impl IntoElement {
+///
+/// `key` is the row's **stable** identity — its probe name and its element id
+/// both derive from it. They used to derive from the *label*, which localizing
+/// would have translated: a probe name is a selector and an element id keys
+/// per-element state and the row's accessibility node, so either moving with
+/// the reader's language is a defect the moment the label does.
+fn credential_row(
+    key: &'static str,
+    label: SharedString,
+    value: SharedString,
+    cx: &App,
+) -> impl IntoElement {
     let theme = cx.theme();
     let to_copy = value.clone();
     v_flex()
@@ -870,7 +866,7 @@ fn credential_row(label: &'static str, value: SharedString, cx: &App) -> impl In
             div()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child(label),
+                .child(label.clone()),
         )
         .child(
             h_flex()
@@ -892,18 +888,21 @@ fn credential_row(label: &'static str, value: SharedString, cx: &App) -> impl In
                 )
                 .child(
                     div()
-                        .id(SharedString::from(format!("onboarding-copy-{label}")))
+                        .id(SharedString::from(format!("onboarding-copy-{key}")))
+                        // The verb is repeated on both rows, so its accessible
+                        // name takes the subject its row supplies — the
+                        // `ghost_button_labeled` rule.
                         .probe(
-                            SharedString::from(format!("onboarding/copy/{label}")),
+                            SharedString::from(format!("onboarding/copy/{key}")),
                             Role::Button,
-                            SharedString::from(format!("Copy {label}")),
+                            crate::i18n::msg::onboarding_copy_label(cx, label.to_string()),
                         )
                         .flex_none()
                         .cursor_pointer()
                         .text_sm()
                         .text_color(theme.muted_foreground)
                         .hover(|s| s.text_color(theme.foreground))
-                        .child("Copy")
+                        .child(crate::i18n::msg::onboarding_copy(cx))
                         .on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(to_copy.to_string()))
                         }),
@@ -912,18 +911,26 @@ fn credential_row(label: &'static str, value: SharedString, cx: &App) -> impl In
 }
 
 /// A labeled text input (existing-account credentials), probed for a11y.
+///
+/// The element id derives from the **probe name**, which is already required to
+/// be unique per painted element and does not move with the reader's language —
+/// deriving it from the label (as it did) would remint the field's per-element
+/// state and its accessibility node on a locale change.
 fn labeled_input(
-    label: &'static str,
+    label: SharedString,
     probe_name: &'static str,
     state: &Entity<InputState>,
 ) -> impl IntoElement {
-    v_flex().gap_1().child(div().text_sm().child(label)).child(
-        div()
-            .id(SharedString::from(format!("onboarding-input-{label}")))
-            .probe_bounds(probe_name, Role::TextInput, label)
-            .w_full()
-            .child(Input::new(state).aria_label(label)),
-    )
+    v_flex()
+        .gap_1()
+        .child(div().text_sm().child(label.clone()))
+        .child(
+            div()
+                .id(SharedString::from(format!("{probe_name}-wrap")))
+                .probe_bounds(probe_name, Role::TextInput, label.clone())
+                .w_full()
+                .child(Input::new(state).aria_label(label)),
+        )
 }
 
 /// A danger-colored inline error line. `key` scopes the a11y/driver name so

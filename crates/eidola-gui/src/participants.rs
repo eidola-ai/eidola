@@ -14,6 +14,34 @@
 //! the model/router picker fields (with their grouped catalogs and accessible
 //! names), the chips and ghost buttons, and the two error surfaces
 //! (`load_error_panel` for a failed read, `error_banner` for a refused write).
+//!
+//! **What is localized here, and what is deliberately not.** The words the
+//! pickers render themselves come from `locales/*/participants.ftl` — the two
+//! field names, their dropdown names, the unset placeholder, the empty state
+//! and the router's **Off**. Four things stay English on purpose:
+//!
+//! - **Caller-supplied labels** (`field_label`, `ghost_button`,
+//!   `load_error_panel`'s headline/detail/retry, `error_banner`'s message,
+//!   `mode_chip`'s label, `RouterField`'s `cost_note`/`help`). A shared default
+//!   would translate one word of a panel whose sentence is still the caller's;
+//!   each moves when its own surface does.
+//! - **The notify-policy vocabulary** ([`NOTIFY_POLICIES`], [`notify_label`]).
+//!   Nothing here renders it: its three read sites compose it into sentences
+//!   (`"Responds {}"`, `"Responds: …"`) owned by the Settings and inspector
+//!   surfaces, so translating the fragment alone would put a localized word
+//!   inside an English sentence — and those sentences are concatenations their
+//!   own extraction has to fix rather than translate.
+//! - **The backend display names** `"Eidola"` / `"Local"` / `"Via Eidola"`.
+//!   The first two stand in for a registry row's `display_name` column, which
+//!   is data rather than copy; the third names the same backend in a group
+//!   header. Whether a backend's *name* localizes is one question, answered in
+//!   one place, and it is not this batch's to answer.
+//! - **[`DEFAULT_AGENT_SYSTEM_PROMPT`]** — a prompt sent to a model, where
+//!   translating changes behavior rather than presentation.
+//!
+//! [`picker_value`]'s `name · backend` join is likewise left alone: it carries
+//! no words, only a separator, and its other consumer is a Settings row that
+//! composes it into an English sentence.
 
 use gpui::{
     Context, InteractiveElement, IntoElement, ParentElement, ScrollHandle, SharedString,
@@ -198,12 +226,17 @@ pub(crate) fn model_field<V: 'static>(
             let (n, b) = model_display(stores, sel, cx);
             (n, Some(b))
         }
-        _ => ("Choose a model…".into(), None),
+        _ => (crate::i18n::msg::participants_model_unset(cx), None),
     };
     let value = picker_value(&name, backend.as_ref());
     let button = h_flex()
         .id(SharedString::from(format!("{probe_prefix}-button")))
-        .probe_value(probe_prefix.clone(), gpui::Role::Button, "Model", value)
+        .probe_value(
+            probe_prefix.clone(),
+            gpui::Role::Button,
+            crate::i18n::msg::participants_model_label(cx),
+            value,
+        )
         .w_full()
         .px_2()
         .py_1()
@@ -245,7 +278,7 @@ pub(crate) fn model_field<V: 'static>(
             .probe(
                 format!("{probe_prefix}/menu"),
                 gpui::Role::ListBox,
-                "Models",
+                crate::i18n::msg::participants_model_list(cx),
             )
             .w_full()
             .max_h(px(220.))
@@ -268,7 +301,7 @@ pub(crate) fn model_field<V: 'static>(
                     .py_2()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child("No models available."),
+                    .child(crate::i18n::msg::participants_model_list_empty(cx)),
             );
         }
         for (gi, (header, models)) in groups.into_iter().enumerate() {
@@ -389,8 +422,12 @@ pub(crate) fn router_field<V: 'static>(
             let (n, b) = model_display(stores, sel, cx);
             (n, Some(b))
         }
-        None => ("Off".into(), None),
+        None => (crate::i18n::msg::participants_router_off(cx), None),
     };
+    // One reading of the word for the resting label, the option's accessible
+    // name and the option's own text: the three are the same choice, and a
+    // locale that spelled them apart would name it three ways in one picker.
+    let off = crate::i18n::msg::participants_router_off(cx);
     // The picker's *content* is which router is chosen — settled (it moves only
     // on a click) and otherwise unreachable to a screen reader, which would hear
     // "Router model" whether the space bills per post or not. Same shape as the
@@ -399,7 +436,12 @@ pub(crate) fn router_field<V: 'static>(
 
     let button = h_flex()
         .id(SharedString::from(format!("{id_prefix}-button")))
-        .probe_value(probe_prefix, gpui::Role::Button, "Router model", value)
+        .probe_value(
+            probe_prefix,
+            gpui::Role::Button,
+            crate::i18n::msg::participants_router_label(cx),
+            value,
+        )
         .w_full()
         .px_2()
         .py_1()
@@ -442,7 +484,7 @@ pub(crate) fn router_field<V: 'static>(
             .probe(
                 format!("{probe_prefix}/menu"),
                 gpui::Role::ListBox,
-                "Router models",
+                crate::i18n::msg::participants_router_list(cx),
             )
             .w_full()
             .max_h(px(220.))
@@ -465,7 +507,7 @@ pub(crate) fn router_field<V: 'static>(
                     .probe(
                         format!("{probe_prefix}/option/off"),
                         gpui::Role::Button,
-                        "Off",
+                        off.clone(),
                     )
                     .px_3()
                     .py_1()
@@ -473,7 +515,7 @@ pub(crate) fn router_field<V: 'static>(
                     .text_sm()
                     .hover(|s| s.bg(theme.secondary.opacity(0.6)))
                     .when(selection.is_none(), |el| el.text_color(theme.link))
-                    .child("Off")
+                    .child(off)
                     .on_click(cx.listener(move |this, _, _, cx| off_pick(None, this, cx))),
             );
         for (gi, (header, models)) in model_groups(stores, cx).into_iter().enumerate() {

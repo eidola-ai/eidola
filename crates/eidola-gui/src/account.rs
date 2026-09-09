@@ -909,6 +909,10 @@ impl Render for AccountView {
                 self.checkout_pending.as_deref(),
                 on_select,
                 "settings/account",
+                // English until this pane's own extraction, which swaps this
+                // one expression for `PlanLabels::localized(cx)`: localized
+                // rows inside an English page read worse than consistent ones.
+                plans::PlanLabels::english(),
                 cx,
             ));
         }
