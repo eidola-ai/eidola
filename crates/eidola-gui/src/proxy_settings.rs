@@ -58,10 +58,10 @@ use crate::stores::{BackendsStore, ProxyStore, Stores};
 /// either Retry replaces the surface it stands in with the load it started.
 /// Each needs a handle on the subtree that disappears, because that is the only
 /// thing that can answer whether the keyboard was in it.
-const BINDING_SLOT: &str = "binding";
-const MINTED_SLOT: &str = "minted";
-const CREATE_SLOT: &str = "create";
-const RETRY_SLOT: &str = "retry";
+pub const BINDING_SLOT: &str = "binding";
+pub const MINTED_SLOT: &str = "minted";
+pub const CREATE_SLOT: &str = "create";
+pub const RETRY_SLOT: &str = "retry";
 
 /// One key row's slot — its Revoke verb is the only tab stop in it.
 fn key_slot(id: &str) -> String {
@@ -117,6 +117,19 @@ impl ProxySettingsView {
             slot_focus: RefCell::new(HashMap::new()),
             _subscriptions,
         }
+    }
+
+    /// Test seam: the handle a disappearing subtree tracks, once it has
+    /// painted. `None` before that — the slots are minted lazily by `render`.
+    #[doc(hidden)]
+    pub fn slot_focus_for_test(&self, key: &str) -> Option<FocusHandle> {
+        self.slot_focus.borrow().get(key).cloned()
+    }
+
+    /// Test seam: the slot key a key row's Revoke verb lives in.
+    #[doc(hidden)]
+    pub fn key_slot_for_test(id: &str) -> String {
+        key_slot(id)
     }
 
     /// Whether the address row is being edited (test seam).

@@ -261,3 +261,56 @@ fn a_restart_leaves_nothing_answering_on_the_address_it_left() {
     handle.stop();
     assert_eq!(handle.address(), None);
 }
+
+/// REGRESSION: **an address is compared as a value, never as text.**
+///
+/// `SocketAddr`'s own `Display` brackets an IPv6 host — `[::1]:11437` — while a
+/// `host:port` join does not, so the reconcile's "is what is bound what the
+/// settings describe" question answered *no* for every IPv6 listener, however
+/// correct. Every refresh then restarted it; and since a restart closes before
+/// it binds, an unrelated invalidation could leave the endpoint stopped, on the
+/// door a reader had pointed a tool at.
+///
+/// `::1` is explicitly supported (`parse_bind_address` accepts it and
+/// `is_loopback` calls it safe), so this is an ordinary configuration rather
+/// than an exotic one.
+#[test]
+fn an_ipv6_listener_is_recognised_as_the_one_the_settings_describe() {
+    // The two spellings of one address: what a naive join produces, and what
+    // the socket actually reports.
+    let listener = std::net::TcpListener::bind("[::1]:0").expect("an IPv6 loopback listener");
+    let bound = listener.local_addr().expect("addr");
+    let joined = format!("{}:{}", "::1", bound.port());
+    assert_ne!(
+        joined,
+        bound.to_string(),
+        "the string comparison this replaced could never match"
+    );
+
+    let ip = eidola_app_core::proxy::parse_bind_address("::1").expect("::1 parses");
+    assert_eq!(
+        std::net::SocketAddr::new(ip, bound.port()),
+        bound,
+        "compared as values, the settings and the socket are the same address"
+    );
+}
+
+#[test]
+fn a_proxy_bound_to_ipv6_loopback_answers_there() {
+    let (core, _dir) = core();
+    let key = core
+        .runtime()
+        .block_on(core.create_proxy_key("a tool".into()))
+        .expect("mint")
+        .key;
+
+    let settings = ProxySettings {
+        bind_address: "::1".into(),
+        ..ephemeral()
+    };
+    let server = proxy::serve(&core, &settings).expect("bind ::1");
+    let address = server.address().expect("a listener that has not given up");
+    assert!(address.is_ipv6(), "bound where the reader asked: {address}");
+    assert!(ask(address, &get("/v1/models", Some(&key))).starts_with("HTTP/1.1 200"));
+    server.close();
+}

@@ -896,3 +896,175 @@ fn a_key_is_shown_once_and_stored_only_as_a_digest() {
         );
     });
 }
+
+/// REGRESSION: **a stream that never opened can still carry its refund.**
+///
+/// The server spends the credential before it dispatches, so a streaming
+/// request that fails after the nullifier is recorded — request validation,
+/// `send_stream`, a spend-proof re-encode — answers with a refund-bearing JSON
+/// error body rather than an SSE stream. Persisting that token for recovery is
+/// best-effort there, so when it fails the in-band copy is the only one: this
+/// branch passed `None` to settlement, recovery answered nothing, and the
+/// credential stayed `spending` for good.
+///
+/// Third door, one rule: the refund the server *hands* us settles, and
+/// recovery is what absence falls back to. `RefundMode::Fail` is the server
+/// whose persistence failed, so a passing test cannot be recovery in disguise.
+#[test]
+fn a_pre_stream_failure_still_settles_from_the_refund_it_carried() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::Non2xxWithRefund(503),
+            refund: RefundMode::Fail,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 503, "the upstream's own status is passed through");
+        assert!(
+            !body.contains("\"refund\""),
+            "no credential material travels downstream, on this arm either: {body}"
+        );
+
+        let wallet = runtime.block_on(core.wallet_lifecycle()).expect("wallet");
+        assert!(
+            wallet.iter().any(|c| c.state == "spent"),
+            "the token in the error body settled the hold: {wallet:?}"
+        );
+        assert!(
+            !wallet.iter().any(|c| c.state == "spending"),
+            "a failed stream must not strand a spent credential: {wallet:?}"
+        );
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "recovery is the fallback for an absent token, not the first move"
+        );
+    });
+}
+
+/// REGRESSION: **the Record keeps a bounded body, and says when it did.**
+///
+/// Every upstream chunk was retained until the stream ended so it could be
+/// written to a `request` row. An authenticated caller names its own ceiling
+/// against whatever backend is exposed, so one request could cost this process
+/// the whole answer in memory and then the same bytes again in the database.
+///
+/// Capping alone would be the worse bug: a Record row holding the first
+/// megabyte of a larger answer and claiming to be whole is a trail that lies,
+/// which is the one thing it may never be. So the seal states both numbers, in
+/// the payload, in a form no upstream sends by accident — and the delivery
+/// downstream is untouched, because what the cap bounds is retention.
+#[test]
+fn an_oversized_answer_is_recorded_as_the_truncation_it_is() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkStreamingOversized,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 200, "the answer is delivered in full");
+        assert!(
+            body.len() > 1_200_000,
+            "delivery is not what the cap bounds: {} bytes",
+            body.len()
+        );
+
+        let requests = runtime.block_on(core.list_requests(20, 0)).expect("record");
+        let row = requests
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is in the Record");
+        let detail = runtime
+            .block_on(core.request_detail(row.id.clone()))
+            .expect("detail")
+            .expect("the row");
+        let recorded = detail.response_body.expect("a recorded body");
+        assert!(
+            recorded.len() < 1_200_000,
+            "what is retained is bounded: {} bytes",
+            recorded.len()
+        );
+        let text = String::from_utf8_lossy(&recorded);
+        assert!(
+            text.contains("this Record entry keeps the first"),
+            "and a partial says it is one: {}",
+            &text[text.len().saturating_sub(300)..]
+        );
+    });
+}
+
+/// REGRESSION: **the registry is authoritative for engine membership; the scan
+/// only decorates.**
+///
+/// `lease_engine` reads the in-memory registry and never touches the
+/// filesystem, so an engine whose backing `.gguf` was renamed or deleted — or
+/// whose model directory stopped being readable — stays ready and stays
+/// serviceable: `open_proxy_route` leases it before the exposure guard is even
+/// consulted. `backend_models` derives its candidates from a *directory scan*,
+/// so the model was missing from `/v1/models` while the proxy went on answering
+/// requests for it. A capability statement that hides a capability is the one
+/// thing this surface must not be.
+///
+/// The fixture is exactly that state and nothing else: a ready engine in the
+/// registry, an empty models directory, `Loaded` exposure.
+#[test]
+fn a_ready_engine_whose_file_vanished_is_still_offered() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let key = core.runtime().block_on(async {
+            core.set_proxy_backend_exposed("local".to_string(), true)
+                .await
+                .expect("expose local");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        // A ready engine the scan can never find — there is no file behind it,
+        // which is precisely the state the status menu already names
+        // "(file missing)" and the route already serves.
+        core.test_register_loaded_local_model("local", "orphaned", 5199);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(&core, &get("/v1/models", Some(&key))));
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("orphaned@local"),
+            "a model the proxy will serve has to be in its listing: {body}"
+        );
+
+        // And nothing else was invented: an engine-backed backend under
+        // `Loaded` offers what is running and no more.
+        let listed = body.matches("\"id\"").count();
+        assert_eq!(listed, 1, "one ready engine, one entry: {body}");
+    });
+}

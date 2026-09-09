@@ -3488,3 +3488,69 @@ fn a_proxy_that_stopped_accepting_says_why_and_is_reconciled_again(cx: &mut Test
     handle.stop();
     cx.run_until_parked();
 }
+
+/// REGRESSION: **a correct IPv6 listener is not restarted on every refresh.**
+///
+/// The reconcile asked "is what is bound what the settings describe" by
+/// comparing a `host:port` join against `SocketAddr`'s own `Display`, which
+/// brackets an IPv6 host — `::1:11437` versus `[::1]:11437` — so the answer was
+/// always *no* however correct the listener. And a restart closes before it
+/// binds: the old socket is still open when the new bind is attempted on the
+/// same address, so the refresh did not merely churn, it **stopped the proxy**
+/// on the door a reader had pointed a tool at.
+///
+/// `::1` is an explicitly supported binding (`parse_bind_address` accepts it,
+/// `is_loopback` calls it safe), so this is an ordinary configuration.
+#[gpui::test]
+fn a_refresh_leaves_a_correct_ipv6_listener_alone(cx: &mut TestAppContext) {
+    // A machine without IPv6 loopback has nothing to say about this rule.
+    let Ok(probe) = std::net::TcpListener::bind("[::1]:0") else {
+        return;
+    };
+    let port = probe.local_addr().expect("addr").port();
+    drop(probe);
+
+    let (stores, _backing) = backed_stores(cx);
+    stores.proxy.update(cx, |s, cx| {
+        s.set_binding("::1".into(), port, cx);
+    });
+    wait_until(cx, "the binding lands", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.bind_port))
+            == Some(port)
+    });
+    stores.proxy.update(cx, |s, cx| s.set_enabled(true, cx));
+    wait_until(cx, "the reconcile binds the socket", |cx| {
+        stores.proxy.read_with(cx, |s, _| s.is_running())
+    });
+    let bound = stores.proxy.read_with(cx, |s, _| s.address());
+    assert!(
+        bound.is_some_and(|a| a.is_ipv6()),
+        "bound where the reader asked: {bound:?}"
+    );
+
+    // The refresh a bus event, a settings write, or the launch reconcile all
+    // arrive as. Nothing about the configuration moved, so nothing about the
+    // socket may.
+    for _ in 0..3 {
+        stores.proxy.update(cx, |s, cx| s.refresh(cx));
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        stores.proxy.read_with(cx, |s, _| s.listen_error()),
+        None,
+        "a listener that already matches is not closed and rebound"
+    );
+    assert_eq!(
+        stores.proxy.read_with(cx, |s, _| s.address()),
+        bound,
+        "and it is still answering where it was"
+    );
+
+    let handle = stores.proxy.read_with(cx, |s, _| s.handle());
+    handle.stop();
+    cx.run_until_parked();
+}

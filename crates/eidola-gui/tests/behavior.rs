@@ -22251,3 +22251,118 @@ fn space_find_arms_a_worker_for_work_deferred_after_the_count_had_settled(cx: &m
         );
     });
 }
+
+/// REGRESSION: **the handback asks the disappearing subtree, not the pane.**
+///
+/// `contains_focused` on the *pane* is true for every control in it, including
+/// the one being activated — so a Save, a Cancel or a Done run from the
+/// keyboard found "the pane has it", moved nothing, and then removed the
+/// binding editor or the minted-key banner around the focused control. The
+/// window was left on a handle nobody paints: silent arrows, silent Escape, and
+/// Tab restarting from the window root.
+///
+/// The class is "a verb whose press removes the verb", and the pane has five
+/// members — Revoke and Generate and the two Retrys join the two named above,
+/// which is why the question is asked of a per-subtree handle rather than
+/// patched per verb.
+#[gpui::test]
+fn a_proxy_verb_that_unmounts_itself_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::{BINDING_SLOT, CREATE_SLOT, MINTED_SLOT, ProxySettingsView};
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.proxy_settings = Some(eidola_app_core::proxy::ProxySettings {
+            enabled: false,
+            bind_address: "127.0.0.1".into(),
+            bind_port: 11437,
+            local_exposure: eidola_app_core::proxy::LocalExposure::Loaded,
+            backends: Vec::new(),
+            exposed_ids: Vec::new(),
+            live_key_count: 0,
+        });
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    draw_window(cx, window);
+
+    let root = view.read_with(cx, |v, cx| gpui::Focusable::focus_handle(v, cx));
+    let slot = |cx: &mut TestAppContext, key: &str| {
+        view.read_with(cx, |v, _| v.slot_focus_for_test(key))
+            .unwrap_or_else(|| panic!("the {key} subtree painted"))
+    };
+
+    // --- the binding editor: Cancel and Save both take it away -------------
+    for commit in [false, true] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.begin_binding_edit(window, cx));
+        })
+        .unwrap();
+        draw_window(cx, window);
+        let editor = slot(cx, BINDING_SLOT);
+        cx.update_window(window, |_, window, cx| window.focus(&editor, cx))
+            .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                if commit {
+                    v.commit_binding_edit(window, cx)
+                } else {
+                    v.cancel_binding_edit(window, cx)
+                }
+            });
+        })
+        .unwrap();
+        assert!(
+            cx.update_window(window, |_, window, _| root.is_focused(window))
+                .unwrap(),
+            "the editor was removed under the keyboard (commit: {commit})"
+        );
+    }
+
+    // --- the minted banner: Done takes it away ----------------------------
+    stores.proxy.update(cx, |s, _| {
+        s.set_minted_for_test(eidola_app_core::proxy::MintedProxyKey {
+            info: eidola_app_core::proxy::ProxyKeyInfo {
+                id: "k-new".into(),
+                label: "A new tool".into(),
+                prefix: "eid-Qq11Ww".into(),
+                created_at: 0,
+                last_used_at: None,
+                revoked_at: None,
+            },
+            key: "eid-Qq11Ww-the-whole-secret".into(),
+        });
+    });
+    draw_window(cx, window);
+    let banner = slot(cx, MINTED_SLOT);
+    cx.update_window(window, |_, window, cx| window.focus(&banner, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_minted(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "Done took the banner away, so it owed the keyboard back"
+    );
+
+    // --- and a reader working elsewhere in the pane keeps their caret ------
+    let elsewhere = slot(cx, CREATE_SLOT);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_binding_edit(window, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+    cx.update_window(window, |_, window, cx| window.focus(&elsewhere, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_binding_edit(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| elsewhere.is_focused(window))
+            .unwrap(),
+        "the subtree that disappeared was not the one holding the keyboard"
+    );
+}

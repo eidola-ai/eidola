@@ -135,6 +135,17 @@ pub enum ChatBehavior {
     /// Non-2xx JSON error body (e.g. 500). Exercises the non-2xx arm of both
     /// `chat` and `chat_stream`.
     Non2xx(u16),
+    /// A **refund-bearing** non-2xx, the shape the server answers with when a
+    /// streaming request fails after the nullifier is recorded but before the
+    /// SSE opens — request validation, `send_stream`, a spend-proof re-encode
+    /// (`eidola-server/src/handlers.rs`: `error_response_with_refund`). The
+    /// credential is spent and the only copy of its refund may be in this body,
+    /// because the server's own persistence of the token is best-effort.
+    Non2xxWithRefund(u16),
+    /// A `200` SSE stream carrying **more bytes than the Record keeps**, so a
+    /// truncated recording is what a reader must be told about rather than
+    /// handed silently.
+    OkStreamingOversized,
     /// Accept the request, then drop the connection before sending any
     /// response bytes (network error after send).
     DropBeforeResponse,
@@ -1205,6 +1216,24 @@ async fn handle_chat(
         }
         ChatBehavior::Non2xx(status) => {
             write_json(stream, status, &error_body("upstream model error")).await
+        }
+        ChatBehavior::Non2xxWithRefund(status) => {
+            let mut body: serde_json::Value =
+                serde_json::from_str(&error_body("stream start failed")).expect("error body");
+            if let Some(refund_b64) = auth
+                .and_then(Issuer::spend_proof_from_auth)
+                .and_then(|sp| issuer.refund_for(&sp))
+            {
+                body["refund"] =
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
+            }
+            write_json(stream, status, &body.to_string()).await
+        }
+        ChatBehavior::OkStreamingOversized => {
+            // One very large content delta — far past what a Record row keeps,
+            // and nothing else about the stream unusual.
+            let big = "x".repeat(1_200_000);
+            write_sse_stream(stream, true, &[&big]).await
         }
         ChatBehavior::DropBeforeResponse => {
             // Drop the connection without writing anything: the client's
