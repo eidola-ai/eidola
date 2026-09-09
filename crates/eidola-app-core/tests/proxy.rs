@@ -215,15 +215,13 @@ fn a_keys_first_use_is_announced_and_its_second_is_not() {
 #[test]
 fn a_latched_process_starts_no_work_for_a_key_it_would_admit() {
     run(|| {
-        // The latch is asked twice — once before the request is looked at, and
-        // again on the last line before dispatch, because authentication is a
-        // real await the latch can be thrown across. **That interleaving
-        // cannot be scheduled from a test**: the stretch from the auth landing
-        // to the dispatch has no seam to land on, which is the same honest
-        // limit `crates/eidola-gui/src/ipc.rs` records for its own sweep. What
-        // *is* testable is the outcome the second ask exists to produce — a
-        // latched process serves a perfectly good key nothing at all, and
-        // starts no billed work doing it.
+        // This is the **door**: a process that had already begun teardown when
+        // the request arrived refuses it before authenticating, before reading
+        // a body, before anything. The latch thrown *during* one of those is
+        // the dispatch check's business and has its own test
+        // (`a_latch_thrown_while_the_body_uploads_starts_no_work`); what this
+        // pins is that a latched process serves a perfectly good key nothing at
+        // all, and starts no billed work doing it.
         let (mock, core, _dir) = core_for(MockConfig {
             chat: ChatBehavior::OkBlocking,
             ..Default::default()
