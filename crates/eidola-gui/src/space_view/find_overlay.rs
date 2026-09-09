@@ -1443,8 +1443,10 @@ mod tests {
 
     #[test]
     fn a_hit_in_no_block_is_dropped_rather_than_placed() {
-        let blocks = [0..10];
-        let hits = [50..52];
+        let blocks = vec![0..10, 20..30];
+        // Two, so the block list and the hit list are both plural — a lone
+        // range literal reads to clippy as an attempt to write `(50..52)`.
+        let hits = vec![50..52, 60..62];
         assert!(fragment_runs(&blocks, &hits).is_empty());
     }
 }
