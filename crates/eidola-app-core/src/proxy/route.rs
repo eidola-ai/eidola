@@ -62,6 +62,69 @@ use crate::{
 /// the same budget from the same model.
 const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4096;
 
+/// The most of one response body a `request` row keeps.
+///
+/// **A bound the Record needs and the delivery does not.** What travels
+/// downstream is streamed through and forgotten; what is *retained* is retained
+/// per connection until the stream ends, so a caller free to name any ceiling
+/// against any exposed backend could otherwise make one request cost this
+/// process the whole answer in memory — and then the same bytes again in the
+/// database. A megabyte is far past any answer a person reads and far short of
+/// a size worth holding: an SSE transcript of a 4k-token completion is tens of
+/// kilobytes.
+///
+/// The turn path's own `response_buf` has no such bound today. It is the same
+/// shape and a different exposure — the app issues those requests itself, one
+/// per turn, against a ceiling it set — so it is recorded as a known twin
+/// rather than changed from here.
+const RECORD_BODY_MAX_BYTES: usize = 1 << 20;
+
+/// A response body on its way to the Record, kept to [`RECORD_BODY_MAX_BYTES`].
+///
+/// **Truncation is recorded as truncation.** A Record row holding the first
+/// megabyte of a larger answer and saying nothing would be a partial claiming
+/// to be whole, which is the one thing this trail may never be — a reader opens
+/// it to see what left this machine. So the seal states both numbers, in the
+/// payload itself, in a form no upstream could have sent by accident.
+#[derive(Default)]
+struct RecordedBody {
+    kept: Vec<u8>,
+    received: usize,
+}
+
+impl RecordedBody {
+    fn push(&mut self, bytes: &[u8]) {
+        self.received += bytes.len();
+        let room = RECORD_BODY_MAX_BYTES.saturating_sub(self.kept.len());
+        if room > 0 {
+            self.kept.extend_from_slice(&bytes[..room.min(bytes.len())]);
+        }
+    }
+
+    /// The bytes to record, with the note when they are not all of them.
+    fn seal(self) -> Vec<u8> {
+        seal_recorded_body(self.kept, self.received)
+    }
+}
+
+/// Take a whole body down to what the Record keeps, saying so if it did.
+fn seal_recorded_body(mut kept: Vec<u8>, received: usize) -> Vec<u8> {
+    if kept.len() > RECORD_BODY_MAX_BYTES {
+        kept.truncate(RECORD_BODY_MAX_BYTES);
+    }
+    if received <= kept.len() {
+        return kept;
+    }
+    let note = format!(
+        "\n\n[eidola: this Record entry keeps the first {} bytes of a {}-byte response. The rest \
+         was delivered and not retained.]\n",
+        kept.len(),
+        received
+    );
+    kept.extend_from_slice(note.as_bytes());
+    kept
+}
+
 /// Whether the proxy puts a `traceparent` on the upstream request.
 ///
 /// **The default is off, and it is a decision rather than an omission.** The
@@ -381,15 +444,28 @@ impl Inner {
     /// only those with an engine already running.
     pub(crate) async fn proxy_models(&self) -> Result<Vec<ModelInfo>, AppError> {
         let settings = self.proxy_settings().await?;
-        let running: std::collections::HashSet<String> =
-            self.running_engines().into_iter().map(|e| e.id).collect();
+        // **The registry is authoritative for engine membership; the scan only
+        // decorates.** The status menu learned this rule against a teardown;
+        // here it is a listing, and the disagreement it prevents is worse,
+        // because the *route* already obeys it: `open_proxy_route` leases from
+        // this same registry and never consults the filesystem, so an engine
+        // whose `.gguf` was renamed or deleted — or whose directory stopped
+        // being readable — goes on serving requests perfectly well while a scan
+        // -derived listing hides it. That is the one thing this surface must
+        // not do: `/v1/models` is a capability statement, and a model the proxy
+        // will serve has to be in it.
+        //
+        // **Ready, not merely present**: `reserve_engine` inserts the entry
+        // before the subprocess is up and `lease_engine` refuses it until it
+        // is, so listing a warming engine would be the same disagreement read
+        // the other way round.
+        let ready: Vec<local_models::RunningEngine> = self
+            .running_engines()
+            .into_iter()
+            .filter(|engine| engine.ready)
+            .collect();
         let mut out = Vec::new();
         for backend_id in &settings.backends {
-            // One dead backend must not blank the whole listing — the same
-            // rule the GUI's per-backend catalog slots take.
-            let Ok(models) = self.backend_models(backend_id).await else {
-                continue;
-            };
             let row = db::get_backend(&self.db_conn().await?, backend_id).await?;
             let engine_backed = row
                 .as_ref()
@@ -399,12 +475,27 @@ impl Inner {
             let starts_on_demand = row.map(|row| row.auto_start).unwrap_or(false);
             let loaded_only =
                 offers_running_engines_only(settings.local_exposure, starts_on_demand);
-            for model in models {
-                if engine_backed && loaded_only && !running.contains(&model.id) {
-                    continue;
+            // One dead backend must not blank the whole listing — the same
+            // rule the GUI's per-backend catalog slots take.
+            let scanned = self.backend_models(backend_id).await.ok();
+            if engine_backed && loaded_only {
+                // The scan is the *decoration* here, not the membership: it
+                // supplies a context length and capabilities where it has
+                // them, and where it does not the engine still answers for
+                // itself. A scan that failed outright therefore blanks nothing.
+                for engine in ready.iter().filter(|e| &e.backend_id == backend_id) {
+                    let decorated = scanned
+                        .as_ref()
+                        .and_then(|models| models.iter().find(|m| m.id == engine.id))
+                        .cloned();
+                    out.push(decorated.unwrap_or_else(|| engine_model_info(engine)));
                 }
-                out.push(model);
+                continue;
             }
+            let Some(models) = scanned else {
+                continue;
+            };
+            out.extend(models);
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out.dedup_by(|a, b| a.id == b.id);
@@ -813,7 +904,7 @@ impl Inner {
             &headers,
             &body,
             Some(status.as_u16()),
-            text.as_bytes().to_vec(),
+            seal_recorded_body(text.as_bytes().to_vec(), text.len()),
             None,
             nonce,
             request_at,
@@ -946,14 +1037,30 @@ impl Inner {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+            // **A stream that never opened can still carry its refund.** The
+            // server spends the credential before it dispatches, so every
+            // failure after the nullifier is recorded — request validation,
+            // `send_stream`, a spend-proof re-encode — answers with a
+            // refund-bearing JSON error body rather than an SSE stream
+            // (`eidola-server/src/handlers.rs`: `error_response_with_refund`).
+            // Persisting that token for recovery is best-effort there, so the
+            // in-band value is again the only one that can answer for the arm
+            // where persistence failed. Third door, same rule: the refund the
+            // server *hands* us settles; recovery is what absence falls back
+            // to. This is the arm the blocking transport already covered by
+            // reading `refund` off the parsed body before it looks at the
+            // status.
+            let inline = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|body| body.get("refund").cloned());
+            self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
                 &route,
                 &headers,
                 &body,
                 Some(status.as_u16()),
-                text.as_bytes().to_vec(),
+                seal_recorded_body(text.as_bytes().to_vec(), text.len()),
                 None,
                 nonce,
                 request_at,
@@ -971,10 +1078,19 @@ impl Inner {
 
         let mut byte_stream = response.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let mut raw: Vec<u8> = Vec::new();
+        // What the Record will keep, and how much really arrived — the two are
+        // not the same number, and the row says so when they differ.
+        let mut raw = RecordedBody::default();
         let mut read_error: Option<AppError> = None;
         // The refund the upstream closed the stream with, if it sent one.
         let mut inline_refund: Option<Value> = None;
+        // **The caller has gone, and what that ends depends on what is owed.**
+        // A spending route's refund arrives at the *end* of the stream, so the
+        // upstream is drained to reach it — delivery is what a vanished caller
+        // loses, never this app's accounting. With nothing to settle there is
+        // nothing at the end worth reading, so the read stops with the caller.
+        let mut downstream_gone = false;
+        let settling = spend.is_some();
         while let Some(chunk) = byte_stream.next().await {
             let bytes = match chunk {
                 Ok(bytes) => bytes,
@@ -985,7 +1101,7 @@ impl Inner {
                     break;
                 }
             };
-            raw.extend_from_slice(&bytes);
+            raw.push(&bytes);
             buf.extend_from_slice(&bytes);
             while let Some(pos) = find_event_boundary(&buf) {
                 let event: Vec<u8> = buf.drain(..pos).collect();
@@ -994,6 +1110,11 @@ impl Inner {
                 let (mut out, refund) = forward_sse_event(&event);
                 if refund.is_some() {
                     inline_refund = refund;
+                }
+                if downstream_gone {
+                    // Still parsed, because the refund is in here somewhere;
+                    // no longer sent, because there is nobody to send it to.
+                    continue;
                 }
                 out.extend_from_slice(&terminator);
                 // **Awaited, on a bounded queue** — that is what makes a
@@ -1004,20 +1125,22 @@ impl Inner {
                 // the socket, and the only place that can relieve it is the
                 // caller reading. Nothing waits on anything behind it.
                 //
-                // **It always terminates, and the taxonomy is one line:** a
+                // **It always terminates, and the taxonomy is three lines:** a
                 // caller that goes away drops hyper's body, which drops the
-                // receiver, which fails this send immediately — the pump
-                // stops, and the settle and the Record row below still run.
-                // The turn is upstream and paid for either way, so what a
-                // vanished caller loses is delivery, never this app's
-                // accounting. A caller that stalls without going away holds
-                // the pump, which is deliberate backpressure and delays the
-                // settlement rather than losing it: the hold stays `spending`
-                // with a live request behind it, which is exactly what
-                // `LiveSpend` keeps recovery out of.
+                // receiver, which fails this send immediately — forwarding
+                // ends here and now. A caller that stalls without going away
+                // holds the pump, which is deliberate backpressure and delays
+                // the settlement rather than losing it: the hold stays
+                // `spending` with a live request behind it, which is exactly
+                // what `LiveSpend` keeps recovery out of. And a caller that
+                // went away on a route with a hold to settle leaves the drain
+                // below running to the refund, on a body the cap bounds.
                 if sender.send(ProxyStreamEvent::Chunk(out)).await.is_err() {
-                    break;
+                    downstream_gone = true;
                 }
+            }
+            if downstream_gone && !settling {
+                break;
             }
         }
         // Whatever is left is a partial event; forward it so a downstream
@@ -1027,7 +1150,9 @@ impl Inner {
             if refund.is_some() {
                 inline_refund = refund;
             }
-            let _ = sender.send(ProxyStreamEvent::Chunk(out)).await;
+            if !downstream_gone {
+                let _ = sender.send(ProxyStreamEvent::Chunk(out)).await;
+            }
         }
 
         // **The in-band token first, recovery only for its absence.** The
@@ -1048,7 +1173,7 @@ impl Inner {
             &headers,
             &body,
             Some(status.as_u16()),
-            raw,
+            raw.seal(),
             read_error.as_ref().map(ToString::to_string),
             nonce,
             request_at,
@@ -1119,6 +1244,26 @@ impl Inner {
 /// to break that backend's own configuration. So a backend that will not start
 /// an engine on demand takes the running-engine filter whatever the exposure
 /// setting says, which is what keeps the listing and the route agreeing.
+/// What the proxy can say about an engine the filesystem scan cannot name.
+///
+/// The registry has no display metadata — that lives in a `.meta.json` sidecar
+/// beside the file that may be gone — so this is the id the route answers to
+/// plus the context length the engine was actually started with. Zero pricing
+/// is not a claim: an engine-backed model is free by construction, which is
+/// exactly what `plain_model_info` says for every other locally-served row.
+fn engine_model_info(engine: &local_models::RunningEngine) -> ModelInfo {
+    ModelInfo {
+        id: engine.id.clone(),
+        context_length: u64::from(engine.context_tokens),
+        max_output_tokens: None,
+        output_budget_class: None,
+        capabilities: Default::default(),
+        prompt_credits_per_token: 0.0,
+        completion_credits_per_token: 0.0,
+        request_credits: None,
+    }
+}
+
 fn offers_running_engines_only(exposure: LocalExposure, starts_on_demand: bool) -> bool {
     exposure == LocalExposure::Loaded || !starts_on_demand
 }

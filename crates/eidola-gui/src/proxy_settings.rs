@@ -41,10 +41,32 @@ use gpui_component::{
 };
 use gpui_component::{h_flex, label::Label};
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use crate::i18n::msg;
 use crate::participants::{ghost_button, ghost_button_labeled, load_error_panel};
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, ProxyStore, Stores};
+
+/// The subtrees a verb in this pane can unmount from under the keyboard.
+///
+/// **The class is "a verb whose press removes the verb"**, and it has five
+/// members here rather than the two the binding editor and the minted banner
+/// make obvious: Revoke takes its own row's only verb away (the row stays and
+/// the button goes), Generate is replaced by the reason it is unavailable, and
+/// either Retry replaces the surface it stands in with the load it started.
+/// Each needs a handle on the subtree that disappears, because that is the only
+/// thing that can answer whether the keyboard was in it.
+const BINDING_SLOT: &str = "binding";
+const MINTED_SLOT: &str = "minted";
+const CREATE_SLOT: &str = "create";
+const RETRY_SLOT: &str = "retry";
+
+/// One key row's slot — its Revoke verb is the only tab stop in it.
+fn key_slot(id: &str) -> String {
+    format!("key:{id}")
+}
 
 pub struct ProxySettingsView {
     proxy: Entity<ProxyStore>,
@@ -59,6 +81,10 @@ pub struct ProxySettingsView {
     binding_edit: Option<BindingEdit>,
     /// The name a new key will carry.
     key_label: Entity<InputState>,
+    /// One handle per subtree of this pane that a verb can unmount from under
+    /// the keyboard — see [`ProxySettingsView::slot`]. Interior-mutable because
+    /// the row builders are `&self` (the Local pane's `row_focus` shape).
+    slot_focus: RefCell<HashMap<String, FocusHandle>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -88,6 +114,7 @@ impl ProxySettingsView {
             focus_handle: cx.focus_handle(),
             binding_edit: None,
             key_label,
+            slot_focus: RefCell::new(HashMap::new()),
             _subscriptions,
         }
     }
@@ -118,7 +145,7 @@ impl ProxySettingsView {
     /// Abandon the edit. The keyboard goes back to the pane, because the fields
     /// this unmounts are where it was.
     pub fn cancel_binding_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.hand_back_focus(window, cx);
+        self.hand_back_focus_from(BINDING_SLOT, window, cx);
         self.binding_edit = None;
         cx.notify();
     }
@@ -138,7 +165,7 @@ impl ProxySettingsView {
         };
         self.proxy
             .update(cx, |s, cx| s.set_binding(address, port, cx));
-        self.hand_back_focus(window, cx);
+        self.hand_back_focus_from(BINDING_SLOT, window, cx);
         self.binding_edit = None;
         cx.notify();
     }
@@ -167,13 +194,20 @@ impl ProxySettingsView {
         if label.is_empty() {
             return;
         }
+        // The verb is replaced by "Generating…" the moment this lands, so the
+        // press takes its own control away.
+        self.hand_back_focus_from(CREATE_SLOT, window, cx);
         self.proxy.update(cx, |s, cx| s.create_key(label, cx));
         self.key_label
             .update(cx, |s, cx| s.set_value(String::new(), window, cx));
         cx.notify();
     }
 
-    pub fn revoke_key(&mut self, id: String, cx: &mut Context<Self>) {
+    /// Revoke a key. **Its own verb does not survive this**: the row stays (its
+    /// label is what tells a reader which tool lost access) and loses the only
+    /// tab stop in it, so the press unmounts the control that made it.
+    pub fn revoke_key(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.hand_back_focus_from(&key_slot(&id), window, cx);
         self.proxy.update(cx, |s, cx| s.revoke_key(id, cx));
         cx.notify();
     }
@@ -181,21 +215,52 @@ impl ProxySettingsView {
     /// Acknowledge the generated key. **The value goes with the press** — only
     /// its digest was ever stored, so nothing can bring it back.
     pub fn dismiss_minted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.hand_back_focus(window, cx);
+        self.hand_back_focus_from(MINTED_SLOT, window, cx);
         self.proxy.update(cx, |s, cx| s.dismiss_minted(cx));
         cx.notify();
     }
 
-    /// Put the keyboard back on the pane, but only from a surface that is
-    /// holding it — a reader working elsewhere keeps their caret.
-    fn hand_back_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.focus_handle.contains_focused(window, cx) {
+    /// The focus handle for one subtree that can disappear under the keyboard,
+    /// minted on first use.
+    ///
+    /// Every verb in this pane whose press removes the verb needs one: the
+    /// question a handback has to ask is whether **the subtree that is about to
+    /// stop being painted** was holding the keyboard, and nothing smaller can
+    /// answer it (a probed button rides gpui's implicit handle, which this code
+    /// never receives). Keyed by a string so a per-key row gets its own.
+    fn slot(&self, key: &str, cx: &App) -> FocusHandle {
+        self.slot_focus
+            .borrow_mut()
+            .entry(key.to_string())
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// Put the keyboard back on the pane when the subtree named by `key` — the
+    /// one this verb is about to unmount — is where it was.
+    ///
+    /// **The question is about the disappearing subtree, not the pane.** Asking
+    /// whether the *pane* contains focus is true for every control in it,
+    /// including the one being activated, so the helper declined exactly when
+    /// it was needed: Save, Cancel and Done each ran from the keyboard, found
+    /// "the pane has it", moved nothing, and then removed the editor or the
+    /// banner around the focused control — leaving the window on a handle
+    /// nobody paints, with Tab restarting from the window root. Asked of the
+    /// subtree, a reader working *elsewhere in the pane* still keeps their
+    /// caret, which is the property the original predicate was reaching for.
+    fn hand_back_focus_from(&self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.slot(key, cx).contains_focused(window, cx) {
             return;
         }
         self.focus_handle.focus(window, cx);
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    /// Re-read the proxy's state. **Every door into this is a verb that
+    /// replaces the surface it stands in** — a failure panel becomes the
+    /// loading line, a stale strip stands down over its rows — so the press
+    /// hands the keyboard back from whichever surface carried it.
+    fn refresh(&mut self, slot: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.hand_back_focus_from(slot, window, cx);
         self.proxy.update(cx, |s, cx| s.refresh(cx));
         cx.notify();
     }
@@ -237,14 +302,23 @@ impl Render for ProxySettingsView {
         // A failed *initial* read leaves nothing here to act on, so the way
         // back is a Retry rather than a plausible-looking empty pane.
         if let crate::loadable::Loadable::Failed { error, prior: None } = &settings {
-            return col.child(load_error_panel(
-                "settings/proxy/retry",
-                msg::proxy_failed(cx),
-                &error.to_string(),
-                msg::proxy_retry(cx),
-                cx,
-                cx.listener(|this, _, _, cx| this.refresh(cx)),
-            ));
+            return col.child(
+                // The panel is what its own Retry replaces, so the press asks
+                // *this* subtree whether it was holding the keyboard. One slot
+                // serves this panel and the keys' one below: the settings
+                // failure returns early, so no frame can paint both.
+                div()
+                    .id("proxy-retry-slot")
+                    .track_focus(&self.slot(RETRY_SLOT, cx))
+                    .child(load_error_panel(
+                        "settings/proxy/retry",
+                        msg::proxy_failed(cx),
+                        &error.to_string(),
+                        msg::proxy_retry(cx),
+                        cx,
+                        cx.listener(|this, _, window, cx| this.refresh(RETRY_SLOT, window, cx)),
+                    )),
+            );
         }
         // A refresh that failed over a snapshot we still hold keeps the rows and
         // says so quietly — "Failed is not empty", and its mirror: a read still
@@ -420,14 +494,19 @@ impl Render for ProxySettingsView {
         // nothing on the page that could ever cause a second one.
         match &keys {
             crate::loadable::Loadable::Failed { error, prior: None } => {
-                col = col.child(load_error_panel(
-                    "settings/proxy/keys/retry",
-                    msg::proxy_keys_failed(cx),
-                    &error.to_string(),
-                    msg::proxy_retry(cx),
-                    cx,
-                    cx.listener(|this, _, _, cx| this.refresh(cx)),
-                ));
+                col = col.child(
+                    div()
+                        .id("proxy-keys-retry-slot")
+                        .track_focus(&self.slot(RETRY_SLOT, cx))
+                        .child(load_error_panel(
+                            "settings/proxy/keys/retry",
+                            msg::proxy_keys_failed(cx),
+                            &error.to_string(),
+                            msg::proxy_retry(cx),
+                            cx,
+                            cx.listener(|this, _, window, cx| this.refresh(RETRY_SLOT, window, cx)),
+                        )),
+                );
             }
             crate::loadable::Loadable::NotLoaded | crate::loadable::Loadable::Loading => {
                 col = col.child(loading_line(
@@ -465,6 +544,10 @@ impl Render for ProxySettingsView {
         }
         col = col.child(
             h_flex()
+                .id("proxy-key-create-row")
+                // Generate is replaced by the reason it is unavailable, so the
+                // press unmounts its own control; the row it stands in stays.
+                .track_focus(&self.slot(CREATE_SLOT, cx))
                 .w_full()
                 .gap_2()
                 .child(
@@ -578,7 +661,12 @@ impl ProxySettingsView {
                     cx.listener(|this, _, window, cx| this.begin_binding_edit(window, cx)),
                 ))
                 .into_any_element(),
+            // The editor is what Save and Cancel replace, so it is the subtree
+            // their handback asks about — the fields inside it are where the
+            // keyboard is, and the pane around it survives either press.
             Some(edit) => h_flex()
+                .id("proxy-binding-editor")
+                .track_focus(&self.slot(BINDING_SLOT, cx))
                 .gap_2()
                 .items_center()
                 .child(
@@ -692,6 +780,8 @@ impl ProxySettingsView {
         let id = key.id.clone();
         let live = key.is_live();
         h_flex()
+            .id(SharedString::from(format!("proxy-key-row-{index}")))
+            .track_focus(&self.slot(&key_slot(&key.id), cx))
             .w_full()
             .gap_2()
             .items_center()
@@ -722,7 +812,7 @@ impl ProxySettingsView {
                     msg::proxy_key_revoke_name(cx, label.to_string()),
                     false,
                     cx,
-                    cx.listener(move |this, _, _, cx| this.revoke_key(id.clone(), cx)),
+                    cx.listener(move |this, _, window, cx| this.revoke_key(id.clone(), window, cx)),
                 ))
             })
     }
@@ -739,12 +829,18 @@ impl ProxySettingsView {
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme();
+        // The strip stands down the moment its Retry restarts the read, so the
+        // press unmounts the surface it was made from. Keyed by the probe name,
+        // which is already unique per painted element — the settings strip and
+        // the keys strip can stand at once.
         h_flex()
+            .id(probe_name)
+            .track_focus(&self.slot(probe_name, cx))
             .gap_2()
             .items_center()
             .child(
                 div()
-                    .id(probe_name)
+                    .id(SharedString::from(format!("{probe_name}/line")))
                     .probe(probe_name, gpui::Role::Label, msg::proxy_stale(cx))
                     .text_xs()
                     .text_color(theme.muted_foreground)
@@ -756,7 +852,7 @@ impl ProxySettingsView {
                 msg::proxy_retry(cx),
                 false,
                 cx,
-                cx.listener(|this, _, _, cx| this.refresh(cx)),
+                cx.listener(move |this, _, window, cx| this.refresh(probe_name, window, cx)),
             ))
     }
 
@@ -772,6 +868,9 @@ impl ProxySettingsView {
         let copy = key.clone();
         v_flex()
             .id("proxy-key-minted")
+            // Done takes this banner away, and its Copy verb is a tab stop in
+            // it too — so the banner is the subtree the handback asks about.
+            .track_focus(&self.slot(MINTED_SLOT, cx))
             // The key is what this surface is for, so it is the node's value —
             // a reader who cannot see it must still be able to hear it.
             .probe_value(

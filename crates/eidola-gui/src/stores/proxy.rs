@@ -21,6 +21,7 @@ use std::sync::Arc;
 use eidola_app_core::AppCore;
 use eidola_app_core::proxy::{
     LocalExposure, MintedProxyKey, ProxyKeyInfo, ProxySettings, ProxySettingsUpdate,
+    parse_bind_address,
 };
 use gpui::{Context, Task};
 
@@ -288,8 +289,18 @@ impl ProxyStore {
             cx.notify();
             return;
         }
-        let wanted = format!("{}:{}", settings.bind_address, settings.bind_port);
-        if self.handle.address().map(|a| a.to_string()).as_deref() == Some(wanted.as_str()) {
+        // **Compared as values, never as text.** `SocketAddr`'s own `Display`
+        // brackets an IPv6 host (`[::1]:11437`) and a naive `host:port` join
+        // does not, so an IPv6 binding — `::1` is explicitly supported — never
+        // matched what was bound: every refresh treated a correct listener as
+        // wrong and restarted it, and since a restart closes before it binds,
+        // any unrelated invalidation could leave the endpoint stopped when the
+        // old socket had not been released yet. An address that does not parse
+        // falls through to `start`, which is the one place that reports why.
+        let wanted = parse_bind_address(&settings.bind_address)
+            .ok()
+            .map(|ip| SocketAddr::new(ip, settings.bind_port));
+        if wanted.is_some() && self.handle.address() == wanted {
             return;
         }
         match self.handle.start(&core, &settings) {
