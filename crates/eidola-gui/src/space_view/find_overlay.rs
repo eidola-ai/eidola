@@ -56,9 +56,9 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
-    prelude::FluentBuilder as _, px,
+    AnyElement, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement,
+    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{HighlightLayer, MarkdownEditor, MarkdownEditorState};
@@ -106,6 +106,10 @@ const RESULT_MARGIN: f32 = 600.0;
 /// per wrapped line of its source, plus the card's own chrome. Replaced by the
 /// measurement the frame after it first paints, exactly as a post's estimate is.
 const FRAGMENT_CHROME_H: f32 = 24.0;
+/// How much of a fragment its accessible name carries. A card's whole text
+/// would be read aloud on every cursor move; the opening is what tells a reader
+/// which result this is, and Enter takes them to the passage itself.
+const FRAGMENT_LABEL_CHARS: usize = 120;
 
 // ---------------------------------------------------------------------------
 // The map's layout — pure
@@ -214,7 +218,10 @@ pub(crate) fn fragment_runs(
     for (h, hit) in hits.iter().enumerate() {
         for (b, block) in blocks.iter().enumerate() {
             if block.start < hit.end.max(hit.start + 1) && hit.start < block.end {
-                touched.entry(b).and_modify(|e| *e = (*e).min(h)).or_insert(h);
+                touched
+                    .entry(b)
+                    .and_modify(|e| *e = (*e).min(h))
+                    .or_insert(h);
             }
         }
     }
@@ -395,7 +402,11 @@ impl SpaceView {
     /// on a handle nobody paints. Only from an overlay that is actually holding
     /// the keyboard — a pointer press on the disclosure takes nothing from a
     /// reader composing elsewhere.
-    pub(crate) fn close_find_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn close_find_overlay(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(session) = self.find.as_mut() else {
             return false;
         };
@@ -458,7 +469,11 @@ impl SpaceView {
                 Some(p) => (p.byline.clone(), p.time.clone(), p.byline_backend.clone()),
                 // A draft is the reader's own unposted words; it has no byline
                 // row of its own, so the overlay names it for what it is.
-                None => (crate::i18n::msg::find_result_draft(cx), SharedString::default(), None),
+                None => (
+                    crate::i18n::msg::find_result_draft(cx),
+                    SharedString::default(),
+                    None,
+                ),
             };
             let item_id = post.and_then(|p| p.item_id.clone());
             let hits: Vec<Range<usize>> = result.hits.to_vec();
@@ -499,7 +514,9 @@ impl SpaceView {
     /// past the end is a dead Enter and a ring nobody draws.
     fn find_result_cursor(&self, total: usize) -> Option<usize> {
         let session = self.find.as_ref()?;
-        total.checked_sub(1).map(|last| session.overlay.cursor.min(last))
+        total
+            .checked_sub(1)
+            .map(|last| session.overlay.cursor.min(last))
     }
 
     /// The cursor **as a card renders it** — `None` unless the list itself
@@ -651,7 +668,7 @@ impl SpaceView {
         };
 
         let list = self.render_find_results(&groups, viewport_h, settled, window, cx);
-        let map_column = self.render_find_map(&map, &groups, window, cx);
+        let map_column = self.render_find_map(&map, &groups, cx);
 
         let focus = self.find.as_ref().expect("checked").overlay.focus.clone();
         Some(
@@ -693,7 +710,6 @@ impl SpaceView {
         &mut self,
         map: &[MapNode],
         groups: &[ResultGroup],
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (muted, border, wash, accent) = {
@@ -706,8 +722,7 @@ impl SpaceView {
                 style.highlight_accent_color,
             )
         };
-        let with_matches: HashSet<SharedString> =
-            groups.iter().map(|g| g.node.clone()).collect();
+        let with_matches: HashSet<SharedString> = groups.iter().map(|g| g.node.clone()).collect();
         let in_view = self
             .find
             .as_ref()
@@ -731,7 +746,9 @@ impl SpaceView {
 
         // Edges first, so a dot always sits on top of the line into it.
         for node in map {
-            let Some((pd, pl)) = node.parent else { continue };
+            let Some((pd, pl)) = node.parent else {
+                continue;
+            };
             let cx0 = x(pl) + MAP_DOT / 2.0;
             let cx1 = x(node.lane) + MAP_DOT / 2.0;
             let cy0 = y(pd) + MAP_DOT / 2.0;
@@ -773,12 +790,12 @@ impl SpaceView {
             let (role, label) = if has {
                 (
                     gpui::Role::Button,
-                    crate::i18n::msg::find_map_node_matches(cx, byline),
+                    crate::i18n::msg::find_map_node_matches(cx, byline.to_string()),
                 )
             } else {
                 (
                     gpui::Role::Label,
-                    crate::i18n::msg::find_map_node(cx, byline),
+                    crate::i18n::msg::find_map_node(cx, byline.to_string()),
                 )
             };
             let target = node.node.clone();
@@ -797,8 +814,9 @@ impl SpaceView {
                 dot = dot.border_1().border_color(accent);
             }
             if has {
-                dot = dot.cursor_pointer().on_click(cx.listener(
-                    move |this, _, _window, cx| {
+                dot = dot
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _window, cx| {
                         let top = this
                             .find
                             .as_ref()
@@ -807,8 +825,7 @@ impl SpaceView {
                             this.scroll_find_results_to(top);
                             cx.notify();
                         }
-                    },
-                ));
+                    }));
             } else {
                 dot = dot.tab_stop(false);
             }
@@ -859,7 +876,7 @@ impl SpaceView {
         let keyboard = window.last_input_was_keyboard();
         let (muted, border, card) = {
             let theme = cx.theme();
-            (theme.muted_foreground, theme.border, theme.card)
+            (theme.muted_foreground, theme.border, theme.background)
         };
 
         let scroll = self.find.as_ref().expect("checked").overlay.scroll.clone();
@@ -939,13 +956,12 @@ impl SpaceView {
                     .gap_2()
                     .items_center()
                     .text_sm()
-                    .child(div().font_weight(gpui::FontWeight::MEDIUM).child(group.byline.clone()))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(group.time.clone()),
-                    ),
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(group.byline.clone()),
+                    )
+                    .child(div().text_xs().text_color(muted).child(group.time.clone())),
             );
             y += GROUP_HEADER_H;
 
@@ -1001,11 +1017,13 @@ impl SpaceView {
                 crate::i18n::msg::find_results_label(cx),
             )
             .track_focus(&list_focus)
-            .on_key_down(cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
-                if this.handle_find_results_key(&keys, ev, window, cx) {
-                    cx.stop_propagation();
-                }
-            }))
+            .on_key_down(
+                cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
+                    if this.handle_find_results_key(&keys, ev, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .flex_1()
             .min_w_0()
             .h_full()
@@ -1119,7 +1137,13 @@ impl SpaceView {
             .content
             .get(fragment.range.clone())
             .unwrap_or_default();
-        super::minimap::spoken_snippet(text)
+        // No references: a fragment's own bytes are what it paints, and an
+        // embed marker inside one is hidden there exactly as it is in the post.
+        SharedString::from(super::minimap::spoken_snippet(
+            text,
+            &[],
+            FRAGMENT_LABEL_CHARS,
+        ))
     }
 
     /// The editor state one fragment paints through, minted on first sight.
@@ -1144,7 +1168,10 @@ impl SpaceView {
             None => {
                 let e = cx.new(|cx| MarkdownEditorState::new(window, cx));
                 if let Some(session) = self.find.as_mut() {
-                    session.overlay.bodies.insert(fragment.id.clone(), e.clone());
+                    session
+                        .overlay
+                        .bodies
+                        .insert(fragment.id.clone(), e.clone());
                 }
                 e
             }
@@ -1252,10 +1279,8 @@ mod tests {
                 vec![node("d", vec![node("e", vec![])]), node("c", vec![])],
             )],
         )];
-        let order: Vec<&str> = map_layout(&tree, &all)
-            .iter()
-            .map(|n| n.node.as_ref())
-            .collect();
+        let laid = map_layout(&tree, &all);
+        let order: Vec<&str> = laid.iter().map(|n| n.node.as_ref()).collect();
         assert_eq!(order, vec!["a", "b", "d", "c", "e"]);
     }
 
@@ -1301,7 +1326,11 @@ mod tests {
     fn an_excluded_leaf_leaves_the_shape_alone() {
         let tree = vec![node(
             "a",
-            vec![node("keep", vec![]), node("drop", vec![]), node("also", vec![])],
+            vec![
+                node("keep", vec![]),
+                node("drop", vec![]),
+                node("also", vec![]),
+            ],
         )];
         let laid = map_layout(&tree, &|n| n.id != "drop");
         let order: Vec<&str> = laid.iter().map(|n| n.node.as_ref()).collect();
@@ -1335,8 +1364,8 @@ mod tests {
 
     #[test]
     fn a_hit_in_no_block_is_dropped_rather_than_placed() {
-        let blocks = vec![0..10];
-        let hits = vec![50..52];
+        let blocks = [0..10];
+        let hits = [50..52];
         assert!(fragment_runs(&blocks, &hits).is_empty());
     }
 }

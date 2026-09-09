@@ -30,6 +30,7 @@
 pub mod composer;
 pub mod context_menu;
 pub mod find;
+pub mod find_overlay;
 pub mod inspector;
 pub mod inspector_participants;
 pub mod keyboard;
@@ -3169,6 +3170,12 @@ impl Render for SpaceView {
             // defers; staying in the normal pass keeps both below late overlays
             // like the gpui dev inspector.
             .child(self.render_minimap(&tree, page_width, window_h, window, cx))
+            // The Find-all overlay covers the rest of the window below the
+            // bar, so it paints after everything under it — the composer, the
+            // notices, the minimap. It is geometrically clear of the drag band
+            // and of the bar's own controls, so those two keep their clicks
+            // whatever the paint order says.
+            .children(self.render_find_overlay(&tree, window_h, window, cx))
             // The context menu is the last child of all: a menu opened at the
             // pointer must sit above every surface it can be opened over,
             // the minimap and the floating composer included.
@@ -3241,9 +3248,19 @@ impl Render for SpaceView {
                     if this.close_inspector_participant_picker(cx) {
                         return;
                     }
-                    // …and the find bar — **gated on focus being inside it**,
-                    // so an Escape in the composer still deactivates the draft
-                    // rather than closing a bar the reader was not in.
+                    // …and the find surface, **innermost first**: the Find-all
+                    // overlay collapses before the bar it hangs off, so one
+                    // Escape backs out one rung rather than taking the whole
+                    // search away from a reader who was reading its results.
+                    // Ungated, unlike the bar's rung below: the overlay covers
+                    // the window, so there is nothing behind it an Escape could
+                    // sensibly have been meant for.
+                    if this.close_find_overlay(window, cx) {
+                        return;
+                    }
+                    // …then the bar — **gated on focus being inside it**, so an
+                    // Escape in the composer still deactivates the draft rather
+                    // than closing a bar the reader was not in.
                     if this.find_holds_focus(window, cx) && this.close_find(window, cx) {
                         return;
                     }

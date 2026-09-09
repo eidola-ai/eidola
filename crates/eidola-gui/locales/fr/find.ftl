@@ -11,3 +11,13 @@ find-total = { $total } au total
 find-total-counting = Comptage…
 find-branch-count = { $count } de plus dans cette branche
 find-no-results-in-branch = Aucun sur cette branche
+
+find-show-all = Afficher tous les résultats
+find-hide-all = Masquer tous les résultats
+find-overlay-label = Tous les résultats
+find-map-label = Carte de la conversation
+find-map-node = { $byline }
+find-map-node-matches = { $byline } — contient des occurrences
+find-results-label = Résultats
+find-result-draft = Brouillon
+find-overlay-empty = Aucune occurrence dans cette conversation

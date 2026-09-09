@@ -489,7 +489,15 @@ impl SpaceView {
         // into the conversation, and goes on reading with it up. Asking
         // "is it open" there would leave the arrows and every printable
         // yielded to a field nobody is in.
-        self.find_holds_focus(window, cx)
+        // **The Find-all overlay is a member whether or not it holds the
+        // keyboard**, which is exactly where it parts company with the bar
+        // above it: the bar is a row of chrome a reader deliberately goes on
+        // reading past, while the overlay *covers the conversation*. A
+        // printable behind it would start a draft on a page nobody can see —
+        // the defect `space_an_open_picker_keeps_printables_out_of_the_conversation`
+        // pins, reached through a surface that happens to fill the window.
+        self.find_overlay_open()
+            || self.find_holds_focus(window, cx)
             || self.context_menu.is_some()
             || self.band_menu.is_some()
             || self.highlight_picker.is_some()

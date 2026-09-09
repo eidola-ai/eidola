@@ -755,6 +755,13 @@ pub(crate) struct FindSession {
     pub(crate) floating: Option<SharedString>,
     /// The whole-space count and its honest in-progress state.
     pub(crate) space: SpaceCount,
+    /// **The Find-all overlay** — the surface behind the total's disclosure.
+    ///
+    /// Held here, never beside the session, for the same reason the projection
+    /// cache is: closing the bar drops the overlay's scroll position, its
+    /// measured heights and every editor state it minted, so "no session, no
+    /// work" stays structural. See [`super::find_overlay`].
+    pub(crate) overlay: super::find_overlay::FindOverlay,
     /// The chunked pass that fills [`Self::space`].
     ///
     /// A task on the session, per `STATE.md`: replace = cancel, and dropping
@@ -818,6 +825,19 @@ pub(crate) struct FindSession {
     pub(crate) returned_input: Option<gpui::WeakEntity<gpui_component::input::InputState>>,
 }
 
+/// What one node holds for the current query — [`FindSession::node_result`]'s
+/// answer, borrowed from the projection cache rather than copied out of it.
+pub(crate) struct NodeResult<'a> {
+    /// The markdown the projection was built from: the live buffer for a node
+    /// the reader is editing, the persisted row for everything else.
+    pub(crate) content: &'a SharedString,
+    /// Each rendered block's source range, in document order.
+    pub(crate) blocks: &'a [Range<usize>],
+    /// The query's hits, in projection order — index *is* the match's ordinal
+    /// within the node, by the same construction `MatchSet` relies on.
+    pub(crate) hits: &'a [Range<usize>],
+}
+
 impl FindSession {
     /// Whether this session owns the keyboard: the query field's own handle,
     /// or anything inside the bar's subtree.
@@ -832,9 +852,41 @@ impl FindSession {
     /// by the close (which did not), taking the session away without putting
     /// the keyboard back where it came from. Written once, the two cannot
     /// disagree about a frame.
+    /// **The overlay is the third half**, because it is a surface of the
+    /// session painted outside the bar's own subtree: a reader standing in the
+    /// results list is inside the find surface, and an Escape there belongs to
+    /// find rather than to the conversation behind it.
     fn holds_focus(&self, window: &Window, cx: &gpui::App) -> bool {
         gpui::Focusable::focus_handle(self.input.read(cx), cx).is_focused(window)
             || self.focus.contains_focused(window, cx)
+            || self.overlay.holds_focus(window, cx)
+    }
+
+    /// One node's text, the blocks its render laid it out in, and the hits the
+    /// current query found there — **read from the one cache both passes
+    /// fill**, and only when the memo is an answer about the query the bar is
+    /// showing.
+    ///
+    /// This is what keeps the Find-all overlay from being a second source of
+    /// truth: `sync_find` fills a visible-branch node's entry from what is on
+    /// screen (an inline edit's unsaved buffer, a draft's live text) and the
+    /// whole-space count fills every other post's from the persisted row, both
+    /// through `hits_of` — so a fragment can only ever show what the readout
+    /// counted, and the ordinals a result hands the anchor are the ordinals the
+    /// branch's own match list uses.
+    ///
+    /// `None` for a node the pass has not reached, and for a composing draft
+    /// deliberately left unprojected. Neither is a group; the overlay says it
+    /// is still counting rather than presenting a partial set as a whole one.
+    pub(crate) fn node_result(&self, node: &SharedString) -> Option<NodeResult<'_>> {
+        let query = self.query.as_ref()?;
+        let entry = self.projections.get(node)?;
+        let (answered, hits) = entry.hits.as_ref()?;
+        (answered == query).then_some(NodeResult {
+            content: &entry.seed.content,
+            blocks: &entry.projection.blocks,
+            hits,
+        })
     }
 
     /// The current match, if the anchor still names one.
@@ -1263,6 +1315,17 @@ impl SpaceView {
                     let text = state.read(cx).value().to_string();
                     this.set_find_query(text, cx);
                 }
+                // **⌘↩ opens the Find-all overlay**, the disclosure's other
+                // door and the one a reader already in the field can reach
+                // without leaving it. `InputState` reports the modifier on the
+                // event itself, so this needs no binding of its own — and a
+                // binding would have had to outrank the composer's own submit
+                // chord to be reachable here at all.
+                gpui_component::input::InputEvent::PressEnter {
+                    secondary: true, ..
+                } => {
+                    this.toggle_find_overlay(window, cx);
+                }
                 gpui_component::input::InputEvent::PressEnter { shift, .. } => {
                     this.find_step(!shift, window, cx);
                 }
@@ -1278,6 +1341,7 @@ impl SpaceView {
             anchor: None,
             branch_nodes: HashSet::new(),
             space: SpaceCount::default(),
+            overlay: super::find_overlay::FindOverlay::new(cx),
             count_task: None,
             floating: None,
             projections: HashMap::new(),
@@ -1412,6 +1476,13 @@ impl SpaceView {
         }
         session.query = Query::new(&text);
         session.text = text;
+        // **The overlay's retained position belongs to the query it was taken
+        // in.** Position retention is "while the query is unchanged" — the
+        // task's own rule — so a new search starts at the top of a list that is
+        // about something else, with no cursor pointing into the old one and no
+        // measured height or editor state left over from a fragment that is
+        // gone.
+        session.overlay.forget_results();
         invalidate_for_new_query(
             &mut session.matches,
             &mut session.anchor,
@@ -2749,6 +2820,7 @@ impl SpaceView {
         // one and the previous query's total is the same lie with a longer
         // fuse. A settled zero shows nothing at all: the index's own sentence
         // beside it has already said so, on both counts.
+        let overlay_open = self.find_overlay_open();
         let space_total = self.find.as_ref().and_then(|s| s.space.total);
         let settled_total = space_total.filter(|n| *n > 0);
         let total_readout: Option<SharedString> = if !has_query {
@@ -2886,26 +2958,41 @@ impl SpaceView {
                     .text_color(muted)
                     .child(sentence)
                     .children(settled_total.map(|_| {
-                        // **The disclosure, rendered and inert.** What it will
-                        // open — the Find-all overlay — is a later wave, and a
-                        // `Role::Button` with no listener is a control
-                        // VoiceOver offers, activates and silently does nothing
-                        // with (`find_step_button`'s rule). So it carries no
-                        // a11y node at all: a registry-only probe, exactly as
-                        // the highlight picker's ordinal does, because the
-                        // sentence above already speaks the number and a node
-                        // here would say it twice.
+                        // **The disclosure is a real control now**, because it
+                        // finally does something: it expands the Find-all
+                        // overlay. It was a registry-only probe while the
+                        // surface behind it did not exist — the step arrows'
+                        // rule, that a `Role::Button` with no listener is a
+                        // control VoiceOver offers, activates and silently does
+                        // nothing with — and it becomes a `Button` in the same
+                        // breath as the handler. Its name says what the click
+                        // *does*, in both directions, because the glyph alone
+                        // says nothing to a screen reader; the sentence beside
+                        // it already speaks the number, so this one does not.
+                        let open = overlay_open;
                         div()
                             .id("space-find-total-disclosure")
-                            .probe_bounds(
+                            .probe(
                                 "space/find/total/disclosure",
-                                gpui::Role::Label,
-                                "Find all",
+                                gpui::Role::Button,
+                                if open {
+                                    crate::i18n::msg::find_hide_all(cx)
+                                } else {
+                                    crate::i18n::msg::find_show_all(cx)
+                                },
                             )
+                            .aria_expanded(open)
                             .flex_none()
+                            .px_1()
+                            .rounded_sm()
                             .text_xs()
+                            .cursor_pointer()
                             .text_color(muted.opacity(0.7))
-                            .child("▲")
+                            .hover(|s| s.text_color(muted))
+                            .child(if open { "▼" } else { "▲" })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_find_overlay(window, cx);
+                            }))
                     }))
             }));
 
@@ -3335,7 +3422,8 @@ mod tests {
     fn a_mapped_embed_marker_is_not_searchable_and_an_unmapped_one_is() {
         let source = "{{ embed 1 }}";
         let mapped =
-            searchable_projection(source, &EmbedMap::new([(1, "quoted".to_string())]), None);
+            searchable_projection(source, &EmbedMap::new([(1, "quoted".to_string())]), None)
+                .projection;
         assert!(mapped.text().trim().is_empty());
         // An ordinal with no reference behind it is ordinary text — which is
         // also how a marker looks before its reference exists.
