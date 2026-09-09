@@ -22617,14 +22617,28 @@ fn space_an_open_find_overlay_withholds_the_quote_verbs(cx: &mut TestAppContext)
         "precondition: the overlay stands over the conversation"
     );
 
-    // The real door: an action dispatched through the window, which is exactly
-    // what a menu item does — and what registration decides.
+    // Registration *is* enablement, so the first assertion is the one macOS
+    // reads to grey a menu item: none of the three is available along the
+    // dispatch path while the overlay stands.
     let root = view.read_with(&vcx, |v, _| v.focus_handle());
-    for action in [
-        Box::new(eidola_gui::actions::QuoteElsewhere) as Box<dyn gpui::Action>,
-        Box::new(eidola_gui::actions::Quote),
-        Box::new(eidola_gui::actions::QuoteInReply),
-    ] {
+    let verbs = || {
+        [
+            Box::new(eidola_gui::actions::QuoteElsewhere) as Box<dyn gpui::Action>,
+            Box::new(eidola_gui::actions::Quote),
+            Box::new(eidola_gui::actions::QuoteInReply),
+        ]
+    };
+    for action in verbs() {
+        assert!(
+            !vcx.update(|window, cx| window.is_action_available(action.as_ref(), cx)),
+            "the menu greys {:?} while the overlay covers what it would open",
+            action.name()
+        );
+    }
+
+    // And the other door: an action dispatched through the window anyway — the
+    // context menu's rows reach these handlers without passing registration.
+    for action in verbs() {
         vcx.update(|window, cx| root.dispatch_action(action.as_ref(), window, cx));
         vcx.run_until_parked();
     }
@@ -22644,6 +22658,13 @@ fn space_an_open_find_overlay_withholds_the_quote_verbs(cx: &mut TestAppContext)
         view.update(cx, |v, cx| v.close_find_overlay(window, cx));
     });
     vcx.run_until_parked();
+    for action in verbs() {
+        assert!(
+            vcx.update(|window, cx| window.is_action_available(action.as_ref(), cx)),
+            "…and the collapsed overlay gives {:?} back",
+            action.name()
+        );
+    }
     vcx.update(|window, cx| root.dispatch_action(&eidola_gui::actions::QuoteElsewhere, window, cx));
     vcx.run_until_parked();
     assert_eq!(
