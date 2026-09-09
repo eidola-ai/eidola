@@ -58,6 +58,36 @@ use crate::ipc::Shutdown;
 /// should not be able to ask this process for unbounded memory.
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
+/// How long a connection may stay silent before its request head arrives.
+///
+/// Covers the two moments a peer owes bytes and is sending none: after opening
+/// a connection, and between requests on a kept-alive one. Fifteen seconds is
+/// far past any real client's latency and far short of "for ever", which is
+/// what an unset deadline means here.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The deadline in force, in milliseconds — [`HEADER_READ_TIMEOUT`] unless a
+/// test has shortened it.
+///
+/// The property is "a silent socket is reaped", and proving it at fifteen
+/// seconds would make the test a fifteen-second test. The seam moves the
+/// number, never the mechanism: the same builder, the same timer, the same
+/// arming site.
+static HEADER_READ_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn header_read_timeout() -> std::time::Duration {
+    match HEADER_READ_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => HEADER_READ_TIMEOUT,
+        ms => std::time::Duration::from_millis(ms),
+    }
+}
+
+/// Test-only: shorten the pre-request deadline. `0` restores the default.
+#[doc(hidden)]
+pub fn set_header_read_timeout_for_test(millis: u64) {
+    HEADER_READ_TIMEOUT_MS.store(millis, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// How many upstream events may sit waiting for the downstream socket.
 ///
 /// **The queue has to be bounded, or the connection cap bounds nothing that
@@ -101,6 +131,27 @@ where
     // OpenAI-compatible client sends, so supporting it would be surface with
     // no caller.
     let _ = hyper::server::conn::http1::Builder::new()
+        // **A socket that says nothing must not hold a slot for ever.**
+        // Admission happens before authentication — it has to, since the key
+        // is in a header nobody has sent yet — so a peer that opens a
+        // connection and writes nothing occupies one of the listener's slots
+        // with no credential and no request. Fill the cap that way and every
+        // legitimate client is refused, by someone who never had to hold a key.
+        //
+        // hyper *has* a 30-second default here and it is **inert without a
+        // timer**: `Time::Empty` turns the default into `None` and logs
+        // "timeout has default, but no timer set" (hyper 1.11's
+        // `common::time::Time::check`), so the builder has to be given one.
+        // The deadline is armed in `poll_read_head`, which runs for the first
+        // request head *and* for every later one on a kept-alive connection —
+        // so it reaps a silent opener and an idle holder alike.
+        //
+        // Deliberately its own, short deadline rather than a whole-request
+        // one: a completion legitimately takes minutes, and a bound that had
+        // to cover both would be no bound at all. This one covers only the
+        // stretch where nothing is being asked for.
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(header_read_timeout())
         .serve_connection(hyper_util::rt::TokioIo::new(io), service)
         .await;
 }
@@ -125,20 +176,22 @@ async fn answer(
         Admission::Failed(e) => return app_error_response(&e),
     }
 
-    // **Asked again, on the last line before any work starts.** The
-    // authentication above is a real await on the core's runtime, so the latch
-    // can be thrown while it completes — and the dispatch below reaches
-    // `proxy_chat`/`proxy_chat_stream`, which spend. Aborting the connection
-    // afterwards cannot help: an abort lands at an await point, and the
-    // stretch from here to the dispatch passes only awaits that are typically
-    // already ready. This is the control protocol's own idiom (`ipc::serve`
-    // re-asks after its permit wait for exactly this reason): the answer to
-    // "is this process still here" has to be as fresh as the decision it
-    // gates.
-    if shutdown.is_latched() {
-        return shutting_down_response();
-    }
-
+    // **The latch is asked at the door and again on the last line before
+    // anything spends — and those are the only two places it belongs.**
+    //
+    // A third point check was the tempting fix and the wrong one. This function
+    // grew an `await` between the check and the dispatch twice (authentication,
+    // then the body collection inside `completions_response`), and each time the
+    // gap re-opened: a request that had passed the check resumed after teardown
+    // began and went on to spend. Answering that with one more check at
+    // whichever line happens to be last today only moves the next gap. So the
+    // authoritative question is asked **inside `completions_response`,
+    // immediately before each of its two dispatch points** (`proxy_chat`,
+    // `proxy_chat_stream`), which is where the spending actually starts — every
+    // future await added upstream of them is covered without anyone
+    // remembering to add anything. What stays here is the *door*: a refusal
+    // before this process authenticates or reads a body for a request it has
+    // already decided not to serve.
     let path = request.uri().path().to_string();
     match (request.method(), path.as_str()) {
         (&Method::GET, "/v1/models") => models_response(&core, None).await,
@@ -146,7 +199,9 @@ async fn answer(
             let id = percent_decode(&path["/v1/models/".len()..]);
             models_response(&core, Some(id)).await
         }
-        (&Method::POST, "/v1/chat/completions") => completions_response(core, request).await,
+        (&Method::POST, "/v1/chat/completions") => {
+            completions_response(core, request, shutdown).await
+        }
         _ => error_response(
             StatusCode::NOT_FOUND,
             "invalid_request_error",
@@ -292,6 +347,7 @@ fn backend_of(id: &str) -> String {
 async fn completions_response(
     core: Arc<AppCore>,
     request: Request<Incoming>,
+    shutdown: Shutdown,
 ) -> Response<ProxyBody> {
     let collected = match Limited::new(request.into_body(), MAX_REQUEST_BYTES)
         .collect()
@@ -322,6 +378,23 @@ async fn completions_response(
         Ok(parsed) => parsed,
         Err(e) => return app_error_response(&e),
     };
+
+    // **The last line before either kind of spending.** Everything above this
+    // — reading a body a slow client is still uploading, parsing it, reading
+    // the allowlist — is `await`ed work a teardown can begin during, and both
+    // arms below reach a credential and can start an engine. Asked here, the
+    // answer is as fresh as the decision it gates, which no check further up
+    // can promise.
+    //
+    // **One check serves both arms because nothing awaits between it and
+    // either dispatch**: the blocking arm calls `proxy_chat` on the next line,
+    // and the streaming arm only builds a channel and spawns. An `await` added
+    // between here and either of them re-opens the gap and needs its own
+    // check — which is the whole reason this sits at the dispatch rather than
+    // at the door.
+    if shutdown.is_latched() {
+        return shutting_down_response();
+    }
 
     if !parsed.stream {
         return match core.proxy_chat(parsed).await {

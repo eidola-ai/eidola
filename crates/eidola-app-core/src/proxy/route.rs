@@ -79,6 +79,35 @@ const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4096;
 /// rather than changed from here.
 const RECORD_BODY_MAX_BYTES: usize = 1 << 20;
 
+/// How long one backend has to answer `/v1/models` before it is treated as
+/// unavailable for this listing.
+///
+/// A catalog read is a small request a healthy backend answers in
+/// milliseconds; a local engine's is loopback. Ten seconds is generous enough
+/// that a slow-but-working backend still contributes and short enough that a
+/// wedged one costs a listing rather than the endpoint. It is deliberately
+/// unrelated to a completion's own budget: a completion may legitimately take
+/// minutes, and a bound covering both would be no bound at all.
+const MODEL_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The per-backend catalog deadline in force, in milliseconds —
+/// [`MODEL_LIST_TIMEOUT`] unless a test has shortened it. The seam moves the
+/// number, never the mechanism.
+static MODEL_LIST_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn model_list_timeout() -> std::time::Duration {
+    match MODEL_LIST_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => MODEL_LIST_TIMEOUT,
+        ms => std::time::Duration::from_millis(ms),
+    }
+}
+
+/// Test-only: shorten the per-backend catalog deadline. `0` restores it.
+#[doc(hidden)]
+pub fn set_model_list_timeout_for_test(millis: u64) {
+    MODEL_LIST_TIMEOUT_MS.store(millis, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A response body on its way to the Record, kept to [`RECORD_BODY_MAX_BYTES`].
 ///
 /// **Truncation is recorded as truncation.** A Record row holding the first
@@ -104,6 +133,73 @@ impl RecordedBody {
     /// The bytes to record, with the note when they are not all of them.
     fn seal(self) -> Vec<u8> {
         seal_recorded_body(self.kept, self.received)
+    }
+
+    /// The bytes to record for a *stream*, saying how it ended.
+    fn seal_stream(self, delivery: StreamDelivery) -> Vec<u8> {
+        let mut out = seal_recorded_body(self.kept, self.received);
+        if let Some(note) = delivery.note() {
+            out.extend_from_slice(note.as_bytes());
+        }
+        out
+    }
+}
+
+/// How a proxied stream ended, as the Record has to state it.
+///
+/// **The cap was the first face of "a partial must never claim to be whole";
+/// this is the second.** A stream has three endings and two of them leave the
+/// row saying something untrue if nothing names them: an upstream read *ended
+/// on purpose* looks byte-for-byte like an upstream that finished, and a
+/// delivery that stopped short looks like one that did not. Neither is visible
+/// in `received` versus `kept`, which is why the cap's own marker cannot cover
+/// it.
+///
+/// The note deliberately states **facts, not a ratio**. What reaches the caller
+/// is *forwarded* bytes — an event carrying a refund is rebuilt on the way out
+/// — so "M of N bytes delivered" would mix two counts that are not the same
+/// unit. What is true and useful is which of the three endings happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamDelivery {
+    /// The upstream closed on its own and everything it sent went downstream.
+    Complete,
+    /// The caller went away; the upstream was read to its end anyway, because
+    /// a hold had to settle from the refund in its tail. What is recorded is
+    /// the whole upstream answer — and is **not** what was delivered.
+    CallerGoneReadOn,
+    /// The caller went away and the upstream read ended with it. What is
+    /// recorded stops where this app stopped reading, which is not where the
+    /// upstream had stopped talking.
+    CallerGoneReadEnded,
+}
+
+/// Which ending a stream had, from the two facts the loop records.
+///
+/// A pure decision so the Record's claim can be pinned without staging a
+/// caller that vanishes mid-stream — an interleaving the in-memory transport
+/// cannot schedule deterministically.
+fn stream_delivery(downstream_gone: bool, read_ended_early: bool) -> StreamDelivery {
+    match (downstream_gone, read_ended_early) {
+        (false, _) => StreamDelivery::Complete,
+        (true, false) => StreamDelivery::CallerGoneReadOn,
+        (true, true) => StreamDelivery::CallerGoneReadEnded,
+    }
+}
+
+impl StreamDelivery {
+    fn note(self) -> Option<&'static str> {
+        match self {
+            StreamDelivery::Complete => None,
+            StreamDelivery::CallerGoneReadOn => Some(
+                "\n\n[eidola: the caller disconnected before the end. The upstream response above \
+                 was read in full and is not what was delivered.]\n",
+            ),
+            StreamDelivery::CallerGoneReadEnded => Some(
+                "\n\n[eidola: the caller disconnected and the upstream read ended with it. The \
+                 response above stops where this app stopped reading, not where the upstream \
+                 stopped sending.]\n",
+            ),
+        }
     }
 }
 
@@ -464,7 +560,9 @@ impl Inner {
             .into_iter()
             .filter(|engine| engine.ready)
             .collect();
-        let mut out = Vec::new();
+        // The registry rows first — local reads, and what decides how each
+        // backend is treated below.
+        let mut plans = Vec::new();
         for backend_id in &settings.backends {
             let row = db::get_backend(&self.db_conn().await?, backend_id).await?;
             let engine_backed = row
@@ -473,17 +571,43 @@ impl Inner {
                 .map(|kind| kind.is_engine_backed())
                 .unwrap_or(false);
             let starts_on_demand = row.map(|row| row.auto_start).unwrap_or(false);
-            let loaded_only =
-                offers_running_engines_only(settings.local_exposure, starts_on_demand);
-            // One dead backend must not blank the whole listing — the same
-            // rule the GUI's per-backend catalog slots take.
-            let scanned = self.backend_models(backend_id).await.ok();
+            plans.push((
+                backend_id,
+                engine_backed,
+                offers_running_engines_only(settings.local_exposure, starts_on_demand),
+            ));
+        }
+
+        // **Every catalog is asked at once, and each one is asked with a
+        // deadline.** One dead backend must not blank the whole listing — the
+        // rule the GUI's per-backend catalog slots take — but `.ok()` only
+        // isolates a future that *resolves*, and `plain_http_client` sets no
+        // request timeout: a backend that accepts the connection and then says
+        // nothing left this `await` outstanding for ever, so `/v1/models` never
+        // answered at all and every healthy backend's models went with it.
+        // Awaiting them sequentially also made the endpoint's latency the
+        // *sum* of every backend's, which is the same defect measured in
+        // seconds rather than in forever.
+        //
+        // [`MODEL_LIST_TIMEOUT`] is the per-backend bound; a timeout reads as
+        // an unavailable backend, which is exactly what it is.
+        let scans = futures_util::future::join_all(plans.iter().map(|(backend_id, _, _)| async {
+            tokio::time::timeout(model_list_timeout(), self.backend_models(backend_id))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+        }))
+        .await;
+
+        let mut out = Vec::new();
+        for ((backend_id, engine_backed, loaded_only), scanned) in plans.iter().zip(scans) {
+            let (engine_backed, loaded_only) = (*engine_backed, *loaded_only);
             if engine_backed && loaded_only {
                 // The scan is the *decoration* here, not the membership: it
                 // supplies a context length and capabilities where it has
                 // them, and where it does not the engine still answers for
                 // itself. A scan that failed outright therefore blanks nothing.
-                for engine in ready.iter().filter(|e| &e.backend_id == backend_id) {
+                for engine in ready.iter().filter(|e| &&e.backend_id == backend_id) {
                     let decorated = scanned
                         .as_ref()
                         .and_then(|models| models.iter().find(|m| m.id == engine.id))
@@ -1073,8 +1197,61 @@ impl Inner {
             });
         }
 
-        // Only now is there going to be a `200` downstream.
-        let _ = sender.send(ProxyStreamEvent::Open).await;
+        // **A `200` is not an answer until it is the *shape* that was asked
+        // for.** Opening downstream commits this response to
+        // `200 text/event-stream`, and the head cannot be taken back — so a
+        // backend that ignored `stream: true` and answered a normal JSON
+        // completion, or an intermediary that answered an HTML page, would
+        // have its body forwarded as an unterminated SSE fragment under a
+        // status saying everything went well. That is the blocking transport's
+        // malformed-2xx rule (a `2xx` that is not JSON is a gateway failure)
+        // read on the other transport, where the wrong shape is *not* JSON.
+        //
+        // Strict when the header is present, permissive when it is absent: the
+        // two cases this exists for both name a content type (`application/json`
+        // and `text/html`), while a compliant SSE server always sets one, so
+        // refusing an unlabelled body would only break a server that is already
+        // unusual without catching anything the named cases do not.
+        //
+        // **And this is a fifth arm of the refund class**: a backend that
+        // ignored `stream: true` may well have answered with a whole
+        // completion, refund and all — the credential is spent either way, so
+        // the body is read for its token before this fails.
+        if !is_event_stream(response.headers()) {
+            let text = response.text().await.unwrap_or_default();
+            let inline = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|body| body.get("refund").cloned());
+            self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
+                .await;
+            self.record_proxy_request(
+                &route,
+                &headers,
+                &body,
+                Some(status.as_u16()),
+                seal_recorded_body(text.as_bytes().to_vec(), text.len()),
+                None,
+                nonce,
+                request_at,
+                now_ms(),
+            )
+            .await;
+            return Err(AppError::Network {
+                message: format!(
+                    "`{}` answered {} to a streaming request with a body that is not \
+                     server-sent events",
+                    route.backend_id,
+                    status.as_u16()
+                ),
+            });
+        }
+
+        // Only now is there going to be a `200` downstream. **A caller that
+        // has already gone is noticed here rather than at the first chunk**:
+        // an upstream that answers and closes with nothing in it would
+        // otherwise leave the ending classified as a complete delivery to a
+        // caller who was not there.
+        let mut downstream_gone = sender.send(ProxyStreamEvent::Open).await.is_err();
 
         let mut byte_stream = response.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -1089,7 +1266,9 @@ impl Inner {
         // upstream is drained to reach it — delivery is what a vanished caller
         // loses, never this app's accounting. With nothing to settle there is
         // nothing at the end worth reading, so the read stops with the caller.
-        let mut downstream_gone = false;
+        // Whether the loop above stopped because the caller had gone rather
+        // than because the upstream had. The Record says which.
+        let mut read_ended_early = false;
         let settling = spend.is_some();
         while let Some(chunk) = byte_stream.next().await {
             let bytes = match chunk {
@@ -1140,6 +1319,7 @@ impl Inner {
                 }
             }
             if downstream_gone && !settling {
+                read_ended_early = true;
                 break;
             }
         }
@@ -1173,7 +1353,7 @@ impl Inner {
             &headers,
             &body,
             Some(status.as_u16()),
-            raw.seal(),
+            raw.seal_stream(stream_delivery(downstream_gone, read_ended_early)),
             read_error.as_ref().map(ToString::to_string),
             nonce,
             request_at,
@@ -1266,6 +1446,27 @@ fn engine_model_info(engine: &local_models::RunningEngine) -> ModelInfo {
 
 fn offers_running_engines_only(exposure: LocalExposure, starts_on_demand: bool) -> bool {
     exposure == LocalExposure::Loaded || !starts_on_demand
+}
+
+/// Whether a response's own headers say it is server-sent events.
+///
+/// The media type only — parameters (`; charset=utf-8`) are the sender's
+/// business — and an **absent** header answers `true`, which is the permissive
+/// half of the rule stated at the call site.
+fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+    let Some(value) = headers.get(reqwest::header::CONTENT_TYPE) else {
+        return true;
+    };
+    value
+        .to_str()
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
+        .unwrap_or(false)
 }
 
 /// One SSE event on its way downstream, and the refund it was carrying.
