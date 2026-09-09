@@ -1199,8 +1199,6 @@ impl Inner {
         request: ProxyChatRequest,
         sender: tokio::sync::mpsc::Sender<ProxyStreamEvent>,
     ) -> Result<(), AppError> {
-        use futures_util::StreamExt;
-
         let settings = self.proxy_settings().await?;
         let target = self.resolve_proxy_target(&settings, &request.model).await?;
         let mut route = self.open_proxy_route(&settings, &target).await?;
@@ -1394,7 +1392,20 @@ impl Inner {
         // than because the upstream had. The Record says which.
         let mut read_ended_early = false;
         let settling = spend.is_some();
-        while let Some(chunk) = byte_stream.next().await {
+        loop {
+            // **The caller is watched while nothing arrives**, or a silent
+            // upstream would hold this read — and the connection and engine
+            // lease behind it — long after there was anyone to deliver to.
+            // See [`next_chunk`] for why a spending route waits anyway.
+            let chunk = match next_chunk(&mut byte_stream, &sender, settling).await {
+                NextChunk::Chunk(chunk) => chunk,
+                NextChunk::UpstreamEnded => break,
+                NextChunk::CallerGone => {
+                    downstream_gone = true;
+                    read_ended_early = true;
+                    break;
+                }
+            };
             let bytes = match chunk {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -1590,6 +1601,55 @@ async fn deliver(
     }
     if sender.send(event).await.is_err() {
         *downstream_gone = true;
+    }
+}
+
+/// What ended one turn of the forwarding loop's wait.
+enum NextChunk<T> {
+    /// The upstream produced something — a chunk, or the failure of one.
+    Chunk(T),
+    /// The upstream closed.
+    UpstreamEnded,
+    /// The caller went away while nothing was arriving.
+    CallerGone,
+}
+
+/// Wait for the next chunk — **watching the caller while nothing arrives.**
+///
+/// A vanished caller is otherwise noticed only at a send, which never comes if
+/// the upstream has gone quiet: a backend that answers its head and then says
+/// nothing, or stalls between chunks, left this `await` outstanding for as long
+/// as it cared to, holding the upstream connection and any engine lease behind
+/// it while nobody was left to receive a byte. So with **nothing to settle**
+/// the wait watches the receiver too, and the caller's departure ends the read
+/// the same way a send failure would.
+///
+/// With a hold to settle it does not: a spending route's refund arrives at the
+/// *end* of the stream, so the drain is deliberate and delivery is what a
+/// vanished caller loses, never this app's accounting. `biased` so a chunk
+/// already in hand is always preferred to noticing the departure.
+async fn next_chunk<S, T>(
+    stream: &mut S,
+    sender: &tokio::sync::mpsc::Sender<ProxyStreamEvent>,
+    settling: bool,
+) -> NextChunk<T>
+where
+    S: futures_util::Stream<Item = T> + Unpin,
+{
+    use futures_util::StreamExt;
+
+    let arrived = if settling {
+        stream.next().await
+    } else {
+        tokio::select! {
+            biased;
+            chunk = stream.next() => chunk,
+            () = sender.closed() => return NextChunk::CallerGone,
+        }
+    };
+    match arrived {
+        Some(chunk) => NextChunk::Chunk(chunk),
+        None => NextChunk::UpstreamEnded,
     }
 }
 
@@ -2015,6 +2075,59 @@ mod tests {
             stream_delivery(downstream_gone, false),
             StreamDelivery::CallerGoneReadOn,
             "and the Record says so rather than calling it complete"
+        );
+    }
+
+    /// **A caller that goes while the upstream is silent still ends the read.**
+    /// The departure is otherwise noticed only at a send, and a backend that
+    /// answers its head and then says nothing never produces one — so the read
+    /// held the upstream connection, and any engine lease behind it, for as
+    /// long as that backend cared to stay quiet, with nobody left to deliver a
+    /// byte to.
+    #[tokio::test]
+    async fn a_caller_that_goes_while_the_upstream_is_silent_ends_the_read() {
+        use std::time::Duration;
+
+        let (sender, receiver) = tokio::sync::mpsc::channel::<ProxyStreamEvent>(1);
+        drop(receiver);
+        let mut silent = futures_util::stream::pending::<Vec<u8>>();
+
+        // The wait is bounded here because the defect's own shape is a wait
+        // that never ends: without the cure this fails rather than hangs, and
+        // a hang says nothing.
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            next_chunk(&mut silent, &sender, false),
+        )
+        .await
+        .expect("the read ends with the caller rather than waiting out a silent upstream");
+        assert!(matches!(ended, NextChunk::CallerGone));
+
+        // A route with a hold to settle waits anyway: its refund is at the end
+        // of the stream, and delivery is what a vanished caller loses.
+        let settling = tokio::time::timeout(
+            Duration::from_millis(50),
+            next_chunk(&mut silent, &sender, true),
+        )
+        .await;
+        assert!(
+            settling.is_err(),
+            "a spending route reads on to the refund in the tail"
+        );
+
+        // And the upstream's own two endings are unchanged, caller or no.
+        let mut done = futures_util::stream::empty::<Vec<u8>>();
+        assert!(matches!(
+            next_chunk(&mut done, &sender, false).await,
+            NextChunk::UpstreamEnded
+        ));
+        let mut one = futures_util::stream::iter(vec![vec![1u8]]);
+        assert!(
+            matches!(
+                next_chunk(&mut one, &sender, false).await,
+                NextChunk::Chunk(_)
+            ),
+            "a chunk in hand is preferred to noticing the departure"
         );
     }
 
