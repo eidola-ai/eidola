@@ -492,6 +492,18 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
             "insufficient_quota",
             Some("insufficient_quota"),
         ),
+        // **A precondition the reader can lift, not a server failure.** The
+        // server answers `428` while the current terms are unaccepted and
+        // `check_status` types that; reaching the wildcard turned it into a
+        // `500`, so a client's backoff read "the server is broken and may
+        // recover" for a state that changes only when a person opens Eidola and
+        // accepts. The status the server chose is the one that travels, and the
+        // code names the act.
+        AppError::TermsAcceptanceRequired { .. } => (
+            StatusCode::PRECONDITION_REQUIRED,
+            "invalid_request_error",
+            Some("terms_acceptance_required"),
+        ),
         // An upstream status is passed through where it is a status at all —
         // a client's backoff should see the 429 the server sent, not a 502
         // this app invented over it.
@@ -627,6 +639,16 @@ mod tests {
                 message: "gone".into()
             }),
             StatusCode::BAD_GATEWAY
+        );
+        // **A precondition is not a server failure.** Provisioning refused for
+        // unaccepted terms reached the wildcard and answered `500`, which a
+        // client reads as "retry later" for a state only a person can change.
+        assert_eq!(
+            status(AppError::TermsAcceptanceRequired {
+                message: "accept the current terms".into()
+            }),
+            StatusCode::PRECONDITION_REQUIRED,
+            "the status the server chose is the one that travels"
         );
     }
 
