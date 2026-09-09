@@ -22676,7 +22676,8 @@ fn space_find_a_card_measures_against_the_text_it_is_showing(cx: &mut TestAppCon
 
     let first = vcx
         .update(|window, cx| view.read_with(cx, |v, cx| v.find_result_cards_for_test(window, cx)));
-    let draft_card = |cards: &[(String, std::ops::Range<usize>, Vec<std::ops::Range<usize>>)]| {
+    type Card = (String, std::ops::Range<usize>, Vec<std::ops::Range<usize>>);
+    let draft_card = |cards: &[Card]| {
         cards
             .iter()
             .find(|(id, _, _)| id.starts_with("draft"))
