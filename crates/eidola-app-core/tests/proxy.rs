@@ -1448,12 +1448,22 @@ fn a_proxied_completion_carries_no_user_agent() {
 
         let head = captured.lock().expect("captured head").clone();
         let lower = head.to_ascii_lowercase();
-        assert!(
-            lower.contains("content-type: application/json"),
-            "the enumerated header is on the wire, so this is the right request: {head}"
-        );
-        assert!(
-            !lower.contains("user-agent"),
+        let names: Vec<String> = lower
+            .lines()
+            .skip(1)
+            .filter_map(|line| Some(line.split_once(':')?.0.trim().to_string()))
+            .filter(|name| !name.is_empty())
+            .collect();
+        // Exactly the allowlist for a non-streaming request, plus HTTP's own
+        // framing. Asserted as a **set**, because every way this claim was
+        // false was a header nobody here wrote: the client's `User-Agent`, the
+        // client's `Accept: */*` — which on a streaming request would have sat
+        // beside the one the allowlist names — and a second `Content-Type`,
+        // since `RequestBuilder::header` appends and `json()` had already set
+        // one.
+        assert_eq!(
+            names,
+            vec!["content-type", "accept", "host", "content-length"],
             "the proxy sends the set it enumerates and nothing else: {head}"
         );
     });

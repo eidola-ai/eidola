@@ -405,8 +405,10 @@ fn mint_traceparent() -> String {
 /// The members, and why each is here:
 ///
 /// - **`Content-Type: application/json`** — the request has a JSON body.
-/// - **`Accept: text/event-stream`** — streaming only, and the same header the
-///   app's own streaming turns send.
+/// - **`Accept`** — `text/event-stream` on a streaming request (the same header
+///   the app's own streaming turns send), `application/json` otherwise. Stated
+///   on both because reqwest inserts an `Accept: */*` of its own where the
+///   request carries none: an unstated header is not an absent one.
 /// - **`Authorization`** — the ACT this app spends, or an external backend's
 ///   own key. **Never the downstream's.** A downstream `Authorization`
 ///   authenticates the tool *to the proxy* and is consumed there; the two
@@ -438,9 +440,19 @@ impl UpstreamHeaders {
     /// its own.
     pub fn to_pairs(&self) -> Vec<(&'static str, String)> {
         let mut pairs = vec![("Content-Type", "application/json".to_string())];
-        if self.streaming {
-            pairs.push(("Accept", "text/event-stream".to_string()));
-        }
+        // **Always named, because otherwise something else names it.** reqwest
+        // inserts `Accept: */*` when the request carries none, so leaving the
+        // blocking transport's unstated did not mean "no `Accept`" — it meant
+        // one this app did not decide, outside the enumeration the Record shows.
+        // Saying what each transport actually wants is both truer and shorter.
+        pairs.push((
+            "Accept",
+            if self.streaming {
+                "text/event-stream".to_string()
+            } else {
+                "application/json".to_string()
+            },
+        ));
         if let Some(auth) = &self.authorization {
             pairs.push(("Authorization", auth.clone()));
         }
@@ -1078,17 +1090,9 @@ impl Inner {
         };
 
         let request_at = now_ms();
-        let mut outbound = route
-            .client
-            .post(format!("{}/v1/chat/completions", route.base_url))
-            .json(&body);
-        for (name, value) in headers.to_pairs() {
-            // `json()` already set Content-Type; setting it again is
-            // idempotent and keeps the allowlist the single enumeration.
-            outbound = outbound.header(name, value);
-        }
+        let outbound = build_upstream_request(&route, &body, &headers)?;
 
-        let response = match outbound.send().await {
+        let response = match route.client.execute(outbound).await {
             Ok(response) => response,
             Err(e) => {
                 let error = AppError::from_request(e);
@@ -1256,15 +1260,9 @@ impl Inner {
         };
 
         let request_at = now_ms();
-        let mut outbound = route
-            .client
-            .post(format!("{}/v1/chat/completions", route.base_url))
-            .json(&body);
-        for (name, value) in headers.to_pairs() {
-            outbound = outbound.header(name, value);
-        }
+        let outbound = build_upstream_request(&route, &body, &headers)?;
 
-        let response = match outbound.send().await {
+        let response = match route.client.execute(outbound).await {
             Ok(response) => response,
             Err(e) => {
                 let error = AppError::from_request(e);
@@ -1595,6 +1593,53 @@ fn offers_running_engines_only(exposure: LocalExposure, starts_on_demand: bool) 
     exposure == LocalExposure::Loaded || !starts_on_demand
 }
 
+/// Build the upstream request so its header set is **exactly** the allowlist.
+///
+/// "These headers and nothing else" was untrue in three ways at once, and only
+/// one of them was written anywhere: `RequestBuilder::header` **appends**, so
+/// `json()`'s `Content-Type` and the allowlist's became two of them on the
+/// wire; reqwest adds an `Accept: */*` of its own, which on a streaming request
+/// sat beside `Accept: text/event-stream` and left the upstream to choose;
+/// and the client's builder added a `User-Agent`. The claim is not something to
+/// re-audit each time a dependency moves, so the request is **built and then
+/// its headers replaced**: whatever a client or a body helper put there is
+/// cleared, and the enumeration becomes a fact. What hyper adds afterwards is
+/// framing (`Host`, `Content-Length`) — the protocol, not a claim about this
+/// app — and the body is serialized here rather than by `json()` for the same
+/// reason: a helper that sets a header is a second author of the set.
+fn build_upstream_request(
+    route: &ProxyRoute,
+    body: &Value,
+    headers: &UpstreamHeaders,
+) -> Result<reqwest::Request, AppError> {
+    let mut request = route
+        .client
+        .post(format!("{}/v1/chat/completions", route.base_url))
+        .body(body.to_string())
+        .build()
+        .map_err(|e| AppError::Network {
+            message: format!(
+                "building the upstream request: {}",
+                crate::error::request_error_text(e)
+            ),
+        })?;
+    let out = request.headers_mut();
+    out.clear();
+    for (name, value) in headers.to_pairs() {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            AppError::Config {
+                message: format!("`{name}` is not a usable header name"),
+            }
+        })?;
+        let value =
+            reqwest::header::HeaderValue::from_str(&value).map_err(|_| AppError::Config {
+                message: format!("`{name}` carries a value that cannot travel in a header"),
+            })?;
+        out.insert(name, value);
+    }
+    Ok(request)
+}
+
 /// Send one event downstream, and let a failed send be the fact it is.
 ///
 /// **The one door out of the forwarding loop**, so no send can be made whose
@@ -1790,8 +1835,8 @@ mod tests {
         };
         assert_eq!(
             names(&headers(None, false, TraceUpstream::Off)),
-            vec!["Content-Type"],
-            "a local route carries nothing but the body's own type"
+            vec!["Content-Type", "Accept"],
+            "a local route carries the body's own type and what it will take back"
         );
         assert_eq!(
             names(&headers(Some("Bearer x"), true, TraceUpstream::Off)),
@@ -1994,9 +2039,21 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
+            // Read the request first: answering over unread bytes and closing
+            // resets the connection, which the client meets as a read failure.
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                match socket.read(&mut byte).await {
+                    Ok(1) => request.push(byte[0]),
+                    _ => break,
+                }
+            }
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n",
