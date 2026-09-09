@@ -22657,6 +22657,65 @@ fn space_find_reveals_a_map_dot_the_keyboard_lands_on(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_opening_the_find_overlay_dismisses_what_it_would_cover(cx: &mut TestAppContext) {
+    // The mirror of withholding the quote verbs. Every popover the conversation
+    // can hold paints inside the pane, so the overlay stands in front of it:
+    // unreachable by mouse or Tab, still owning the keyboard, and — worse —
+    // ahead of the overlay in the root's Escape chain, so the first press would
+    // close something the reader never saw.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    view.update(&mut vcx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    run_find(&view, window, &mut vcx, "quick");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        Some(None),
+        "precondition: a picker stands over the conversation"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        None,
+        "the surface about to cover it dismissed it"
+    );
+
+    // …so the first Escape is the overlay's own rung, not a picker's.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "one press backs out the surface the reader is looking at"
+    );
+}
+
+#[gpui::test]
 fn space_an_open_find_overlay_withholds_the_quote_verbs(cx: &mut TestAppContext) {
     // Menu dispatch is not traversal, so the overlay's tab-order suppression
     // never reached the Edit menu: with a quotable selection standing, "Quote in

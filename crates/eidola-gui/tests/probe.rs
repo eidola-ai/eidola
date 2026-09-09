@@ -8746,6 +8746,18 @@ fn the_find_overlay_keeps_the_tab_order_to_itself(cx: &mut TestAppContext) {
     });
     draw(cx, window);
 
+    // Enter a post's affordance row first. That verb is the one tab stop under
+    // the overlay that rides a **tracked** handle rather than a probe-derived
+    // one, so gpui reads the handle's own `tab_stop` and the guard — which acts
+    // where a role becomes a stop — cannot reach it: a reader standing on Edit
+    // who then opened the overlay left it reachable behind the surface.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_affordance_for_test("a1", 0, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
     let focus = view.read_with(cx, |v, _| v.focus_handle());
     cx.update_window(window, |_, window, cx| {
         focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);

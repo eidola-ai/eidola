@@ -597,9 +597,25 @@ impl SpaceView {
             self.close_find_overlay(window, cx);
             return;
         }
-        let Some(session) = self.find.as_mut() else {
+        if self.find.is_none() {
             return;
-        };
+        }
+        // **A surface that covers the conversation dismisses what it would
+        // bury.** Every popover the conversation can hold paints inside the
+        // pane, so the overlay stands in front of it: its rows are unreachable
+        // (the guard takes their tab stops, the containment takes the mouse)
+        // while it goes on owning the keyboard through `transient_overlay_open`
+        // and, worse, sits *ahead* of the overlay in the root's Escape chain —
+        // so the first press would close something the reader never saw, which
+        // is the same defect as mounting a picker behind this surface. Closing
+        // them is the mirror of withholding the quote verbs, and settles the
+        // class from the other end. The **inspector's** dropdowns are left
+        // alone: that panel is a column beside the pane and stays visible.
+        self.close_context_menu(cx);
+        self.close_quote_destination(window, cx);
+        self.band_menu = None;
+        self.highlight_picker = None;
+        let session = self.find.as_mut().expect("checked");
         session.overlay.open = true;
         // **A surface that takes the window takes the keyboard.** The results
         // list is the single tab stop inside it, so that is where a reader
