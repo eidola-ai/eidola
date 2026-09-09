@@ -1185,14 +1185,20 @@ fn a_connection_that_says_nothing_is_reaped() {
             // A peer that holds its end open and writes nothing at all.
             let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), serving).await;
             drop(client);
-            outcome.is_ok()
+            // **Ended, and ended cleanly.** The deadline is armed only when the
+            // builder has been given a timer, and hyper *panics* on a
+            // configured timeout with none (`common::time::Time::check`) — a
+            // panic inside the connection task also "ends" it, so a test asking
+            // no more than "did the future resolve" would pass with the timer
+            // removed and every real connection taken down by it.
+            matches!(outcome, Ok(Ok(())))
         });
         http::set_header_read_timeout_for_test(0);
 
         assert!(
             ended,
-            "a silent connection must give its slot back rather than hold it against every \
-             legitimate client"
+            "a silent connection must give its slot back — cleanly — rather than hold it against \
+             every legitimate client"
         );
     });
 }
