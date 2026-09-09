@@ -322,7 +322,18 @@ async fn accept_loop(
 /// engine drain stays the order of lines in one body rather than the sequence
 /// of separately-registered hooks.
 #[derive(Clone, Default)]
-pub struct ProxyHandle(Arc<Mutex<Option<ProxyServer>>>);
+pub struct ProxyHandle {
+    server: Arc<Mutex<Option<ProxyServer>>>,
+    /// How many sockets this handle has bound.
+    ///
+    /// **A restart is not observable from outside without it.** Whether a
+    /// reconcile left a correct listener alone or closed and rebound it on the
+    /// same address is invisible in the address it reports — and the *cost* of
+    /// getting that wrong is a race (the old socket may or may not have been
+    /// released), which is exactly the kind of thing a test must not depend on.
+    /// One counter makes "nothing was started" a fact rather than a hope.
+    binds: Arc<std::sync::atomic::AtomicU64>,
+}
 
 impl ProxyHandle {
     /// Start (or restart) the listener on `settings`' binding.
@@ -337,7 +348,7 @@ impl ProxyHandle {
         core: &Arc<AppCore>,
         settings: &ProxySettings,
     ) -> Result<SocketAddr, AppError> {
-        let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = self.server.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(running) = held.take() {
             running.close();
         }
@@ -346,12 +357,14 @@ impl ProxyHandle {
         // `bound_address` is the one that always answers.
         let address = server.bound_address();
         *held = Some(server);
+        self.binds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(address)
     }
 
     /// Stop the listener, if one is running. Idempotent.
     pub fn stop(&self) {
-        let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = self.server.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(running) = held.take() {
             running.close();
         }
@@ -363,7 +376,7 @@ impl ProxyHandle {
     /// "the reader asked for this" and "this is where a tool should point" are
     /// different facts, and a bind that failed makes them differ.
     pub fn address(&self) -> Option<SocketAddr> {
-        self.0
+        self.server
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -381,7 +394,7 @@ impl ProxyHandle {
     /// has stopped answering, so the honest cost is that a reader may see the
     /// stale line until something else moves.
     pub fn accept_failure(&self) -> Option<String> {
-        self.0
+        self.server
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -393,10 +406,21 @@ impl ProxyHandle {
         self.address().is_some()
     }
 
+    /// Test-only: how many sockets this handle has bound.
+    #[doc(hidden)]
+    pub fn binds_for_test(&self) -> u64 {
+        self.binds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Test-only: see [`ProxyServer::fail_accepting_for_test`].
     #[doc(hidden)]
     pub fn fail_accepting_for_test(&self, reason: &str) {
-        if let Some(server) = self.0.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(server) = self
+            .server
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             server.fail_accepting_for_test(reason);
         }
     }

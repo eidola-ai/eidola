@@ -3530,9 +3530,15 @@ fn a_refresh_leaves_a_correct_ipv6_listener_alone(cx: &mut TestAppContext) {
         "bound where the reader asked: {bound:?}"
     );
 
+    let handle = stores.proxy.read_with(cx, |s, _| s.handle());
+    let bound_once = handle.binds_for_test();
+    assert_eq!(bound_once, 1, "one socket, bound once");
+
     // The refresh a bus event, a settings write, or the launch reconcile all
     // arrive as. Nothing about the configuration moved, so nothing about the
-    // socket may.
+    // socket may — and *that* is the assertion, not the address it reports:
+    // a restart rebinds the same address, so whether the endpoint survives it
+    // is a race with the old socket's release rather than a property.
     for _ in 0..3 {
         stores.proxy.update(cx, |s, cx| s.refresh(cx));
         cx.run_until_parked();
@@ -3540,9 +3546,14 @@ fn a_refresh_leaves_a_correct_ipv6_listener_alone(cx: &mut TestAppContext) {
         cx.run_until_parked();
     }
     assert_eq!(
+        handle.binds_for_test(),
+        bound_once,
+        "a listener that already matches is not closed and rebound"
+    );
+    assert_eq!(
         stores.proxy.read_with(cx, |s, _| s.listen_error()),
         None,
-        "a listener that already matches is not closed and rebound"
+        "so nothing could have failed to come back"
     );
     assert_eq!(
         stores.proxy.read_with(cx, |s, _| s.address()),
@@ -3550,7 +3561,6 @@ fn a_refresh_leaves_a_correct_ipv6_listener_alone(cx: &mut TestAppContext) {
         "and it is still answering where it was"
     );
 
-    let handle = stores.proxy.read_with(cx, |s, _| s.handle());
     handle.stop();
     cx.run_until_parked();
 }
