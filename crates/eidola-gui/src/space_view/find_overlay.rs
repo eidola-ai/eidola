@@ -313,6 +313,18 @@ pub(crate) fn map_lane_width(lanes: usize) -> f32 {
     (avail / (lanes - 1) as f32).clamp(MAP_LANE_MIN_W, MAP_LANE_W)
 }
 
+/// Where a lane's dots sit, in a graph that wide.
+///
+/// **Lane index *is* the x position** — that is what makes ordering by lane the
+/// same as reading the map left to right. Past thirteen lanes the floor above
+/// carries the last of them beyond the column's own width, and the excess is
+/// *scrolled to* rather than folded back: clamping it stacked distinct branches
+/// — and their buttons — on one x, contradicting the topology the map exists to
+/// show and putting some nodes out of reach.
+pub(crate) fn map_lane_x(lane: usize, lanes: usize) -> f32 {
+    lane as f32 * map_lane_width(lanes)
+}
+
 /// Every post's node id, resolved **once**.
 ///
 /// Both halves of the overlay ask "which transcript row is this node?" — the
@@ -985,8 +997,7 @@ impl SpaceView {
             .map(|m| m.node.clone());
         let lanes = map.iter().map(|n| n.lane + 1).max().unwrap_or(1);
         let depths = map.iter().map(|n| n.depth + 1).max().unwrap_or(1);
-        let lane_w = map_lane_width(lanes);
-        let x = |lane: usize| lane as f32 * lane_w;
+        let x = |lane: usize| map_lane_x(lane, lanes);
         let y = |depth: usize| depth as f32 * MAP_ROW_H;
 
         // **Excess lanes run off the edge and are scrolled to, never folded
@@ -1832,9 +1843,12 @@ mod tests {
         // the column and is scrolled to. Clamping the excess instead stacked
         // every lane past the twelfth on one x — distinct branches, and their
         // buttons, on top of one another.
-        let wide = map_lane_width(14);
-        assert_eq!(wide, MAP_LANE_MIN_W, "a wide graph is at the lane floor");
-        let xs: Vec<f32> = (0..14).map(|lane| lane as f32 * wide).collect();
+        assert_eq!(
+            map_lane_width(14),
+            MAP_LANE_MIN_W,
+            "a wide graph is at the lane floor"
+        );
+        let xs: Vec<f32> = (0..14).map(|lane| map_lane_x(lane, 14)).collect();
         let avail = MAP_WIDTH - 2.0 * MAP_PAD - MAP_DOT;
         assert!(
             xs.last().copied().unwrap_or(0.0) > avail,
