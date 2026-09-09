@@ -22286,7 +22286,7 @@ fn a_proxy_verb_that_unmounts_itself_hands_the_keyboard_back(cx: &mut TestAppCon
     });
     draw_window(cx, window);
 
-    let root = view.read_with(cx, |v, cx| gpui::Focusable::focus_handle(v, cx));
+    let root = view.read_with(cx, gpui::Focusable::focus_handle);
     let slot = |cx: &mut TestAppContext, key: &str| {
         view.read_with(cx, |v, _| v.slot_focus_for_test(key))
             .unwrap_or_else(|| panic!("the {key} subtree painted"))
