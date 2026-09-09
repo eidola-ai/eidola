@@ -417,6 +417,13 @@ fn mint_traceparent() -> String {
 /// What is deliberately absent: everything else. `User-Agent`, `X-Request-Id`,
 /// `Cookie`, `tracestate`, a vendor's own `x-*` — a header the proxy did not
 /// decide to send does not go.
+///
+/// **Including the ones nobody wrote here.** An enumeration is only true if
+/// nothing underneath it adds a header of its own, and `plain_http_client`'s
+/// builder installs `User-Agent: eidola-app-core/<version>` — so a proxied
+/// route is built from [`local_models::proxy_http_client`] instead, which sets
+/// none. What is left on the wire besides this list is HTTP's own framing
+/// (`Host`, `Content-Length`): the protocol, not a fact about this app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpstreamHeaders {
     /// `Some` iff the route carries a credential.
@@ -817,7 +824,10 @@ impl Inner {
                     }
                 };
                 Ok(ProxyRoute {
-                    client: self.plain_client()?,
+                    // Not `plain_client`: its builder adds a `User-Agent`, which
+                    // would travel outside the enumerated header set the Record
+                    // shows the reader (`local_models::proxy_http_client`).
+                    client: self.proxy_client()?,
                     base_url: engine_url,
                     wire_model: target.canonical.clone(),
                     canonical: target.canonical.clone(),
@@ -838,7 +848,10 @@ impl Inner {
                         message: format!("backend `{}` has no base URL", backend.id),
                     })?;
                 Ok(ProxyRoute {
-                    client: self.plain_client()?,
+                    // Not `plain_client`: its builder adds a `User-Agent`, which
+                    // would travel outside the enumerated header set the Record
+                    // shows the reader (`local_models::proxy_http_client`).
+                    client: self.proxy_client()?,
                     base_url,
                     wire_model: target.model.clone(),
                     canonical: target.canonical.clone(),

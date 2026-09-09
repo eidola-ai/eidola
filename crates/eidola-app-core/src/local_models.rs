@@ -1511,17 +1511,35 @@ pub(crate) fn resolve_external_engine(engine_path: Option<&str>) -> Option<PathB
 /// A plain (non-attesting) HTTPS-capable client: native trust roots, used
 /// for model downloads and loopback engine traffic.
 pub(crate) fn plain_http_client() -> Result<reqwest::Client, AppError> {
+    plain_client_with_agent(Some(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION"))))
+}
+
+/// The client the **local inference proxy's** own upstream requests go out on.
+///
+/// [`plain_http_client`] without the identifying `User-Agent`, and that is the
+/// whole difference. The proxy's upstream header set is an enumerated allowlist
+/// whose "and nothing else" is a claim the Record repeats back to the reader
+/// (`proxy::route::UpstreamHeaders::for_record`), so a header the *builder*
+/// adds would travel on every proxied completion — a version fingerprint on an
+/// external backend's wire — while the row said it did not. The one surface
+/// whose whole point is that a downstream tool's headers do not go must not add
+/// one of its own behind the enumeration.
+pub(crate) fn proxy_http_client() -> Result<reqwest::Client, AppError> {
+    plain_client_with_agent(None)
+}
+
+fn plain_client_with_agent(user_agent: Option<&'static str>) -> Result<reqwest::Client, AppError> {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(crate::load_native_root_store())
         .with_no_client_auth();
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(tls_config)
-        .user_agent(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| AppError::LocalModel {
-            message: format!("constructing HTTP client: {e}"),
-        })
+    let mut builder = reqwest::Client::builder().tls_backend_preconfigured(tls_config);
+    if let Some(agent) = user_agent {
+        builder = builder.user_agent(agent);
+    }
+    builder.build().map_err(|e| AppError::LocalModel {
+        message: format!("constructing HTTP client: {e}"),
+    })
 }
 
 /// Pick a free loopback port by binding port 0 and reading the assignment

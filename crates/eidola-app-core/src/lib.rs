@@ -2607,6 +2607,19 @@ impl Inner {
         local_models::plain_http_client()
     }
 
+    /// The client a **proxied** completion goes out on: [`Inner::plain_client`]
+    /// without the identifying `User-Agent`, because the proxy's upstream
+    /// header set is an allowlist the Record repeats back to the reader and a
+    /// header the builder adds would travel outside it. See
+    /// [`local_models::proxy_http_client`].
+    fn proxy_client(&self) -> Result<reqwest::Client, AppError> {
+        #[cfg(feature = "test-support")]
+        if let Some(client) = &self.http_override {
+            return Ok(client.clone());
+        }
+        local_models::proxy_http_client()
+    }
+
     /// Is what this eidola connection says about its models a fact this
     /// client may act on, or merely a hint?
     ///
