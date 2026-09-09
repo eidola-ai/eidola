@@ -8289,7 +8289,6 @@ fn the_find_overlay_probes_its_map_and_its_results(cx: &mut TestAppContext) {
         "You：a kestrel hovers",
     );
     cx.update(|cx| eidola_gui::i18n::apply("en", cx));
-    let entries = fresh_entries(cx, window);
 
     // **And the list is a real tab stop.** `Role::List` is deliberately not in
     // the focusable set the probe derives, so the element carrying it takes
