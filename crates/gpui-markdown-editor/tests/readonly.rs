@@ -449,3 +449,51 @@ fn a_fragment_lays_out_only_its_blocks_and_keeps_their_containers(cx: &mut TestA
         "the fragment's own line still addresses the whole document ({start})"
     );
 }
+
+/// **The painted range is the whole document as far as this surface claims.**
+/// Filtering the layout alone left the *selection* addressing everything: Select
+/// All selected `0..markdown.len()`, so a Copy from a result card put every
+/// unpainted block of the post on the clipboard, and a shift-navigation or a
+/// drag past the fragment's edge reached text the reader cannot see.
+#[gpui::test]
+fn a_fragment_selects_only_what_it_paints(cx: &mut TestAppContext) {
+    let markdown = "an opening paragraph\n\n\
+        the middle one, which is the fragment\n\n\
+        a closing paragraph";
+    let middle = markdown
+        .find("the middle one")
+        .expect("the passage is in the source");
+    let fragment = middle..middle + "the middle one, which is the fragment".len();
+
+    let (mut vcx, editor) = open_readonly_fragment(cx, markdown, Some(fragment.clone()));
+
+    // Select All, the command the context menu and ⌘A both reach.
+    vcx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.perform(gpui_markdown_editor::EditorCommand::SelectAll, window, cx)
+        });
+    });
+    let selected = editor.read_with(&vcx, |e, _| e.selection().selection_range());
+    assert_eq!(
+        selected, fragment,
+        "Select All selects the fragment, not the document behind it"
+    );
+    assert_eq!(
+        &markdown[selected.clone()],
+        "the middle one, which is the fragment",
+        "…so a copy carries exactly what the card paints"
+    );
+
+    // And a caret sent to the document's end — the event a document-end
+    // navigation, a shift-extension or a drag past the last painted line all
+    // arrive as — stops at the fragment's own end rather than in text this
+    // surface never drew.
+    vcx.update(|_, cx| {
+        editor.update(cx, |e, cx| e.append_at_end("", cx));
+    });
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.selection().head()),
+        fragment.end,
+        "the document's end is the fragment's end"
+    );
+}
