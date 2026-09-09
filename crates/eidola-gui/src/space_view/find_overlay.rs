@@ -110,6 +110,8 @@ const FRAGMENT_CHROME_H: f32 = 24.0;
 /// would be read aloud on every cursor move; the opening is what tells a reader
 /// which result this is, and Enter takes them to the passage itself.
 const FRAGMENT_LABEL_CHARS: usize = 120;
+/// The results column's own inset either side of a fragment card.
+const RESULTS_PAD: f32 = 16.0;
 
 // ---------------------------------------------------------------------------
 // The map's layout — pure
@@ -714,9 +716,14 @@ impl SpaceView {
 
         let top = TITLE_BAR_RESERVE.as_f32() + FIND_BAR_H;
         let viewport_h = (window_h.as_f32() - top).max(0.0);
+        // **The overlay's ground is the separators' muted paper, not the page's.**
+        // A fragment is a sheet lifted out of the conversation, and a sheet on a
+        // sheet is invisible: the cards below take `theme.background`, so the
+        // surface under them has to be the band's ground for the lift to read at
+        // all. Same inversion the compact composer's action bar takes.
         let (bg, border) = {
             let theme = cx.theme();
-            (theme.background, theme.border)
+            (theme.muted, theme.border)
         };
 
         let list = self.render_find_results(&groups, viewport_h, settled, window, cx);
@@ -904,6 +911,8 @@ impl SpaceView {
             .w(px(MAP_WIDTH))
             .h_full()
             .p(px(MAP_PAD))
+            .border_r_1()
+            .border_color(cx.theme().border)
             .overflow_y_scroll()
             .track_scroll(&handle)
             .child(canvas)
@@ -943,7 +952,12 @@ impl SpaceView {
         let offset = -scroll.offset().y.as_f32();
         let band = (offset - RESULT_MARGIN)..(offset + viewport_h + RESULT_MARGIN);
 
-        let mut column = v_flex().w_full().gap_0();
+        // The reading measure holds here too: a fragment is prose, and prose
+        // set across a thousand pixels is not readable because it is a result.
+        let mut column = v_flex()
+            .w_full()
+            .max_w(super::BODY_MAX_WIDTH + px(2.0 * RESULTS_PAD))
+            .gap_0();
         let mut y = 0.0_f32;
         let mut tops: HashMap<SharedString, (f32, f32)> = HashMap::new();
         let mut in_view: HashSet<SharedString> = HashSet::new();
@@ -1162,6 +1176,7 @@ impl SpaceView {
                     .bg(card)
                     .border_1()
                     .border_color(if on_cursor && keyboard { border } else { card })
+                    .shadow_xs()
                     .when(on_cursor && keyboard, |d| {
                         d.shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))
                     })

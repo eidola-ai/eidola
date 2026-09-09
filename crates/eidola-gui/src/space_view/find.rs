@@ -1438,6 +1438,25 @@ impl SpaceView {
         self.layout.measured(node).is_some() || self.active_draft.as_ref() == Some(node)
     }
 
+    /// Open a session on `query` — the scene seam, for a surface that has to
+    /// exist before any frame has run.
+    ///
+    /// It goes through `set_find_query`, the same door the field's own `Change`
+    /// event takes, so a scene never stands on a state the production path
+    /// cannot produce. Calling it again replaces the query on the open session,
+    /// which is what the reader typing over their search does.
+    #[doc(hidden)]
+    pub fn seed_find_for_test(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            self.open_find(&crate::actions::FindInSpace, window, cx);
+        }
+        if let Some(session) = self.find.as_ref() {
+            let input = session.input.clone();
+            input.update(cx, |s, cx| s.set_value(query, window, cx));
+        }
+        self.set_find_query(query.to_string(), cx);
+    }
+
     /// Whether the find surface currently owns the keyboard — what gates the
     /// Escape rung, so an Escape in the composer still deactivates the draft,
     /// and what puts the bar in `transient_overlay_open`.
