@@ -1090,7 +1090,30 @@ impl Inner {
         };
 
         let request_at = now_ms();
-        let outbound = build_upstream_request(&route, &body, &headers)?;
+        // **A failure here is past the hold, so it settles like every other
+        // one.** The build can refuse — an external backend's key is user-typed
+        // and may not be a header value — and a `?` would have returned with a
+        // credential left `spending` and nothing in the Record to say why.
+        let outbound = match build_upstream_request(&route, &body, &headers) {
+            Ok(outbound) => outbound,
+            Err(error) => {
+                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                    .await;
+                self.record_proxy_request(
+                    &route,
+                    &headers,
+                    &body,
+                    None,
+                    Vec::new(),
+                    Some(error.to_string()),
+                    nonce,
+                    request_at,
+                    now_ms(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
 
         let response = match route.client.execute(outbound).await {
             Ok(response) => response,
@@ -1260,7 +1283,28 @@ impl Inner {
         };
 
         let request_at = now_ms();
-        let outbound = build_upstream_request(&route, &body, &headers)?;
+        // Past the hold, so a refusal settles it — the blocking transport's
+        // arm, for the same reason.
+        let outbound = match build_upstream_request(&route, &body, &headers) {
+            Ok(outbound) => outbound,
+            Err(error) => {
+                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                    .await;
+                self.record_proxy_request(
+                    &route,
+                    &headers,
+                    &body,
+                    None,
+                    Vec::new(),
+                    Some(error.to_string()),
+                    nonce,
+                    request_at,
+                    now_ms(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
 
         let response = match route.client.execute(outbound).await {
             Ok(response) => response,
