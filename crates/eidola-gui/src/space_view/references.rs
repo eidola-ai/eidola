@@ -794,6 +794,20 @@ impl SpaceView {
 
     // -- Quote --------------------------------------------------------------
 
+    /// Whether the surface a quote verb would open stands **behind** the
+    /// Find-all overlay.
+    ///
+    /// Every one of the three lands the reader on something the overlay covers:
+    /// the destination picker paints before it (and so wholly under it), and
+    /// the other two focus a composer inside the covered pane. The menu
+    /// registration is what withholds them (`SpaceView::render`), and this is
+    /// the same question asked at the handler — because the context menu's rows
+    /// call these methods **directly**, bypassing registration entirely, so an
+    /// offered verb and an accepted press could otherwise disagree.
+    fn quoting_is_covered(&self) -> bool {
+        self.find_overlay_open()
+    }
+
     /// `Edit > Quote` — attach the current post selection to the **active**
     /// draft (activating the selected branch's tail draft, or opening one at
     /// its leaf, when no composer is open) and inject the embed marker at the
@@ -804,7 +818,7 @@ impl SpaceView {
         // populated, focused composer whose submit is refused. Guarded at the
         // handler as well as at the two surfaces that offer it, because a
         // keystroke reaches this without passing either.
-        if !self.viewer_may_act(cx) {
+        if !self.viewer_may_act(cx) || self.quoting_is_covered() {
             return;
         }
         let Some(selection) = self.post_selection.clone() else {
@@ -828,7 +842,7 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         // Lands a draft here too — see [`Self::quote`].
-        if !self.viewer_may_act(cx) {
+        if !self.viewer_may_act(cx) || self.quoting_is_covered() {
             return;
         }
         let Some(selection) = self.post_selection.clone() else {
@@ -999,6 +1013,9 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quoting_is_covered() {
+            return;
+        }
         let Some(selection) = self.post_selection.clone() else {
             return;
         };

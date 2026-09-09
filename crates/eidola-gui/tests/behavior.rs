@@ -22572,6 +22572,88 @@ fn space_an_open_find_overlay_keeps_printables_out_of_the_conversation(cx: &mut 
 }
 
 #[gpui::test]
+fn space_an_open_find_overlay_withholds_the_quote_verbs(cx: &mut TestAppContext) {
+    // Menu dispatch is not traversal, so the overlay's tab-order suppression
+    // never reached the Edit menu: with a quotable selection standing, "Quote in
+    // Another Conversation…" mounted the destination picker *behind* the
+    // overlay (it paints earlier) and focused it, so the reader was typing into
+    // an invisible surface and the first Escape closed a picker they never saw.
+    // Its two siblings land a populated draft in the covered composer, which is
+    // the same shape. Registration is the enablement, so withholding it is what
+    // greys the items.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    view.update(&mut vcx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.has_post_selection_for_test()),
+        "precondition: a quotable passage is selected"
+    );
+
+    run_find(&view, window, &mut vcx, "quick");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "precondition: the overlay stands over the conversation"
+    );
+
+    // The real door: an action dispatched through the window, which is exactly
+    // what a menu item does — and what registration decides.
+    let root = view.read_with(&vcx, |v, _| v.focus_handle());
+    for action in [
+        Box::new(eidola_gui::actions::QuoteElsewhere) as Box<dyn gpui::Action>,
+        Box::new(eidola_gui::actions::Quote),
+        Box::new(eidola_gui::actions::QuoteInReply),
+    ] {
+        vcx.update(|window, cx| root.dispatch_action(action.as_ref(), window, cx));
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        None,
+        "no destination picker is mounted behind the overlay"
+    );
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "and neither of the in-place quotes opens a covered composer"
+    );
+
+    // One Escape's worth of collapsing hands the verbs back — the reason this
+    // is a withholding rather than the overlay closing itself.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.close_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| root.dispatch_action(&eidola_gui::actions::QuoteElsewhere, window, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        Some(None),
+        "with the overlay gone the same dispatch opens the picker on its list"
+    );
+}
+
+#[gpui::test]
 fn space_find_escape_collapses_the_overlay_before_the_bar(cx: &mut TestAppContext) {
     // Innermost first: one Escape backs out one rung, so a reader reading the
     // results does not lose the whole search to a press meant for the surface

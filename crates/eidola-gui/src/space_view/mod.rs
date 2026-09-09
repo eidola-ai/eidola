@@ -3310,16 +3310,36 @@ impl Render for SpaceView {
             // registration-is-enablement mechanism as CloseWindow, with the
             // extra selection condition. `note_body_selection` re-renders on
             // exactly the transitions that flip this.
+            //
+            // **And only while the reader can see what each verb would do.**
+            // Menu dispatch is not traversal, so the Find-all overlay's
+            // tab-order suppression ([`crate::focus::Covered`]) does not reach
+            // these: every one of them mounts and focuses a surface the overlay
+            // covers — the destination picker, which paints before the overlay
+            // and stands wholly behind it, and the composer the other two land
+            // a populated draft in. The reader would be typing into something
+            // they cannot see, and the first Escape would close a picker they
+            // never saw. Withheld rather than closing the overlay first,
+            // because that is what the menus already do with every other verb
+            // that would not work here, and because taking a reader's search
+            // away is a decision they did not make: one Escape collapses the
+            // overlay and the verbs come back. `find_overlay_open` is view
+            // state, and every path that flips it notifies.
+            //
             // Quoting *elsewhere* lands its draft in whichever conversation
-            // the reader picks, so a selection is the whole of its condition.
-            .when(self.post_selection.is_some(), |d| {
-                d.on_action(cx.listener(Self::quote_elsewhere))
-            })
+            // the reader picks, so a selection is the whole of its own
+            // condition.
+            .when(
+                self.post_selection.is_some() && !self.find_overlay_open(),
+                |d| d.on_action(cx.listener(Self::quote_elsewhere)),
+            )
             // These two land a draft **here**, so they also need the reader to
             // be able to act here — registration-is-enablement, so macOS greys
             // them for a reader who is only watching.
             .when(
-                self.post_selection.is_some() && self.viewer_may_act(cx),
+                self.post_selection.is_some()
+                    && self.viewer_may_act(cx)
+                    && !self.find_overlay_open(),
                 |d| {
                     d.on_action(cx.listener(Self::quote))
                         .on_action(cx.listener(Self::quote_in_reply))
