@@ -1295,6 +1295,66 @@ fn a_streamed_ask_answered_with_json_is_a_gateway_failure() {
     });
 }
 
+/// REGRESSION: **exposure is granted to a backend, not to a name.**
+///
+/// Removal is soft (`request.backend_id` keeps a resolvable target) and
+/// `insert_backend` revives a row of the same id with every configuration
+/// column overwritten — so an exposure row that outlived the removal made the
+/// replacement exposed on arrival, and any holder of a proxy key could send
+/// prompts to a destination the reader had never ticked. Invisible in between,
+/// too: the listing joins `removed_at IS NULL`, so the standing permission is
+/// unseeable for exactly as long as it is unattached.
+#[test]
+fn a_removed_backend_takes_its_exposure_with_it() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let external = |url: &str, key: Option<&str>| eidola_app_core::NewBackend {
+            id: "acme".into(),
+            kind: eidola_app_core::BackendKind::OpenAi,
+            display_name: "Acme".into(),
+            base_url: Some(url.into()),
+            api_key: key.map(str::to_string),
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+        };
+        core.runtime().block_on(async {
+            core.add_backend(external("https://first.example", None))
+                .await
+                .expect("add");
+            core.set_proxy_backend_exposed("acme".to_string(), true)
+                .await
+                .expect("expose");
+            let settings = core.proxy_settings().await.expect("settings");
+            assert!(settings.backends.iter().any(|b| b == "acme"));
+
+            core.remove_backend("acme".to_string())
+                .await
+                .expect("remove");
+            let settings = core.proxy_settings().await.expect("settings");
+            assert!(
+                !settings.exposed_ids.iter().any(|b| b == "acme"),
+                "the permission ends with the thing it was about, rather than \
+                 standing where nobody can see it: {settings:?}"
+            );
+
+            // The same id, a different destination and a different key: the
+            // reader ticks it again or nothing reaches it.
+            core.add_backend(external("https://second.example", Some("k")))
+                .await
+                .expect("re-add");
+            let settings = core.proxy_settings().await.expect("settings");
+            assert!(
+                !settings.backends.iter().any(|b| b == "acme"),
+                "a replacement is not exposed on arrival — this is what the \
+                 route reads: {settings:?}"
+            );
+            assert!(!settings.exposed_ids.iter().any(|b| b == "acme"));
+        });
+    });
+}
+
 /// REGRESSION: **"and nothing else" includes the headers the *builder* adds.**
 ///
 /// `plain_http_client` installs `User-Agent: eidola-app-core/<version>`, so

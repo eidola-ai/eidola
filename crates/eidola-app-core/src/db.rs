@@ -1114,9 +1114,41 @@ pub async fn update_backend_config(
     Ok(n > 0)
 }
 
-/// Soft-remove a backend (forensic rows keep their FK target). Returns
-/// whether a live row was removed.
+/// Soft-remove a backend (forensic rows keep their FK target) **and drop the
+/// proxy exposure that named it**. Returns whether a live row was removed.
+///
+/// **The exposure dies with the incarnation it was granted to.** Removal is
+/// soft — `request.backend_id` keeps a resolvable target forever — and
+/// `insert_backend` *revives* a row of the same id, overwriting every
+/// configuration column. The `proxy_backend` row survived both, so re-adding
+/// `acme` with a different base URL and a different key came back **already
+/// exposed**, and any holder of a proxy key could send prompts to a destination
+/// the reader had never ticked. Nothing on the way says so either: the listing
+/// joins `removed_at IS NULL`, so while the backend is gone the exposure is
+/// invisible — a permission standing where nobody can see it, waiting to apply
+/// to something else.
+///
+/// So the permission is not tied to a name; it is ended with the thing it was
+/// about. One `BEGIN IMMEDIATE`, because a removal that dropped one of the two
+/// is exactly the half-state this exists to prevent, and only where a live row
+/// was really removed — a call naming an already-removed backend must not clear
+/// an exposure some concurrent re-add just granted.
 pub async fn remove_backend(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
+    begin_write(conn).await?;
+    match remove_backend_tx_body(conn, id, now).await {
+        Ok(removed) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(removed)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn remove_backend_tx_body(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
     let n = conn
         .execute(
             "UPDATE backend SET removed_at = ?2, updated_at = ?2 \
@@ -1125,7 +1157,16 @@ pub async fn remove_backend(conn: &Connection, id: &str, now: i64) -> Result<boo
         )
         .await
         .map_err(AppError::db)?;
-    Ok(n > 0)
+    if n == 0 {
+        return Ok(false);
+    }
+    conn.execute(
+        "DELETE FROM proxy_backend WHERE backend_id = ?1",
+        (Value::Text(id.to_string()),),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

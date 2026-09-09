@@ -165,11 +165,13 @@ fn external_backend_lifecycle_add_update_disable_remove_revive() {
         let listed = core.runtime().block_on(core.list_backends()).unwrap();
         assert!(!listed.iter().find(|b| b.id == "my-vllm").unwrap().enabled);
 
-        // Remove (soft) — gone from the listing.
+        // Remove (soft) — gone from the listing. **`Proxy` joins it**: removal
+        // clears any exposure that named this backend, so the stored proxy
+        // settings moved and every reader of them is stale.
         core.runtime()
             .block_on(core.remove_backend("my-vllm".into()))
             .expect("remove");
-        assert_eq!(drain(&mut rx), vec![Change::Backends]);
+        assert_eq!(drain(&mut rx), vec![Change::Backends, Change::Proxy]);
         let listed = core.runtime().block_on(core.list_backends()).unwrap();
         assert!(!listed.iter().any(|b| b.id == "my-vllm"));
 

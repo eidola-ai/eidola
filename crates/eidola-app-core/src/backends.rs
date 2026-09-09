@@ -609,6 +609,9 @@ impl Inner {
         }
         self.retire_engines_for(id).await;
         self.bus.emit(Change::Backends);
+        // The removal took any proxy exposure with it (`db::remove_backend`),
+        // so the stored proxy settings moved and every reader of them is stale.
+        self.bus.emit(Change::Proxy);
         Ok(())
     }
 

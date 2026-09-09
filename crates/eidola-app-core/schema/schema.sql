@@ -963,10 +963,15 @@ CREATE TABLE proxy_settings (
 -- exposed backend: an empty table exposes nothing, which is the
 -- honest default for a surface that can spend money.
 --
--- The FK is to the soft-removable `backend` row, so a backend
--- removed while exposed keeps a resolvable reference; the
--- listing joins on `removed_at IS NULL` and simply stops
--- offering it.
+-- The FK is to the soft-removable `backend` row, but the
+-- exposure does not outlive a removal: `db::remove_backend`
+-- deletes it in the same transaction. Removal is soft and
+-- re-adding the same id *revives* the row with a whole new
+-- configuration, so an exposure that survived would grant a
+-- destination the reader never ticked — and while the backend
+-- was gone the listing hid it, so the standing permission was
+-- unseeable too. The `removed_at IS NULL` join remains, which
+-- is what covers a backend merely disabled.
 -- ============================================================
 CREATE TABLE proxy_backend (
     backend_id  TEXT PRIMARY KEY REFERENCES backend(id),
