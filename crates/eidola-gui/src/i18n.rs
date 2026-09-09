@@ -33,6 +33,9 @@
 //! source, so wording assertions are locale-independent by construction and no
 //! test has to pin anything.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use eidola_app_core::ConfigState;
@@ -91,6 +94,7 @@ impl Global for Localization {}
 impl Localization {
     /// Build the bundle for `tag`, which must be a shipped locale.
     fn for_locale(tag: &'static str) -> Self {
+        BUNDLES_BUILT.with(|n| n.set(n.get() + 1));
         Self {
             tag,
             bundle: bundle_for(tag),
@@ -179,35 +183,86 @@ fn resource_for(tag: &str) -> Option<Arc<FluentResource>> {
 }
 
 thread_local! {
-    /// The answer when no [`Localization`] global is installed: the source
-    /// locale alone. Built once per thread, lazily.
-    static SOURCE_ONLY: Localization = Localization::for_locale(SOURCE_LOCALE);
+    /// One bundle per locale named explicitly, built on first use and **never
+    /// invalidated** — every resource it parses is a compile-time constant
+    /// embedded in this binary, so a built bundle can never go stale.
+    ///
+    /// Thread-local rather than a process-wide lock because gpui renders on one
+    /// thread and each test worker owns its own `App`; a shared map would add
+    /// contention for a value that is identical everywhere and cheap to have
+    /// twice.
+    static BUNDLES: RefCell<HashMap<&'static str, Rc<Localization>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The bundle for a shipped tag, built once per thread.
+///
+/// **Building one is not cheap**: it re-parses the whole embedded FTL for the
+/// source locale *and* the requested one. That was affordable while the only
+/// caller was the startup alert — a handful of strings on a path about to end
+/// the process — and stopped being affordable the moment a *rendered* surface
+/// named its locale explicitly (`plans::PlanLabels`, once per label per row per
+/// frame, with the onboarding snap animation drawing every mounted slide).
+fn cached(tag: &'static str) -> Rc<Localization> {
+    BUNDLES.with(|bundles| {
+        Rc::clone(
+            bundles
+                .borrow_mut()
+                .entry(tag)
+                .or_insert_with(|| Rc::new(Localization::for_locale(tag))),
+        )
+    })
 }
 
 /// Format a message in a locale named explicitly, with **no `App`** — the entry
 /// the generated `msg_in` accessors call.
 ///
-/// It exists for the surfaces that run before gpui does (the startup-failure
-/// alert, which is raised before `Application::run` and so has no `cx` to ask).
-/// Resolving the tag is pure — [`resolve`] over [`system_preferred`] and the
-/// stored preference — so the whole path is available that early.
+/// Two kinds of caller name their locale rather than asking for the active one:
+/// the surfaces that run before gpui does (the startup-failure alert, raised
+/// before `Application::run`, which has no `cx`), and a **shared component
+/// rendered by a host that is still English around it** (`plans::plan_rows`
+/// under Settings ▸ Account). Resolving the tag is pure — [`resolve`] over
+/// [`system_preferred`] and the stored preference — so the whole path is
+/// available that early either way.
 ///
 /// A tag this build does not ship answers in the source locale, exactly as
-/// [`apply`] refuses one. The bundle is built per call rather than cached: the
-/// callers are a handful of strings on a path that is about to end the process,
-/// and a cache keyed by tag would outlive the reason for it.
+/// [`apply`] refuses one.
 pub fn format_in(tag: &str, id: &str, args: Option<&Args>) -> SharedString {
-    Localization::for_locale(shipped(tag).unwrap_or(SOURCE_LOCALE)).format(id, args)
+    cached(shipped(tag).unwrap_or(SOURCE_LOCALE)).format(id, args)
 }
 
 /// Format a message in the active locale. The generated accessors are the only
 /// intended callers — reaching for this directly gives up the compile-time id
 /// and argument checking that is the point of the codegen.
+///
+/// **The installed global is the one bundle a rendered surface should reach**,
+/// which is why a component whose host wants the reader's language asks through
+/// here rather than naming the tag: one builder for the common path, and
+/// nothing to keep in step with it.
 pub fn format(cx: &App, id: &str, args: Option<&Args>) -> SharedString {
     match cx.try_global::<Localization>() {
         Some(l10n) => l10n.format(id, args),
-        None => SOURCE_ONLY.with(|l10n| l10n.format(id, args)),
+        // No global installed — a bare test `App`, the visual harness, the
+        // driver before a `locale` command. The source locale, through the same
+        // cache, so this costs one parse per thread rather than one per lookup.
+        None => cached(SOURCE_LOCALE).format(id, args),
     }
+}
+
+thread_local! {
+    /// How many bundles this thread has *built* — every construction, cached or
+    /// not. Counted rather than inferred from the cache's size, because that is
+    /// what a lost cache actually costs: the map would simply stay empty while
+    /// the parses went on happening.
+    static BUNDLES_BUILT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many Fluent bundles this thread has built. A test seam for the cache:
+/// building one re-parses every embedded resource, and that cost is invisible
+/// to any assertion about *what* was rendered.
+#[doc(hidden)]
+pub fn bundles_built_for_test() -> usize {
+    BUNDLES_BUILT.with(Cell::get)
 }
 
 /// The active locale's tag — the source locale when nothing was installed.

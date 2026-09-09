@@ -632,8 +632,51 @@ pub struct PortalMint {
     pub minted_for: String,
 }
 
+/// How often a price is charged, as data rather than words.
+///
+/// The GUI localizes the cadence it shows, and app-core is locale-free by the
+/// layering rule — so what crosses the boundary is the interval Stripe names
+/// and how many of them, never a rendered `/month`.
+///
+/// **Serialized by the local control protocol** ([`crate::ipc`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PriceCadence {
+    /// Charged once.
+    OneTime,
+    /// Charged every `count` × `interval`, where `interval` is the upstream's
+    /// own name for it (`day` / `week` / `month` / `year`) and is passed
+    /// through unread — a name this build does not know is a cadence the reader
+    /// is still owed, so the presentation layer answers for one it cannot spell.
+    Every { interval: String, count: i64 },
+}
+
+/// What a price costs, as data rather than words. `None` is free — the case
+/// [`PriceInfo::amount_display`] spells as a word.
+///
+/// **Serialized by the local control protocol** ([`crate::ipc`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PriceAmount {
+    /// The charge in the currency's minor units, exactly as the upstream states
+    /// it (cents for USD).
+    pub minor_units: i64,
+    /// ISO 4217, upper-cased.
+    pub currency: String,
+}
+
 /// **Serialized by the local control protocol** ([`crate::ipc`]): a field
 /// rename here is a wire change.
+///
+/// **`amount_display` and `recurrence` are rendered English, kept for the
+/// callers that want exactly that** — the CLI's `account prices` listing, which
+/// is English by doctrine. A surface that localizes reads [`PriceInfo::amount`]
+/// and [`PriceInfo::cadence`] instead and words them itself. The two are
+/// derived from the same upstream fields in one place, so they cannot disagree.
+///
+/// The structured pair was **added** rather than replacing the strings, because
+/// this type is on the wire: a caller built against an older shape must keep
+/// deserializing (hence `serde(default)`), and one built against a newer shape
+/// must keep reading a result an older process produced.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PriceInfo {
     pub id: String,
@@ -642,6 +685,20 @@ pub struct PriceInfo {
     pub amount_display: String,
     pub recurrence: String,
     pub credits: i64,
+    /// `None` is free.
+    #[serde(default)]
+    pub amount: Option<PriceAmount>,
+    #[serde(default = "PriceCadence::one_time")]
+    pub cadence: PriceCadence,
+}
+
+impl PriceCadence {
+    /// The default a payload from a build that predates this field decodes to.
+    /// One-time is the safe reading: it is what an empty `recurrence` has always
+    /// meant, and it offers no cadence a reader could be misinformed about.
+    fn one_time() -> Self {
+        Self::OneTime
+    }
 }
 
 /// Whether the account has a subscription in force, as the server answers
@@ -2947,22 +3004,40 @@ impl Inner {
             .data
             .into_iter()
             .map(|p| {
-                let amount_display = p
-                    .unit_amount
-                    .map(|a| format!("{}.{:02} {}", a / 100, a % 100, p.currency.to_uppercase()))
+                // The typed halves are what a localizing surface reads; the two
+                // strings beside them are these same values already worded in
+                // English, for the callers that want exactly that.
+                let amount = p.unit_amount.map(|a| PriceAmount {
+                    minor_units: a,
+                    currency: p.currency.to_uppercase(),
+                });
+                let cadence = match p.recurring.as_ref() {
+                    Some(r) => PriceCadence::Every {
+                        interval: r.interval.clone(),
+                        count: r.interval_count,
+                    },
+                    None => PriceCadence::OneTime,
+                };
+
+                let amount_display = amount
+                    .as_ref()
+                    .map(|a| {
+                        format!(
+                            "{}.{:02} {}",
+                            a.minor_units / 100,
+                            a.minor_units % 100,
+                            a.currency
+                        )
+                    })
                     .unwrap_or_else(|| "free".to_string());
 
-                let recurrence = p
-                    .recurring
-                    .as_ref()
-                    .map(|r| {
-                        if r.interval_count == 1 {
-                            format!("/{}", r.interval)
-                        } else {
-                            format!("/{}x{}", r.interval_count, r.interval)
-                        }
-                    })
-                    .unwrap_or_default();
+                let recurrence = match &cadence {
+                    PriceCadence::OneTime => String::new(),
+                    PriceCadence::Every { interval, count } if *count == 1 => {
+                        format!("/{interval}")
+                    }
+                    PriceCadence::Every { interval, count } => format!("/{count}x{interval}"),
+                };
 
                 PriceInfo {
                     id: p.id,
@@ -2971,6 +3046,8 @@ impl Inner {
                     amount_display,
                     recurrence,
                     credits: p.credits,
+                    amount,
+                    cadence,
                 }
             })
             .collect())
