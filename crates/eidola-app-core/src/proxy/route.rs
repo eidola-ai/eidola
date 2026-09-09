@@ -1374,7 +1374,8 @@ impl Inner {
         // an upstream that answers and closes with nothing in it would
         // otherwise leave the ending classified as a complete delivery to a
         // caller who was not there.
-        let mut downstream_gone = sender.send(ProxyStreamEvent::Open).await.is_err();
+        let mut downstream_gone = false;
+        deliver(&sender, ProxyStreamEvent::Open, &mut downstream_gone).await;
 
         let mut byte_stream = response.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -1437,9 +1438,7 @@ impl Inner {
                 // what `LiveSpend` keeps recovery out of. And a caller that
                 // went away on a route with a hold to settle leaves the drain
                 // below running to the refund, on a body the cap bounds.
-                if sender.send(ProxyStreamEvent::Chunk(out)).await.is_err() {
-                    downstream_gone = true;
-                }
+                deliver(&sender, ProxyStreamEvent::Chunk(out), &mut downstream_gone).await;
             }
             if downstream_gone && !settling {
                 read_ended_early = true;
@@ -1447,15 +1446,16 @@ impl Inner {
             }
         }
         // Whatever is left is a partial event; forward it so a downstream
-        // parser sees exactly the bytes the upstream sent.
+        // parser sees exactly the bytes the upstream sent — through the same
+        // door, because this send can fail for the same reason and its failure
+        // is the same fact: an unterminated tail nobody received is not a
+        // complete delivery, and discarding the result sealed the row as one.
         if !buf.is_empty() {
             let (out, refund) = forward_sse_event(&buf);
             if refund.is_some() {
                 inline_refund = refund;
             }
-            if !downstream_gone {
-                let _ = sender.send(ProxyStreamEvent::Chunk(out)).await;
-            }
+            deliver(&sender, ProxyStreamEvent::Chunk(out), &mut downstream_gone).await;
         }
 
         // **The in-band token first, recovery only for its absence.** The
@@ -1569,6 +1569,28 @@ fn engine_model_info(engine: &local_models::RunningEngine) -> ModelInfo {
 
 fn offers_running_engines_only(exposure: LocalExposure, starts_on_demand: bool) -> bool {
     exposure == LocalExposure::Loaded || !starts_on_demand
+}
+
+/// Send one event downstream, and let a failed send be the fact it is.
+///
+/// **The one door out of the forwarding loop**, so no send can be made whose
+/// result nobody reads: the ending a stream is recorded as is decided from
+/// `downstream_gone` (see [`stream_delivery`]), and a discarded failure seals a
+/// delivery that did not happen as `Complete`. The `Open` event, every
+/// forwarded event and the unterminated tail all go through here for that
+/// reason — the tail was the one that did not, and it is exactly the send most
+/// likely to meet a caller who has already gone.
+async fn deliver(
+    sender: &tokio::sync::mpsc::Sender<ProxyStreamEvent>,
+    event: ProxyStreamEvent,
+    downstream_gone: &mut bool,
+) {
+    if *downstream_gone {
+        return;
+    }
+    if sender.send(event).await.is_err() {
+        *downstream_gone = true;
+    }
 }
 
 /// The gateway failure a `2xx` whose body is not JSON becomes.
@@ -1958,6 +1980,42 @@ mod tests {
         assert_eq!(answer.text(), r#"{"ok":true}"#);
         assert!(!answer.over_ceiling);
         assert_eq!(answer.recorded(), br#"{"ok":true}"#.to_vec());
+    }
+
+    /// **Every send downstream updates the ending the Record will state.**
+    /// The delivery state is what `stream_delivery` reads, so a send whose
+    /// result is discarded seals a delivery that did not happen as a complete
+    /// one — which is what the unterminated final event did, the send most
+    /// likely of all to meet a caller who has already gone.
+    #[tokio::test]
+    async fn a_send_to_a_caller_that_has_gone_is_not_a_delivery() {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<ProxyStreamEvent>(4);
+        let mut downstream_gone = false;
+
+        deliver(
+            &sender,
+            ProxyStreamEvent::Chunk(b"data: hi\n\n".to_vec()),
+            &mut downstream_gone,
+        )
+        .await;
+        assert!(!downstream_gone, "a caller that is there receives it");
+
+        drop(receiver);
+        deliver(
+            &sender,
+            ProxyStreamEvent::Chunk(b"data: tail".to_vec()),
+            &mut downstream_gone,
+        )
+        .await;
+        assert!(
+            downstream_gone,
+            "a send that could not land is not a delivery"
+        );
+        assert_eq!(
+            stream_delivery(downstream_gone, false),
+            StreamDelivery::CallerGoneReadOn,
+            "and the Record says so rather than calling it complete"
+        );
     }
 
     /// **The cap was the first face of "a partial must never claim to be
