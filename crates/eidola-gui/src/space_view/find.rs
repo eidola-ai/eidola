@@ -836,6 +836,14 @@ pub(crate) struct NodeResult<'a> {
     /// The query's hits, in projection order — index *is* the match's ordinal
     /// within the node, by the same construction `MatchSet` relies on.
     pub(crate) hits: &'a [Range<usize>],
+    /// Whether the projection was built **cursor-aware** — that is, whether
+    /// this node is a live editor (a draft, or the post being edited in place).
+    ///
+    /// It is the one honest answer to "can this node's text move while its id
+    /// stands still": every other node mints a new action id when its text
+    /// changes, so its node id is already the discriminator. The overlay reads
+    /// it to stamp a fragment's measurement key — see [`ResultFragment::id`].
+    pub(crate) live_editor: bool,
 }
 
 impl FindSession {
@@ -886,6 +894,7 @@ impl FindSession {
             content: &entry.seed.content,
             blocks: &entry.projection.blocks,
             hits,
+            live_editor: entry.seed.render_cursor.is_some(),
         })
     }
 

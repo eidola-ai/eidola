@@ -226,41 +226,121 @@ fn lay_out_node(
 /// Hits that fall in no block are dropped rather than approximated: every hit
 /// the projection reports comes out of a block, so one that does not is a
 /// disagreement, and showing a fragment for it would be inventing a place.
-pub(crate) fn fragment_runs(
-    blocks: &[Range<usize>],
-    hits: &[Range<usize>],
-) -> Vec<(Range<usize>, usize)> {
-    // block index -> the lowest hit index landing in it.
-    let mut touched: HashMap<usize, usize> = HashMap::new();
+///
+/// **Both inputs are already in document order, so this is one walk rather
+/// than a cross product.** A nested loop compared every hit with every block on
+/// every frame the overlay drew — a one-character query matching each of ten
+/// thousand paragraphs is a hundred million range checks per frame, ahead of
+/// the virtualization that exists to bound exactly this, and the window freezes
+/// while the reader merely scrolls. The block cursor never rewinds, because a
+/// later hit can only start at or after the current one; the inner walk covers
+/// the one hit that spans several blocks without moving it.
+pub(crate) fn fragment_runs(blocks: &[Range<usize>], hits: &[Range<usize>]) -> Vec<FragmentRun> {
+    // block index -> the lowest and highest hit index landing in it.
+    let mut touched: Vec<Option<(usize, usize)>> = vec![None; blocks.len()];
+    let mut b = 0usize;
     for (h, hit) in hits.iter().enumerate() {
-        for (b, block) in blocks.iter().enumerate() {
-            if block.start < hit.end.max(hit.start + 1) && hit.start < block.end {
-                touched
-                    .entry(b)
-                    .and_modify(|e| *e = (*e).min(h))
-                    .or_insert(h);
+        let end = hit.end.max(hit.start + 1);
+        while b < blocks.len() && blocks[b].end <= hit.start {
+            b += 1;
+        }
+        let mut j = b;
+        while j < blocks.len() && blocks[j].start < end {
+            match &mut touched[j] {
+                Some((_, last)) => *last = h,
+                slot => *slot = Some((h, h)),
             }
+            j += 1;
         }
     }
-    let mut indices: Vec<usize> = touched.keys().copied().collect();
-    indices.sort_unstable();
-    let mut out: Vec<(Range<usize>, usize)> = Vec::new();
-    let mut run: Option<(usize, usize, usize)> = None; // (first block, last block, first hit)
-    for b in indices {
-        let hit = touched[&b];
+    let mut out: Vec<FragmentRun> = Vec::new();
+    // (first block, last block, first hit, last hit)
+    let mut run: Option<(usize, usize, usize, usize)> = None;
+    let close = |out: &mut Vec<FragmentRun>,
+                 (first, last, h0, h1): (usize, usize, usize, usize)| {
+        out.push(FragmentRun {
+            range: blocks[first].start..blocks[last].end,
+            hits: h0..h1 + 1,
+        });
+    };
+    for (b, slot) in touched.iter().enumerate() {
+        let Some((lo, hi)) = *slot else { continue };
         run = match run {
-            Some((first, last, h)) if b == last + 1 => Some((first, b, h.min(hit))),
-            Some((first, last, h)) => {
-                out.push((blocks[first].start..blocks[last].end, h));
-                Some((b, b, hit))
+            Some((first, last, h0, h1)) if b == last + 1 => {
+                Some((first, b, h0.min(lo), h1.max(hi)))
             }
-            None => Some((b, b, hit)),
+            Some(open) => {
+                close(&mut out, open);
+                Some((b, b, lo, hi))
+            }
+            None => Some((b, b, lo, hi)),
         };
     }
-    if let Some((first, last, h)) = run {
-        out.push((blocks[first].start..blocks[last].end, h));
+    if let Some(open) = run {
+        close(&mut out, open);
     }
     out
+}
+
+/// One fragment the cutter found: the consolidated block span it paints, and
+/// **the slice of the node's hits that fall inside it** — a range into that
+/// node's own ordered hit vector rather than a copy.
+///
+/// The hits are a range because a node's hits partition across its fragments
+/// exactly: they ascend, and two blocks a single hit spans are consolidated
+/// into one run by construction, so no hit can straddle two fragments. The
+/// range's start is the fragment's **ordinal within the node** — half of the
+/// anchor a click hands the bar — and its length is what the card's highlight
+/// layer takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FragmentRun {
+    /// The consolidated block span, in the node's source bytes.
+    pub(crate) range: Range<usize>,
+    /// The fragment's hits, as indices into the node's hit vector.
+    pub(crate) hits: Range<usize>,
+}
+
+/// The horizontal stride between two lanes of the map, for a graph that wide.
+///
+/// Lanes are squeezed toward [`MAP_LANE_MIN_W`] as the fork count grows and
+/// never past it: below that a dot is on top of its neighbour, which says less
+/// than a map that runs off its own edge and can be scrolled.
+pub(crate) fn map_lane_width(lanes: usize) -> f32 {
+    if lanes <= 1 {
+        return MAP_LANE_W;
+    }
+    let avail = (MAP_WIDTH - 2.0 * MAP_PAD - MAP_DOT).max(MAP_LANE_MIN_W);
+    (avail / (lanes - 1) as f32).clamp(MAP_LANE_MIN_W, MAP_LANE_W)
+}
+
+/// Every post's node id, resolved **once**.
+///
+/// Both halves of the overlay ask "which transcript row is this node?" — the
+/// results for its attribution, the map for every dot's label — and each answer
+/// used to be a linear scan that recomputed each candidate's id on the way
+/// past. That is quadratic in the conversation and paid on every frame the
+/// overlay draws, whether or not anything matched: a ten-thousand-post space
+/// spends a hundred million comparisons just to label the map, outside the
+/// virtualization that bounds the cards. One pass builds the index and every
+/// lookup is a hash.
+pub(crate) fn post_index(posts: &[super::model::PostData]) -> HashMap<SharedString, usize> {
+    (0..posts.len())
+        .map(|i| (super::model::node_id(posts, i), i))
+        .collect()
+}
+
+/// The discriminator a fragment's measurement key carries for a node whose text
+/// can move under a stable id — see [`ResultFragment::id`]. Zero for every
+/// other node, whose id already changes with its text, so nothing is hashed for
+/// the conversation at large.
+fn content_stamp(result: &super::find::NodeResult<'_>) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    if !result.live_editor {
+        return 0;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    result.content.as_ref().hash(&mut hasher);
+    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -271,18 +351,38 @@ pub(crate) fn fragment_runs(
 /// it takes the reader to.
 #[derive(Clone)]
 pub(crate) struct ResultFragment {
-    /// `{node}#{start}` — stable across frames while the query stands, which is
-    /// what lets a measured height and an editor state belong to it.
+    /// `{node}@{stamp}#{start}` — what a measured height and an editor state
+    /// belong to.
+    ///
+    /// **The stamp is there because a node id is not always enough.** A post
+    /// mints a new action id whenever its text changes, so its node id already
+    /// discriminates; a **draft** and a **post being edited in place** do not —
+    /// their text moves under a stable id, and a height measured against the
+    /// old text then stood in for the new one as a placeholder, corrupting
+    /// every group top below it (and with them the map's scroll targets and the
+    /// list's extent) until the card happened back into the viewport band. The
+    /// stamp is a hash of the node's own content, taken once per node and only
+    /// for the nodes that can move — the ones the projection rendered
+    /// cursor-aware, which is exactly the set of live editors.
     pub(crate) id: SharedString,
     pub(crate) node: SharedString,
     pub(crate) item_id: Option<SharedString>,
+    /// Who wrote it — the group's attribution, carried so the card's accessible
+    /// name can say it. The header beside it is a sibling `Label`, so a reader
+    /// hearing the active descendant alone would otherwise get the snippet with
+    /// no author and could not tell two similar results apart.
+    pub(crate) byline: SharedString,
     /// The consolidated block span this fragment paints.
     pub(crate) range: Range<usize>,
     /// The node's own markdown — the document the fragment is a window onto.
     pub(crate) content: SharedString,
-    /// Every hit in the node, for the highlight layer. Painting only the ones
-    /// inside the fragment would be the same set: the element lays out no line
-    /// the others could land on.
+    /// **Only this fragment's hits**, in the node's own order. A node with many
+    /// separated matching blocks produces many fragments, and giving each one
+    /// the whole node's hit list materialized that vector per fragment — five
+    /// thousand isolated matches is twenty-five million ranges built before a
+    /// single card is virtualized, and every visible card then rebuilt its
+    /// highlight set from the oversized copy. The painted result is the same
+    /// set either way: the element lays out no line the others could land on.
     pub(crate) hits: Vec<Range<usize>>,
     /// The first hit inside this fragment, as its **ordinal within the node** —
     /// half of the anchor a click hands the bar.
@@ -350,7 +450,19 @@ impl FindOverlay {
             open: false,
             scroll: gpui::ScrollHandle::new(),
             map_scroll: gpui::ScrollHandle::new(),
-            list_focus: cx.focus_handle(),
+            // **A real tab stop, like every other roving list in the app.**
+            // `Role::List` is deliberately not in the focusable set `probe`
+            // derives from, so the element carrying it takes focus only when
+            // this handle says so: without it the list could be focused
+            // explicitly (opening the overlay does) and then never again, so a
+            // reader who tabbed onto a map node could not get back to the
+            // results cursor without closing and reopening the surface. It
+            // rides the find bar's own region, because the overlay is that
+            // bar's surface rather than the conversation's.
+            list_focus: cx
+                .focus_handle()
+                .tab_index(crate::focus::region::FIND)
+                .tab_stop(true),
             focus: cx.focus_handle(),
             cursor: 0,
             heights: Rc::new(RefCell::new(HashMap::new())),
@@ -365,6 +477,18 @@ impl FindOverlay {
     /// heights of fragments that are gone, and the editor states behind them.
     /// The retention rule is "while the query is unchanged", so this is where
     /// it ends.
+    /// Drop every per-fragment cell whose fragment this frame no longer has.
+    ///
+    /// The heights and the editor states are keyed by fragment id, and a
+    /// fragment cut from a live editor carries a stamp of its own content — so
+    /// a reader typing in a draft supersedes that draft's cards on every
+    /// keystroke. Without this the maps would grow one entry per edit and hold
+    /// an editor entity for each until the query moved.
+    pub(crate) fn retain_results(&mut self, live: &HashSet<SharedString>) {
+        self.heights.borrow_mut().retain(|id, _| live.contains(id));
+        self.bodies.retain(|id, _| live.contains(id));
+    }
+
     pub(crate) fn forget_results(&mut self) {
         self.cursor = 0;
         self.scroll.set_offset(gpui::point(px(0.), px(0.)));
@@ -461,7 +585,7 @@ impl SpaceView {
         map: &[MapNode],
         cx: &gpui::App,
     ) -> Vec<ResultGroup> {
-        self.find_results(map, cx)
+        self.find_results(map, &post_index(&self.posts), cx)
     }
 
     fn find_map_includes(&self, node: &TreeNode, cx: &gpui::App) -> bool {
@@ -483,12 +607,33 @@ impl SpaceView {
     /// this query yet — the pass is still walking, or a composing draft was
     /// deliberately left unprojected — is simply not a group; the list says it
     /// is still counting rather than presenting a partial set as a whole one.
-    fn find_results(&self, map: &[MapNode], cx: &gpui::App) -> Vec<ResultGroup> {
+    fn find_results(
+        &self,
+        map: &[MapNode],
+        posts: &HashMap<SharedString, usize>,
+        cx: &gpui::App,
+    ) -> Vec<ResultGroup> {
         let Some(session) = self.find.as_ref() else {
             return Vec::new();
         };
         let mut groups = Vec::new();
         for entry in map {
+            let post = posts.get(&entry.node).map(|i| &self.posts[*i]);
+            // **A post being regenerated is out here for the same reason it is
+            // out of the branch's matches and out of the count.** The answer on
+            // screen is the pending revision, not the generation the cache
+            // still holds a projection of — and `CountKey` carries the revising
+            // set precisely because that exclusion moves with no rebuild behind
+            // it, so the memo survives while the total drops the post. Read
+            // through the memo alone, the overlay went on offering a result the
+            // total excluded and the conversation no longer showed.
+            if post.is_some_and(|p| {
+                p.action_id
+                    .as_deref()
+                    .is_some_and(|id| self.space.read(cx).revising_seq(id).is_some())
+            }) {
+                continue;
+            }
             let Some(result) = session.node_result(&entry.node) else {
                 continue;
             };
@@ -496,7 +641,6 @@ impl SpaceView {
             if runs.is_empty() {
                 continue;
             }
-            let post = self.post_for_node(&entry.node);
             let (byline, time, backend) = match post {
                 Some(p) => (p.byline.clone(), p.time.clone(), p.byline_backend.clone()),
                 // A draft is the reader's own unposted words; it has no byline
@@ -508,17 +652,18 @@ impl SpaceView {
                 ),
             };
             let item_id = post.and_then(|p| p.item_id.clone());
-            let hits: Vec<Range<usize>> = result.hits.to_vec();
+            let stamp = content_stamp(&result);
             let fragments = runs
                 .into_iter()
-                .map(|(range, ordinal)| ResultFragment {
-                    id: SharedString::from(format!("{}#{}", entry.node, range.start)),
+                .map(|run| ResultFragment {
+                    id: SharedString::from(format!("{}@{stamp:x}#{}", entry.node, run.range.start)),
                     node: entry.node.clone(),
                     item_id: item_id.clone(),
-                    range,
+                    byline: byline.clone(),
+                    ordinal: run.hits.start,
+                    hits: result.hits[run.hits].to_vec(),
+                    range: run.range,
                     content: result.content.clone(),
-                    hits: hits.clone(),
-                    ordinal,
                 })
                 .collect();
             groups.push(ResultGroup {
@@ -546,8 +691,9 @@ impl SpaceView {
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(page_width, &turns);
         let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        let posts = post_index(&self.posts);
         let Some(fragment) = self
-            .find_results(&map, cx)
+            .find_results(&map, &posts, cx)
             .into_iter()
             .flat_map(|g| g.fragments)
             .nth(index)
@@ -557,12 +703,18 @@ impl SpaceView {
         self.open_find_result(fragment, window, cx);
     }
 
-    /// The transcript row a node id names, if it names one at all (a draft does
-    /// not).
-    fn post_for_node(&self, node: &SharedString) -> Option<&super::model::PostData> {
-        (0..self.posts.len())
-            .find(|i| super::model::node_id(&self.posts, *i) == *node)
-            .map(|i| &self.posts[i])
+    /// The byline the map speaks for a node — the post's own, or the word for a
+    /// draft, which has no byline row of its own.
+    fn find_map_byline(
+        &self,
+        node: &SharedString,
+        posts: &HashMap<SharedString, usize>,
+        cx: &gpui::App,
+    ) -> SharedString {
+        posts
+            .get(node)
+            .map(|i| self.posts[*i].byline.clone())
+            .unwrap_or_else(|| crate::i18n::msg::find_result_draft(cx))
     }
 
     /// The roving cursor, clamped into this frame's results — `None` when there
@@ -740,7 +892,8 @@ impl SpaceView {
             return None;
         }
         let map = map_layout(tree, &|node| self.find_map_includes(node, cx));
-        let groups = self.find_results(&map, cx);
+        let posts = post_index(&self.posts);
+        let groups = self.find_results(&map, &posts, cx);
         let settled = self
             .find
             .as_ref()
@@ -759,7 +912,7 @@ impl SpaceView {
         };
 
         let list = self.render_find_results(&groups, viewport_h, settled, window, cx);
-        let map_column = self.render_find_map(&map, &groups, cx);
+        let map_column = self.render_find_map(&map, &groups, &posts, cx);
 
         let focus = self.find.as_ref().expect("checked").overlay.focus.clone();
         Some(
@@ -801,6 +954,7 @@ impl SpaceView {
         &mut self,
         map: &[MapNode],
         groups: &[ResultGroup],
+        posts: &HashMap<SharedString, usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (muted, border, wash, accent) = {
@@ -831,18 +985,23 @@ impl SpaceView {
             .map(|m| m.node.clone());
         let lanes = map.iter().map(|n| n.lane + 1).max().unwrap_or(1);
         let depths = map.iter().map(|n| n.depth + 1).max().unwrap_or(1);
-        let avail = (MAP_WIDTH - 2.0 * MAP_PAD - MAP_DOT).max(MAP_LANE_MIN_W);
-        let lane_w = if lanes > 1 {
-            (avail / (lanes - 1) as f32).clamp(MAP_LANE_MIN_W, MAP_LANE_W)
-        } else {
-            MAP_LANE_W
-        };
-        let x = |lane: usize| (lane as f32 * lane_w).min(avail);
+        let lane_w = map_lane_width(lanes);
+        let x = |lane: usize| lane as f32 * lane_w;
         let y = |depth: usize| depth as f32 * MAP_ROW_H;
 
+        // **Excess lanes run off the edge and are scrolled to, never folded
+        // onto one x.** Past thirteen lanes the minimum stride carries the last
+        // of them beyond the column's own width, and clamping there stacked
+        // distinct branches — and their buttons — on top of one another at the
+        // right edge: a map contradicting the topology it exists to show, with
+        // some nodes unreachable. Lane index *is* the x position, so the canvas
+        // states its real width and the column scrolls horizontally.
         let mut canvas = div()
             .relative()
-            .w_full()
+            .w(px(
+                (x(lanes.saturating_sub(1)) + MAP_DOT).max(MAP_WIDTH - 2.0 * MAP_PAD)
+            ))
+            .flex_none()
             .h(px(y(depths.saturating_sub(1)) + MAP_DOT + MAP_ROW_H));
 
         // Edges first, so a dot always sits on top of the line into it.
@@ -880,10 +1039,7 @@ impl SpaceView {
             let has = with_matches.contains(&node.node);
             let showing = in_view.contains(&node.node);
             let is_current = current.as_ref() == Some(&node.node);
-            let byline = self
-                .post_for_node(&node.node)
-                .map(|p| p.byline.clone())
-                .unwrap_or_else(|| crate::i18n::msg::find_result_draft(cx));
+            let byline = self.find_map_byline(&node.node, posts, cx);
             // **The role tracks whether a handler attaches** — the bar's own
             // step-arrow rule. A node with matches scrolls the list to its
             // group, so it is a `Button`; one without has nothing to do, and a
@@ -902,7 +1058,14 @@ impl SpaceView {
             };
             let target = node.node.clone();
             let mut dot = div()
-                .id(SharedString::from(format!("space-find-map-{i}")))
+                // **Keyed by the post it represents, not by where it sits.** A
+                // dot is a real tab stop, and the sort is depth-then-lane over
+                // a tree a background write can reshape — so an id keyed by
+                // index leaves the reader's focus on position *i* while the
+                // label and the click target under it become another post's.
+                // The probe name stays positional: it is the driver's selector
+                // for "the i-th dot", which is what a test presses.
+                .id(SharedString::from(format!("space-find-map-{}", node.node)))
                 .probe(format!("space/find/map/{i}"), role, label)
                 .aria_selected(showing)
                 .absolute()
@@ -945,24 +1108,40 @@ impl SpaceView {
             .overlay
             .map_scroll
             .clone();
+        // The scroller and its indicator are **siblings inside a `relative`
+        // ancestor** — the house rule, because an overlay painted as a child of
+        // the scrolling element scrolls away with the content. Floating rather
+        // than window-edge: this column is a bounded mid-window surface, so the
+        // CSD corner clearance would inset it wrongly.
         div()
-            .id("space-find-map")
-            // A `Group` of the conversation's nodes — a table of contents for
-            // the list beside it, not a way into the page behind it.
-            .probe(
-                "space/find/map",
-                gpui::Role::Group,
-                crate::i18n::msg::find_map_label(cx),
-            )
+            .relative()
             .flex_none()
             .w(px(MAP_WIDTH))
             .h_full()
-            .p(px(MAP_PAD))
             .border_r_1()
             .border_color(cx.theme().border)
-            .overflow_y_scroll()
-            .track_scroll(&handle)
-            .child(canvas)
+            .child(
+                div()
+                    .id("space-find-map")
+                    // A `Group` of the conversation's nodes — a table of
+                    // contents for the list beside it, not a way into the page
+                    // behind it.
+                    .probe(
+                        "space/find/map",
+                        gpui::Role::Group,
+                        crate::i18n::msg::find_map_label(cx),
+                    )
+                    .size_full()
+                    .p(px(MAP_PAD))
+                    .overflow_y_scroll()
+                    .overflow_x_scroll()
+                    .track_scroll(&handle)
+                    .child(canvas),
+            )
+            .child(crate::scrollbar::vertical_floating(
+                "space-find-map-scroll",
+                &handle,
+            ))
             .into_any_element()
     }
 
@@ -980,6 +1159,15 @@ impl SpaceView {
             .flat_map(|g| g.fragments.iter().cloned())
             .collect();
         let total = fragments.len();
+        // **Forget what belongs to a fragment that no longer exists.** A
+        // measurement and an editor state are keyed by fragment id, and a live
+        // editor's id carries its content, so every keystroke in a draft
+        // supersedes its own cards. Retaining to this frame's ids is what keeps
+        // that from accumulating a state per edit for the length of a search.
+        if let Some(session) = self.find.as_mut() {
+            let live: HashSet<SharedString> = fragments.iter().map(|f| f.id.clone()).collect();
+            session.overlay.retain_results(&live);
+        }
         let cursor = self.find_result_cursor_row(total, window);
         let keyboard = window.last_input_was_keyboard();
         let (muted, border, card) = {
@@ -1099,7 +1287,10 @@ impl SpaceView {
                 } else {
                     column = column.child(
                         div()
-                            .id(SharedString::from(format!("space-find-frag-slot-{index}")))
+                            .id(SharedString::from(format!(
+                                "space-find-frag-slot-{}",
+                                fragment.id
+                            )))
                             .w_full()
                             .h(px(height)),
                     );
@@ -1127,30 +1318,40 @@ impl SpaceView {
             session.overlay.in_view = in_view;
         }
 
-        let keys = fragments.clone();
         div()
-            .id("space-find-results")
-            // One tab stop with a roving cursor: a card per stop would describe
-            // a tab order that does not contain the results nobody scrolled to.
-            .probe(
-                "space/find/results",
-                gpui::Role::List,
-                crate::i18n::msg::find_results_label(cx),
-            )
-            .track_focus(&list_focus)
-            .on_key_down(
-                cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
-                    if this.handle_find_results_key(&keys, viewport_h, ev, window, cx) {
-                        cx.stop_propagation();
-                    }
-                }),
-            )
+            .relative()
             .flex_1()
             .min_w_0()
             .h_full()
-            .overflow_y_scroll()
-            .track_scroll(&scroll)
-            .child(column)
+            .child(
+                div()
+                    .id("space-find-results")
+                    // One tab stop with a roving cursor: a card per stop would
+                    // describe a tab order that does not contain the results
+                    // nobody scrolled to.
+                    .probe(
+                        "space/find/results",
+                        gpui::Role::List,
+                        crate::i18n::msg::find_results_label(cx),
+                    )
+                    .track_focus(&list_focus)
+                    .on_key_down(
+                        cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
+                            if this.handle_find_results_key(&fragments, viewport_h, ev, window, cx)
+                            {
+                                cx.stop_propagation();
+                            }
+                        }),
+                    )
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll)
+                    .child(column),
+            )
+            .child(crate::scrollbar::vertical_floating(
+                "space-find-results-scroll",
+                &scroll,
+            ))
             .into_any_element()
     }
 
@@ -1202,7 +1403,15 @@ impl SpaceView {
         let opener = fragment.clone();
         let label = self.find_fragment_label(fragment);
         div()
-            .id(SharedString::from(format!("space-find-frag-{index}")))
+            // Keyed by the fragment, not by its seat: the results are re-cut on
+            // every frame and a background write reorders them, so an
+            // index-keyed element would carry one card's per-element state — an
+            // armed mouse-down among it — onto whatever result took its place.
+            // The probe name stays positional, as the driver's selector.
+            .id(SharedString::from(format!(
+                "space-find-frag-{}",
+                fragment.id
+            )))
             // A managed descendant of the list, never a tab stop of its own.
             .probe_delegating(
                 format!("space/find/result/{index}"),
@@ -1252,8 +1461,13 @@ impl SpaceView {
             .into_any_element()
     }
 
-    /// A fragment's accessible name: who wrote it, and the opening of what it
-    /// says — the minimap cell's shape, over the fragment's own text.
+    /// A fragment's accessible name: **who wrote it**, and the opening of what
+    /// it says — the minimap cell's shape, over the fragment's own text.
+    ///
+    /// The attribution is part of the name rather than left to the group header
+    /// beside it, because that header is a sibling `Label`: a reader met the
+    /// card through the list's active descendant, heard the snippet alone, and
+    /// could not tell two similar results by different participants apart.
     fn find_fragment_label(&self, fragment: &ResultFragment) -> SharedString {
         let text = fragment
             .content
@@ -1261,11 +1475,8 @@ impl SpaceView {
             .unwrap_or_default();
         // No references: a fragment's own bytes are what it paints, and an
         // embed marker inside one is hidden there exactly as it is in the post.
-        SharedString::from(super::minimap::spoken_snippet(
-            text,
-            &[],
-            FRAGMENT_LABEL_CHARS,
-        ))
+        let snippet = super::minimap::spoken_snippet(text, &[], FRAGMENT_LABEL_CHARS);
+        SharedString::from(format!("{}: {snippet}", fragment.byline))
     }
 
     /// The editor state one fragment paints through, minted on first sight.
@@ -1471,7 +1682,86 @@ mod tests {
         // its own fragment.
         let hits = vec![2..4, 12..14, 33..35];
         let runs = fragment_runs(&blocks, &hits);
-        assert_eq!(runs, vec![(0..20, 0), (30..40, 2)]);
+        assert_eq!(cuts(&runs), vec![(0..20, 0..2), (30..40, 2..3)]);
+    }
+
+    /// A run's source span and the slice of the node's hits it owns.
+    fn cuts(runs: &[FragmentRun]) -> Vec<(Range<usize>, Range<usize>)> {
+        runs.iter()
+            .map(|r| (r.range.clone(), r.hits.clone()))
+            .collect()
+    }
+
+    /// What the cross product answered: every hit against every block, the
+    /// lowest and highest hit index recorded per block, then consecutive block
+    /// indices consolidated. The two-pointer walk replaced this, so the walk is
+    /// pinned against it rather than against a hand-written expectation.
+    fn cuts_by_scan(
+        blocks: &[Range<usize>],
+        hits: &[Range<usize>],
+    ) -> Vec<(Range<usize>, Range<usize>)> {
+        let mut touched: Vec<Option<(usize, usize)>> = vec![None; blocks.len()];
+        for (h, hit) in hits.iter().enumerate() {
+            for (b, block) in blocks.iter().enumerate() {
+                if block.start < hit.end.max(hit.start + 1) && hit.start < block.end {
+                    touched[b] = Some(match touched[b] {
+                        Some((lo, hi)) => (lo.min(h), hi.max(h)),
+                        None => (h, h),
+                    });
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut run: Option<(usize, usize, usize, usize)> = None;
+        for (b, slot) in touched.iter().enumerate() {
+            let Some((lo, hi)) = *slot else { continue };
+            run = match run {
+                Some((f, l, h0, h1)) if b == l + 1 => Some((f, b, h0.min(lo), h1.max(hi))),
+                Some((f, l, h0, h1)) => {
+                    out.push((blocks[f].start..blocks[l].end, h0..h1 + 1));
+                    Some((b, b, lo, hi))
+                }
+                None => Some((b, b, lo, hi)),
+            };
+        }
+        if let Some((f, l, h0, h1)) = run {
+            out.push((blocks[f].start..blocks[l].end, h0..h1 + 1));
+        }
+        out
+    }
+
+    #[test]
+    fn the_run_walk_answers_what_the_cross_product_would() {
+        // A layout with every shape the walk has to keep straight: a hit before
+        // the first block, a hit that spans three blocks, several hits inside
+        // one block, adjacent blocks with a source gap, a block nothing
+        // touches, and a hit past the end. The walk's block cursor never
+        // rewinds, so a hit landing behind one that spanned forward is exactly
+        // where a one-pass version goes wrong.
+        let blocks = vec![10..20, 20..30, 30..40, 50..60, 70..80];
+        let hits = vec![
+            0..2,   // before every block
+            12..14, // block 0
+            15..16, // block 0 again
+            25..35, // spans blocks 1 and 2
+            26..27, // back inside block 1, after the spanning hit
+            72..73, // block 4, with block 3 untouched between them
+            90..92, // past the end
+        ];
+        assert_eq!(
+            cuts(&fragment_runs(&blocks, &hits)),
+            cuts_by_scan(&blocks, &hits),
+            "the walk selects what the scan selected"
+        );
+        // And the answer really is the cut the reader sees: three fragments,
+        // each owning a contiguous slice of the node's hits, with no hit in two
+        // of them and none of the placed hits lost.
+        let runs = fragment_runs(&blocks, &hits);
+        assert_eq!(
+            cuts(&runs),
+            vec![(10..40, 1..5), (70..80, 5..6)],
+            "the spanning hit consolidates its blocks, and an untouched block splits"
+        );
     }
 
     #[test]
@@ -1483,7 +1773,7 @@ mod tests {
         let blocks = vec![0..10, 10..20, 20..30];
         let hits = vec![3..4, 25..26];
         let runs = fragment_runs(&blocks, &hits);
-        assert_eq!(runs, vec![(0..10, 0), (20..30, 1)]);
+        assert_eq!(cuts(&runs), vec![(0..10, 0..1), (20..30, 1..2)]);
     }
 
     #[test]
@@ -1493,7 +1783,29 @@ mod tests {
         // and the whitespace separating them in the source is not a third.
         let blocks = vec![0..10, 20..30];
         let hits = vec![3..4, 25..26];
-        assert_eq!(fragment_runs(&blocks, &hits), vec![(0..30, 0)]);
+        assert_eq!(cuts(&fragment_runs(&blocks, &hits)), vec![(0..30, 0..2)]);
+    }
+
+    #[test]
+    fn a_lane_past_the_columns_edge_keeps_its_own_x() {
+        // Lanes squeeze to the floor and no further, so a wide graph runs off
+        // the column and is scrolled to. Clamping the excess instead stacked
+        // every lane past the twelfth on one x — distinct branches, and their
+        // buttons, on top of one another.
+        let wide = map_lane_width(14);
+        assert_eq!(wide, MAP_LANE_MIN_W, "a wide graph is at the lane floor");
+        let xs: Vec<f32> = (0..14).map(|lane| lane as f32 * wide).collect();
+        let avail = MAP_WIDTH - 2.0 * MAP_PAD - MAP_DOT;
+        assert!(
+            xs.last().copied().unwrap_or(0.0) > avail,
+            "the last lane really is past the column's own width"
+        );
+        for pair in xs.windows(2) {
+            assert!(pair[1] > pair[0], "no two lanes share an x: {xs:?}");
+        }
+        // A narrow graph still spreads to the full stride.
+        assert_eq!(map_lane_width(1), MAP_LANE_W);
+        assert_eq!(map_lane_width(2), MAP_LANE_W);
     }
 
     #[test]
