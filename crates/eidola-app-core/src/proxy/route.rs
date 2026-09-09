@@ -1509,6 +1509,39 @@ mod tests {
         assert_eq!(refund["issuer_key_id"], "ab");
     }
 
+    /// **The cap bounds what is held, not only what is written.** Sealing
+    /// alone would keep the Record row honest while the process still carried
+    /// the whole answer in memory for the length of the stream — which is the
+    /// half a caller naming its own ceiling against an external backend can
+    /// spend. So the ceiling is enforced as the bytes arrive, and the seal is
+    /// what makes the result honest about it.
+    #[test]
+    fn a_recorded_body_never_holds_more_than_its_cap() {
+        let mut body = RecordedBody::default();
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..40 {
+            body.push(&chunk);
+            assert!(
+                body.kept.len() <= RECORD_BODY_MAX_BYTES,
+                "retention is bounded as the stream runs, not at the end: {} bytes",
+                body.kept.len()
+            );
+        }
+        let received = body.received;
+        assert_eq!(received, 40 * chunk.len(), "and it counts what really came");
+
+        let sealed = body.seal();
+        let text = String::from_utf8_lossy(&sealed);
+        assert!(
+            text.contains(&format!("{received}-byte response")),
+            "a partial says how much it is not: {}",
+            &text[text.len().saturating_sub(200)..]
+        );
+        // The note is the only thing past the cap, and it names itself.
+        assert!(sealed.len() > RECORD_BODY_MAX_BYTES);
+        assert!(sealed.len() < RECORD_BODY_MAX_BYTES + 1024);
+    }
+
     #[test]
     fn a_backend_that_will_not_start_an_engine_offers_only_what_runs() {
         // The managed `local` singleton always starts on demand, so the
