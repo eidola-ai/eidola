@@ -22580,3 +22580,79 @@ fn space_find_escape_collapses_the_overlay_before_the_bar(cx: &mut TestAppContex
         "the second ends the search"
     );
 }
+
+#[gpui::test]
+fn space_find_results_cursor_brings_its_card_into_view(cx: &mut TestAppContext) {
+    // A virtualized list is **one** tab stop with a roving cursor, and what
+    // makes that equivalent to a stop per card is the scroll: a fragment
+    // outside the viewport band is a sized placeholder with nothing to read and
+    // nothing a screen reader could report, so a cursor that landed on one
+    // would be a stop describing nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Short, so the later results really are below the fold.
+    vcx.simulate_resize(gpui::size(px(900.), px(400.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The list holds the keyboard from the moment the overlay opens — a
+    // surface that takes the window takes the keyboard.
+    let list = view
+        .read_with(&vcx, |v, _| v.find_results_focus_for_test())
+        .expect("the overlay is open");
+    assert!(
+        vcx.update(|window, _| list.is_focused(window)),
+        "opening focused the results list"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_result_cursor_for_test()),
+        Some(0),
+        "and the cursor starts at the first result"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        0.0,
+        "precondition: the list starts at the top"
+    );
+
+    // Walk to the end. The last card is well below the fold, so the list has
+    // to follow the cursor there.
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    let cursor = view
+        .read_with(&vcx, |v, _| v.find_result_cursor_for_test())
+        .expect("a session is open");
+    assert!(
+        cursor > 0,
+        "End took the cursor to the last result ({cursor})"
+    );
+    let scrolled = view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test());
+    assert!(
+        scrolled > 0.0,
+        "the list scrolled to bring that card into view ({scrolled})"
+    );
+
+    // …and back, minimally: Home returns to the top rather than leaving the
+    // reader looking at a cursor they cannot see.
+    vcx.simulate_keystrokes("home");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_result_cursor_for_test()),
+        Some(0)
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        0.0,
+        "the first card is at the top of the list, so that is where it goes"
+    );
+}

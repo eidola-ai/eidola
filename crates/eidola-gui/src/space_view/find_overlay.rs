@@ -333,8 +333,11 @@ pub(crate) struct FindOverlay {
     /// a `set_value` notify, and dropping them on the way out of the band would
     /// pay that on every scroll step.
     bodies: HashMap<SharedString, Entity<MarkdownEditorState>>,
-    /// Each group's top offset inside the list, recorded as the list is laid
-    /// out. What a map press scrolls to, and what the scroll↔map sync reads.
+    /// Each group's and each fragment's top offset inside the list, recorded
+    /// as the list is laid out — keyed by node id for a group and by fragment
+    /// id for a card, which cannot collide (a fragment's id carries a `#`).
+    /// What a map press scrolls to, what the roving cursor follows, and what
+    /// the scroll↔map sync reads.
     tops: HashMap<SharedString, (f32, f32)>,
     /// The nodes whose group is in the list's viewport this frame — the map's
     /// `aria_selected` set, derived rather than stored as state of its own.
@@ -634,6 +637,7 @@ impl SpaceView {
     fn handle_find_results_key(
         &mut self,
         fragments: &[ResultFragment],
+        viewport_h: f32,
         ev: &gpui::KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -662,18 +666,46 @@ impl SpaceView {
             }
             _ => return false,
         };
-        self.move_find_result_cursor(target, cx);
+        self.move_find_result_cursor(target, fragments, viewport_h, cx);
         true
     }
 
     /// Move the cursor and bring what it lands on into view — the move that
     /// makes one tab stop equivalent to a stop per card, since a fragment
-    /// outside the band is a placeholder with nothing to read.
-    fn move_find_result_cursor(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let Some(session) = self.find.as_mut() else {
-            return;
-        };
-        session.overlay.cursor = idx;
+    /// outside the viewport band is a placeholder with nothing to read and
+    /// nothing a screen reader could report.
+    ///
+    /// The offsets are the *last* frame's, which is the lag every estimate in
+    /// this list already carries: a card that has not painted is placed from
+    /// its estimate and corrected on the frame it does.
+    fn move_find_result_cursor(
+        &mut self,
+        idx: usize,
+        fragments: &[ResultFragment],
+        viewport_h: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let placed = self.find.as_mut().and_then(|session| {
+            session.overlay.cursor = idx;
+            fragments
+                .get(idx)
+                .and_then(|f| session.overlay.tops.get(&f.id).copied())
+                .map(|placed| (placed, -session.overlay.scroll.offset().y.as_f32()))
+        });
+        // Minimal motion, the reveal's own rule: a card already in view is left
+        // where the reader put it.
+        if let Some(((top, height), at)) = placed {
+            let next = if top < at {
+                Some(top)
+            } else if top + height > at + viewport_h {
+                Some(top + height - viewport_h)
+            } else {
+                None
+            };
+            if let Some(next) = next {
+                self.scroll_find_results_to(next);
+            }
+        }
         cx.notify();
     }
 
@@ -787,6 +819,16 @@ impl SpaceView {
             .as_ref()
             .map(|s| s.overlay.in_view.clone())
             .unwrap_or_default();
+        // **The current match's post is distinguished**, in the same colour the
+        // conversation gives that match's own wash — so the map says where the
+        // reader *is* as well as what the space holds. It is always a node of
+        // the visible branch, because find never leaves it: the anchor is
+        // resolved against the branch's own match list.
+        let current = self
+            .find
+            .as_ref()
+            .and_then(|s| s.current())
+            .map(|m| m.node.clone());
         let lanes = map.iter().map(|n| n.lane + 1).max().unwrap_or(1);
         let depths = map.iter().map(|n| n.depth + 1).max().unwrap_or(1);
         let avail = (MAP_WIDTH - 2.0 * MAP_PAD - MAP_DOT).max(MAP_LANE_MIN_W);
@@ -837,6 +879,7 @@ impl SpaceView {
         for (i, node) in map.iter().enumerate() {
             let has = with_matches.contains(&node.node);
             let showing = in_view.contains(&node.node);
+            let is_current = current.as_ref() == Some(&node.node);
             let byline = self
                 .post_for_node(&node.node)
                 .map(|p| p.byline.clone())
@@ -868,7 +911,11 @@ impl SpaceView {
                 .w(px(MAP_DOT))
                 .h(px(MAP_DOT))
                 .rounded_full()
-                .bg(if has { wash } else { muted.opacity(0.35) });
+                .bg(match (is_current, has) {
+                    (true, _) => accent,
+                    (false, true) => wash,
+                    (false, false) => muted.opacity(0.35),
+                });
             if showing {
                 dot = dot.border_1().border_color(accent);
             }
@@ -1031,7 +1078,7 @@ impl SpaceView {
             );
             y += GROUP_HEADER_H;
 
-            for fragment in &group.fragments {
+            for (nth, fragment) in group.fragments.iter().enumerate() {
                 let measured = heights.borrow().get(&fragment.id).copied();
                 let height = measured.unwrap_or_else(|| self.find_fragment_estimate(fragment));
                 let visible = y < band.end && (y + height) > band.start;
@@ -1057,6 +1104,14 @@ impl SpaceView {
                             .h(px(height)),
                     );
                 }
+                // **A card's reveal starts at its attribution where it has
+                // one.** The cursor's whole job is to make one tab stop read
+                // like a stop per card, and a card scrolled to its own top with
+                // the byline just above the fold is a result whose author the
+                // reader cannot see. The first fragment of a group therefore
+                // reveals from the group's top; the rest reveal from their own.
+                let reveal_top = if nth == 0 { group_top } else { y };
+                tops.insert(fragment.id.clone(), (reveal_top, y + height - reveal_top));
                 y += height;
                 index += 1;
             }
@@ -1085,7 +1140,7 @@ impl SpaceView {
             .track_focus(&list_focus)
             .on_key_down(
                 cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
-                    if this.handle_find_results_key(&keys, ev, window, cx) {
+                    if this.handle_find_results_key(&keys, viewport_h, ev, window, cx) {
                         cx.stop_propagation();
                     }
                 }),

@@ -1655,6 +1655,19 @@ impl SpaceView {
         self.scroll_find_results_to(top);
     }
 
+    /// Where the results list's roving cursor sits, and the list's own focus
+    /// handle — the surface's single tab stop.
+    #[doc(hidden)]
+    pub fn find_results_focus_for_test(&self) -> Option<gpui::FocusHandle> {
+        self.find.as_ref().map(|s| s.overlay.list_focus.clone())
+    }
+
+    /// The cursor's index into the flat fragment list.
+    #[doc(hidden)]
+    pub fn find_result_cursor_for_test(&self) -> Option<usize> {
+        self.find.as_ref().map(|s| s.overlay.cursor)
+    }
+
     /// The overlay's map, in the order it lays the space out and the results
     /// read: `(node id, depth, lane)` sorted depth-then-lane.
     #[doc(hidden)]
