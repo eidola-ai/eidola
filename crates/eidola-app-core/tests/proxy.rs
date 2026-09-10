@@ -2205,6 +2205,83 @@ fn an_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
     });
 }
 
+/// REGRESSION: **a `200` that parses is not yet an answer.**
+///
+/// Syntax was the whole test: `{}`, `null` and an upstream's error document all
+/// parse, so each went downstream as a success — with this app's own canonical
+/// `model` inserted into it, which makes the fabrication read *more* like a
+/// completion than the raw body did. The floor is the turn path's own: a body
+/// with no `choices` array carries nothing this app's chat would call an answer.
+///
+/// The refund half is the other assertion, and it is why the settlement runs
+/// before the refusal: the credential was spent upstream either way, so a body
+/// too shapeless to answer with can still hold the only copy of its successor.
+/// `RefundMode::Fail` makes that the *only* copy — recovery cannot answer — so a
+/// cure that refused before reading the token would strand the credential.
+#[test]
+fn a_success_that_is_not_a_completion_is_refused_rather_than_forwarded() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlockingNotACompletion,
+            refund: RefundMode::Fail,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#),
+            ),
+        ));
+        assert_ne!(
+            status, 200,
+            "a body with no completion in it is not an answer to hand on: {body}"
+        );
+        assert!(
+            body.contains("not a chat completion"),
+            "and the refusal says what was wrong with it: {body}"
+        );
+
+        // The exchange is evidence, and the row says what the caller was told.
+        let recorded = runtime
+            .block_on(core.list_requests(20, 0))
+            .expect("record")
+            .into_iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is recorded");
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not a chat completion")),
+            "the row carries this app's own refusal: {:?}",
+            recorded.error
+        );
+
+        // The hold settled from the token the refused body carried.
+        let wallet = runtime.block_on(core.wallet_lifecycle()).expect("wallet");
+        assert!(
+            wallet.iter().any(|c| c.state == "spent"),
+            "the refund rode the body this app refused: {wallet:?}"
+        );
+        assert!(
+            !wallet.iter().any(|c| c.state == "spending"),
+            "a refusal must not strand a spent credential: {wallet:?}"
+        );
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "recovery is the fallback for an absent token, not the first move"
+        );
+    });
+}
+
 /// **A bare-`\r` stream is split into its events, not accumulated into one.**
 ///
 /// The event-stream format takes `\r\n`, `\n` and a bare `\r`, and any two in a

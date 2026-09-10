@@ -1279,18 +1279,31 @@ impl Inner {
         let parsed: Option<Value> = (!answer.over_ceiling)
             .then(|| serde_json::from_str::<Value>(&text).ok())
             .flatten();
+        // **And syntax is not shape.** `{}`, `null`, and an upstream's error
+        // document all parse, so a check that ended at `from_str` handed a
+        // downstream tool a `200` carrying nothing it could read as an answer —
+        // with this app's own `model` inserted into it, which makes the
+        // fabrication look more like a completion rather than less. The floor
+        // is [`is_completion`]: exactly what this app's own turn path requires
+        // of a blocking answer, so the proxy refuses nothing its chat would
+        // have accepted.
+        //
         // **A refusal this app made belongs in the row it made it about.** The
         // upstream's status is the upstream's claim; a `2xx` this proxy would
         // not accept is recorded as an error too, or the Record shows the
         // exchange as the success the caller was explicitly not given. A
         // non-2xx needs no such column — its status already says what happened.
-        let refusal = (status.is_success() && parsed.is_none()).then(|| {
-            if answer.over_ceiling {
-                oversized_answer(&route.backend_id)
-            } else {
-                malformed_json_answer(&route.backend_id, status.as_u16())
-            }
-        });
+        let refusal = status
+            .is_success()
+            .then(|| match parsed.as_ref() {
+                None if answer.over_ceiling => Some(oversized_answer(&route.backend_id)),
+                None => Some(malformed_json_answer(&route.backend_id, status.as_u16())),
+                Some(body) if !is_completion(body) => {
+                    Some(shapeless_answer(&route.backend_id, status.as_u16()))
+                }
+                Some(_) => None,
+            })
+            .flatten();
         self.settle_proxy_refund(
             &db_conn,
             &spend,
@@ -1321,10 +1334,17 @@ impl Inner {
 
         // This is the arm `refusal` was built for — the status is a success and
         // there is no answer — so the caller is told exactly what the row says,
-        // by carrying the same value rather than rebuilding it.
+        // by carrying the same value rather than rebuilding it. The settlement
+        // above ran first on purpose: a body this app will not accept can still
+        // carry the credential's successor, and the class rule is that whatever
+        // the server *hands* us settles, whatever else the body turns out to be.
+        if let Some(refusal) = refusal {
+            return Err(refusal);
+        }
+        // A success that reached here parsed and passed the shape check, so the
+        // `else` is unreachable — and refuses rather than inventing a body.
         let Some(mut parsed) = parsed else {
-            return Err(refusal
-                .unwrap_or_else(|| malformed_json_answer(&route.backend_id, status.as_u16())));
+            return Err(malformed_json_answer(&route.backend_id, status.as_u16()));
         };
         if let Some(object) = parsed.as_object_mut() {
             // **The credential artifact never reaches downstream.** Eidola's
@@ -1508,7 +1528,7 @@ impl Inner {
         // refusing an unlabelled body would only break a server that is already
         // unusual without catching anything the named cases do not.
         //
-        // **And this is a fifth arm of the refund class**: a backend that
+        // **And this is a fourth arm of the refund class**: a backend that
         // ignored `stream: true` may well have answered with a whole
         // completion, refund and all — the credential is spent either way, so
         // the body is read for its token before this fails.
@@ -1905,6 +1925,33 @@ fn malformed_json_answer(backend_id: &str, status: u16) -> AppError {
     }
 }
 
+/// Whether a parsed `2xx` body is a completion at all.
+///
+/// **The bar is this app's own, not a stricter one invented here.** The turn
+/// path reads a blocking answer by walking `choices` as an array and taking the
+/// first element's `message` (`lib.rs`), so a body with no `choices` array
+/// carries nothing that path would call an answer — while everything above that
+/// floor (an empty `choices`, a `message` with no `content`, unknown fields) is
+/// something it reads without complaint, and the proxy must too. Matching the
+/// floor exactly is what keeps this from refusing completions the app's own
+/// chat accepts.
+///
+/// `Value::get` answers `None` for anything that is not an object, so `null`, a
+/// bare array and a string are refused by the same line.
+fn is_completion(body: &Value) -> bool {
+    body.get("choices").is_some_and(Value::is_array)
+}
+
+/// A `2xx` whose body is JSON but not a completion — `{}`, `null`, or an
+/// upstream's error document answered with a success status.
+fn shapeless_answer(backend_id: &str, status: u16) -> AppError {
+    AppError::Network {
+        message: format!(
+            "`{backend_id}` answered {status} with JSON that is not a chat completion"
+        ),
+    }
+}
+
 /// A `2xx` whose body crossed [`MAX_RESPONSE_BYTES`] — refused on the app's own
 /// decision to stop reading, never on what the fragment happens to parse as.
 fn oversized_answer(backend_id: &str) -> AppError {
@@ -2188,6 +2235,33 @@ mod tests {
         assert!(
             ProxyChatRequest::from_json(&serde_json::json!({"model": "m"})).is_err(),
             "no messages"
+        );
+    }
+
+    /// The floor is the turn path's, and a floor has two edges: what it lets
+    /// through matters as much as what it stops. Everything the app's own chat
+    /// reads without complaint is accepted here, or the proxy would be holding
+    /// a policy the rest of the app does not.
+    #[test]
+    fn a_completion_is_an_object_with_choices_and_nothing_stricter() {
+        assert!(is_completion(&serde_json::json!({"choices": []})), "empty");
+        assert!(
+            is_completion(&serde_json::json!({"choices": [{"message": {}}], "extra": 1})),
+            "a choice with no content, and fields this app does not know"
+        );
+        assert!(!is_completion(&serde_json::json!({})));
+        assert!(!is_completion(&serde_json::json!(null)));
+        assert!(
+            !is_completion(&serde_json::json!({"error": {"message": "no"}})),
+            "an error document answered with a success status"
+        );
+        assert!(
+            !is_completion(&serde_json::json!({"choices": {"message": {}}})),
+            "`choices` that is not an array"
+        );
+        assert!(
+            !is_completion(&serde_json::json!([{"choices": []}])),
+            "array"
         );
     }
 

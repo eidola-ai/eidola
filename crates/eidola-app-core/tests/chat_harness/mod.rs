@@ -89,6 +89,17 @@ pub enum ChatBehavior {
     /// the retained prefix parses perfectly, which is exactly why the ceiling
     /// has to be asked about rather than inferred from the parse.
     OkBlockingPaddedPastCeiling,
+    /// A `200` whose body is valid JSON and not a completion: an error document
+    /// answered with a success status, carrying a refund.
+    ///
+    /// Syntax is not shape. This parses perfectly and has no `choices`, so a
+    /// reader that stops at `from_str` hands a downstream tool an apparent
+    /// success carrying nothing it can read as an answer. The refund rides it
+    /// because the credential is spent either way — a body too shapeless to
+    /// answer with can still hold the only copy of the token — and it is minted
+    /// whatever [`RefundMode`] says, for the same reason
+    /// [`ChatBehavior::StreamingWithMetadataRefund`] does.
+    OkBlockingNotACompletion,
     /// A `200` whose body is not JSON at all — a truncated answer, or an
     /// intermediary's HTML error page. What a client must never read as a
     /// successful completion.
@@ -1262,6 +1273,18 @@ async fn handle_chat(
             // learn this app's ceilings.
             let padded = format!("{body}{}", " ".repeat(9 * 1024 * 1024));
             write_json(stream, 200, &padded).await
+        }
+        ChatBehavior::OkBlockingNotACompletion => {
+            let mut body: serde_json::Value =
+                serde_json::from_str(&error_body("upstream model error")).expect("error body");
+            if let Some(refund_b64) = auth
+                .and_then(Issuer::spend_proof_from_auth)
+                .and_then(|sp| issuer.refund_for(&sp))
+            {
+                body["refund"] =
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
+            }
+            write_json(stream, 200, &body.to_string()).await
         }
         ChatBehavior::Non2xx(status) => {
             write_json(stream, status, &error_body("upstream model error")).await
