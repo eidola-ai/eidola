@@ -179,6 +179,18 @@ impl RecordedBody {
         out
     }
 
+    /// The bytes to record for a **request** body.
+    ///
+    /// **There is no ending to state here, and that is why this seal is its
+    /// own.** A request body was constructed by this app and handed to the
+    /// transport in one piece, so nothing about how it *ended* can be in
+    /// question — only the retention cap can make the row a partial, and the
+    /// cap's own note says exactly that. Every seal names its class, so the
+    /// absence of an ending is a stated fact rather than a forgotten one.
+    fn seal_request(self) -> Vec<u8> {
+        seal_recorded_body(self.kept, self.received)
+    }
+
     /// The bytes to record for a blocking answer, with the note when the
     /// ceiling — not the upstream — is why the read stopped.
     fn seal_blocking(self, read: BodyRead) -> Vec<u8> {
@@ -220,6 +232,14 @@ impl BodyRead {
 
 /// One blocking upstream answer, read under [`MAX_RESPONSE_BYTES`].
 type CappedBody = crate::peer_read::BoundedBody;
+
+/// What the Record keeps of a proxied request's body — bounded, and honest
+/// about it. See [`RecordedBody::seal_request`].
+fn recorded_request(body: &Value) -> Vec<u8> {
+    let mut kept = RecordedBody::default();
+    kept.push(body.to_string().as_bytes());
+    kept.seal_request()
+}
 
 /// What the Record keeps of a blocking answer, stating both the retention cap
 /// and the ceiling where either applied.
@@ -1028,7 +1048,14 @@ impl Inner {
             method: "POST".to_string(),
             path: "/v1/chat/completions".to_string(),
             request_headers: Some(headers.for_record()),
-            request_body: Some(request_body.to_string().into_bytes()),
+            // **The retention cap's request-side twin, and the durable half.**
+            // A caller may send `MAX_REQUEST_BYTES` and repeat it, and every
+            // exchange wrote the reconstructed body down in full — a few dozen
+            // calls adding a gigabyte to the profile database and its WAL, with
+            // nothing pruning `request` rows to take it back. The prompt still
+            // travels upstream whole; what is bounded is what is *kept*, and a
+            // row that keeps less says so in the payload itself.
+            request_body: Some(recorded_request(request_body)),
             response_status: response_status.map(i64::from),
             response_headers: None,
             response_body: Some(response_body),

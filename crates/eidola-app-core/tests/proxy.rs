@@ -1913,3 +1913,75 @@ fn an_event_that_never_ends_is_refused_rather_than_accumulated() {
         );
     });
 }
+
+/// REGRESSION: **the request column is bounded too, and it is the durable
+/// half.**
+///
+/// A caller may send the whole allowed body and repeat it, and every exchange
+/// wrote the reconstructed prompt down in full — a few dozen calls adding a
+/// gigabyte to the profile database and its WAL, with nothing pruning `request`
+/// rows to take it back. The prompt still travels upstream whole; what is
+/// bounded is what is kept, and a row that keeps less says so.
+#[test]
+fn an_enormous_prompt_is_recorded_as_the_truncation_it_is() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig::default());
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        // Comfortably past the retention cap, and nowhere near the request
+        // ceiling the HTTP surface enforces.
+        let prompt = "x".repeat(2 * 1024 * 1024);
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"{prompt}"}}]}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 200, "{}", &body[..body.len().min(200)]);
+
+        // The whole prompt reached the backend: what is bounded is the row.
+        let seen = mock
+            .chat_bodies()
+            .first()
+            .expect("the upstream saw a request")
+            .to_string();
+        assert!(
+            seen.len() > 1024 * 1024,
+            "the prompt travels upstream whole: {} bytes",
+            seen.len()
+        );
+
+        let id = runtime
+            .block_on(core.list_requests(20, 0))
+            .expect("record")
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is recorded")
+            .id
+            .clone();
+        let detail = runtime
+            .block_on(core.request_detail(id))
+            .expect("detail")
+            .expect("a recorded row");
+        let recorded = detail.request_body.expect("a request body");
+        assert!(
+            recorded.len() < seen.len(),
+            "the row keeps less than travelled: {} of {} bytes",
+            recorded.len(),
+            seen.len()
+        );
+        let text = String::from_utf8_lossy(&recorded);
+        assert!(
+            text.contains("keeps the first"),
+            "and a partial says it is one: {}",
+            &text[text.len().saturating_sub(200)..]
+        );
+    });
+}
