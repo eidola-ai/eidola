@@ -240,11 +240,11 @@ pub fn run_with(opts: LaunchOptions) {
                 if let Some(socket) = &socket {
                     socket.close();
                 }
-                proxy_door.stop();
+                proxy_door.retire();
             }
         };
         #[cfg(not(unix))]
-        let close_door = move || proxy_door.stop();
+        let close_door = move || proxy_door.retire();
 
         // The *full* shutdown drains the engines — and on macOS this hook
         // is the only thing that delivers it. ⌘Q no longer reaches it (it

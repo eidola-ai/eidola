@@ -314,3 +314,48 @@ fn a_proxy_bound_to_ipv6_loopback_answers_there() {
     assert!(ask(address, &get("/v1/models", Some(&key))).starts_with("HTTP/1.1 200"));
     server.close();
 }
+
+/// **The full shutdown latches the door; a reconcile landing after it starts
+/// nothing.**
+///
+/// `stop()` is reversible by design — the reader's switch turns the proxy off
+/// and on again — so the shutdown needs a stronger word than the one the store
+/// uses every day. A `ProxyStore` read or write already in flight when teardown
+/// begins runs its continuation during the shutdown grace, calls
+/// `reconcile_listener`, sees the settings still asking for a proxy, and binds:
+/// the endpoint reopening after the doors were closed, ready to accept billed
+/// work while the engines drain.
+///
+/// The counter is what makes "nothing was started" a fact rather than a hope —
+/// a rebind on an ephemeral port would land somewhere new and prove nothing
+/// about whether one happened at all.
+#[test]
+fn a_reconcile_landing_after_the_shutdown_starts_nothing() {
+    let (core, _dir) = core();
+    let handle = proxy::ProxyHandle::default();
+    let address = handle.start(&core, &ephemeral()).expect("start");
+    assert_eq!(handle.address(), Some(address));
+    let bound = handle.binds_for_test();
+
+    handle.retire();
+    assert_eq!(handle.address(), None, "the door is closed");
+
+    // What a store operation completing inside the grace would do.
+    let refused = handle
+        .start(&core, &ephemeral())
+        .expect_err("a retired handle starts nothing");
+    assert!(
+        refused.to_string().contains("shutdown"),
+        "and says why: {refused}"
+    );
+    assert_eq!(
+        handle.binds_for_test(),
+        bound,
+        "no socket was bound after the door closed"
+    );
+    assert!(!handle.is_running());
+
+    // The latch does not clear: a second reconcile is refused too.
+    assert!(handle.start(&core, &ephemeral()).is_err());
+    assert_eq!(handle.binds_for_test(), bound);
+}

@@ -321,9 +321,29 @@ async fn accept_loop(
 /// that closes the control socket, so the order between the two doors and the
 /// engine drain stays the order of lines in one body rather than the sequence
 /// of separately-registered hooks.
+/// The listener, and whether this process has closed the door for good.
+///
+/// **The flag and the listener live under one lock because a reconcile is a
+/// *decision* about the listener** — the `Serving` shape one level down, at the
+/// handle. `stop()` is reversible by design (the reader's switch turns the
+/// proxy off and on again), so the full shutdown needs a stronger word: a
+/// `ProxyStore` read or write already in flight when teardown begins runs its
+/// continuation during the shutdown grace, calls `reconcile_listener`, sees the
+/// settings still want a proxy, and **binds a new socket** — the endpoint
+/// reopening after the doors were closed, accepting billed work while the
+/// engines drain. Latched, that start is unrepresentable rather than unlikely:
+/// whichever of the two takes the lock first, the other sees a committed
+/// decision and answers to it.
+#[derive(Default)]
+struct Door {
+    /// Set once by [`ProxyHandle::retire`] and never cleared.
+    retired: bool,
+    server: Option<ProxyServer>,
+}
+
 #[derive(Clone, Default)]
 pub struct ProxyHandle {
-    server: Arc<Mutex<Option<ProxyServer>>>,
+    door: Arc<Mutex<Door>>,
     /// How many sockets this handle has bound.
     ///
     /// **A restart is not observable from outside without it.** Whether a
@@ -343,29 +363,55 @@ impl ProxyHandle {
     /// means an address the OS refuses leaves the proxy *stopped* rather than
     /// still answering on the old one. That is the honest outcome: a reader who
     /// changed the address must not be told it moved when it did not.
+    /// **A retired handle starts nothing.** The refusal is typed rather than
+    /// silent because the reconcile has an error slot to put it in, and it
+    /// reaches no reader in practice: the only way here is a store operation
+    /// completing inside the shutdown grace, with every window already closed.
     pub fn start(
         &self,
         core: &Arc<AppCore>,
         settings: &ProxySettings,
     ) -> Result<SocketAddr, AppError> {
-        let mut held = self.server.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(running) = held.take() {
+        let mut door = self.door.lock().unwrap_or_else(|e| e.into_inner());
+        if door.retired {
+            return Err(AppError::Internal {
+                message: "the proxy was closed for shutdown".to_string(),
+            });
+        }
+        if let Some(running) = door.server.take() {
             running.close();
         }
         let server = serve(core, settings)?;
         // The bound address — a listener a frame old has not given up, and
         // `bound_address` is the one that always answers.
         let address = server.bound_address();
-        *held = Some(server);
+        door.server = Some(server);
         self.binds
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(address)
     }
 
-    /// Stop the listener, if one is running. Idempotent.
+    /// Stop the listener, if one is running. Idempotent, and **reversible** —
+    /// this is what the reader's own switch does, so a later reconcile may
+    /// start it again. The full shutdown wants [`ProxyHandle::retire`].
     pub fn stop(&self) {
-        let mut held = self.server.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(running) = held.take() {
+        let mut door = self.door.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(running) = door.server.take() {
+            running.close();
+        }
+    }
+
+    /// Close the door for the life of the process: stop the listener and refuse
+    /// every later start.
+    ///
+    /// Called from the full shutdown's one `close_door` closure beside the
+    /// control socket's close, because "everything after this is teardown" has
+    /// to be true of both — and `stop` alone cannot say it, since a reconcile
+    /// landing a moment later would honestly read the settings and bind again.
+    pub fn retire(&self) {
+        let mut door = self.door.lock().unwrap_or_else(|e| e.into_inner());
+        door.retired = true;
+        if let Some(running) = door.server.take() {
             running.close();
         }
     }
@@ -376,9 +422,10 @@ impl ProxyHandle {
     /// "the reader asked for this" and "this is where a tool should point" are
     /// different facts, and a bind that failed makes them differ.
     pub fn address(&self) -> Option<SocketAddr> {
-        self.server
+        self.door
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .server
             .as_ref()
             .and_then(ProxyServer::address)
     }
@@ -394,9 +441,10 @@ impl ProxyHandle {
     /// has stopped answering, so the honest cost is that a reader may see the
     /// stale line until something else moves.
     pub fn accept_failure(&self) -> Option<String> {
-        self.server
+        self.door
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .server
             .as_ref()
             .and_then(ProxyServer::accept_failure)
     }
@@ -416,9 +464,10 @@ impl ProxyHandle {
     #[doc(hidden)]
     pub fn fail_accepting_for_test(&self, reason: &str) {
         if let Some(server) = self
-            .server
+            .door
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .server
             .as_ref()
         {
             server.fail_accepting_for_test(reason);
