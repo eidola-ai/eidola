@@ -1510,7 +1510,7 @@ impl Inner {
                 let event: Vec<u8> = buf.drain(..pos).collect();
                 let boundary_len = if buf.starts_with(b"\r\n\r\n") { 4 } else { 2 };
                 let terminator: Vec<u8> = buf.drain(..boundary_len.min(buf.len())).collect();
-                let (mut out, refund) = forward_sse_event(&event);
+                let (mut out, refund) = forward_sse_event(&event, &route.canonical);
                 if refund.is_some() {
                     inline_refund = refund;
                 }
@@ -1573,7 +1573,7 @@ impl Inner {
         // is the same fact: an unterminated tail nobody received is not a
         // complete delivery, and discarding the result sealed the row as one.
         if !buf.is_empty() {
-            let (out, refund) = forward_sse_event(&buf);
+            let (out, refund) = forward_sse_event(&buf, &route.canonical);
             if refund.is_some() {
                 inline_refund = refund;
             }
@@ -1856,12 +1856,22 @@ fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
 
 /// One SSE event on its way downstream, and the refund it was carrying.
 ///
-/// **Byte-identical unless there is a credential in it.** The answer a model
-/// gave is not this app's to reformat, so an event whose payloads carry
-/// nothing of ours is passed through exactly as it arrived. The one thing that
-/// may not travel is a `refund` — wallet material this app consumes — and
-/// removing it is the only reason an event is ever rebuilt. This is the
-/// outbound half of the same allowlist discipline the headers take.
+/// **Byte-identical unless one of two fields is this app's business.** The
+/// answer a model gave is not this app's to reformat, so an event whose
+/// payloads carry neither is passed through exactly as it arrived; those two
+/// are the only reasons an event is ever rebuilt, and they are the outbound
+/// half of the same allowlist discipline the headers take:
+///
+/// - **`refund`** — wallet material this app consumes, which may not travel.
+/// - **`model`** — the caller asked for `<model>@<backend>` and the wire
+///   request carries the backend's own spelling, so a chunk answers with the
+///   *unqualified* id. The blocking transport rewrites that field for exactly
+///   this reason: a tool that stores what came back and reuses it names a model
+///   with no backend, which resolves to the default one — a request answered by
+///   a different backend than the one it was answered by last time, and, where
+///   two backends serve the same name, a display that conflates them. The field
+///   is rewritten only where the payload already has one, so nothing is added
+///   to an event that never claimed a model.
 ///
 /// **And the token is taken, not merely dropped.** The Eidola server closes a
 /// stream with a metadata event (`object == "eidola.chat.completion.metadata"`)
@@ -1874,18 +1884,26 @@ fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
 /// fallback for its *absence* — the order the blocking path already keeps.
 /// The object handed back is `RefundInfo` (`{refund, issuer_key_id}`), the
 /// same shape [`process_refund`] reads from a blocking body.
-fn forward_sse_event(event: &[u8]) -> (Vec<u8>, Option<Value>) {
+fn forward_sse_event(event: &[u8], canonical: &str) -> (Vec<u8>, Option<Value>) {
     let Ok(text) = std::str::from_utf8(event) else {
         return (event.to_vec(), None);
     };
-    let refund = text.lines().find_map(|line| {
-        line.trim_end_matches('\r')
-            .strip_prefix("data:")
-            .map(str::trim_start)
-            .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-            .and_then(|value| value.get("refund").cloned())
+    let payloads = || {
+        text.lines().filter_map(|line| {
+            line.trim_end_matches('\r')
+                .strip_prefix("data:")
+                .map(str::trim_start)
+                .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+        })
+    };
+    let refund = payloads().find_map(|value| value.get("refund").cloned());
+    let misnames = payloads().any(|value| {
+        value
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| model != canonical)
     });
-    if refund.is_none() {
+    if refund.is_none() && !misnames {
         return (event.to_vec(), None);
     }
     let mut out = String::with_capacity(text.len());
@@ -1900,9 +1918,12 @@ fn forward_sse_event(event: &[u8]) -> (Vec<u8>, Option<Value>) {
             .map(str::trim_start)
             .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
         {
-            Some(mut value) if value.get("refund").is_some() => {
+            Some(mut value) if value.get("refund").is_some() || value.get("model").is_some() => {
                 if let Some(object) = value.as_object_mut() {
                     object.remove("refund");
+                    if object.contains_key("model") {
+                        object.insert("model".to_string(), Value::String(canonical.to_string()));
+                    }
                 }
                 out.push_str("data: ");
                 out.push_str(&value.to_string());
@@ -2060,7 +2081,7 @@ mod tests {
     #[test]
     fn an_sse_event_is_forwarded_byte_for_byte() {
         let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
-        let (out, refund) = forward_sse_event(event);
+        let (out, refund) = forward_sse_event(event, "m@acme");
         assert_eq!(
             out,
             event.to_vec(),
@@ -2068,11 +2089,56 @@ mod tests {
         );
         assert!(refund.is_none());
         assert_eq!(
-            forward_sse_event(b"data: [DONE]").0,
+            forward_sse_event(b"data: [DONE]", "m@acme").0,
             b"data: [DONE]".to_vec()
         );
         // A non-UTF-8 event still travels.
-        assert_eq!(forward_sse_event(&[0xff, 0xfe]).0, vec![0xff, 0xfe]);
+        assert_eq!(
+            forward_sse_event(&[0xff, 0xfe], "m@acme").0,
+            vec![0xff, 0xfe]
+        );
+        // And an event already naming the model the caller asked for is left
+        // exactly as it arrived — the rewrite is a correction, not a pass.
+        let named = br#"data: {"model":"m@acme","choices":[]}"#;
+        assert_eq!(forward_sse_event(named, "m@acme").0, named.to_vec());
+    }
+
+    /// **A chunk names the model the caller asked for.** The caller named
+    /// `<model>@<backend>` and the wire request carries the backend's own
+    /// spelling, so a chunk answers with the unqualified id — which a tool that
+    /// stores and reuses it turns into a request for the *default* backend, and
+    /// which conflates two backends serving one name in any display. The
+    /// blocking transport rewrites that field; this is the streaming twin.
+    #[test]
+    fn a_streamed_chunk_names_the_model_the_caller_asked_for() {
+        let (out, refund) = forward_sse_event(
+            br#"data: {"id":"c1","model":"m","choices":[{"delta":{"content":"hi"}}]}"#,
+            "m@acme",
+        );
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(text.contains(r#""model":"m@acme""#), "{text}");
+        assert!(
+            text.contains(r#""content":"hi""#),
+            "what the model said is untouched: {text}"
+        );
+        assert!(refund.is_none());
+
+        // Nothing is *added*: an event that never claimed a model does not
+        // acquire one, and `[DONE]` is not JSON at all.
+        let bare = br#"data: {"choices":[{"delta":{"content":"hi"}}]}"#;
+        assert_eq!(forward_sse_event(bare, "m@acme").0, bare.to_vec());
+
+        // And the two rewrites compose on one event: the terminal metadata
+        // carries a refund, and a chunk carrying both loses one and gains the
+        // other.
+        let (out, refund) = forward_sse_event(
+            br#"data: {"model":"m","refund":{"refund":"material","issuer_key_id":"ab"}}"#,
+            "m@acme",
+        );
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(!text.contains("material"), "{text}");
+        assert!(text.contains(r#""model":"m@acme""#), "{text}");
+        assert_eq!(refund.expect("the refund")["refund"], "material");
     }
 
     #[test]
@@ -2081,6 +2147,7 @@ mod tests {
         // refund nested as `RefundInfo` — the shape `process_refund` reads.
         let (out, refund) = forward_sse_event(
             br#"data: {"object":"eidola.chat.completion.metadata","id":"x","refund":{"refund":"credential-material","issuer_key_id":"ab"}}"#,
+            "m@eidola",
         );
         let text = String::from_utf8(out).expect("utf-8");
         assert!(!text.contains("credential-material"), "{text}");
