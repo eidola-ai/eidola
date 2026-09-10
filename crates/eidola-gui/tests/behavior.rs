@@ -22819,6 +22819,89 @@ fn wide_map_posts() -> Vec<PostNode> {
     posts
 }
 
+/// **The map is virtualised over the band it is read through, and Tab still
+/// walks the whole of it.**
+///
+/// One dot per post over a canvas that states the whole conversation's height
+/// meant an element per post on every frame the overlay drew — the results list
+/// beside it has always been band-virtualised, and the map simply had not been.
+/// The half that needs proving is the second: the dots stay per-node tab stops,
+/// so a Tab into one below the fold lands on a painted element, the reveal
+/// scrolls it in, and the next frame's band has advanced past it — the walk
+/// carries the band along in front of the reader.
+#[gpui::test]
+fn space_find_virtualises_its_map_and_still_lets_tab_walk_it(cx: &mut TestAppContext) {
+    // Wide rather than deep: the page renders one nested scroller per depth
+    // level, so a chain long enough to exceed the map's band buries the stack
+    // before it reaches the map at all — and a fan of siblings is the shape a
+    // large real conversation takes anyway.
+    const BRANCHES: usize = 200;
+    let mut posts = vec![fixture_user_post("a1", "a kestrel at the root")];
+    for i in 0..BRANCHES {
+        let mut p = fixture_assistant_post(&format!("b{i}"), "another kestrel");
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let total =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx)));
+    assert_eq!(
+        total,
+        BRANCHES + 1,
+        "precondition: the map is about the whole space"
+    );
+    let painted = view.read_with(&vcx, |v, _| v.find_map_painted_for_test());
+    assert!(
+        painted > 0 && painted < total / 2,
+        "the map builds the band it is being read through, not the conversation \
+         ({painted} dots built of {total})"
+    );
+
+    // Stand on the last dot the band holds and walk with Tab. Each step reveals
+    // the dot it lands on, which advances the band — so the walk cannot run out
+    // of painted elements while the map has more.
+    let start = painted - 1;
+    assert!(
+        vcx.update(|window, cx| view.update(cx, |v, cx| v
+            .focus_find_map_node_for_test(start, window, cx))),
+        "precondition: the band's last dot is a tab stop"
+    );
+    vcx.run_until_parked();
+    for _ in 0..12 {
+        vcx.update(|window, cx| window.focus_next(cx));
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    let landed = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_focused_map_node_for_test(window, cx)))
+        .expect("the keyboard is still on a map dot");
+    assert!(
+        landed > start,
+        "Tab carried the band along in front of it (from {start} to {landed}, \
+         with {painted} built when the walk began)"
+    );
+    assert!(
+        landed >= painted,
+        "…and past where the first frame's band ended"
+    );
+}
+
 #[gpui::test]
 fn space_find_reveals_a_map_dot_the_keyboard_lands_on(cx: &mut TestAppContext) {
     // Past thirteen lanes a dot sits beyond the column's own width, and every

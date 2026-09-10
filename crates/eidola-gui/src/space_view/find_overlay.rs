@@ -89,6 +89,27 @@ const MAP_LANE_MIN_W: f32 = 11.0;
 const MAP_DOT: f32 = 9.0;
 /// The map's own breathing room inside its column.
 const MAP_PAD: f32 = 16.0;
+/// How far outside the map's own viewport a row still paints.
+///
+/// The map draws one dot per post over a canvas that states the whole
+/// conversation's height, so an unvirtualized column built an element — a cell,
+/// a circle, a probe, a click closure, and for a matching node a tracked focus
+/// handle — for every post in the space on **every frame the overlay drew**,
+/// which is every frame the reader scrolls the results or watches a reveal
+/// animate. The results list beside it has always been band-virtualized for
+/// exactly this reason; the map simply had not been.
+///
+/// The margin is what keeps **Tab reachability whole** despite the band, and it
+/// is worth stating how: the dots stay per-node tab stops (the map is a graph,
+/// not a list of the content — every group is reachable through the results
+/// list's own roving cursor regardless), so a Tab into a dot below the fold
+/// still lands on a painted element, `map_reveal_axis` scrolls it in, and the
+/// next frame's band has advanced past it. Walking the map with Tab therefore
+/// carries the band along in front of the reader, one stop at a time, exactly
+/// as it did when every dot painted. The **focused** dot is materialised
+/// whatever the band says, so the one thing a band could stranded — a dot the
+/// reader is standing on when the map scrolls under them — cannot happen.
+const MAP_MARGIN: f32 = 4.0 * MAP_ROW_H;
 /// A result group's attribution header.
 const GROUP_HEADER_H: f32 = 30.0;
 /// The gap under each fragment card.
@@ -566,6 +587,10 @@ pub(crate) struct FindOverlay {
     /// What a map press scrolls to, what the roving cursor follows, and what
     /// the scroll↔map sync reads.
     tops: HashMap<SharedString, (f32, f32)>,
+    /// How many map dots the last frame actually built — the counted bound
+    /// behind [`MAP_MARGIN`], and the only thing that can show it (a dot
+    /// outside the band and one the conversation does not have paint alike).
+    map_painted: usize,
     /// The nodes whose group is in the list's viewport this frame — the map's
     /// `aria_selected` set, derived rather than stored as state of its own.
     in_view: HashSet<SharedString>,
@@ -611,6 +636,7 @@ impl FindOverlay {
             cursor: 0,
             heights: Rc::new(RefCell::new(HashMap::new())),
             bodies: HashMap::new(),
+            map_painted: 0,
             tops: HashMap::new(),
             in_view: HashSet::new(),
             map_slots: HashMap::new(),
@@ -1444,6 +1470,35 @@ impl SpaceView {
         true
     }
 
+    /// How many map dots the last frame actually **built** — the counted bound
+    /// behind [`MAP_MARGIN`]. A dot outside the band and a post the
+    /// conversation does not have paint exactly alike, so nothing else can see
+    /// this.
+    #[doc(hidden)]
+    pub fn find_map_painted_for_test(&self) -> usize {
+        self.find
+            .as_ref()
+            .map(|s| s.overlay.map_painted)
+            .unwrap_or(0)
+    }
+
+    /// Where in the map's own depth-then-lane order the focused dot sits — what
+    /// says a Tab walk really carries the band along in front of it.
+    #[doc(hidden)]
+    pub fn find_focused_map_node_for_test(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        let slots = &self.find.as_ref()?.overlay.map_slots;
+        map.iter()
+            .position(|n| slots.get(&n.node).is_some_and(|h| h.is_focused(window)))
+    }
+
     /// How many nodes the map draws, in depth-then-lane order.
     #[doc(hidden)]
     pub fn find_map_nodes_for_test(&mut self, window: &Window, cx: &mut Context<Self>) -> usize {
@@ -1666,12 +1721,16 @@ impl SpaceView {
         // Revealed the way the results cursor reveals its card: minimally, so a
         // dot already in view is left exactly where the reader put it.
         //
-        // Deliberately **not** a roving cursor like the list beside it. That
-        // idiom exists because a virtualized list cannot have a stop per row;
-        // every dot here paints, and the map is a *graph* — the minimap, this
-        // app's other topology map, likewise gives each node its own stop, and
-        // collapsing them onto one would make the map a second linear walk of
-        // the sequence the list already is.
+        // Deliberately **not** a roving cursor like the list beside it, even
+        // though the map is virtualised too ([`MAP_MARGIN`]). That idiom exists
+        // because a virtualised list's rows are the content, so a stop per row
+        // would describe an order missing whatever nobody scrolled to; the map
+        // is a *graph* and a **shortcut** over the list beside it — every group
+        // it can reach is reachable through that list's own cursor — and the
+        // reveal keeps the band moving in front of a Tab walk, so no dot is out
+        // of reach either. The minimap, this app's other topology map, likewise
+        // gives each node its own stop, and collapsing them onto one would make
+        // this a second linear walk of the sequence the list already is.
         let handle = self
             .find
             .as_ref()
@@ -1730,6 +1789,55 @@ impl SpaceView {
             }
         }
 
+        // **The map is virtualised over the band it is being read through**
+        // ([`MAP_MARGIN`]). The canvas below still states the whole
+        // conversation's height, so the scroll extent, every dot's position and
+        // the reveal above are unchanged — what the band decides is only which
+        // rows are *built*. Read from the scroller's own last paint, exactly as
+        // the reveal reads it, so the two cannot disagree about where the
+        // reader is looking; before that first paint there is no viewport to
+        // speak of and the whole map is built, which is what the frame that
+        // establishes those bounds needs anyway.
+        //
+        // **On both axes**, because the map is unbounded on both: a deep
+        // conversation carries rows below the fold and a wide one carries lanes
+        // past the column's own width (`map_lane_x` states the real x rather
+        // than folding it back), and which of the two a space is is not this
+        // view's to assume.
+        let map_view = handle.bounds().size;
+        let seen = map_view.height.as_f32() > 0.0;
+        let band_y = if seen {
+            let top = -handle.offset().y.as_f32();
+            (top - MAP_MARGIN)..(top + map_view.height.as_f32() + MAP_MARGIN)
+        } else {
+            f32::NEG_INFINITY..f32::INFINITY
+        };
+        let band_x = if seen {
+            let left = -handle.offset().x.as_f32();
+            (left - MAP_MARGIN)..(left + map_view.width.as_f32() + MAP_MARGIN)
+        } else {
+            f32::NEG_INFINITY..f32::INFINITY
+        };
+        // A dot is in the band when the *cell* it carries is — the cell being
+        // what a reader aims at and what the ring is drawn around.
+        let cell_in_band = |depth: usize, lane: usize| {
+            let top = map_cell_origin(y(depth), MAP_ROW_H);
+            let left = map_cell_origin(x(lane), lane_stride);
+            top < band_y.end
+                && top + MAP_ROW_H > band_y.start
+                && left < band_x.end
+                && left + lane_stride > band_x.start
+        };
+        // An edge is built when the box it spans meets the band — endpoints
+        // rather than the box would drop a long horizontal run whose two ends
+        // are outside a viewport it crosses, leaving a visible gap in the
+        // graph.
+        let edge_in_band = |(pd, pl): (usize, usize), depth: usize, lane: usize| {
+            let (top, bottom) = (y(pd).min(y(depth)), y(pd).max(y(depth)) + MAP_DOT);
+            let (left, right) = (x(pl).min(x(lane)), x(pl).max(x(lane)) + MAP_DOT);
+            top < band_y.end && bottom > band_y.start && left < band_x.end && right > band_x.start
+        };
+
         // **Excess lanes run off the edge and are scrolled to, never folded
         // onto one x.** Past thirteen lanes the minimum stride carries the last
         // of them beyond the column's own width, and clamping there stacked
@@ -1758,6 +1866,9 @@ impl SpaceView {
             let cx1 = x(node.lane) + MAP_DOT / 2.0;
             let cy0 = y(pd) + MAP_DOT / 2.0;
             let cy1 = y(node.depth) + MAP_DOT / 2.0;
+            if !edge_in_band((pd, pl), node.depth, node.lane) {
+                continue;
+            }
             if (cx1 - cx0).abs() > 0.5 {
                 canvas = canvas.child(
                     div()
@@ -1780,8 +1891,21 @@ impl SpaceView {
             );
         }
 
+        let mut painted = 0usize;
         for (i, node) in map.iter().enumerate() {
             let has = with_matches.contains(&node.node);
+            // **The focused dot is built whatever the band says.** A tracked
+            // handle on an element nobody paints is the dead slot this window's
+            // focus doctrine is built around, and the map scrolling under a
+            // reader standing on a dot is the one way the band could produce
+            // one. `prune_map_slots` still answers the *other* way a dot stops
+            // being a stop — its post ceasing to match — which is a fact about
+            // the results rather than about the viewport.
+            let focused = has && slots.get(&node.node).is_some_and(|h| h.is_focused(window));
+            if !cell_in_band(node.depth, node.lane) && !focused {
+                continue;
+            }
+            painted += 1;
             let showing = in_view.contains(&node.node);
             let is_current = current.as_ref() == Some(&node.node);
             let byline = self.find_map_byline(&node.node, posts, cx);
@@ -1875,6 +1999,9 @@ impl SpaceView {
                 dot = dot.tab_stop(false);
             }
             canvas = canvas.child(dot);
+        }
+        if let Some(session) = self.find.as_mut() {
+            session.overlay.map_painted = painted;
         }
 
         // The scroller and its indicator are **siblings inside a `relative`
