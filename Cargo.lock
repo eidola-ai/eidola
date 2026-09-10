@@ -6547,9 +6547,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "open"
-version = "5.4.2"
+version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ade3be4664bc1ef537ce133015f04c176b737815c2ba9fd60edf212d6e90dd55"
+checksum = "7c603ab8300cf18bc3b14146b19fe3dfcc4843ae5a400cd0e7a30b95aa366634"
 dependencies = [
  "is-wsl",
  "libc",
@@ -7703,9 +7703,9 @@ dependencies = [
 
 [[package]]
 name = "ratex-layout"
-version = "0.1.13"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "357b26fa792ed80b127a5cec401b6ee99a9d3bf8de51df832f52045ecf761b49"
+checksum = "1792738e2e36683cd20de742296a5233759565efc8cd03831064a0ccfb1fe0f7"
 dependencies = [
  "ratex-font",
  "ratex-parser",
@@ -7715,9 +7715,9 @@ dependencies = [
 
 [[package]]
 name = "ratex-lexer"
-version = "0.1.13"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73da647195c345fe25d1815b67ae365950f0b80640a555f07f65c6b4d79dc509"
+checksum = "f704add86d7bf4c4ecc7767f45ab38a44f1bbfa4b49725b2ae53c32e83b8a61e"
 dependencies = [
  "ratex-types",
  "serde",
@@ -7726,9 +7726,9 @@ dependencies = [
 
 [[package]]
 name = "ratex-parser"
-version = "0.1.13"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b632e1438b4a273dd856036765405a4bbc223b6bfc67234285888580545b9fd2"
+checksum = "079ec2e7ac6bc76137a6de093a173d1f901139a51318589ab9ce17139c21a6f0"
 dependencies = [
  "fancy-regex 0.14.0",
  "ratex-font",
@@ -8218,9 +8218,9 @@ dependencies = [
 
 [[package]]
 name = "rumdl"
-version = "0.2.62"
+version = "0.2.64"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc9bd963bd87b1e8c6fa973a57fd576e765ed5ce1ce447e6d8eb0b8bf620f62e"
+checksum = "4609b658f06d4846f980f7a9223c7c25074b5caadceef649925e4bec1643c0a8"
 dependencies = [
  "blake3",
  "chrono",
@@ -8239,6 +8239,7 @@ dependencies = [
  "log",
  "mimalloc",
  "notify 8.2.0",
+ "percent-encoding",
  "postcard",
  "pulldown-cmark 0.13.4",
  "rayon",
