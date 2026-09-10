@@ -352,20 +352,19 @@ impl Inner {
         exposed: bool,
     ) -> Result<ProxySettings, AppError> {
         let conn = self.db_conn().await?;
-        // Named before it is written, so exposing something that does not
-        // exist is a refusal rather than a row nothing will ever join.
-        if exposed
-            && db::get_backend(&conn, backend_id)
-                .await?
-                .filter(|b| b.removed_at.is_none())
-                .is_none()
-        {
+        // **Named by the write itself**, not by a read before it. Asking here
+        // and writing afterwards leaves a gap a concurrent removal fits inside
+        // — the check passes, the removal drops the exposure it is deleting,
+        // and this insert lands anyway on a soft-removed row, which re-adding
+        // that id would revive already exposed. `db::set_proxy_backend` carries
+        // the premise into its own transaction and reports the verdict.
+        let wrote = db::set_proxy_backend(&conn, backend_id, exposed, now_ms()).await?;
+        drop(conn);
+        if wrote == db::ExposureWrite::NoLiveBackend {
             return Err(AppError::NotConfigured {
                 message: format!("no backend named `{backend_id}` is configured"),
             });
         }
-        db::set_proxy_backend(&conn, backend_id, exposed, now_ms()).await?;
-        drop(conn);
         self.bus.emit(Change::Proxy);
         self.proxy_settings().await
     }

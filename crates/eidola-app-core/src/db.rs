@@ -8774,29 +8774,80 @@ pub async fn list_proxy_backend_rows(conn: &Connection) -> Result<Vec<String>, A
 }
 
 /// Expose or withdraw one backend. Idempotent in both directions.
+/// What an exposure write did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExposureWrite {
+    /// The permission now says what the caller asked it to.
+    Applied,
+    /// There is no live backend of that id to grant a permission over, so
+    /// nothing was written.
+    NoLiveBackend,
+}
+
+/// Grant or withdraw the proxy's permission over one backend.
+///
+/// **The write carries its own premise** (the decide-at-the-write rule). A
+/// caller that checks the backend is live and *then* writes leaves a gap that
+/// `remove_backend` fits inside: the check passes, the removal's transaction
+/// soft-deletes the row and drops the exposure with it, and the insert then
+/// lands anyway — the foreign key is satisfied, because removal is soft, so the
+/// permission stands invisibly on a removed backend and re-adding that id
+/// revives it already exposed. That is exactly the implicit exposure the
+/// removal cure exists to prevent, reached through the other door.
+///
+/// So the liveness read and the insert are one `BEGIN IMMEDIATE` transaction,
+/// which turso serializes against the removal's own: whichever reserves the
+/// writer first, the loser sees the winner's committed state and decides
+/// against *that*. Withdrawing needs no premise — ending a permission over
+/// something that is not there is what the caller asked for either way.
 pub async fn set_proxy_backend(
     conn: &Connection,
     backend_id: &str,
     exposed: bool,
     now: i64,
-) -> Result<(), AppError> {
-    if exposed {
-        conn.execute(
-            "INSERT INTO proxy_backend (backend_id, created_at) VALUES (?1, ?2) \
-             ON CONFLICT(backend_id) DO NOTHING",
-            (Value::Text(backend_id.to_string()), Value::Integer(now)),
-        )
-        .await
-        .map_err(AppError::db)?;
-    } else {
+) -> Result<ExposureWrite, AppError> {
+    if !exposed {
         conn.execute(
             "DELETE FROM proxy_backend WHERE backend_id = ?1",
             (Value::Text(backend_id.to_string()),),
         )
         .await
         .map_err(AppError::db)?;
+        return Ok(ExposureWrite::Applied);
     }
-    Ok(())
+    begin_write(conn).await?;
+    match expose_proxy_backend_tx_body(conn, backend_id, now).await {
+        Ok(wrote) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(wrote)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn expose_proxy_backend_tx_body(
+    conn: &Connection,
+    backend_id: &str,
+    now: i64,
+) -> Result<ExposureWrite, AppError> {
+    let live = get_backend(conn, backend_id)
+        .await?
+        .is_some_and(|row| row.removed_at.is_none());
+    if !live {
+        return Ok(ExposureWrite::NoLiveBackend);
+    }
+    conn.execute(
+        "INSERT INTO proxy_backend (backend_id, created_at) VALUES (?1, ?2) \
+         ON CONFLICT(backend_id) DO NOTHING",
+        (Value::Text(backend_id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(ExposureWrite::Applied)
 }
 
 /// Every key ever generated, newest first — live ones and revoked ones alike,
@@ -8929,6 +8980,81 @@ pub async fn touch_proxy_key(conn: &Connection, id: &str, now: i64) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSION: **the exposure write carries its own premise.**
+    ///
+    /// Asking whether the backend is live and *then* inserting leaves a gap a
+    /// concurrent `remove_backend` fits inside: the check passes, the removal
+    /// soft-deletes the row and drops the exposure it is deleting, and the
+    /// insert lands anyway — the foreign key is satisfied, because removal is
+    /// soft. The permission then stands on a removed backend where no listing
+    /// shows it, and re-adding that id revives it already exposed, which is the
+    /// implicit exposure the removal cure exists to prevent, reached through the
+    /// other door. The race cannot be scheduled from a test; what can be held is
+    /// the property that makes it harmless — a write that decides for itself.
+    #[test]
+    fn exposing_a_removed_backend_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        runtime.block_on(async move {
+            let database = open(dir.path()).await.expect("open");
+            let conn = connect(&database).await.expect("connect");
+            let row = BackendRow {
+                id: "acme".into(),
+                kind: "openai".into(),
+                display_name: "Acme".into(),
+                enabled: true,
+                base_url: Some("https://first.example".into()),
+                api_key: None,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                trusted_measurements: None,
+                hardware_root_ca: None,
+                hardware_intermediate_ca: None,
+                created_at: 1,
+                updated_at: 1,
+                removed_at: None,
+            };
+            insert_backend(&conn, &row).await.expect("add");
+            assert_eq!(
+                set_proxy_backend(&conn, "acme", true, 2)
+                    .await
+                    .expect("expose"),
+                ExposureWrite::Applied,
+                "a live backend takes the permission"
+            );
+
+            // The state the race leaves behind: the backend is gone (softly),
+            // and a write that had already passed its check arrives.
+            assert!(remove_backend(&conn, "acme", 3).await.expect("remove"));
+            assert_eq!(
+                set_proxy_backend(&conn, "acme", true, 4)
+                    .await
+                    .expect("expose"),
+                ExposureWrite::NoLiveBackend,
+                "and a removed one refuses at the write"
+            );
+            assert!(
+                list_proxy_backend_rows(&conn)
+                    .await
+                    .expect("rows")
+                    .is_empty(),
+                "nothing stands where no listing would ever show it"
+            );
+
+            // Withdrawing needs no premise: it is what the caller asked for
+            // whether or not the backend is there.
+            assert_eq!(
+                set_proxy_backend(&conn, "acme", false, 5)
+                    .await
+                    .expect("withdraw"),
+                ExposureWrite::Applied
+            );
+        });
+    }
 
     /// A reference edge quoting a post's text — what the two edge-level
     /// predicates are asked about. *Whether the quoted post can be named by
