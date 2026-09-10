@@ -2204,3 +2204,49 @@ fn an_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
         );
     });
 }
+
+/// **A bare-`\r` stream is split into its events, not accumulated into one.**
+///
+/// The event-stream format takes `\r\n`, `\n` and a bare `\r`, and any two in a
+/// row end an event — so recognising only `\n\n` and `\r\n\r\n` never split such
+/// a stream at all. On this path that is worse than slow: the frame accumulator
+/// has a ceiling of its own, so a long enough stream is refused outright, and
+/// until then nothing streams and the per-event model rewrite never runs.
+///
+/// The assertion is the rewrite, because it is per event: it can only be true
+/// if the events were separated.
+#[test]
+fn a_stream_framed_with_bare_carriage_returns_is_split_into_its_events() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkStreamingBareCarriageReturns,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("[DONE]"), "the stream ran to its end: {body}");
+        assert!(
+            body.matches("data:").count() >= 3,
+            "the events arrived separately rather than as one frame: {body}"
+        );
+        assert!(
+            !body.contains("refund"),
+            "no credential material travels downstream: {body}"
+        );
+        assert!(mock.refund_hits() >= 1, "the streaming hold settled");
+    });
+}

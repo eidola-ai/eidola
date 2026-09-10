@@ -95,6 +95,13 @@ pub enum ChatBehavior {
     OkNonJsonBody,
     /// 200 SSE stream: content + reasoning deltas, usage, `[DONE]`.
     OkStreaming,
+    /// The same stream with **bare carriage returns** as line endings.
+    ///
+    /// Valid event-stream — the format takes `\r\n`, `\n` and `\r` — and the
+    /// one a reader recognising only the first two never splits at all: every
+    /// event piles into one frame until a ceiling or EOF. A backend choosing
+    /// this is unusual, which is exactly why nothing else would notice.
+    OkStreamingBareCarriageReturns,
     /// The **real server's** streaming shape: content, a usage chunk, then a
     /// terminal metadata event (`object == "eidola.chat.completion.metadata"`)
     /// carrying the refund, then `[DONE]`.
@@ -1295,6 +1302,9 @@ async fn handle_chat(
             .await
         }
         ChatBehavior::OkStreaming => write_sse_stream(stream, true, &[STREAM_CONTENT]).await,
+        ChatBehavior::OkStreamingBareCarriageReturns => {
+            write_sse_stream_with_terminator(stream, &[STREAM_CONTENT], "\r").await
+        }
         ChatBehavior::StreamingWithMetadataRefund => {
             let refund = auth
                 .and_then(Issuer::spend_proof_from_auth)
@@ -2156,6 +2166,56 @@ async fn write_sse_stream(
     stream.write_all(&send_event("[DONE]".to_string())).await?;
 
     // Terminating zero-length chunk.
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// [`write_sse_stream`]'s happy path with a line ending the caller names.
+///
+/// Only the terminator differs — same events, same order, same `[DONE]` — so a
+/// test asserting the ordinary outcome over this writer is asserting that the
+/// *framing* was understood rather than that some other path was taken.
+async fn write_sse_stream_with_terminator(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+    eol: &str,
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let send_event = |payload: String| -> Vec<u8> {
+        let event = format!("data: {payload}{eol}{eol}");
+        let mut out = format!("{:x}\r\n", event.len()).into_bytes();
+        out.extend_from_slice(event.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+
+    let reasoning = serde_json::json!({
+        "choices": [{ "delta": { "reasoning": "thinking…" } }]
+    });
+    stream.write_all(&send_event(reasoning.to_string())).await?;
+    stream.flush().await?;
+
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "choices": [{ "delta": { "content": chunk } }]
+        });
+        stream.write_all(&send_event(content.to_string())).await?;
+        stream.flush().await?;
+    }
+
+    let usage = serde_json::json!({
+        "choices": [],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 5 }
+    });
+    stream.write_all(&send_event(usage.to_string())).await?;
+    stream.write_all(&send_event("[DONE]".to_string())).await?;
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())

@@ -1589,10 +1589,9 @@ impl Inner {
             };
             raw.push(&bytes);
             buf.extend_from_slice(&bytes);
-            while let Some(pos) = find_event_boundary(&buf) {
+            while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
                 let event: Vec<u8> = buf.drain(..pos).collect();
-                let boundary_len = if buf.starts_with(b"\r\n\r\n") { 4 } else { 2 };
-                let terminator: Vec<u8> = buf.drain(..boundary_len.min(buf.len())).collect();
+                let terminator: Vec<u8> = buf.drain(..boundary_len).collect();
                 let (mut out, refund) = forward_sse_event(&event, &route.canonical);
                 if refund.is_some() {
                     inline_refund = refund;

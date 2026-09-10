@@ -401,6 +401,57 @@ fn blocking_chat_recovers_refund_when_no_inline_refund() {
 // Happy path — streaming chat
 // ===========================================================================
 
+/// **A stream framed with bare carriage returns is still a stream.**
+///
+/// The event-stream format takes `\r\n`, `\n` and a bare `\r` as line endings,
+/// and any two in a row end an event — so a reader recognising only `\n\n` and
+/// `\r\n\r\n` never split such a stream at all: every event piled into one
+/// frame, deltas arrived (if at all) as one lump at EOF, and on the proxy's own
+/// path the per-event ceiling refused the stream outright. The turn path shares
+/// `find_event_boundary` with the proxy, so it is asserted here too: the
+/// ordinary outcome over unusual framing is what proves the framing was read.
+#[test]
+fn a_stream_framed_with_bare_carriage_returns_still_delivers_its_deltas() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreamingBareCarriageReturns,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content, reasoning, deltas) = core.runtime().block_on(async {
+            let collector = async {
+                let mut content = String::new();
+                let mut reasoning = String::new();
+                let mut deltas = 0usize;
+                while let Some(ev) = events_rx.recv().await {
+                    deltas += 1;
+                    match ev {
+                        ChatStreamEvent::ContentDelta(t) => content.push_str(&t),
+                        ChatStreamEvent::ReasoningDelta(t) => reasoning.push_str(&t),
+                    }
+                }
+                (content, reasoning, deltas)
+            };
+            let chat = core.chat_stream("stream me".into(), MODEL.into(), None, tx);
+            let (res, (content, reasoning, deltas)) = tokio::join!(chat, collector);
+            (res, content, reasoning, deltas)
+        });
+
+        let res = res.expect("a bare-CR stream completes like any other");
+        assert_eq!(content, "Hello from the stream.");
+        assert_eq!(reasoning, "thinking…");
+        assert_eq!(res.input_tokens, Some(11));
+        assert_eq!(res.output_tokens, Some(5));
+        assert_eq!(
+            deltas, 2,
+            "the events arrived one at a time rather than as one undivided frame"
+        );
+        assert!(mock.refund_hits() >= 1);
+    });
+}
+
 #[test]
 fn streaming_chat_delivers_deltas_and_persists() {
     run(|| {

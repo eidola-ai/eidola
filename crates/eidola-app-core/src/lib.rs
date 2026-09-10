@@ -8350,13 +8350,11 @@ impl Inner {
             response_buf.extend_from_slice(&bytes);
             buf.extend_from_slice(&bytes);
 
-            while let Some(pos) = find_event_boundary(&buf) {
+            while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
                 let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
-                // Drop the boundary itself (\n\n or \r\n\r\n).
-                let boundary_len = if buf.starts_with(b"\r\n\r\n") { 4 } else { 2 };
-                if buf.len() >= boundary_len {
-                    buf.drain(..boundary_len);
-                }
+                // Drop the boundary itself — 2, 3 or 4 bytes, whichever pair of
+                // line terminators `find_event_boundary` matched.
+                buf.drain(..boundary_len);
                 let event_str = match std::str::from_utf8(&event_bytes) {
                     Ok(s) => s,
                     Err(_) => continue,
@@ -8960,17 +8958,53 @@ impl Inner {
     }
 }
 
-/// Find the byte offset of the next SSE event boundary (`\n\n` or
-/// `\r\n\r\n`) in `buf`, if any. Returns the position *before* the boundary
-/// — i.e. the length of the next event's body.
-fn find_event_boundary(buf: &[u8]) -> Option<usize> {
+/// The length of the SSE line terminator starting at `i`, or `None` if none
+/// starts there.
+///
+/// The event-stream format takes three line endings — `\r\n`, `\n` and a bare
+/// `\r` — and treats any two in a row as the blank line that ends an event.
+///
+/// **A `\r` at the very end of `buf` is read as a terminator, and the residual
+/// is stated rather than avoided.** It is genuinely ambiguous — it may be the
+/// first half of a `\r\n` the next chunk carries, the classic split-across-
+/// chunk-edges trap — but the two ways of resolving it are not symmetric.
+/// Waiting for the byte that decides it strands the **last** event of any
+/// `\r`-terminated stream, which is exactly `[DONE]`: the read reaches EOF with
+/// the terminator still unresolved and the turn reports a stream that ended
+/// without finishing. Reading it eagerly splits `\r\r` out of a stream that
+/// really said `\r\r\n` and leaves a stray `\n` heading the next event — which
+/// **both** consumers already tolerate: the proxy forwards each event with the
+/// terminator it consumed, so the bytes a downstream parser sees are unchanged
+/// in total, and the turn path's `lines()` walk skips a line carrying no
+/// `data:` prefix. A harmless mis-split beats a lost completion.
+fn terminator_len(buf: &[u8], i: usize) -> Option<usize> {
+    match buf.get(i)? {
+        b'\r' if buf.get(i + 1) == Some(&b'\n') => Some(2),
+        b'\r' | b'\n' => Some(1),
+        _ => None,
+    }
+}
+
+/// Find the next SSE event boundary in `buf`: the offset *before* it (the
+/// length of the next event's body) and the boundary's own length.
+///
+/// **Every valid line ending, not the two that are common.** Recognising only
+/// `\n\n` and `\r\n\r\n` meant a backend emitting bare-`\r` SSE — valid, and
+/// what the format explicitly allows — never split at all: its events piled
+/// into one frame until the per-event ceiling rejected the stream or EOF
+/// forwarded the whole tail at once, so nothing streamed and no per-event
+/// rewriting happened. The boundary's length is returned rather than
+/// re-derived, since it is now 2, 3 or 4 bytes depending on which pair of
+/// terminators was found.
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     for i in 0..buf.len() {
-        if buf[i..].starts_with(b"\r\n\r\n") {
-            return Some(i);
-        }
-        if buf[i..].starts_with(b"\n\n") {
-            return Some(i);
-        }
+        let Some(first) = terminator_len(buf, i) else {
+            continue;
+        };
+        let Some(second) = terminator_len(buf, i + first) else {
+            continue;
+        };
+        return Some((i, first + second));
     }
     None
 }
@@ -16182,6 +16216,73 @@ async fn flush_attestations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An event ends at any two line terminators the format allows.**
+    ///
+    /// The event-stream format takes `\r\n`, `\n` and a bare `\r`, so a blank
+    /// line is any two of them in a row — six pairs, not the two that are
+    /// common. Recognising only `\n\n` and `\r\n\r\n` meant a backend emitting
+    /// bare-`\r` SSE never split at all: every event piled into one frame until
+    /// the per-event ceiling refused the stream or EOF forwarded the whole tail
+    /// in one piece, so nothing streamed and no per-event work ran.
+    #[test]
+    fn an_event_ends_at_every_line_ending_the_format_allows() {
+        for (sep, len) in [
+            ("\n\n", 2),
+            ("\r\r", 2),
+            ("\r\n\r\n", 4),
+            ("\r\n\n", 3),
+            ("\n\r\n", 3),
+            ("\r\n\r", 3),
+        ] {
+            let buf = format!("data: one{sep}data: two\n\n");
+            assert_eq!(
+                find_event_boundary(buf.as_bytes()),
+                Some((9, len)),
+                "separator {sep:?} ends the first event"
+            );
+        }
+
+        // Nothing that is not a blank line ends one.
+        assert_eq!(find_event_boundary(b"data: one\ndata: two\n"), None);
+        assert_eq!(find_event_boundary(b""), None);
+    }
+
+    /// **A `\r` at a chunk edge is split eagerly, and the residual is what
+    /// makes that the right choice** — the classic split-across-chunk-edges
+    /// trap, resolved by comparing what each answer costs.
+    ///
+    /// Waiting for the byte that decides it strands the last event of any
+    /// `\r`-terminated stream (exactly `[DONE]`, at EOF, where no byte is
+    /// coming): the turn reports a stream that ended without finishing. Reading
+    /// it eagerly can split `\r\r` out of a `\r\r\n`, leaving a stray `\n`
+    /// heading the next event — which both readers already tolerate.
+    #[test]
+    fn a_carriage_return_at_a_chunk_edge_still_ends_its_event() {
+        // The end of the buffer is the end of the evidence.
+        assert_eq!(find_event_boundary(b"data: one\r\r"), Some((9, 2)));
+        assert_eq!(find_event_boundary(b"data: one\r"), None, "one is not two");
+
+        // With the next byte in hand the length follows what really arrived.
+        assert_eq!(find_event_boundary(b"data: one\r\rd"), Some((9, 2)));
+        assert_eq!(find_event_boundary(b"data: one\r\r\nd"), Some((9, 3)));
+        assert_eq!(find_event_boundary(b"data: one\r\n\r\nd"), Some((9, 4)));
+
+        // The residual, named: the `\r\r\n` split across a chunk edge leaves a
+        // `\n` heading the next event. It carries no `data:` prefix, so the
+        // turn path's line walk skips it, and the proxy forwards every byte it
+        // consumed either way — so the split is invisible downstream.
+        let (pos, len) = find_event_boundary(b"data: one\r\r").expect("a boundary");
+        assert_eq!(&b"data: one\r\r"[pos..pos + len], b"\r\r");
+        assert!(
+            !"\ndata: two"
+                .lines()
+                .next()
+                .expect("a line")
+                .starts_with("data:"),
+            "the stray newline heads a line no reader acts on"
+        );
+    }
 
     /// A model list from a server that publishes no capabilities at all — the
     /// shape every generic backend sends, and the shape our own server sent
