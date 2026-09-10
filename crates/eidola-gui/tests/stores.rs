@@ -3482,6 +3482,80 @@ fn two_presses_of_the_proxy_switch_derive_from_each_other(cx: &mut TestAppContex
     );
 }
 
+/// REGRESSION: **a settling write does not revert a sibling's pending edit.**
+///
+/// An answer is a whole snapshot of the database at the moment *that* write
+/// committed, so adopting one while a differently-keyed sibling is still
+/// travelling overwrites the sibling's optimistic delta with a row that
+/// predates it — an exposure checkbox goes back to unchecked while its own
+/// write is on its way to making it true. Worse than a flicker, because the
+/// pane derives its next press from what it renders: taking the choice back
+/// then reads the reverted checkbox and writes `true` a second time, so the
+/// reader's undo leaves it exposed.
+///
+/// Two spawned writes cannot be made to interleave on demand, so the landing is
+/// driven directly — the decision under test is what a settle does while
+/// another slot is genuinely occupied.
+#[gpui::test]
+fn a_settling_write_leaves_a_pending_siblings_edit_alone(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+
+    stores.proxy.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the settings load", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().is_some())
+    });
+    let exposed = |cx: &mut TestAppContext| {
+        stores.proxy.read_with(cx, |s, _| {
+            s.settings()
+                .value()
+                .expect("a loaded snapshot")
+                .exposed_ids
+                .iter()
+                .any(|b| b == "eidola")
+        })
+    };
+    assert!(!exposed(cx), "a fresh profile exposes nothing");
+
+    // The checkbox's press: its slot is occupied and its delta is on screen.
+    stores
+        .proxy
+        .update(cx, |s, cx| s.set_backend_exposed("eidola".into(), true, cx));
+    assert!(exposed(cx), "the press shows what it is writing");
+
+    // A sibling write lands with the database as it was *before* that press —
+    // which is exactly what its own round trip would have answered with.
+    let stale = stores
+        .proxy
+        .read_with(cx, |s, _| s.settings().value().cloned())
+        .map(|mut settings| {
+            settings.exposed_ids.retain(|b| b != "eidola");
+            settings.backends.retain(|b| b != "eidola");
+            settings.enabled = true;
+            settings
+        })
+        .expect("a snapshot to age");
+    stores
+        .proxy
+        .update(cx, |s, cx| s.settle_for_test(Ok(stale), cx));
+
+    assert!(
+        exposed(cx),
+        "the pending choice is still what the reader sees, so their next press \
+         derives from it rather than from a row that predates it"
+    );
+
+    // And once nothing is writing, the batch-end read is what resolves the
+    // cell — the honest answer, taken after the last write.
+    wait_until(cx, "the batch settles", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.op_error().is_some() || !s.writing())
+    });
+    assert!(exposed(cx), "and the database agrees");
+}
+
 /// REGRESSION: **a listener that gave up says why, and is started again.**
 ///
 /// The accept loop stops after sixteen consecutive refused accepts. Nothing

@@ -534,18 +534,49 @@ impl ProxyStore {
         cx.notify();
     }
 
+    /// Test seam: land a settings answer as a write's completion would, so the
+    /// decision below can be held while another slot is genuinely occupied —
+    /// an interleaving two spawned writes cannot be made to take on demand.
+    #[doc(hidden)]
+    pub fn settle_for_test(
+        &mut self,
+        result: Result<ProxySettings, eidola_app_core::error::AppError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.settle(result, cx);
+    }
+
     /// A settings write's landing: adopt what the core answered — which is the
     /// resolved settings, not what was asked for — and reconcile the listener
     /// against it.
+    ///
+    /// **Only the last write adopts.** An answer is a whole snapshot of the
+    /// database at the moment *that* write committed, so adopting one while a
+    /// differently-keyed sibling is still travelling overwrites the sibling's
+    /// optimistic delta with a row that predates it: an exposure checkbox goes
+    /// back to unchecked while its own write is still on its way to making it
+    /// true. That is worse than a flicker, because the pane derives its next
+    /// press from what it renders — taking the choice back then reads the
+    /// reverted checkbox and writes `true` a second time, so the reader's undo
+    /// leaves it exposed. The batch-end resolving read is already the honest
+    /// answer to "what does the database now say" (`start_op` takes it once
+    /// `op_tasks` is empty); until then the optimistic snapshot is what will be
+    /// true, which is exactly what the reader should be looking at. The slot is
+    /// removed before this runs, so an empty map means *this* was the last.
     fn settle(
         &mut self,
         result: Result<ProxySettings, eidola_app_core::error::AppError>,
         cx: &mut Context<Self>,
     ) {
         match result {
-            Ok(settings) => {
+            Ok(settings) if self.op_tasks.is_empty() => {
                 self.settings = Loadable::loaded(settings);
                 self.reconcile_listener(cx);
+            }
+            Ok(_) => {
+                // A sibling is still writing, so its optimistic delta is the
+                // truth in flight and this answer is already out of date. The
+                // listener moves with the batch-end read, for the same reason.
             }
             Err(e) => {
                 self.op_error = Some(e.to_string());
