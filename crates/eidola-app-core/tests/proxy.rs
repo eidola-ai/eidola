@@ -1985,6 +1985,19 @@ fn an_enormous_prompt_is_recorded_as_the_truncation_it_is() {
             "and a partial says it is one: {}",
             &text[text.len().saturating_sub(200)..]
         );
+        // **And it says which side it truncated.** A shared wording had this
+        // column claiming it kept part of a "response" whose remainder "was
+        // delivered" — the other side's story told about the bytes this app
+        // sent, on the one trail whose value is that it describes itself.
+        let tail = &text[text.len().saturating_sub(300)..];
+        assert!(
+            tail.contains("-byte request") && tail.contains("sent upstream"),
+            "a truncated request says it is a request: {tail}"
+        );
+        assert!(
+            !tail.contains("response") && !tail.contains("delivered"),
+            "and never borrows the response's words: {tail}"
+        );
     });
 }
 

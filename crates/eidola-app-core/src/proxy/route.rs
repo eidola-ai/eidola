@@ -181,7 +181,7 @@ impl RecordedBody {
     /// is not optional information about a body, and a blocking read has an
     /// ending of its own now that it is bounded — see [`RecordedBody::seal_blocking`].
     fn seal_stream(self, delivery: StreamDelivery) -> Vec<u8> {
-        let mut out = seal_recorded_body(self.kept, self.received);
+        let mut out = seal_recorded_body(self.kept, self.received, RecordedSide::Response);
         if let Some(note) = delivery.note() {
             out.extend_from_slice(note.as_bytes());
         }
@@ -196,14 +196,19 @@ impl RecordedBody {
     /// question — only the retention cap can make the row a partial, and the
     /// cap's own note says exactly that. Every seal names its class, so the
     /// absence of an ending is a stated fact rather than a forgotten one.
+    ///
+    /// **And the cap's note is a request's note** ([`RecordedSide`]): a shared
+    /// wording had this column saying it kept part of a "response" whose
+    /// remainder "was delivered", which is the other side's story told about
+    /// these bytes.
     fn seal_request(self) -> Vec<u8> {
-        seal_recorded_body(self.kept, self.received)
+        seal_recorded_body(self.kept, self.received, RecordedSide::Request)
     }
 
     /// The bytes to record for a blocking answer, with the note when the
     /// ceiling — not the upstream — is why the read stopped.
     fn seal_blocking(self, read: BodyRead) -> Vec<u8> {
-        let mut out = seal_recorded_body(self.kept, self.received);
+        let mut out = seal_recorded_body(self.kept, self.received, RecordedSide::Response);
         if let Some(note) = read.note() {
             out.extend_from_slice(note.as_bytes());
         }
@@ -338,20 +343,49 @@ impl StreamDelivery {
     }
 }
 
-/// Take a whole body down to what the Record keeps, saying so if it did.
-fn seal_recorded_body(mut kept: Vec<u8>, received: usize) -> Vec<u8> {
+/// Which side of an exchange a recorded body is.
+///
+/// **The cap's note names the side it truncated, because the Record's whole
+/// value is that it describes itself.** One wording for both columns had the
+/// `request_body` column saying it kept part of a "response" whose remainder
+/// "was delivered" — response words, on the bytes this app *sent*, so a reader
+/// looking at a truncated exchange could not tell which half was cut. And the
+/// two sides are not truncated for the same reason: a response's remainder went
+/// downstream to the caller, while a request's remainder went **upstream** —
+/// the prompt travels whole, and only the retention is bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordedSide {
+    /// A body this app constructed and sent upstream in one piece.
+    Request,
+    /// A body an upstream sent, whose kept prefix is what a caller received.
+    Response,
+}
+
+impl RecordedSide {
+    fn cap_note(self, kept: usize, received: usize) -> String {
+        match self {
+            RecordedSide::Request => format!(
+                "\n\n[eidola: this Record entry keeps the first {kept} bytes of a {received}-byte \
+                 request. The whole request was sent upstream; the rest was not retained.]\n"
+            ),
+            RecordedSide::Response => format!(
+                "\n\n[eidola: this Record entry keeps the first {kept} bytes of a {received}-byte \
+                 response. The rest was delivered and not retained.]\n"
+            ),
+        }
+    }
+}
+
+/// Take a whole body down to what the Record keeps, saying so — and saying
+/// which side it is — if it did.
+fn seal_recorded_body(mut kept: Vec<u8>, received: usize, side: RecordedSide) -> Vec<u8> {
     if kept.len() > RECORD_BODY_MAX_BYTES {
         kept.truncate(RECORD_BODY_MAX_BYTES);
     }
     if received <= kept.len() {
         return kept;
     }
-    let note = format!(
-        "\n\n[eidola: this Record entry keeps the first {} bytes of a {}-byte response. The rest \
-         was delivered and not retained.]\n",
-        kept.len(),
-        received
-    );
+    let note = side.cap_note(kept.len(), received);
     kept.extend_from_slice(note.as_bytes());
     kept
 }
