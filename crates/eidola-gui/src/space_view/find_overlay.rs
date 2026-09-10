@@ -123,6 +123,23 @@ const FRAGMENT_GAP: f32 = 10.0;
 /// placeholder, and its size is the measured height where the fragment has
 /// painted once and an estimate before that.
 const RESULT_MARGIN: f32 = 600.0;
+/// A reveal owed a correction, and what it was last performed against.
+///
+/// `key` is a [`FindOverlay::tops`] key — a fragment id for the cursor's own
+/// reveal, a node id for a map press's group jump, which cannot collide (a
+/// fragment id carries a `#`). `align_top` is which of the two rules to re-run:
+/// a group jump puts its target at the top of the viewport, a cursor move is
+/// minimal and leaves a card already in view where the reader put it.
+#[derive(Clone, PartialEq)]
+struct RevealDebt {
+    key: SharedString,
+    placed: (f32, f32),
+    align_top: bool,
+    /// The list's offset as this reveal left it — what says whether the next
+    /// frame's offset is still ours or the reader's.
+    at: f32,
+}
+
 /// How far outside the results viewport a card's **editor state** is kept.
 ///
 /// A card's state is not the card: it holds a copy of its node's *whole*
@@ -591,6 +608,26 @@ pub(crate) struct FindOverlay {
     /// behind [`MAP_MARGIN`], and the only thing that can show it (a dot
     /// outside the band and one the conversation does not have paint alike).
     map_painted: usize,
+    /// A reveal that was performed against a **placement that may still move**,
+    /// and the placement it used — the list's own half of the two-phase reveal
+    /// the bar already runs against the page.
+    ///
+    /// Every position in this list is a sum of the cards above it, and a card
+    /// that has never painted contributes an *estimate*. So a jump lands the
+    /// reader by arithmetic over text nobody has shaped: the target's band then
+    /// renders for the first time, its measuring canvases replace those
+    /// estimates, and everything below shifts — far enough, when the guesses
+    /// were generous, to carry the cursor's card clean out of the viewport
+    /// while the cursor still names it and Enter still opens it. Recorded here
+    /// so the frame that learns the real numbers can re-run the same reveal
+    /// against them; discharged the moment the placement stops moving, which is
+    /// what keeps it from re-asserting itself over a reader who has since
+    /// scrolled somewhere of their own.
+    reveal_debt: Option<RevealDebt>,
+    /// The height the list was last laid out against — what "in view" means for
+    /// a card, recorded rather than re-derived so a reader of this state and
+    /// the render cannot disagree about the viewport.
+    list_viewport: f32,
     /// The nodes whose group is in the list's viewport this frame — the map's
     /// `aria_selected` set, derived rather than stored as state of its own.
     in_view: HashSet<SharedString>,
@@ -637,6 +674,8 @@ impl FindOverlay {
             heights: Rc::new(RefCell::new(HashMap::new())),
             bodies: HashMap::new(),
             map_painted: 0,
+            reveal_debt: None,
+            list_viewport: 0.0,
             tops: HashMap::new(),
             in_view: HashSet::new(),
             map_slots: HashMap::new(),
@@ -1381,21 +1420,103 @@ impl SpaceView {
                 .and_then(|f| session.overlay.tops.get(&f.id).copied())
                 .map(|placed| (placed, -session.overlay.scroll.offset().y.as_f32()))
         });
-        // Minimal motion, the reveal's own rule: a card already in view is left
-        // where the reader put it.
-        if let Some(((top, height), at)) = placed {
-            let next = if top < at {
-                Some(top)
-            } else if top + height > at + viewport_h {
-                Some(top + height - viewport_h)
-            } else {
-                None
-            };
-            if let Some(next) = next {
-                self.scroll_find_results_to(next);
-            }
+        if let Some((placed, at)) = placed
+            && let Some(key) = fragments.get(idx).map(|f| f.id.clone())
+        {
+            self.apply_find_reveal(key, placed, at, viewport_h, false);
         }
         cx.notify();
+    }
+
+    /// Perform one results-list reveal and **record what it was performed
+    /// against**, so the frame that replaces an estimate with a measurement can
+    /// re-run it against the real numbers ([`RevealDebt`]).
+    ///
+    /// `align_top` distinguishes the two rules this list has: a group jump puts
+    /// its target at the top of the viewport, while a cursor move is *minimal*
+    /// — the reveal's own rule, so a card already in view is left where the
+    /// reader put it.
+    fn apply_find_reveal(
+        &mut self,
+        key: SharedString,
+        placed: (f32, f32),
+        at: f32,
+        viewport_h: f32,
+        align_top: bool,
+    ) {
+        let (top, height) = placed;
+        let next = if align_top || top < at {
+            // A group jump aligns its target to the top of the viewport; a
+            // cursor move does the same only when the card is *above* it.
+            Some(top)
+        } else if top + height > at + viewport_h {
+            Some(top + height - viewport_h)
+        } else {
+            // Minimal motion, the reveal's own rule: a card already in view is
+            // left where the reader put it. Unreachable for a group jump, whose
+            // first arm is unconditional.
+            None
+        };
+        if let Some(next) = next {
+            self.scroll_find_results_to(next);
+        }
+        if let Some(session) = self.find.as_mut() {
+            let at = -session.overlay.scroll.offset().y.as_f32();
+            session.overlay.reveal_debt = Some(RevealDebt {
+                key,
+                placed,
+                align_top,
+                at,
+            });
+        }
+    }
+
+    /// Re-run a reveal whose placement moved under it, and discharge it once it
+    /// has stopped moving.
+    ///
+    /// Run from the render, after the frame's `tops` are recorded, because
+    /// those are what a measurement has just changed. **It corrects while the
+    /// number moves and then lets go** — which is what keeps it a correction
+    /// rather than a standing claim on the viewport: by the time a reader could
+    /// scroll somewhere of their own, the debt is already discharged, so no
+    /// later measurement can drag them back. A key the list no longer carries
+    /// (its fragment gone, its group regenerated away) is dropped for the same
+    /// reason there is nothing to retarget onto.
+    fn correct_find_list_reveal(&mut self, viewport_h: f32) {
+        let Some(debt) = self
+            .find
+            .as_ref()
+            .and_then(|s| s.overlay.reveal_debt.clone())
+        else {
+            return;
+        };
+        let Some(session) = self.find.as_ref() else {
+            return;
+        };
+        let Some(placed) = session.overlay.tops.get(&debt.key).copied() else {
+            if let Some(session) = self.find.as_mut() {
+                session.overlay.reveal_debt = None;
+            }
+            return;
+        };
+        let at = -session.overlay.scroll.offset().y.as_f32();
+        if placed == debt.placed {
+            // **Nothing has moved, so the question is whose offset this is.**
+            // A debt is not discharged by standing still — the frame right
+            // after a jump has measured nothing yet, so "stable" there means
+            // *not yet*, and discharging on it would let go one frame before
+            // the numbers it is waiting for arrive. It is discharged by the
+            // **reader**: an offset that is no longer the one this reveal left
+            // is theirs, and a correction that pulled them back from it would
+            // be the surface taking the viewport off someone who had moved on.
+            if (at - debt.at).abs() > 0.5
+                && let Some(session) = self.find.as_mut()
+            {
+                session.overlay.reveal_debt = None;
+            }
+            return;
+        }
+        self.apply_find_reveal(debt.key, placed, at, viewport_h, debt.align_top);
     }
 
     /// What a press on a map node does: take the results list to that node's
@@ -1415,14 +1536,18 @@ impl SpaceView {
         first_fragment: Option<usize>,
         cx: &mut Context<Self>,
     ) {
-        let Some((top, _)) = self
+        let Some((session, placed)) = self
             .find
             .as_ref()
-            .and_then(|s| s.overlay.tops.get(node).copied())
+            .and_then(|s| s.overlay.tops.get(node).copied().map(|p| (s, p)))
         else {
             return;
         };
-        self.scroll_find_results_to(top);
+        // A group jump aligns its target to the top, and is owed the same
+        // correction a cursor move is: the group's own top is a sum over every
+        // card above it, and those are estimates until they paint.
+        let at = -session.overlay.scroll.offset().y.as_f32();
+        self.apply_find_reveal(node.clone(), placed, at, 0.0, true);
         if let (Some(index), Some(session)) = (first_fragment, self.find.as_mut()) {
             session.overlay.cursor = index;
         }
@@ -1499,6 +1624,33 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn scroll_find_results_for_test(&mut self, top: f32) {
         self.scroll_find_results_to(top);
+    }
+
+    /// Whether the card the roving cursor names is in the list's viewport —
+    /// the property the reveal's correction exists to keep true, and the only
+    /// honest way to ask it (the cursor names a card whether or not the reveal
+    /// left it anywhere the reader can see).
+    #[doc(hidden)]
+    pub fn find_cursor_in_view_for_test(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        let ids: Vec<SharedString> = self
+            .find_results(&map, &post_index(&self.posts), cx)
+            .into_iter()
+            .flat_map(|g| g.fragments)
+            .map(|f| f.id)
+            .collect();
+        let id = ids.get(self.find_result_cursor(ids.len())?)?.clone();
+        let overlay = &self.find.as_ref()?.overlay;
+        let (top, height) = overlay.tops.get(&id).copied()?;
+        let at = -overlay.scroll.offset().y.as_f32();
+        Some(top + height > at && top < at + overlay.list_viewport)
     }
 
     /// How many map dots the last frame actually **built** — the counted bound
@@ -1922,6 +2074,53 @@ impl SpaceView {
             );
         }
 
+        // **A sparse match needs a traversal candidate.** The band alone is not
+        // enough to keep Tab whole, and the hole is exactly where the earlier
+        // defence stopped: the walk advances the band only when the dot it
+        // *lands on* was outside it, so two matching dots separated by more
+        // than the margin with nothing matching between leave the reader on the
+        // last painted match — already in view, so nothing scrolls — with the
+        // distant one unpainted and therefore not in a tab order derived from
+        // what painted. Tab skipped it.
+        //
+        // **The candidate question is one-dimensional, because the tab order
+        // is**: it is paint order, which is this loop's order, which is the
+        // map's own depth-then-lane sequence. So there is no diagonal to reason
+        // about — the rule is over the *matching* nodes in that sequence, and
+        // it is the smallest one that makes the walk total: a matching node is
+        // built when its immediate neighbour in that sequence is in band. From
+        // any painted match, Tab therefore reaches its linear successor, the
+        // reveal brings that one into view, and the next frame makes *its*
+        // successor a candidate — the induction the band alone could not carry.
+        //
+        // Bounded by the painted set rather than by the conversation: at most
+        // two extra dots per painted match, and two in total in the ordinary
+        // case where the painted matches are contiguous in the sequence. That
+        // cost is what keeps per-node stops (and with them the map's shape as a
+        // *graph*) rather than conceding the roving cursor the list beside it
+        // uses — the two structural reasons for refusing it are untouched:
+        // every group is still reachable through the list's own cursor, and
+        // collapsing the dots onto one stop would still make this map a second
+        // linear walk of the sequence that list already is.
+        let candidates: HashSet<SharedString> = {
+            let ms: Vec<usize> = map
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| with_matches.contains(&n.node))
+                .map(|(i, _)| i)
+                .collect();
+            let banded: Vec<bool> = ms
+                .iter()
+                .map(|&i| cell_in_band(map[i].depth, map[i].lane))
+                .collect();
+            (0..ms.len())
+                .filter(|&p| {
+                    !banded[p] && ((p > 0 && banded[p - 1]) || (p + 1 < ms.len() && banded[p + 1]))
+                })
+                .map(|p| map[ms[p]].node.clone())
+                .collect()
+        };
+
         let mut painted = 0usize;
         for (i, node) in map.iter().enumerate() {
             let has = with_matches.contains(&node.node);
@@ -1938,7 +2137,8 @@ impl SpaceView {
             // stops being a stop — its post ceasing to match — which is a fact
             // about the results rather than about the viewport.
             let focused = has && slots.get(&node.node).is_some_and(|h| h.is_focused(window));
-            if !cell_in_band(node.depth, node.lane) && !focused {
+            if !cell_in_band(node.depth, node.lane) && !focused && !candidates.contains(&node.node)
+            {
                 continue;
             }
             painted += 1;
@@ -2086,6 +2286,9 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(session) = self.find.as_mut() {
+            session.overlay.list_viewport = viewport_h;
+        }
         let fragments: Vec<ResultFragment> = groups
             .iter()
             .flat_map(|g| g.fragments.iter().cloned())
@@ -2315,6 +2518,10 @@ impl SpaceView {
             // place that can answer which states the band still wants.
             session.overlay.retain_bodies(&kept);
         }
+        // …and where every card is, is exactly what a measurement landing this
+        // frame has just changed, so a reveal owed a correction is corrected
+        // here.
+        self.correct_find_list_reveal(viewport_h);
 
         div()
             .relative()

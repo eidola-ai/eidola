@@ -23334,6 +23334,150 @@ fn space_an_overlaying_inspector_takes_the_keyboard_off_what_it_covers(cx: &mut 
     );
 }
 
+/// **A reveal performed against estimates is corrected when the measurements
+/// land.**
+///
+/// Every position in the results list is a sum of the cards above it, and a
+/// card that has never painted contributes an estimate — so a jump places the
+/// reader by arithmetic over text nobody has shaped. The target's band then
+/// renders for the first time and those estimates are replaced; where the
+/// guesses were generous, everything below moves up far enough to carry the
+/// cursor's own card clean out of the viewport while the cursor still names it
+/// and Enter still opens it.
+#[gpui::test]
+fn space_find_corrects_a_cursor_reveal_when_the_measurements_land(cx: &mut TestAppContext) {
+    // Cards whose source is much longer than what they render: a read-only
+    // editor hides a link's URL, so the estimate counts a thousand characters
+    // where the reader sees one word. That is a real over-estimate rather than
+    // a contrived one — it is the shape the projection exists to handle.
+    const BLOCKS: usize = 40;
+    let url = "a".repeat(300);
+    let mut body = String::new();
+    for i in 0..BLOCKS {
+        body.push_str(&format!(
+            "a kestrel [{i}](https://example.com/{url})\n\nthe grass below\n\n"
+        ));
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", &body)]);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // End: the cursor jumps to the last card, placed by estimates over forty
+    // cards nobody has laid out.
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+
+    // Let the frames the jump caused settle: the band renders, its canvases
+    // measure, the tops move, and the correction re-runs until they stop.
+    // Convergence is one band's worth of cards per frame — each correction
+    // moves the band, which measures the next few, which moves the tops again —
+    // so the budget is generous rather than tight. Nothing here polls a
+    // condition: the frames simply happen, as they do in front of a reader.
+    for _ in 0..20 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+
+    assert_eq!(
+        vcx.update(|window, cx| view
+            .update(cx, |v, cx| v.find_cursor_in_view_for_test(window, cx))),
+        Some(true),
+        "the card the cursor names is where the reader can see it"
+    );
+}
+
+/// **A sparse match is still reachable by Tab.**
+///
+/// The band alone does not keep the walk whole: it advances only when the dot
+/// Tab *lands on* was outside it, so two matching dots separated by more than
+/// the margin with nothing matching between left the reader on the last painted
+/// match — already in view, so nothing scrolled — with the distant one unpainted
+/// and out of a tab order derived from what painted.
+#[gpui::test]
+fn space_find_reaches_a_distant_match_on_the_map_by_tab(cx: &mut TestAppContext) {
+    // One fan, matches only at its two ends: every lane between them is a
+    // `Label` and no stop at all, so nothing in the middle can carry the walk.
+    const BRANCHES: usize = 60;
+    let mut posts = vec![fixture_user_post("a1", "a kestrel at the root")];
+    for i in 0..BRANCHES {
+        let text = if i == 0 || i == BRANCHES - 1 {
+            "another kestrel"
+        } else {
+            "the grass below"
+        };
+        let mut p = fixture_assistant_post(&format!("b{i}"), text);
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let total =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx)));
+    assert_eq!(
+        total,
+        BRANCHES + 1,
+        "precondition: the map is the whole space"
+    );
+    let distant = total - 1;
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_map_painted_for_test()) < total,
+        "precondition: the far lane is past the band"
+    );
+
+    // Stand on the near match — the root's own dot's neighbour, and the last
+    // one the band holds — and press Tab once.
+    assert!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.focus_find_map_node_for_test(1, window, cx))
+        ),
+        "precondition: the near match is a tab stop"
+    );
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.focus_next(cx));
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.find_focused_map_node_for_test(window, cx))
+        ),
+        Some(distant),
+        "Tab reaches the far match rather than walking out of the map"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()).0 < 0.0,
+        "…and the reveal brought it into view, as it does for any dot below the fold"
+    );
+}
+
 /// **The band never takes away what the reader is standing on.**
 ///
 /// Two things point into the results list from outside the band's own
