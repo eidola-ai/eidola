@@ -80,8 +80,55 @@ pub enum ChatBehavior {
     /// 200 JSON completion **without** an inline refund (forces the body-refund
     /// fallback to go through `/v1/credentials/refund`).
     OkBlockingNoInlineRefund,
+    /// A **complete** 200 JSON completion followed by enough trailing
+    /// whitespace to cross the blocking read's ceiling.
+    ///
+    /// The padded-complete-object shape, not a truncation: most oversized JSON
+    /// truncates into something that does not parse, so a mock that merely sent
+    /// a huge body would be indistinguishable from the cured behaviour. Here
+    /// the retained prefix parses perfectly, which is exactly why the ceiling
+    /// has to be asked about rather than inferred from the parse.
+    OkBlockingPaddedPastCeiling,
+    /// A `200` whose body is valid JSON and not a completion: an error document
+    /// answered with a success status, carrying a refund.
+    ///
+    /// Syntax is not shape. This parses perfectly and has no `choices`, so a
+    /// reader that stops at `from_str` hands a downstream tool an apparent
+    /// success carrying nothing it can read as an answer. The refund rides it
+    /// because the credential is spent either way — a body too shapeless to
+    /// answer with can still hold the only copy of the token — and it is minted
+    /// whatever [`RefundMode`] says, for the same reason
+    /// [`ChatBehavior::StreamingWithMetadataRefund`] does.
+    OkBlockingNotACompletion,
+    /// A `200` whose body is not JSON at all — a truncated answer, or an
+    /// intermediary's HTML error page. What a client must never read as a
+    /// successful completion.
+    OkNonJsonBody,
     /// 200 SSE stream: content + reasoning deltas, usage, `[DONE]`.
     OkStreaming,
+    /// The same stream with **bare carriage returns** as line endings.
+    ///
+    /// Valid event-stream — the format takes `\r\n`, `\n` and `\r` — and the
+    /// one a reader recognising only the first two never splits at all: every
+    /// event piles into one frame until a ceiling or EOF. A backend choosing
+    /// this is unusual, which is exactly why nothing else would notice.
+    ///
+    /// Its events are **multi-field** (`id:` ahead of `data:`) and name the
+    /// model in the upstream's own spelling, so a consumer that separates
+    /// events correctly and then parses their fields with `str::lines()` is
+    /// caught too — see [`write_sse_stream_with_terminator`].
+    OkStreamingBareCarriageReturns,
+    /// The **real server's** streaming shape: content, a usage chunk, then a
+    /// terminal metadata event (`object == "eidola.chat.completion.metadata"`)
+    /// carrying the refund, then `[DONE]`.
+    ///
+    /// The refund rides that event **whatever [`RefundMode`] says**, because
+    /// that is what the server does: its persistence of the token is
+    /// best-effort and its failure is exactly what makes the recovery endpoint
+    /// unable to answer, while the in-band copy still goes out. Pairing this
+    /// with `RefundMode::Fail` is therefore the honest model of the one case
+    /// where the in-band token is the *only* copy.
+    StreamingWithMetadataRefund,
     /// A plain success in **whichever transport asked** — SSE for a streaming
     /// request, JSON for a blocking one. One behaviour for a test that must
     /// exercise both twins against one upstream, which is otherwise impossible:
@@ -100,6 +147,11 @@ pub enum ChatBehavior {
     /// 200 SSE stream that the server aborts mid-event (writes a partial event,
     /// then drops the TCP connection). Exercises the mid-SSE read failure arm.
     StreamingMidAbort,
+    /// A `200 text/event-stream` that never terminates an event: it writes far
+    /// more than the proxy's per-event ceiling with no blank line anywhere, so
+    /// nothing can ever be drained out of the frame accumulator. The shape a
+    /// buffer with no ceiling of its own dies on.
+    StreamingUnterminatedFlood,
     /// 200 SSE stream that ends **cleanly** after real content but never says
     /// it is over: well-formed events, a proper end to the chunked body, and
     /// no `[DONE]` and no terminal `finish_reason` anywhere.
@@ -120,6 +172,17 @@ pub enum ChatBehavior {
     /// Non-2xx JSON error body (e.g. 500). Exercises the non-2xx arm of both
     /// `chat` and `chat_stream`.
     Non2xx(u16),
+    /// A **refund-bearing** non-2xx, the shape the server answers with when a
+    /// streaming request fails after the nullifier is recorded but before the
+    /// SSE opens — request validation, `send_stream`, a spend-proof re-encode
+    /// (`eidola-server/src/handlers.rs`: `error_response_with_refund`). The
+    /// credential is spent and the only copy of its refund may be in this body,
+    /// because the server's own persistence of the token is best-effort.
+    Non2xxWithRefund(u16),
+    /// A `200` SSE stream carrying **more bytes than the Record keeps**, so a
+    /// truncated recording is what a reader must be told about rather than
+    /// handed silently.
+    OkStreamingOversized,
     /// Accept the request, then drop the connection before sending any
     /// response bytes (network error after send).
     DropBeforeResponse,
@@ -286,6 +349,12 @@ pub enum SummaryBehavior {
     Reply(String),
     /// Non-2xx error body — the summarizer is reachable but refuses.
     Fail(u16),
+    /// A **complete** JSON completion whose assistant content is this string,
+    /// followed by megabytes of trailing whitespace — so the first bytes parse
+    /// perfectly while the body as a whole is past the ceiling this app reads.
+    /// The shape a caller that discards `over_ceiling` accepts as a whole
+    /// answer: truncation lands in the padding and the object still parses.
+    ReplyPaddedPastCeiling(String),
 }
 
 /// How the mock answers a chat request for [`ROUTER_MODEL`] — the may-decline
@@ -1065,6 +1134,14 @@ async fn handle_conn(
                     return write_json(&mut stream, *status, &error_body("summarizer unavailable"))
                         .await;
                 }
+                (true, SummaryBehavior::ReplyPaddedPastCeiling(content)) => {
+                    let body = serde_json::json!({
+                        "choices": [{ "message": { "role": "assistant", "content": content } }],
+                        "usage": { "prompt_tokens": 9, "completion_tokens": 5 },
+                    });
+                    let padded = format!("{body}{}", " ".repeat(3 * 1024 * 1024));
+                    return write_json(&mut stream, 200, &padded).await;
+                }
                 _ => {}
             }
             // A request for the router model is answered by the router arm
@@ -1188,8 +1265,52 @@ async fn handle_chat(
             }
             write_json(stream, 200, &body.to_string()).await
         }
+        ChatBehavior::OkBlockingPaddedPastCeiling => {
+            let body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            // Past `proxy::route::MAX_RESPONSE_BYTES` (8 MiB) — spelled here
+            // rather than imported, because the mock is the *peer* and must not
+            // learn this app's ceilings.
+            let padded = format!("{body}{}", " ".repeat(9 * 1024 * 1024));
+            write_json(stream, 200, &padded).await
+        }
+        ChatBehavior::OkBlockingNotACompletion => {
+            let mut body: serde_json::Value =
+                serde_json::from_str(&error_body("upstream model error")).expect("error body");
+            if let Some(refund_b64) = auth
+                .and_then(Issuer::spend_proof_from_auth)
+                .and_then(|sp| issuer.refund_for(&sp))
+            {
+                body["refund"] =
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
         ChatBehavior::Non2xx(status) => {
             write_json(stream, status, &error_body("upstream model error")).await
+        }
+        ChatBehavior::Non2xxWithRefund(status) => {
+            let mut body: serde_json::Value =
+                serde_json::from_str(&error_body("stream start failed")).expect("error body");
+            if let Some(refund_b64) = auth
+                .and_then(Issuer::spend_proof_from_auth)
+                .and_then(|sp| issuer.refund_for(&sp))
+            {
+                body["refund"] =
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
+            }
+            write_json(stream, status, &body.to_string()).await
+        }
+        ChatBehavior::OkStreamingOversized => {
+            // One very large content delta — far past what a Record row keeps,
+            // and nothing else about the stream unusual.
+            let big = "x".repeat(1_200_000);
+            write_sse_stream(stream, true, &[&big]).await
         }
         ChatBehavior::DropBeforeResponse => {
             // Drop the connection without writing anything: the client's
@@ -1199,7 +1320,28 @@ async fn handle_chat(
             // all reqwest surfaces a transport error from `send`.
             Ok(())
         }
+        ChatBehavior::OkNonJsonBody => {
+            write_raw(
+                stream,
+                200,
+                "text/html",
+                "<html><body>502 Bad Gateway</body></html>",
+            )
+            .await
+        }
         ChatBehavior::OkStreaming => write_sse_stream(stream, true, &[STREAM_CONTENT]).await,
+        ChatBehavior::OkStreamingBareCarriageReturns => {
+            write_sse_stream_with_terminator(stream, &[STREAM_CONTENT], "\r").await
+        }
+        ChatBehavior::StreamingWithMetadataRefund => {
+            let refund = auth
+                .and_then(Issuer::spend_proof_from_auth)
+                .and_then(|sp| issuer.refund_for(&sp))
+                .map(|refund_b64| {
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                });
+            write_sse_stream_with_metadata(stream, &[STREAM_CONTENT], refund).await
+        }
         ChatBehavior::OkStreamingWithHeader => {
             write_sse_stream(
                 stream,
@@ -1230,6 +1372,7 @@ async fn handle_chat(
             .await
         }
         ChatBehavior::StreamingMidAbort => write_sse_stream(stream, false, &[STREAM_CONTENT]).await,
+        ChatBehavior::StreamingUnterminatedFlood => write_sse_flood(stream).await,
         ChatBehavior::StreamingEndsWithoutDone => {
             write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
         }
@@ -1800,6 +1943,11 @@ fn sse_event(payload: &str) -> Vec<u8> {
 /// The streaming mock's answer text.
 pub const STREAM_CONTENT: &str = "Hello from the stream.";
 
+/// The name an upstream gives the model in its own chunks — deliberately
+/// **not** the canonical id, so a forwarded chunk still carrying it is a
+/// chunk nothing rewrote.
+pub const STREAM_WIRE_MODEL: &str = "upstream-wire-name";
+
 /// What a model that spent its whole budget thinking has to show for it.
 pub const TRUNCATED_REASONING: &str = "still working through it…";
 
@@ -1909,6 +2057,99 @@ async fn write_sse_unterminated_stream(
     Ok(())
 }
 
+/// The server's real streaming close: the ordinary chunks, then one metadata
+/// event carrying the refund, then `[DONE]`. See
+/// [`ChatBehavior::StreamingWithMetadataRefund`].
+/// A response with an arbitrary content type and body — for the shapes that
+/// are not JSON at all.
+async fn write_raw(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body.as_bytes()).await?;
+    stream.flush().await
+}
+
+async fn write_sse_stream_with_metadata(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+    refund: Option<serde_json::Value>,
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let send_event = |payload: String| -> Vec<u8> {
+        let event = format!("data: {payload}\n\n");
+        let mut out = format!("{:x}\r\n", event.len()).into_bytes();
+        out.extend_from_slice(event.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "choices": [{ "delta": { "content": chunk } }]
+        });
+        stream.write_all(&send_event(content.to_string())).await?;
+        stream.flush().await?;
+    }
+    let usage = serde_json::json!({
+        "choices": [],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 5 }
+    });
+    stream.write_all(&send_event(usage.to_string())).await?;
+
+    let mut metadata = serde_json::json!({
+        "object": "eidola.chat.completion.metadata",
+        "id": "chatcmpl-mock",
+    });
+    if let Some(refund) = refund {
+        metadata["refund"] = refund;
+    }
+    stream.write_all(&send_event(metadata.to_string())).await?;
+    stream.write_all(&send_event("[DONE]".to_string())).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// A stream that opens as server-sent events and then never ends an event.
+///
+/// Every byte is `data:` content with no blank line after it, so
+/// `find_event_boundary` never succeeds and everything written stays in the
+/// reader's frame accumulator. Deliberately more than the proxy's per-event
+/// ceiling, which is the whole point: the ceiling is what has to end this.
+async fn write_sse_flood(stream: &mut TcpStream) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let filler = "x".repeat(64 * 1024);
+    stream.write_all(b"6\r\ndata: \r\n").await?;
+    for _ in 0..24 {
+        let framed = format!("{:x}\r\n{filler}\r\n", filler.len());
+        stream.write_all(framed.as_bytes()).await?;
+        stream.flush().await?;
+    }
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await
+}
+
 async fn write_sse_stream(
     stream: &mut TcpStream,
     complete: bool,
@@ -1958,6 +2199,78 @@ async fn write_sse_stream(
     stream.write_all(&send_event("[DONE]".to_string())).await?;
 
     // Terminating zero-length chunk.
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// [`write_sse_stream`]'s happy path with a line ending the caller names.
+///
+/// Only the terminator differs — same events, same order, same `[DONE]` — so a
+/// test asserting the ordinary outcome over this writer is asserting that the
+/// *framing* was understood rather than that some other path was taken.
+///
+/// **Every event carries a second field**, an `id:` line ahead of its `data:`
+/// one, because a one-field event hides half the defect: separating events at
+/// the right byte and then splitting their *fields* the wrong way leaves a
+/// single-field event looking perfectly fine, while `id: 1\rdata: {…}` collapses
+/// into one line with no `data:` prefix — the payload invisible, no delta
+/// delivered, no `[DONE]` seen, and, on the proxy, no refund found.
+async fn write_sse_stream_with_terminator(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+    eol: &str,
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let send_event = |id: usize, payload: String| -> Vec<u8> {
+        let event = format!("id: {id}{eol}data: {payload}{eol}{eol}");
+        let mut out = format!("{:x}\r\n", event.len()).into_bytes();
+        out.extend_from_slice(event.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+
+    // Each payload names the model the *upstream* calls it, which is what makes
+    // a per-event assertion possible downstream: the proxy rewrites that field
+    // to the canonical id, and it can only do so on a payload it found.
+    let reasoning = serde_json::json!({
+        "model": STREAM_WIRE_MODEL,
+        "choices": [{ "delta": { "reasoning": "thinking…" } }]
+    });
+    stream
+        .write_all(&send_event(0, reasoning.to_string()))
+        .await?;
+    stream.flush().await?;
+
+    for (index, chunk) in content_chunks.iter().enumerate() {
+        let content = serde_json::json!({
+            "model": STREAM_WIRE_MODEL,
+            "choices": [{ "delta": { "content": chunk } }]
+        });
+        stream
+            .write_all(&send_event(index + 1, content.to_string()))
+            .await?;
+        stream.flush().await?;
+    }
+
+    let next = content_chunks.len() + 1;
+    let usage = serde_json::json!({
+        "model": STREAM_WIRE_MODEL,
+        "choices": [],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 5 }
+    });
+    stream
+        .write_all(&send_event(next, usage.to_string()))
+        .await?;
+    stream
+        .write_all(&send_event(next + 1, "[DONE]".to_string()))
+        .await?;
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())

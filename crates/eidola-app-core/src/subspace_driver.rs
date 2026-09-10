@@ -2089,7 +2089,7 @@ fn with(mut leaves: Vec<String>, post: String) -> Vec<String> {
 /// Hold here until whoever opened this window lets go. A no-op — one lock and a
 /// `None` — whenever nobody has.
 #[cfg(feature = "test-support")]
-async fn pause_in_window(
+pub(crate) async fn pause_in_window(
     window: &std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
     >,

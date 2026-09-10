@@ -387,6 +387,8 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("interval", "month");
                 args.set("amount", "10.00 USD");
                 args.set("description", "the seller's own words");
+                args.set("address", "127.0.0.1:11437");
+                args.set("backend", "Eidola");
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),

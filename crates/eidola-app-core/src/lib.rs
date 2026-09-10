@@ -8,6 +8,8 @@ pub mod error;
 pub mod ipc;
 pub mod local_models;
 pub mod memory;
+mod peer_read;
+pub mod proxy;
 pub mod router;
 pub mod search;
 pub mod subspace_driver;
@@ -2071,6 +2073,15 @@ struct Inner {
     #[cfg(feature = "test-support")]
     claim_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **between a proxied request's settings snapshot
+    /// and the read that authorizes it**. A backend removed and re-added in
+    /// that gap keeps its id and loses its exposure, so what the authorization
+    /// is *about* is the thing that can change — and the gap is a whole
+    /// request's latency wide, which no test can hit by racing. Same shape and
+    /// same reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    proxy_resolve_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
@@ -2661,6 +2672,19 @@ impl Inner {
             return Ok(client.clone());
         }
         local_models::plain_http_client()
+    }
+
+    /// The client a **proxied** completion goes out on: [`Inner::plain_client`]
+    /// without the identifying `User-Agent`, because the proxy's upstream
+    /// header set is an allowlist the Record repeats back to the reader and a
+    /// header the builder adds would travel outside it. See
+    /// [`local_models::proxy_http_client`].
+    fn proxy_client(&self) -> Result<reqwest::Client, AppError> {
+        #[cfg(feature = "test-support")]
+        if let Some(client) = &self.http_override {
+            return Ok(client.clone());
+        }
+        local_models::proxy_http_client()
     }
 
     /// Is what this eidola connection says about its models a fact this
@@ -8326,19 +8350,16 @@ impl Inner {
             response_buf.extend_from_slice(&bytes);
             buf.extend_from_slice(&bytes);
 
-            while let Some(pos) = find_event_boundary(&buf) {
+            while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
                 let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
-                // Drop the boundary itself (\n\n or \r\n\r\n).
-                let boundary_len = if buf.starts_with(b"\r\n\r\n") { 4 } else { 2 };
-                if buf.len() >= boundary_len {
-                    buf.drain(..boundary_len);
-                }
+                // Drop the boundary itself — 2, 3 or 4 bytes, whichever pair of
+                // line terminators `find_event_boundary` matched.
+                buf.drain(..boundary_len);
                 let event_str = match std::str::from_utf8(&event_bytes) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                for line in event_str.lines() {
-                    let line = line.trim_end_matches('\r');
+                for (line, _) in split_event_lines(event_str) {
                     let Some(payload) = line.strip_prefix("data:") else {
                         continue;
                     };
@@ -8936,19 +8957,92 @@ impl Inner {
     }
 }
 
-/// Find the byte offset of the next SSE event boundary (`\n\n` or
-/// `\r\n\r\n`) in `buf`, if any. Returns the position *before* the boundary
-/// — i.e. the length of the next event's body.
-fn find_event_boundary(buf: &[u8]) -> Option<usize> {
+/// The length of the SSE line terminator starting at `i`, or `None` if none
+/// starts there.
+///
+/// The event-stream format takes three line endings — `\r\n`, `\n` and a bare
+/// `\r` — and treats any two in a row as the blank line that ends an event.
+///
+/// **A `\r` at the very end of `buf` is read as a terminator, and the residual
+/// is stated rather than avoided.** It is genuinely ambiguous — it may be the
+/// first half of a `\r\n` the next chunk carries, the classic split-across-
+/// chunk-edges trap — but the two ways of resolving it are not symmetric.
+/// Waiting for the byte that decides it strands the **last** event of any
+/// `\r`-terminated stream, which is exactly `[DONE]`: the read reaches EOF with
+/// the terminator still unresolved and the turn reports a stream that ended
+/// without finishing. Reading it eagerly splits `\r\r` out of a stream that
+/// really said `\r\r\n` and leaves a stray `\n` heading the next event — which
+/// **both** consumers already tolerate: the proxy forwards each event with the
+/// terminator it consumed, so the bytes a downstream parser sees are unchanged
+/// in total, and the turn path's field walk skips a line carrying no `data:`
+/// prefix. A harmless mis-split beats a lost completion.
+fn terminator_len(buf: &[u8], i: usize) -> Option<usize> {
+    match buf.get(i)? {
+        b'\r' if buf.get(i + 1) == Some(&b'\n') => Some(2),
+        b'\r' | b'\n' => Some(1),
+        _ => None,
+    }
+}
+
+/// Find the next SSE event boundary in `buf`: the offset *before* it (the
+/// length of the next event's body) and the boundary's own length.
+///
+/// **Every valid line ending, not the two that are common.** Recognising only
+/// `\n\n` and `\r\n\r\n` meant a backend emitting bare-`\r` SSE — valid, and
+/// what the format explicitly allows — never split at all: its events piled
+/// into one frame until the per-event ceiling rejected the stream or EOF
+/// forwarded the whole tail at once, so nothing streamed and no per-event
+/// rewriting happened. The boundary's length is returned rather than
+/// re-derived, since it is now 2, 3 or 4 bytes depending on which pair of
+/// terminators was found.
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     for i in 0..buf.len() {
-        if buf[i..].starts_with(b"\r\n\r\n") {
-            return Some(i);
-        }
-        if buf[i..].starts_with(b"\n\n") {
-            return Some(i);
-        }
+        let Some(first) = terminator_len(buf, i) else {
+            continue;
+        };
+        let Some(second) = terminator_len(buf, i + first) else {
+            continue;
+        };
+        return Some((i, first + second));
     }
     None
+}
+
+/// Split one SSE event's text into its fields: each line with the terminator
+/// that ended it, `""` for a final line the event ended without one.
+///
+/// **The same scanner that separates events separates their fields.** An event
+/// is a run of lines, and the format's line endings are the format's line
+/// endings in both places — but `str::lines()` knows only `\n` and `\r\n`, so a
+/// bare-`\r` event arrived as a single line: `id: 1\rdata: {…}` has no `data:`
+/// prefix, so the payload inside it was invisible to both consumers. Splitting
+/// events correctly and then parsing their fields the old way cures half a
+/// defect and hides the other half, because the failure is now silent instead
+/// of loud — the proxy stops rewriting the model name and, worse, stops finding
+/// the refund that settles a spent credential; the turn path drops the deltas
+/// and never sees `[DONE]`.
+///
+/// Terminators are returned rather than normalized so a caller rebuilding an
+/// event emits the bytes the sender chose. Every terminator byte is ASCII, so
+/// the slice boundaries are always char boundaries.
+fn split_event_lines(text: &str) -> Vec<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    while i < bytes.len() {
+        match terminator_len(bytes, i) {
+            Some(len) => {
+                lines.push((&text[start..i], &text[i..i + len]));
+                i += len;
+                start = i;
+            }
+            None => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        lines.push((&text[start..], ""));
+    }
+    lines
 }
 
 // ============================================================================
@@ -9527,6 +9621,8 @@ impl AppCore {
                 persist_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 claim_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                proxy_resolve_window: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 plan_faults: std::sync::atomic::AtomicU32::new(0),
@@ -10779,6 +10875,29 @@ impl AppCore {
             .anchor_window
             .lock()
             .expect("anchor window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: stop the next proxied request between its settings
+    /// snapshot and the read that authorizes it (see
+    /// `Inner::proxy_resolve_window`).
+    ///
+    /// The exposure a request is authorized by is a permission over a backend
+    /// *incarnation*, and the row behind an id can be replaced while a request
+    /// is in flight — which is exactly the interleaving nothing outside can
+    /// stage. Each request that reaches the window sends a resume handle down
+    /// the returned channel and blocks until it is used.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_proxy_resolve_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .proxy_resolve_window
+            .lock()
+            .expect("proxy resolve window lock poisoned") = Some(tx);
         rx
     }
 
@@ -13239,13 +13358,8 @@ async fn recover_refund(
         .await
         .map_err(AppError::from_request)?;
 
-    let status = resp.status();
-    let body_text = resp.text().await.map_err(|e| AppError::Network {
-        message: format!(
-            "failed to read recovery response: {}",
-            crate::error::request_error_text(e)
-        ),
-    })?;
+    let (status, body_text) =
+        crate::peer_read::read_api_answer(resp, "the recovery response").await?;
     let body: serde_json::Value =
         serde_json::from_str(&body_text).map_err(|e| AppError::Network {
             message: format!("failed to parse recovery response: {e}"),
@@ -16020,15 +16134,12 @@ fn params_from_domain_separator(ds: &str) -> Result<Params, AppError> {
     Ok(Params::new(parts[1], parts[2], parts[3], parts[4]))
 }
 
+/// Read one server answer — **bounded as it arrives** (`peer_read`'s class
+/// rule). This is the shared reader for every call this app makes to the Eidola
+/// server, so the ceiling lands on all of them at once; attested or not, the
+/// bytes are still chosen by the other end.
 async fn read_response(resp: reqwest::Response) -> Result<(reqwest::StatusCode, String), AppError> {
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| AppError::Network {
-        message: format!(
-            "failed to read response body: {}",
-            crate::error::request_error_text(e)
-        ),
-    })?;
-    Ok((status, body))
+    crate::peer_read::read_api_answer(resp, "the server's answer").await
 }
 
 fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError> {
@@ -16141,6 +16252,104 @@ async fn flush_attestations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An event ends at any two line terminators the format allows.**
+    ///
+    /// The event-stream format takes `\r\n`, `\n` and a bare `\r`, so a blank
+    /// line is any two of them in a row — six pairs, not the two that are
+    /// common. Recognising only `\n\n` and `\r\n\r\n` meant a backend emitting
+    /// bare-`\r` SSE never split at all: every event piled into one frame until
+    /// the per-event ceiling refused the stream or EOF forwarded the whole tail
+    /// in one piece, so nothing streamed and no per-event work ran.
+    #[test]
+    fn an_event_ends_at_every_line_ending_the_format_allows() {
+        for (sep, len) in [
+            ("\n\n", 2),
+            ("\r\r", 2),
+            ("\r\n\r\n", 4),
+            ("\r\n\n", 3),
+            ("\n\r\n", 3),
+            ("\r\n\r", 3),
+        ] {
+            let buf = format!("data: one{sep}data: two\n\n");
+            assert_eq!(
+                find_event_boundary(buf.as_bytes()),
+                Some((9, len)),
+                "separator {sep:?} ends the first event"
+            );
+        }
+
+        // Nothing that is not a blank line ends one.
+        assert_eq!(find_event_boundary(b"data: one\ndata: two\n"), None);
+        assert_eq!(find_event_boundary(b""), None);
+    }
+
+    /// **A `\r` at a chunk edge is split eagerly, and the residual is what
+    /// makes that the right choice** — the classic split-across-chunk-edges
+    /// trap, resolved by comparing what each answer costs.
+    ///
+    /// Waiting for the byte that decides it strands the last event of any
+    /// `\r`-terminated stream (exactly `[DONE]`, at EOF, where no byte is
+    /// coming): the turn reports a stream that ended without finishing. Reading
+    /// it eagerly can split `\r\r` out of a `\r\r\n`, leaving a stray `\n`
+    /// heading the next event — which both readers already tolerate.
+    #[test]
+    fn a_carriage_return_at_a_chunk_edge_still_ends_its_event() {
+        // The end of the buffer is the end of the evidence.
+        assert_eq!(find_event_boundary(b"data: one\r\r"), Some((9, 2)));
+        assert_eq!(find_event_boundary(b"data: one\r"), None, "one is not two");
+
+        // With the next byte in hand the length follows what really arrived.
+        assert_eq!(find_event_boundary(b"data: one\r\rd"), Some((9, 2)));
+        assert_eq!(find_event_boundary(b"data: one\r\r\nd"), Some((9, 3)));
+        assert_eq!(find_event_boundary(b"data: one\r\n\r\nd"), Some((9, 4)));
+
+        // The residual, named: the `\r\r\n` split across a chunk edge leaves a
+        // `\n` heading the next event. It carries no `data:` prefix, so the
+        // turn path's line walk skips it, and the proxy forwards every byte it
+        // consumed either way — so the split is invisible downstream.
+        let (pos, len) = find_event_boundary(b"data: one\r\r").expect("a boundary");
+        assert_eq!(&b"data: one\r\r"[pos..pos + len], b"\r\r");
+        assert!(
+            !"\ndata: two"
+                .lines()
+                .next()
+                .expect("a line")
+                .starts_with("data:"),
+            "the stray newline heads a line no reader acts on"
+        );
+    }
+
+    /// **An event's fields are split the same way its edges are.**
+    ///
+    /// `str::lines()` knows two of the format's three line endings, so a
+    /// bare-`\r` event arrived as one line: `id: 1\rdata: {…}` has no `data:`
+    /// prefix and its payload was invisible to every reader. Terminators come
+    /// back with their lines so a caller rebuilding an event frames it the way
+    /// the sender did.
+    #[test]
+    fn an_events_fields_are_split_at_every_line_ending_too() {
+        assert_eq!(
+            split_event_lines("id: 1\rdata: {}"),
+            vec![("id: 1", "\r"), ("data: {}", "")],
+            "a bare carriage return separates two fields"
+        );
+        assert_eq!(
+            split_event_lines("id: 1\r\ndata: {}\n"),
+            vec![("id: 1", "\r\n"), ("data: {}", "\n")],
+            "and the mixed endings each come back as themselves"
+        );
+        assert_eq!(split_event_lines(""), vec![]);
+        assert_eq!(split_event_lines("\n"), vec![("", "\n")], "a blank line");
+
+        // Rebuilt from the pieces, an event is the bytes it arrived as.
+        let event = "id: 1\rdata: {}\r\nretry: 10";
+        let rebuilt: String = split_event_lines(event)
+            .iter()
+            .map(|(line, terminator)| format!("{line}{terminator}"))
+            .collect();
+        assert_eq!(rebuilt, event);
+    }
 
     /// A model list from a server that publishes no capabilities at all — the
     /// shape every generic backend sends, and the shape our own server sent

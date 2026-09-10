@@ -941,10 +941,56 @@ fn settings_stores(cx: &mut App) -> Stores {
 
 /// `settings_stores` plus a populated backend registry and local-model
 /// state, so the Backends pane's three tabs render with content.
+/// The registry the Backends and Proxy scenes share: the two singletons plus
+/// one user-owned llama.cpp install.
+fn settings_backends_fixture() -> Vec<eidola_app_core::BackendInfo> {
+    use eidola_app_core::{BackendInfo, BackendKind};
+    vec![
+        BackendInfo {
+            id: "eidola".into(),
+            kind: BackendKind::Eidola,
+            display_name: "Eidola".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        },
+        BackendInfo {
+            id: "local".into(),
+            kind: BackendKind::Local,
+            display_name: "Local".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        },
+        BackendInfo {
+            id: "my-box".into(),
+            kind: BackendKind::LlamaCpp,
+            display_name: "My box".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: Some("/Users/me/models".into()),
+            model_overrides: None,
+            engine_path: None,
+            auto_start: false,
+            created_at: 1,
+        },
+    ]
+}
+
 fn settings_backends_stores(cx: &mut App) -> Stores {
     use eidola_app_core::{
-        BackendInfo, BackendKind, ExternalEngineBackend, LocalModelInfo, LocalModelStatus,
-        LocalModelsState,
+        ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState,
     };
     stub_stores(cx, |s| {
         s.config_state = Some(stub_config_state(true));
@@ -991,47 +1037,7 @@ fn settings_backends_stores(cx: &mut App) -> Stores {
                 credits: 20_000_000,
             },
         ];
-        s.backends = vec![
-            BackendInfo {
-                id: "eidola".into(),
-                kind: BackendKind::Eidola,
-                display_name: "Eidola".into(),
-                enabled: true,
-                base_url: None,
-                has_api_key: false,
-                models_dir: None,
-                model_overrides: None,
-                engine_path: None,
-                auto_start: true,
-                created_at: 0,
-            },
-            BackendInfo {
-                id: "local".into(),
-                kind: BackendKind::Local,
-                display_name: "Local".into(),
-                enabled: true,
-                base_url: None,
-                has_api_key: false,
-                models_dir: None,
-                model_overrides: None,
-                engine_path: None,
-                auto_start: true,
-                created_at: 0,
-            },
-            BackendInfo {
-                id: "my-box".into(),
-                kind: BackendKind::LlamaCpp,
-                display_name: "My box".into(),
-                enabled: true,
-                base_url: None,
-                has_api_key: false,
-                models_dir: Some("/Users/me/models".into()),
-                model_overrides: None,
-                engine_path: None,
-                auto_start: false,
-                created_at: 1,
-            },
-        ];
+        s.backends = settings_backends_fixture();
         s.local_models = Some(LocalModelsState {
             engine_path: Some("/Applications/Eidola.app/Contents/MacOS/llama-server".into()),
             external: vec![ExternalEngineBackend {
@@ -1215,6 +1221,120 @@ fn register_settings(s: &mut Snapshots) {
         view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
         let pane = view.read(cx).backends_pane();
         pane.update(cx, |p, cx| p.select_tab(BackendsTab::External, cx));
+        view
+    });
+
+    // Proxy pane: the switch and its endpoint, the binding, the per-backend
+    // exposure ticks, the on-device choice, and the key list with one live row
+    // and one revoked. A stub store binds nothing, so the status line honestly
+    // reads "Not listening" beside settings that say enabled — which is the
+    // point of reading the listener rather than the setting.
+    s.add("settings_proxy", settings_size, |window, cx| {
+        use eidola_app_core::proxy::{LocalExposure, ProxyKeyInfo, ProxySettings};
+        let core = stub_stores(cx, |s| {
+            s.config_state = Some(stub_config_state(true));
+            s.eidola_trust = Some(stub_eidola_trust());
+            s.backends = settings_backends_fixture();
+            s.proxy_settings = Some(ProxySettings {
+                enabled: true,
+                bind_address: "127.0.0.1".into(),
+                bind_port: 11437,
+                local_exposure: LocalExposure::Loaded,
+                backends: vec!["eidola".into()],
+                exposed_ids: vec!["eidola".into()],
+                live_key_count: 1,
+            });
+            s.proxy_keys = vec![
+                ProxyKeyInfo {
+                    id: "k-live".into(),
+                    label: "My editor".into(),
+                    prefix: "eid-Ab3xQ9".into(),
+                    created_at: 0,
+                    last_used_at: Some(1),
+                    revoked_at: None,
+                },
+                ProxyKeyInfo {
+                    id: "k-dead".into(),
+                    label: "An old script".into(),
+                    prefix: "eid-Zz00Kk".into(),
+                    created_at: 0,
+                    last_used_at: None,
+                    revoked_at: Some(2),
+                },
+            ];
+        });
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Proxy, cx));
+        view
+    });
+
+    // The same pane in a taller window, so the key list is above the fold: one
+    // live key wearing enough of itself to be identifiable, one revoked row
+    // keeping its label and losing only its verb, and the name-then-generate
+    // row beneath them.
+    s.add(
+        "settings_proxy_keys",
+        size(px(620.), px(900.)),
+        |window, cx| {
+            use eidola_app_core::proxy::{LocalExposure, ProxyKeyInfo, ProxySettings};
+            let core = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
+                s.eidola_trust = Some(stub_eidola_trust());
+                s.backends = settings_backends_fixture();
+                s.proxy_settings = Some(ProxySettings {
+                    enabled: true,
+                    bind_address: "127.0.0.1".into(),
+                    bind_port: 11437,
+                    local_exposure: LocalExposure::Loaded,
+                    backends: vec!["eidola".into()],
+                    exposed_ids: vec!["eidola".into()],
+                    live_key_count: 1,
+                });
+                s.proxy_keys = vec![
+                    ProxyKeyInfo {
+                        id: "k-live".into(),
+                        label: "My editor".into(),
+                        prefix: "eid-Ab3xQ9".into(),
+                        created_at: 0,
+                        last_used_at: Some(1),
+                        revoked_at: None,
+                    },
+                    ProxyKeyInfo {
+                        id: "k-dead".into(),
+                        label: "An old script".into(),
+                        prefix: "eid-Zz00Kk".into(),
+                        created_at: 0,
+                        last_used_at: None,
+                        revoked_at: Some(2),
+                    },
+                ];
+            });
+            let view = cx.new(|cx| SettingsView::new(core, window, cx));
+            view.update(cx, |v, cx| v.select(SettingsPane::Proxy, cx));
+            view
+        },
+    );
+
+    // Proxy pane, bound off loopback: the danger band that is the whole of the
+    // honesty about a plaintext inference endpoint on the network.
+    s.add("settings_proxy_exposed", settings_size, |window, cx| {
+        use eidola_app_core::proxy::{LocalExposure, ProxySettings};
+        let core = stub_stores(cx, |s| {
+            s.config_state = Some(stub_config_state(true));
+            s.eidola_trust = Some(stub_eidola_trust());
+            s.backends = settings_backends_fixture();
+            s.proxy_settings = Some(ProxySettings {
+                enabled: true,
+                bind_address: "0.0.0.0".into(),
+                bind_port: 11437,
+                local_exposure: LocalExposure::Downloaded,
+                backends: vec!["eidola".into(), "local".into()],
+                exposed_ids: vec!["eidola".into(), "local".into()],
+                live_key_count: 0,
+            });
+        });
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Proxy, cx));
         view
     });
 

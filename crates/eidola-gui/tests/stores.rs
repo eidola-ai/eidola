@@ -3282,3 +3282,419 @@ fn a_drain_that_times_out_never_lets_go_of_the_runtime(cx: &mut TestAppContext) 
          now the last one and will drop the runtime from its own worker"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The local inference proxy's store
+// ---------------------------------------------------------------------------
+
+/// A free loopback port, chosen by binding one and letting it go.
+///
+/// The stored binding cannot be port 0 — a config file whose address changes on
+/// every restart is one that lies — so a test that wants the *store* to bind
+/// something has to name a port. Asking the OS for one and releasing it is the
+/// nearest thing to ephemeral that a durable setting allows.
+fn a_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    listener.local_addr().expect("addr").port()
+}
+
+/// REGRESSION: **the invariant is "no live row whose secret was never shown."**
+///
+/// A proxy key's value exists for exactly one render — app-core stores a digest
+/// and nothing else — so a second generation started while one was pending
+/// inserted a second live row and then replaced the banner: one of the two keys
+/// authenticates requests forever and nobody holds it, nobody can recognise it,
+/// and revoking it is guesswork. The same is true of a press made while a
+/// minted key is still standing unread.
+///
+/// The cure is a predicate rather than a courtesy: `can_create_key` decides the
+/// press *and* whether the pane paints the verb at all, so an accepted press
+/// and an offered verb cannot disagree.
+#[gpui::test]
+fn a_second_key_generation_waits_for_the_first_to_be_read(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    stores.proxy.update(cx, |s, cx| {
+        s.create_key("first".into(), cx);
+        // The press a reader makes while the first is still travelling.
+        s.create_key("second".into(), cx);
+    });
+
+    wait_until(cx, "the first key is minted", |cx| {
+        stores.proxy.read_with(cx, |s, _| s.minted().is_some())
+    });
+    let keys = core
+        .runtime()
+        .block_on(core.proxy_keys())
+        .expect("the listing");
+    assert_eq!(
+        keys.len(),
+        1,
+        "a second generation while one is pending would leave a live key nobody ever saw: {keys:?}"
+    );
+
+    // And a press made while the minted key stands unread is refused for the
+    // same reason — the banner can only show one.
+    stores
+        .proxy
+        .update(cx, |s, cx| s.create_key("third".into(), cx));
+    cx.run_until_parked();
+    assert_eq!(
+        core.runtime()
+            .block_on(core.proxy_keys())
+            .expect("the listing")
+            .len(),
+        1,
+        "the standing banner is the reason, and it is still standing"
+    );
+
+    // **The listing the new row belongs in is read after the batch, not by the
+    // write that made it.** No operation here carries a listing — each adopts
+    // or reports its own outcome — and the resolving read is issued once
+    // nothing is still writing, so what the pane shows is the database after
+    // every press rather than after whichever one settled last.
+    wait_until(cx, "the listing catches up with the key", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.key_list().iter().any(|k| k.label == "first"))
+    });
+
+    // Acknowledging it is what gives the verb back.
+    stores.proxy.update(cx, |s, cx| s.dismiss_minted(cx));
+    assert!(stores.proxy.read_with(cx, |s, _| s.can_create_key()));
+    stores
+        .proxy
+        .update(cx, |s, cx| s.create_key("fourth".into(), cx));
+    wait_until(cx, "the second key is minted", |_cx| {
+        core.runtime()
+            .block_on(core.proxy_keys())
+            .map(|k| k.len() == 2)
+            .unwrap_or(false)
+    });
+}
+
+/// REGRESSION: **a superseded write settles nothing, and takes no slot away.**
+///
+/// Two presses of one control are one keyboard's work apart — a reader turning
+/// the proxy on and immediately off, a binding corrected a beat after it was
+/// typed — and they land in the same keyed slot. The successor chains behind
+/// the predecessor so the two writes reach the database in the order they were
+/// made; what this pins is the other half. The predecessor settles *first*, and
+/// if it is allowed to settle it removes the slot — which by then belongs to
+/// its successor, whose `Task` is dropped and whose write therefore never
+/// happens. The reader's last press is silently lost, and the store adopts the
+/// value they took back.
+///
+/// Only the current generation settles, so the predecessor returns quietly.
+#[gpui::test]
+fn the_second_press_of_a_proxy_control_is_the_one_that_stands(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    stores.proxy.update(cx, |s, cx| {
+        s.set_enabled(true, cx);
+        s.set_enabled(false, cx);
+    });
+
+    // Waiting on the *store* rather than on the database: the write lands
+    // first and its continuation a moment later, so a wait on the row would
+    // read the store mid-settle and say nothing about either.
+    wait_until(cx, "the batch settles", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.op_error().is_some() || !s.writing())
+    });
+    assert_eq!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.enabled)),
+        Some(false),
+        "the store shows what the reader last asked for"
+    );
+    assert!(
+        !core
+            .runtime()
+            .block_on(core.proxy_settings())
+            .expect("the stored settings")
+            .enabled,
+        "and so does the database — the second press is what was written last"
+    );
+}
+
+/// REGRESSION: **the next press derives from what this one is writing.**
+///
+/// Every control in the Proxy pane computes its next value from what it renders
+/// — the switch writes `!enabled` — so a snapshot that stays at the stored
+/// value until the round trip settles makes two presses one press: both
+/// handlers read the same stale `false`, both write `true`, and a
+/// start-then-stop persists as start. Sequencing the writes never touched that,
+/// because the two carried the same value; what has to move is the value the
+/// second press is derived *from*. The test derives its second press exactly as
+/// the pane does rather than passing an explicit `false`, which is what the
+/// sequencing test above cannot see.
+#[gpui::test]
+fn two_presses_of_the_proxy_switch_derive_from_each_other(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    // Production refreshes at launch; a bare store has not read anything yet,
+    // and the pane derives its presses from a snapshot it renders.
+    stores.proxy.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the settings load", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().is_some())
+    });
+    let enabled = |cx: &mut TestAppContext| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.enabled))
+            .expect("a loaded snapshot")
+    };
+    assert!(!enabled(cx), "a fresh profile serves nothing");
+
+    // The first press, derived from the render — and read back at once, which
+    // is the whole property: the pane's next frame has to see it.
+    let next = !enabled(cx);
+    stores.proxy.update(cx, |s, cx| s.set_enabled(next, cx));
+    assert!(
+        enabled(cx),
+        "the snapshot advances as the write leaves, so the next press can derive from it"
+    );
+
+    // The second press, derived the same way the pane derives it.
+    let next = !enabled(cx);
+    stores.proxy.update(cx, |s, cx| s.set_enabled(next, cx));
+
+    wait_until(cx, "the batch settles", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.op_error().is_some() || !s.writing())
+    });
+    assert!(
+        !core
+            .runtime()
+            .block_on(core.proxy_settings())
+            .expect("the stored settings")
+            .enabled,
+        "start then stop persists as stopped"
+    );
+}
+
+/// REGRESSION: **a settling write does not revert a sibling's pending edit.**
+///
+/// An answer is a whole snapshot of the database at the moment *that* write
+/// committed, so adopting one while a differently-keyed sibling is still
+/// travelling overwrites the sibling's optimistic delta with a row that
+/// predates it — an exposure checkbox goes back to unchecked while its own
+/// write is on its way to making it true. Worse than a flicker, because the
+/// pane derives its next press from what it renders: taking the choice back
+/// then reads the reverted checkbox and writes `true` a second time, so the
+/// reader's undo leaves it exposed.
+///
+/// Two spawned writes cannot be made to interleave on demand, so the landing is
+/// driven directly — the decision under test is what a settle does while
+/// another slot is genuinely occupied.
+#[gpui::test]
+fn a_settling_write_leaves_a_pending_siblings_edit_alone(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+
+    stores.proxy.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the settings load", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().is_some())
+    });
+    let exposed = |cx: &mut TestAppContext| {
+        stores.proxy.read_with(cx, |s, _| {
+            s.settings()
+                .value()
+                .expect("a loaded snapshot")
+                .exposed_ids
+                .iter()
+                .any(|b| b == "eidola")
+        })
+    };
+    assert!(!exposed(cx), "a fresh profile exposes nothing");
+
+    // The checkbox's press: its slot is occupied and its delta is on screen.
+    stores
+        .proxy
+        .update(cx, |s, cx| s.set_backend_exposed("eidola".into(), true, cx));
+    assert!(exposed(cx), "the press shows what it is writing");
+
+    // A sibling write lands with the database as it was *before* that press —
+    // which is exactly what its own round trip would have answered with.
+    let stale = stores
+        .proxy
+        .read_with(cx, |s, _| s.settings().value().cloned())
+        .map(|mut settings| {
+            settings.exposed_ids.retain(|b| b != "eidola");
+            settings.backends.retain(|b| b != "eidola");
+            settings.enabled = true;
+            settings
+        })
+        .expect("a snapshot to age");
+    stores
+        .proxy
+        .update(cx, |s, cx| s.settle_for_test(Ok(stale), cx));
+
+    assert!(
+        exposed(cx),
+        "the pending choice is still what the reader sees, so their next press \
+         derives from it rather than from a row that predates it"
+    );
+
+    // And once nothing is writing, the batch-end read is what resolves the
+    // cell — the honest answer, taken after the last write.
+    wait_until(cx, "the batch settles", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.op_error().is_some() || !s.writing())
+    });
+    assert!(exposed(cx), "and the database agrees");
+}
+
+/// REGRESSION: **a listener that gave up says why, and is started again.**
+///
+/// The accept loop stops after sixteen consecutive refused accepts. Nothing
+/// pushes that fact anywhere — it happens on the core's runtime — so the store
+/// has to *derive* it: `listen_error` asks the handle rather than reporting only
+/// the last bind failure it recorded, and the reconcile finds no address where
+/// the settings want one and starts the socket again. Neither half is a special
+/// case; both fall out of the handle answering with what the loop learned.
+#[gpui::test]
+fn a_proxy_that_stopped_accepting_says_why_and_is_reconciled_again(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let port = a_free_port();
+
+    stores.proxy.update(cx, |s, cx| {
+        s.set_binding("127.0.0.1".into(), port, cx);
+    });
+    wait_until(cx, "the binding lands", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.bind_port))
+            == Some(port)
+    });
+    stores.proxy.update(cx, |s, cx| s.set_enabled(true, cx));
+    wait_until(cx, "the reconcile binds the socket", |cx| {
+        stores.proxy.read_with(cx, |s, _| s.is_running())
+    });
+    assert_eq!(stores.proxy.read_with(cx, |s, _| s.listen_error()), None);
+
+    let handle = stores.proxy.read_with(cx, |s, _| s.handle());
+    handle.fail_accepting_for_test("too many open files");
+
+    assert!(
+        !stores.proxy.read_with(cx, |s, _| s.is_running()),
+        "a socket that admits nobody is not somewhere to point a tool"
+    );
+    assert_eq!(
+        stores.proxy.read_with(cx, |s, _| s.listen_error()),
+        Some("too many open files".to_string()),
+        "no write failed, so only the loop's own reason can explain this"
+    );
+
+    // Reconcilable: the settings still want a listener and nothing is bound, so
+    // an ordinary refresh starts it. It may take more than one — the socket the
+    // dead loop held is released when its aborted task is dropped, which is the
+    // runtime's business and not this thread's — and that is exactly why the
+    // recovery is a *reconcile* rather than a one-shot repair.
+    let mut restarted = false;
+    for _ in 0..80 {
+        stores.proxy.update(cx, |s, cx| s.refresh(cx));
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        if stores.proxy.read_with(cx, |s, _| s.is_running()) {
+            restarted = true;
+            break;
+        }
+    }
+    assert!(restarted, "a reconcile starts a listener that gave up");
+    assert_eq!(stores.proxy.read_with(cx, |s, _| s.listen_error()), None);
+
+    // Teardown: an accept loop is a task holding the core, so the drain barrier
+    // would wait on it forever. Stopping the handle is what the disable path
+    // does asynchronously, taken directly because the test is over.
+    handle.stop();
+    cx.run_until_parked();
+}
+
+/// REGRESSION: **a correct IPv6 listener is not restarted on every refresh.**
+///
+/// The reconcile asked "is what is bound what the settings describe" by
+/// comparing a `host:port` join against `SocketAddr`'s own `Display`, which
+/// brackets an IPv6 host — `::1:11437` versus `[::1]:11437` — so the answer was
+/// always *no* however correct the listener. And a restart closes before it
+/// binds: the old socket is still open when the new bind is attempted on the
+/// same address, so the refresh did not merely churn, it **stopped the proxy**
+/// on the door a reader had pointed a tool at.
+///
+/// `::1` is an explicitly supported binding (`parse_bind_address` accepts it,
+/// `is_loopback` calls it safe), so this is an ordinary configuration.
+#[gpui::test]
+fn a_refresh_leaves_a_correct_ipv6_listener_alone(cx: &mut TestAppContext) {
+    // A machine without IPv6 loopback has nothing to say about this rule.
+    let Ok(probe) = std::net::TcpListener::bind("[::1]:0") else {
+        return;
+    };
+    let port = probe.local_addr().expect("addr").port();
+    drop(probe);
+
+    let (stores, _backing) = backed_stores(cx);
+    stores.proxy.update(cx, |s, cx| {
+        s.set_binding("::1".into(), port, cx);
+    });
+    wait_until(cx, "the binding lands", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.bind_port))
+            == Some(port)
+    });
+    stores.proxy.update(cx, |s, cx| s.set_enabled(true, cx));
+    wait_until(cx, "the reconcile binds the socket", |cx| {
+        stores.proxy.read_with(cx, |s, _| s.is_running())
+    });
+    let bound = stores.proxy.read_with(cx, |s, _| s.address());
+    assert!(
+        bound.is_some_and(|a| a.is_ipv6()),
+        "bound where the reader asked: {bound:?}"
+    );
+
+    let handle = stores.proxy.read_with(cx, |s, _| s.handle());
+    let bound_once = handle.binds_for_test();
+    assert_eq!(bound_once, 1, "one socket, bound once");
+
+    // The refresh a bus event, a settings write, or the launch reconcile all
+    // arrive as. Nothing about the configuration moved, so nothing about the
+    // socket may — and *that* is the assertion, not the address it reports:
+    // a restart rebinds the same address, so whether the endpoint survives it
+    // is a race with the old socket's release rather than a property.
+    for _ in 0..3 {
+        stores.proxy.update(cx, |s, cx| s.refresh(cx));
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        handle.binds_for_test(),
+        bound_once,
+        "a listener that already matches is not closed and rebound"
+    );
+    assert_eq!(
+        stores.proxy.read_with(cx, |s, _| s.listen_error()),
+        None,
+        "so nothing could have failed to come back"
+    );
+    assert_eq!(
+        stores.proxy.read_with(cx, |s, _| s.address()),
+        bound,
+        "and it is still answering where it was"
+    );
+
+    handle.stop();
+    cx.run_until_parked();
+}

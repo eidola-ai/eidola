@@ -25,6 +25,11 @@ pub mod overlay;
 pub mod participants;
 mod plans;
 pub mod probe;
+/// The local inference proxy's listener — the second door this process opens.
+/// TCP rather than a Unix socket, because the point is that another tool
+/// reaches it the way it reaches any OpenAI-compatible server.
+pub mod proxy;
+pub mod proxy_settings;
 pub mod record;
 pub mod scrollbar;
 pub mod settings;
@@ -52,8 +57,8 @@ use crate::about::AboutView;
 use crate::actions::{
     About, ActualSize, CheckForUpdates, CloseWindow, FindInSpace, GetStarted, Hide, HideOthers,
     Minimize, NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenRecord, OpenSettings, Quit, QuitApp,
-    Quote, QuoteElsewhere, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom,
-    ZoomIn, ZoomOut,
+    Quote, QuoteElsewhere, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector,
+    ToggleProxy, Zoom, ZoomIn, ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::lifecycle::LaunchOptions;
@@ -182,6 +187,10 @@ pub fn run_with(opts: LaunchOptions) {
         stores.local_models.update(cx, |s, cx| s.refresh(cx));
         stores.spaces.update(cx, |s, cx| s.refresh(cx));
         stores.templates.update(cx, |s, cx| s.refresh(cx));
+        // The proxy's own refresh **is** what starts it: the store reconciles
+        // its listener against whatever the settings say, so a profile that
+        // left the proxy on comes back listening without a second mechanism.
+        stores.proxy.update(cx, |s, cx| s.refresh(cx));
 
         // Best-effort recovery of any in-flight credentials left over from a
         // previous run that crashed mid-spend. Owned by the WalletStore; the
@@ -219,6 +228,11 @@ pub fn run_with(opts: LaunchOptions) {
         // full shutdown, and the order between it and the engine teardown is a
         // correctness property, so both live in one hook rather than in the
         // sequence of two calls on this page (`lifecycle::install_shutdown`).
+        // **Both doors close together**, in the one closure the shutdown hook
+        // runs first. The proxy is the second thing in this process a peer can
+        // reach, and it can start billed work exactly as the control socket
+        // can, so "everything after this is teardown" has to be true of both.
+        let proxy_door = stores.proxy.read(cx).handle();
         #[cfg(unix)]
         let close_door = {
             let socket = ipc::bind(&stores);
@@ -226,10 +240,11 @@ pub fn run_with(opts: LaunchOptions) {
                 if let Some(socket) = &socket {
                     socket.close();
                 }
+                proxy_door.retire();
             }
         };
         #[cfg(not(unix))]
-        let close_door = || {};
+        let close_door = move || proxy_door.retire();
 
         // The *full* shutdown drains the engines — and on macOS this hook
         // is the only thing that delivers it. ⌘Q no longer reaches it (it
@@ -378,6 +393,8 @@ fn install_menus(cx: &mut App) {
                 MenuItem::Separator,
                 MenuItem::action("Library…", OpenLibrary),
                 MenuItem::action("Record…", OpenRecord),
+                MenuItem::separator(),
+                MenuItem::action("Start/Stop Proxy", ToggleProxy),
                 MenuItem::Separator,
                 MenuItem::action("Hide Eidola", Hide),
                 MenuItem::action("Hide Others", HideOthers),
@@ -685,6 +702,22 @@ fn install_action_handlers(cx: &mut App) {
             return;
         }
         open_library_window(cx);
+    });
+
+    // Start/Stop Proxy. **A toggle over stored intent, never over the socket.**
+    // The listener is reconciled against the settings wherever they moved, so
+    // this writes the same `enabled` the pane's switch writes and every window
+    // — and every surface — sees one answer.
+    cx.on_action(|_: &ToggleProxy, cx: &mut App| {
+        let proxy = cx.global::<AppGlobal>().stores.proxy.clone();
+        proxy.update(cx, |s, cx| {
+            // A settings read that has not answered says nothing about what
+            // the reader wants, so the press is a no-op rather than a guess.
+            let Some(enabled) = s.settings().value().map(|v| v.enabled) else {
+                return;
+            };
+            s.set_enabled(!enabled, cx);
+        });
     });
 
     cx.on_action(|_: &OpenRecord, cx: &mut App| {

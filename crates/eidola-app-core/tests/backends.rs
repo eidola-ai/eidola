@@ -165,11 +165,13 @@ fn external_backend_lifecycle_add_update_disable_remove_revive() {
         let listed = core.runtime().block_on(core.list_backends()).unwrap();
         assert!(!listed.iter().find(|b| b.id == "my-vllm").unwrap().enabled);
 
-        // Remove (soft) — gone from the listing.
+        // Remove (soft) — gone from the listing. **`Proxy` joins it**: removal
+        // clears any exposure that named this backend, so the stored proxy
+        // settings moved and every reader of them is stale.
         core.runtime()
             .block_on(core.remove_backend("my-vllm".into()))
             .expect("remove");
-        assert_eq!(drain(&mut rx), vec![Change::Backends]);
+        assert_eq!(drain(&mut rx), vec![Change::Backends, Change::Proxy]);
         let listed = core.runtime().block_on(core.list_backends()).unwrap();
         assert!(!listed.iter().any(|b| b.id == "my-vllm"));
 
@@ -1059,6 +1061,61 @@ fn an_older_disables_cleanup_cannot_retire_an_enabled_backends_engine() {
             1,
             "an engine the current configuration authorises may not be retired \
              by an operation the configuration has already moved past"
+        );
+    });
+}
+
+/// REGRESSION: **a catalog is read under a ceiling, as it arrives.**
+///
+/// `/v1/models` used `Response::text()`, which buffers whatever the backend
+/// sends. The per-request deadline bounds how long that may take and not how
+/// much may arrive, so an enormous listing spent this process's memory — and
+/// the local inference proxy exposes this very call to any authenticated tool,
+/// once per request.
+#[test]
+fn an_enormous_model_listing_is_refused_rather_than_buffered() {
+    run(|| {
+        // A server that answers `/v1/models` with far more than any catalog is.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let flood = vec![b'x'; 6 * 1024 * 1024];
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    flood.len()
+                );
+                let _ = stream.write_all(&flood);
+            }
+        });
+
+        let (core, _dir) = bare_core();
+        core.runtime()
+            .block_on(core.add_backend(openai_backend(
+                "flood",
+                &format!("http://127.0.0.1:{port}"),
+                None,
+            )))
+            .expect("add");
+
+        let refused = core
+            .runtime()
+            .block_on(core.backend_models("flood".into()))
+            .expect_err("a listing past the ceiling is no listing");
+        assert!(
+            refused.to_string().contains("ceiling"),
+            "refused for its size rather than reported as malformed: {refused}"
         );
     });
 }
