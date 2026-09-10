@@ -23347,21 +23347,36 @@ fn space_an_overlaying_inspector_takes_the_keyboard_off_what_it_covers(cx: &mut 
 #[gpui::test]
 fn space_find_corrects_a_cursor_reveal_when_the_measurements_land(cx: &mut TestAppContext) {
     // Cards whose source is much longer than what they render: a read-only
-    // editor hides a link's URL, so the estimate counts a thousand characters
+    // editor hides a link's URL, so the estimate counts hundreds of characters
     // where the reader sees one word. That is a real over-estimate rather than
     // a contrived one — it is the shape the projection exists to handle.
-    const BLOCKS: usize = 40;
+    //
+    // **Aimed at the middle of the list, deliberately.** A jump to the *end* is
+    // rescued by gpui's own clamping: as the content shrinks so does
+    // `max_offset`, which drags the viewport along with the end it is parked
+    // at. Nothing rescues a jump into the middle, which is where a reader
+    // pressing a map dot lands.
+    const POSTS: usize = 5;
+    const BLOCKS: usize = 12;
     let url = "a".repeat(300);
-    let mut body = String::new();
-    for i in 0..BLOCKS {
-        body.push_str(&format!(
-            "a kestrel [{i}](https://example.com/{url})\n\nthe grass below\n\n"
-        ));
+    let mut posts = Vec::new();
+    for p in 0..POSTS {
+        let mut body = String::new();
+        for i in 0..BLOCKS {
+            body.push_str(&format!(
+                "a kestrel {p}-{i} [x](https://example.com/{url})\n\nthe grass below\n\n"
+            ));
+        }
+        let mut post = fixture_user_post(&format!("a{p}"), &body);
+        if p > 0 {
+            post.parent_action_id = Some(format!("a{}", p - 1));
+        }
+        posts.push(post);
     }
 
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("s".into()));
-    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", &body)]);
+    seed_quotable_space(&view, window, cx, posts);
 
     let mut vcx = VisualTestContext::from_window(window, cx);
     vcx.simulate_resize(gpui::size(px(900.), px(700.)));
@@ -23375,17 +23390,17 @@ fn space_find_corrects_a_cursor_reveal_when_the_measurements_land(cx: &mut TestA
     vcx.update(|window, _| window.refresh());
     vcx.run_until_parked();
 
-    // End: the cursor jumps to the last card, placed by estimates over forty
-    // cards nobody has laid out.
-    vcx.simulate_keystrokes("end");
+    // A press on the middle post's dot: the group jump, placed by arithmetic
+    // over two whole posts' worth of cards nobody has laid out.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.press_find_map_node_for_test(2, window, cx));
+    });
     vcx.run_until_parked();
 
     // Let the frames the jump caused settle: the band renders, its canvases
     // measure, the tops move, and the correction re-runs until they stop.
-    // Convergence is one band's worth of cards per frame — each correction
-    // moves the band, which measures the next few, which moves the tops again —
-    // so the budget is generous rather than tight. Nothing here polls a
-    // condition: the frames simply happen, as they do in front of a reader.
+    // Convergence is one band's worth of cards per frame, so the budget is
+    // generous rather than tight; nothing here polls a condition.
     for _ in 0..20 {
         vcx.update(|window, _| window.refresh());
         vcx.run_until_parked();
