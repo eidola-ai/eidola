@@ -2281,6 +2281,211 @@ fn a_local_exposure_withdrawn_mid_request_starts_no_engine() {
     });
 }
 
+/// A `llama-server` stand-in that starts and exits at once: enough for the
+/// spawn counter to see a process, and nothing to wait for afterwards.
+fn write_exiting_engine(dir: &std::path::Path) -> String {
+    let path = dir.join("fake-llama-server");
+    std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write engine");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path.to_string_lossy().into_owned()
+}
+
+/// A `llamacpp` backend with its own models directory and engine.
+fn engine_backend(
+    id: &str,
+    models_dir: &std::path::Path,
+    engine: &str,
+) -> eidola_app_core::NewBackend {
+    eidola_app_core::NewBackend {
+        id: id.into(),
+        kind: eidola_app_core::BackendKind::LlamaCpp,
+        display_name: "Acme".into(),
+        base_url: None,
+        api_key: None,
+        models_dir: Some(models_dir.to_string_lossy().into_owned()),
+        model_overrides: None,
+        engine_path: Some(engine.to_string()),
+        auto_start: true,
+    }
+}
+
+/// REGRESSION: **the incarnation a request was authorized against is the one
+/// whose engine may start.**
+///
+/// Exposure now authorizes a backend *row* rather than an id, but the load that
+/// followed resolved its configuration by id all over again — so a
+/// remove-and-re-add landing between the two put a different models directory
+/// and a different `llama-server` behind the same name, and the subprocess
+/// started was the **replacement's**, holding a prompt leased to a destination
+/// nobody had exposed. (The replacement is not even exposed here: it never
+/// needed to be, which is the point.)
+///
+/// The fixture makes the two incarnations tell themselves apart by what they
+/// can serve: only the replacement's directory holds the model file. A load
+/// acting on the authorized row therefore cannot get as far as a process, and
+/// the spawn counter is the witness — a child killed microseconds after `fork`
+/// leaves no other trace.
+#[test]
+fn a_backend_replaced_mid_request_never_gets_its_engine_started() {
+    run(|| {
+        let (_mock, core, dir) = core_for(MockConfig::default());
+        let authorized = dir.path().join("authorized-models");
+        let replacement = dir.path().join("replacement-models");
+        std::fs::create_dir_all(&authorized).expect("authorized dir");
+        std::fs::create_dir_all(&replacement).expect("replacement dir");
+        std::fs::write(replacement.join("m.gguf"), b"gguf").expect("model file");
+        let engine = write_exiting_engine(dir.path());
+
+        let key = core.runtime().block_on(async {
+            core.update_proxy_settings(ProxySettingsUpdate {
+                local_exposure: Some(eidola_app_core::proxy::LocalExposure::Downloaded),
+                ..Default::default()
+            })
+            .await
+            .expect("open the permission");
+            core.add_backend(engine_backend("acme", &authorized, &engine))
+                .await
+                .expect("add");
+            core.set_proxy_backend_exposed("acme".to_string(), true)
+                .await
+                .expect("expose");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        core.test_set_engine_ready_timeout(std::time::Duration::from_millis(1500));
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let mut window = core.test_open_proxy_resolve_window();
+        let asking = {
+            let core = Arc::clone(&core);
+            runtime.spawn(async move {
+                exchange(
+                    &core,
+                    &post(
+                        "/v1/chat/completions",
+                        &key,
+                        r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
+                    ),
+                )
+                .await
+            })
+        };
+
+        let (status, body) = runtime.block_on(async {
+            let resume = window.recv().await.expect("the request reaches the window");
+            core.remove_backend("acme".to_string())
+                .await
+                .expect("remove");
+            core.add_backend(engine_backend("acme", &replacement, &engine))
+                .await
+                .expect("re-add a different backend under the same name");
+            let _ = resume.send(());
+            asking.await.expect("the request finishes")
+        });
+
+        assert_ne!(status, 200, "the request cannot be answered: {body}");
+        assert_eq!(
+            core.test_engine_spawn_count(),
+            0,
+            "a replacement nobody exposed must never have its engine started"
+        );
+        assert!(
+            core.running_engines().is_empty(),
+            "and nothing was left registered"
+        );
+    });
+}
+
+/// REGRESSION: **the epoch that vouches for a request's configuration is read
+/// where that configuration was authorized.**
+///
+/// The sibling of the test above, with the other half isolated: both
+/// incarnations can serve the model, so nothing distinguishes them by *what*
+/// they hold — only *when* their identity was taken. A load that reads its own
+/// epoch reads it after the retirement and so vouches for a configuration the
+/// reader has already withdrawn; the epoch read beside the authorized row moves
+/// under it, and `reserve_engine` refuses inside the critical section the sweep
+/// takes.
+#[test]
+fn an_authorized_incarnation_retired_mid_request_starts_nothing() {
+    run(|| {
+        let (_mock, core, dir) = core_for(MockConfig::default());
+        let authorized = dir.path().join("authorized-models");
+        let replacement = dir.path().join("replacement-models");
+        std::fs::create_dir_all(&authorized).expect("authorized dir");
+        std::fs::create_dir_all(&replacement).expect("replacement dir");
+        // Both can serve it, so only the incarnation's identity separates them.
+        std::fs::write(authorized.join("m.gguf"), b"gguf").expect("model file");
+        std::fs::write(replacement.join("m.gguf"), b"gguf").expect("model file");
+        let engine = write_exiting_engine(dir.path());
+
+        let key = core.runtime().block_on(async {
+            core.update_proxy_settings(ProxySettingsUpdate {
+                local_exposure: Some(eidola_app_core::proxy::LocalExposure::Downloaded),
+                ..Default::default()
+            })
+            .await
+            .expect("open the permission");
+            core.add_backend(engine_backend("acme", &authorized, &engine))
+                .await
+                .expect("add");
+            core.set_proxy_backend_exposed("acme".to_string(), true)
+                .await
+                .expect("expose");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        core.test_set_engine_ready_timeout(std::time::Duration::from_millis(1500));
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let mut window = core.test_open_proxy_resolve_window();
+        let asking = {
+            let core = Arc::clone(&core);
+            runtime.spawn(async move {
+                exchange(
+                    &core,
+                    &post(
+                        "/v1/chat/completions",
+                        &key,
+                        r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
+                    ),
+                )
+                .await
+            })
+        };
+
+        let (status, body) = runtime.block_on(async {
+            let resume = window.recv().await.expect("the request reaches the window");
+            core.remove_backend("acme".to_string())
+                .await
+                .expect("remove");
+            core.add_backend(engine_backend("acme", &replacement, &engine))
+                .await
+                .expect("re-add a different backend under the same name");
+            let _ = resume.send(());
+            asking.await.expect("the request finishes")
+        });
+
+        assert_ne!(status, 200, "the request cannot be answered: {body}");
+        assert_eq!(
+            core.test_engine_spawn_count(),
+            0,
+            "an incarnation retired since it was authorized starts nothing"
+        );
+        assert!(
+            core.running_engines().is_empty(),
+            "and nothing was left registered"
+        );
+    });
+}
+
 /// **A removal takes the exposure with it, so the read that authorizes finds
 /// nothing on a revived row.**
 ///

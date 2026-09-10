@@ -880,19 +880,29 @@ impl Inner {
     async fn resolve_proxy_target(
         &self,
         model_ref: &str,
-    ) -> Result<crate::utility::UtilityTarget, AppError> {
+    ) -> Result<(crate::utility::UtilityTarget, local_models::BackendEpoch), AppError> {
         // The gap this stages is the one the doc above is about: a settings
         // snapshot is already in hand, and the read below is what decides.
         #[cfg(feature = "test-support")]
         crate::subspace_driver::pause_in_window(&self.proxy_resolve_window).await;
         let mref = backends::parse_model_ref(model_ref);
+        // Read **before** the row, the ordering `BackendEpoch` requires: the
+        // epoch has to be no newer than the configuration it vouches for, or a
+        // retirement between the two would be vouched for by the value read
+        // after it. This is the third chapter of the exposure story — the
+        // incarnation the load will act on — and it travels with the row it was
+        // read beside.
+        let epoch = self.local.backend_epoch(&mref.backend_id);
         let conn = self.db_conn().await?;
         let Some(backend) = db::exposed_backend(&conn, &mref.backend_id).await? else {
             return Err(AppError::ModelUnavailable {
                 model: model_ref.to_string(),
             });
         };
-        crate::utility::utility_target_for(backend, mref, "proxy")
+        Ok((
+            crate::utility::utility_target_for(backend, mref, "proxy")?,
+            epoch,
+        ))
     }
 
     /// Open the route: lease or start the engine, build the client, verify and
@@ -901,6 +911,7 @@ impl Inner {
     async fn open_proxy_route(
         &self,
         target: &crate::utility::UtilityTarget,
+        epoch: local_models::BackendEpoch,
     ) -> Result<ProxyRoute, AppError> {
         let backend = &target.backend;
         let now = now_ms();
@@ -937,7 +948,15 @@ impl Inner {
                                 ),
                             });
                         }
-                        self.load_local_model(&target.canonical).await?;
+                        // **The row the request was authorized against, not
+                        // a fresh read of its id.** See
+                        // `Inner::load_authorized_engine`: a remove-and-re-add
+                        // in the window this request has already opened puts a
+                        // different models directory and a different engine
+                        // behind the same name, and a load that resolves by id
+                        // would start *that* one and lease it the prompt.
+                        self.load_authorized_engine(backend, &target.model, epoch)
+                            .await?;
                         self.local
                             .lease_engine(&backend.id, &target.model)
                             .map(|(url, _ctx, lease)| (url, lease))
@@ -1202,8 +1221,8 @@ impl Inner {
         &self,
         request: ProxyChatRequest,
     ) -> Result<ProxyChatResponse, AppError> {
-        let target = self.resolve_proxy_target(&request.model).await?;
-        let mut route = self.open_proxy_route(&target).await?;
+        let (target, epoch) = self.resolve_proxy_target(&request.model).await?;
+        let mut route = self.open_proxy_route(&target, epoch).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(&request, route.declared_max_output);
         let body =
@@ -1432,8 +1451,8 @@ impl Inner {
         request: ProxyChatRequest,
         sender: tokio::sync::mpsc::Sender<ProxyStreamEvent>,
     ) -> Result<(), AppError> {
-        let target = self.resolve_proxy_target(&request.model).await?;
-        let mut route = self.open_proxy_route(&target).await?;
+        let (target, epoch) = self.resolve_proxy_target(&request.model).await?;
+        let mut route = self.open_proxy_route(&target, epoch).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(&request, route.declared_max_output);
         let body =

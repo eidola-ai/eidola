@@ -1991,7 +1991,53 @@ impl Inner {
     /// exits unexpectedly.
     pub(crate) async fn load_local_model(&self, id: &str) -> Result<(), AppError> {
         let key = engine_key_for_id(id);
-        let (backend_id, slug) = (key.0.clone(), key.1.clone());
+        let backend_id = key.0.clone();
+        // The epoch is read **before** the backend row, and handed to the
+        // reservation to validate — see [`BackendEpoch`]. Everything from here
+        // to the reservation is configuration this load is about to act on, and
+        // all of it can be retired while this future awaits.
+        let epoch = self.local.backend_epoch(&backend_id);
+        // The backend row is required for **every** engine backend, the `local`
+        // singleton included: disabling a backend retires its engines, and a
+        // rule that only the chat path enforced would let the explicit verb
+        // (`eidola model load`, the Load button) start another `llama-server`
+        // the moment after the disable stopped one — a disabled backend still
+        // holding gigabytes, which is precisely what disabling it asked for.
+        // Managing *files* (download, delete) stays open: those are not
+        // processes, and a disabled backend's models are still the user's.
+        let db_conn = self.db_conn().await?;
+        let row = self.require_backend(&db_conn, &backend_id).await?;
+        self.load_authorized_engine(&row, &key.1, epoch).await
+    }
+
+    /// The load itself, acting on **the configuration it was handed** and
+    /// reading no backend row of its own.
+    ///
+    /// **A caller that authorized a backend authorizes an incarnation, and this
+    /// is where that survives to the subprocess.** `load_local_model` resolves
+    /// its row by id at load time, which is right for the explicit verbs (the
+    /// reader just pressed Load) and wrong for anything that decided earlier:
+    /// the proxy authorizes an exposed backend row, then opens a route, and a
+    /// remove-and-re-add landing in that window put a **different** models
+    /// directory and a different `llama-server` behind the same id — so the
+    /// engine started was the replacement's, and the prompt was leased to a
+    /// destination nobody had exposed. Handing the row in makes reading the
+    /// replacement's configuration unrepresentable rather than merely checked.
+    ///
+    /// The `epoch` is the other half and cannot be folded into the row: the
+    /// authorized incarnation may itself have been retired since, and only a
+    /// value validated inside [`LocalRuntime::reserve_engine`]'s critical
+    /// section can say so. Unrepresentable for the replacement, refused for the
+    /// retired original — the two questions the caller cannot answer alone.
+    pub(crate) async fn load_authorized_engine(
+        &self,
+        backend: &crate::db::BackendRow,
+        slug: &str,
+        epoch: BackendEpoch,
+    ) -> Result<(), AppError> {
+        let backend_id = backend.id.clone();
+        let key: EngineKey = (backend_id.clone(), slug.to_string());
+        let slug = slug.to_string();
         let cfg = self.load_config();
 
         // Already present: ready → done; warming → join the in-flight load.
@@ -2001,12 +2047,6 @@ impl Inner {
             }
             return self.await_engine_ready(&key).await;
         }
-
-        // The epoch is read **before** the backend row, and handed to the
-        // reservation to validate — see [`BackendEpoch`]. Everything between
-        // here and the reservation is configuration this load is about to act
-        // on, and all of it can be retired while this future awaits.
-        let epoch = self.local.backend_epoch(&backend_id);
 
         // Resolve the model file's directory by backend, and note how the
         // engine binary resolves for it: the managed `local` store served by
@@ -2020,29 +2060,22 @@ impl Inner {
             /// A `llamacpp` backend's explicit path (`Some`) or discovery.
             External(Option<String>),
         }
-        // The backend row is required for **every** engine backend, the `local`
-        // singleton included: disabling a backend retires its engines, and a
-        // rule that only the chat path enforced would let the explicit verb
-        // (`eidola model load`, the Load button) start another `llama-server`
-        // the moment after the disable stopped one — a disabled backend still
-        // holding gigabytes, which is precisely what disabling it asked for.
-        // Managing *files* (download, delete) stays open: those are not
-        // processes, and a disabled backend's models are still the user's.
-        let db_conn = self.db_conn().await?;
-        let row = self.require_backend(&db_conn, &backend_id).await?;
-        let (dir, engine_source) = if backend_id == crate::backends::LOCAL_BACKEND_ID {
-            (models_dir(&self.data_dir), EngineSource::Bundled)
-        } else {
-            if row.kind != crate::backends::BackendKind::LlamaCpp.as_str() {
-                return Err(AppError::LocalModel {
-                    message: format!("backend `{backend_id}` does not serve local engines"),
-                });
-            }
-            let dir = PathBuf::from(row.models_dir.ok_or_else(|| AppError::LocalModel {
-                message: format!("backend `{backend_id}` has no models directory"),
-            })?);
-            (dir, EngineSource::External(row.engine_path))
-        };
+        let (dir, engine_source) =
+            if backend_id == crate::backends::LOCAL_BACKEND_ID {
+                (models_dir(&self.data_dir), EngineSource::Bundled)
+            } else {
+                if backend.kind != crate::backends::BackendKind::LlamaCpp.as_str() {
+                    return Err(AppError::LocalModel {
+                        message: format!("backend `{backend_id}` does not serve local engines"),
+                    });
+                }
+                let dir = PathBuf::from(backend.models_dir.clone().ok_or_else(|| {
+                    AppError::LocalModel {
+                        message: format!("backend `{backend_id}` has no models directory"),
+                    }
+                })?);
+                (dir, EngineSource::External(backend.engine_path.clone()))
+            };
 
         let model_path =
             find_model_file(&dir, &slug)
