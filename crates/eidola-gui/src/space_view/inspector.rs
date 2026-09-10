@@ -131,6 +131,21 @@ impl SpaceView {
         inspector_layout(self.inspector_open, viewport_width)
     }
 
+    /// Whether the panel is **covering** the conversation pane rather than
+    /// standing beside it.
+    ///
+    /// The split form takes width away and the overlay form takes the *page*:
+    /// a full-window scrim painted after everything in the pane, the panel over
+    /// that. So which surfaces are covered is a function of the window's width,
+    /// and the two things a covering surface owes — the tab order and the
+    /// keyboard — are owed only in the second form. The find bar and the
+    /// Find-all overlay ask this before lifting [`crate::focus::Covered`] for
+    /// their own subtrees, which is what keeps them from being reachable by Tab
+    /// underneath a scrim they cannot be seen through.
+    pub(crate) fn inspector_covers_pane(&self, window: &Window) -> bool {
+        self.inspector_layout(crate::chrome::content_size(window).width) == InspectorLayout::Overlay
+    }
+
     /// `Space ▸ Show/Hide Inspector` (⌥⌘I) — the only door, by design.
     pub fn toggle_inspector(
         &mut self,
@@ -153,6 +168,24 @@ impl SpaceView {
         self.inspector_open = open;
         if open {
             self.ensure_inspector_settings(cx);
+            // **A surface that covers the page takes the keyboard off what it
+            // covers.** In the *overlay* form the panel paints a full-window
+            // scrim after the conversation pane, so the Find-all overlay and
+            // the find bar are behind it — and the keyboard was left on
+            // whichever of them held it, so arrows and Enter went on driving a
+            // results list nobody could see while the pointer was intercepted
+            // by the scrim. The split form covers nothing and takes nothing.
+            //
+            // The panel itself is the destination rather than its title field:
+            // ⌥⌘I asks to *see* the inspector, not to type in it, and the
+            // panel's own handle is a live one carrying a role
+            // (`Role::Complementary`), which is what makes it a destination
+            // AccessKit can report focus on. Find-all is deliberately left
+            // standing — the reader's search is not this verb's to spend, and
+            // closing the panel hands the keyboard back.
+            if self.inspector_covers_pane(window) && self.find_holds_focus(window, cx) {
+                window.focus(&self.inspector_focus, cx);
+            }
         } else {
             self.inspector_router_picker = false;
             // The dropdowns are transient by nature and must not come back with
@@ -230,6 +263,13 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         self.set_inspector_open(open, window, cx);
+    }
+
+    /// Whether the inspector panel itself holds the keyboard — where an
+    /// overlaying panel puts it, and the seam that says so.
+    #[doc(hidden)]
+    pub fn inspector_focused_for_test(&self, window: &Window) -> bool {
+        self.inspector_focus.is_focused(window)
     }
 
     /// This space's settings cell, for the rows below.
@@ -437,11 +477,15 @@ impl SpaceView {
         // lives inside that pane — never covers it: its controls keep their
         // place in the tab order ([`crate::focus::Covered`]).
         let _uncovered = crate::focus::Covered::new(false);
+        let focus = self.inspector_focus.clone();
         self.sync_inspector_title(window, cx);
         // The panel meets the window's right edge in both forms, so it owns
         // those corner notches under Linux CSD (no-ops elsewhere).
         let panel = crate::chrome::round_br_client_corner(
-            crate::chrome::round_tr_client_corner(self.render_inspector_panel(window, cx), window),
+            crate::chrome::round_tr_client_corner(
+                self.render_inspector_panel(window, cx).track_focus(&focus),
+                window,
+            ),
             window,
         );
         match layout {

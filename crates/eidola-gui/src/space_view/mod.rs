@@ -540,6 +540,13 @@ pub struct SpaceView {
     /// [`SpaceView::retry_transcript_load`] asks containment of *before* it
     /// acts — the same shape the bottom bands take.
     pub(crate) transcript_retry_focus: FocusHandle,
+    /// The inspector panel's own handle — where the keyboard goes when the
+    /// panel opens in its **overlay** form over a surface that was holding it
+    /// (see [`SpaceView::set_inspector_open`]). It carries the panel's own tab
+    /// attributes, because gpui reads a *tracked* handle's flags rather than
+    /// the element's: without them the panel's `AUX` region would silently
+    /// become index 0 and reorder the whole window's Tab walk.
+    pub(crate) inspector_focus: FocusHandle,
     /// The open right-click menu over one of the space's editors, if any —
     /// window-local transient state, like the band menu and the picker (one
     /// open at a time; see [`context_menu`]).
@@ -1123,6 +1130,10 @@ impl SpaceView {
             quote_destination_scroll: gpui::UniformListScrollHandle::new(),
             band_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             transcript_retry_focus: cx.focus_handle(),
+            inspector_focus: cx
+                .focus_handle()
+                .tab_index(crate::focus::region::AUX)
+                .tab_stop(false),
             context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),

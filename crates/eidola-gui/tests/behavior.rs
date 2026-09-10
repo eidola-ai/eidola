@@ -23086,6 +23086,144 @@ fn space_find_refuses_a_card_the_query_has_moved_out_from_under(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn space_find_refuses_a_card_the_results_have_moved_out_from_under(cx: &mut TestAppContext) {
+    // The generation guard's second axis. A regeneration takes its post out of
+    // the result set with the query untouched — the exclusion rides `CountKey`,
+    // not the query — so a card captured before it passed the generation check
+    // and spent branch selection on a post the overlay no longer offers,
+    // installing an ordinal `sync_find` then resolved the standing query from.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The answer's own card, as a rendered frame's click closure holds it.
+    let stale = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.capture_find_result_for_test(1, window, cx)))
+        .expect("both posts match, so the answer has a card");
+
+    // A background regeneration takes that post out of the results — the query
+    // has not moved, so the generation still agrees.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let anchor = view.read_with(&vcx, |v, _| v.find_anchor_key_for_test());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.press_captured_find_result_for_test(stale, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the press is refused — the overlay does not collapse for a result it \
+         no longer offers"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_anchor_key_for_test()),
+        anchor,
+        "and the reader's place under the standing query is untouched"
+    );
+}
+
+#[gpui::test]
+fn space_an_overlaying_inspector_takes_the_keyboard_off_what_it_covers(cx: &mut TestAppContext) {
+    // The inspector is a *sibling* of the conversation pane only in its split
+    // form. Below `MIN_CONTENT_WIDTH` it paints a full-window scrim after that
+    // pane and the panel over it, so an open Find-all is behind it — and ⌥⌘I
+    // stays registered, so the reader can put it there. The keyboard was left
+    // on the results list underneath: arrows and Enter went on driving a list
+    // nobody could see while the pointer was intercepted by the scrim.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Wide enough that the inspector would split rather than cover.
+    vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: opening the overlay put the keyboard on its results list"
+    );
+
+    // A split inspector covers nothing, so it takes nothing.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "a split panel stands beside the page and leaves the keyboard alone"
+    );
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Narrow enough that it must overlay, and the reader presses ⌥⌘I.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the covered list no longer holds the keyboard"
+    );
+    assert!(
+        vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "…the panel the reader asked for does"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "and the search is left standing — it is not this verb's to spend"
+    );
+}
+
+#[gpui::test]
 fn space_opening_the_find_overlay_dismisses_what_it_would_cover(cx: &mut TestAppContext) {
     // The mirror of withholding the quote verbs. Every popover the conversation
     // can hold paints inside the pane, so the overlay stands in front of it:

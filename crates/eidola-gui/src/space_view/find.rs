@@ -2846,8 +2846,13 @@ impl SpaceView {
         self.find.as_ref()?;
         // The bar is *above* the overlay it opens, so its own controls stay in
         // the tab order while the overlay covers everything else
-        // ([`crate::focus::Covered`]).
-        let _uncovered = crate::focus::Covered::new(false);
+        // ([`crate::focus::Covered`]) — **unless something is covering the bar
+        // in turn**. The inspector's overlay form paints a full-window scrim
+        // after this whole pane, so lifting the guard unconditionally left the
+        // bar's verbs reachable by Tab underneath a wash the reader cannot see
+        // through. Which surfaces cover which is a function of the window's
+        // width, so it is asked rather than assumed.
+        let _uncovered = crate::focus::Covered::new(self.inspector_covers_pane(window));
         self.sync_find_placeholder(window, cx);
         let (bg, border, muted) = {
             let theme = cx.theme();

@@ -951,6 +951,29 @@ impl SpaceView {
         self.click_find_result(fragment, &editor, window, cx);
     }
 
+    /// Whether the results **as they stand** still hold this card.
+    ///
+    /// Asked at the press rather than tracked, because the answer is a function
+    /// of state several other things move (a turn's revising set, a draft's
+    /// text, the transcript) and a tracked flag would be one more thing to
+    /// invalidate. It re-cuts the results once, which is what a click can
+    /// afford and what a frame could not.
+    fn find_result_still_stands(
+        &mut self,
+        fragment: &ResultFragment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        self.find_results(&map, &post_index(&self.posts), cx)
+            .iter()
+            .flat_map(|g| g.fragments.iter())
+            .any(|f| f.id == fragment.id)
+    }
+
     /// A result card as a **rendered click closure** holds it — captured now,
     /// pressable later.
     ///
@@ -1121,6 +1144,24 @@ impl SpaceView {
             .as_ref()
             .is_none_or(|s| s.query_generation != fragment.query_generation);
         if stale {
+            return;
+        }
+        // **And the results move under a standing query too** — the guard's
+        // second axis. A background regeneration takes its post out of the
+        // result set with the query untouched (the exclusion rides `CountKey`,
+        // not the query), and an edit re-cuts a node's fragments; either way the
+        // card under the reader's pointer answers for a list this frame no
+        // longer has, and opening it selected that post's branch and installed
+        // an ordinal `sync_find` then resolved the new results from.
+        //
+        // So the card is looked up in the results **as they stand**, through
+        // the same `find_results` the render itself calls, and a fragment id
+        // carries everything that would have moved: the node, a stamp of its
+        // content, and the run's own start. Identity rather than repair, for
+        // the reason the generation guard gives — there is no "same result" to
+        // retarget onto once the post has left the set, which is exactly the
+        // transcript's rule for an anchor whose item is genuinely gone.
+        if !self.find_result_still_stands(&fragment, window, cx) {
             return;
         }
         self.close_find_overlay(window, cx);
@@ -1411,8 +1452,11 @@ impl SpaceView {
         }
         // The surface doing the covering builds its own controls in the clear
         // ([`crate::focus::Covered`]) — the map's dots and the results list are
-        // the tab stops a reader is meant to reach while it stands.
-        let _uncovered = crate::focus::Covered::new(false);
+        // the tab stops a reader is meant to reach while it stands. **Unless it
+        // is itself covered**: the inspector's overlay form is a full-window
+        // scrim painted after this pane, and a covering surface is not exempt
+        // from being covered.
+        let _uncovered = crate::focus::Covered::new(self.inspector_covers_pane(window));
         let map = map_layout(tree, &|node| self.find_map_includes(node, cx));
         let posts = post_index(&self.posts);
         let groups = self.find_results(&map, &posts, cx);
@@ -1726,7 +1770,17 @@ impl SpaceView {
                     // element a stop at index 0; gpui reads a *tracked*
                     // handle's own flags instead, and the handle carries the
                     // same pair, so the tab order does not move.
-                    .track_focus(&slots[&node.node])
+                    // **A tracked handle honours the covering guard itself**
+                    // (`post.rs`'s rule, second instance): gpui reads a tracked
+                    // handle's own `tab_stop` rather than the element's, so
+                    // `Covered` — which acts where a *role* becomes a stop —
+                    // cannot reach one. Without this the map's dots stayed in
+                    // the tab order under an overlaying inspector's scrim.
+                    .track_focus(
+                        &slots[&node.node]
+                            .clone()
+                            .tab_stop(!crate::focus::tab_stops_suppressed()),
+                    )
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.reveal_find_group(&target, cursor_to, cx);
@@ -1974,7 +2028,14 @@ impl SpaceView {
                         gpui::Role::List,
                         crate::i18n::msg::find_results_label(cx),
                     )
-                    .track_focus(&list_focus)
+                    // The one tab stop the overlay contributes — and it, too,
+                    // asks the covering guard, because a tracked handle carries
+                    // its own flags (see the map's dots above).
+                    .track_focus(
+                        &list_focus
+                            .clone()
+                            .tab_stop(!crate::focus::tab_stops_suppressed()),
+                    )
                     .on_key_down(
                         cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
                             if this.handle_find_results_key(&fragments, viewport_h, ev, window, cx)
