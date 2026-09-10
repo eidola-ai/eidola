@@ -8807,6 +8807,22 @@ fn the_find_overlay_probes_its_map_and_its_results(cx: &mut TestAppContext) {
         "You — has matches",
     );
     assert_probe(&entries, "space/find/map/1", gpui::Role::Label, "You");
+    // **The circle is the mark; the cell is the control.** The handler used to
+    // ride the 9px visual, which is the whole pointer target for the surface's
+    // only navigation verb — hard with a mouse, harder with an unsteady hand.
+    // The interactive element is sized to the room the map's own strides leave,
+    // with the circle drawn inside it, so what a reader aims at is bigger than
+    // what they see without the dot moving a pixel.
+    let dot = entries
+        .iter()
+        .find(|(name, _)| name == "space/find/map/0")
+        .map(|(_, e)| e.bounds)
+        .expect("the map's first dot painted");
+    assert!(
+        dot.size.height.as_f32() > 9.0 && dot.size.width.as_f32() > 9.0,
+        "the hit cell is larger than the circle it holds: {:?}",
+        dot.size
+    );
     // One result, and it is a managed descendant of the list rather than a tab
     // stop of its own — a card per stop would describe an order that does not
     // contain the results nobody scrolled to. **Its name carries the

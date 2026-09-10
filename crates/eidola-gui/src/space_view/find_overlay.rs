@@ -113,6 +113,10 @@ const FRAGMENT_LABEL_CHARS: usize = 120;
 /// The results column's own inset either side of a fragment card.
 const RESULTS_PAD: f32 = 16.0;
 
+/// The card's own horizontal padding, in `rems` — its `px_3`, stated where the
+/// width arithmetic can read it so the two cannot drift.
+const CARD_PAD_X_REMS: f32 = 0.75;
+
 // ---------------------------------------------------------------------------
 // The map's layout — pure
 // ---------------------------------------------------------------------------
@@ -325,6 +329,46 @@ pub(crate) fn map_lane_x(lane: usize, lanes: usize) -> f32 {
     lane as f32 * map_lane_width(lanes)
 }
 
+/// The width a fragment card's prose wraps to, inside a results column
+/// `available` pixels wide at type-scale rem size `rem`.
+///
+/// Everything the column takes off the outside is subtracted here, because this
+/// number is what a card's **measured height** is a function of: the reading
+/// measure the column caps itself at, the fragment wrapper's `px_4`, the card's
+/// own `px_3`, and its hairline border. The paddings are `rems`, so they follow
+/// the reader's type scale — which is why the scale is the *other* half of the
+/// key beside this one.
+pub(crate) fn card_text_width(available: f32, rem: f32) -> f32 {
+    let column = available.min(super::BODY_MAX_WIDTH.as_f32() + 2.0 * RESULTS_PAD);
+    (column - 2.0 * rem - 2.0 * CARD_PAD_X_REMS * rem - 2.0).max(1.0)
+}
+
+/// Whether the layout a card is measured in has moved since the cache was last
+/// pointed at one — [`FindOverlay::ensure_card_geometry`]'s whole decision,
+/// stated apart from the clearing so it can be read on its own.
+///
+/// Nothing measured yet counts as moved, so the first frame states its geometry
+/// rather than adopting whatever it finds.
+pub(crate) fn card_geometry_moved(prev: Option<(f32, f32)>, width: f32, scale: f32) -> bool {
+    match prev {
+        Some((w, s)) => (w - width).abs() > 0.5 || (s - scale).abs() > 1e-3,
+        None => true,
+    }
+}
+
+/// Where a dot's **hit cell** starts on one axis, given where the dot itself
+/// starts and how much room the cell is allowed.
+///
+/// The cell is centred on the circle rather than hung off its corner, so the
+/// mark stays exactly where the topology puts it and the enlarged target grows
+/// symmetrically around it — which is also what makes the cells tile: they are
+/// one stride apart and one stride wide, so neighbours meet and never overlap.
+/// It can go negative at the origin (half a cell hangs left of lane 0 and above
+/// depth 0), which the column's own padding absorbs.
+pub(crate) fn map_cell_origin(dot_start: f32, cell_extent: f32) -> f32 {
+    dot_start + MAP_DOT / 2.0 - cell_extent / 2.0
+}
+
 /// The scroll offset that brings `[start, start + extent)` inside a viewport of
 /// `viewport`, moving as little as possible — one axis of the map's reveal.
 ///
@@ -427,7 +471,21 @@ pub(crate) struct ResultFragment {
     /// The first hit inside this fragment, as its **ordinal within the node** —
     /// half of the anchor a click hands the bar.
     pub(crate) ordinal: usize,
+    /// **Which search this fragment answers** — [`FindSession::query_generation`]
+    /// as it stood when the card was cut.
+    ///
+    /// A card's click closure holds the fragment the *rendered* frame carried,
+    /// and production really does handle a query `Change` and that click
+    /// between two paints. Opening a stale one installed its ordinal as the new
+    /// query's anchor, on a branch the new search never chose; an ordinal means
+    /// nothing across queries, so the press is refused rather than repaired.
+    pub(crate) query_generation: u64,
 }
+
+/// A result card as a rendered frame's click closure holds it — an opaque
+/// handle so a test can press a card the query has since moved out from under.
+#[doc(hidden)]
+pub struct CapturedResult(ResultFragment);
 
 /// One node's results, under its own attribution.
 pub(crate) struct ResultGroup {
@@ -495,6 +553,10 @@ pub(crate) struct FindOverlay {
     /// handle carries `tab_index(0)`, reproducing what `probe` derives, so the
     /// tab order is unchanged; only the *question* is newly answerable.
     map_slots: HashMap<SharedString, gpui::FocusHandle>,
+    /// The layout the measured `heights` were taken at — the card's wrapped
+    /// text width and the reader's type scale. See
+    /// [`FindOverlay::ensure_card_geometry`].
+    card_geometry: Option<(f32, f32)>,
 }
 
 impl FindOverlay {
@@ -523,6 +585,33 @@ impl FindOverlay {
             tops: HashMap::new(),
             in_view: HashSet::new(),
             map_slots: HashMap::new(),
+            card_geometry: None,
+        }
+    }
+
+    /// Point the height cache at the geometry this frame is laying cards out
+    /// at, dropping every measurement if it moved — `Layout::ensure_width`'s
+    /// rule, for the overlay's own cache.
+    ///
+    /// **A measurement is a function of the text *and* the layout it was taken
+    /// in.** The fragment id already carries the text (an action id moves with
+    /// a post's content, and a live editor's card carries a content stamp), so
+    /// it looked like the whole key — but a pane resized below the column's
+    /// maximum width re-wraps every card, and a type-scale change re-wraps *and*
+    /// re-leads them, with no id moving at all. Cards outside the virtualization
+    /// band are never re-rendered, so their stale placeholders went on sizing
+    /// the list: every group top below one was wrong, and with it the map's
+    /// scroll targets, the cursor's reveal and the list's own extent, until the
+    /// reader happened to scroll each card back into the band.
+    ///
+    /// Clearing rather than widening the per-fragment key is deliberate: the
+    /// geometry is the same for every card in a frame, so one comparison
+    /// answers for all of them, and a stale entry can never be *found* rather
+    /// than merely never read.
+    pub(crate) fn ensure_card_geometry(&mut self, width: f32, scale: f32) {
+        if card_geometry_moved(self.card_geometry, width, scale) {
+            self.card_geometry = Some((width, scale));
+            self.heights.borrow_mut().clear();
         }
     }
 
@@ -538,6 +627,17 @@ impl FindOverlay {
     /// a reader typing in a draft supersedes that draft's cards on every
     /// keystroke. Without this the maps would grow one entry per edit and hold
     /// an editor entity for each until the query moved.
+    /// How many cards hold a real measurement — the test seam behind
+    /// [`SpaceView::find_measured_cards_for_test`].
+    pub(crate) fn measured_cards(&self) -> usize {
+        self.heights.borrow().len()
+    }
+
+    /// One card's measured height, if it has one.
+    pub(crate) fn card_height(&self, id: &SharedString) -> Option<f32> {
+        self.heights.borrow().get(id).copied()
+    }
+
     pub(crate) fn retain_results(&mut self, live: &HashSet<SharedString>) {
         self.heights.borrow_mut().retain(|id, _| live.contains(id));
         self.bodies.retain(|id, _| live.contains(id));
@@ -553,16 +653,38 @@ impl FindOverlay {
         self.map_slots.clear();
     }
 
+    /// Drop the slots of every node this frame's map no longer paints a *stop*
+    /// for, and answer whether one of them was holding the keyboard.
+    ///
+    /// Same shape as [`Self::retain_results`] — a slot map is only bounded by
+    /// pruning it against what actually painted — plus the rule every unmount
+    /// in this window owes: **a surface that takes a focus destination away
+    /// hands the keyboard back**. A background regeneration is enough to do it:
+    /// the post stops being a result, so its dot stops being a `Button`, stops
+    /// tracking a handle, and its slot goes — leaving the window focused on a
+    /// handle no frame paints, where arrows reach nothing and Tab restarts from
+    /// the root. The answer is *observed here*, before the handles are dropped,
+    /// because afterwards there is nothing left to ask.
+    ///
+    /// The caller does the moving: it is the one that knows where the keyboard
+    /// should land (the results list, the overlay's own single stop).
+    fn prune_map_slots(&mut self, live: &HashSet<SharedString>, window: &Window) -> bool {
+        let mut orphaned = false;
+        self.map_slots.retain(|id, handle| {
+            let keep = live.contains(id);
+            orphaned |= !keep && handle.is_focused(window);
+            keep
+        });
+        orphaned
+    }
+
     /// Hand back the handle for a map dot that is a tab stop, minting one the
-    /// first time, and drop the slots of every node this frame's map no longer
-    /// has one for. Same shape as [`Self::retain_results`]: a slot map is only
-    /// bounded by pruning it against what actually painted.
+    /// first time. Prune with [`Self::prune_map_slots`] first.
     fn map_slots_for(
         &mut self,
         live: &HashSet<SharedString>,
         cx: &mut gpui::App,
     ) -> &HashMap<SharedString, gpui::FocusHandle> {
-        self.map_slots.retain(|id, _| live.contains(id));
         for id in live {
             self.map_slots
                 .entry(id.clone())
@@ -705,6 +827,7 @@ impl SpaceView {
         let Some(session) = self.find.as_ref() else {
             return Vec::new();
         };
+        let generation = session.query_generation;
         let mut groups = Vec::new();
         for entry in map {
             let post = posts.get(&entry.node).map(|i| &self.posts[*i]);
@@ -753,6 +876,7 @@ impl SpaceView {
                     hits: result.hits[run.hits].to_vec(),
                     range: run.range,
                     content: result.content.clone(),
+                    query_generation: generation,
                 })
                 .collect();
             groups.push(ResultGroup {
@@ -825,6 +949,76 @@ impl SpaceView {
             return;
         };
         self.click_find_result(fragment, &editor, window, cx);
+    }
+
+    /// A result card as a **rendered click closure** holds it — captured now,
+    /// pressable later.
+    ///
+    /// The seam exists because the interleaving it pins cannot be staged
+    /// through a window: under `cfg(test)` gpui draws every dirty window inside
+    /// each effect flush, fusing the notified render onto the `Change` that
+    /// scheduled it, while production draws from the platform's frame callback
+    /// and really does handle a query change and a click between two paints.
+    #[doc(hidden)]
+    pub fn capture_find_result_for_test(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<CapturedResult> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        self.find_results(&map, &post_index(&self.posts), cx)
+            .into_iter()
+            .flat_map(|g| g.fragments)
+            .nth(index)
+            .map(CapturedResult)
+    }
+
+    /// Press a card captured earlier — what the click closure of a frame that
+    /// has not been redrawn does.
+    #[doc(hidden)]
+    pub fn press_captured_find_result_for_test(
+        &mut self,
+        captured: CapturedResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_find_result(captured.0, window, cx);
+    }
+
+    /// How many result cards have a **measured** height — the half of the
+    /// height cache a geometry change has to drop.
+    #[doc(hidden)]
+    pub fn find_measured_cards_for_test(&self) -> usize {
+        self.find
+            .as_ref()
+            .map(|s| s.overlay.measured_cards())
+            .unwrap_or(0)
+    }
+
+    /// The measured height standing for the `index`-th card, if one is cached —
+    /// what a stale geometry would keep serving.
+    #[doc(hidden)]
+    pub fn find_card_height_for_test(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<f32> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map = map_layout(&tree, &|node| self.find_map_includes(node, cx));
+        let id = self
+            .find_results(&map, &post_index(&self.posts), cx)
+            .into_iter()
+            .flat_map(|g| g.fragments)
+            .nth(index)?
+            .id;
+        self.find.as_ref().and_then(|s| s.overlay.card_height(&id))
     }
 
     /// Take the reader to the `index`-th result the overlay is showing — the
@@ -910,6 +1104,25 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // **A card answers for the search it was cut in, and no other.** gpui
+        // draws from the platform's frame callback, so a query `Change` and a
+        // press on a card still showing the previous query's results really can
+        // arrive between two paints — and by then `set_find_query` has emptied
+        // the match set, cleared the anchor and dropped the overlay's results.
+        // Acting anyway spent the one thing find never spends (the reader's
+        // branch) to go somewhere the new search never chose, and installed an
+        // ordinal from a list that no longer exists as its anchor, which
+        // `sync_find` then resolved the new query from. Refused rather than
+        // repaired: an ordinal is meaningless across queries, so there is
+        // nothing here to carry forward. The next frame draws the new query's
+        // cards in the same place, which is what the reader will press.
+        let stale = self
+            .find
+            .as_ref()
+            .is_none_or(|s| s.query_generation != fragment.query_generation);
+        if stale {
+            return;
+        }
         self.close_find_overlay(window, cx);
         let page_width = self.page_size(window).width;
         let turns = self.stream_overlays(cx);
@@ -1113,6 +1326,25 @@ impl SpaceView {
         map_layout(&tree, &|node| self.find_map_includes(node, cx)).len()
     }
 
+    /// Whether the overlay's results list — its single tab stop, and where a
+    /// handback lands — holds the keyboard.
+    #[doc(hidden)]
+    pub fn find_results_list_focused_for_test(&self, window: &Window) -> bool {
+        self.find
+            .as_ref()
+            .is_some_and(|s| s.overlay.list_focus.is_focused(window))
+    }
+
+    /// The node the bar's current match belongs to — the key a result press
+    /// installs as the anchor.
+    #[doc(hidden)]
+    pub fn find_anchor_key_for_test(&self) -> Option<String> {
+        self.find
+            .as_ref()
+            .and_then(|s| s.anchor.as_ref())
+            .map(|a| a.key.to_string())
+    }
+
     /// The map column's scroll offset — what a reveal moves.
     #[doc(hidden)]
     pub fn find_map_scroll_for_test(&self) -> (f32, f32) {
@@ -1245,7 +1477,7 @@ impl SpaceView {
         map: &[MapNode],
         groups: &[ResultGroup],
         posts: &HashMap<SharedString, usize>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (muted, border, wash, accent) = {
@@ -1291,6 +1523,9 @@ impl SpaceView {
         let depths = map.iter().map(|n| n.depth + 1).max().unwrap_or(1);
         let x = |lane: usize| map_lane_x(lane, lanes);
         let y = |depth: usize| depth as f32 * MAP_ROW_H;
+        // The room a dot's hit cell may take without touching its neighbour's:
+        // one lane stride across, one row down (see the cell below).
+        let lane_stride = map_lane_width(lanes);
 
         // **A dot the keyboard reaches is a dot the reader can see.** Only the
         // nodes with matches are tab stops, and the column clips on both axes —
@@ -1314,10 +1549,23 @@ impl SpaceView {
             .overlay
             .map_scroll
             .clone();
-        let slots = {
+        let (slots, orphaned, list_focus) = {
             let overlay = &mut self.find.as_mut().expect("checked").overlay;
-            overlay.map_slots_for(&with_matches, cx).clone()
+            let orphaned = overlay.prune_map_slots(&with_matches, window);
+            (
+                overlay.map_slots_for(&with_matches, cx).clone(),
+                orphaned,
+                overlay.list_focus.clone(),
+            )
         };
+        // **The dot that was holding the keyboard has gone, so the keyboard
+        // goes somewhere that is still painted.** The results list is this
+        // surface's own single stop and is rendered on every frame the overlay
+        // is, empty or not — which is exactly why opening the overlay lands
+        // there too.
+        if orphaned {
+            window.focus(&list_focus, cx);
+        }
         if let Some(node) = map
             .iter()
             .find(|n| slots.get(&n.node).is_some_and(|h| h.is_focused(window)))
@@ -1329,16 +1577,19 @@ impl SpaceView {
             let view = handle.bounds().size;
             let (offset, max) = (handle.offset(), handle.max_offset());
             let target = gpui::point(
+                // The **cell**, not the circle inside it: the cell is what
+                // carries the role, so it is what the focus ring is drawn
+                // around and what the reader has to be able to see all of.
                 px(map_reveal_axis(
-                    x(node.lane),
-                    MAP_DOT,
+                    map_cell_origin(x(node.lane), lane_stride),
+                    lane_stride,
                     view.width.as_f32() - 2.0 * MAP_PAD,
                     offset.x.as_f32(),
                     max.x.as_f32(),
                 )),
                 px(map_reveal_axis(
-                    y(node.depth),
-                    MAP_DOT,
+                    map_cell_origin(y(node.depth), MAP_ROW_H),
+                    MAP_ROW_H,
                     view.height.as_f32() - 2.0 * MAP_PAD,
                     offset.y.as_f32(),
                     max.y.as_f32(),
@@ -1356,11 +1607,15 @@ impl SpaceView {
         // right edge: a map contradicting the topology it exists to show, with
         // some nodes unreachable. Lane index *is* the x position, so the canvas
         // states its real width and the column scrolls horizontally.
+        // The extent is the last **cell's** far edge, not the last circle's: the
+        // hit cell is what the reader aims at, so a canvas short of it would
+        // leave the right-most column's target partly outside the scrollable
+        // area.
+        let last_cell_right =
+            map_cell_origin(x(lanes.saturating_sub(1)), lane_stride) + lane_stride;
         let mut canvas = div()
             .relative()
-            .w(px(
-                (x(lanes.saturating_sub(1)) + MAP_DOT).max(MAP_WIDTH - 2.0 * MAP_PAD)
-            ))
+            .w(px(last_cell_right.max(MAP_WIDTH - 2.0 * MAP_PAD)))
             .flex_none()
             .h(px(y(depths.saturating_sub(1)) + MAP_DOT + MAP_ROW_H));
 
@@ -1417,6 +1672,32 @@ impl SpaceView {
                 )
             };
             let target = node.node.clone();
+            // **The circle is the mark; the cell is the control.** A 9px dot is
+            // the whole pointer target when the handler rides the visual, which
+            // is a hard thing to hit with a mouse and a harder one with an
+            // unsteady hand — for the surface's only navigation verb. The
+            // composer's resize handle already states the shape (a thin painted
+            // separator inside a `COMPOSER_RESIZE_HIT_H` band): the interactive
+            // element is sized to the room the layout has, and the visual is a
+            // child of it. Here that room is exactly the map's own strides, so
+            // the cells tile the graph without overlapping — a row is
+            // `MAP_ROW_H` apart and a lane one stride apart, so two neighbours'
+            // cells meet and never cover each other, and no dot is reachable by
+            // aiming at another's.
+            let (cell_w, cell_h) = (lane_stride, MAP_ROW_H);
+            let visual = {
+                let mut circle = div().w(px(MAP_DOT)).h(px(MAP_DOT)).rounded_full().bg(
+                    match (is_current, has) {
+                        (true, _) => accent,
+                        (false, true) => wash,
+                        (false, false) => muted.opacity(0.35),
+                    },
+                );
+                if showing {
+                    circle = circle.border_1().border_color(accent);
+                }
+                circle
+            };
             let mut dot = div()
                 // **Keyed by the post it represents, not by where it sits.** A
                 // dot is a real tab stop, and the sort is depth-then-lane over
@@ -1429,19 +1710,14 @@ impl SpaceView {
                 .probe(format!("space/find/map/{i}"), role, label)
                 .aria_selected(showing)
                 .absolute()
-                .top(px(y(node.depth)))
-                .left(px(x(node.lane)))
-                .w(px(MAP_DOT))
-                .h(px(MAP_DOT))
-                .rounded_full()
-                .bg(match (is_current, has) {
-                    (true, _) => accent,
-                    (false, true) => wash,
-                    (false, false) => muted.opacity(0.35),
-                });
-            if showing {
-                dot = dot.border_1().border_color(accent);
-            }
+                .top(px(map_cell_origin(y(node.depth), cell_h)))
+                .left(px(map_cell_origin(x(node.lane), cell_w)))
+                .w(px(cell_w))
+                .h(px(cell_h))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(visual);
             if has {
                 let cursor_to = first_fragment.get(&node.node).copied();
                 dot = dot
@@ -1517,7 +1793,17 @@ impl SpaceView {
         // editor's id carries its content, so every keystroke in a draft
         // supersedes its own cards. Retaining to this frame's ids is what keeps
         // that from accumulating a state per edit for the length of a search.
+        // **The measurements belong to a geometry as well as to a text.** Both
+        // halves come from outside this list — the column's width from the
+        // window and the inspector split, the scale from the reader's zoom —
+        // so they are read here and compared once for the whole frame.
+        let card_width = card_text_width(
+            self.page_width(window).as_f32() - MAP_WIDTH - 1.0,
+            window.rem_size().as_f32(),
+        );
+        let scale = crate::theme::font_scale(cx);
         if let Some(session) = self.find.as_mut() {
+            session.overlay.ensure_card_geometry(card_width, scale);
             let live: HashSet<SharedString> = fragments.iter().map(|f| f.id.clone()).collect();
             session.overlay.retain_results(&live);
         }
@@ -1621,7 +1907,8 @@ impl SpaceView {
 
             for (nth, fragment) in group.fragments.iter().enumerate() {
                 let measured = heights.borrow().get(&fragment.id).copied();
-                let height = measured.unwrap_or_else(|| self.find_fragment_estimate(fragment));
+                let height = measured
+                    .unwrap_or_else(|| Self::find_fragment_estimate(fragment, card_width, scale));
                 let visible = y < band.end && (y + height) > band.start;
                 let on_cursor = cursor == Some(index);
                 if visible {
@@ -1713,15 +2000,21 @@ impl SpaceView {
     /// The transcript's own estimate over the fragment's source, plus the
     /// card's chrome — honest in the same direction, and replaced by the real
     /// measurement the frame after the card first paints.
-    fn find_fragment_estimate(&self, fragment: &ResultFragment) -> f32 {
+    /// **The estimate is taken at the geometry the card will really be laid out
+    /// in** — the same pair the height cache is keyed on. Sized against the
+    /// reading measure and the unscaled prose size instead, it was wrong in both
+    /// directions the moment the pane was narrower than the column's cap or the
+    /// reader had zoomed, so every unmeasured card's placeholder mis-sized the
+    /// list before it had ever painted.
+    fn find_fragment_estimate(fragment: &ResultFragment, width: f32, scale: f32) -> f32 {
         let text = fragment
             .content
             .get(fragment.range.clone())
             .unwrap_or_default();
         super::layout::estimate_post_height(
             text,
-            (super::BODY_MAX_WIDTH.as_f32() - 2.0 * super::POST_PAD_Y.as_f32()).max(1.0),
-            super::PROSE_FONT_SIZE.as_f32(),
+            width,
+            super::PROSE_FONT_SIZE.as_f32() * scale,
             super::PROSE_LINE_HEIGHT,
             super::PROSE_PARAGRAPH_GAP,
             0.0,
@@ -2219,6 +2512,118 @@ mod tests {
         // A narrow graph still spreads to the full stride.
         assert_eq!(map_lane_width(1), MAP_LANE_W);
         assert_eq!(map_lane_width(2), MAP_LANE_W);
+    }
+
+    #[test]
+    fn a_cards_width_follows_the_pane_and_the_type_scale() {
+        // The reading measure caps it — a wide pane sets prose no wider than a
+        // post's column — but below that cap the column really does narrow, and
+        // the paddings either side are `rems`, so a zoom eats into the text
+        // width at any pane size. Both are why a measurement taken at one
+        // geometry cannot stand in at another.
+        let rem = 14.0;
+        let capped = card_text_width(2000.0, rem);
+        assert!(
+            capped < super::super::BODY_MAX_WIDTH.as_f32() + 2.0 * RESULTS_PAD,
+            "a wide pane is held to the reading measure: {capped}"
+        );
+        assert_eq!(
+            card_text_width(3000.0, rem),
+            capped,
+            "…and widening past the cap changes nothing"
+        );
+
+        let narrow = card_text_width(420.0, rem);
+        assert!(
+            narrow < capped,
+            "below the cap the column narrows with the pane ({narrow} < {capped})"
+        );
+
+        let zoomed = card_text_width(2000.0, rem * 2.0);
+        assert!(
+            zoomed < capped,
+            "the paddings scale, so a zoom narrows the text too ({zoomed} < {capped})"
+        );
+        assert!(zoomed > 0.0, "and never past nothing");
+    }
+
+    #[test]
+    fn a_geometry_change_is_what_drops_every_measurement() {
+        // `Layout::ensure_width`'s rule for the overlay's own cache: one
+        // comparison per frame, because the geometry is the same for every card
+        // in it — and a stale entry can then never be *found*, rather than
+        // merely never read.
+        assert!(
+            card_geometry_moved(None, 600.0, 1.0),
+            "the first frame has no geometry to agree with"
+        );
+        assert!(
+            !card_geometry_moved(Some((600.0, 1.0)), 600.0, 1.0),
+            "an unmoved geometry keeps what was measured against it"
+        );
+        assert!(
+            card_geometry_moved(Some((600.0, 1.0)), 420.0, 1.0),
+            "a narrower column re-wraps every card"
+        );
+        assert!(
+            card_geometry_moved(Some((600.0, 1.0)), 600.0, 1.25),
+            "and a zoom re-wraps and re-leads them, at the same width"
+        );
+        assert!(
+            !card_geometry_moved(Some((600.0, 1.0)), 600.2, 1.0),
+            "a sub-pixel wobble is not a relayout"
+        );
+    }
+
+    #[test]
+    fn an_estimate_is_taken_at_the_geometry_the_card_will_have() {
+        let fragment = ResultFragment {
+            id: "f".into(),
+            node: "n".into(),
+            item_id: None,
+            byline: "You".into(),
+            range: 0..40,
+            content: "a passage long enough to wrap more than once".into(),
+            hits: Vec::new(),
+            ordinal: 0,
+            query_generation: 0,
+        };
+        let wide = SpaceView::find_fragment_estimate(&fragment, 600.0, 1.0);
+        let narrow = SpaceView::find_fragment_estimate(&fragment, 200.0, 1.0);
+        let zoomed = SpaceView::find_fragment_estimate(&fragment, 600.0, 2.0);
+        assert!(
+            narrow > wide,
+            "a narrower card wraps to more lines ({narrow} > {wide})"
+        );
+        assert!(
+            zoomed > wide,
+            "and a zoomed one leads taller ({zoomed} > {wide})"
+        );
+    }
+
+    #[test]
+    fn a_dots_hit_cell_is_centred_on_it_and_tiles_with_its_neighbours() {
+        // The circle stays exactly where the topology puts it; the target grows
+        // around it. Cells one stride apart and one stride wide meet and never
+        // overlap, so no dot is reachable by aiming at another's.
+        let stride = map_lane_width(3);
+        let a = map_cell_origin(map_lane_x(0, 3), stride);
+        let b = map_cell_origin(map_lane_x(1, 3), stride);
+        assert!(
+            (b - (a + stride)).abs() < 1e-3,
+            "adjacent lanes' cells butt together: {a} + {stride} vs {b}"
+        );
+        let centre = |origin: f32| origin + stride / 2.0;
+        assert!(
+            (centre(a) - (map_lane_x(0, 3) + MAP_DOT / 2.0)).abs() < 1e-3,
+            "and the cell is centred on the circle it is a target for"
+        );
+        // Rows tile the same way, one `MAP_ROW_H` apart.
+        let r0 = map_cell_origin(0.0, MAP_ROW_H);
+        let r1 = map_cell_origin(MAP_ROW_H, MAP_ROW_H);
+        assert!((r1 - (r0 + MAP_ROW_H)).abs() < 1e-3);
+        // A cell is never smaller than the dot it holds.
+        assert!(map_lane_width(14) >= MAP_DOT);
     }
 
     #[test]

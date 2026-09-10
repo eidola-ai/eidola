@@ -22890,6 +22890,167 @@ fn space_find_reveals_a_map_dot_the_keyboard_lands_on(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_find_a_card_measures_against_the_layout_it_is_drawn_in(cx: &mut TestAppContext) {
+    // A measurement is a function of the text *and* the geometry it was taken
+    // in. The fragment id already carried the text, so a pane narrowed below
+    // the results column's cap — or a type-scale change — re-wrapped every card
+    // while the cache went on serving heights from the old layout. Cards
+    // outside the virtualization band are never re-rendered, so their stale
+    // placeholders sized the whole list under them.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let long = format!("a kestrel {}", "hovering over the long grass ".repeat(12));
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", &long)]);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let wide = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(0, window, cx)))
+        .expect("the card painted, so it measured");
+
+    // Narrow the pane past the column's own cap, so the card really re-wraps.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let narrow = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(0, window, cx)))
+        .expect("and measured again in the layout it is now drawn in");
+    assert!(
+        narrow > wide,
+        "the narrowed card is taller than the height cached for the wide one \
+         ({narrow} vs {wide})"
+    );
+}
+
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_when_a_focused_dot_stops_matching(cx: &mut TestAppContext) {
+    // A map dot is a stop only while its post is a result, and a background
+    // regeneration is enough to end that: the post stays in the map as an inert
+    // label while its slot — the tracked handle the keyboard is *on* — is
+    // pruned, leaving the window focused on a handle no frame paints.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // Stand on the answer's own dot — index 1 in depth-then-lane order.
+    assert!(
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.focus_find_map_node_for_test(1, window, cx))
+        }),
+        "precondition: the answer's dot is a tab stop"
+    );
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: the keyboard is on the dot, not the list"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the dot's slot went, so the keyboard went to the surface's own stop"
+    );
+}
+
+#[gpui::test]
+fn space_find_refuses_a_card_the_query_has_moved_out_from_under(cx: &mut TestAppContext) {
+    // gpui draws from the platform's frame callback, so a query `Change` and a
+    // press on a card still showing the previous query's results really do
+    // arrive between two paints. The closure holds the old fragment, and
+    // opening it spent the one thing find never spends — the reader's branch —
+    // to go somewhere the new search never chose, installing an ordinal from a
+    // list that no longer exists as the new query's anchor.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "a heron on the far bank");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The card as a rendered frame's click closure holds it.
+    let stale = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.capture_find_result_for_test(0, window, cx)))
+        .expect("the query matches, so there is a card");
+
+    // The reader retypes; the results the card belonged to are gone.
+    run_find(&view, window, &mut vcx, "heron");
+    settle_find_count(&mut vcx);
+
+    let anchor = view.read_with(&vcx, |v, _| v.find_anchor_key_for_test());
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.press_captured_find_result_for_test(stale, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the press is refused outright — the overlay does not collapse"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_anchor_key_for_test()),
+        anchor,
+        "and the new query's own place is untouched — no ordinal from a list \
+         that no longer exists is installed as its anchor"
+    );
+}
+
+#[gpui::test]
 fn space_opening_the_find_overlay_dismisses_what_it_would_cover(cx: &mut TestAppContext) {
     // The mirror of withholding the quote verbs. Every popover the conversation
     // can hold paints inside the pane, so the overlay stands in front of it:

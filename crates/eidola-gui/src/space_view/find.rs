@@ -732,6 +732,20 @@ pub(crate) struct FindSession {
     pub(crate) text: String,
     /// The prepared query, or `None` while the field is empty.
     pub(crate) query: Option<Query>,
+    /// **Which query the results on screen belong to.** Bumped by
+    /// [`SpaceView::set_find_query`] — the one door a query changes through,
+    /// and one that early-returns on unchanged text, so this moves exactly when
+    /// the search does.
+    ///
+    /// A rendered `ResultFragment` carries the generation it was cut for,
+    /// because gpui draws from the platform's frame callback and really does
+    /// handle two events between two paints: a `Change` and a card's click land
+    /// in that order, the click closure still holds the *old* fragment, and
+    /// opening it selected a branch and installed an ordinal from a search that
+    /// no longer exists — `sync_find` then resolved the new query from a branch
+    /// the reader never chose. An ordinal is meaningless across queries, which
+    /// is why identity rather than repair is the answer.
+    pub(crate) query_generation: u64,
     /// Every match on the visible branch, in document order and grouped by
     /// node — see [`MatchSet`] for why the grouping is not an optimization.
     pub(crate) matches: MatchSet,
@@ -1346,6 +1360,7 @@ impl SpaceView {
             _sub: sub,
             text: String::new(),
             query: None,
+            query_generation: 0,
             matches: MatchSet::default(),
             anchor: None,
             branch_nodes: HashSet::new(),
@@ -1504,6 +1519,9 @@ impl SpaceView {
         }
         session.query = Query::new(&text);
         session.text = text;
+        // Everything cut for the search that just ended stops being this
+        // session's — see [`FindSession::query_generation`].
+        session.query_generation = session.query_generation.wrapping_add(1);
         // **The overlay's retained position belongs to the query it was taken
         // in.** Position retention is "while the query is unchanged" — the
         // task's own rule — so a new search starts at the top of a list that is
