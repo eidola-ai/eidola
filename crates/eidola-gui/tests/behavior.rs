@@ -23221,6 +23221,125 @@ fn space_an_overlaying_inspector_takes_the_keyboard_off_what_it_covers(cx: &mut 
         view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
         "and the search is left standing — it is not this verb's to spend"
     );
+
+    // And the verb that would put a *second* reader into the same state is
+    // withheld while the panel covers the pane — registration-is-enablement,
+    // so macOS greys Edit ▸ Find in Conversation rather than mounting the bar
+    // behind a scrim.
+    assert!(
+        !vcx.update(|window, cx| window.is_action_available(&eidola_gui::actions::FindInSpace, cx)),
+        "⌘F is withheld while the panel covers the surface it would open"
+    );
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| window.is_action_available(&eidola_gui::actions::FindInSpace, cx)),
+        "…and comes back the moment the panel stops covering it"
+    );
+    // Which it can only do because the borrow was returned: dispatch walks from
+    // the focused element, so a panel that closed onto its own dead handle
+    // would take every per-view action with it.
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the panel hands the keyboard back to the surface it borrowed from"
+    );
+}
+
+/// **The other half of what a covering surface owes: the tab order.**
+///
+/// The find bar and the Find-all overlay lift [`focus::Covered`] for their own
+/// subtrees — they are what the *overlay* is not covering — which was written
+/// as an unconditional lift and so left their verbs, the map's dots and the
+/// results list reachable by Tab underneath the inspector's scrim. Measured as
+/// the property rather than as a number: with the panel covering the pane, a
+/// standing find surface contributes **nothing** to the window's tab order, so
+/// the walk is the same length with it up as without.
+#[gpui::test]
+fn space_a_covering_inspector_takes_the_find_surface_out_of_the_tab_order(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Narrow enough that the panel must overlay rather than split.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+
+    /// Tab until the walk repeats itself; the count is what the window offers.
+    fn stops(vcx: &mut VisualTestContext) -> usize {
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..200 {
+            vcx.update(|window, cx| window.focus_next(cx));
+            vcx.update(|window, _| window.refresh());
+            vcx.run_until_parked();
+            let Some(id) = vcx.update(|window, cx| window.focused(cx).map(|h| format!("{h:?}")))
+            else {
+                break;
+            };
+            if seen.contains(&id) {
+                break;
+            }
+            seen.push(id);
+        }
+        seen.len()
+    }
+
+    // The panel alone.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    let panel_only = stops(&mut vcx);
+    assert!(
+        panel_only > 0,
+        "precondition: the panel really does contribute stops of its own"
+    );
+
+    // Now a whole find surface behind it. ⌘F is withheld while it covers, so
+    // the reader's order is the reachable one: search, then open the panel.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    let uncovered = stops(&mut vcx);
+    assert!(
+        uncovered > panel_only,
+        "precondition: the find surface really does hold stops \
+         ({uncovered} with it in the clear, {panel_only} for the panel alone)"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "precondition: the covered find surface is still painted"
+    );
+    assert_eq!(
+        stops(&mut vcx),
+        panel_only,
+        "a covered find surface contributes nothing to the tab order"
+    );
 }
 
 #[gpui::test]

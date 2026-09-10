@@ -204,7 +204,20 @@ impl SpaceView {
             // `overlay_borrowed_focus` rule. A reader composing beside an open
             // inspector never lent the keyboard, and yanking their caret to the
             // view root on a close would be exactly what they did not ask for.
-            if self.inspector_field_focused(window, cx) {
+            //
+            // **And the panel's own handle is a lender's debt too.** The open
+            // arm above takes the keyboard off a find surface it is about to
+            // cover, so this is where that borrow is returned — to the find
+            // surface rather than to the conversation at large, since a reader
+            // who asked to search is not done searching. Without it the close
+            // left the window on the panel's unmounted handle: `focus_next`
+            // restarting from the root, and every per-view action (⌘F included)
+            // unavailable, because dispatch walks from the focused element.
+            if self.inspector_focus.is_focused(window) {
+                if !self.refocus_find_surface(window, cx) {
+                    window.focus(&self.focus_handle, cx);
+                }
+            } else if self.inspector_field_focused(window, cx) {
                 window.focus(&self.focus_handle, cx);
             }
         }

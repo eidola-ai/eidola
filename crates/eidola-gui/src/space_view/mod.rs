@@ -3314,7 +3314,21 @@ impl Render for SpaceView {
             .on_action(cx.listener(Self::toggle_inspector))
             // Edit → Find in Conversation (⌘F). Registered per-view like
             // `ToggleInspector`, so macOS greys it with no space window open.
-            .on_action(cx.listener(Self::open_find))
+            //
+            // **And only while the bar it opens would be visible.** Dispatch is
+            // not traversal, so the covering guard does not reach it: in the
+            // inspector's *overlay* form the panel paints a full-window scrim
+            // after this pane, and ⌘F under one mounted the bar behind that
+            // scrim and focused its query field — a reader typing into a
+            // surface they cannot see, with the pointer intercepted. The quote
+            // verbs' rule, reached through the other cover: withheld rather
+            // than dismissing the panel, because the panel is not this verb's
+            // to close and one ⌥⌘I (or a click on the scrim) brings ⌘F back.
+            // The split form covers nothing, so the condition is exactly the
+            // layout.
+            .when(!self.inspector_covers_pane(window), |d| {
+                d.on_action(cx.listener(Self::open_find))
+            })
             // Edit → Quote / Quote in Reply. Registered **only while a
             // quotable post selection exists**, so `is_action_available` is
             // false otherwise and macOS greys both items — the same

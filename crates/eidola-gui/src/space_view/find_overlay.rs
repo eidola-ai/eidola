@@ -776,6 +776,34 @@ impl SpaceView {
         true
     }
 
+    /// Put the keyboard back on the find surface, wherever inside it a reader
+    /// would be — the results list while the overlay stands, the query field
+    /// otherwise. Answers whether there was a session to return it to.
+    ///
+    /// This is what the **inspector's overlay form** borrowed from, so it is
+    /// what that panel's close hands back to: a borrow returned to the surface
+    /// it was taken from rather than to the conversation at large, which is
+    /// where a reader who had asked to search would otherwise not be. The
+    /// destination is the same one each surface's own opener chooses, so the
+    /// return and the arrival cannot disagree.
+    pub(crate) fn refocus_find_surface(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session) = self.find.as_ref() else {
+            return false;
+        };
+        if session.overlay.open {
+            let handle = session.overlay.list_focus.clone();
+            window.focus(&handle, cx);
+        } else {
+            let field = session.input.clone();
+            field.update(cx, |s, cx| s.focus(window, cx));
+        }
+        true
+    }
+
     /// The map's membership rule, and therefore the results': every post, plus
     /// a draft the reader has actually written in.
     ///
