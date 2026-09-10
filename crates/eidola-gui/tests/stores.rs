@@ -3422,6 +3422,66 @@ fn the_second_press_of_a_proxy_control_is_the_one_that_stands(cx: &mut TestAppCo
     );
 }
 
+/// REGRESSION: **the next press derives from what this one is writing.**
+///
+/// Every control in the Proxy pane computes its next value from what it renders
+/// — the switch writes `!enabled` — so a snapshot that stays at the stored
+/// value until the round trip settles makes two presses one press: both
+/// handlers read the same stale `false`, both write `true`, and a
+/// start-then-stop persists as start. Sequencing the writes never touched that,
+/// because the two carried the same value; what has to move is the value the
+/// second press is derived *from*. The test derives its second press exactly as
+/// the pane does rather than passing an explicit `false`, which is what the
+/// sequencing test above cannot see.
+#[gpui::test]
+fn two_presses_of_the_proxy_switch_derive_from_each_other(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    // Production refreshes at launch; a bare store has not read anything yet,
+    // and the pane derives its presses from a snapshot it renders.
+    stores.proxy.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the settings load", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().is_some())
+    });
+    let enabled = |cx: &mut TestAppContext| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.enabled))
+            .expect("a loaded snapshot")
+    };
+    assert!(!enabled(cx), "a fresh profile serves nothing");
+
+    // The first press, derived from the render — and read back at once, which
+    // is the whole property: the pane's next frame has to see it.
+    let next = !enabled(cx);
+    stores.proxy.update(cx, |s, cx| s.set_enabled(next, cx));
+    assert!(
+        enabled(cx),
+        "the snapshot advances as the write leaves, so the next press can derive from it"
+    );
+
+    // The second press, derived the same way the pane derives it.
+    let next = !enabled(cx);
+    stores.proxy.update(cx, |s, cx| s.set_enabled(next, cx));
+
+    wait_until(cx, "the batch settles", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.op_error().is_some() || !s.writing())
+    });
+    assert!(
+        !core
+            .runtime()
+            .block_on(core.proxy_settings())
+            .expect("the stored settings")
+            .enabled,
+        "start then stop persists as stopped"
+    );
+}
+
 /// REGRESSION: **a listener that gave up says why, and is started again.**
 ///
 /// The accept loop stops after sixteen consecutive refused accepts. Nothing

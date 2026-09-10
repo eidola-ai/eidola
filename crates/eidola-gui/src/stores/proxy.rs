@@ -316,6 +316,27 @@ impl ProxyStore {
         cx.notify();
     }
 
+    /// **Advance the cached snapshot as the write leaves** (STATE.md's
+    /// derived-value rule, the shape `SpaceSettingsStore`'s steppers take).
+    ///
+    /// Every control in this pane derives its *next* press from what it
+    /// renders — the switch writes `!enabled`, a checkbox writes `!exposed` —
+    /// so leaving the snapshot at the stored value until the round trip
+    /// settles makes two presses one press: start-then-stop persisted as
+    /// start, because both handlers read the same stale `false` and both wrote
+    /// `true`. Chaining the writes was never the answer to that: they were
+    /// sequenced correctly and carried the same value. What has to move is the
+    /// value the second press is derived *from*.
+    ///
+    /// The refusal path needs nothing extra: the op's own settle re-reads the
+    /// settings unconditionally, so a write the database refused reconciles the
+    /// same way a successful one does.
+    fn advance_settings(&mut self, apply: impl FnOnce(&mut ProxySettings)) {
+        if let Some(settings) = self.settings.value_mut() {
+            apply(settings);
+        }
+    }
+
     /// Turn the proxy on or off.
     pub fn set_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.write_settings(
@@ -357,6 +378,15 @@ impl ProxyStore {
     /// Expose or withdraw one backend.
     pub fn set_backend_exposed(&mut self, id: String, exposed: bool, cx: &mut Context<Self>) {
         let slot = format!("backend:{id}");
+        // The checkbox derives its next press from `exposed_ids`, so the same
+        // rule the switch takes applies here — see [`Self::advance_settings`].
+        let for_cache = id.clone();
+        self.advance_settings(move |settings| {
+            settings.exposed_ids.retain(|b| b != &for_cache);
+            if exposed {
+                settings.exposed_ids.push(for_cache);
+            }
+        });
         self.start_op(
             slot,
             cx,
@@ -413,6 +443,20 @@ impl ProxyStore {
     }
 
     fn write_settings(&mut self, key: &str, update: ProxySettingsUpdate, cx: &mut Context<Self>) {
+        self.advance_settings(|settings| {
+            if let Some(enabled) = update.enabled {
+                settings.enabled = enabled;
+            }
+            if let Some(address) = &update.bind_address {
+                settings.bind_address = address.clone();
+            }
+            if let Some(port) = update.bind_port {
+                settings.bind_port = port;
+            }
+            if let Some(exposure) = update.local_exposure {
+                settings.local_exposure = exposure;
+            }
+        });
         self.start_op(
             key.to_string(),
             cx,
