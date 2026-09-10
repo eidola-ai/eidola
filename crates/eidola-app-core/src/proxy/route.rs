@@ -448,11 +448,64 @@ pub struct UpstreamHeaders {
     pub trace: TraceUpstream,
 }
 
+/// The header set actually put on **one attempt's** wire.
+///
+/// **Minted once, so the Record shows what travelled.** `traceparent` is a new
+/// id per attempt, which is right — and it made the description
+/// ([`UpstreamHeaders`]) and the thing itself two different values: the request
+/// builder minted one set and the Record row minted a second, so the recorded
+/// trace id had never been on any wire and could correlate with nothing. The
+/// attempt's headers are therefore materialised into this, and both the request
+/// and the row read that one value; `for_record` lives here rather than on the
+/// description because redacting *a set* is what the Record actually needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SentHeaders(Vec<(&'static str, String)>);
+
+impl SentHeaders {
+    /// The pairs, in the order they are set.
+    pub fn pairs(&self) -> &[(&'static str, String)] {
+        &self.0
+    }
+
+    /// What the Record shows about this request's headers: every name, and
+    /// every value **except** the credential, which is replaced by its scheme.
+    ///
+    /// The names are the evidence that the allowlist did its job — a reader
+    /// can see for themselves that nothing of their tool's travelled. The
+    /// value of `Authorization` is a spend proof or an API key and is the one
+    /// thing that must not land in a durable local log.
+    pub fn for_record(&self) -> String {
+        let redacted: Vec<Value> = self
+            .0
+            .iter()
+            .map(|(name, value)| {
+                let shown = if *name == "Authorization" {
+                    value
+                        .split_once(' ')
+                        .map(|(scheme, _)| format!("{scheme} <redacted>"))
+                        .unwrap_or_else(|| "<redacted>".to_string())
+                } else {
+                    value.clone()
+                };
+                Value::Array(vec![Value::String(name.to_string()), Value::String(shown)])
+            })
+            .collect();
+        Value::Array(redacted).to_string()
+    }
+}
+
 impl UpstreamHeaders {
+    /// Mint this attempt's header set. Call **once per attempt** — that is the
+    /// whole point of [`SentHeaders`].
+    pub fn materialize(&self) -> SentHeaders {
+        SentHeaders(self.to_pairs())
+    }
+
     /// The headers, in the order they are set. `traceparent` is minted here
     /// rather than carried on the struct, so each call — each *attempt* — gets
-    /// its own.
-    pub fn to_pairs(&self) -> Vec<(&'static str, String)> {
+    /// its own; [`UpstreamHeaders::materialize`] is the one caller, so "each
+    /// call" and "each attempt" cannot come apart.
+    fn to_pairs(&self) -> Vec<(&'static str, String)> {
         let mut pairs = vec![("Content-Type", "application/json".to_string())];
         // **Always named, because otherwise something else names it.** reqwest
         // inserts `Accept: */*` when the request carries none, so leaving the
@@ -474,32 +527,6 @@ impl UpstreamHeaders {
             pairs.push(("traceparent", mint_traceparent()));
         }
         pairs
-    }
-
-    /// What the Record shows about this request's headers: every name, and
-    /// every value **except** the credential, which is replaced by its scheme.
-    ///
-    /// The names are the evidence that the allowlist did its job — a reader
-    /// can see for themselves that nothing of their tool's travelled. The
-    /// value of `Authorization` is a spend proof or an API key and is the one
-    /// thing that must not land in a durable local log.
-    pub fn for_record(&self) -> String {
-        let redacted: Vec<Value> = self
-            .to_pairs()
-            .into_iter()
-            .map(|(name, value)| {
-                let shown = if name == "Authorization" {
-                    value
-                        .split_once(' ')
-                        .map(|(scheme, _)| format!("{scheme} <redacted>"))
-                        .unwrap_or_else(|| "<redacted>".to_string())
-                } else {
-                    value
-                };
-                Value::Array(vec![Value::String(name.to_string()), Value::String(shown)])
-            })
-            .collect();
-        Value::Array(redacted).to_string()
     }
 }
 
@@ -1058,7 +1085,7 @@ impl Inner {
     async fn record_proxy_request(
         &self,
         route: &ProxyRoute,
-        headers: &UpstreamHeaders,
+        headers: &SentHeaders,
         request_body: &Value,
         response_status: Option<u16>,
         response_body: Vec<u8>,
@@ -1146,11 +1173,15 @@ impl Inner {
             }
         };
         let nonce = spend.as_ref().map(|s| s.cred.nonce.clone());
+        // Materialised **once** for this attempt: the wire and the Record row
+        // then carry the same `traceparent`, which is the whole point of the
+        // set being a value rather than a recipe.
         let headers = UpstreamHeaders {
             authorization: auth_value.clone(),
             streaming: false,
             trace: self.upstream_tracing(),
-        };
+        }
+        .materialize();
 
         let request_at = now_ms();
         // **A failure here is past the hold, so it settles like every other
@@ -1358,11 +1389,15 @@ impl Inner {
             }
         };
         let nonce = spend.as_ref().map(|s| s.cred.nonce.clone());
+        // Materialised **once** for this attempt: the wire and the Record row
+        // then carry the same `traceparent`, which is the whole point of the
+        // set being a value rather than a recipe.
         let headers = UpstreamHeaders {
             authorization: auth_value.clone(),
             streaming: true,
             trace: self.upstream_tracing(),
-        };
+        }
+        .materialize();
 
         let request_at = now_ms();
         // Past the hold, so a refusal settles it — the blocking transport's
@@ -1758,7 +1793,7 @@ fn offers_running_engines_only(exposure: LocalExposure, starts_on_demand: bool) 
 fn build_upstream_request(
     route: &ProxyRoute,
     body: &Value,
-    headers: &UpstreamHeaders,
+    headers: &SentHeaders,
 ) -> Result<reqwest::Request, AppError> {
     let mut request = route
         .client
@@ -1773,14 +1808,14 @@ fn build_upstream_request(
         })?;
     let out = request.headers_mut();
     out.clear();
-    for (name, value) in headers.to_pairs() {
+    for (name, value) in headers.pairs() {
         let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
             AppError::Config {
                 message: format!("`{name}` is not a usable header name"),
             }
         })?;
         let value =
-            reqwest::header::HeaderValue::from_str(&value).map_err(|_| AppError::Config {
+            reqwest::header::HeaderValue::from_str(value).map_err(|_| AppError::Config {
                 message: format!("`{name}` carries a value that cannot travel in a header"),
             })?;
         out.insert(name, value);
@@ -2011,7 +2046,11 @@ mod tests {
     #[test]
     fn the_upstream_header_set_is_exactly_the_allowlist() {
         let names = |h: &UpstreamHeaders| -> Vec<&'static str> {
-            h.to_pairs().into_iter().map(|(name, _)| name).collect()
+            h.materialize()
+                .pairs()
+                .iter()
+                .map(|(name, _)| *name)
+                .collect()
         };
         assert_eq!(
             names(&headers(None, false, TraceUpstream::Off)),
@@ -2033,28 +2072,42 @@ mod tests {
     fn tracing_is_off_and_mints_a_fresh_id_when_it_is_not() {
         let off = headers(None, false, TraceUpstream::Off);
         assert!(
-            !off.to_pairs()
+            !off.materialize()
+                .pairs()
                 .iter()
                 .any(|(name, _)| *name == "traceparent"),
             "a downstream tool cannot ask this app to trace"
         );
 
         let on = headers(None, false, TraceUpstream::On);
-        let first = on
-            .to_pairs()
-            .into_iter()
-            .find(|(name, _)| *name == "traceparent")
-            .expect("traceparent")
-            .1;
-        let second = on
-            .to_pairs()
-            .into_iter()
-            .find(|(name, _)| *name == "traceparent")
-            .expect("traceparent")
-            .1;
+        let trace_of = |sent: &SentHeaders| -> String {
+            sent.pairs()
+                .iter()
+                .find(|(name, _)| *name == "traceparent")
+                .expect("traceparent")
+                .1
+                .clone()
+        };
+        let attempt = on.materialize();
+        let first = trace_of(&attempt);
+        let second = trace_of(&on.materialize());
         assert_ne!(
             first, second,
             "each attempt mints its own id — a retry that reused one would link the two"
+        );
+        // **And within one attempt the wire and the Record agree.** The id is
+        // minted per materialization, so a second `to_pairs` for the row's sake
+        // would record a trace that had never travelled and could correlate
+        // with nothing.
+        assert!(
+            attempt.for_record().contains(&first),
+            "the row shows the id this attempt actually sent: {}",
+            attempt.for_record()
+        );
+        assert_eq!(
+            trace_of(&attempt),
+            first,
+            "and the set is a value, not a recipe"
         );
         assert!(
             first.starts_with("00-") && first.ends_with("-01"),
@@ -2065,7 +2118,9 @@ mod tests {
 
     #[test]
     fn the_record_shows_the_names_and_never_the_credential() {
-        let recorded = headers(Some("Bearer super-secret"), true, TraceUpstream::Off).for_record();
+        let recorded = headers(Some("Bearer super-secret"), true, TraceUpstream::Off)
+            .materialize()
+            .for_record();
         assert!(recorded.contains("Authorization"), "{recorded}");
         assert!(recorded.contains("Bearer <redacted>"), "{recorded}");
         assert!(
