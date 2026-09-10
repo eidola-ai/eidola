@@ -517,18 +517,30 @@ async fn completions_response(
 /// model is the tool's request to change, and an upstream's own status is
 /// passed through so a client's retry logic sees what really happened.
 pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
-    let (status, kind, code) = match error {
+    let (status, kind, code, disclosure) = match error {
         AppError::ModelUnavailable { .. } => (
             StatusCode::NOT_FOUND,
             "invalid_request_error",
             Some("model_not_found"),
+            Disclosure::Detail,
         ),
-        AppError::Config { .. } => (StatusCode::BAD_REQUEST, "invalid_request_error", None),
+        AppError::Config { .. } => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            None,
+            Disclosure::Detail,
+        ),
         AppError::NotConfigured { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "invalid_request_error",
             None,
+            Disclosure::Detail,
         ),
+        // **Funding is the reader's business, not the tool's.** The class is
+        // what a caller can act on — stop asking, or tell whoever runs this
+        // machine — and `insufficient_quota` says that in the field a client
+        // reads. The balance figures, the credential's state and the
+        // provisioning queue's timing are this profile's private finances.
         AppError::NoAccount
         | AppError::InsufficientBalance { .. }
         | AppError::Credential { .. }
@@ -536,6 +548,7 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
             StatusCode::PAYMENT_REQUIRED,
             "insufficient_quota",
             Some("insufficient_quota"),
+            Disclosure::Fixed("This proxy cannot fund the request."),
         ),
         // **A precondition the reader can lift, not a server failure.** The
         // server answers `428` while the current terms are unaccepted and
@@ -548,22 +561,83 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
             StatusCode::PRECONDITION_REQUIRED,
             "invalid_request_error",
             Some("terms_acceptance_required"),
+            Disclosure::Fixed("This proxy's account must accept the current terms."),
         ),
         // An upstream status is passed through where it is a status at all —
         // a client's backoff should see the 429 the server sent, not a 502
-        // this app invented over it.
+        // this app invented over it. Its message is the *upstream's* answer to
+        // a request this caller made, so it travels with it.
         AppError::Server { status, .. } => (
             StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
             "server_error",
             None,
+            Disclosure::Detail,
         ),
-        AppError::Network { .. } | AppError::Attestation { .. } => {
-            (StatusCode::BAD_GATEWAY, "server_error", None)
-        }
-        AppError::LocalModel { .. } => (StatusCode::SERVICE_UNAVAILABLE, "server_error", None),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "server_error", None),
+        // What this app decided about the exchange the caller asked for — a
+        // body that was not JSON, a stream that was not one, a read that
+        // failed. Written here, about this request, with the URL already
+        // stripped out of any transport error (`request_error_text`).
+        AppError::Network { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "server_error",
+            None,
+            Disclosure::Detail,
+        ),
+        AppError::Attestation { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "server_error",
+            None,
+            Disclosure::Fixed("This proxy could not verify its upstream."),
+        ),
+        AppError::LocalModel { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            None,
+            Disclosure::Fixed("This proxy could not start the model."),
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            None,
+            Disclosure::Fixed("This proxy could not complete the request."),
+        ),
     };
-    error_response(status, kind, &error.to_string(), code)
+    let message = match disclosure {
+        Disclosure::Detail => error.to_string(),
+        Disclosure::Fixed(public) => {
+            // The detail is not lost, it is kept where its audience is. A
+            // route-level failure is already in the Record with its own text;
+            // this covers the ones that happen before there is a route.
+            eprintln!("proxy: answering `{public}` for: {error}");
+            public.to_string()
+        }
+    };
+    error_response(status, kind, &message, code)
+}
+
+/// What a downstream tool is told about a failure.
+///
+/// **The audience decides, and here it is the opposite audience from the
+/// server's.** `eidola-server` hands its client every detail and redacts its
+/// own logs, because there the detail *is* the client's own data and the log is
+/// the surface a stranger might read. This proxy is the mirror image: the
+/// detail is about **this machine** — a models directory on someone's disk, a
+/// local database, an attestation, a wallet — and the audience is a stranger's
+/// tool holding a key, possibly not even on this host. So a failure the caller
+/// can act on keeps its words, and a failure about this profile's insides
+/// answers a stable sentence while the text stays local.
+///
+/// The line is *what the message is about*, never how severe it is: `Network`
+/// carries this app's verdict on the exchange the caller asked for and travels,
+/// while `LocalModel` — whose text names an absolute path on the reader's
+/// disk — does not. `NotConfigured` travels because its messages name backend
+/// and model ids the caller can already see in `/v1/models`, which is the one
+/// judgment call in the table.
+enum Disclosure {
+    /// The error is about the caller's own request; its text goes.
+    Detail,
+    /// The error is about this machine; the caller gets this sentence instead.
+    Fixed(&'static str),
 }
 
 fn error_response(
@@ -694,6 +768,71 @@ mod tests {
             }),
             StatusCode::PRECONDITION_REQUIRED,
             "the status the server chose is the one that travels"
+        );
+    }
+
+    /// REGRESSION: **what the caller is told is decided by what the message is
+    /// about.**
+    ///
+    /// Every `AppError`'s log-oriented text went to the tool verbatim, so a
+    /// missing model file answered with the absolute path of the reader's
+    /// models directory — to a key holder who may not even be on this host.
+    /// The detail stays local; the caller gets a stable sentence for anything
+    /// about this machine, and keeps every word about its own request.
+    #[test]
+    fn a_failure_about_this_machine_says_nothing_about_it() {
+        let text = |e: AppError| -> String {
+            let response = app_error_response(&e);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            let collected = rt.block_on(async move {
+                use http_body_util::BodyExt;
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes()
+            });
+            String::from_utf8_lossy(&collected).to_string()
+        };
+
+        let leaky = text(AppError::LocalModel {
+            message: "no model file `gemma` in /Users/someone/Library/Application Support/eidola"
+                .into(),
+        });
+        assert!(
+            !leaky.contains("/Users/someone"),
+            "a path on the reader's disk is not the tool's business: {leaky}"
+        );
+        assert!(
+            leaky.contains("could not start the model"),
+            "and the caller still learns what class of thing went wrong: {leaky}"
+        );
+
+        let internal = text(AppError::Database {
+            message: "no such table: proxy_key".into(),
+        });
+        assert!(
+            !internal.contains("proxy_key"),
+            "this profile's insides stay inside: {internal}"
+        );
+
+        // What the caller asked for keeps its words.
+        let mine = text(AppError::ModelUnavailable {
+            model: "gemma@local".into(),
+        });
+        assert!(
+            mine.contains("gemma@local"),
+            "the caller named this model, so the refusal names it back: {mine}"
+        );
+        let gateway = text(AppError::Network {
+            message: "`acme` answered 200 with a body that is not JSON".into(),
+        });
+        assert!(
+            gateway.contains("not JSON"),
+            "this app's verdict on the caller's own exchange travels: {gateway}"
         );
     }
 
