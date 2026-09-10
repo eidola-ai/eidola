@@ -23251,6 +23251,75 @@ fn space_an_overlaying_inspector_takes_the_keyboard_off_what_it_covers(cx: &mut 
     );
 }
 
+/// **The editor states a results list holds are bounded by its band, not by the
+/// query.**
+///
+/// A card's state carries its node's *whole* markdown — the fragment filter
+/// narrows the paint, not the document — so one per visited card is one whole
+/// post per matching block, and a long post with many isolated matches retained
+/// hundreds of megabytes for as long as the query stood. Counted rather than
+/// looked at, because an evicted card and one the reader never reached paint
+/// exactly alike: measured here at 28 states held after walking 120 cards.
+#[gpui::test]
+fn space_find_bounds_the_editors_it_keeps_while_the_query_stands(cx: &mut TestAppContext) {
+    // Matching paragraphs separated by non-matching ones, so each is a fragment
+    // of its own: contiguous blocks consolidate into one card.
+    const BLOCKS: usize = 120;
+    let mut body = String::new();
+    for i in 0..BLOCKS {
+        body.push_str(&format!("a kestrel over field {i}\n\nthe grass below\n\n"));
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", &body)]);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Walk the roving cursor the whole way down, one card at a time — every
+    // card renders as the cursor reaches it, which is precisely the reader who
+    // used to end up holding all of them.
+    for _ in 0..BLOCKS {
+        vcx.simulate_keystrokes("down");
+    }
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let retained = view.read_with(&vcx, |v, _| v.find_retained_editors_for_test());
+    assert!(
+        retained > 0,
+        "precondition: the cards the reader is looking at keep their states"
+    );
+    assert!(
+        retained < BLOCKS / 2,
+        "a scrolled-past card gives its document back ({retained} states held of \
+         {BLOCKS} cards walked)"
+    );
+    assert!(
+        vcx.update(|window, cx| view
+            .update(cx, |v, cx| v.find_result_editor_for_test(0, window, cx))
+            .is_none()),
+        "the first card, far above the band, holds no document"
+    );
+    assert!(
+        vcx.update(|window, cx| view
+            .update(cx, |v, cx| v.find_result_editor_for_test(
+                BLOCKS - 1,
+                window,
+                cx
+            ))
+            .is_some()),
+        "…and the one under the cursor does"
+    );
+}
+
 /// **The other half of what a covering surface owes: the tab order.**
 ///
 /// The find bar and the Find-all overlay lift [`focus::Covered`] for their own

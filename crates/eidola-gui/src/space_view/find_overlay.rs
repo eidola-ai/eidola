@@ -102,6 +102,33 @@ const FRAGMENT_GAP: f32 = 10.0;
 /// placeholder, and its size is the measured height where the fragment has
 /// painted once and an estimate before that.
 const RESULT_MARGIN: f32 = 600.0;
+/// How far outside the results viewport a card's **editor state** is kept.
+///
+/// A card's state is not the card: it holds a copy of its node's *whole*
+/// markdown, because a block's source range indexes into that document and the
+/// fragment filter is only what narrows the paint. So one per visited fragment
+/// is one whole post per matching block — a 100 KB post with five thousand
+/// isolated matching blocks retains ~500 MB for as long as the query stands,
+/// and nothing but a new query ever gave it back.
+///
+/// Widened past [`RESULT_MARGIN`] rather than equal to it, so the ordinary
+/// gesture — scrolling a little and coming back — never re-mints a parse: a
+/// card leaves the render band a whole margin before it stops being kept, which
+/// is what keeps eviction off the steady-state cost. The retained set is then
+/// `viewport + 2 · this` tall whatever the conversation holds: at a 700px
+/// viewport and ~62px a card that is about fifty states, ~5 MB of the same
+/// 100 KB post — **bounded by the band rather than by the query**.
+///
+/// The named residual is that a band's worth of source is still duplicated per
+/// card, which is exactly the standard the transcript already holds for its own
+/// on-screen posts. Sharing one state per *node* was considered and refused:
+/// the fragment range lives in the **state** (`sync_fragment` /
+/// `clamp_to_fragment` — the selection clamp), so two cards of one node sharing
+/// a state would clamp each other's selection away, and `click_find_result`'s
+/// selection guard would let a live selection in one card refuse to open its
+/// sibling. The layout filter alone is an element prop and would have been fine;
+/// the clamp is what makes the state per fragment.
+const BODY_KEEP_MARGIN: f32 = 2.0 * RESULT_MARGIN;
 /// The estimated height of a fragment that has never painted — one prose line
 /// per wrapped line of its source, plus the card's own chrome. Replaced by the
 /// measurement the frame after it first paints, exactly as a post's estimate is.
@@ -526,10 +553,12 @@ pub(crate) struct FindOverlay {
     /// Per-fragment measured heights, written by each rendered card's measuring
     /// canvas. `Rc` because that canvas outlives the borrow that built it.
     heights: Rc<RefCell<HashMap<SharedString, f32>>>,
-    /// The editor state each rendered fragment paints through. Kept for every
-    /// fragment the reader has scrolled past — re-minting one costs a parse and
-    /// a `set_value` notify, and dropping them on the way out of the band would
-    /// pay that on every scroll step.
+    /// The editor state each rendered fragment paints through — **bounded by
+    /// the band it was rendered in** ([`BODY_KEEP_MARGIN`]), not by the query.
+    /// Re-minting one costs a parse and a `set_value` notify, so the kept band
+    /// is wider than the rendered one and a direction change pays nothing;
+    /// what the bound buys is that a reader who scrolls through ten thousand
+    /// results holds fifty documents rather than ten thousand.
     bodies: HashMap<SharedString, Entity<MarkdownEditorState>>,
     /// Each group's and each fragment's top offset inside the list, recorded
     /// as the list is laid out — keyed by node id for a group and by fragment
@@ -641,6 +670,24 @@ impl FindOverlay {
     pub(crate) fn retain_results(&mut self, live: &HashSet<SharedString>) {
         self.heights.borrow_mut().retain(|id, _| live.contains(id));
         self.bodies.retain(|id, _| live.contains(id));
+    }
+
+    /// Drop the editor state of every card outside the kept band
+    /// ([`BODY_KEEP_MARGIN`]) — the second half of what bounds this map, and
+    /// the half that bounds it against the *conversation* rather than against
+    /// an edit.
+    ///
+    /// The **heights** are deliberately kept: an `f32` per fragment is nothing
+    /// beside a document, and it is what sizes the placeholder a evicted card
+    /// leaves behind — dropping one would make the list re-estimate a card it
+    /// has already measured and shift every group top below it.
+    pub(crate) fn retain_bodies(&mut self, kept: &HashSet<SharedString>) {
+        self.bodies.retain(|id, _| kept.contains(id));
+    }
+
+    /// How many cards hold an editor state — the test seam behind the bound.
+    pub(crate) fn retained_bodies(&self) -> usize {
+        self.bodies.len()
     }
 
     pub(crate) fn forget_results(&mut self) {
@@ -1038,6 +1085,17 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         self.open_find_result(captured.0, window, cx);
+    }
+
+    /// How many result cards hold an **editor state** — the counted bound
+    /// [`BODY_KEEP_MARGIN`] states, and the only thing that can show it: a card
+    /// evicted behind the reader looks exactly like one they never reached.
+    #[doc(hidden)]
+    pub fn find_retained_editors_for_test(&self) -> usize {
+        self.find
+            .as_ref()
+            .map(|s| s.overlay.retained_bodies())
+            .unwrap_or(0)
     }
 
     /// How many result cards have a **measured** height — the half of the
@@ -1907,6 +1965,8 @@ impl SpaceView {
             .clone();
         let offset = -scroll.offset().y.as_f32();
         let band = (offset - RESULT_MARGIN)..(offset + viewport_h + RESULT_MARGIN);
+        // The wider band the *states* live in — see [`BODY_KEEP_MARGIN`].
+        let keep = (offset - BODY_KEEP_MARGIN)..(offset + viewport_h + BODY_KEEP_MARGIN);
 
         // The reading measure holds here too: a fragment is prose, and prose
         // set across a thousand pixels is not readable because it is a result.
@@ -1917,6 +1977,7 @@ impl SpaceView {
         let mut y = 0.0_f32;
         let mut tops: HashMap<SharedString, (f32, f32)> = HashMap::new();
         let mut in_view: HashSet<SharedString> = HashSet::new();
+        let mut kept: HashSet<SharedString> = HashSet::new();
         let mut index = 0usize;
 
         if !settled {
@@ -1992,6 +2053,9 @@ impl SpaceView {
                 let height = measured
                     .unwrap_or_else(|| Self::find_fragment_estimate(fragment, card_width, scale));
                 let visible = y < band.end && (y + height) > band.start;
+                if y < keep.end && (y + height) > keep.start {
+                    kept.insert(fragment.id.clone());
+                }
                 let on_cursor = cursor == Some(index);
                 if visible {
                     column = column.child(self.render_find_fragment(
@@ -2038,6 +2102,9 @@ impl SpaceView {
         if let Some(session) = self.find.as_mut() {
             session.overlay.tops = tops;
             session.overlay.in_view = in_view;
+            // The list has just said where every card is, so this is the one
+            // place that can answer which states the band still wants.
+            session.overlay.retain_bodies(&kept);
         }
 
         div()
