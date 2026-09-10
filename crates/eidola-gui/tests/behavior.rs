@@ -22889,18 +22889,33 @@ fn space_find_reveals_a_map_dot_the_keyboard_lands_on(cx: &mut TestAppContext) {
     );
 }
 
+/// Twenty-one matching posts — one root and twenty replies, so the fixture is
+/// wide and shallow (depth is the expensive axis for this view) while the
+/// results list, which is flat, runs well past the viewport band.
+fn many_matching_posts() -> Vec<PostNode> {
+    let body = format!("a kestrel {}", "hovering over the long grass ".repeat(4));
+    let mut posts = vec![fixture_user_post("a1", &body)];
+    for i in 0..20 {
+        let mut p = fixture_assistant_post(&format!("b{i}"), &body);
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+    posts
+}
+
 #[gpui::test]
 fn space_find_a_card_measures_against_the_layout_it_is_drawn_in(cx: &mut TestAppContext) {
     // A measurement is a function of the text *and* the geometry it was taken
     // in. The fragment id already carried the text, so a pane narrowed below
     // the results column's cap — or a type-scale change — re-wrapped every card
-    // while the cache went on serving heights from the old layout. Cards
-    // outside the virtualization band are never re-rendered, so their stale
-    // placeholders sized the whole list under them.
+    // while the cache went on serving heights from the old layout. **The cards
+    // that matter are the ones outside the virtualization band**: they are
+    // never re-rendered, so a stale placeholder went on sizing every group top
+    // below it, and with it the map's scroll targets and the list's extent,
+    // until the reader happened to bring that card back.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("s".into()));
-    let long = format!("a kestrel {}", "hovering over the long grass ".repeat(12));
-    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", &long)]);
+    seed_quotable_space(&view, window, cx, many_matching_posts());
 
     let mut vcx = VisualTestContext::from_window(window, cx);
     vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
@@ -22914,23 +22929,43 @@ fn space_find_a_card_measures_against_the_layout_it_is_drawn_in(cx: &mut TestApp
     vcx.update(|window, _| window.refresh());
     vcx.run_until_parked();
 
-    let wide = vcx
-        .update(|window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(0, window, cx)))
-        .expect("the card painted, so it measured");
+    // Walk the roving cursor to the end so the last card paints and measures,
+    // then back to the top so it leaves the band again.
+    let last = 20usize;
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let measured = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(last, window, cx)))
+        .expect("the cursor brought the last card into view, so it measured");
 
-    // Narrow the pane past the column's own cap, so the card really re-wraps.
+    vcx.simulate_keystrokes("home");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(last, window, cx))
+        ),
+        Some(measured),
+        "precondition: back at the top it keeps the height it was measured at"
+    );
+
+    // Narrow the pane past the column's own cap. The card is off-band, so
+    // nothing re-measures it — which is exactly why the old height must go.
     vcx.simulate_resize(gpui::size(px(560.), px(700.)));
     vcx.run_until_parked();
     vcx.update(|window, _| window.refresh());
     vcx.run_until_parked();
 
-    let narrow = vcx
-        .update(|window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(0, window, cx)))
-        .expect("and measured again in the layout it is now drawn in");
-    assert!(
-        narrow > wide,
-        "the narrowed card is taller than the height cached for the wide one \
-         ({narrow} vs {wide})"
+    assert_eq!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(last, window, cx))
+        ),
+        None,
+        "a height measured in a layout that has gone is no answer at all — the \
+         list estimates at the geometry it is drawing in"
     );
 }
 
