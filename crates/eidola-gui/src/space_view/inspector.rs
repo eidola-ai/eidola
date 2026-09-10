@@ -251,11 +251,27 @@ impl SpaceView {
             // left the window on the panel's unmounted handle: `focus_next`
             // restarting from the root, and every per-view action (⌘F included)
             // unavailable, because dispatch walks from the focused element.
-            if self.inspector_focus.is_focused(window) {
-                if !self.refocus_find_surface(window, cx) {
-                    window.focus(&self.focus_handle, cx);
-                }
-            } else if self.inspector_field_focused(window, cx) {
+            //
+            // **Containment, not identity** — the question is about the
+            // *subtree* that is about to stop being painted, and the panel owns
+            // one. It holds its own handle only until the reader's first Tab or
+            // click: a title field, a stepper, the router button and every
+            // roster control are descendants, and asking the container's handle
+            // alone missed all of them, so the close left the keyboard on a
+            // control whose panel had unmounted (the fields fell through to the
+            // conversation root, which is the wrong destination rather than a
+            // dead one).
+            //
+            // **And the borrow is returned only to a lender there was one
+            // from.** The panel takes the keyboard off the find surface exactly
+            // when it *covers* it, so the split form — which the reader stepped
+            // into themselves — goes back to the conversation as it always did.
+            // `inspector_covered` is what remembers that, and it has to be:
+            // `inspector_open` is already false by here, so asking the layout
+            // again would answer "covering nothing" for every close.
+            if self.inspector_focus.contains_focused(window, cx)
+                && !(self.inspector_covered && self.refocus_find_surface(window, cx))
+            {
                 window.focus(&self.focus_handle, cx);
             }
         }

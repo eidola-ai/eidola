@@ -1336,7 +1336,7 @@ impl SpaceView {
                 // a render-time `value()` read would see the spliced preedit.
                 gpui_component::input::InputEvent::Change => {
                     let text = state.read(cx).value().to_string();
-                    this.set_find_query(text, cx);
+                    this.set_find_query(text, window, cx);
                 }
                 // **⌘↩ opens the Find-all overlay**, the disclosure's other
                 // door and the one a reader already in the field can reach
@@ -1478,7 +1478,7 @@ impl SpaceView {
             let input = session.input.clone();
             input.update(cx, |s, cx| s.set_value(query, window, cx));
         }
-        self.set_find_query(query.to_string(), cx);
+        self.set_find_query(query.to_string(), window, cx);
     }
 
     /// Whether the find surface currently owns the keyboard — what gates the
@@ -1510,7 +1510,7 @@ impl SpaceView {
     }
 
     /// Apply a committed query. Never called from an observer or a render.
-    fn set_find_query(&mut self, text: String, cx: &mut Context<Self>) {
+    fn set_find_query(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.find.as_mut() else {
             return;
         };
@@ -1546,6 +1546,21 @@ impl SpaceView {
         // query that *does* match glides again from wherever this stopped, so
         // cancelling is right either way.
         self.cancel_page_glide();
+        // **And a query cleared under the overlay takes the overlay with it**,
+        // the other half of the same rule. The disclosure that collapses this
+        // surface disappears with the readout it lives beside, so an overlay
+        // left standing over an emptied query has lost its own pointer way out
+        // while claiming "Nothing matches anywhere" about a search that is no
+        // longer being made. Through `close_find_overlay`, so the keyboard goes
+        // back to the field the reader is typing in rather than being left on a
+        // results list that has stopped existing.
+        if self
+            .find
+            .as_ref()
+            .is_some_and(|s| s.query.is_none() && s.overlay.open)
+        {
+            self.close_find_overlay(window, cx);
+        }
         cx.notify();
     }
 

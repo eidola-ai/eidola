@@ -851,7 +851,16 @@ impl SpaceView {
             self.close_find_overlay(window, cx);
             return;
         }
-        if self.find.is_none() {
+        // **An empty query is an absence, not a search that found nothing.**
+        // The bar states that already: with no query it shows no index readout,
+        // no step verbs and no total — and therefore no disclosure, since the
+        // disclosure lives with the readout. So the surface behind that
+        // disclosure may not exist either, and ⌘Return with an empty field —
+        // the one door that does not go through the chevron — used to cover the
+        // conversation with "Nothing matches anywhere", a claim about a search
+        // nobody made. Refused rather than opened-and-empty for the same reason
+        // the bar shows nothing rather than a zero.
+        if !self.find.as_ref().is_some_and(|s| s.query.is_some()) {
             return;
         }
         // **A surface that covers the conversation dismisses what it would
@@ -2113,9 +2122,26 @@ impl SpaceView {
                 .iter()
                 .map(|&i| cell_in_band(map[i].depth, map[i].lane))
                 .collect();
+            // **The induction needs a base case, and the ends are it.** The
+            // neighbour rule carries the walk *from a painted match*, so with
+            // no matching node in band at all — a result only in the sixtieth
+            // root lane, say — it produces nothing, the paint loop omits every
+            // matching dot, and Tab cannot start the walk at all: a retained
+            // handle does not enter a paint-derived tab order by itself. The
+            // **first** matching node in traversal order is therefore always
+            // built, which is where Tab entering the map arrives, and the
+            // **last** for the same reason from the other side, where
+            // Shift-Tab does. Two dots, unconditionally rather than only when
+            // nothing is banded: a rule with no special case is one fewer thing
+            // to be wrong about, and the ends are exactly where a walk in
+            // either direction begins.
+            let ends = [0, ms.len().saturating_sub(1)];
             (0..ms.len())
                 .filter(|&p| {
-                    !banded[p] && ((p > 0 && banded[p - 1]) || (p + 1 < ms.len() && banded[p + 1]))
+                    !banded[p]
+                        && (ends.contains(&p)
+                            || (p > 0 && banded[p - 1])
+                            || (p + 1 < ms.len() && banded[p + 1]))
                 })
                 .map(|p| map[ms[p]].node.clone())
                 .collect()
@@ -2272,6 +2298,19 @@ impl SpaceView {
             )
             .child(crate::scrollbar::vertical_floating(
                 "space-find-map-scroll",
+                &handle,
+            ))
+            // **And a horizontal one, because this column really scrolls both
+            // ways.** Past thirteen lanes `map_lane_x` states an x beyond the
+            // column's own width rather than folding it back, and gpui does not
+            // redirect a vertical-only wheel to the other axis once both are
+            // scrollable — so an ordinary mouse had no path at all to the
+            // clipped lanes, leaving them to horizontal-capable hardware, a
+            // modifier gesture, or the keyboard. It yields the bottom-right
+            // corner to the vertical strip; both show nothing on an axis with
+            // nothing to scroll, which is why neither is conditional.
+            .child(crate::scrollbar::horizontal_floating(
+                "space-find-map-scroll-x",
                 &handle,
             ))
             .into_any_element()
