@@ -23,7 +23,9 @@
 
 mod chat_harness;
 
-use chat_harness::{ChatBehavior, MODEL, MockConfig, RefundMode, core_for, with_account};
+use chat_harness::{
+    ChatBehavior, MODEL, MockConfig, RefundMode, STREAM_WIRE_MODEL, core_for, with_account,
+};
 use eidola_app_core::AppCore;
 use eidola_app_core::ipc::Shutdown;
 use eidola_app_core::proxy::{ProxySettingsUpdate, http};
@@ -2337,6 +2339,21 @@ fn a_stream_framed_with_bare_carriage_returns_is_split_into_its_events() {
         assert!(
             !body.contains("refund"),
             "no credential material travels downstream: {body}"
+        );
+        // **And the fields inside each event were read, not just its edges.**
+        // Every payload names the model in the upstream's own spelling behind
+        // an `id:` line; a parser that splits events at the right byte and then
+        // walks their fields with `str::lines()` sees one line with no `data:`
+        // prefix, finds no payload, and forwards the event untouched — which is
+        // silent, and is also how a metadata event's refund goes missing.
+        assert!(
+            !body.contains(STREAM_WIRE_MODEL),
+            "every chunk's model was rewritten, so every chunk's fields were \
+             parsed: {body}"
+        );
+        assert!(
+            body.matches(&format!("\"model\":\"{MODEL}\"")).count() >= 3,
+            "and the rewrite is per event: {body}"
         );
         assert!(mock.refund_hits() >= 1, "the streaming hold settled");
     });

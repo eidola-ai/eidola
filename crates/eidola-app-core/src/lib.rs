@@ -8359,8 +8359,7 @@ impl Inner {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                for line in event_str.lines() {
-                    let line = line.trim_end_matches('\r');
+                for (line, _) in split_event_lines(event_str) {
                     let Some(payload) = line.strip_prefix("data:") else {
                         continue;
                     };
@@ -8975,8 +8974,8 @@ impl Inner {
 /// really said `\r\r\n` and leaves a stray `\n` heading the next event — which
 /// **both** consumers already tolerate: the proxy forwards each event with the
 /// terminator it consumed, so the bytes a downstream parser sees are unchanged
-/// in total, and the turn path's `lines()` walk skips a line carrying no
-/// `data:` prefix. A harmless mis-split beats a lost completion.
+/// in total, and the turn path's field walk skips a line carrying no `data:`
+/// prefix. A harmless mis-split beats a lost completion.
 fn terminator_len(buf: &[u8], i: usize) -> Option<usize> {
     match buf.get(i)? {
         b'\r' if buf.get(i + 1) == Some(&b'\n') => Some(2),
@@ -9007,6 +9006,43 @@ fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
         return Some((i, first + second));
     }
     None
+}
+
+/// Split one SSE event's text into its fields: each line with the terminator
+/// that ended it, `""` for a final line the event ended without one.
+///
+/// **The same scanner that separates events separates their fields.** An event
+/// is a run of lines, and the format's line endings are the format's line
+/// endings in both places — but `str::lines()` knows only `\n` and `\r\n`, so a
+/// bare-`\r` event arrived as a single line: `id: 1\rdata: {…}` has no `data:`
+/// prefix, so the payload inside it was invisible to both consumers. Splitting
+/// events correctly and then parsing their fields the old way cures half a
+/// defect and hides the other half, because the failure is now silent instead
+/// of loud — the proxy stops rewriting the model name and, worse, stops finding
+/// the refund that settles a spent credential; the turn path drops the deltas
+/// and never sees `[DONE]`.
+///
+/// Terminators are returned rather than normalized so a caller rebuilding an
+/// event emits the bytes the sender chose. Every terminator byte is ASCII, so
+/// the slice boundaries are always char boundaries.
+fn split_event_lines(text: &str) -> Vec<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    while i < bytes.len() {
+        match terminator_len(bytes, i) {
+            Some(len) => {
+                lines.push((&text[start..i], &text[i..i + len]));
+                i += len;
+                start = i;
+            }
+            None => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        lines.push((&text[start..], ""));
+    }
+    lines
 }
 
 // ============================================================================
@@ -16282,6 +16318,37 @@ mod tests {
                 .starts_with("data:"),
             "the stray newline heads a line no reader acts on"
         );
+    }
+
+    /// **An event's fields are split the same way its edges are.**
+    ///
+    /// `str::lines()` knows two of the format's three line endings, so a
+    /// bare-`\r` event arrived as one line: `id: 1\rdata: {…}` has no `data:`
+    /// prefix and its payload was invisible to every reader. Terminators come
+    /// back with their lines so a caller rebuilding an event frames it the way
+    /// the sender did.
+    #[test]
+    fn an_events_fields_are_split_at_every_line_ending_too() {
+        assert_eq!(
+            split_event_lines("id: 1\rdata: {}"),
+            vec![("id: 1", "\r"), ("data: {}", "")],
+            "a bare carriage return separates two fields"
+        );
+        assert_eq!(
+            split_event_lines("id: 1\r\ndata: {}\n"),
+            vec![("id: 1", "\r\n"), ("data: {}", "\n")],
+            "and the mixed endings each come back as themselves"
+        );
+        assert_eq!(split_event_lines(""), vec![]);
+        assert_eq!(split_event_lines("\n"), vec![("", "\n")], "a blank line");
+
+        // Rebuilt from the pieces, an event is the bytes it arrived as.
+        let event = "id: 1\rdata: {}\r\nretry: 10";
+        let rebuilt: String = split_event_lines(event)
+            .iter()
+            .map(|(line, terminator)| format!("{line}{terminator}"))
+            .collect();
+        assert_eq!(rebuilt, event);
     }
 
     /// A model list from a server that publishes no capabilities at all — the

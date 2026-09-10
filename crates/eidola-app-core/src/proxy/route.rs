@@ -2028,10 +2028,15 @@ fn forward_sse_event(event: &[u8], canonical: &str) -> (Vec<u8>, Option<Value>) 
     let Ok(text) = std::str::from_utf8(event) else {
         return (event.to_vec(), None);
     };
+    // **Fields are split by the same scanner that split the events.** An event
+    // is a run of lines, and `str::lines()` knows only two of the format's
+    // three line endings — so `id: 1\rdata: {…}` arrived as one line with no
+    // `data:` prefix and its payload was invisible: no model rewrite, and no
+    // refund found in the metadata event that settles the credential.
+    let lines = crate::split_event_lines(text);
     let payloads = || {
-        text.lines().filter_map(|line| {
-            line.trim_end_matches('\r')
-                .strip_prefix("data:")
+        lines.iter().filter_map(|(line, _)| {
+            line.strip_prefix("data:")
                 .map(str::trim_start)
                 .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
         })
@@ -2046,14 +2051,11 @@ fn forward_sse_event(event: &[u8], canonical: &str) -> (Vec<u8>, Option<Value>) 
     if refund.is_none() && !misnames {
         return (event.to_vec(), None);
     }
+    // Rebuilt line by line with the terminator each line actually carried, so
+    // an event this app rewrites is framed the way the sender framed it.
     let mut out = String::with_capacity(text.len());
-    for (index, line) in text.split('\n').enumerate() {
-        if index > 0 {
-            out.push('\n');
-        }
-        let carriage = line.ends_with('\r');
-        let bare = line.trim_end_matches('\r');
-        match bare
+    for (line, terminator) in &lines {
+        match line
             .strip_prefix("data:")
             .map(str::trim_start)
             .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
@@ -2068,11 +2070,9 @@ fn forward_sse_event(event: &[u8], canonical: &str) -> (Vec<u8>, Option<Value>) 
                 out.push_str("data: ");
                 out.push_str(&value.to_string());
             }
-            _ => out.push_str(bare),
+            _ => out.push_str(line),
         }
-        if carriage {
-            out.push('\r');
-        }
+        out.push_str(terminator);
     }
     (out.into_bytes(), refund)
 }

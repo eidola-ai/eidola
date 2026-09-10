@@ -112,6 +112,11 @@ pub enum ChatBehavior {
     /// one a reader recognising only the first two never splits at all: every
     /// event piles into one frame until a ceiling or EOF. A backend choosing
     /// this is unusual, which is exactly why nothing else would notice.
+    ///
+    /// Its events are **multi-field** (`id:` ahead of `data:`) and name the
+    /// model in the upstream's own spelling, so a consumer that separates
+    /// events correctly and then parses their fields with `str::lines()` is
+    /// caught too — see [`write_sse_stream_with_terminator`].
     OkStreamingBareCarriageReturns,
     /// The **real server's** streaming shape: content, a usage chunk, then a
     /// terminal metadata event (`object == "eidola.chat.completion.metadata"`)
@@ -1938,6 +1943,11 @@ fn sse_event(payload: &str) -> Vec<u8> {
 /// The streaming mock's answer text.
 pub const STREAM_CONTENT: &str = "Hello from the stream.";
 
+/// The name an upstream gives the model in its own chunks — deliberately
+/// **not** the canonical id, so a forwarded chunk still carrying it is a
+/// chunk nothing rewrote.
+pub const STREAM_WIRE_MODEL: &str = "upstream-wire-name";
+
 /// What a model that spent its whole budget thinking has to show for it.
 pub const TRUNCATED_REASONING: &str = "still working through it…";
 
@@ -2199,6 +2209,13 @@ async fn write_sse_stream(
 /// Only the terminator differs — same events, same order, same `[DONE]` — so a
 /// test asserting the ordinary outcome over this writer is asserting that the
 /// *framing* was understood rather than that some other path was taken.
+///
+/// **Every event carries a second field**, an `id:` line ahead of its `data:`
+/// one, because a one-field event hides half the defect: separating events at
+/// the right byte and then splitting their *fields* the wrong way leaves a
+/// single-field event looking perfectly fine, while `id: 1\rdata: {…}` collapses
+/// into one line with no `data:` prefix — the payload invisible, no delta
+/// delivered, no `[DONE]` seen, and, on the proxy, no refund found.
 async fn write_sse_stream_with_terminator(
     stream: &mut TcpStream,
     content_chunks: &[&str],
@@ -2211,34 +2228,49 @@ async fn write_sse_stream_with_terminator(
     stream.write_all(head.as_bytes()).await?;
     stream.flush().await?;
 
-    let send_event = |payload: String| -> Vec<u8> {
-        let event = format!("data: {payload}{eol}{eol}");
+    let send_event = |id: usize, payload: String| -> Vec<u8> {
+        let event = format!("id: {id}{eol}data: {payload}{eol}{eol}");
         let mut out = format!("{:x}\r\n", event.len()).into_bytes();
         out.extend_from_slice(event.as_bytes());
         out.extend_from_slice(b"\r\n");
         out
     };
 
+    // Each payload names the model the *upstream* calls it, which is what makes
+    // a per-event assertion possible downstream: the proxy rewrites that field
+    // to the canonical id, and it can only do so on a payload it found.
     let reasoning = serde_json::json!({
+        "model": STREAM_WIRE_MODEL,
         "choices": [{ "delta": { "reasoning": "thinking…" } }]
     });
-    stream.write_all(&send_event(reasoning.to_string())).await?;
+    stream
+        .write_all(&send_event(0, reasoning.to_string()))
+        .await?;
     stream.flush().await?;
 
-    for chunk in content_chunks {
+    for (index, chunk) in content_chunks.iter().enumerate() {
         let content = serde_json::json!({
+            "model": STREAM_WIRE_MODEL,
             "choices": [{ "delta": { "content": chunk } }]
         });
-        stream.write_all(&send_event(content.to_string())).await?;
+        stream
+            .write_all(&send_event(index + 1, content.to_string()))
+            .await?;
         stream.flush().await?;
     }
 
+    let next = content_chunks.len() + 1;
     let usage = serde_json::json!({
+        "model": STREAM_WIRE_MODEL,
         "choices": [],
         "usage": { "prompt_tokens": 11, "completion_tokens": 5 }
     });
-    stream.write_all(&send_event(usage.to_string())).await?;
-    stream.write_all(&send_event("[DONE]".to_string())).await?;
+    stream
+        .write_all(&send_event(next, usage.to_string()))
+        .await?;
+    stream
+        .write_all(&send_event(next + 1, "[DONE]".to_string()))
+        .await?;
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())
