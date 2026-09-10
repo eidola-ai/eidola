@@ -683,16 +683,16 @@ impl Inner {
                     req = req.bearer_auth(key);
                 }
                 let resp = req.send().await.map_err(AppError::from_request)?;
-                let status = resp.status();
-                let text = resp.text().await.map_err(|e| AppError::Network {
-                    // `Response::text` attaches the request URL to its error,
-                    // so this goes through the same stripping every other
-                    // reqwest error in this crate does.
-                    message: format!(
-                        "failed to read model list: {}",
-                        crate::error::request_error_text(e)
-                    ),
-                })?;
+                // **Bounded as it arrives** (`peer_read`'s class rule). The
+                // proxy exposes this listing to a downstream tool, and an
+                // external backend chooses every byte of it: a per-request
+                // deadline bounds how long it may take and not how much it may
+                // send, so an enormous catalog would spend this process's
+                // memory once per authenticated caller. The reader also strips
+                // the URL out of any transport error, as every reqwest error in
+                // this crate does.
+                let (status, text) =
+                    crate::peer_read::read_api_answer(resp, "the model list").await?;
                 if !status.is_success() {
                     return Err(AppError::Server {
                         status: status.as_u16(),

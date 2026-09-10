@@ -202,68 +202,36 @@ impl BodyRead {
 }
 
 /// One blocking upstream answer, read under [`MAX_RESPONSE_BYTES`].
-#[derive(Default)]
-struct CappedBody {
-    /// What was read, to the ceiling.
-    bytes: Vec<u8>,
-    /// How much arrived — larger than `bytes` only where the ceiling stopped
-    /// the read part-way through a chunk.
-    received: usize,
-    /// Whether the ceiling is why the read stopped.
-    over_ceiling: bool,
-}
+type CappedBody = crate::peer_read::BoundedBody;
 
-impl CappedBody {
-    fn text(&self) -> std::borrow::Cow<'_, str> {
-        String::from_utf8_lossy(&self.bytes)
-    }
-
-    /// What the Record keeps of this answer, stating both the retention cap
-    /// and the ceiling where either applied.
-    fn recorded(&self) -> Vec<u8> {
-        let mut kept = RecordedBody::default();
-        kept.push(&self.bytes);
-        // The ceiling can stop the read part-way through a chunk, so more
-        // arrived than was kept to parse; the Record states the larger number.
-        kept.received = self.received;
-        kept.seal_blocking(if self.over_ceiling {
-            BodyRead::CeilingReached
-        } else {
-            BodyRead::Complete
-        })
-    }
+/// What the Record keeps of a blocking answer, stating both the retention cap
+/// and the ceiling where either applied.
+fn recorded(answer: &CappedBody) -> Vec<u8> {
+    let mut kept = RecordedBody::default();
+    kept.push(&answer.bytes);
+    // The ceiling can stop the read part-way through a chunk, so more arrived
+    // than was kept to parse; the Record states the larger number.
+    kept.received = answer.received;
+    kept.seal_blocking(if answer.over_ceiling {
+        BodyRead::CeilingReached
+    } else {
+        BodyRead::Complete
+    })
 }
 
 /// Read a blocking answer, bounded **as the bytes arrive**.
 ///
-/// `Response::text()` buffers whatever the upstream sends before anything can
-/// cap it, which is the blocking twin of the defect the stream's
-/// [`RecordedBody`] already answers — one rule, both transports. The ceiling
-/// here is [`MAX_RESPONSE_BYTES`] rather than the retention cap: what the
-/// Record keeps and what this app may hold to answer a caller are different
-/// numbers, and only the second one bounds the process.
+/// The reader is [`crate::peer_read::read_bounded`] — the crate's one rule for
+/// reading from a peer — and what differs here is only the **ending**: an
+/// oversized API answer is refused, while a proxied completion keeps what it
+/// read, records it as the truncation it is, and answers the caller a gateway
+/// failure, because the Record is evidence and a body that stopped at this
+/// app's ceiling is a fact about the exchange. The ceiling is
+/// [`MAX_RESPONSE_BYTES`] rather than the retention cap: what the Record keeps
+/// and what this app may hold to answer one caller are different numbers, and
+/// only the second bounds the process.
 async fn read_capped_body(response: reqwest::Response) -> Result<CappedBody, AppError> {
-    use futures_util::StreamExt;
-
-    let mut stream = response.bytes_stream();
-    let mut body = CappedBody::default();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| AppError::Network {
-            message: format!(
-                "failed to read the response: {}",
-                crate::error::request_error_text(e)
-            ),
-        })?;
-        body.received += chunk.len();
-        let room = MAX_RESPONSE_BYTES.saturating_sub(body.bytes.len());
-        if chunk.len() > room {
-            body.bytes.extend_from_slice(&chunk[..room]);
-            body.over_ceiling = true;
-            break;
-        }
-        body.bytes.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    crate::peer_read::read_bounded(response, MAX_RESPONSE_BYTES).await
 }
 
 /// How a proxied stream ended, as the Record has to state it.
@@ -1193,7 +1161,7 @@ impl Inner {
             &headers,
             &body,
             Some(status.as_u16()),
-            answer.recorded(),
+            recorded(&answer),
             refusal.as_ref().map(ToString::to_string),
             nonce,
             request_at,
@@ -1362,7 +1330,7 @@ impl Inner {
                 &headers,
                 &body,
                 Some(status.as_u16()),
-                answer.recorded(),
+                recorded(&answer),
                 None,
                 nonce,
                 request_at,
@@ -1412,7 +1380,7 @@ impl Inner {
                 &headers,
                 &body,
                 Some(status.as_u16()),
-                answer.recorded(),
+                recorded(&answer),
                 Some(refusal.to_string()),
                 nonce,
                 request_at,
@@ -2133,13 +2101,13 @@ mod tests {
             answer.bytes.len()
         );
         assert!(answer.over_ceiling, "and it knows why it stopped");
-        let recorded = String::from_utf8_lossy(&answer.recorded()).to_string();
+        let row = String::from_utf8_lossy(&recorded(&answer)).to_string();
         assert!(
-            recorded.contains("keeps the first"),
+            row.contains("keeps the first"),
             "the retention cap still speaks"
         );
         assert!(
-            recorded.contains("never read"),
+            row.contains("never read"),
             "and a read this app ended is not an upstream that finished"
         );
 
@@ -2153,7 +2121,7 @@ mod tests {
         let answer = read_capped_body(response).await.expect("read");
         assert_eq!(answer.text(), r#"{"ok":true}"#);
         assert!(!answer.over_ceiling);
-        assert_eq!(answer.recorded(), br#"{"ok":true}"#.to_vec());
+        assert_eq!(recorded(&answer), br#"{"ok":true}"#.to_vec());
     }
 
     /// **Every send downstream updates the ending the Record will state.**

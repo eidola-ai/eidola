@@ -317,20 +317,22 @@ impl Inner {
         // would strand the credential in `spending`, and the very next turn
         // would burn its bounded provisioning wait on a refund that is never
         // coming.
-        let text = match response.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
-                    .await;
-                return Err(AppError::Network {
-                    message: format!(
-                        "failed to read the {} response: {}",
-                        target.chore,
-                        crate::error::request_error_text(e)
-                    ),
-                });
-            }
-        };
+        // Bounded as it arrives, like every other read from a peer on this
+        // crate's side of a socket (`peer_read`): a chore's answer is one
+        // completion, and an engine or an external backend chooses its size.
+        let text =
+            match crate::peer_read::read_bounded(response, crate::peer_read::API_ANSWER_MAX_BYTES)
+                .await
+            {
+                Ok(body) => body.text().into_owned(),
+                Err(e) => {
+                    self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
+                        .await;
+                    return Err(AppError::Network {
+                        message: format!("failed to read the {} response: {e}", target.chore),
+                    });
+                }
+            };
         let parsed: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
 

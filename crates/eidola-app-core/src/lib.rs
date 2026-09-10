@@ -8,6 +8,7 @@ pub mod error;
 pub mod ipc;
 pub mod local_models;
 pub mod memory;
+mod peer_read;
 pub mod proxy;
 pub mod router;
 pub mod search;
@@ -13253,13 +13254,8 @@ async fn recover_refund(
         .await
         .map_err(AppError::from_request)?;
 
-    let status = resp.status();
-    let body_text = resp.text().await.map_err(|e| AppError::Network {
-        message: format!(
-            "failed to read recovery response: {}",
-            crate::error::request_error_text(e)
-        ),
-    })?;
+    let (status, body_text) =
+        crate::peer_read::read_api_answer(resp, "the recovery response").await?;
     let body: serde_json::Value =
         serde_json::from_str(&body_text).map_err(|e| AppError::Network {
             message: format!("failed to parse recovery response: {e}"),
@@ -16034,15 +16030,12 @@ fn params_from_domain_separator(ds: &str) -> Result<Params, AppError> {
     Ok(Params::new(parts[1], parts[2], parts[3], parts[4]))
 }
 
+/// Read one server answer — **bounded as it arrives** (`peer_read`'s class
+/// rule). This is the shared reader for every call this app makes to the Eidola
+/// server, so the ceiling lands on all of them at once; attested or not, the
+/// bytes are still chosen by the other end.
 async fn read_response(resp: reqwest::Response) -> Result<(reqwest::StatusCode, String), AppError> {
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| AppError::Network {
-        message: format!(
-            "failed to read response body: {}",
-            crate::error::request_error_text(e)
-        ),
-    })?;
-    Ok((status, body))
+    crate::peer_read::read_api_answer(resp, "the server's answer").await
 }
 
 fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError> {
