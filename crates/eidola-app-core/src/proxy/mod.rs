@@ -310,6 +310,22 @@ impl Inner {
         })
     }
 
+    /// The local-exposure permission, read on its own.
+    ///
+    /// **The narrow read that decides.** Exposure is a permission to start an
+    /// engine, and a permission is only meaningful as of the moment it is
+    /// acted on — so the engine-start branch asks for this rather than
+    /// carrying a `ProxySettings` snapshot taken a whole request earlier. The
+    /// same shape as `db::exposed_backend`: one read, at the decision, of
+    /// exactly the fact the decision needs.
+    pub(crate) async fn proxy_local_exposure(&self) -> Result<LocalExposure, AppError> {
+        let conn = self.db_conn().await?;
+        Ok(db::get_proxy_settings(&conn)
+            .await?
+            .map(|row| LocalExposure::parse(&row.local_exposure))
+            .unwrap_or_default())
+    }
+
     pub(crate) async fn update_proxy_settings(
         &self,
         update: ProxySettingsUpdate,

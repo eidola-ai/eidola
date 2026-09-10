@@ -2113,6 +2113,80 @@ fn a_permission_withdrawn_mid_request_is_not_authorized_by_the_snapshot() {
     });
 }
 
+/// REGRESSION: **the permission to start an engine is read where the engine
+/// starts, not where the request arrived.**
+///
+/// Local exposure is the setting that says whether a downstream tool may cost
+/// this machine a subprocess and its memory. It was read into a `ProxySettings`
+/// snapshot before the backend was even resolved, so a reader who withdrew it
+/// while a request was in flight still had `llama-server` started on their
+/// behalf — the request-time twin of the backend-exposure defect, on the
+/// setting whose whole purpose is to bound what a request may spend locally.
+///
+/// The window is the same seam, staged at the same point: the resolve pauses,
+/// the reader narrows the setting, and the branch below decides on what is true
+/// when it decides. `Loaded` refuses by name (`404`); the stale snapshot would
+/// have gone on to `load_local_model`, which fails differently (`503`) because
+/// there is no file behind the model — so the two answers cannot be confused.
+#[test]
+fn a_local_exposure_withdrawn_mid_request_starts_no_engine() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+        let key = runtime.block_on(async {
+            core.update_proxy_settings(ProxySettingsUpdate {
+                local_exposure: Some(eidola_app_core::proxy::LocalExposure::Downloaded),
+                ..Default::default()
+            })
+            .await
+            .expect("open the permission");
+            core.set_proxy_backend_exposed("local".to_string(), true)
+                .await
+                .expect("expose local");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+
+        let mut window = core.test_open_proxy_resolve_window();
+        let asking = {
+            let core = Arc::clone(&core);
+            runtime.spawn(async move {
+                exchange(
+                    &core,
+                    &post(
+                        "/v1/chat/completions",
+                        &key,
+                        r#"{"model":"absent@local","messages":[{"role":"user","content":"hi"}]}"#,
+                    ),
+                )
+                .await
+            })
+        };
+
+        let (status, body) = runtime.block_on(async {
+            let resume = window.recv().await.expect("the request reaches the window");
+            // The reader narrows the permission while the request is in flight.
+            core.update_proxy_settings(ProxySettingsUpdate {
+                local_exposure: Some(eidola_app_core::proxy::LocalExposure::Loaded),
+                ..Default::default()
+            })
+            .await
+            .expect("withdraw the permission");
+            let _ = resume.send(());
+            asking.await.expect("the request finishes")
+        });
+
+        assert_eq!(
+            status, 404,
+            "a snapshot taken before the withdrawal must not start an engine: {body}"
+        );
+        assert!(body.contains("model_not_found"), "{body}");
+    });
+}
+
 /// **A removal takes the exposure with it, so the read that authorizes finds
 /// nothing on a revived row.**
 ///

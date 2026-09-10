@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{LocalExposure, ProxySettings};
+use super::LocalExposure;
 use crate::changes::Change;
 use crate::error::AppError;
 use crate::{
@@ -856,7 +856,6 @@ impl Inner {
     /// bills.
     async fn open_proxy_route(
         &self,
-        settings: &ProxySettings,
         target: &crate::utility::UtilityTarget,
     ) -> Result<ProxyRoute, AppError> {
         let backend = &target.backend;
@@ -871,7 +870,17 @@ impl Inner {
                         // engine*, so it is enforced here rather than only in
                         // the listing: a tool that names a model the listing
                         // withheld must not be able to start it anyway.
-                        if settings.local_exposure == LocalExposure::Loaded {
+                        //
+                        // **And it is read here, at the branch that acts on
+                        // it.** A `ProxySettings` snapshot taken when the
+                        // request arrived says what the permission was a whole
+                        // resolve-and-catalog ago; a reader who takes the
+                        // permission back in that window would still have a
+                        // subprocess started on their machine, which is the one
+                        // thing the setting exists to prevent. Same rule as the
+                        // backend's own exposure (`db::exposed_backend`): the
+                        // read that authorizes is the read that decides.
+                        if self.proxy_local_exposure().await? == LocalExposure::Loaded {
                             return Err(AppError::ModelUnavailable {
                                 model: target.canonical.clone(),
                             });
@@ -1136,9 +1145,8 @@ impl Inner {
         &self,
         request: ProxyChatRequest,
     ) -> Result<ProxyChatResponse, AppError> {
-        let settings = self.proxy_settings().await?;
         let target = self.resolve_proxy_target(&request.model).await?;
-        let mut route = self.open_proxy_route(&settings, &target).await?;
+        let mut route = self.open_proxy_route(&target).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(&request, route.declared_max_output);
         let body = Self::proxy_request_body(
@@ -1372,9 +1380,8 @@ impl Inner {
         request: ProxyChatRequest,
         sender: tokio::sync::mpsc::Sender<ProxyStreamEvent>,
     ) -> Result<(), AppError> {
-        let settings = self.proxy_settings().await?;
         let target = self.resolve_proxy_target(&request.model).await?;
-        let mut route = self.open_proxy_route(&settings, &target).await?;
+        let mut route = self.open_proxy_route(&target).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(&request, route.declared_max_output);
         let body = Self::proxy_request_body(
