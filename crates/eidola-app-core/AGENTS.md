@@ -406,6 +406,23 @@ One cheap model call filtering the mechanical notify set, between planning and t
 
 **Every read from a peer is capped as the bytes arrive, and every await on a peer has a deadline.** One rule, stated once, because it arrived three times as separate findings on three surfaces. The two halves are independent and neither implies the other: a deadline bounds elapsed time and not bytes (gigabytes fit inside ten seconds), a cap bounds bytes and not time (one byte a minute is forever). A *peer* is anything on the other end of a socket — an external OpenAI-compatible backend, a local engine, the Eidola server — because what matters is that this process does not choose what arrives, not who is nominally trusted. `Content-Length` is never the cap: it is a claim by the party supplying the body, so it may refuse *early* and never decide when to stop.
 
+**Compliance, enumerated — because a class that arrives one surface at a time is a class nobody is checking.** Every place this crate reads from or waits on a peer:
+
+| Surface | Byte bound | Time bound |
+|---|---|---|
+| Proxied completion (`proxy::route`) | `MAX_RESPONSE_BYTES`, 8 MiB | none by design — an inference legitimately takes minutes; a **zero-spend stream** ends with its caller (`next_chunk`), and a spending one is bounded by the hold it must settle |
+| Proxy catalog reads — the listing *and* the route's own pricing fetch | `API_ANSWER_MAX_BYTES` (via `read_api_answer`) | `MODEL_LIST_TIMEOUT`, 10 s per read |
+| External backend `/v1/models` (`backends::backend_models`) | `API_ANSWER_MAX_BYTES` | the caller's (the proxy's deadline above; the GUI's per-backend catalog slot) |
+| Every Eidola server call (`read_response` → account, balance, credentials, models) | `API_ANSWER_MAX_BYTES` | attested client's `connect_timeout`; no request deadline, as for a completion |
+| Refund recovery (`recover_refund`) | `API_ANSWER_MAX_BYTES` | as above |
+| Chore completion (`utility.rs`) | `API_ANSWER_MAX_BYTES` | none — same reason as a completion |
+| Signed release documents (`updater::fetch_url_network`) | `MAX_DOCUMENT_BYTES`, 16 MiB | `FETCH_STALL_TIMEOUT`, 60 s of silence |
+| Model download (`local_models`) | **deliberately none** — a model is gigabytes by definition; it is streamed to disk rather than held, and its integrity is checked afterwards | `DOWNLOAD_STALL_TIMEOUT`, 120 s of silence (a read timeout, never a total one) |
+| The proxy's *inbound* HTTP (`proxy::http`) | `MAX_REQUEST_BYTES`, 32 MiB | `HEADER_READ_TIMEOUT` for the head, `BODY_READ_TIMEOUT` for the body |
+| **Turn path** (`lib.rs`'s completion bodies and streaming `response_buf`) | **known twin, uncured** | as for a completion |
+
+The turn path is the one row without a bound, and it is the chat path: extending it is a change that must extend the chat harness (`tests/chat_path.rs` + the `tests/bus.rs` exit-point table), which is why it is recorded here rather than done from the proxy. Its exposure is genuinely smaller — the app issues those requests itself, one per turn, against a ceiling it set — but the row says "uncured" rather than "fine", because the rule is about who chooses the bytes.
+
 `read_bounded` is the reader; what differs by surface is only the **ending**. An **API answer** (`read_api_answer`, `API_ANSWER_MAX_BYTES` = 2 MiB) is refused, because a truncated JSON document is not a smaller answer and continuing turns a size failure into a confusing syntax one. A **proxied completion** (`MAX_RESPONSE_BYTES` = 8 MiB) keeps what it read, records it as the truncation it is and answers the caller a gateway failure, because the Record is evidence a reader goes looking for. Regressions: `a_peers_answer_is_bounded_while_it_arrives`, `an_oversized_api_answer_is_refused_rather_than_truncated` (`peer_read.rs`), `an_enormous_model_listing_is_refused_rather_than_buffered` (`tests/backends.rs`), `a_blocking_answer_is_bounded_as_it_arrives` (`proxy/route.rs`).
 
 ## Chore runner (`utility.rs`)
