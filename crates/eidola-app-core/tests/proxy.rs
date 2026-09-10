@@ -2239,9 +2239,23 @@ fn a_stream_framed_with_bare_carriage_returns_is_split_into_its_events() {
         ));
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("[DONE]"), "the stream ran to its end: {body}");
+        // **Separately** is the claim, and the count of `data:` cannot make it:
+        // one undivided frame carries every event's text too. What differs is
+        // the *framing* — each forwarded event is its own HTTP chunk — so the
+        // chunk headers are what the assertion reads.
+        let chunks = body
+            .split("\r\n")
+            .filter(|line| {
+                !line.is_empty()
+                    && *line != "0"
+                    && line.chars().all(|c| c.is_ascii_hexdigit())
+                    && u64::from_str_radix(line, 16).is_ok()
+            })
+            .count();
         assert!(
-            body.matches("data:").count() >= 3,
-            "the events arrived separately rather than as one frame: {body}"
+            chunks >= 3,
+            "the events were forwarded one at a time rather than accumulated \
+             into one frame — {chunks} chunk(s) in: {body}"
         );
         assert!(
             !body.contains("refund"),
