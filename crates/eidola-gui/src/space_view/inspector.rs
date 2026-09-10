@@ -153,6 +153,9 @@ impl SpaceView {
     fn hand_keyboard_to_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.inspector_covers_pane(window) && self.find_holds_focus(window, cx) {
             window.focus(&self.inspector_focus, cx);
+            // **The loan is recorded where it is made** — see
+            // `SpaceView::inspector_borrowed_find`.
+            self.inspector_borrowed_find = true;
         }
     }
 
@@ -201,6 +204,10 @@ impl SpaceView {
     ) {
         self.inspector_open = open;
         if open {
+            // A panel that is about to open has borrowed nothing yet; the
+            // handoff below, or a later resize into the covering form, is what
+            // records one.
+            self.inspector_borrowed_find = false;
             self.ensure_inspector_settings(cx);
             // **A surface that covers the page takes the keyboard off what it
             // covers.** In the *overlay* form the panel paints a full-window
@@ -262,18 +269,22 @@ impl SpaceView {
             // conversation root, which is the wrong destination rather than a
             // dead one).
             //
-            // **And the borrow is returned only to a lender there was one
-            // from.** The panel takes the keyboard off the find surface exactly
-            // when it *covers* it, so the split form — which the reader stepped
-            // into themselves — goes back to the conversation as it always did.
-            // `inspector_covered` is what remembers that, and it has to be:
-            // `inspector_open` is already false by here, so asking the layout
-            // again would answer "covering nothing" for every close.
+            // **And the borrow is returned only where one was made — read
+            // from the loan record, never inferred from the layout.** Covering
+            // is what *allows* the handoff, not what performs it: with a find
+            // session standing but the keyboard somewhere in the pane, the
+            // panel covers and takes nothing, and treating the layout as proof
+            // of a loan sent a reader who had stepped into a control of their
+            // own accord off to the results list — abandoning the conversation
+            // context they were actually in. `hand_keyboard_to_inspector`
+            // records what it really took, which is also the only thing that
+            // can answer for a loan made a frame later by a resize.
             if self.inspector_focus.contains_focused(window, cx)
-                && !(self.inspector_covered && self.refocus_find_surface(window, cx))
+                && !(self.inspector_borrowed_find && self.refocus_find_surface(window, cx))
             {
                 window.focus(&self.focus_handle, cx);
             }
+            self.inspector_borrowed_find = false;
         }
         cx.notify();
     }

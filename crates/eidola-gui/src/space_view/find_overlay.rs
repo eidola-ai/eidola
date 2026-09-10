@@ -123,6 +123,45 @@ const FRAGMENT_GAP: f32 = 10.0;
 /// placeholder, and its size is the measured height where the fragment has
 /// painted once and an estimate before that.
 const RESULT_MARGIN: f32 = 600.0;
+/// The rects one edge is drawn as, from the two **cell origins** it joins.
+///
+/// **The elbow drops before it runs, so a connector never crosses a node it
+/// does not join.** Drawn as a horizontal run at the *parent's* row and then a
+/// drop, a fork into a lane beyond an already-reserved one sends its connector
+/// straight through whatever dot occupies the lane between — root `r1` in lane
+/// 0 forking to lane 2 while root `r2` holds lane 1 draws a line into `r2` and
+/// out the other side, which is the map stating a topology the conversation
+/// does not have. Dots paint after edges, so the line is not even hidden.
+///
+/// So it takes the git-graph shape: down the parent's own lane into the gap
+/// above the child's row, across that gap, then down the child's lane to the
+/// child. **Every piece is provably clear of every unrelated dot**, and both
+/// halves of that come from `map_layout`'s own invariants: a lane meets each
+/// depth exactly once, so nothing else can sit in either lane between these two
+/// rows; and a parent is always exactly one depth above its child, so the gap
+/// this runs through is the one between two adjacent rows — `MAP_ROW_H` apart
+/// with a `MAP_DOT` circle at the top of each, which leaves the run strictly
+/// below the parent row's circle and strictly above the child row's.
+///
+/// A child in its parent's own lane keeps the single straight segment: there is
+/// no corner to turn, and an elbow there would be a kink for nothing.
+fn map_edge_rects(parent: (f32, f32), child: (f32, f32)) -> Vec<(f32, f32, f32, f32)> {
+    let (px0, py0) = parent;
+    let (cx0, cy0) = child;
+    let (pcx, pcy) = (px0 + MAP_DOT / 2.0, py0 + MAP_DOT / 2.0);
+    let (ccx, ccy) = (cx0 + MAP_DOT / 2.0, cy0 + MAP_DOT / 2.0);
+    if (ccx - pcx).abs() <= 0.5 {
+        return vec![(pcx - 0.5, pcy, 1.0, (ccy - pcy).max(0.0))];
+    }
+    // Midway between the child row's circle and the row above it.
+    let band = cy0 - (MAP_ROW_H - MAP_DOT) / 2.0;
+    vec![
+        (pcx - 0.5, pcy, 1.0, (band - pcy).max(0.0)),
+        (pcx.min(ccx), band - 0.5, (ccx - pcx).abs(), 1.0),
+        (ccx - 0.5, band, 1.0, (ccy - band).max(0.0)),
+    ]
+}
+
 /// A reveal owed a correction, and what it was last performed against.
 ///
 /// `key` is a [`FindOverlay::tops`] key — a fragment id for the cursor's own
@@ -588,6 +627,17 @@ pub(crate) struct FindOverlay {
     /// read, never chased on write: the results move under it whenever the
     /// conversation does.
     pub(crate) cursor: usize,
+    /// **What the cursor is *on*, as opposed to where it sits.** A results list
+    /// is re-cut on every frame and a background write reorders it, so an index
+    /// alone silently retargets: with the cursor on B and a C after it, a
+    /// regeneration that takes an earlier A out leaves the same number pointing
+    /// at C — the focus indication, the active descendant and what Enter opens
+    /// all change while the reader never moved. The id is resolved into the
+    /// rebuilt list each frame and the index follows it; the number is the
+    /// fallback for the one case identity cannot answer, which is the fragment
+    /// itself being gone. `rethread_drafts`' rule, reaching the last
+    /// window-local reference into the results that was still positional.
+    pub(crate) cursor_id: Option<SharedString>,
     /// Per-fragment measured heights, written by each rendered card's measuring
     /// canvas. `Rc` because that canvas outlives the borrow that built it.
     heights: Rc<RefCell<HashMap<SharedString, f32>>>,
@@ -671,6 +721,7 @@ impl FindOverlay {
                 .tab_stop(true),
             focus: cx.focus_handle(),
             cursor: 0,
+            cursor_id: None,
             heights: Rc::new(RefCell::new(HashMap::new())),
             bodies: HashMap::new(),
             map_painted: 0,
@@ -707,6 +758,26 @@ impl FindOverlay {
             self.card_geometry = Some((width, scale));
             self.heights.borrow_mut().clear();
         }
+    }
+
+    /// Follow the cursor's **fragment** into this frame's list, and let the
+    /// index follow it.
+    ///
+    /// Positional only where identity has nothing left to name: the fragment
+    /// the cursor was on is gone, so the reader's *place* is the best remaining
+    /// answer and whatever now stands there is adopted — which is also what
+    /// re-establishes an identity to follow from the next frame on. Run before
+    /// anything reads the cursor, so the card it names, the card the reveal
+    /// aims at and the card the band materialises are one card.
+    pub(crate) fn sync_cursor(&mut self, ids: &[SharedString]) {
+        if let Some(id) = self.cursor_id.as_ref()
+            && let Some(at) = ids.iter().position(|f| f == id)
+        {
+            self.cursor = at;
+            return;
+        }
+        self.cursor = self.cursor.min(ids.len().saturating_sub(1));
+        self.cursor_id = ids.get(self.cursor).cloned();
     }
 
     /// How many cards hold a real measurement — the test seam behind
@@ -777,6 +848,7 @@ impl FindOverlay {
     /// it ends.
     pub(crate) fn forget_results(&mut self) {
         self.cursor = 0;
+        self.cursor_id = None;
         self.scroll.set_offset(gpui::point(px(0.), px(0.)));
         self.heights.borrow_mut().clear();
         self.bodies.clear();
@@ -1424,6 +1496,9 @@ impl SpaceView {
     ) {
         let placed = self.find.as_mut().and_then(|session| {
             session.overlay.cursor = idx;
+            // The cursor is *on a fragment*, and the index is where that
+            // fragment currently sits — so every write of one writes the other.
+            session.overlay.cursor_id = fragments.get(idx).map(|f| f.id.clone());
             fragments
                 .get(idx)
                 .and_then(|f| session.overlay.tops.get(&f.id).copied())
@@ -1559,6 +1634,11 @@ impl SpaceView {
         self.apply_find_reveal(node.clone(), placed, at, 0.0, true);
         if let (Some(index), Some(session)) = (first_fragment, self.find.as_mut()) {
             session.overlay.cursor = index;
+            // A map press has only the group's first index in hand; the id is
+            // adopted from the list on the next frame's `sync_cursor`, which is
+            // the same answer by construction (`nth == 0` is that group's own
+            // first fragment).
+            session.overlay.cursor_id = None;
         }
         cx.notify();
     }
@@ -1633,6 +1713,22 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn scroll_find_results_for_test(&mut self, top: f32) {
         self.scroll_find_results_to(top);
+    }
+
+    /// The **fragment** the roving cursor is on, rather than where it sits —
+    /// the identity that has to survive a list re-cut under a standing query.
+    #[doc(hidden)]
+    pub fn find_cursor_id_for_test(&self) -> Option<String> {
+        self.find
+            .as_ref()
+            .and_then(|s| s.overlay.cursor_id.as_ref())
+            .map(|id| id.to_string())
+    }
+
+    /// Where the roving cursor sits in the flat result list.
+    #[doc(hidden)]
+    pub fn find_cursor_index_for_test(&self) -> usize {
+        self.find.as_ref().map(|s| s.overlay.cursor).unwrap_or(0)
     }
 
     /// Whether the card the roving cursor names is in the list's viewport —
@@ -2054,33 +2150,20 @@ impl SpaceView {
             let Some((pd, pl)) = node.parent else {
                 continue;
             };
-            let cx0 = x(pl) + MAP_DOT / 2.0;
-            let cx1 = x(node.lane) + MAP_DOT / 2.0;
-            let cy0 = y(pd) + MAP_DOT / 2.0;
-            let cy1 = y(node.depth) + MAP_DOT / 2.0;
             if !edge_in_band((pd, pl), node.depth, node.lane) {
                 continue;
             }
-            if (cx1 - cx0).abs() > 0.5 {
+            for (rx, ry, rw, rh) in map_edge_rects((x(pl), y(pd)), (x(node.lane), y(node.depth))) {
                 canvas = canvas.child(
                     div()
                         .absolute()
-                        .top(px(cy0 - 0.5))
-                        .left(px(cx0.min(cx1)))
-                        .w(px((cx1 - cx0).abs()))
-                        .h(px(1.))
+                        .top(px(ry))
+                        .left(px(rx))
+                        .w(px(rw))
+                        .h(px(rh))
                         .bg(border),
                 );
             }
-            canvas = canvas.child(
-                div()
-                    .absolute()
-                    .top(px(cy0))
-                    .left(px(cx1 - 0.5))
-                    .w(px(1.))
-                    .h(px((cy1 - cy0).max(0.0)))
-                    .bg(border),
-            );
         }
 
         // **A sparse match needs a traversal candidate.** The band alone is not
@@ -2333,6 +2416,14 @@ impl SpaceView {
             .flat_map(|g| g.fragments.iter().cloned())
             .collect();
         let total = fragments.len();
+        // **Identity first, then everything that reads a position.** The list
+        // is re-cut every frame, so the cursor's fragment is followed into this
+        // one before the cursor row, the reveal and the materialisation rule
+        // each ask where it is.
+        if let Some(session) = self.find.as_mut() {
+            let ids: Vec<SharedString> = fragments.iter().map(|f| f.id.clone()).collect();
+            session.overlay.sync_cursor(&ids);
+        }
         // **Forget what belongs to a fragment that no longer exists.** A
         // measurement and an editor state are keyed by fragment id, and a live
         // editor's id carries its content, so every keystroke in a draft
@@ -3209,6 +3300,121 @@ mod tests {
         assert!(
             zoomed > wide,
             "and a zoomed one leads taller ({zoomed} > {wide})"
+        );
+    }
+
+    /// **No connector crosses a node it does not join.** The property, asserted
+    /// against the geometry the render actually draws: every edge's rects are
+    /// intersected with every dot's circle, and only the two the edge joins may
+    /// be touched.
+    #[test]
+    fn an_edge_never_crosses_a_dot_it_does_not_join() {
+        fn overlaps(r: (f32, f32, f32, f32), d: (f32, f32)) -> bool {
+            let (rx, ry, rw, rh) = r;
+            let (dx, dy) = d;
+            rx < dx + MAP_DOT && rx + rw > dx && ry < dy + MAP_DOT && ry + rh > dy
+        }
+
+        // Every edge of a layout, checked against every dot in it.
+        let check = |nodes: &[MapNode]| {
+            let lanes = nodes.iter().map(|n| n.lane + 1).max().unwrap_or(1);
+            let x = |lane: usize| map_lane_x(lane, lanes);
+            let y = |depth: usize| depth as f32 * MAP_ROW_H;
+            for node in nodes {
+                let Some((pd, pl)) = node.parent else {
+                    continue;
+                };
+                let rects = map_edge_rects((x(pl), y(pd)), (x(node.lane), y(node.depth)));
+                for other in nodes {
+                    let joins = (other.depth, other.lane) == (pd, pl)
+                        || (other.depth, other.lane) == (node.depth, node.lane);
+                    if joins {
+                        continue;
+                    }
+                    let dot = (x(other.lane), y(other.depth));
+                    for r in &rects {
+                        assert!(
+                            !overlaps(*r, dot),
+                            "an edge from ({pd},{pl}) to ({},{}) crosses the dot at \
+                             ({},{}): rect {r:?} over {dot:?}",
+                            node.depth,
+                            node.lane,
+                            other.depth,
+                            other.lane
+                        );
+                    }
+                }
+            }
+        };
+
+        // The filing's own three nodes: two roots, and the first forking past
+        // the second's lane. Drawn at the parent's row, `r1`'s connector ran
+        // straight through `r2`.
+        let three = vec![
+            MapNode {
+                node: "r1".into(),
+                depth: 0,
+                lane: 0,
+                parent: None,
+            },
+            MapNode {
+                node: "r2".into(),
+                depth: 0,
+                lane: 1,
+                parent: None,
+            },
+            MapNode {
+                node: "c".into(),
+                depth: 1,
+                lane: 2,
+                parent: Some((0, 0)),
+            },
+        ];
+        check(&three);
+
+        // And a whole forest, so the property is not a fact about one shape:
+        // one root, fifty-four branches off it, each branch two deep.
+        let mut forest = vec![MapNode {
+            node: "root".into(),
+            depth: 0,
+            lane: 0,
+            parent: None,
+        }];
+        for i in 0..54usize {
+            let lane = if i == 0 { 0 } else { i };
+            forest.push(MapNode {
+                node: format!("b{i}").into(),
+                depth: 1,
+                lane,
+                parent: Some((0, 0)),
+            });
+            forest.push(MapNode {
+                node: format!("b{i}-c").into(),
+                depth: 2,
+                lane,
+                parent: Some((1, lane)),
+            });
+        }
+        check(&forest);
+    }
+
+    /// A child in its parent's own lane keeps one straight segment, and a fork
+    /// turns its corner in the gap between the two rows rather than on either.
+    #[test]
+    fn an_edge_turns_its_corner_between_the_rows() {
+        let straight = map_edge_rects((0.0, 0.0), (0.0, MAP_ROW_H));
+        assert_eq!(straight.len(), 1, "no corner to turn: {straight:?}");
+
+        let elbow = map_edge_rects((0.0, 0.0), (40.0, MAP_ROW_H));
+        assert_eq!(elbow.len(), 3, "drop, run, drop: {elbow:?}");
+        let run = elbow[1];
+        assert!(
+            run.1 > MAP_DOT && run.1 + run.3 < MAP_ROW_H,
+            "the run is strictly inside the gap between the rows: {run:?}"
+        );
+        assert!(
+            (run.2 - 40.0).abs() < 0.01,
+            "and spans exactly the lanes it joins: {run:?}"
         );
     }
 

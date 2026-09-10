@@ -23503,6 +23503,143 @@ fn the_find_maps_column_carries_both_scroll_indicators(_cx: &mut TestAppContext)
     }
 }
 
+/// **A loan is a fact about what happened, not about what was permitted.**
+///
+/// Covering is what *allows* the panel's handoff, not what performs it: with a
+/// find session standing but the keyboard somewhere in the pane, the panel
+/// covers and takes nothing — and reading the layout as proof of a loan sent a
+/// reader who had stepped into a panel control of their own accord off to the
+/// results list, abandoning the conversation they were in.
+#[gpui::test]
+fn space_a_covering_panel_returns_only_what_it_borrowed(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // The reader leaves the search standing and puts the keyboard back in the
+    // conversation — so there is a session to cover, and nothing to take.
+    let home = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| window.focus(&home, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "precondition: the panel took nothing, the keyboard not being find's"
+    );
+
+    // They then step into a panel control themselves, and close the panel.
+    let title = view
+        .read_with(&vcx, |v, _| v.inspector_title_state_for_test())
+        .expect("the panel's title field");
+    vcx.update(|window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "a panel that borrowed nothing returns nothing — the reader is left in \
+         the conversation they were in"
+    );
+    assert!(
+        vcx.update(|window, cx| home.is_focused(window)
+            || view.read_with(cx, |v, _| v.find_open_for_test())),
+        "…and the window still has a live place for the keyboard"
+    );
+}
+
+/// **The roving cursor is on a fragment, not at a number.**
+///
+/// The list is re-cut on every frame and a background write reorders it, so an
+/// index alone silently retargets: with the cursor on B and a C after it, a
+/// regeneration that takes an earlier A out leaves the same number pointing at
+/// C — the focus indication, the active descendant and what Enter opens all
+/// change while the reader never moved.
+#[gpui::test]
+fn space_find_keeps_the_cursor_on_the_result_it_was_on(cx: &mut TestAppContext) {
+    // Three posts, three groups: A above, then B, then C.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut b = fixture_assistant_post("a2", "a kestrel in the middle");
+    b.parent_action_id = Some("a1".into());
+    let mut c = fixture_user_post("a3", "a kestrel at the end");
+    c.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel at the start"), b, c],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Down once: the cursor stands on B, with C still after it.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let on = view
+        .read_with(&vcx, |v, _| v.find_cursor_id_for_test())
+        .expect("the cursor names a fragment");
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_cursor_index_for_test()),
+        1,
+        "precondition: it is the second result"
+    );
+
+    // A regenerates somewhere, which takes its result out of the list
+    // altogether — every later index shifts up by one.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_cursor_id_for_test()),
+        Some(on),
+        "the cursor is still on the result it was on"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_cursor_index_for_test()),
+        0,
+        "…which is now the first, so the index really did have to move"
+    );
+}
+
 /// **An empty query is an absence, not a search that found nothing.**
 ///
 /// The bar states that already — with no query it shows no index readout, no

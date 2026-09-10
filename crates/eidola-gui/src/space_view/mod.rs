@@ -552,6 +552,19 @@ pub struct SpaceView {
     /// [`SpaceView::sync_inspector_cover`]). The layout decision is a function
     /// of the window's width, so it moves with a resize and through no door.
     pub(crate) inspector_covered: bool,
+    /// Whether the panel **actually took the keyboard off the find surface** —
+    /// the loan record, recorded where the handoff happens
+    /// ([`SpaceView::hand_keyboard_to_inspector`]) and read by the close.
+    ///
+    /// Covering is what *allows* the handoff, not what performs it: a find
+    /// session can stand with the keyboard somewhere else in the pane, and then
+    /// the panel covers and takes nothing. Reading the layout as proof of a
+    /// loan sent a reader who had stepped into a panel control of their own
+    /// accord off to the results list on the close, abandoning the conversation
+    /// they were in. Same shape as `overlay_borrowed_focus` and
+    /// `FindSession::returned_input`: **a borrow is a fact about what happened,
+    /// not about what was permitted.**
+    pub(crate) inspector_borrowed_find: bool,
     /// The open right-click menu over one of the space's editors, if any —
     /// window-local transient state, like the band menu and the picker (one
     /// open at a time; see [`context_menu`]).
@@ -1140,6 +1153,7 @@ impl SpaceView {
                 .tab_index(crate::focus::region::AUX)
                 .tab_stop(false),
             inspector_covered: false,
+            inspector_borrowed_find: false,
             context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
