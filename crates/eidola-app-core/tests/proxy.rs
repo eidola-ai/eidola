@@ -1621,3 +1621,65 @@ fn a_backend_that_never_answers_does_not_take_the_listing_with_it() {
         );
     });
 }
+
+/// REGRESSION: **the catalog deadline belongs to the read, not to the
+/// listing.**
+///
+/// Opening a route reads the catalog again — pricing has to be known before a
+/// hold can be computed — and that fetch sat outside every bound: an endpoint
+/// that accepted the connection and then said nothing held the completion, and
+/// the proxy connection behind it, for ever, without the chat request ever
+/// being made.
+#[test]
+fn a_backend_that_stalls_on_pricing_does_not_hold_the_completion() {
+    run(|| {
+        // A listener that accepts and then says nothing, for ever.
+        let wedged = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let wedged_port = wedged.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = wedged.accept() {
+                held.push(stream);
+            }
+        });
+
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        with_account(&core);
+        let key = armed(&core);
+        core.runtime()
+            .block_on(core.set_base_url(format!("http://127.0.0.1:{wedged_port}")))
+            .expect("point the eidola backend at the wedged listener");
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        eidola_app_core::proxy::route::set_model_list_timeout_for_test(300);
+        // Bounded here too, because the defect's own shape is a wait that never
+        // ends: without the deadline this hangs rather than fails, and a hang
+        // says nothing.
+        let answered = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                exchange(
+                    &core,
+                    &post(
+                        "/v1/chat/completions",
+                        &key,
+                        &format!(
+                            r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#
+                        ),
+                    ),
+                ),
+            )
+            .await
+        });
+        eidola_app_core::proxy::route::set_model_list_timeout_for_test(0);
+
+        let (status, body) = answered
+            .expect("the completion answers on the catalog's deadline rather than waiting out a silent endpoint");
+        assert_eq!(status, 502, "{body}");
+        assert!(
+            body.contains("catalog"),
+            "and it says what did not answer: {body}"
+        );
+    });
+}

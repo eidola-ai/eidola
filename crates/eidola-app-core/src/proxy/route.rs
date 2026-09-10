@@ -863,7 +863,29 @@ impl Inner {
                     },
                 ));
                 let client = self.build_client(&eidola, observer).await?;
-                let models = fetch_models(&client, &eidola.base_url).await?;
+                // **The same deadline the listing takes.** Opening a route is
+                // its own catalog fetch — pricing has to be read before a hold
+                // can be computed — and it sat outside every bound: an endpoint
+                // that accepted the connection and then said nothing left the
+                // completion, and the proxy connection behind it, pending for
+                // ever without the chat request ever being made. One deadline
+                // per catalog read, wherever the read happens.
+                let models = match tokio::time::timeout(
+                    model_list_timeout(),
+                    fetch_models(&client, &eidola.base_url),
+                )
+                .await
+                {
+                    Ok(models) => models?,
+                    Err(_) => {
+                        return Err(AppError::Network {
+                            message: format!(
+                                "`{}` did not answer its model catalog in time",
+                                backend.id
+                            ),
+                        });
+                    }
+                };
                 let connection_id =
                     flush_attestations(&log, &db_conn, &provider_id, &eidola.base_url, now).await?;
                 if connection_id.is_some() {
