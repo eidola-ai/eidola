@@ -1857,3 +1857,59 @@ fn a_body_that_stops_arriving_ends_the_request() {
         );
     });
 }
+
+/// REGRESSION: **the frame accumulator has a ceiling of its own.**
+///
+/// A stream is bounded in what it retains and in what it may queue for the
+/// caller, and neither bounds the buffer events are assembled in: a backend
+/// that never terminates an event grows it until the process dies, with the
+/// Record's cap and the delivery queue both looking healthy. What passes the
+/// ceiling is not an event this app can forward, so the stream ends and the row
+/// says why.
+#[test]
+fn an_event_that_never_ends_is_refused_rather_than_accumulated() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::StreamingUnterminatedFlood,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+                ),
+            ),
+        ));
+        // The head was committed before a byte of the body arrived, so what the
+        // caller meets is a stream that ends — the honest ending for a refusal
+        // this app makes mid-stream.
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !body.contains("xxxx"),
+            "and the bytes this app refused are not forwarded either: {}",
+            &body[..body.len().min(200)]
+        );
+
+        let requests = runtime.block_on(core.list_requests(20, 0)).expect("record");
+        let completion = requests
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is recorded");
+        assert!(
+            completion
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "the row says the stream ended on this app's ceiling: {:?}",
+            completion.error
+        );
+    });
+}

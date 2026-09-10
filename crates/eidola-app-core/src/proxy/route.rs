@@ -79,6 +79,23 @@ const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4096;
 /// rather than changed from here.
 const RECORD_BODY_MAX_BYTES: usize = 1 << 20;
 
+/// The most one server-sent event may accumulate before it is refused.
+///
+/// **The third buffer, and the one two ceilings did not cover.** A stream is
+/// bounded in what it *retains* (`RECORD_BODY_MAX_BYTES`) and in what it may
+/// queue for the caller (`STREAM_QUEUE_EVENTS`), and neither bounds the frame
+/// accumulator: bytes go into `buf` and only come out when
+/// [`find_event_boundary`] finds the blank line that ends an event. A backend
+/// that sends one enormous event — or never sends a terminator at all — grows
+/// that buffer until the process is out of memory, with the Record's cap and
+/// the queue both looking perfectly healthy.
+///
+/// A megabyte is orders of magnitude past any real event: a completion chunk is
+/// hundreds of bytes and the terminal metadata event carrying a refund is a few
+/// kilobytes. What passes it is not an event this app can forward, so the
+/// stream ends and the Record says why.
+const MAX_SSE_EVENT_BYTES: usize = 1 << 20;
+
 /// The most of one upstream answer this app will read at all.
 ///
 /// **The retention cap's other half, and the one the process feels.**
@@ -1495,6 +1512,28 @@ impl Inner {
                 // went away on a route with a hold to settle leaves the drain
                 // below running to the refund, on a body the cap bounds.
                 deliver(&sender, ProxyStreamEvent::Chunk(out), &mut downstream_gone).await;
+            }
+            // **What is left over is an event still being accumulated**, and
+            // it is the one buffer on this path with no ceiling of its own: the
+            // retention cap bounds the Record and the queue bounds delivery,
+            // while a backend that never terminates an event grows this until
+            // the process dies. Checked after the drain, so what is measured is
+            // an event with no boundary in it rather than a chunk that happened
+            // to straddle one; the residual is a single transport chunk of
+            // overshoot, which is the transport's own bound rather than ours.
+            if buf.len() > MAX_SSE_EVENT_BYTES {
+                read_error = Some(AppError::Network {
+                    message: format!(
+                        "`{}` sent a single event past the {MAX_SSE_EVENT_BYTES}-byte ceiling \
+                         this app will hold, or never ended one",
+                        route.backend_id
+                    ),
+                });
+                // Refused, so not forwarded: the tail below exists to hand a
+                // downstream parser the bytes the upstream really sent, and
+                // these are the bytes this app has just declined to accept.
+                buf.clear();
+                break;
             }
             if downstream_gone && !settling {
                 read_ended_early = true;

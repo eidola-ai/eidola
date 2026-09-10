@@ -115,6 +115,11 @@ pub enum ChatBehavior {
     /// 200 SSE stream that the server aborts mid-event (writes a partial event,
     /// then drops the TCP connection). Exercises the mid-SSE read failure arm.
     StreamingMidAbort,
+    /// A `200 text/event-stream` that never terminates an event: it writes far
+    /// more than the proxy's per-event ceiling with no blank line anywhere, so
+    /// nothing can ever be drained out of the frame accumulator. The shape a
+    /// buffer with no ceiling of its own dies on.
+    StreamingUnterminatedFlood,
     /// 200 SSE stream that ends **cleanly** after real content but never says
     /// it is over: well-formed events, a proper end to the chunked body, and
     /// no `[DONE]` and no terminal `finish_reason` anywhere.
@@ -1292,6 +1297,7 @@ async fn handle_chat(
             .await
         }
         ChatBehavior::StreamingMidAbort => write_sse_stream(stream, false, &[STREAM_CONTENT]).await,
+        ChatBehavior::StreamingUnterminatedFlood => write_sse_flood(stream).await,
         ChatBehavior::StreamingEndsWithoutDone => {
             write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
         }
@@ -2037,6 +2043,31 @@ async fn write_sse_stream_with_metadata(
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// A stream that opens as server-sent events and then never ends an event.
+///
+/// Every byte is `data:` content with no blank line after it, so
+/// `find_event_boundary` never succeeds and everything written stays in the
+/// reader's frame accumulator. Deliberately more than the proxy's per-event
+/// ceiling, which is the whole point: the ceiling is what has to end this.
+async fn write_sse_flood(stream: &mut TcpStream) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let filler = "x".repeat(64 * 1024);
+    stream.write_all(b"6\r\ndata: \r\n").await?;
+    for _ in 0..24 {
+        let framed = format!("{:x}\r\n{filler}\r\n", filler.len());
+        stream.write_all(framed.as_bytes()).await?;
+        stream.flush().await?;
+    }
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await
 }
 
 async fn write_sse_stream(
