@@ -127,17 +127,26 @@ const MODEL_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 
 /// The per-backend catalog deadline in force, in milliseconds —
 /// [`MODEL_LIST_TIMEOUT`] unless a test has shortened it. The seam moves the
-/// number, never the mechanism.
+/// number, never the mechanism, and it is compiled only for tests: see
+/// `http::set_header_read_timeout_for_test` for why a
+/// `#[doc(hidden)] pub fn` over a process-global atomic is not a test-only
+/// seam at all.
+#[cfg(feature = "test-support")]
 static MODEL_LIST_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn model_list_timeout() -> std::time::Duration {
-    match MODEL_LIST_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => MODEL_LIST_TIMEOUT,
-        ms => std::time::Duration::from_millis(ms),
+    #[cfg(feature = "test-support")]
+    {
+        let ms = MODEL_LIST_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
     }
+    MODEL_LIST_TIMEOUT
 }
 
 /// Test-only: shorten the per-backend catalog deadline. `0` restores it.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn set_model_list_timeout_for_test(millis: u64) {
     MODEL_LIST_TIMEOUT_MS.store(millis, std::sync::atomic::Ordering::Relaxed);

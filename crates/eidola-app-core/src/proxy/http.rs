@@ -73,16 +73,37 @@ const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// seconds would make the test a fifteen-second test. The seam moves the
 /// number, never the mechanism: the same builder, the same timer, the same
 /// arming site.
+///
+/// **And the seam is compiled only for tests — the override storage as much as
+/// the setter.** `#[doc(hidden)]` hides a function from the docs and from
+/// nothing else: a `pub fn` over a process-global atomic is a live API in every
+/// release build, so a dependent (or anything reachable from one) could move
+/// this proxy's admission deadline at runtime — set it enormous and a silent
+/// socket is never reaped, which is precisely the bound that keeps
+/// `MAX_CONNECTIONS` from being filled by peers who never held a key. The
+/// house rule for a test-only seam is the non-default `test-support` feature,
+/// where a release build provably contains no path rather than an undocumented
+/// one, and this is that rule applied to the three deadline seams the proxy
+/// added (`set_body_read_timeout_for_test` and the catalog deadline's
+/// `route::set_model_list_timeout_for_test` are the others). Under the feature
+/// the reader consults the override; without it, the constant is the only
+/// value that exists.
+#[cfg(feature = "test-support")]
 static HEADER_READ_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn header_read_timeout() -> std::time::Duration {
-    match HEADER_READ_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => HEADER_READ_TIMEOUT,
-        ms => std::time::Duration::from_millis(ms),
+    #[cfg(feature = "test-support")]
+    {
+        let ms = HEADER_READ_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
     }
+    HEADER_READ_TIMEOUT
 }
 
 /// Test-only: shorten the pre-request deadline. `0` restores the default.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn set_header_read_timeout_for_test(millis: u64) {
     HEADER_READ_TIMEOUT_MS.store(millis, std::sync::atomic::Ordering::Relaxed);
@@ -103,16 +124,24 @@ pub fn set_header_read_timeout_for_test(millis: u64) {
 /// or a LAN, and far short of "for ever".
 const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The override, under the same rule as [`HEADER_READ_TIMEOUT_MS`]: compiled
+/// only for tests, so a release build has the constant and nothing else.
+#[cfg(feature = "test-support")]
 static BODY_READ_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn body_read_timeout() -> std::time::Duration {
-    match BODY_READ_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => BODY_READ_TIMEOUT,
-        ms => std::time::Duration::from_millis(ms),
+    #[cfg(feature = "test-support")]
+    {
+        let ms = BODY_READ_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
     }
+    BODY_READ_TIMEOUT
 }
 
 /// Test-only: shorten the body deadline. `0` restores the default.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn set_body_read_timeout_for_test(millis: u64) {
     BODY_READ_TIMEOUT_MS.store(millis, std::sync::atomic::Ordering::Relaxed);

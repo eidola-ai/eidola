@@ -1985,3 +1985,67 @@ fn an_enormous_prompt_is_recorded_as_the_truncation_it_is() {
         );
     });
 }
+
+/// **A test-only seam is compiled only for tests — the storage as much as the
+/// setter.**
+///
+/// `#[doc(hidden)]` gates documentation and nothing else, so a `pub fn` over a
+/// process-global atomic is a live API in every release build: a dependent
+/// could move this proxy's admission or catalog deadline at runtime, and an
+/// admission deadline set enormous is exactly how a peer that never held a key
+/// fills every connection slot. The house rule is the non-default
+/// `test-support` feature, where a release build provably contains no path
+/// rather than an undocumented one — the rule the attestation seams already
+/// obey (`only_a_spawn_can_mint_a_capability` pins the same thing lexically,
+/// for the same reason).
+///
+/// The seams are **enumerated** rather than merely checked: a scan that only
+/// tested what it happened to find would pass on a file with none, and the
+/// point is that this is a closed set somebody has looked at.
+#[test]
+fn the_proxys_deadline_seams_are_compiled_only_for_tests() {
+    const GATE: &str = "#[cfg(feature = \"test-support\")]";
+    let mut found: Vec<String> = Vec::new();
+    for (file, source) in [
+        ("proxy/http.rs", include_str!("../src/proxy/http.rs")),
+        ("proxy/route.rs", include_str!("../src/proxy/route.rs")),
+    ] {
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(source, |(before, _)| before);
+        let lines: Vec<&str> = production.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            // A seam is either the setter or the override it writes to.
+            let name = if let Some(rest) = trimmed.strip_prefix("pub fn ") {
+                rest.split('(').next().unwrap_or_default()
+            } else if let Some(rest) = trimmed.strip_prefix("static ") {
+                rest.split(':').next().unwrap_or_default()
+            } else {
+                continue;
+            };
+            if !(name.ends_with("_for_test") || name.ends_with("_TIMEOUT_MS")) {
+                continue;
+            }
+            found.push(format!("{file}::{name}"));
+            let gated = lines[..i].iter().rev().take(4).any(|l| l.trim() == GATE);
+            assert!(
+                gated,
+                "{file}::{name} is a documented test-only seam over process-global state and \
+                 must carry `{GATE}`, or a release build carries it too"
+            );
+        }
+    }
+    assert_eq!(
+        found,
+        vec![
+            "proxy/http.rs::HEADER_READ_TIMEOUT_MS",
+            "proxy/http.rs::set_header_read_timeout_for_test",
+            "proxy/http.rs::BODY_READ_TIMEOUT_MS",
+            "proxy/http.rs::set_body_read_timeout_for_test",
+            "proxy/route.rs::MODEL_LIST_TIMEOUT_MS",
+            "proxy/route.rs::set_model_list_timeout_for_test",
+        ],
+        "the seam set is closed: a new one joins this list deliberately, gated"
+    );
+}
