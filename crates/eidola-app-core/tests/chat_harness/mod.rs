@@ -80,6 +80,15 @@ pub enum ChatBehavior {
     /// 200 JSON completion **without** an inline refund (forces the body-refund
     /// fallback to go through `/v1/credentials/refund`).
     OkBlockingNoInlineRefund,
+    /// A **complete** 200 JSON completion followed by enough trailing
+    /// whitespace to cross the blocking read's ceiling.
+    ///
+    /// The padded-complete-object shape, not a truncation: most oversized JSON
+    /// truncates into something that does not parse, so a mock that merely sent
+    /// a huge body would be indistinguishable from the cured behaviour. Here
+    /// the retained prefix parses perfectly, which is exactly why the ceiling
+    /// has to be asked about rather than inferred from the parse.
+    OkBlockingPaddedPastCeiling,
     /// A `200` whose body is not JSON at all — a truncated answer, or an
     /// intermediary's HTML error page. What a client must never read as a
     /// successful completion.
@@ -1232,6 +1241,20 @@ async fn handle_chat(
                 body["refund"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::OkBlockingPaddedPastCeiling => {
+            let body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            // Past `proxy::route::MAX_RESPONSE_BYTES` (8 MiB) — spelled here
+            // rather than imported, because the mock is the *peer* and must not
+            // learn this app's ceilings.
+            let padded = format!("{body}{}", " ".repeat(9 * 1024 * 1024));
+            write_json(stream, 200, &padded).await
         }
         ChatBehavior::Non2xx(status) => {
             write_json(stream, status, &error_body("upstream model error")).await

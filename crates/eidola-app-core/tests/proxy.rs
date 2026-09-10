@@ -2144,3 +2144,63 @@ fn a_revived_backend_is_not_exposed_by_the_permission_its_predecessor_held() {
         });
     });
 }
+
+/// **A body the ceiling stopped is refused whatever the fragment parses as.**
+///
+/// "A truncated body does not parse" is true of most oversized JSON and false
+/// of the case that matters: a complete object followed by enough whitespace to
+/// cross the ceiling parses perfectly, because trailing whitespace is valid. So
+/// the caller was handed a `200` carrying that object while the Record row
+/// beside it said the read had stopped at this app's ceiling — one exchange
+/// described two ways, and a partial answer taken for a whole one.
+///
+/// Which is exactly the `whole_text` rule (`peer_read`) reaching the one
+/// surface that *keeps* what it read: the exchange is still recorded, the hold
+/// still settles, and only the answer becomes the gateway failure it is.
+#[test]
+fn an_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlockingPaddedPastCeiling,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#),
+            ),
+        ));
+        assert_ne!(
+            status, 200,
+            "a read this app stopped is not an answer to hand on: {body}"
+        );
+        assert!(
+            body.contains("ceiling"),
+            "and the refusal says what stopped it: {body}"
+        );
+
+        // The exchange is still evidence, and the row says the same thing the
+        // caller was told.
+        let recorded = runtime
+            .block_on(core.list_requests(20, 0))
+            .expect("record")
+            .into_iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is recorded");
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "the row carries this app's own refusal: {:?}",
+            recorded.error
+        );
+    });
+}

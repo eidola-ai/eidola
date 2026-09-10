@@ -1233,16 +1233,33 @@ impl Inner {
         // response or an intermediary's HTML error page reads as "the model
         // said nothing". The exchange is still recorded and the hold still
         // settles below; only the *answer* becomes the gateway failure it is.
-        // A body the ceiling stopped lands here too, and by the same route: it
-        // is a fragment, so it does not parse, so it is not an answer.
-        let parsed: Option<Value> = serde_json::from_str(&text).ok();
+        //
+        // **And a body the ceiling stopped is refused whatever it parses as**,
+        // which is not the same claim. "A fragment does not parse" is true of
+        // most oversized JSON and false of the case that matters: a *complete*
+        // object followed by enough whitespace to cross the ceiling parses
+        // perfectly, because trailing whitespace is valid — so the caller was
+        // handed a success while the Record row beside it said the read had
+        // stopped at this app's ceiling, the two describing one exchange
+        // differently. `over_ceiling` is the app's own decision to stop reading
+        // and is therefore asked *before* the parse rather than inferred from
+        // it — the `whole_text` rule (`peer_read`), on the one surface that
+        // keeps what it read instead of refusing outright.
+        let parsed: Option<Value> = (!answer.over_ceiling)
+            .then(|| serde_json::from_str::<Value>(&text).ok())
+            .flatten();
         // **A refusal this app made belongs in the row it made it about.** The
         // upstream's status is the upstream's claim; a `2xx` this proxy would
         // not accept is recorded as an error too, or the Record shows the
         // exchange as the success the caller was explicitly not given. A
         // non-2xx needs no such column — its status already says what happened.
-        let refusal = (status.is_success() && parsed.is_none())
-            .then(|| malformed_json_answer(&route.backend_id, status.as_u16()));
+        let refusal = (status.is_success() && parsed.is_none()).then(|| {
+            if answer.over_ceiling {
+                oversized_answer(&route.backend_id)
+            } else {
+                malformed_json_answer(&route.backend_id, status.as_u16())
+            }
+        });
         self.settle_proxy_refund(
             &db_conn,
             &spend,
@@ -1272,9 +1289,11 @@ impl Inner {
         }
 
         // This is the arm `refusal` was built for — the status is a success and
-        // the body did not parse — so the caller is told what the row says.
+        // there is no answer — so the caller is told exactly what the row says,
+        // by carrying the same value rather than rebuilding it.
         let Some(mut parsed) = parsed else {
-            return Err(malformed_json_answer(&route.backend_id, status.as_u16()));
+            return Err(refusal
+                .unwrap_or_else(|| malformed_json_answer(&route.backend_id, status.as_u16())));
         };
         if let Some(object) = parsed.as_object_mut() {
             // **The credential artifact never reaches downstream.** Eidola's
@@ -1849,6 +1868,17 @@ where
 fn malformed_json_answer(backend_id: &str, status: u16) -> AppError {
     AppError::Network {
         message: format!("`{backend_id}` answered {status} with a body that is not JSON"),
+    }
+}
+
+/// A `2xx` whose body crossed [`MAX_RESPONSE_BYTES`] — refused on the app's own
+/// decision to stop reading, never on what the fragment happens to parse as.
+fn oversized_answer(backend_id: &str) -> AppError {
+    AppError::Network {
+        message: format!(
+            "`{backend_id}` sent an answer past the {MAX_RESPONSE_BYTES}-byte ceiling this app \
+             reads, so what arrived is a fragment rather than an answer"
+        ),
     }
 }
 
