@@ -23334,6 +23334,166 @@ fn space_an_overlaying_inspector_takes_the_keyboard_off_what_it_covers(cx: &mut 
     );
 }
 
+/// **The band never takes away what the reader is standing on.**
+///
+/// Two things point into the results list from outside the band's own
+/// reasoning, and a placeholder answers for neither: the roving **cursor**,
+/// which a wheel scroll moves the viewport away from without touching (leaving
+/// the focused list with no painted active descendant, and the next Arrow
+/// snapping the viewport back), and a card's **editor**, which a pointer
+/// selection focuses and whose handle is tracked on the card.
+#[gpui::test]
+fn space_find_keeps_the_cursor_and_the_focused_card_painted_past_the_band(cx: &mut TestAppContext) {
+    const BLOCKS: usize = 120;
+    let mut body = String::new();
+    for i in 0..BLOCKS {
+        body.push_str(&format!("a kestrel over field {i}\n\nthe grass below\n\n"));
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", &body)]);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    let painted = |vcx: &mut VisualTestContext| -> Vec<String> {
+        probe::clear_window(window.window_id().as_u64());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    };
+    let names = painted(&mut vcx);
+    assert!(
+        names.contains(&"space/find/result/2".to_string()),
+        "precondition: a card near the top of the list paints while it is there"
+    );
+
+    // **The cursor.** Opening the overlay put the keyboard on the list and the
+    // cursor on the first card. The reader now scrolls the list itself, far
+    // past the margin — nothing here moves the cursor.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.scroll_find_results_for_test(5_000.0));
+    });
+    vcx.run_until_parked();
+    let names = painted(&mut vcx);
+    assert!(
+        !names.contains(&"space/find/result/2".to_string()),
+        "precondition: the band really has left that part of the list behind"
+    );
+    assert!(
+        names.contains(&"space/find/result/0".to_string()),
+        "the cursor's card is still painted, so the list still has an active \
+         descendant to name"
+    );
+
+    // **The focused editor**, which is a different claim on a different card: a
+    // pointer selection focuses it, and that takes the keyboard off the list —
+    // so the cursor stops being painted at all (a row claims it only while the
+    // list itself is the focused element), and this card's own handle is what
+    // has to keep it materialised.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.scroll_find_results_for_test(0.0));
+    });
+    vcx.run_until_parked();
+    // Draw before asking: the far scroll evicted that card's state, and a card
+    // mints one again by rendering.
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let editor = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_result_editor_for_test(1, window, cx)))
+        .expect("the second card is back at the top of the list");
+    vcx.update(|window, cx| {
+        let handle = editor.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.scroll_find_results_for_test(5_000.0));
+    });
+    vcx.run_until_parked();
+
+    let names = painted(&mut vcx);
+    assert!(
+        names.contains(&"space/find/result/1".to_string()),
+        "the card holding the keyboard is still painted"
+    );
+    assert!(
+        !names.contains(&"space/find/result/0".to_string()),
+        "…and the cursor's is not, because with the list unfocused no row \
+         claims the cursor — two claims, not one"
+    );
+}
+
+/// **A prune that drops a focused element hands the keyboard back** — the rule's
+/// third instance, and the one prune the band cannot cover: a fragment the
+/// results no longer contain at all.
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_when_a_focused_card_leaves_the_results(
+    cx: &mut TestAppContext,
+) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut a2 = fixture_assistant_post("a2", "another kestrel entirely");
+    a2.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass"), a2],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // A selection in the answer's card puts the keyboard on that card's editor.
+    let editor = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_result_editor_for_test(1, window, cx)))
+        .expect("the answer's card");
+    vcx.update(|window, cx| {
+        let handle = editor.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: the card, not the list, is holding the keyboard"
+    );
+
+    // That answer begins being regenerated somewhere, which takes it out of the
+    // results entirely — the card is not moved, it is gone.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the keyboard goes to the one stop this surface paints on every frame"
+    );
+}
+
 /// **The editor states a results list holds are bounded by its band, not by the
 /// query.**
 ///

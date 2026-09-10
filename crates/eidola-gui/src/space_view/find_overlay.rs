@@ -56,9 +56,9 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    div, prelude::FluentBuilder as _, px,
+    AnyElement, AppContext, Bounds, Context, Entity, Focusable as _, InteractiveElement,
+    IntoElement, ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled,
+    WeakEntity, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{HighlightLayer, MarkdownEditor, MarkdownEditorState};
@@ -681,16 +681,36 @@ impl FindOverlay {
         self.heights.borrow().get(id).copied()
     }
 
-    /// Drop every per-fragment cell whose fragment this frame no longer has.
+    /// Drop every per-fragment cell whose fragment this frame no longer has,
+    /// and answer whether one of the editors that went was holding the
+    /// keyboard.
     ///
     /// The heights and the editor states are keyed by fragment id, and a
     /// fragment cut from a live editor carries a stamp of its own content — so
     /// a reader typing in a draft supersedes that draft's cards on every
     /// keystroke. Without this the maps would grow one entry per edit and hold
     /// an editor entity for each until the query moved.
-    pub(crate) fn retain_results(&mut self, live: &HashSet<SharedString>) {
+    ///
+    /// **No pool prune drops a focused element** (the rule stated in full
+    /// beside `prune_map_slots`): this is the prune that can, because it is
+    /// about a fragment the results no longer contain at all — a card whose
+    /// post began regenerating, or whose draft was retyped under it. The
+    /// *band* prune below cannot, because the kept set contains everything
+    /// rendered and a focused card is rendered whatever the band says. Asked
+    /// **here**, before the entities go, because afterwards there is nothing
+    /// left to ask.
+    pub(crate) fn retain_results(
+        &mut self,
+        live: &HashSet<SharedString>,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> bool {
+        let orphaned = self.bodies.iter().any(|(id, editor)| {
+            !live.contains(id) && editor.read(cx).focus_handle(cx).is_focused(window)
+        });
         self.heights.borrow_mut().retain(|id, _| live.contains(id));
         self.bodies.retain(|id, _| live.contains(id));
+        orphaned
     }
 
     /// Drop the editor state of every card outside the kept band
@@ -1470,6 +1490,17 @@ impl SpaceView {
         true
     }
 
+    /// Scroll the results list to `top` — the reader's own wheel, as a seam.
+    ///
+    /// A wheel or trackpad scroll's whole effect on this surface is the
+    /// handle's offset (gpui's scroll handling writes exactly this), so a test
+    /// that sets it is exercising the state the gesture produces rather than
+    /// standing in for one.
+    #[doc(hidden)]
+    pub fn scroll_find_results_for_test(&mut self, top: f32) {
+        self.scroll_find_results_to(top);
+    }
+
     /// How many map dots the last frame actually **built** — the counted bound
     /// behind [`MAP_MARGIN`]. A dot outside the band and a post the
     /// conversation does not have paint exactly alike, so nothing else can see
@@ -2074,10 +2105,27 @@ impl SpaceView {
             window.rem_size().as_f32(),
         );
         let scale = crate::theme::font_scale(cx);
-        if let Some(session) = self.find.as_mut() {
+        let orphaned = if let Some(session) = self.find.as_mut() {
             session.overlay.ensure_card_geometry(card_width, scale);
             let live: HashSet<SharedString> = fragments.iter().map(|f| f.id.clone()).collect();
-            session.overlay.retain_results(&live);
+            session.overlay.retain_results(&live, window, cx)
+        } else {
+            false
+        };
+        // **The editor that was holding the keyboard has gone, so the keyboard
+        // goes somewhere that is still painted** — `prune_map_slots`' own
+        // sentence, for this pool. The results list is the surface's single
+        // stop and is rendered on every frame the overlay is, which is why
+        // opening the overlay lands there too.
+        if orphaned {
+            let handle = self
+                .find
+                .as_ref()
+                .expect("checked")
+                .overlay
+                .list_focus
+                .clone();
+            window.focus(&handle, cx);
         }
         let cursor = self.find_result_cursor_row(total, window);
         let keyboard = window.last_input_was_keyboard();
@@ -2184,11 +2232,40 @@ impl SpaceView {
                 let measured = heights.borrow().get(&fragment.id).copied();
                 let height = measured
                     .unwrap_or_else(|| Self::find_fragment_estimate(fragment, card_width, scale));
-                let visible = y < band.end && (y + height) > band.start;
-                if y < keep.end && (y + height) > keep.start {
+                let on_cursor = cursor == Some(index);
+                // **The band never takes away what the reader is standing on.**
+                // Two things point *into* this list from outside the band's
+                // reasoning, and a placeholder answers for neither:
+                //
+                // * the **roving cursor**, which is the list's own active
+                //   descendant — a wheel or trackpad scroll moves the viewport
+                //   without touching it, so past the margin the focused list
+                //   had no painted descendant for assistive technology to read
+                //   and the next Arrow snapped the viewport back to a card that
+                //   was not there. Kept materialised rather than dragged along
+                //   with the band, deliberately: "the cursor is where the
+                //   reader left it" is the roving contract, and moving it would
+                //   let a pointer gesture silently retarget what Enter opens.
+                // * a card's **editor**, which a pointer selection focuses. Its
+                //   handle is tracked on the card, so a card that stops
+                //   painting leaves the window focused on an element no frame
+                //   draws — Copy, selection navigation and ordinary traversal
+                //   all stop reaching the overlay.
+                //
+                // Both are one card, so the bound the band exists for is
+                // untouched; and this is what keeps [`Self::retain_bodies`]
+                // unable to drop a focused editor, since the kept set contains
+                // everything rendered by construction.
+                let holds_focus = self
+                    .find
+                    .as_ref()
+                    .and_then(|s| s.overlay.bodies.get(&fragment.id))
+                    .is_some_and(|e| e.read(cx).focus_handle(cx).is_focused(window));
+                let visible =
+                    (y < band.end && (y + height) > band.start) || on_cursor || holds_focus;
+                if visible || (y < keep.end && (y + height) > keep.start) {
                     kept.insert(fragment.id.clone());
                 }
-                let on_cursor = cursor == Some(index);
                 if visible {
                     column = column.child(self.render_find_fragment(
                         fragment,
