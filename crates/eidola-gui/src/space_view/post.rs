@@ -507,7 +507,20 @@ impl SpaceView {
                     aria: SharedString| {
             let b = verb_button(id, probe, label, aria, cx);
             match self.affordance_slots.get(slot).filter(|_| holds_level) {
-                Some(handle) => b.track_focus(handle),
+                // **A tracked handle honours the covering guard itself.** gpui
+                // reads a tracked handle's own `tab_stop` rather than the
+                // element's, so [`crate::focus::Covered`] — which acts where a
+                // *role* becomes a stop — cannot reach one: a reader who had
+                // entered a post's verbs and then opened the Find-all overlay
+                // left that verb in the tab order, behind a surface covering
+                // it. It is the one tracked stop inside the covered pane (every
+                // other tracked handle down here is a container), and asking
+                // the same guard is what keeps the two answers from drifting.
+                Some(handle) => b.track_focus(
+                    &handle
+                        .clone()
+                        .tab_stop(!crate::focus::tab_stops_suppressed()),
+                ),
                 None => b,
             }
         };

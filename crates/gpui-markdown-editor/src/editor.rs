@@ -333,6 +333,12 @@ pub struct MarkdownEditorState {
     /// and select-all handlers are still registered, so the text can be selected
     /// and copied. Synced from the element's `.disabled(..)` prop each frame.
     pub(crate) disabled: bool,
+    /// The span this surface paints, when it is showing a **fragment** of its
+    /// document ([`MarkdownEditor::fragment`]) rather than the whole of it.
+    /// Every selection is clamped into it, which is what makes the painted
+    /// range the document as far as the reader — and the clipboard — is
+    /// concerned. Synced from the element's prop each frame, like `disabled`.
+    pub(crate) fragment: Option<Range<usize>>,
     /// Host callback invoked when the user clicks a rendered embed block
     /// (see [`crate::embed`]) — the wave-2 click-to-navigate seam. Synced
     /// from the element's `.on_embed_click(..)` prop each frame; the editor
@@ -490,6 +496,7 @@ impl MarkdownEditorState {
             state,
             focus_handle,
             disabled: false,
+            fragment: None,
             on_embed_click: None,
             highlights: crate::highlight::HighlightLayers::default(),
             on_highlight_click: None,
@@ -1181,6 +1188,52 @@ impl MarkdownEditorState {
         self.disabled = disabled;
     }
 
+    /// Note this frame's [`MarkdownEditor::fragment`] prop — **and bring the
+    /// selection inside it**.
+    ///
+    /// The fragment filters the *layout*; the selection model still addressed
+    /// the whole document, so `SelectAll` selected `0..markdown.len()` and
+    /// `Copy` put every unpainted block on the clipboard, while a drag or a
+    /// shift-navigation past the fragment's edge reached text the reader cannot
+    /// see. What a surface paints is what it may select: the clamp is applied
+    /// here (a surface that *becomes* a fragment brings a wider selection in
+    /// with it) and after every event ([`Self::clamp_to_fragment`]), which is
+    /// the one place every selection is decided.
+    ///
+    /// Clamping to the range's own ends is byte-safe: a fragment's bounds are
+    /// block source-range edges, which are character boundaries by
+    /// construction.
+    pub(crate) fn sync_fragment(&mut self, fragment: Option<Range<usize>>, cx: &mut Context<Self>) {
+        self.fragment = fragment;
+        let before = self.state.selection;
+        self.clamp_to_fragment();
+        if self.state.selection != before {
+            cx.emit(MarkdownEditorEvent::SelectionChanged);
+            cx.notify();
+        }
+    }
+
+    /// Pull the selection inside the painted fragment, if there is one. Keeps
+    /// the selection's *direction* (which end is the head), so a shift-extension
+    /// that ran into the edge simply stops there.
+    fn clamp_to_fragment(&mut self) {
+        let Some(range) = self.fragment.clone() else {
+            return;
+        };
+        let clamp = |offset: usize| offset.clamp(range.start, range.end);
+        self.state.selection = match self.state.selection {
+            Selection::Cursor(p) => Selection::Cursor(clamp(p)),
+            Selection::Range { anchor, head } => {
+                let (anchor, head) = (clamp(anchor), clamp(head));
+                if anchor == head {
+                    Selection::Cursor(head)
+                } else {
+                    Selection::Range { anchor, head }
+                }
+            }
+        };
+    }
+
     /// Note this frame's focus, ending an open composition when focus has just
     /// left — the other half of [`Self::sync_disabled`], and the same rule: a
     /// composition cannot outlive the editor's ability to receive IME.
@@ -1260,6 +1313,12 @@ impl MarkdownEditorState {
         } else {
             update::update_guarded(before.clone(), event, &mut self.table_guard)
         };
+        // **A fragment surface may select only what it paints.** Applied here
+        // rather than at each verb, because this is the one place a selection
+        // is decided: Select All, a drag, a shift-extension and every document
+        // navigation all arrive as one of these events, and the update pipeline
+        // itself stays a pure function of the whole document.
+        self.clamp_to_fragment();
         self.end_composition(cx);
         // Compare the buffer across the update so selection-only events
         // (Move*/Extend*/SetSelection) don't push an undo step or count
@@ -2439,6 +2498,7 @@ pub struct MarkdownEditor {
     style: Option<MarkdownStyle>,
     disabled: bool,
     min_height: Option<Pixels>,
+    fragment: Option<Range<usize>>,
     on_embed_click: Option<EmbedClickHandler>,
     on_highlight_click: Option<HighlightClickHandler>,
     on_context_menu: Option<ContextMenuHandler>,
@@ -2452,6 +2512,7 @@ impl MarkdownEditor {
             style: None,
             disabled: false,
             min_height: None,
+            fragment: None,
             on_embed_click: None,
             on_highlight_click: None,
             on_context_menu: None,
@@ -2485,6 +2546,42 @@ impl MarkdownEditor {
     /// container from the text without feeding its own floor back in.
     pub fn min_height(mut self, height: Pixels) -> Self {
         self.min_height = Some(height);
+        self
+    }
+
+    /// Lay out **only the blocks intersecting `range`**, leaving the document
+    /// itself whole.
+    ///
+    /// A host that wants to show one part of a document — a search result
+    /// beside the passage it came from, say — needs the block still wearing its
+    /// own chrome: this inner paragraph, but still as a child of its blockquote
+    /// inside its list item. That chrome is not something to synthesize.
+    /// [`RenderBlock::containers`] already carries the whole ancestor chain and
+    /// the element layer derives every indent and decoration from it, so
+    /// **filtering the block list is the whole of it**: each survivor knows
+    /// what it sits inside, and the offsets stay the document's own, so
+    /// highlights ([`MarkdownEditorState::set_highlights_in`]) and per-offset
+    /// geometry ([`MarkdownEditorState::content_y_for_offset`]) go on answering
+    /// for what is painted.
+    ///
+    /// Deliberately **not** the standalone-render path an embed takes: an
+    /// embedded piece carries no source range and no display-to-source map, so
+    /// it has no hit test and takes no highlight quads at all — which is the
+    /// one thing a fragment shown *because* it matched must not lose.
+    ///
+    /// Neighbour-dependent spacing follows the filtered list, so a fragment's
+    /// first and last blocks read as document edges. The intersection is
+    /// strict, so a zero-width block (an injected empty paragraph) joins only
+    /// when it falls strictly inside the range.
+    ///
+    /// **The painted range is the whole document as far as this surface is
+    /// concerned**, so it bounds the *selection* too — see
+    /// [`MarkdownEditorState::sync_fragment`]. Filtering the layout alone left
+    /// Select All selecting `0..markdown.len()` and Copy putting every
+    /// unpainted block on the clipboard, with a drag or a shift-navigation past
+    /// the fragment's edge reaching text the reader cannot see.
+    pub fn fragment(mut self, range: Range<usize>) -> Self {
+        self.fragment = Some(range);
         self
     }
 
@@ -2538,6 +2635,7 @@ impl RenderOnce for MarkdownEditor {
         let context_menu_cb = self.on_context_menu.clone();
         self.state.update(cx, |st, cx| {
             st.sync_disabled(self.disabled, cx);
+            st.sync_fragment(self.fragment.clone(), cx);
             st.on_embed_click = embed_cb;
             st.on_highlight_click = highlight_cb;
             st.on_context_menu = context_menu_cb;
@@ -2697,7 +2795,19 @@ impl RenderOnce for MarkdownEditor {
                 );
         }
 
-        let spec_blocks = spec.blocks;
+        // **The fragment filter** (see [`MarkdownEditor::fragment`]): the
+        // document is whole, and only the blocks the caller asked for are laid
+        // out. Applied here, before the neighbour chains are snapshotted, so a
+        // fragment's edges read as document edges rather than borrowing the
+        // spacing of blocks that are not painted.
+        let spec_blocks = match &self.fragment {
+            Some(range) => spec
+                .blocks
+                .into_iter()
+                .filter(|b| b.source_range.start < range.end && b.source_range.end > range.start)
+                .collect(),
+            None => spec.blocks,
+        };
         let block_count = spec_blocks.len();
         let block_starts: Vec<usize> = spec_blocks.iter().map(|b| b.source_range.start).collect();
         // Snapshot each block's container chain *before* moving the blocks

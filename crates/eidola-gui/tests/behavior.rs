@@ -21906,6 +21906,34 @@ fn space_find_says_it_is_counting_rather_than_showing_a_number_on_its_way(cx: &m
         assert_eq!(v.find_space_total_for_test(), None);
     });
 
+    // **And the disclosure stays mounted while it counts.** Painting it only on
+    // a settled total took the focused control out from under a keyboard reader
+    // for the length of the scan — a background write restarting a large count
+    // is enough — leaving the window on a dead slot with no way to open the
+    // overlay until the pass landed. The overlay it opens has its own honest
+    // counting state, so the control is as true here as after.
+    {
+        let _probes = probes_on();
+        eidola_gui::probe::clear_window(window.window_id().as_u64());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        let entries = eidola_gui::probe::window_entries(window.window_id().as_u64());
+        let (_, disclosure) = entries
+            .iter()
+            .find(|(n, _)| n == "space/find/total/disclosure")
+            .expect("the disclosure is painted while the count is still walking");
+        assert_eq!(disclosure.role, gpui::Role::Button);
+        let (_, total) = entries
+            .iter()
+            .find(|(n, _)| n == "space/find/total")
+            .expect("the readout beside it");
+        assert_eq!(
+            total.value.as_deref(),
+            Some("Counting…"),
+            "precondition: this really is the counting state"
+        );
+    }
+
     settle_find_count(&mut vcx);
     view.read_with(&vcx, |v, _| {
         assert!(!v.find_counting_for_test(), "the pass lands");
@@ -22477,4 +22505,2378 @@ fn space_find_arms_a_worker_for_work_deferred_after_the_count_had_settled(cx: &m
             "thirty-six in the posts and one in each retained draft"
         );
     });
+}
+
+#[gpui::test]
+fn space_find_shows_every_result_in_depth_then_lane_order(cx: &mut TestAppContext) {
+    // The overlay's whole reason for existing: the same matches the bar
+    // counted, presented in a **different orientation** from the transcript's.
+    // Depth from the root first, then left to right as the map lays them out —
+    // deliberately not the pre-order the conversation itself reads in, because
+    // agreeing with the transcript is the failure mode rather than the goal.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the disclosure's verb expanded the surface"
+    );
+
+    let (map, results) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_map_for_test(window, cx),
+                v.find_results_for_test(window, cx),
+            )
+        })
+    });
+
+    // The map is the whole space, one node per post, with the spine keeping
+    // lane 0 and each later branch opening one of its own.
+    assert_eq!(
+        map,
+        vec![
+            ("a1".into(), 0, 0),
+            ("a2".into(), 1, 0),
+            ("a3".into(), 1, 1),
+            ("a4".into(), 2, 0),
+            ("a6".into(), 2, 1),
+            ("a5".into(), 2, 2),
+        ],
+        "every post, laid out depth down and lanes across — and the fork's two \
+         children are adjacent lanes, which is the reservation rule: with lanes \
+         taken on the way down, a3 would sit right of a5 because a2's subtree \
+         opened one first"
+    );
+
+    // The results are the nodes of that map that hold matches, in that order —
+    // `a2` is absent because it holds none. The transcript's own pre-order
+    // would have read a1, a2, a4, a5, a3, a6.
+    let order: Vec<&str> = results.iter().map(|(node, _)| node.as_str()).collect();
+    assert_eq!(
+        order,
+        vec!["a1", "a3", "a4", "a6", "a5"],
+        "depth first, then left to right — a5 opened the rightmost lane, so \
+         it reads last even though the transcript puts it before a3"
+    );
+    assert_eq!(
+        results.len(),
+        5,
+        "five groups, and none for the post that matched nothing"
+    );
+    // And what the overlay draws is what the bar counted, node for node: a
+    // fragment per matching block, cut from the same projection cache.
+    let total = view.read_with(&vcx, |v, _| v.find_space_total_for_test());
+    assert_eq!(total, Some(8), "precondition: the bar counted eight");
+    assert!(
+        results.iter().all(|(_, frags)| !frags.is_empty()),
+        "a group with no fragment would be a post the overlay claims and \
+         cannot show"
+    );
+}
+
+#[gpui::test]
+fn space_find_opening_a_result_takes_the_reader_to_its_branch(cx: &mut TestAppContext) {
+    // **The one place find spends branch selection**, and only because the
+    // reader asked for this result by name. Everything after the branch switch
+    // is the machinery the bar already owns: the anchor is set by identity and
+    // the reveal is the ordinary two-phase one, armed as a debt `sync_find`
+    // discharges once the new branch's match list exists.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The branch the reader is *not* on. `a6` hangs off the other fork, so its
+    // matches are in the total and not in the index.
+    let branch_before = view.read_with(&vcx, |v, _| {
+        v.find_matches_for_test()
+            .0
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        !branch_before.iter().any(|n| n == "a6"),
+        "precondition: a6 is on a branch the reader is not looking at \
+         ({branch_before:?})"
+    );
+    let index = vcx
+        .update(|window, cx| {
+            view.read_with(cx, |v, cx| {
+                v.find_results_for_test(window, cx)
+                    .iter()
+                    .position(|(node, _)| node == "a6")
+            })
+        })
+        .expect("a6 holds matches, so it is a group");
+    // The flat fragment index the pointer would press: every group before it
+    // contributes its own fragments first.
+    let flat = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            v.find_results_for_test(window, cx)
+                .iter()
+                .take(index)
+                .map(|(_, frags)| frags.len())
+                .sum::<usize>()
+        })
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.open_find_result_for_test(flat, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the overlay collapses — the reader asked to be taken somewhere"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…and the bar it hangs off stays, because the search has not ended"
+    );
+    let (matches, current) = view.read_with(&vcx, |v, _| v.find_matches_for_test());
+    let branch_after: Vec<String> = matches.iter().map(|(n, _)| n.to_string()).collect();
+    assert!(
+        branch_after.iter().any(|n| n == "a6"),
+        "the branch really moved: a6's matches are on the visible branch now \
+         ({branch_after:?})"
+    );
+    let current = current.expect("a match is current");
+    assert_eq!(
+        matches[current - 1].0,
+        "a6",
+        "and the current match is the one that was clicked, not the first of \
+         the new branch"
+    );
+}
+
+#[gpui::test]
+fn space_find_keeps_the_overlays_place_until_the_query_moves(cx: &mut TestAppContext) {
+    // Position retention, the task's own rule: reopening the overlay without
+    // changing the query puts the reader back where they were. A position in
+    // one search's results means nothing in another's, so a new query is where
+    // it ends.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Short enough that five groups of results really do overflow it — a list
+    // with nothing to scroll would let this test pass vacuously.
+    vcx.simulate_resize(gpui::size(px(900.), px(400.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // Scroll the results list, then collapse and reopen. Read the offset back
+    // rather than asserting the value asked for: a scroll handle clamps to the
+    // content it actually has, and what retention is about is that the number
+    // survives, not what it is.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| {
+            v.find_overlay_scroll_to_for_test(120.0);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let scrolled = view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test());
+    assert!(
+        scrolled > 0.0,
+        "precondition: the reader scrolled ({scrolled})"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        scrolled,
+        "reopening on the same query puts the reader back where they were"
+    );
+
+    // A new query, and it is gone — along with the measured heights and the
+    // editor states of fragments that no longer exist. Collapse first, which
+    // hands the keyboard back to the field the query is typed into.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.close_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("backspace");
+    vcx.run_until_parked();
+    settle_find_count(&mut vcx);
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        0.0,
+        "a new query starts at the top of a list about something else"
+    );
+}
+
+#[gpui::test]
+fn space_an_open_find_overlay_keeps_printables_out_of_the_conversation(cx: &mut TestAppContext) {
+    // The overlay covers the conversation, so a printable behind it would start
+    // a draft on a page nobody can see — the exact defect
+    // `space_an_open_picker_keeps_printables_out_of_the_conversation` pins,
+    // reached through a surface that happens to fill the window. Unlike the bar
+    // above it, membership is unconditional rather than focus-gated: the bar is
+    // a row of chrome a reader goes on reading past.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    // Leave nothing composing, so a stray printable would be visible as a jump.
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Focus the conversation itself, so nothing about the *bar* is what yields.
+    let root = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| window.focus(&root, cx));
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "precondition: nothing is composing"
+    );
+
+    vcx.simulate_keystrokes("z");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "a printable behind the overlay starts no draft"
+    );
+
+    // …and the conversation takes them back the moment the overlay collapses.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.close_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.focus(&root, cx));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("z");
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "with the overlay gone the same press reaches the composer"
+    );
+}
+
+/// Fourteen branches off one root, every one of them matching: wide and
+/// shallow, so the map runs off the right of its own column (`map_lane_x`
+/// squeezes to the lane floor and then states the real x) while the fixture
+/// stays cheap — depth is the expensive axis for this view, breadth the free
+/// one.
+fn wide_map_posts() -> Vec<PostNode> {
+    let mut posts = vec![fixture_user_post("a1", "a kestrel at the root")];
+    for i in 0..14 {
+        let mut p = fixture_assistant_post(&format!("b{i}"), "another kestrel");
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+    posts
+}
+
+/// **The map is virtualised over the band it is read through, and Tab still
+/// walks the whole of it.**
+///
+/// One dot per post over a canvas that states the whole conversation's height
+/// meant an element per post on every frame the overlay drew — the results list
+/// beside it has always been band-virtualised, and the map simply had not been.
+/// The half that needs proving is the second: the dots stay per-node tab stops,
+/// so a Tab into one below the fold lands on a painted element, the reveal
+/// scrolls it in, and the next frame's band has advanced past it — the walk
+/// carries the band along in front of the reader.
+#[gpui::test]
+fn space_find_virtualises_its_map_and_still_lets_tab_walk_it(cx: &mut TestAppContext) {
+    // Wide rather than deep: the page renders one nested scroller per depth
+    // level, so a chain long enough to exceed the map's band buries the stack
+    // before it reaches the map at all — and a fan of siblings is the shape a
+    // large real conversation takes anyway.
+    const BRANCHES: usize = 200;
+    let mut posts = vec![fixture_user_post("a1", "a kestrel at the root")];
+    for i in 0..BRANCHES {
+        let mut p = fixture_assistant_post(&format!("b{i}"), "another kestrel");
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let total =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx)));
+    assert_eq!(
+        total,
+        BRANCHES + 1,
+        "precondition: the map is about the whole space"
+    );
+    let painted = view.read_with(&vcx, |v, _| v.find_map_painted_for_test());
+    assert!(
+        painted > 0 && painted < total / 2,
+        "the map builds the band it is being read through, not the conversation \
+         ({painted} dots built of {total})"
+    );
+
+    // Stand on the last dot the band holds and walk with Tab. Each step reveals
+    // the dot it lands on, which advances the band — so the walk cannot run out
+    // of painted elements while the map has more.
+    let start = painted - 1;
+    assert!(
+        vcx.update(|window, cx| view.update(cx, |v, cx| v
+            .focus_find_map_node_for_test(start, window, cx))),
+        "precondition: the band's last dot is a tab stop"
+    );
+    vcx.run_until_parked();
+    for _ in 0..12 {
+        vcx.update(|window, cx| window.focus_next(cx));
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    let landed = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_focused_map_node_for_test(window, cx)))
+        .expect("the keyboard is still on a map dot");
+    assert!(
+        landed > start,
+        "Tab carried the band along in front of it (from {start} to {landed}, \
+         with {painted} built when the walk began)"
+    );
+    assert!(
+        landed >= painted,
+        "…and past where the first frame's band ended"
+    );
+}
+
+#[gpui::test]
+fn space_find_reveals_a_map_dot_the_keyboard_lands_on(cx: &mut TestAppContext) {
+    // Past thirteen lanes a dot sits beyond the column's own width, and every
+    // dot with matches is a real tab stop — so Tab could put the keyboard on
+    // one with no visible ring, and Enter would then scroll the results to a
+    // group chosen out of sight. The column scrolls to it, minimally, the way
+    // the results cursor reveals its card.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_map_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()),
+        (0.0, 0.0),
+        "precondition: the map opens at its origin"
+    );
+
+    // The last node in depth-then-lane order is the right-most lane — the one
+    // the column clips.
+    let last =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx))) - 1;
+    assert!(
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.focus_find_map_node_for_test(last, window, cx))
+        }),
+        "precondition: the right-most dot is a tab stop"
+    );
+    vcx.run_until_parked();
+    let (x, y) = view.read_with(&vcx, |v, _| v.find_map_scroll_for_test());
+    assert!(
+        x < 0.0,
+        "the column scrolled to bring the clipped dot into view (x = {x})"
+    );
+    assert_eq!(y, 0.0, "and moved on no axis it did not have to");
+
+    // A dot already in view leaves the reader's place alone…
+    assert!(vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.focus_find_map_node_for_test(last - 1, window, cx)
+        })
+    }));
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()).0,
+        x,
+        "a dot beside it is already showing, so nothing moves"
+    );
+
+    // …and walking back to the root brings the near edge with it.
+    assert!(vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.focus_find_map_node_for_test(0, window, cx))
+    }));
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()),
+        (0.0, 0.0),
+        "the root's dot is at the origin, so the column returns to it"
+    );
+}
+
+/// Twenty-one matching posts — one root and twenty replies, so the fixture is
+/// wide and shallow (depth is the expensive axis for this view) while the
+/// results list, which is flat, runs well past the viewport band.
+fn many_matching_posts() -> Vec<PostNode> {
+    let body = format!("a kestrel {}", "hovering over the long grass ".repeat(4));
+    let mut posts = vec![fixture_user_post("a1", &body)];
+    for i in 0..20 {
+        let mut p = fixture_assistant_post(&format!("b{i}"), &body);
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+    posts
+}
+
+#[gpui::test]
+fn space_find_a_card_measures_against_the_layout_it_is_drawn_in(cx: &mut TestAppContext) {
+    // A measurement is a function of the text *and* the geometry it was taken
+    // in. The fragment id already carried the text, so a pane narrowed below
+    // the results column's cap — or a type-scale change — re-wrapped every card
+    // while the cache went on serving heights from the old layout. **The cards
+    // that matter are the ones outside the virtualization band**: they are
+    // never re-rendered, so a stale placeholder went on sizing every group top
+    // below it, and with it the map's scroll targets and the list's extent,
+    // until the reader happened to bring that card back.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, many_matching_posts());
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // Walk the roving cursor to the end so the last card paints and measures,
+    // then back to the top so it leaves the band again.
+    let last = 20usize;
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let measured = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(last, window, cx)))
+        .expect("the cursor brought the last card into view, so it measured");
+
+    vcx.simulate_keystrokes("home");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(last, window, cx))
+        ),
+        Some(measured),
+        "precondition: back at the top it keeps the height it was measured at"
+    );
+
+    // Narrow the pane past the column's own cap. The card is off-band, so
+    // nothing re-measures it — which is exactly why the old height must go.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(last, window, cx))
+        ),
+        None,
+        "a height measured in a layout that has gone is no answer at all — the \
+         list estimates at the geometry it is drawing in"
+    );
+}
+
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_when_a_focused_dot_stops_matching(cx: &mut TestAppContext) {
+    // A map dot is a stop only while its post is a result, and a background
+    // regeneration is enough to end that: the post stays in the map as an inert
+    // label while its slot — the tracked handle the keyboard is *on* — is
+    // pruned, leaving the window focused on a handle no frame paints.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // Stand on the answer's own dot — index 1 in depth-then-lane order.
+    assert!(
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.focus_find_map_node_for_test(1, window, cx))
+        }),
+        "precondition: the answer's dot is a tab stop"
+    );
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: the keyboard is on the dot, not the list"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the dot's slot went, so the keyboard went to the surface's own stop"
+    );
+}
+
+#[gpui::test]
+fn space_find_refuses_a_card_the_query_has_moved_out_from_under(cx: &mut TestAppContext) {
+    // gpui draws from the platform's frame callback, so a query `Change` and a
+    // press on a card still showing the previous query's results really do
+    // arrive between two paints. The closure holds the old fragment, and
+    // opening it spent the one thing find never spends — the reader's branch —
+    // to go somewhere the new search never chose, installing an ordinal from a
+    // list that no longer exists as the new query's anchor.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "a heron on the far bank");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The card as a rendered frame's click closure holds it.
+    let stale = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.capture_find_result_for_test(0, window, cx)))
+        .expect("the query matches, so there is a card");
+
+    // The reader retypes; the results the card belonged to are gone.
+    run_find(&view, window, &mut vcx, "heron");
+    settle_find_count(&mut vcx);
+
+    let anchor = view.read_with(&vcx, |v, _| v.find_anchor_key_for_test());
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.press_captured_find_result_for_test(stale, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the press is refused outright — the overlay does not collapse"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_anchor_key_for_test()),
+        anchor,
+        "and the new query's own place is untouched — no ordinal from a list \
+         that no longer exists is installed as its anchor"
+    );
+}
+
+#[gpui::test]
+fn space_find_refuses_a_card_the_results_have_moved_out_from_under(cx: &mut TestAppContext) {
+    // The generation guard's second axis. A regeneration takes its post out of
+    // the result set with the query untouched — the exclusion rides `CountKey`,
+    // not the query — so a card captured before it passed the generation check
+    // and spent branch selection on a post the overlay no longer offers,
+    // installing an ordinal `sync_find` then resolved the standing query from.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The answer's own card, as a rendered frame's click closure holds it.
+    let stale = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.capture_find_result_for_test(1, window, cx)))
+        .expect("both posts match, so the answer has a card");
+
+    // A background regeneration takes that post out of the results — the query
+    // has not moved, so the generation still agrees.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let anchor = view.read_with(&vcx, |v, _| v.find_anchor_key_for_test());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.press_captured_find_result_for_test(stale, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the press is refused — the overlay does not collapse for a result it \
+         no longer offers"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_anchor_key_for_test()),
+        anchor,
+        "and the reader's place under the standing query is untouched"
+    );
+}
+
+#[gpui::test]
+fn space_an_overlaying_inspector_takes_the_keyboard_off_what_it_covers(cx: &mut TestAppContext) {
+    // The inspector is a *sibling* of the conversation pane only in its split
+    // form. Below `MIN_CONTENT_WIDTH` it paints a full-window scrim after that
+    // pane and the panel over it, so an open Find-all is behind it — and ⌥⌘I
+    // stays registered, so the reader can put it there. The keyboard was left
+    // on the results list underneath: arrows and Enter went on driving a list
+    // nobody could see while the pointer was intercepted by the scrim.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Wide enough that the inspector would split rather than cover.
+    vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: opening the overlay put the keyboard on its results list"
+    );
+
+    // A split inspector covers nothing, so it takes nothing.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "a split panel stands beside the page and leaves the keyboard alone"
+    );
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Narrow enough that it must overlay, and the reader presses ⌥⌘I.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the covered list no longer holds the keyboard"
+    );
+    assert!(
+        vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "…the panel the reader asked for does"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "and the search is left standing — it is not this verb's to spend"
+    );
+
+    // And the verb that would put a *second* reader into the same state is
+    // withheld while the panel covers the pane — registration-is-enablement,
+    // so macOS greys Edit ▸ Find in Conversation rather than mounting the bar
+    // behind a scrim.
+    assert!(
+        !vcx.update(|window, cx| window.is_action_available(&eidola_gui::actions::FindInSpace, cx)),
+        "⌘F is withheld while the panel covers the surface it would open"
+    );
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| window.is_action_available(&eidola_gui::actions::FindInSpace, cx)),
+        "…and comes back the moment the panel stops covering it"
+    );
+    // Which it can only do because the borrow was returned: dispatch walks from
+    // the focused element, so a panel that closed onto its own dead handle
+    // would take every per-view action with it.
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the panel hands the keyboard back to the surface it borrowed from"
+    );
+}
+
+/// **A reveal performed against estimates is corrected when the measurements
+/// land.**
+///
+/// Every position in the results list is a sum of the cards above it, and a
+/// card that has never painted contributes an estimate — so a jump places the
+/// reader by arithmetic over text nobody has shaped. The target's band then
+/// renders for the first time and those estimates are replaced; where the
+/// guesses were generous, everything below moves up far enough to carry the
+/// cursor's own card clean out of the viewport while the cursor still names it
+/// and Enter still opens it.
+#[gpui::test]
+fn space_find_corrects_a_cursor_reveal_when_the_measurements_land(cx: &mut TestAppContext) {
+    // Cards whose source is much longer than what they render: a read-only
+    // editor hides a link's URL, so the estimate counts hundreds of characters
+    // where the reader sees one word. That is a real over-estimate rather than
+    // a contrived one — it is the shape the projection exists to handle.
+    //
+    // **Aimed at the middle of the list, deliberately.** A jump to the *end* is
+    // rescued by gpui's own clamping: as the content shrinks so does
+    // `max_offset`, which drags the viewport along with the end it is parked
+    // at. Nothing rescues a jump into the middle, which is where a reader
+    // pressing a map dot lands.
+    const POSTS: usize = 5;
+    const BLOCKS: usize = 12;
+    let url = "a".repeat(300);
+    let mut posts = Vec::new();
+    for p in 0..POSTS {
+        let mut body = String::new();
+        for i in 0..BLOCKS {
+            body.push_str(&format!(
+                "a kestrel {p}-{i} [x](https://example.com/{url})\n\nthe grass below\n\n"
+            ));
+        }
+        let mut post = fixture_user_post(&format!("a{p}"), &body);
+        if p > 0 {
+            post.parent_action_id = Some(format!("a{}", p - 1));
+        }
+        posts.push(post);
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, posts);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // A press on the middle post's dot: the group jump, placed by arithmetic
+    // over two whole posts' worth of cards nobody has laid out.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.press_find_map_node_for_test(2, window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Let the frames the jump caused settle: the band renders, its canvases
+    // measure, the tops move, and the correction re-runs until they stop.
+    // Convergence is one band's worth of cards per frame, so the budget is
+    // generous rather than tight; nothing here polls a condition.
+    for _ in 0..20 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+
+    assert_eq!(
+        vcx.update(|window, cx| view
+            .update(cx, |v, cx| v.find_cursor_in_view_for_test(window, cx))),
+        Some(true),
+        "the card the cursor names is where the reader can see it"
+    );
+}
+
+/// **The panel's handback asks about the subtree, not the container's handle.**
+///
+/// It owns that handle only until the reader's first Tab or click: a title
+/// field, a stepper, the router button and every roster control are
+/// descendants, so an exact-handle check missed all of them and the close left
+/// the keyboard anywhere but the search still standing behind the panel.
+#[gpui::test]
+fn space_a_covering_panel_hands_back_from_a_control_inside_it(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "precondition: the covering panel took the keyboard"
+    );
+
+    // The reader steps into the panel — its title field is one Tab away, and
+    // the container's own handle stops being the focused element the moment
+    // they do.
+    let title = view
+        .read_with(&vcx, |v, _| v.inspector_title_state_for_test())
+        .expect("the panel's title field");
+    vcx.update(|window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "precondition: a descendant holds it now, not the panel itself"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the borrow comes back to the search the panel was standing over"
+    );
+}
+
+/// **A wide map has a pointer path to its clipped lanes.**
+///
+/// Past thirteen lanes the column really scrolls horizontally, and gpui does
+/// not redirect a vertical-only wheel to the other axis once both are
+/// scrollable — so without a thumb an ordinary mouse had no path at all to what
+/// is clipped there. A **source scan**, because a scroll indicator is
+/// deliberately not a probe target (it is an indicator, not an affordance) and
+/// so has no painted bounds a test could press.
+#[gpui::test]
+fn the_find_maps_column_carries_both_scroll_indicators(_cx: &mut TestAppContext) {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/space_view/find_overlay.rs"
+    ))
+    .expect("the overlay's source");
+    for axis in ["vertical_floating", "horizontal_floating"] {
+        assert!(
+            src.contains(&format!(
+                "crate::scrollbar::{axis}(\n                \"space-find-map-scroll"
+            )),
+            "the map column renders its {axis} indicator"
+        );
+    }
+}
+
+/// **A loan is a fact about what happened, not about what was permitted.**
+///
+/// Covering is what *allows* the panel's handoff, not what performs it: with a
+/// find session standing but the keyboard somewhere in the pane, the panel
+/// covers and takes nothing — and reading the layout as proof of a loan sent a
+/// reader who had stepped into a panel control of their own accord off to the
+/// results list, abandoning the conversation they were in.
+#[gpui::test]
+fn space_a_covering_panel_returns_only_what_it_borrowed(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // The reader leaves the search standing and puts the keyboard back in the
+    // conversation — so there is a session to cover, and nothing to take.
+    let home = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| window.focus(&home, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "precondition: the panel took nothing, the keyboard not being find's"
+    );
+
+    // They then step into a panel control themselves, and close the panel.
+    let title = view
+        .read_with(&vcx, |v, _| v.inspector_title_state_for_test())
+        .expect("the panel's title field");
+    vcx.update(|window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "a panel that borrowed nothing returns nothing — the reader is left in \
+         the conversation they were in"
+    );
+    assert!(
+        vcx.update(|window, cx| home.is_focused(window)
+            || view.read_with(cx, |v, _| v.find_open_for_test())),
+        "…and the window still has a live place for the keyboard"
+    );
+}
+
+/// **The roving cursor is on a fragment, not at a number.**
+///
+/// The list is re-cut on every frame and a background write reorders it, so an
+/// index alone silently retargets: with the cursor on B and a C after it, a
+/// regeneration that takes an earlier A out leaves the same number pointing at
+/// C — the focus indication, the active descendant and what Enter opens all
+/// change while the reader never moved.
+#[gpui::test]
+fn space_find_keeps_the_cursor_on_the_result_it_was_on(cx: &mut TestAppContext) {
+    // Three posts, three groups: A above, then B, then C.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut b = fixture_assistant_post("a2", "a kestrel in the middle");
+    b.parent_action_id = Some("a1".into());
+    let mut c = fixture_user_post("a3", "a kestrel at the end");
+    c.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel at the start"), b, c],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Down once: the cursor stands on B, with C still after it.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let on = view
+        .read_with(&vcx, |v, _| v.find_cursor_id_for_test())
+        .expect("the cursor names a fragment");
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_cursor_index_for_test()),
+        1,
+        "precondition: it is the second result"
+    );
+
+    // A regenerates somewhere, which takes its result out of the list
+    // altogether — every later index shifts up by one.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_cursor_id_for_test()),
+        Some(on),
+        "the cursor is still on the result it was on"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_cursor_index_for_test()),
+        0,
+        "…which is now the first, so the index really did have to move"
+    );
+}
+
+/// **An empty query is an absence, not a search that found nothing.**
+///
+/// The bar states that already — with no query it shows no index readout, no
+/// step verbs and no total, and therefore no disclosure. So ⌘Return with an
+/// empty field used to cover the conversation with "Nothing matches anywhere",
+/// a claim about a search nobody made; and clearing the query under a standing
+/// overlay took away the very chevron that collapses it.
+#[gpui::test]
+fn space_find_all_refuses_a_query_that_is_not_there(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "precondition: the bar is up with nothing typed into it"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the surface behind a disclosure the bar does not show cannot be opened"
+    );
+
+    // Now with a real query, and then without one again.
+    vcx.simulate_keystrokes("k e s t r e l");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "precondition: a query that exists opens it"
+    );
+
+    // Opening the overlay put the keyboard on its results list, so the reader
+    // goes back to the field the way ⌘F takes them — and clears it.
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    for _ in 0..7 {
+        vcx.simulate_keystrokes("backspace");
+    }
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "a query cleared under the overlay takes the overlay with it"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…and leaves the bar the reader is typing in"
+    );
+}
+
+/// **The traversal induction needs a base case, and Tab is how it is proved.**
+///
+/// The neighbour rule carries the walk *from a painted match*, so with no
+/// matching node in band at all — a result only in the sixtieth root lane —
+/// it produced nothing, the paint loop omitted every matching dot, and Tab
+/// could not start the walk: a retained handle does not enter a paint-derived
+/// tab order by itself.
+#[gpui::test]
+fn space_find_reaches_the_only_match_on_a_map_that_starts_past_the_band(cx: &mut TestAppContext) {
+    // Nothing matches anywhere near the origin — not even the root — so no
+    // neighbour of a banded match exists to seed the walk from.
+    const BRANCHES: usize = 60;
+    let mut posts = vec![fixture_user_post("a1", "the grass below")];
+    for i in 0..BRANCHES {
+        let text = if i == BRANCHES - 1 {
+            "a kestrel over the far lane"
+        } else {
+            "the grass below"
+        };
+        let mut p = fixture_assistant_post(&format!("b{i}"), text);
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let total =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx)));
+    let only = total - 1;
+
+    // Walk out of the results list with Tab, the way a reader reaches the map.
+    let mut landed = None;
+    for _ in 0..12 {
+        vcx.update(|window, cx| window.focus_next(cx));
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        landed = vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.find_focused_map_node_for_test(window, cx))
+        });
+        if landed.is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        landed,
+        Some(only),
+        "the map's one matching dot is reachable even though nothing near the \
+         origin matches"
+    );
+}
+
+/// **A sparse match is still reachable by Tab.**
+///
+/// The band alone does not keep the walk whole: it advances only when the dot
+/// Tab *lands on* was outside it, so two matching dots separated by more than
+/// the margin with nothing matching between left the reader on the last painted
+/// match — already in view, so nothing scrolled — with the distant one unpainted
+/// and out of a tab order derived from what painted.
+#[gpui::test]
+fn space_find_reaches_a_distant_match_on_the_map_by_tab(cx: &mut TestAppContext) {
+    // One fan, matches only at its two ends: every lane between them is a
+    // `Label` and no stop at all, so nothing in the middle can carry the walk.
+    const BRANCHES: usize = 60;
+    let mut posts = vec![fixture_user_post("a1", "a kestrel at the root")];
+    for i in 0..BRANCHES {
+        let text = if i == 0 || i == BRANCHES - 1 {
+            "another kestrel"
+        } else {
+            "the grass below"
+        };
+        let mut p = fixture_assistant_post(&format!("b{i}"), text);
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let total =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx)));
+    assert_eq!(
+        total,
+        BRANCHES + 1,
+        "precondition: the map is the whole space"
+    );
+    let distant = total - 1;
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_map_painted_for_test()) < total,
+        "precondition: the far lane is past the band"
+    );
+
+    // Stand on the near match — the root's own dot's neighbour, and the last
+    // one the band holds — and press Tab once.
+    assert!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.focus_find_map_node_for_test(1, window, cx))
+        ),
+        "precondition: the near match is a tab stop"
+    );
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.focus_next(cx));
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.find_focused_map_node_for_test(window, cx))
+        ),
+        Some(distant),
+        "Tab reaches the far match rather than walking out of the map"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()).0 < 0.0,
+        "…and the reveal brought it into view, as it does for any dot below the fold"
+    );
+}
+
+/// **The band never takes away what the reader is standing on.**
+///
+/// Two things point into the results list from outside the band's own
+/// reasoning, and a placeholder answers for neither: the roving **cursor**,
+/// which a wheel scroll moves the viewport away from without touching (leaving
+/// the focused list with no painted active descendant, and the next Arrow
+/// snapping the viewport back), and a card's **editor**, which a pointer
+/// selection focuses and whose handle is tracked on the card.
+#[gpui::test]
+fn space_find_keeps_the_cursor_and_the_focused_card_painted_past_the_band(cx: &mut TestAppContext) {
+    const BLOCKS: usize = 120;
+    let mut body = String::new();
+    for i in 0..BLOCKS {
+        body.push_str(&format!("a kestrel over field {i}\n\nthe grass below\n\n"));
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", &body)]);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    let painted = |vcx: &mut VisualTestContext| -> Vec<String> {
+        probe::clear_window(window.window_id().as_u64());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    };
+    let names = painted(&mut vcx);
+    assert!(
+        names.contains(&"space/find/result/2".to_string()),
+        "precondition: a card near the top of the list paints while it is there"
+    );
+
+    // **The cursor.** Opening the overlay put the keyboard on the list and the
+    // cursor on the first card. The reader now scrolls the list itself, far
+    // past the margin — nothing here moves the cursor.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.scroll_find_results_for_test(5_000.0));
+    });
+    vcx.run_until_parked();
+    let names = painted(&mut vcx);
+    assert!(
+        !names.contains(&"space/find/result/2".to_string()),
+        "precondition: the band really has left that part of the list behind"
+    );
+    assert!(
+        names.contains(&"space/find/result/0".to_string()),
+        "the cursor's card is still painted, so the list still has an active \
+         descendant to name"
+    );
+
+    // **The focused editor**, which is a different claim on a different card: a
+    // pointer selection focuses it, and that takes the keyboard off the list —
+    // so the cursor stops being painted at all (a row claims it only while the
+    // list itself is the focused element), and this card's own handle is what
+    // has to keep it materialised.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.scroll_find_results_for_test(0.0));
+    });
+    vcx.run_until_parked();
+    // Draw before asking: the far scroll evicted that card's state, and a card
+    // mints one again by rendering.
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let editor = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_result_editor_for_test(1, window, cx)))
+        .expect("the second card is back at the top of the list");
+    vcx.update(|window, cx| {
+        let handle = editor.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.scroll_find_results_for_test(5_000.0));
+    });
+    vcx.run_until_parked();
+
+    let names = painted(&mut vcx);
+    assert!(
+        names.contains(&"space/find/result/1".to_string()),
+        "the card holding the keyboard is still painted"
+    );
+    assert!(
+        !names.contains(&"space/find/result/0".to_string()),
+        "…and the cursor's is not, because with the list unfocused no row \
+         claims the cursor — two claims, not one"
+    );
+}
+
+/// **A prune that drops a focused element hands the keyboard back** — the rule's
+/// third instance, and the one prune the band cannot cover: a fragment the
+/// results no longer contain at all.
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_when_a_focused_card_leaves_the_results(
+    cx: &mut TestAppContext,
+) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut a2 = fixture_assistant_post("a2", "another kestrel entirely");
+    a2.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass"), a2],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // A selection in the answer's card puts the keyboard on that card's editor.
+    let editor = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_result_editor_for_test(1, window, cx)))
+        .expect("the answer's card");
+    vcx.update(|window, cx| {
+        let handle = editor.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: the card, not the list, is holding the keyboard"
+    );
+
+    // That answer begins being regenerated somewhere, which takes it out of the
+    // results entirely — the card is not moved, it is gone.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the keyboard goes to the one stop this surface paints on every frame"
+    );
+}
+
+/// **The editor states a results list holds are bounded by its band, not by the
+/// query.**
+///
+/// A card's state carries its node's *whole* markdown — the fragment filter
+/// narrows the paint, not the document — so one per visited card is one whole
+/// post per matching block, and a long post with many isolated matches retained
+/// hundreds of megabytes for as long as the query stood. Counted rather than
+/// looked at, because an evicted card and one the reader never reached paint
+/// exactly alike: measured here at 28 states held after walking 120 cards.
+#[gpui::test]
+fn space_find_bounds_the_editors_it_keeps_while_the_query_stands(cx: &mut TestAppContext) {
+    // Matching paragraphs separated by non-matching ones, so each is a fragment
+    // of its own: contiguous blocks consolidate into one card.
+    const BLOCKS: usize = 120;
+    let mut body = String::new();
+    for i in 0..BLOCKS {
+        body.push_str(&format!("a kestrel over field {i}\n\nthe grass below\n\n"));
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", &body)]);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Walk the roving cursor the whole way down, one card at a time — every
+    // card renders as the cursor reaches it, which is precisely the reader who
+    // used to end up holding all of them.
+    for _ in 0..BLOCKS {
+        vcx.simulate_keystrokes("down");
+    }
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let retained = view.read_with(&vcx, |v, _| v.find_retained_editors_for_test());
+    assert!(
+        retained > 0,
+        "precondition: the cards the reader is looking at keep their states"
+    );
+    assert!(
+        retained < BLOCKS / 2,
+        "a scrolled-past card gives its document back ({retained} states held of \
+         {BLOCKS} cards walked)"
+    );
+    assert!(
+        vcx.update(|window, cx| view
+            .update(cx, |v, cx| v.find_result_editor_for_test(0, window, cx))
+            .is_none()),
+        "the first card, far above the band, holds no document"
+    );
+    assert!(
+        vcx.update(|window, cx| view
+            .update(cx, |v, cx| v.find_result_editor_for_test(
+                BLOCKS - 1,
+                window,
+                cx
+            ))
+            .is_some()),
+        "…and the one under the cursor does"
+    );
+}
+
+/// **The cover is decided by the window's width, so a resize owes the keyboard
+/// too.**
+///
+/// Opening the panel wide splits, which covers nothing and correctly takes
+/// nothing; dragging that window narrower flips the layout decision during
+/// render, with no door called — so the scrim went up over a Find-all whose
+/// results list still had the keys.
+#[gpui::test]
+fn space_a_resize_into_the_covering_layout_takes_the_keyboard_too(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: a split panel leaves the keyboard where it was"
+    );
+
+    // The reader drags the window narrower. Nothing calls ⌥⌘I.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the newly covered list gives the keyboard up"
+    );
+    assert!(
+        vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "…to the panel now standing over it"
+    );
+}
+
+/// **A rung answers only for a surface the reader can see.**
+///
+/// The find rungs were ordered innermost-first on the premise that nothing
+/// covers them — which the panel's overlay form breaks wholesale. An Escape
+/// from the panel used to reach past it and collapse the hidden Find-all,
+/// spending search state behind a scrim that did not itself change.
+#[gpui::test]
+fn space_escape_answers_for_the_panel_that_covers_the_search(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.inspector_open_for_test()),
+        "the press answers for the panel — the one thing the reader can see"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "…and the search behind it is untouched"
+    );
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "…with the keyboard handed back to it"
+    );
+
+    // The next press finds the pane uncovered and answers for what is now in
+    // front — the chain's ordinary innermost-first rule, resumed.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the overlay collapses once it is the surface in front"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…one rung at a time, so the bar it hangs off is still up"
+    );
+}
+
+/// **The other half of what a covering surface owes: the tab order.**
+///
+/// The find bar and the Find-all overlay lift [`focus::Covered`] for their own
+/// subtrees — they are what the *overlay* is not covering — which was written
+/// as an unconditional lift and so left their verbs, the map's dots and the
+/// results list reachable by Tab underneath the inspector's scrim. Measured as
+/// the property rather than as a number: with the panel covering the pane, a
+/// standing find surface contributes **nothing** to the window's tab order, so
+/// the walk is the same length with it up as without.
+#[gpui::test]
+fn space_a_covering_inspector_takes_the_find_surface_out_of_the_tab_order(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Narrow enough that the panel must overlay rather than split.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+
+    /// Tab until the walk repeats itself; the count is what the window offers.
+    fn stops(vcx: &mut VisualTestContext) -> usize {
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..200 {
+            vcx.update(|window, cx| window.focus_next(cx));
+            vcx.update(|window, _| window.refresh());
+            vcx.run_until_parked();
+            let Some(id) = vcx.update(|window, cx| window.focused(cx).map(|h| format!("{h:?}")))
+            else {
+                break;
+            };
+            if seen.contains(&id) {
+                break;
+            }
+            seen.push(id);
+        }
+        seen.len()
+    }
+
+    // The panel alone.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    let panel_only = stops(&mut vcx);
+    assert!(
+        panel_only > 0,
+        "precondition: the panel really does contribute stops of its own"
+    );
+
+    // Now a whole find surface behind it. ⌘F is withheld while it covers, so
+    // the reader's order is the reachable one: search, then open the panel.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    let uncovered = stops(&mut vcx);
+    assert!(
+        uncovered > panel_only,
+        "precondition: the find surface really does hold stops \
+         ({uncovered} with it in the clear, {panel_only} for the panel alone)"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "precondition: the covered find surface is still painted"
+    );
+    assert_eq!(
+        stops(&mut vcx),
+        panel_only,
+        "a covered find surface contributes nothing to the tab order"
+    );
+}
+
+#[gpui::test]
+fn space_opening_the_find_overlay_dismisses_what_it_would_cover(cx: &mut TestAppContext) {
+    // The mirror of withholding the quote verbs. Every popover the conversation
+    // can hold paints inside the pane, so the overlay stands in front of it:
+    // unreachable by mouse or Tab, still owning the keyboard, and — worse —
+    // ahead of the overlay in the root's Escape chain, so the first press would
+    // close something the reader never saw.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    view.update(&mut vcx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    run_find(&view, window, &mut vcx, "quick");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        Some(None),
+        "precondition: a picker stands over the conversation"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        None,
+        "the surface about to cover it dismissed it"
+    );
+
+    // …so the first Escape is the overlay's own rung, not a picker's.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "one press backs out the surface the reader is looking at"
+    );
+}
+
+#[gpui::test]
+fn space_an_open_find_overlay_withholds_the_quote_verbs(cx: &mut TestAppContext) {
+    // Menu dispatch is not traversal, so the overlay's tab-order suppression
+    // never reached the Edit menu: with a quotable selection standing, "Quote in
+    // Another Conversation…" mounted the destination picker *behind* the
+    // overlay (it paints earlier) and focused it, so the reader was typing into
+    // an invisible surface and the first Escape closed a picker they never saw.
+    // Its two siblings land a populated draft in the covered composer, which is
+    // the same shape. Registration is the enablement, so withholding it is what
+    // greys the items.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    view.update(&mut vcx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.has_post_selection_for_test()),
+        "precondition: a quotable passage is selected"
+    );
+
+    run_find(&view, window, &mut vcx, "quick");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "precondition: the overlay stands over the conversation"
+    );
+
+    // Registration *is* enablement, so the first assertion is the one macOS
+    // reads to grey a menu item: none of the three is available along the
+    // dispatch path while the overlay stands.
+    let root = view.read_with(&vcx, |v, _| v.focus_handle());
+    let verbs = || {
+        [
+            Box::new(eidola_gui::actions::QuoteElsewhere) as Box<dyn gpui::Action>,
+            Box::new(eidola_gui::actions::Quote),
+            Box::new(eidola_gui::actions::QuoteInReply),
+        ]
+    };
+    for action in verbs() {
+        assert!(
+            !vcx.update(|window, cx| window.is_action_available(action.as_ref(), cx)),
+            "the menu greys {:?} while the overlay covers what it would open",
+            action.name()
+        );
+    }
+
+    // And the other door: the context menu's rows call these handlers
+    // **directly**, bypassing registration, so each is asked the same question
+    // where it acts.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx);
+            v.quote(&eidola_gui::actions::Quote, window, cx);
+            v.quote_in_reply(&eidola_gui::actions::QuoteInReply, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        None,
+        "no destination picker is mounted behind the overlay"
+    );
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "and neither of the in-place quotes opens a covered composer"
+    );
+
+    // One Escape's worth of collapsing hands the verbs back — the reason this
+    // is a withholding rather than the overlay closing itself.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.close_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    for action in verbs() {
+        assert!(
+            vcx.update(|window, cx| window.is_action_available(action.as_ref(), cx)),
+            "…and the collapsed overlay gives {:?} back",
+            action.name()
+        );
+    }
+    vcx.update(|window, cx| root.dispatch_action(&eidola_gui::actions::QuoteElsewhere, window, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        Some(None),
+        "with the overlay gone the same dispatch opens the picker on its list"
+    );
+}
+
+#[gpui::test]
+fn space_find_escape_collapses_the_overlay_before_the_bar(cx: &mut TestAppContext) {
+    // Innermost first: one Escape backs out one rung, so a reader reading the
+    // results does not lose the whole search to a press meant for the surface
+    // in front of them.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the first Escape collapses the overlay"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…and leaves the bar, with the query the reader typed"
+    );
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "the second ends the search"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_map_press_takes_the_cursor_to_the_group_it_reveals(cx: &mut TestAppContext) {
+    // The map scrolls the list; the cursor is where the keyboard and assistive
+    // technology think the reader is. Moving one without the other left the
+    // list's active descendant on a fragment now outside the viewport band — a
+    // sized placeholder with nothing to announce — and the reader's next arrow
+    // scrolled the viewport back toward it, undoing the press.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Short enough that the groups really do overflow the list.
+    vcx.simulate_resize(gpui::size(px(900.), px(400.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_result_cursor_for_test()),
+        Some(0),
+        "precondition: the cursor starts on the first result"
+    );
+
+    // The last map node that holds matches — far enough down that its group is
+    // below the fold.
+    let map = vcx.update(|window, cx| view.read_with(cx, |v, cx| v.find_map_for_test(window, cx)));
+    let groups =
+        vcx.update(|window, cx| view.read_with(cx, |v, cx| v.find_results_for_test(window, cx)));
+    let last_group = groups.last().expect("results").0.clone();
+    let index = map
+        .iter()
+        .position(|(node, _, _)| *node == last_group)
+        .expect("the group's node is on the map");
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.press_find_map_node_for_test(index, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let scrolled = view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test());
+    assert!(
+        scrolled > 0.0,
+        "the press took the list to that group ({scrolled})"
+    );
+    let cursor = view
+        .read_with(&vcx, |v, _| v.find_result_cursor_for_test())
+        .expect("a session is open");
+    let expected: usize = groups
+        .iter()
+        .take_while(|(node, _)| *node != last_group)
+        .map(|(_, fragments)| fragments.len())
+        .sum();
+    assert_eq!(
+        cursor, expected,
+        "…and the cursor with it, onto that group's first fragment"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_card_keeps_a_selection_instead_of_opening(cx: &mut TestAppContext) {
+    // A card's editor is read-only *and selectable* — that is the read-only
+    // editor's own contract, and the I-beam over it says so. A drag inside one
+    // ends with the pointer released over the card, which the ancestor's click
+    // read as "open this result": the overlay collapsed and took the passage
+    // away before it could be copied.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let editor = vcx
+        .update(|window, cx| {
+            view.read_with(cx, |v, cx| v.find_result_editor_for_test(0, window, cx))
+        })
+        .expect("the first card has painted, so it has an editor");
+    // A selection, as a drag would leave one.
+    vcx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.perform(gpui_markdown_editor::EditorCommand::SelectAll, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(|_, cx| editor.read(cx).selection().is_collapsed()),
+        "precondition: the card really holds a selection"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.press_find_result_for_test(0, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the press that ended a selection keeps the overlay — and the passage — \
+         where the reader can copy it"
+    );
+
+    // The positive control: a card nobody has selected in still navigates, so
+    // this is a claim about the selection rather than about the press.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.press_find_result_for_test(1, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "…and a press on a card with nothing selected opens the result"
+    );
+}
+
+#[gpui::test]
+fn space_find_shows_no_result_for_an_answer_being_regenerated(cx: &mut TestAppContext) {
+    // The overlay reads the projection cache, and a cache entry is keyed on the
+    // seed it was built from — not on the count's own key. So a post that
+    // matched and *then* began regenerating kept its memo: the whole-space
+    // total dropped it (the revising set is in `CountKey` precisely because
+    // that exclusion moves with no rebuild behind it), the conversation showed
+    // the pending revision in its place, and the overlay went on offering the
+    // superseded answer as a result to click.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let before =
+        vcx.update(|window, cx| view.read_with(cx, |v, cx| v.find_results_for_test(window, cx)));
+    assert_eq!(
+        before.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["a1", "a2"],
+        "both posts carry the word to begin with"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let after = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            assert!(
+                v.space().read(cx).revising_seq("a2").is_some(),
+                "the regeneration is pending on the post it replaces"
+            );
+            v.find_results_for_test(window, cx)
+        })
+    });
+    assert_eq!(
+        after.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["a1"],
+        "the answer being replaced is off screen, so the overlay does not offer it"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_card_measures_against_the_text_it_is_showing(cx: &mut TestAppContext) {
+    // A measured height stands in for a card that has scrolled out of the
+    // viewport band, so it has to belong to the text it was measured against. A
+    // post mints a new action id whenever its text changes, but a **draft**
+    // does not: its node id, and the block start under it, both stand still
+    // while the reader types — and a key built from those alone handed the new
+    // card the old card's height, moving every group top below it (and with
+    // them the map's scroll targets and the list's own extent) until the reader
+    // happened to bring the card back into the band.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    let draft = view
+        .read_with(&vcx, |v, _| v.tail_draft_state_for_test())
+        .expect("a docked tail draft");
+    draft.update(&mut vcx, |e, cx| {
+        e.set_value("a kestrel of my own".to_string(), cx)
+    });
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let first = vcx
+        .update(|window, cx| view.read_with(cx, |v, cx| v.find_result_cards_for_test(window, cx)));
+    type Card = (String, std::ops::Range<usize>, Vec<std::ops::Range<usize>>);
+    let draft_card = |cards: &[Card]| {
+        cards
+            .iter()
+            .find(|(id, _, _)| id.starts_with("draft"))
+            .map(|(id, range, _)| (id.clone(), range.clone()))
+            .expect("the draft is a result of its own")
+    };
+    let (before_id, before_range) = draft_card(&first);
+
+    // Type ahead of the match. The block starts where it always did and the
+    // draft is the same node, so the id has nothing but the text to move on.
+    draft.update(&mut vcx, |e, cx| {
+        e.set_value(
+            "a longer preamble and then a kestrel of my own".to_string(),
+            cx,
+        )
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let (after_id, after_range) =
+        draft_card(&vcx.update(|window, cx| {
+            view.read_with(cx, |v, cx| v.find_result_cards_for_test(window, cx))
+        }));
+    assert_eq!(
+        (before_range.start, after_range.start),
+        (0, 0),
+        "precondition: the block the card paints starts where it did, and the \
+         key is built from that start — so neither it nor the node id can tell \
+         the two apart"
+    );
+    assert_ne!(
+        before_range.end, after_range.end,
+        "precondition: the text really did move"
+    );
+    assert_ne!(
+        before_id, after_id,
+        "the card's measurement key moved with the text it is showing"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_card_carries_only_the_matches_it_can_paint(cx: &mut TestAppContext) {
+    // A node with several separated matching blocks becomes several cards, and
+    // giving each of them the node's whole hit list materialized that vector
+    // once per card before any of them was virtualized — then every visible
+    // card rebuilt its highlight set from the oversized copy. The painted
+    // result is the same set either way (a card lays out no line the other
+    // hits could land on), so what the partition costs is nothing and what it
+    // buys is a bound.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let long = "a kestrel hovers\n\nnothing here\n\nand a kestrel again\n\nnothing here either\n\none last kestrel";
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", long)]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let cards = vcx
+        .update(|window, cx| view.read_with(cx, |v, cx| v.find_result_cards_for_test(window, cx)));
+    assert_eq!(cards.len(), 3, "three separated blocks, three cards");
+    let mut seen = 0usize;
+    for (id, range, hits) in &cards {
+        assert_eq!(hits.len(), 1, "{id} paints the one match inside it");
+        for hit in hits {
+            assert!(
+                range.start <= hit.start && hit.end <= range.end,
+                "{id} owns only hits inside the span it paints ({hit:?} in {range:?})"
+            );
+        }
+        seen += hits.len();
+    }
+    assert_eq!(
+        seen, 3,
+        "and between them the cards still account for every match"
+    );
+}
+
+#[gpui::test]
+fn space_find_results_cursor_brings_its_card_into_view(cx: &mut TestAppContext) {
+    // A virtualized list is **one** tab stop with a roving cursor, and what
+    // makes that equivalent to a stop per card is the scroll: a fragment
+    // outside the viewport band is a sized placeholder with nothing to read and
+    // nothing a screen reader could report, so a cursor that landed on one
+    // would be a stop describing nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Short, so the later results really are below the fold.
+    vcx.simulate_resize(gpui::size(px(900.), px(400.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The list holds the keyboard from the moment the overlay opens — a
+    // surface that takes the window takes the keyboard.
+    let list = view
+        .read_with(&vcx, |v, _| v.find_results_focus_for_test())
+        .expect("the overlay is open");
+    assert!(
+        vcx.update(|window, _| list.is_focused(window)),
+        "opening focused the results list"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_result_cursor_for_test()),
+        Some(0),
+        "and the cursor starts at the first result"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        0.0,
+        "precondition: the list starts at the top"
+    );
+
+    // Walk to the end. The last card is well below the fold, so the list has
+    // to follow the cursor there.
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    let cursor = view
+        .read_with(&vcx, |v, _| v.find_result_cursor_for_test())
+        .expect("a session is open");
+    assert!(
+        cursor > 0,
+        "End took the cursor to the last result ({cursor})"
+    );
+    let scrolled = view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test());
+    assert!(
+        scrolled > 0.0,
+        "the list scrolled to bring that card into view ({scrolled})"
+    );
+
+    // …and back, minimally: Home returns to the top rather than leaving the
+    // reader looking at a cursor they cannot see.
+    vcx.simulate_keystrokes("home");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_result_cursor_for_test()),
+        Some(0)
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        0.0,
+        "the first card is at the top of the list, so that is where it goes"
+    );
 }

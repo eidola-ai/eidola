@@ -8723,16 +8723,175 @@ fn space_find_bar_probes_its_field_verbs_and_readout(cx: &mut TestAppContext) {
         "3 total",
         "3 total",
     );
-    // Its disclosure is painted and inert: what it will open is a later wave,
-    // and a `Role::Button` with no listener is a control VoiceOver offers,
-    // activates and silently does nothing with. Registry-only, so the driver
-    // can see it and the a11y tree does not gain a second voice for a number
-    // the sentence above already speaks.
+    // Its disclosure is a real control now, because it opens the Find-all
+    // overlay — the role tracks whether a handler attaches, and its name says
+    // what the click does rather than naming the chevron.
+    assert_probe(
+        &entries,
+        "space/find/total/disclosure",
+        gpui::Role::Button,
+        "Show every result",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The Find-all overlay's accessible surface: a named landmark, a `Group` of
+/// map nodes whose role tracks whether pressing one does anything, and the
+/// results as **one** list with its rows as managed descendants.
+#[gpui::test]
+fn the_find_overlay_probes_its_map_and_its_results(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    // Two posts, one of which holds nothing — so the map has a node of each
+    // kind and the role difference is a fact about this fixture rather than a
+    // fact about an empty one.
+    let mut a2 = probe_post("a2", "nothing to see in this one");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers"), a2], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    // Open it through the disclosure the reader would press.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/overlay",
+        gpui::Role::Region,
+        "Every result",
+    );
+    assert_probe(
+        &entries,
+        "space/find/map",
+        gpui::Role::Group,
+        "Conversation map",
+    );
+    assert_probe(&entries, "space/find/results", gpui::Role::List, "Results");
+    // The map's first node holds the match and is pressable; the second holds
+    // nothing, so it is a `Label` — the role tracks whether a handler
+    // attaches, exactly as the bar's step arrows do.
+    assert_probe(
+        &entries,
+        "space/find/map/0",
+        gpui::Role::Button,
+        "You — has matches",
+    );
+    assert_probe(&entries, "space/find/map/1", gpui::Role::Label, "You");
+    // **The circle is the mark; the cell is the control.** The handler used to
+    // ride the 9px visual, which is the whole pointer target for the surface's
+    // only navigation verb — hard with a mouse, harder with an unsteady hand.
+    // The interactive element is sized to the room the map's own strides leave,
+    // with the circle drawn inside it, so what a reader aims at is bigger than
+    // what they see without the dot moving a pixel.
+    let dot = entries
+        .iter()
+        .find(|(name, _)| name == "space/find/map/0")
+        .map(|(_, e)| e.bounds)
+        .expect("the map's first dot painted");
     assert!(
-        entries
-            .iter()
-            .any(|(n, _)| n == "space/find/total/disclosure"),
-        "the disclosure affordance is painted"
+        dot.size.height.as_f32() > 9.0 && dot.size.width.as_f32() > 9.0,
+        "the hit cell is larger than the circle it holds: {:?}",
+        dot.size
+    );
+    // One result, and it is a managed descendant of the list rather than a tab
+    // stop of its own — a card per stop would describe an order that does not
+    // contain the results nobody scrolled to. **Its name carries the
+    // attribution**, because the group header above it is a sibling `Label`: a
+    // reader meeting the card as the list's active descendant would otherwise
+    // hear the snippet with nobody's name on it, and could not tell two
+    // similar results by two participants apart.
+    assert_probe(
+        &entries,
+        "space/find/result/0",
+        gpui::Role::ListItem,
+        "You: a kestrel hovers",
+    );
+
+    // **And the join between the two is the translation's to choose.** Its
+    // parts are data, but the punctuation and the order are not — the Chinese
+    // locales set a full-width colon — so a hard-coded `": "` is the
+    // concatenation the localization doctrine bans however few English words it
+    // contains, and it is invisible in English, which is why this is pinned in
+    // a locale where the two spellings differ.
+    cx.update(|cx| eidola_gui::i18n::apply("zh-Hans", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/result/0",
+        gpui::Role::ListItem,
+        "You：a kestrel hovers",
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+
+    // **And the list is a real tab stop.** `Role::List` is deliberately not in
+    // the focusable set the probe derives, so the element carrying it takes
+    // focus only because the handle says so: without that the list could be
+    // focused once — opening the overlay does exactly that — and never again,
+    // so a reader who tabbed onto a map node had no way back to the results
+    // cursor but to close the surface and reopen it.
+    let list = view
+        .read_with(cx, |v, _| v.find_results_focus_for_test())
+        .expect("the overlay is open");
+    let wanted = format!("{list:?}");
+    let mut reached = false;
+    let mut prev = cx
+        .update_window(window, |_, window, cx| {
+            window.focused(cx).map(|h| format!("{h:?}"))
+        })
+        .unwrap();
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        cx.update_window(window, |_, window, cx| window.focus_next(cx))
+            .unwrap();
+        let id = cx
+            .update_window(window, |_, window, cx| {
+                window.focused(cx).map(|h| format!("{h:?}"))
+            })
+            .unwrap();
+        if id == prev {
+            break;
+        }
+        let Some(id) = id else { break };
+        if seen.contains(&id) {
+            break;
+        }
+        reached |= id == wanted;
+        seen.push(id.clone());
+        prev = Some(id);
+    }
+    assert!(
+        reached,
+        "Tab reaches the results list ({wanted}); the cycle held {seen:?}"
     );
 
     probe::set_probes_enabled(false);
@@ -9123,5 +9282,109 @@ fn the_find_bars_readout_and_verbs_speak_the_readers_language(cx: &mut TestAppCo
         "1 au total",
     );
     cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    probe::set_probes_enabled(false);
+}
+/// **A surface that covers the window takes the tab order with it.** gpui
+/// builds the frame's tab map from what painted, and painting on top removes
+/// nothing — so with the Find-all overlay expanded, Tab walked out of it into
+/// the conversation underneath: a band's `+`, a docked draft's row, the
+/// composer's own verbs, each reachable and activatable while the reader could
+/// not see any of them. `crate::focus::Covered` is the cure, applied where a
+/// role becomes a stop.
+#[gpui::test]
+fn the_find_overlay_keeps_the_tab_order_to_itself(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "another kestrel here");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers"), a2], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    // The find surface's own stops, counted from what actually painted rather
+    // than written down: every probed control in it whose role derives a stop,
+    // plus the two that are stops without being probed controls — the query
+    // `Input`, which owns its own focus handle (the two-regime rule), and the
+    // results list, whose handle carries the stop because `Role::List` does
+    // not.
+    let find_probe_stops = |cx: &mut TestAppContext| {
+        fresh_entries(cx, window)
+            .iter()
+            .filter(|(name, e)| {
+                name.starts_with("space/find/") && eidola_gui::focus::is_tab_stop(e.role)
+            })
+            .count()
+    };
+
+    // With the overlay closed the conversation contributes stops of its own —
+    // which is what makes the assertion below a claim about suppression rather
+    // than about an empty page.
+    let closed = tab_stop_count(cx, window);
+    let bar_only = find_probe_stops(cx) + 2;
+    assert!(
+        closed > bar_only,
+        "precondition: the covered conversation really does hold tab stops \
+         ({closed} reachable, {bar_only} of them the bar's own)"
+    );
+
+    // Put the reader on a post's action gutter — *after* the count above, whose
+    // traversal would move focus straight off it. That verb is the one tab stop
+    // under the overlay riding a **tracked** handle rather than a probe-derived
+    // one, and gpui reads a tracked handle's own `tab_stop`, so the guard —
+    // which acts where a *role* becomes a stop — cannot reach it: the verb
+    // stayed reachable behind the surface covering it. The level survives the
+    // open because `sync_tree_focus` parks its observation while a transient
+    // overlay stands.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_affordance_for_test("a1", 0, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+    assert!(
+        fresh_entries(cx, window)
+            .iter()
+            .any(|(name, _)| name == "space/post/0/edit"),
+        "precondition: the covered post's verb really is still painted"
+    );
+
+    let expected = find_probe_stops(cx) + 2;
+    let reachable = tab_stop_count(cx, window);
+    assert_eq!(
+        reachable, expected,
+        "every reachable stop belongs to the find surface — nothing under the \
+         overlay is in the tab order"
+    );
+
     probe::set_probes_enabled(false);
 }

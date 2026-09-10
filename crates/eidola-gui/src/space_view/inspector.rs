@@ -131,6 +131,58 @@ impl SpaceView {
         inspector_layout(self.inspector_open, viewport_width)
     }
 
+    /// Whether the panel is **covering** the conversation pane rather than
+    /// standing beside it.
+    ///
+    /// The split form takes width away and the overlay form takes the *page*:
+    /// a full-window scrim painted after everything in the pane, the panel over
+    /// that. So which surfaces are covered is a function of the window's width,
+    /// and the two things a covering surface owes — the tab order and the
+    /// keyboard — are owed only in the second form. The find bar and the
+    /// Find-all overlay ask this before lifting [`crate::focus::Covered`] for
+    /// their own subtrees, which is what keeps them from being reachable by Tab
+    /// underneath a scrim they cannot be seen through.
+    pub(crate) fn inspector_covers_pane(&self, window: &Window) -> bool {
+        self.inspector_layout(crate::chrome::content_size(window).width) == InspectorLayout::Overlay
+    }
+
+    /// Take the keyboard off the surface this panel is about to cover.
+    ///
+    /// The move itself, so the two places that make it — the ⌥⌘I press and the
+    /// per-frame watcher below — cannot make different ones.
+    fn hand_keyboard_to_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inspector_covers_pane(window) && self.find_holds_focus(window, cx) {
+            window.focus(&self.inspector_focus, cx);
+            // **The loan is recorded where it is made** — see
+            // `SpaceView::inspector_borrowed_find`.
+            self.inspector_borrowed_find = true;
+        }
+    }
+
+    /// Watch the covering predicate across frames and pay what a *rise* owes.
+    ///
+    /// **The layout decision is a function of the window's width, so it moves
+    /// without anyone calling a door.** Opening the panel at a wide window
+    /// splits, which covers nothing and correctly takes nothing; dragging that
+    /// window narrower then flips `inspector_covers_pane` **during layout**,
+    /// and `set_inspector_open` is not called again — so the scrim went up over
+    /// a Find-all whose results list still had the keyboard, arrows and Enter
+    /// driving a list behind it. The handoff therefore follows the *predicate*
+    /// rather than the door: it is asked once a frame, beside the frame's own
+    /// `inspector_layout`, and the rising edge is what owes the move.
+    ///
+    /// Only the rise: a *fall* (widening back, or closing) leaves the panel
+    /// painted beside the pane or gone entirely, and the close's own arm
+    /// already returns the borrow. Recorded rather than derived because an edge
+    /// is by definition a fact about two frames.
+    pub(crate) fn sync_inspector_cover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let covering = self.inspector_covers_pane(window);
+        if covering && !self.inspector_covered {
+            self.hand_keyboard_to_inspector(window, cx);
+        }
+        self.inspector_covered = covering;
+    }
+
     /// `Space ▸ Show/Hide Inspector` (⌥⌘I) — the only door, by design.
     pub fn toggle_inspector(
         &mut self,
@@ -152,7 +204,33 @@ impl SpaceView {
     ) {
         self.inspector_open = open;
         if open {
+            // A panel that is about to open has borrowed nothing yet; the
+            // handoff below, or a later resize into the covering form, is what
+            // records one.
+            self.inspector_borrowed_find = false;
             self.ensure_inspector_settings(cx);
+            // **A surface that covers the page takes the keyboard off what it
+            // covers.** In the *overlay* form the panel paints a full-window
+            // scrim after the conversation pane, so the Find-all overlay and
+            // the find bar are behind it — and the keyboard was left on
+            // whichever of them held it, so arrows and Enter went on driving a
+            // results list nobody could see while the pointer was intercepted
+            // by the scrim. The split form covers nothing and takes nothing.
+            //
+            // The panel itself is the destination rather than its title field:
+            // ⌥⌘I asks to *see* the inspector, not to type in it, and the
+            // panel's own handle is a live one carrying a role
+            // (`Role::Complementary`), which is what makes it a destination
+            // AccessKit can report focus on. Find-all is deliberately left
+            // standing — the reader's search is not this verb's to spend, and
+            // closing the panel hands the keyboard back.
+            //
+            // Eager, though [`Self::sync_inspector_cover`] would catch this
+            // very edge on the next frame: ⌥⌘I is the one way the predicate
+            // rises that a reader is *pressing a key* through, so the frame
+            // their press produced is the frame that must not leave the
+            // keyboard behind the scrim.
+            self.hand_keyboard_to_inspector(window, cx);
         } else {
             self.inspector_router_picker = false;
             // The dropdowns are transient by nature and must not come back with
@@ -171,9 +249,42 @@ impl SpaceView {
             // `overlay_borrowed_focus` rule. A reader composing beside an open
             // inspector never lent the keyboard, and yanking their caret to the
             // view root on a close would be exactly what they did not ask for.
-            if self.inspector_field_focused(window, cx) {
+            //
+            // **And the panel's own handle is a lender's debt too.** The open
+            // arm above takes the keyboard off a find surface it is about to
+            // cover, so this is where that borrow is returned — to the find
+            // surface rather than to the conversation at large, since a reader
+            // who asked to search is not done searching. Without it the close
+            // left the window on the panel's unmounted handle: `focus_next`
+            // restarting from the root, and every per-view action (⌘F included)
+            // unavailable, because dispatch walks from the focused element.
+            //
+            // **Containment, not identity** — the question is about the
+            // *subtree* that is about to stop being painted, and the panel owns
+            // one. It holds its own handle only until the reader's first Tab or
+            // click: a title field, a stepper, the router button and every
+            // roster control are descendants, and asking the container's handle
+            // alone missed all of them, so the close left the keyboard on a
+            // control whose panel had unmounted (the fields fell through to the
+            // conversation root, which is the wrong destination rather than a
+            // dead one).
+            //
+            // **And the borrow is returned only where one was made — read
+            // from the loan record, never inferred from the layout.** Covering
+            // is what *allows* the handoff, not what performs it: with a find
+            // session standing but the keyboard somewhere in the pane, the
+            // panel covers and takes nothing, and treating the layout as proof
+            // of a loan sent a reader who had stepped into a control of their
+            // own accord off to the results list — abandoning the conversation
+            // context they were actually in. `hand_keyboard_to_inspector`
+            // records what it really took, which is also the only thing that
+            // can answer for a loan made a frame later by a resize.
+            if self.inspector_focus.contains_focused(window, cx)
+                && !(self.inspector_borrowed_find && self.refocus_find_surface(window, cx))
+            {
                 window.focus(&self.focus_handle, cx);
             }
+            self.inspector_borrowed_find = false;
         }
         cx.notify();
     }
@@ -230,6 +341,13 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         self.set_inspector_open(open, window, cx);
+    }
+
+    /// Whether the inspector panel itself holds the keyboard — where an
+    /// overlaying panel puts it, and the seam that says so.
+    #[doc(hidden)]
+    pub fn inspector_focused_for_test(&self, window: &Window) -> bool {
+        self.inspector_focus.is_focused(window)
     }
 
     /// This space's settings cell, for the rows below.
@@ -432,11 +550,20 @@ impl SpaceView {
         if layout == InspectorLayout::Hidden {
             return Vec::new();
         }
+        // The panel is a column *beside* the conversation pane (and, in the
+        // floating form, painted over it), so the Find-all overlay — which
+        // lives inside that pane — never covers it: its controls keep their
+        // place in the tab order ([`crate::focus::Covered`]).
+        let _uncovered = crate::focus::Covered::new(false);
+        let focus = self.inspector_focus.clone();
         self.sync_inspector_title(window, cx);
         // The panel meets the window's right edge in both forms, so it owns
         // those corner notches under Linux CSD (no-ops elsewhere).
         let panel = crate::chrome::round_br_client_corner(
-            crate::chrome::round_tr_client_corner(self.render_inspector_panel(window, cx), window),
+            crate::chrome::round_tr_client_corner(
+                self.render_inspector_panel(window, cx).track_focus(&focus),
+                window,
+            ),
             window,
         );
         match layout {

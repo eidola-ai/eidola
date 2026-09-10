@@ -74,11 +74,32 @@ use crate::probe::Probe;
 /// only when its ordinal is **mapped**, and is ordinary literal text when it
 /// is not. Passing the post's own map is what keeps the projection agreeing
 /// with the post's own editor.
+/// A node's searchable text **and the blocks the render laid it out in**.
+///
+/// The two come out of one pass because they are two readings of the same
+/// render: the projection is what a query is scanned against, and the block
+/// ranges are the units the Find-all overlay cuts a *fragment* out of (see
+/// [`super::find_overlay`]). Deriving the blocks a second time would be a
+/// second parse of every post, and — worse — a second answer to "what does this
+/// post render as", which is exactly the drift the projection exists to remove.
+pub(crate) struct NodeProjection {
+    pub(crate) projection: Projection,
+    /// Each rendered block's source range, in document order.
+    pub(crate) blocks: Vec<Range<usize>>,
+}
+
+impl NodeProjection {
+    /// The source ranges `query` matches — the projection's own answer.
+    pub(crate) fn find(&self, query: &Query) -> Vec<Range<usize>> {
+        self.projection.find(query)
+    }
+}
+
 pub(crate) fn searchable_projection(
     content: &str,
     embeds: &EmbedMap,
     cursor: Option<Selection>,
-) -> Projection {
+) -> NodeProjection {
     let mut state = gpui_markdown_editor::EditorState::with_markdown(content);
     state.embeds = embeds.clone();
     let tree = gpui_markdown_editor::parse(&state.markdown);
@@ -99,12 +120,14 @@ pub(crate) fn searchable_projection(
     };
 
     let mut builder = ProjectionBuilder::new(content);
+    let mut blocks: Vec<Range<usize>> = Vec::new();
     let mut prev_end: Option<usize> = None;
     for block in &spec.blocks {
         let block_range = clamp(&block.source_range, content.len());
         if block_range.start >= block_range.end {
             continue;
         }
+        blocks.push(block_range.clone());
         // **A barrier between blocks.** Two adjacent paragraphs are two
         // separate things on the page, so a query must not match across the
         // gap between them — but the gap's bytes are not a run of their own,
@@ -122,7 +145,10 @@ pub(crate) fn searchable_projection(
         append_block(&mut builder, content, block, block_range.clone());
         prev_end = Some(block_range.end.max(prev_end.unwrap_or(0)));
     }
-    builder.finish()
+    NodeProjection {
+        projection: builder.finish(),
+        blocks,
+    }
 }
 
 /// What the walk over one block's source finds at a given byte.
@@ -706,6 +732,20 @@ pub(crate) struct FindSession {
     pub(crate) text: String,
     /// The prepared query, or `None` while the field is empty.
     pub(crate) query: Option<Query>,
+    /// **Which query the results on screen belong to.** Bumped by
+    /// [`SpaceView::set_find_query`] — the one door a query changes through,
+    /// and one that early-returns on unchanged text, so this moves exactly when
+    /// the search does.
+    ///
+    /// A rendered `ResultFragment` carries the generation it was cut for,
+    /// because gpui draws from the platform's frame callback and really does
+    /// handle two events between two paints: a `Change` and a card's click land
+    /// in that order, the click closure still holds the *old* fragment, and
+    /// opening it selected a branch and installed an ordinal from a search that
+    /// no longer exists — `sync_find` then resolved the new query from a branch
+    /// the reader never chose. An ordinal is meaningless across queries, which
+    /// is why identity rather than repair is the answer.
+    pub(crate) query_generation: u64,
     /// Every match on the visible branch, in document order and grouped by
     /// node — see [`MatchSet`] for why the grouping is not an optimization.
     pub(crate) matches: MatchSet,
@@ -729,6 +769,13 @@ pub(crate) struct FindSession {
     pub(crate) floating: Option<SharedString>,
     /// The whole-space count and its honest in-progress state.
     pub(crate) space: SpaceCount,
+    /// **The Find-all overlay** — the surface behind the total's disclosure.
+    ///
+    /// Held here, never beside the session, for the same reason the projection
+    /// cache is: closing the bar drops the overlay's scroll position, its
+    /// measured heights and every editor state it minted, so "no session, no
+    /// work" stays structural. See [`super::find_overlay`].
+    pub(crate) overlay: super::find_overlay::FindOverlay,
     /// The chunked pass that fills [`Self::space`].
     ///
     /// A task on the session, per `STATE.md`: replace = cancel, and dropping
@@ -792,6 +839,27 @@ pub(crate) struct FindSession {
     pub(crate) returned_input: Option<gpui::WeakEntity<gpui_component::input::InputState>>,
 }
 
+/// What one node holds for the current query — [`FindSession::node_result`]'s
+/// answer, borrowed from the projection cache rather than copied out of it.
+pub(crate) struct NodeResult<'a> {
+    /// The markdown the projection was built from: the live buffer for a node
+    /// the reader is editing, the persisted row for everything else.
+    pub(crate) content: &'a SharedString,
+    /// Each rendered block's source range, in document order.
+    pub(crate) blocks: &'a [Range<usize>],
+    /// The query's hits, in projection order — index *is* the match's ordinal
+    /// within the node, by the same construction `MatchSet` relies on.
+    pub(crate) hits: &'a [Range<usize>],
+    /// Whether the projection was built **cursor-aware** — that is, whether
+    /// this node is a live editor (a draft, or the post being edited in place).
+    ///
+    /// It is the one honest answer to "can this node's text move while its id
+    /// stands still": every other node mints a new action id when its text
+    /// changes, so its node id is already the discriminator. The overlay reads
+    /// it to stamp a fragment's measurement key — see [`ResultFragment::id`].
+    pub(crate) live_editor: bool,
+}
+
 impl FindSession {
     /// Whether this session owns the keyboard: the query field's own handle,
     /// or anything inside the bar's subtree.
@@ -806,9 +874,42 @@ impl FindSession {
     /// by the close (which did not), taking the session away without putting
     /// the keyboard back where it came from. Written once, the two cannot
     /// disagree about a frame.
+    /// **The overlay is the third half**, because it is a surface of the
+    /// session painted outside the bar's own subtree: a reader standing in the
+    /// results list is inside the find surface, and an Escape there belongs to
+    /// find rather than to the conversation behind it.
     fn holds_focus(&self, window: &Window, cx: &gpui::App) -> bool {
         gpui::Focusable::focus_handle(self.input.read(cx), cx).is_focused(window)
             || self.focus.contains_focused(window, cx)
+            || self.overlay.holds_focus(window, cx)
+    }
+
+    /// One node's text, the blocks its render laid it out in, and the hits the
+    /// current query found there — **read from the one cache both passes
+    /// fill**, and only when the memo is an answer about the query the bar is
+    /// showing.
+    ///
+    /// This is what keeps the Find-all overlay from being a second source of
+    /// truth: `sync_find` fills a visible-branch node's entry from what is on
+    /// screen (an inline edit's unsaved buffer, a draft's live text) and the
+    /// whole-space count fills every other post's from the persisted row, both
+    /// through `hits_of` — so a fragment can only ever show what the readout
+    /// counted, and the ordinals a result hands the anchor are the ordinals the
+    /// branch's own match list uses.
+    ///
+    /// `None` for a node the pass has not reached, and for a composing draft
+    /// deliberately left unprojected. Neither is a group; the overlay says it
+    /// is still counting rather than presenting a partial set as a whole one.
+    pub(crate) fn node_result(&self, node: &SharedString) -> Option<NodeResult<'_>> {
+        let query = self.query.as_ref()?;
+        let entry = self.projections.get(node)?;
+        let (answered, hits) = entry.hits.as_ref()?;
+        (answered == query).then_some(NodeResult {
+            content: &entry.seed.content,
+            blocks: &entry.projection.blocks,
+            hits,
+            live_editor: entry.seed.render_cursor.is_some(),
+        })
     }
 
     /// The current match, if the anchor still names one.
@@ -1064,7 +1165,7 @@ impl ScopeNode {
 pub(crate) struct CachedProjection {
     /// What [`Self::projection`] is a projection *of*.
     seed: ProjectionSeed,
-    projection: Projection,
+    projection: NodeProjection,
     /// The last query this node was scanned for, and what it found. Held with
     /// the query rather than cleared on a query change, so the memo cannot go
     /// stale by someone forgetting to invalidate it.
@@ -1235,7 +1336,18 @@ impl SpaceView {
                 // a render-time `value()` read would see the spliced preedit.
                 gpui_component::input::InputEvent::Change => {
                     let text = state.read(cx).value().to_string();
-                    this.set_find_query(text, cx);
+                    this.set_find_query(text, window, cx);
+                }
+                // **⌘↩ opens the Find-all overlay**, the disclosure's other
+                // door and the one a reader already in the field can reach
+                // without leaving it. `InputState` reports the modifier on the
+                // event itself, so this needs no binding of its own — and a
+                // binding would have had to outrank the composer's own submit
+                // chord to be reachable here at all.
+                gpui_component::input::InputEvent::PressEnter {
+                    secondary: true, ..
+                } => {
+                    this.toggle_find_overlay(window, cx);
                 }
                 gpui_component::input::InputEvent::PressEnter { shift, .. } => {
                     this.find_step(!shift, window, cx);
@@ -1248,10 +1360,12 @@ impl SpaceView {
             _sub: sub,
             text: String::new(),
             query: None,
+            query_generation: 0,
             matches: MatchSet::default(),
             anchor: None,
             branch_nodes: HashSet::new(),
             space: SpaceCount::default(),
+            overlay: super::find_overlay::FindOverlay::new(cx),
             count_task: None,
             floating: None,
             projections: HashMap::new(),
@@ -1348,6 +1462,25 @@ impl SpaceView {
         self.layout.measured(node).is_some() || self.active_draft.as_ref() == Some(node)
     }
 
+    /// Open a session on `query` — the scene seam, for a surface that has to
+    /// exist before any frame has run.
+    ///
+    /// It goes through `set_find_query`, the same door the field's own `Change`
+    /// event takes, so a scene never stands on a state the production path
+    /// cannot produce. Calling it again replaces the query on the open session,
+    /// which is what the reader typing over their search does.
+    #[doc(hidden)]
+    pub fn seed_find_for_test(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            self.open_find(&crate::actions::FindInSpace, window, cx);
+        }
+        if let Some(session) = self.find.as_ref() {
+            let input = session.input.clone();
+            input.update(cx, |s, cx| s.set_value(query, window, cx));
+        }
+        self.set_find_query(query.to_string(), window, cx);
+    }
+
     /// Whether the find surface currently owns the keyboard — what gates the
     /// Escape rung, so an Escape in the composer still deactivates the draft,
     /// and what puts the bar in `transient_overlay_open`.
@@ -1377,7 +1510,7 @@ impl SpaceView {
     }
 
     /// Apply a committed query. Never called from an observer or a render.
-    fn set_find_query(&mut self, text: String, cx: &mut Context<Self>) {
+    fn set_find_query(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.find.as_mut() else {
             return;
         };
@@ -1386,6 +1519,16 @@ impl SpaceView {
         }
         session.query = Query::new(&text);
         session.text = text;
+        // Everything cut for the search that just ended stops being this
+        // session's — see [`FindSession::query_generation`].
+        session.query_generation = session.query_generation.wrapping_add(1);
+        // **The overlay's retained position belongs to the query it was taken
+        // in.** Position retention is "while the query is unchanged" — the
+        // task's own rule — so a new search starts at the top of a list that is
+        // about something else, with no cursor pointing into the old one and no
+        // measured height or editor state left over from a fragment that is
+        // gone.
+        session.overlay.forget_results();
         invalidate_for_new_query(
             &mut session.matches,
             &mut session.anchor,
@@ -1403,6 +1546,21 @@ impl SpaceView {
         // query that *does* match glides again from wherever this stopped, so
         // cancelling is right either way.
         self.cancel_page_glide();
+        // **And a query cleared under the overlay takes the overlay with it**,
+        // the other half of the same rule. The disclosure that collapses this
+        // surface disappears with the readout it lives beside, so an overlay
+        // left standing over an emptied query has lost its own pointer way out
+        // while claiming "Nothing matches anywhere" about a search that is no
+        // longer being made. Through `close_find_overlay`, so the keyboard goes
+        // back to the field the reader is typing in rather than being left on a
+        // results list that has stopped existing.
+        if self
+            .find
+            .as_ref()
+            .is_some_and(|s| s.query.is_none() && s.overlay.open)
+        {
+            self.close_find_overlay(window, cx);
+        }
         cx.notify();
     }
 
@@ -2701,6 +2859,15 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         self.find.as_ref()?;
+        // The bar is *above* the overlay it opens, so its own controls stay in
+        // the tab order while the overlay covers everything else
+        // ([`crate::focus::Covered`]) — **unless something is covering the bar
+        // in turn**. The inspector's overlay form paints a full-window scrim
+        // after this whole pane, so lifting the guard unconditionally left the
+        // bar's verbs reachable by Tab underneath a wash the reader cannot see
+        // through. Which surfaces cover which is a function of the window's
+        // width, so it is asked rather than assumed.
+        let _uncovered = crate::focus::Covered::new(self.inspector_covers_pane(window));
         self.sync_find_placeholder(window, cx);
         let (bg, border, muted) = {
             let theme = cx.theme();
@@ -2723,6 +2890,7 @@ impl SpaceView {
         // one and the previous query's total is the same lie with a longer
         // fuse. A settled zero shows nothing at all: the index's own sentence
         // beside it has already said so, on both counts.
+        let overlay_open = self.find_overlay_open();
         let space_total = self.find.as_ref().and_then(|s| s.space.total);
         let settled_total = space_total.filter(|n| *n > 0);
         let total_readout: Option<SharedString> = if !has_query {
@@ -2859,27 +3027,54 @@ impl SpaceView {
                     .text_sm()
                     .text_color(muted)
                     .child(sentence)
-                    .children(settled_total.map(|_| {
-                        // **The disclosure, rendered and inert.** What it will
-                        // open — the Find-all overlay — is a later wave, and a
-                        // `Role::Button` with no listener is a control
-                        // VoiceOver offers, activates and silently does nothing
-                        // with (`find_step_button`'s rule). So it carries no
-                        // a11y node at all: a registry-only probe, exactly as
-                        // the highlight picker's ordinal does, because the
-                        // sentence above already speaks the number and a node
-                        // here would say it twice.
+                    // **The disclosure lives with the readout, not with the
+                    // number.** Mounting it only on a settled total meant a
+                    // background write that restarted a large count took the
+                    // focused control out from under a keyboard reader for the
+                    // length of the scan — ordinary keys reaching nothing, Tab
+                    // recovering from a dead slot — and left no way to open the
+                    // overlay while the pass ran. The overlay's own honest
+                    // counting state is what it opens onto, so the control is
+                    // as true while counting as after. What it is *not* offered
+                    // for is a settled **zero**, which shows no readout either:
+                    // that is the one state where there is nothing to show, and
+                    // `total_readout` is already exactly that predicate.
+                    .children(std::iter::once(()).map(|_| {
+                        // **The disclosure is a real control now**, because it
+                        // finally does something: it expands the Find-all
+                        // overlay. It was a registry-only probe while the
+                        // surface behind it did not exist — the step arrows'
+                        // rule, that a `Role::Button` with no listener is a
+                        // control VoiceOver offers, activates and silently does
+                        // nothing with — and it becomes a `Button` in the same
+                        // breath as the handler. Its name says what the click
+                        // *does*, in both directions, because the glyph alone
+                        // says nothing to a screen reader; the sentence beside
+                        // it already speaks the number, so this one does not.
+                        let open = overlay_open;
                         div()
                             .id("space-find-total-disclosure")
-                            .probe_bounds(
+                            .probe(
                                 "space/find/total/disclosure",
-                                gpui::Role::Label,
-                                "Find all",
+                                gpui::Role::Button,
+                                if open {
+                                    crate::i18n::msg::find_hide_all(cx)
+                                } else {
+                                    crate::i18n::msg::find_show_all(cx)
+                                },
                             )
+                            .aria_expanded(open)
                             .flex_none()
+                            .px_1()
+                            .rounded_sm()
                             .text_xs()
+                            .cursor_pointer()
                             .text_color(muted.opacity(0.7))
-                            .child("▲")
+                            .hover(|s| s.text_color(muted))
+                            .child(if open { "▼" } else { "▲" })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_find_overlay(window, cx);
+                            }))
                     }))
             }));
 
@@ -3065,14 +3260,14 @@ mod tests {
     use super::*;
 
     fn project(source: &str) -> Projection {
-        searchable_projection(source, &EmbedMap::default(), None)
+        searchable_projection(source, &EmbedMap::default(), None).projection
     }
 
     /// The projection of a node whose editor is *enabled* with its cursor at
     /// `at` — an inline edit or a draft, which is what the reader is looking
     /// at when they search one.
     fn project_editing(source: &str, at: usize) -> Projection {
-        searchable_projection(source, &EmbedMap::default(), Some(Selection::Cursor(at)))
+        searchable_projection(source, &EmbedMap::default(), Some(Selection::Cursor(at))).projection
     }
 
     /// How many math overlays the read-only render puts on this source.
@@ -3309,7 +3504,8 @@ mod tests {
     fn a_mapped_embed_marker_is_not_searchable_and_an_unmapped_one_is() {
         let source = "{{ embed 1 }}";
         let mapped =
-            searchable_projection(source, &EmbedMap::new([(1, "quoted".to_string())]), None);
+            searchable_projection(source, &EmbedMap::new([(1, "quoted".to_string())]), None)
+                .projection;
         assert!(mapped.text().trim().is_empty());
         // An ordinal with no reference behind it is ordinary text — which is
         // also how a marker looks before its reference exists.

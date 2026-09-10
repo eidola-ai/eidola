@@ -30,6 +30,7 @@
 pub mod composer;
 pub mod context_menu;
 pub mod find;
+pub mod find_overlay;
 pub mod inspector;
 pub mod inspector_participants;
 pub mod keyboard;
@@ -539,6 +540,31 @@ pub struct SpaceView {
     /// [`SpaceView::retry_transcript_load`] asks containment of *before* it
     /// acts — the same shape the bottom bands take.
     pub(crate) transcript_retry_focus: FocusHandle,
+    /// The inspector panel's own handle — where the keyboard goes when the
+    /// panel opens in its **overlay** form over a surface that was holding it
+    /// (see [`SpaceView::set_inspector_open`]). It carries the panel's own tab
+    /// attributes, because gpui reads a *tracked* handle's flags rather than
+    /// the element's: without them the panel's `AUX` region would silently
+    /// become index 0 and reorder the whole window's Tab walk.
+    pub(crate) inspector_focus: FocusHandle,
+    /// Whether the panel was **covering** the conversation pane on the last
+    /// frame — the other half of an edge (see
+    /// [`SpaceView::sync_inspector_cover`]). The layout decision is a function
+    /// of the window's width, so it moves with a resize and through no door.
+    pub(crate) inspector_covered: bool,
+    /// Whether the panel **actually took the keyboard off the find surface** —
+    /// the loan record, recorded where the handoff happens
+    /// ([`SpaceView::hand_keyboard_to_inspector`]) and read by the close.
+    ///
+    /// Covering is what *allows* the handoff, not what performs it: a find
+    /// session can stand with the keyboard somewhere else in the pane, and then
+    /// the panel covers and takes nothing. Reading the layout as proof of a
+    /// loan sent a reader who had stepped into a panel control of their own
+    /// accord off to the results list on the close, abandoning the conversation
+    /// they were in. Same shape as `overlay_borrowed_focus` and
+    /// `FindSession::returned_input`: **a borrow is a fact about what happened,
+    /// not about what was permitted.**
+    pub(crate) inspector_borrowed_find: bool,
     /// The open right-click menu over one of the space's editors, if any —
     /// window-local transient state, like the band menu and the picker (one
     /// open at a time; see [`context_menu`]).
@@ -1122,6 +1148,12 @@ impl SpaceView {
             quote_destination_scroll: gpui::UniformListScrollHandle::new(),
             band_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             transcript_retry_focus: cx.focus_handle(),
+            inspector_focus: cx
+                .focus_handle()
+                .tab_index(crate::focus::region::AUX)
+                .tab_stop(false),
+            inspector_covered: false,
+            inspector_borrowed_find: false,
             context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
@@ -1630,6 +1662,103 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn find_counting_for_test(&self) -> bool {
         self.find.as_ref().is_some_and(|s| !s.space.is_settled())
+    }
+
+    /// Whether the Find-all overlay is expanded.
+    #[doc(hidden)]
+    pub fn find_overlay_open_for_test(&self) -> bool {
+        self.find_overlay_open()
+    }
+
+    /// Where the overlay's results list stands, as a positive offset from the
+    /// top — the retention seam.
+    #[doc(hidden)]
+    pub fn find_overlay_scroll_for_test(&self) -> f32 {
+        self.find
+            .as_ref()
+            .map_or(0.0, |s| -s.overlay.scroll.offset().y.as_f32())
+    }
+
+    /// Scroll the overlay's results list, as a map press or the roving cursor
+    /// would.
+    #[doc(hidden)]
+    pub fn find_overlay_scroll_to_for_test(&mut self, top: f32) {
+        self.scroll_find_results_to(top);
+    }
+
+    /// Where the results list's roving cursor sits, and the list's own focus
+    /// handle — the surface's single tab stop.
+    #[doc(hidden)]
+    pub fn find_results_focus_for_test(&self) -> Option<gpui::FocusHandle> {
+        self.find.as_ref().map(|s| s.overlay.list_focus.clone())
+    }
+
+    /// The cursor's index into the flat fragment list.
+    #[doc(hidden)]
+    pub fn find_result_cursor_for_test(&self) -> Option<usize> {
+        self.find.as_ref().map(|s| s.overlay.cursor)
+    }
+
+    /// The overlay's map, in the order it lays the space out and the results
+    /// read: `(node id, depth, lane)` sorted depth-then-lane.
+    #[doc(hidden)]
+    pub fn find_map_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, usize, usize)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        find_overlay::map_layout(&tree, &|node| self.find_map_includes_for_test(node, cx))
+            .into_iter()
+            .map(|n| (n.node.to_string(), n.depth, n.lane))
+            .collect()
+    }
+
+    /// The overlay's results, in the order it draws them: one entry per group
+    /// as `(node id, fragment source ranges)`.
+    #[doc(hidden)]
+    pub fn find_results_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, Vec<std::ops::Range<usize>>)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map =
+            find_overlay::map_layout(&tree, &|node| self.find_map_includes_for_test(node, cx));
+        self.find_results_for_map_for_test(&map, cx)
+            .into_iter()
+            .map(|g| {
+                (
+                    g.node.to_string(),
+                    g.fragments.iter().map(|f| f.range.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The overlay's result **cards**, flat and in the order the list draws
+    /// them: `(measurement id, source range, the hits that card paints)`.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn find_result_cards_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, std::ops::Range<usize>, Vec<std::ops::Range<usize>>)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map =
+            find_overlay::map_layout(&tree, &|node| self.find_map_includes_for_test(node, cx));
+        self.find_results_for_map_for_test(&map, cx)
+            .into_iter()
+            .flat_map(|g| g.fragments)
+            .map(|f| (f.id.to_string(), f.range.clone(), f.hits.clone()))
+            .collect()
     }
 
     /// The left-hand side of the exactness invariant, over this frame's real
@@ -2802,6 +2931,17 @@ impl Focusable for SpaceView {
 
 impl Render for SpaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // **The Find-all overlay covers this window, so it takes the tab order
+        // with it** ([`crate::focus::Covered`]). Painting on top removes
+        // nothing from the frame's tab map, so without this Tab walked out of
+        // the overlay into the conversation's own affordances — a Post, an Ask,
+        // a Regenerate the reader cannot see, each one press from running. The
+        // guard stands for the whole render and the two surfaces that are *not*
+        // covered take it off again for their own subtrees: the find bar (whose
+        // controls the overlay hangs off, and which paints above it) and the
+        // overlay itself. The inspector does the same, being a column beside
+        // the conversation pane rather than under it.
+        let _covered = crate::focus::Covered::new(self.find_overlay_open());
         let theme = cx.theme();
         let bg = theme.background;
         let fg = theme.foreground;
@@ -2827,6 +2967,10 @@ impl Render for SpaceView {
         // …and an invite form over a space that turns out to be a notebook: the
         // grant door is withheld there, and a form is a door left standing.
         self.sync_inspector_invite(window, cx);
+        // The panel's *covering* is decided by the width just read, so a resize
+        // can raise it with no door called — and a rise owes the keyboard.
+        // Before `sync_tree_focus`, which asks who owns it.
+        self.sync_inspector_cover(window, cx);
         // Tree focus is *observed*, not merely bookkept: see
         // `keyboard::sync_tree_focus`.
         self.sync_tree_focus(window, cx);
@@ -3169,6 +3313,12 @@ impl Render for SpaceView {
             // defers; staying in the normal pass keeps both below late overlays
             // like the gpui dev inspector.
             .child(self.render_minimap(&tree, page_width, window_h, window, cx))
+            // The Find-all overlay covers the rest of the window below the
+            // bar, so it paints after everything under it — the composer, the
+            // notices, the minimap. It is geometrically clear of the drag band
+            // and of the bar's own controls, so those two keep their clicks
+            // whatever the paint order says.
+            .children(self.render_find_overlay(&tree, window_h, window, cx))
             // The context menu is the last child of all: a menu opened at the
             // pointer must sit above every surface it can be opened over,
             // the minimap and the floating composer included.
@@ -3188,23 +3338,57 @@ impl Render for SpaceView {
             .on_action(cx.listener(Self::toggle_inspector))
             // Edit → Find in Conversation (⌘F). Registered per-view like
             // `ToggleInspector`, so macOS greys it with no space window open.
-            .on_action(cx.listener(Self::open_find))
+            //
+            // **And only while the bar it opens would be visible.** Dispatch is
+            // not traversal, so the covering guard does not reach it: in the
+            // inspector's *overlay* form the panel paints a full-window scrim
+            // after this pane, and ⌘F under one mounted the bar behind that
+            // scrim and focused its query field — a reader typing into a
+            // surface they cannot see, with the pointer intercepted. The quote
+            // verbs' rule, reached through the other cover: withheld rather
+            // than dismissing the panel, because the panel is not this verb's
+            // to close and one ⌥⌘I (or a click on the scrim) brings ⌘F back.
+            // The split form covers nothing, so the condition is exactly the
+            // layout.
+            .when(!self.inspector_covers_pane(window), |d| {
+                d.on_action(cx.listener(Self::open_find))
+            })
             // Edit → Quote / Quote in Reply. Registered **only while a
             // quotable post selection exists**, so `is_action_available` is
             // false otherwise and macOS greys both items — the same
             // registration-is-enablement mechanism as CloseWindow, with the
             // extra selection condition. `note_body_selection` re-renders on
             // exactly the transitions that flip this.
+            //
+            // **And only while the reader can see what each verb would do.**
+            // Menu dispatch is not traversal, so the Find-all overlay's
+            // tab-order suppression ([`crate::focus::Covered`]) does not reach
+            // these: every one of them mounts and focuses a surface the overlay
+            // covers — the destination picker, which paints before the overlay
+            // and stands wholly behind it, and the composer the other two land
+            // a populated draft in. The reader would be typing into something
+            // they cannot see, and the first Escape would close a picker they
+            // never saw. Withheld rather than closing the overlay first,
+            // because that is what the menus already do with every other verb
+            // that would not work here, and because taking a reader's search
+            // away is a decision they did not make: one Escape collapses the
+            // overlay and the verbs come back. `find_overlay_open` is view
+            // state, and every path that flips it notifies.
+            //
             // Quoting *elsewhere* lands its draft in whichever conversation
-            // the reader picks, so a selection is the whole of its condition.
-            .when(self.post_selection.is_some(), |d| {
-                d.on_action(cx.listener(Self::quote_elsewhere))
-            })
+            // the reader picks, so a selection is the whole of its own
+            // condition.
+            .when(
+                self.post_selection.is_some() && !self.find_overlay_open(),
+                |d| d.on_action(cx.listener(Self::quote_elsewhere)),
+            )
             // These two land a draft **here**, so they also need the reader to
             // be able to act here — registration-is-enablement, so macOS greys
             // them for a reader who is only watching.
             .when(
-                self.post_selection.is_some() && self.viewer_may_act(cx),
+                self.post_selection.is_some()
+                    && self.viewer_may_act(cx)
+                    && !self.find_overlay_open(),
                 |d| {
                     d.on_action(cx.listener(Self::quote))
                         .on_action(cx.listener(Self::quote_in_reply))
@@ -3219,9 +3403,24 @@ impl Render for SpaceView {
             // no-op when no menu is open.
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
+                    // **A rung answers only for a surface the reader can see.**
+                    // The chain is ordered innermost-first, which is the right
+                    // rule while everything in it is in front of everything
+                    // below it — and the inspector's *overlay* form breaks that
+                    // premise wholesale: its scrim covers the conversation
+                    // pane, so every rung belonging to the pane (this menu, the
+                    // quote picker, the Find-all overlay, the bar, and the
+                    // conversation's own levels below) would spend state behind
+                    // it while the visible surface did not change. The panel's
+                    // own rung is placed among them at the depth it actually
+                    // sits — inside its dropdowns, outside everything in the
+                    // pane — so the pane's later rungs need no gate of their
+                    // own: they are unreachable while it stands, and the two
+                    // that *precede* it ask.
+                    let covered = this.inspector_covers_pane(window);
                     // Rung 1 of the Escape chain (see `keyboard`): the menu
                     // wins, and consumes the press.
-                    if this.close_context_menu(cx) {
+                    if !covered && this.close_context_menu(cx) {
                         return;
                     }
                     // Then the inspector's own dropdown — the same
@@ -3233,7 +3432,7 @@ impl Render for SpaceView {
                     }
                     // …and the quote-destination picker, an overlay of the
                     // same kind over the conversation itself.
-                    if this.close_quote_destination(window, cx) {
+                    if !covered && this.close_quote_destination(window, cx) {
                         return;
                     }
                     // …and its Participants section's model dropdown, which is
@@ -3241,9 +3440,35 @@ impl Render for SpaceView {
                     if this.close_inspector_participant_picker(cx) {
                         return;
                     }
-                    // …and the find bar — **gated on focus being inside it**,
-                    // so an Escape in the composer still deactivates the draft
-                    // rather than closing a bar the reader was not in.
+                    // …then the **covering panel itself**. It is a member of
+                    // `transient_overlay_open` exactly while it covers, so it
+                    // answers Escape as every other transient overlay in this
+                    // window does — and closing it is what makes the press
+                    // never inert *and* never destructive: the panel's own
+                    // close hands the keyboard back to the search it borrowed
+                    // from, and the next press finds the pane uncovered and
+                    // answers for what is now in front. In the split form it is
+                    // a column beside the page rather than an overlay over it,
+                    // so it takes no rung at all and Escape reaches the
+                    // conversation as it always did.
+                    if covered {
+                        this.set_inspector_open(false, window, cx);
+                        return;
+                    }
+                    // …and the find surface, **innermost first**: the Find-all
+                    // overlay collapses before the bar it hangs off, so one
+                    // Escape backs out one rung rather than taking the whole
+                    // search away from a reader who was reading its results.
+                    // Ungated, unlike the bar's rung below: the overlay covers
+                    // the window, so there is nothing behind it an Escape could
+                    // sensibly have been meant for — and the one surface that
+                    // covers *it* has already answered above.
+                    if this.close_find_overlay(window, cx) {
+                        return;
+                    }
+                    // …then the bar — **gated on focus being inside it**, so an
+                    // Escape in the composer still deactivates the draft rather
+                    // than closing a bar the reader was not in.
                     if this.find_holds_focus(window, cx) && this.close_find(window, cx) {
                         return;
                     }
