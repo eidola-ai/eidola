@@ -88,6 +88,36 @@ pub fn set_header_read_timeout_for_test(millis: u64) {
     HEADER_READ_TIMEOUT_MS.store(millis, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// How long the **body** may take to arrive once the head has.
+///
+/// The head deadline's twin, and it is a separate number because it covers a
+/// separate phase: hyper's deadline ends when the head is read, and
+/// `Limited::collect()` bounds the byte count and not the clock — so a caller
+/// that declares a body under the cap and then sends it one byte a minute holds
+/// a connection slot indefinitely, having authenticated and started nothing. A
+/// key holder can fill every slot that way, and so can a stuck client.
+///
+/// Deliberately **not** the completion's own budget: an inference legitimately
+/// takes minutes, while a body a client already has in hand is a local write.
+/// Thirty seconds is far past any honest upload of a conversation over loopback
+/// or a LAN, and far short of "for ever".
+const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+static BODY_READ_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn body_read_timeout() -> std::time::Duration {
+    match BODY_READ_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => BODY_READ_TIMEOUT,
+        ms => std::time::Duration::from_millis(ms),
+    }
+}
+
+/// Test-only: shorten the body deadline. `0` restores the default.
+#[doc(hidden)]
+pub fn set_body_read_timeout_for_test(millis: u64) {
+    BODY_READ_TIMEOUT_MS.store(millis, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// How many upstream events may sit waiting for the downstream socket.
 ///
 /// **The queue has to be bounded, or the connection cap bounds nothing that
@@ -349,16 +379,31 @@ async fn completions_response(
     request: Request<Incoming>,
     shutdown: Shutdown,
 ) -> Response<ProxyBody> {
-    let collected = match Limited::new(request.into_body(), MAX_REQUEST_BYTES)
-        .collect()
-        .await
+    // **Bounded in both dimensions, because they are different dimensions.**
+    // `Limited` bounds the bytes; the deadline bounds the clock. Hyper's own
+    // deadline ended with the head, so a caller that declares a body under the
+    // cap and sends it arbitrarily slowly held a connection slot with nothing
+    // started — every slot, given a key and a loop.
+    let collected = match tokio::time::timeout(
+        body_read_timeout(),
+        Limited::new(request.into_body(), MAX_REQUEST_BYTES).collect(),
+    )
+    .await
     {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(_)) => {
             return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "invalid_request_error",
                 "The request body is larger than this proxy will read.",
+                None,
+            );
+        }
+        Err(_) => {
+            return error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "invalid_request_error",
+                "The request body did not arrive in time.",
                 None,
             );
         }

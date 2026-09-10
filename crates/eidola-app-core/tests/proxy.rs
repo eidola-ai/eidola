@@ -1792,3 +1792,63 @@ fn a_proxied_completion_does_not_follow_a_redirect() {
         );
     });
 }
+
+/// REGRESSION: **a body that never finishes arriving does not hold a slot.**
+///
+/// `Limited::collect()` bounds the byte count and hyper's deadline ends with
+/// the head, so a caller that declared a body under the cap and then sent it
+/// arbitrarily slowly occupied a connection slot having authenticated and
+/// started nothing — every slot, given a key and a loop.
+#[test]
+fn a_body_that_stops_arriving_ends_the_request() {
+    run(|| {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        http::set_body_read_timeout_for_test(200);
+        let outcome = runtime.block_on(async {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let serving = tokio::spawn(http::serve_connection(
+                Arc::clone(&core),
+                server,
+                Shutdown::default(),
+            ));
+            let (mut reader, mut writer) = tokio::io::split(client);
+            // A head promising a body, and a body that stops after a few bytes.
+            let head = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+                 Authorization: Bearer {key}\r\nContent-Type: application/json\r\n\
+                 Content-Length: 4096\r\n\r\n"
+            );
+            writer.write_all(head.as_bytes()).await.expect("head");
+            writer
+                .write_all(b"{\"model\":")
+                .await
+                .expect("a little body");
+            writer.flush().await.expect("flush");
+
+            // Bounded, because the defect's shape is a wait that never ends.
+            let answered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut raw = Vec::new();
+                reader.read_to_end(&mut raw).await.expect("read the answer");
+                raw
+            })
+            .await;
+            let _ = serving.await;
+            answered
+        });
+        http::set_body_read_timeout_for_test(0);
+
+        let raw =
+            outcome.expect("the request ends on its own deadline rather than waiting for ever");
+        let text = String::from_utf8_lossy(&raw).to_string();
+        assert!(
+            text.starts_with("HTTP/1.1 408"),
+            "the caller is told its body never arrived: {text}"
+        );
+    });
+}
