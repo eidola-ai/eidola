@@ -670,18 +670,6 @@ impl FindOverlay {
         }
     }
 
-    /// Forget everything that was an answer about the **previous** query: the
-    /// reader's place in a result list that no longer exists, the measured
-    /// heights of fragments that are gone, and the editor states behind them.
-    /// The retention rule is "while the query is unchanged", so this is where
-    /// it ends.
-    /// Drop every per-fragment cell whose fragment this frame no longer has.
-    ///
-    /// The heights and the editor states are keyed by fragment id, and a
-    /// fragment cut from a live editor carries a stamp of its own content — so
-    /// a reader typing in a draft supersedes that draft's cards on every
-    /// keystroke. Without this the maps would grow one entry per edit and hold
-    /// an editor entity for each until the query moved.
     /// How many cards hold a real measurement — the test seam behind
     /// [`SpaceView::find_measured_cards_for_test`].
     pub(crate) fn measured_cards(&self) -> usize {
@@ -693,6 +681,13 @@ impl FindOverlay {
         self.heights.borrow().get(id).copied()
     }
 
+    /// Drop every per-fragment cell whose fragment this frame no longer has.
+    ///
+    /// The heights and the editor states are keyed by fragment id, and a
+    /// fragment cut from a live editor carries a stamp of its own content — so
+    /// a reader typing in a draft supersedes that draft's cards on every
+    /// keystroke. Without this the maps would grow one entry per edit and hold
+    /// an editor entity for each until the query moved.
     pub(crate) fn retain_results(&mut self, live: &HashSet<SharedString>) {
         self.heights.borrow_mut().retain(|id, _| live.contains(id));
         self.bodies.retain(|id, _| live.contains(id));
@@ -716,6 +711,11 @@ impl FindOverlay {
         self.bodies.len()
     }
 
+    /// Forget everything that was an answer about the **previous** query: the
+    /// reader's place in a result list that no longer exists, the measured
+    /// heights of fragments that are gone, and the editor states behind them.
+    /// The retention rule is "while the query is unchanged", so this is where
+    /// it ends.
     pub(crate) fn forget_results(&mut self) {
         self.cursor = 0;
         self.scroll.set_offset(gpui::point(px(0.), px(0.)));
@@ -1897,10 +1897,15 @@ impl SpaceView {
             // **The focused dot is built whatever the band says.** A tracked
             // handle on an element nobody paints is the dead slot this window's
             // focus doctrine is built around, and the map scrolling under a
-            // reader standing on a dot is the one way the band could produce
-            // one. `prune_map_slots` still answers the *other* way a dot stops
-            // being a stop — its post ceasing to match — which is a fact about
-            // the results rather than about the viewport.
+            // reader standing on a dot is the one way a band could produce one.
+            // *Belt-and-braces, honestly*: the reveal above runs first and
+            // writes the offset the band is then read from, so a focused dot is
+            // in view — and therefore in band — by construction on every frame
+            // that renders one. This makes the invariant structural rather than
+            // dependent on that ordering, which is why it has no regression of
+            // its own. `prune_map_slots` still answers the *other* way a dot
+            // stops being a stop — its post ceasing to match — which is a fact
+            // about the results rather than about the viewport.
             let focused = has && slots.get(&node.node).is_some_and(|h| h.is_focused(window));
             if !cell_in_band(node.depth, node.lane) && !focused {
                 continue;
