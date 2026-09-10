@@ -1368,6 +1368,87 @@ fn a_request_that_cannot_be_built_is_still_recorded() {
     });
 }
 
+/// REGRESSION: **a pass-through sends the options the caller sent, and no
+/// others.**
+///
+/// `stream_options: {"include_usage": true}` was added to every streaming
+/// request on a route that does not bill — and both zero-spend route kinds
+/// carry no pricing, so "does not bill" swept up **external** OpenAI backends
+/// alongside engine-backed ones. On a strict OpenAI-compatible server that does
+/// not implement the optional field, that rejects every proxied stream; on a
+/// lenient one it emits a usage event nobody asked for. Nothing on this path
+/// reads `usage` — a billed route settles from the refund the server hands
+/// back — so the question was never about billing at all.
+///
+/// Both halves are asserted, because "send nothing" would be the other bug:
+/// the caller who *does* ask still gets the field.
+#[test]
+fn a_streamed_ask_carries_only_the_options_the_caller_sent() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..Default::default()
+        });
+        let key = core.runtime().block_on(async {
+            core.add_backend(eidola_app_core::NewBackend {
+                id: "acme".into(),
+                kind: eidola_app_core::BackendKind::OpenAi,
+                display_name: "Acme".into(),
+                base_url: Some(mock.base_url.clone()),
+                api_key: None,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+            })
+            .await
+            .expect("add");
+            core.set_proxy_backend_exposed("acme".to_string(), true)
+                .await
+                .expect("expose");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            ),
+        ));
+        assert_eq!(status, 200, "{body}");
+        let sent = mock.chat_bodies();
+        let first = sent.first().expect("the upstream saw a request");
+        assert!(
+            first.get("stream_options").is_none(),
+            "an option the caller never sent is not this proxy's to add: {first}"
+        );
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#,
+            ),
+        ));
+        assert_eq!(status, 200, "{body}");
+        let sent = mock.chat_bodies();
+        let second = sent.get(1).expect("the upstream saw the second request");
+        assert_eq!(
+            second.get("stream_options"),
+            Some(&serde_json::json!({"include_usage": true})),
+            "and the option the caller did send travels: {second}"
+        );
+    });
+}
+
 /// REGRESSION: **exposure is granted to a backend, not to a name.**
 ///
 /// Removal is soft (`request.backend_id` keeps a resolvable target) and

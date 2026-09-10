@@ -582,6 +582,11 @@ pub struct ProxyChatRequest {
     pub tools: Option<Vec<Value>>,
     pub tool_choice: Option<Value>,
     pub stream: bool,
+    /// Whether the caller asked for a usage chunk (`stream_options.
+    /// include_usage`). Read as a field of its own rather than forwarded as an
+    /// object, because the outer shape expresses exactly this one option and
+    /// the allowlist discipline says a key nobody decided to send is not sent.
+    pub include_usage: bool,
 }
 
 impl ProxyChatRequest {
@@ -624,6 +629,11 @@ impl ProxyChatRequest {
             tool_choice: object.get("tool_choice").cloned(),
             stream: object
                 .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            include_usage: object
+                .get("stream_options")
+                .and_then(|options| options.get("include_usage"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         })
@@ -1092,7 +1102,6 @@ impl Inner {
         wire_model: &str,
         max_completion_tokens: u32,
         stream: bool,
-        bills: bool,
     ) -> Value {
         let mut body = eidola_common::chat_completion_request_body(
             wire_model,
@@ -1100,10 +1109,24 @@ impl Inner {
             max_completion_tokens,
             request.tool_schemas(),
             stream,
-            // The Eidola server forces `include_usage` upstream regardless
-            // (accurate refunds depend on it); a local engine only reports
-            // usage when asked. The same rule the app's own turns take.
-            stream && !bills,
+            // **The caller's option, not a rule about billing.** This asked for
+            // usage on every route that does not bill — which is *both*
+            // zero-spend kinds, an engine and an external OpenAI backend, since
+            // neither carries pricing. On an external backend that is a field
+            // the downstream never sent: a strict OpenAI-compatible server that
+            // does not implement it rejects every proxied stream, and a lenient
+            // one emits a usage event nobody asked for.
+            //
+            // The app's own turns ask because they *consume* usage — the token
+            // counts go on the `inference` row. Nothing on this path reads
+            // `usage` at all: a billed route settles from the refund the server
+            // hands back, and a zero-spend route settles nothing. So the honest
+            // rule here is the pass-through one: ask exactly when the caller
+            // asked, on every route kind. (A billed route gets a usage chunk
+            // regardless, because the Eidola server forces `include_usage`
+            // upstream for its own refunds — asking or not asking changes
+            // nothing there.)
+            stream && request.include_usage,
         );
         if let Some(object) = body.as_object_mut() {
             for (key, value) in [
@@ -1183,13 +1206,8 @@ impl Inner {
         let mut route = self.open_proxy_route(&target).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(&request, route.declared_max_output);
-        let body = Self::proxy_request_body(
-            &request,
-            &route.wire_model,
-            max_completion_tokens,
-            false,
-            route.pricing.is_some(),
-        );
+        let body =
+            Self::proxy_request_body(&request, &route.wire_model, max_completion_tokens, false);
 
         let cfg = self.load_config();
         let now = now_ms();
@@ -1418,13 +1436,8 @@ impl Inner {
         let mut route = self.open_proxy_route(&target).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(&request, route.declared_max_output);
-        let body = Self::proxy_request_body(
-            &request,
-            &route.wire_model,
-            max_completion_tokens,
-            true,
-            route.pricing.is_some(),
-        );
+        let body =
+            Self::proxy_request_body(&request, &route.wire_model, max_completion_tokens, true);
 
         let cfg = self.load_config();
         let now = now_ms();
@@ -2228,6 +2241,7 @@ mod tests {
             "tools": [{"type": "function"}],
             "tool_choice": "auto",
             "stream": true,
+            "stream_options": {"include_usage": true, "something_else": 1},
             "max_tokens": 128,
             "logit_bias": {"1": 2},
             "x-vendor-extension": "whatever a future SDK sends"
@@ -2240,7 +2254,7 @@ mod tests {
 
         // The unknown fields are simply not represented — there is nowhere for
         // them to be forwarded from.
-        let upstream = Inner::proxy_request_body(&request, "m", 128, true, false);
+        let upstream = Inner::proxy_request_body(&request, "m", 128, true);
         let object = upstream.as_object().expect("object");
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -2263,6 +2277,52 @@ mod tests {
         assert_eq!(
             object["model"], "m",
             "the backend's own id goes on the wire"
+        );
+        assert_eq!(
+            object["stream_options"],
+            serde_json::json!({"include_usage": true}),
+            "the one option the outer shape expresses, rebuilt rather than \
+             forwarded — `something_else` is a key nobody decided to send"
+        );
+    }
+
+    /// **Asking for usage is the caller's decision on every route kind.**
+    ///
+    /// It used to be `stream && !bills`, which is a fact about billing standing
+    /// in for a fact about the caller — and it swept up external OpenAI
+    /// backends, which carry no pricing either, adding a field the downstream
+    /// never sent to a server that may not implement it.
+    #[test]
+    fn a_usage_chunk_is_asked_for_only_when_the_caller_asked() {
+        let ask = |stream_options: Value, stream: bool| {
+            let mut body = serde_json::json!({
+                "model": "m@acme",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": stream,
+            });
+            if !stream_options.is_null() {
+                body["stream_options"] = stream_options;
+            }
+            let request = ProxyChatRequest::from_json(&body).expect("read");
+            Inner::proxy_request_body(&request, "m", 128, stream)
+                .get("stream_options")
+                .cloned()
+        };
+        assert_eq!(ask(Value::Null, true), None, "nothing asked, nothing added");
+        assert_eq!(
+            ask(serde_json::json!({"include_usage": false}), true),
+            None,
+            "and `false` is an answer, not an absence"
+        );
+        assert_eq!(
+            ask(serde_json::json!({"include_usage": true}), true),
+            Some(serde_json::json!({"include_usage": true})),
+            "asked for, so sent"
+        );
+        assert_eq!(
+            ask(serde_json::json!({"include_usage": true}), false),
+            None,
+            "the option means nothing off a stream, so it never travels on one"
         );
     }
 
