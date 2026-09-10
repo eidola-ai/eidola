@@ -23403,6 +23403,126 @@ fn space_find_bounds_the_editors_it_keeps_while_the_query_stands(cx: &mut TestAp
     );
 }
 
+/// **The cover is decided by the window's width, so a resize owes the keyboard
+/// too.**
+///
+/// Opening the panel wide splits, which covers nothing and correctly takes
+/// nothing; dragging that window narrower flips the layout decision during
+/// render, with no door called — so the scrim went up over a Find-all whose
+/// results list still had the keys.
+#[gpui::test]
+fn space_a_resize_into_the_covering_layout_takes_the_keyboard_too(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: a split panel leaves the keyboard where it was"
+    );
+
+    // The reader drags the window narrower. Nothing calls ⌥⌘I.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the newly covered list gives the keyboard up"
+    );
+    assert!(
+        vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "…to the panel now standing over it"
+    );
+}
+
+/// **A rung answers only for a surface the reader can see.**
+///
+/// The find rungs were ordered innermost-first on the premise that nothing
+/// covers them — which the panel's overlay form breaks wholesale. An Escape
+/// from the panel used to reach past it and collapse the hidden Find-all,
+/// spending search state behind a scrim that did not itself change.
+#[gpui::test]
+fn space_escape_answers_for_the_panel_that_covers_the_search(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.inspector_open_for_test()),
+        "the press answers for the panel — the one thing the reader can see"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "…and the search behind it is untouched"
+    );
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "…with the keyboard handed back to it"
+    );
+
+    // The next press finds the pane uncovered and answers for what is now in
+    // front — the chain's ordinary innermost-first rule, resumed.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the overlay collapses once it is the surface in front"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…one rung at a time, so the bar it hangs off is still up"
+    );
+}
+
 /// **The other half of what a covering surface owes: the tab order.**
 ///
 /// The find bar and the Find-all overlay lift [`focus::Covered`] for their own

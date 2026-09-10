@@ -146,6 +146,40 @@ impl SpaceView {
         self.inspector_layout(crate::chrome::content_size(window).width) == InspectorLayout::Overlay
     }
 
+    /// Take the keyboard off the surface this panel is about to cover.
+    ///
+    /// The move itself, so the two places that make it — the ⌥⌘I press and the
+    /// per-frame watcher below — cannot make different ones.
+    fn hand_keyboard_to_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inspector_covers_pane(window) && self.find_holds_focus(window, cx) {
+            window.focus(&self.inspector_focus, cx);
+        }
+    }
+
+    /// Watch the covering predicate across frames and pay what a *rise* owes.
+    ///
+    /// **The layout decision is a function of the window's width, so it moves
+    /// without anyone calling a door.** Opening the panel at a wide window
+    /// splits, which covers nothing and correctly takes nothing; dragging that
+    /// window narrower then flips `inspector_covers_pane` **during layout**,
+    /// and `set_inspector_open` is not called again — so the scrim went up over
+    /// a Find-all whose results list still had the keyboard, arrows and Enter
+    /// driving a list behind it. The handoff therefore follows the *predicate*
+    /// rather than the door: it is asked once a frame, beside the frame's own
+    /// `inspector_layout`, and the rising edge is what owes the move.
+    ///
+    /// Only the rise: a *fall* (widening back, or closing) leaves the panel
+    /// painted beside the pane or gone entirely, and the close's own arm
+    /// already returns the borrow. Recorded rather than derived because an edge
+    /// is by definition a fact about two frames.
+    pub(crate) fn sync_inspector_cover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let covering = self.inspector_covers_pane(window);
+        if covering && !self.inspector_covered {
+            self.hand_keyboard_to_inspector(window, cx);
+        }
+        self.inspector_covered = covering;
+    }
+
     /// `Space ▸ Show/Hide Inspector` (⌥⌘I) — the only door, by design.
     pub fn toggle_inspector(
         &mut self,
@@ -183,9 +217,13 @@ impl SpaceView {
             // AccessKit can report focus on. Find-all is deliberately left
             // standing — the reader's search is not this verb's to spend, and
             // closing the panel hands the keyboard back.
-            if self.inspector_covers_pane(window) && self.find_holds_focus(window, cx) {
-                window.focus(&self.inspector_focus, cx);
-            }
+            //
+            // Eager, though [`Self::sync_inspector_cover`] would catch this
+            // very edge on the next frame: ⌥⌘I is the one way the predicate
+            // rises that a reader is *pressing a key* through, so the frame
+            // their press produced is the frame that must not leave the
+            // keyboard behind the scrim.
+            self.hand_keyboard_to_inspector(window, cx);
         } else {
             self.inspector_router_picker = false;
             // The dropdowns are transient by nature and must not come back with

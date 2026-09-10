@@ -496,7 +496,15 @@ impl SpaceView {
         // printable behind it would start a draft on a page nobody can see —
         // the defect `space_an_open_picker_keeps_printables_out_of_the_conversation`
         // pins, reached through a surface that happens to fill the window.
-        self.find_overlay_open()
+        // **And the inspector's overlay form is a member exactly while it
+        // covers the pane.** In that form the panel paints a full-window scrim
+        // after the conversation, so a printable behind it starts a draft on a
+        // page nobody can see and an arrow drives a list behind it — the
+        // Find-all overlay's own membership, reached by the other cover. Its
+        // *split* form is a column beside the page and no such thing, which is
+        // why this asks the layout rather than `inspector_open`.
+        self.inspector_covers_pane(window)
+            || self.find_overlay_open()
             || self.find_holds_focus(window, cx)
             || self.context_menu.is_some()
             || self.band_menu.is_some()

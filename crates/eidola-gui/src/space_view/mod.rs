@@ -547,6 +547,11 @@ pub struct SpaceView {
     /// the element's: without them the panel's `AUX` region would silently
     /// become index 0 and reorder the whole window's Tab walk.
     pub(crate) inspector_focus: FocusHandle,
+    /// Whether the panel was **covering** the conversation pane on the last
+    /// frame — the other half of an edge (see
+    /// [`SpaceView::sync_inspector_cover`]). The layout decision is a function
+    /// of the window's width, so it moves with a resize and through no door.
+    pub(crate) inspector_covered: bool,
     /// The open right-click menu over one of the space's editors, if any —
     /// window-local transient state, like the band menu and the picker (one
     /// open at a time; see [`context_menu`]).
@@ -1134,6 +1139,7 @@ impl SpaceView {
                 .focus_handle()
                 .tab_index(crate::focus::region::AUX)
                 .tab_stop(false),
+            inspector_covered: false,
             context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
@@ -2947,6 +2953,10 @@ impl Render for SpaceView {
         // …and an invite form over a space that turns out to be a notebook: the
         // grant door is withheld there, and a form is a door left standing.
         self.sync_inspector_invite(window, cx);
+        // The panel's *covering* is decided by the width just read, so a resize
+        // can raise it with no door called — and a rise owes the keyboard.
+        // Before `sync_tree_focus`, which asks who owns it.
+        self.sync_inspector_cover(window, cx);
         // Tree focus is *observed*, not merely bookkept: see
         // `keyboard::sync_tree_focus`.
         self.sync_tree_focus(window, cx);
@@ -3379,9 +3389,24 @@ impl Render for SpaceView {
             // no-op when no menu is open.
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
+                    // **A rung answers only for a surface the reader can see.**
+                    // The chain is ordered innermost-first, which is the right
+                    // rule while everything in it is in front of everything
+                    // below it — and the inspector's *overlay* form breaks that
+                    // premise wholesale: its scrim covers the conversation
+                    // pane, so every rung belonging to the pane (this menu, the
+                    // quote picker, the Find-all overlay, the bar, and the
+                    // conversation's own levels below) would spend state behind
+                    // it while the visible surface did not change. The panel's
+                    // own rung is placed among them at the depth it actually
+                    // sits — inside its dropdowns, outside everything in the
+                    // pane — so the pane's later rungs need no gate of their
+                    // own: they are unreachable while it stands, and the two
+                    // that *precede* it ask.
+                    let covered = this.inspector_covers_pane(window);
                     // Rung 1 of the Escape chain (see `keyboard`): the menu
                     // wins, and consumes the press.
-                    if this.close_context_menu(cx) {
+                    if !covered && this.close_context_menu(cx) {
                         return;
                     }
                     // Then the inspector's own dropdown — the same
@@ -3393,12 +3418,27 @@ impl Render for SpaceView {
                     }
                     // …and the quote-destination picker, an overlay of the
                     // same kind over the conversation itself.
-                    if this.close_quote_destination(window, cx) {
+                    if !covered && this.close_quote_destination(window, cx) {
                         return;
                     }
                     // …and its Participants section's model dropdown, which is
                     // the same kind of overlay over the same panel.
                     if this.close_inspector_participant_picker(cx) {
+                        return;
+                    }
+                    // …then the **covering panel itself**. It is a member of
+                    // `transient_overlay_open` exactly while it covers, so it
+                    // answers Escape as every other transient overlay in this
+                    // window does — and closing it is what makes the press
+                    // never inert *and* never destructive: the panel's own
+                    // close hands the keyboard back to the search it borrowed
+                    // from, and the next press finds the pane uncovered and
+                    // answers for what is now in front. In the split form it is
+                    // a column beside the page rather than an overlay over it,
+                    // so it takes no rung at all and Escape reaches the
+                    // conversation as it always did.
+                    if covered {
+                        this.set_inspector_open(false, window, cx);
                         return;
                     }
                     // …and the find surface, **innermost first**: the Find-all
@@ -3407,7 +3447,8 @@ impl Render for SpaceView {
                     // search away from a reader who was reading its results.
                     // Ungated, unlike the bar's rung below: the overlay covers
                     // the window, so there is nothing behind it an Escape could
-                    // sensibly have been meant for.
+                    // sensibly have been meant for — and the one surface that
+                    // covers *it* has already answered above.
                     if this.close_find_overlay(window, cx) {
                         return;
                     }
