@@ -2049,3 +2049,98 @@ fn the_proxys_deadline_seams_are_compiled_only_for_tests() {
         "the seam set is closed: a new one joins this list deliberately, gated"
     );
 }
+
+/// **The permission is read with the row it is about, at the moment of use.**
+///
+/// A settings snapshot names backend *ids*, and an id is not an incarnation:
+/// `remove_backend` soft-deletes the row and drops its exposure, and re-adding
+/// the same id revives it with a different base URL and a different key, not
+/// exposed. So authorizing from the snapshot and then resolving the live row
+/// asks two questions about two different things — with a whole request's
+/// network and engine latency in between, which is why this stages the gap
+/// rather than racing it.
+///
+/// What the window sees here is the withdrawal by its **effect**, which is what
+/// a removal leaves behind: no exposure row for that id. The other half of the
+/// incarnation story — that a removal really does take the permission with it,
+/// so a revived row comes back unexposed — is `db::exposed_backend`'s own
+/// assertion below.
+#[test]
+fn a_permission_withdrawn_mid_request_is_not_authorized_by_the_snapshot() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let mut window = core.test_open_proxy_resolve_window();
+        let asking = {
+            let core = Arc::clone(&core);
+            let key = key.clone();
+            runtime.spawn(async move {
+                exchange(
+                    &core,
+                    &post(
+                        "/v1/chat/completions",
+                        &key,
+                        &format!(
+                            r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#
+                        ),
+                    ),
+                )
+                .await
+            })
+        };
+
+        let (status, body) = runtime.block_on(async {
+            let resume = window.recv().await.expect("the request reaches the window");
+            // The reader takes the permission back while the request is in
+            // flight, exactly as a remove-and-re-add would.
+            core.set_proxy_backend_exposed("eidola".to_string(), false)
+                .await
+                .expect("withdraw");
+            let _ = resume.send(());
+            asking.await.expect("the request finishes")
+        });
+
+        assert_eq!(
+            status, 404,
+            "a snapshot taken before the withdrawal must not authorize the request: {body}"
+        );
+        assert!(body.contains("model_not_found"), "{body}");
+    });
+}
+
+/// **A removal takes the exposure with it, so the read that authorizes finds
+/// nothing on a revived row.**
+///
+/// The join is what makes the two one question; this is the join answering.
+#[test]
+fn a_revived_backend_is_not_exposed_by_the_permission_its_predecessor_held() {
+    run(|| {
+        let (_mock, core, dir) = core_for(MockConfig::default());
+        let data_dir = dir.path().join("data");
+        let runtime = core.runtime();
+        runtime.block_on(async {
+            core.set_proxy_backend_exposed("eidola".to_string(), true)
+                .await
+                .expect("expose");
+            let db = eidola_app_core::db::open(&data_dir).await.expect("open");
+            let conn = eidola_app_core::db::connect(&db).await.expect("connect");
+            assert!(
+                eidola_app_core::db::exposed_backend(&conn, "eidola")
+                    .await
+                    .expect("read")
+                    .is_some(),
+                "an exposed live backend is what the read is for"
+            );
+            assert!(
+                eidola_app_core::db::exposed_backend(&conn, "local")
+                    .await
+                    .expect("read")
+                    .is_none(),
+                "a live backend nobody ticked is not authorized"
+            );
+        });
+    });
+}

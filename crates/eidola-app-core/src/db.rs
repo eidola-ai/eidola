@@ -8757,6 +8757,46 @@ pub async fn list_proxy_backends(conn: &Connection) -> Result<Vec<String>, AppEr
     Ok(ids)
 }
 
+/// The live backend of that id **if the proxy is allowed to reach it**, in one
+/// statement.
+///
+/// **The permission and the row it is about are read together, or neither is
+/// what the other was granted for.** Exposure is granted to an *incarnation*:
+/// removal is soft, `insert_backend` revives a row of the same id overwriting
+/// every configuration column, and `remove_backend` therefore drops the
+/// exposure with the row (see there). So a caller that checks a settings
+/// snapshot for the id and *then* reads the backend is checking one incarnation
+/// and using another: a remove-and-re-add landing in between clears the
+/// permission the snapshot still shows, and the request goes to whatever base
+/// URL and key the new row carries — a destination nobody ticked. The
+/// snapshot's age is not the defect; asking two questions is, and the gap is
+/// wide because a request pauses between them for network and engine work.
+///
+/// One statement is one point in time, which is the same shape the write side
+/// takes for the same reason ([`set_proxy_backend`]'s single transaction):
+/// whichever of this read and a concurrent removal reaches the database first,
+/// the other sees a committed state and decides against *that*. What comes back
+/// is the row the request will actually be sent to, and its being here at all
+/// is the authorization.
+pub async fn exposed_backend(conn: &Connection, id: &str) -> Result<Option<BackendRow>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {BACKEND_COLUMNS} FROM backend WHERE id = ?1 \
+             AND removed_at IS NULL AND enabled = 1 \
+             AND id IN (SELECT backend_id FROM proxy_backend)"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(backend_row_from(&row)?)),
+        None => Ok(None),
+    }
+}
+
 /// Every exposure row, live backend or not — what the settings pane's
 /// checkboxes read, so a backend the user disabled still shows its exposure
 /// choice rather than silently losing it.

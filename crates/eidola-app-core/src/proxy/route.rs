@@ -789,19 +789,39 @@ impl Inner {
     /// the stale-selection refusal on the turn path: the only thing worse than
     /// this failure would be quietly answering from somewhere the reader did
     /// not agree to.
+    ///
+    /// **And it is checked against the row the request will be sent to, in the
+    /// same read.** A settings snapshot names ids, and an id is not an
+    /// incarnation: `remove_backend` + `insert_backend` puts a different base
+    /// URL and a different key behind the same name, and the removal is what
+    /// drops the exposure. Authorizing from the snapshot and then resolving the
+    /// live row is therefore two questions about two different things, with a
+    /// request's own network and engine latency in between — so the permission
+    /// and the row come back from one statement ([`db::exposed_backend`]) and
+    /// this reads neither `settings.backends` nor anything else taken earlier.
+    /// It is the decide-at-the-write rule read from the other side: the read
+    /// that authorizes is the read that resolves.
+    ///
+    /// A backend that is not exposed, one that was removed, and one that was
+    /// disabled all answer the same refusal, deliberately. They are one fact to
+    /// the caller — this proxy will not serve that model — and a key holder is
+    /// owed no way to tell a backend that exists from one that does not.
     async fn resolve_proxy_target(
         &self,
-        settings: &ProxySettings,
         model_ref: &str,
     ) -> Result<crate::utility::UtilityTarget, AppError> {
+        // The gap this stages is the one the doc above is about: a settings
+        // snapshot is already in hand, and the read below is what decides.
+        #[cfg(feature = "test-support")]
+        crate::subspace_driver::pause_in_window(&self.proxy_resolve_window).await;
         let mref = backends::parse_model_ref(model_ref);
-        if !settings.backends.contains(&mref.backend_id) {
+        let conn = self.db_conn().await?;
+        let Some(backend) = db::exposed_backend(&conn, &mref.backend_id).await? else {
             return Err(AppError::ModelUnavailable {
                 model: model_ref.to_string(),
             });
-        }
-        let conn = self.db_conn().await?;
-        self.resolve_utility_target(&conn, model_ref, "proxy").await
+        };
+        crate::utility::utility_target_for(backend, mref, "proxy")
     }
 
     /// Open the route: lease or start the engine, build the client, verify and
@@ -1090,7 +1110,7 @@ impl Inner {
         request: ProxyChatRequest,
     ) -> Result<ProxyChatResponse, AppError> {
         let settings = self.proxy_settings().await?;
-        let target = self.resolve_proxy_target(&settings, &request.model).await?;
+        let target = self.resolve_proxy_target(&request.model).await?;
         let mut route = self.open_proxy_route(&settings, &target).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(&request, route.declared_max_output);
@@ -1283,7 +1303,7 @@ impl Inner {
         sender: tokio::sync::mpsc::Sender<ProxyStreamEvent>,
     ) -> Result<(), AppError> {
         let settings = self.proxy_settings().await?;
-        let target = self.resolve_proxy_target(&settings, &request.model).await?;
+        let target = self.resolve_proxy_target(&request.model).await?;
         let mut route = self.open_proxy_route(&settings, &target).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(&request, route.declared_max_output);

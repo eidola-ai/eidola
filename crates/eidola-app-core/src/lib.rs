@@ -2073,6 +2073,15 @@ struct Inner {
     #[cfg(feature = "test-support")]
     claim_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **between a proxied request's settings snapshot
+    /// and the read that authorizes it**. A backend removed and re-added in
+    /// that gap keeps its id and loses its exposure, so what the authorization
+    /// is *about* is the thing that can change — and the gap is a whole
+    /// request's latency wide, which no test can hit by racing. Same shape and
+    /// same reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    proxy_resolve_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
@@ -9542,6 +9551,8 @@ impl AppCore {
                 persist_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 claim_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                proxy_resolve_window: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 plan_faults: std::sync::atomic::AtomicU32::new(0),
@@ -10794,6 +10805,29 @@ impl AppCore {
             .anchor_window
             .lock()
             .expect("anchor window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: stop the next proxied request between its settings
+    /// snapshot and the read that authorizes it (see
+    /// `Inner::proxy_resolve_window`).
+    ///
+    /// The exposure a request is authorized by is a permission over a backend
+    /// *incarnation*, and the row behind an id can be replaced while a request
+    /// is in flight — which is exactly the interleaving nothing outside can
+    /// stage. Each request that reaches the window sends a resume handle down
+    /// the returned channel and blocks until it is used.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_proxy_resolve_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .proxy_resolve_window
+            .lock()
+            .expect("proxy resolve window lock poisoned") = Some(tx);
         rx
     }
 

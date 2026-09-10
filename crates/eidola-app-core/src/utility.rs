@@ -121,6 +121,32 @@ pub(crate) fn clip_middle(text: &str, max_bytes: usize) -> String {
     format!("{}…{}", &text[..head], &text[tail..])
 }
 
+/// Build the target from a backend row already read, so the two callers that
+/// read that row differently still produce the same target.
+///
+/// The chore runner reads it by id ([`Inner::resolve_utility_target`]); the
+/// proxy reads it **joined to its own permission**, because there the row's
+/// liveness is not the whole question (`proxy::route`'s
+/// `resolve_proxy_target`). Everything after the read is identical, and this is
+/// that everything.
+pub(crate) fn utility_target_for(
+    backend: db::BackendRow,
+    mref: backends::ModelRef,
+    chore: &'static str,
+) -> Result<UtilityTarget, AppError> {
+    let kind = backends::BackendKind::parse(&backend.kind).ok_or_else(|| AppError::Database {
+        message: format!("unknown backend kind `{}`", backend.kind),
+    })?;
+    let canonical = backends::qualified_model_id(&mref.model, &backend.id);
+    Ok(UtilityTarget {
+        backend,
+        kind,
+        model: mref.model,
+        canonical,
+        chore,
+    })
+}
+
 impl Inner {
     /// Resolve a chore's model reference through the backend registry.
     ///
@@ -135,18 +161,7 @@ impl Inner {
     ) -> Result<UtilityTarget, AppError> {
         let mref = backends::parse_model_ref(model_ref);
         let backend = self.require_backend(db_conn, &mref.backend_id).await?;
-        let kind =
-            backends::BackendKind::parse(&backend.kind).ok_or_else(|| AppError::Database {
-                message: format!("unknown backend kind `{}`", backend.kind),
-            })?;
-        let canonical = backends::qualified_model_id(&mref.model, &backend.id);
-        Ok(UtilityTarget {
-            backend,
-            kind,
-            model: mref.model,
-            canonical,
-            chore,
-        })
+        utility_target_for(backend, mref, chore)
     }
 
     /// Open the route: lease or start the engine, build the client, and read
