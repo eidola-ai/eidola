@@ -320,11 +320,21 @@ impl Inner {
         // Bounded as it arrives, like every other read from a peer on this
         // crate's side of a socket (`peer_read`): a chore's answer is one
         // completion, and an engine or an external backend chooses its size.
+        //
+        // **And the ceiling is an answer, not a note.** `over_ceiling` says the
+        // bytes in hand are a prefix; parsing them anyway degrades a chore
+        // silently in the common case (truncated JSON becomes `Null`, so a
+        // successful call returns nothing usable) and lies outright in the
+        // dangerous one (a complete object followed by padding parses
+        // perfectly, and a partial answer is taken for a whole one). The hold
+        // is settled first, exactly as for a read that failed outright.
+        let what = format!("the {} response", target.chore);
         let text =
             match crate::peer_read::read_bounded(response, crate::peer_read::API_ANSWER_MAX_BYTES)
                 .await
+                .and_then(|body| crate::peer_read::whole_text(body, &what))
             {
-                Ok(body) => body.text().into_owned(),
+                Ok(text) => text,
                 Err(e) => {
                     self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
                         .await;

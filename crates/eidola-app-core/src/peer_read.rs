@@ -109,6 +109,19 @@ pub(crate) async fn read_api_answer(
 ) -> Result<(reqwest::StatusCode, String), AppError> {
     let status = response.status();
     let body = read_bounded(response, API_ANSWER_MAX_BYTES).await?;
+    Ok((status, whole_text(body, what)?))
+}
+
+/// The text of a bounded answer, or the size failure a truncated one **is**.
+///
+/// **`over_ceiling` is not advisory**, which is why the flag becomes a `Result`
+/// here rather than being left for each reader to remember. A caller that reads
+/// the bytes and drops it gets the worst of both: most oversized JSON truncates
+/// into nothing and parses as `Null`, so a silent degradation is reported as
+/// success — and the dangerous minority is a *complete* object followed by
+/// padding, where the cut lands in the padding, the object parses perfectly,
+/// and a partial answer is accepted as a whole one.
+pub(crate) fn whole_text(body: BoundedBody, what: &str) -> Result<String, AppError> {
     if body.over_ceiling {
         return Err(AppError::Network {
             message: format!(
@@ -116,7 +129,7 @@ pub(crate) async fn read_api_answer(
             ),
         });
     }
-    Ok((status, body.text().into_owned()))
+    Ok(body.text().into_owned())
 }
 
 #[cfg(test)]

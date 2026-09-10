@@ -317,6 +317,12 @@ pub enum SummaryBehavior {
     Reply(String),
     /// Non-2xx error body — the summarizer is reachable but refuses.
     Fail(u16),
+    /// A **complete** JSON completion whose assistant content is this string,
+    /// followed by megabytes of trailing whitespace — so the first bytes parse
+    /// perfectly while the body as a whole is past the ceiling this app reads.
+    /// The shape a caller that discards `over_ceiling` accepts as a whole
+    /// answer: truncation lands in the padding and the object still parses.
+    ReplyPaddedPastCeiling(String),
 }
 
 /// How the mock answers a chat request for [`ROUTER_MODEL`] — the may-decline
@@ -1095,6 +1101,14 @@ async fn handle_conn(
                 (true, SummaryBehavior::Fail(status)) => {
                     return write_json(&mut stream, *status, &error_body("summarizer unavailable"))
                         .await;
+                }
+                (true, SummaryBehavior::ReplyPaddedPastCeiling(content)) => {
+                    let body = serde_json::json!({
+                        "choices": [{ "message": { "role": "assistant", "content": content } }],
+                        "usage": { "prompt_tokens": 9, "completion_tokens": 5 },
+                    });
+                    let padded = format!("{body}{}", " ".repeat(3 * 1024 * 1024));
+                    return write_json(&mut stream, 200, &padded).await;
                 }
                 _ => {}
             }
