@@ -1510,25 +1510,61 @@ pub(crate) fn resolve_external_engine(engine_path: Option<&str>) -> Option<PathB
 
 /// A plain (non-attesting) HTTPS-capable client: native trust roots, used
 /// for model downloads and loopback engine traffic.
+///
+/// **Follows redirects, deliberately**: a model download is a `GET` for public
+/// bytes whose integrity is checked afterwards, and every large-file host
+/// redirects to a CDN. See [`proxy_http_client`] for the client that does not,
+/// and why the difference is about what the request *carries*.
 pub(crate) fn plain_http_client() -> Result<reqwest::Client, AppError> {
-    plain_client_with_agent(Some(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION"))))
+    plain_client(
+        Some(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION"))),
+        Redirects::Follow,
+    )
+}
+
+/// Whether a client follows a redirect, or hands it back as the answer.
+pub(crate) enum Redirects {
+    Follow,
+    Refuse,
 }
 
 /// The client the **local inference proxy's** own upstream requests go out on.
 ///
-/// [`plain_http_client`] without the identifying `User-Agent`, and that is the
-/// whole difference. The proxy's upstream header set is an enumerated allowlist
-/// whose "and nothing else" is a claim the Record repeats back to the reader
-/// (`proxy::route::UpstreamHeaders::for_record`), so a header the *builder*
-/// adds would travel on every proxied completion — a version fingerprint on an
-/// external backend's wire — while the row said it did not. The one surface
-/// whose whole point is that a downstream tool's headers do not go must not add
-/// one of its own behind the enumeration.
+/// Two differences from [`plain_http_client`], and both are about the fact that
+/// a proxied request carries somebody's prompt to a destination the reader
+/// ticked by name:
+///
+/// - **No `User-Agent`.** The proxy's upstream header set is an enumerated
+///   allowlist whose "and nothing else" is a claim the Record repeats back to
+///   the reader (`proxy::route::UpstreamHeaders::for_record`), so a header the
+///   *builder* adds would travel on every proxied completion — a version
+///   fingerprint on an external backend's wire — while the row said it did not.
+/// - **No redirects.** reqwest's default follows up to ten and replays a
+///   cloneable body on `307`/`308`, so an exposed external backend could answer
+///   `/v1/chat/completions` with a `Location` pointing anywhere and receive the
+///   whole prompt at an origin the reader never exposed — while the Record went
+///   on naming the configured backend, because that is the backend the request
+///   was made to. reqwest strips a cross-origin `Authorization`; it does not
+///   strip the body, and the body is the sensitive part here. A redirect is
+///   therefore handed back as the answer it is: the caller sees the upstream's
+///   own `3xx`, the Record shows it, and nothing of the reader's leaves for a
+///   destination they did not choose.
+///
+/// *Known twins, not cured here:* the turn path's own external completions
+/// (`Inner::plain_client` at the chat and chore call sites) and the attested
+/// client (`tinfoil_verifier::attesting_client`) set no redirect policy either,
+/// so both inherit reqwest's default. The attested one is bounded by its own
+/// per-connection verification against the configured host; the turn path's is
+/// the same exposure as this one and wants the same cure, but it is the chat
+/// path and belongs with the harness extension that rule requires.
 pub(crate) fn proxy_http_client() -> Result<reqwest::Client, AppError> {
-    plain_client_with_agent(None)
+    plain_client(None, Redirects::Refuse)
 }
 
-fn plain_client_with_agent(user_agent: Option<&'static str>) -> Result<reqwest::Client, AppError> {
+fn plain_client(
+    user_agent: Option<&'static str>,
+    redirects: Redirects,
+) -> Result<reqwest::Client, AppError> {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(crate::load_native_root_store())
@@ -1536,6 +1572,9 @@ fn plain_client_with_agent(user_agent: Option<&'static str>) -> Result<reqwest::
     let mut builder = reqwest::Client::builder().tls_backend_preconfigured(tls_config);
     if let Some(agent) = user_agent {
         builder = builder.user_agent(agent);
+    }
+    if matches!(redirects, Redirects::Refuse) {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
     }
     builder.build().map_err(|e| AppError::LocalModel {
         message: format!("constructing HTTP client: {e}"),

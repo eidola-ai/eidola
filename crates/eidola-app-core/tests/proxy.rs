@@ -1683,3 +1683,112 @@ fn a_backend_that_stalls_on_pricing_does_not_hold_the_completion() {
         );
     });
 }
+
+/// REGRESSION: **a proxied prompt does not follow a redirect.**
+///
+/// reqwest's default policy follows up to ten and replays a cloneable body on
+/// `307`/`308`, so an exposed external backend could answer
+/// `/v1/chat/completions` with a `Location` pointing anywhere and be handed the
+/// whole prompt at an origin the reader never exposed — with the Record still
+/// naming the backend that was configured. The `Authorization` is stripped
+/// cross-origin by reqwest; the body is not, and the body is what matters here.
+#[test]
+fn a_proxied_completion_does_not_follow_a_redirect() {
+    run(|| {
+        // The destination the redirect points at: it records anything it is
+        // handed, and must be handed nothing.
+        let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let elsewhere_port = elsewhere.local_addr().expect("addr").port();
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw = Arc::clone(&reached);
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = elsewhere.accept() {
+                use std::io::{Read, Write};
+                saw.store(true, std::sync::atomic::Ordering::SeqCst);
+                let mut scratch = [0u8; 1024];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+            }
+        });
+
+        // The exposed backend, which answers only with a redirect.
+        let backend = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let backend_port = backend.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while let Ok((mut stream, _)) = backend.accept() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let text = String::from_utf8_lossy(&head).to_string();
+                let length: usize = text
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut rest = vec![0u8; length];
+                let _ = stream.read_exact(&mut rest);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 307 Temporary Redirect\r\n\
+                     Location: http://127.0.0.1:{elsewhere_port}/v1/chat/completions\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+
+        // An ordinary core: the harness's injected client would answer for the
+        // one the route builds, and the policy *is* what is being held.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("core");
+        let key = core.runtime().block_on(async {
+            core.add_backend(eidola_app_core::NewBackend {
+                id: "acme".into(),
+                kind: eidola_app_core::BackendKind::OpenAi,
+                display_name: "Acme".into(),
+                base_url: Some(format!("http://127.0.0.1:{backend_port}")),
+                api_key: None,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+            })
+            .await
+            .expect("add");
+            core.set_proxy_backend_exposed("acme".to_string(), true)
+                .await
+                .expect("expose");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        let core = Arc::new(core);
+
+        let (status, body) = core.runtime().block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                r#"{"model":"m@acme","messages":[{"role":"user","content":"a private prompt"}]}"#,
+            ),
+        ));
+        assert_eq!(
+            status, 307,
+            "the upstream's own answer reaches the caller rather than being chased: {body}"
+        );
+        assert!(
+            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            "and the prompt never left for an origin the reader did not expose"
+        );
+    });
+}
