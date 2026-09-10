@@ -1838,6 +1838,11 @@ fn a_body_that_stops_arriving_ends_the_request() {
                 raw
             })
             .await;
+            // **Aborted, never awaited.** Without the deadline the connection
+            // task is still waiting on a body that will never finish, so
+            // awaiting it here would turn this test into a hang — and a hang
+            // says nothing. The answer above is what is being asserted.
+            serving.abort();
             let _ = serving.await;
             answered
         });
