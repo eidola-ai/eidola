@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::{Link, SpanKind, TraceContextExt, TraceId, TracerProvider as _};
+use opentelemetry_otlp::WithHttpConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SamplingDecision, SamplingResult, ShouldSample, SpanProcessor};
@@ -204,10 +205,37 @@ where
         .with_context_activation(false)
 }
 
+/// The HTTP client all three OTLP exporters send through.
+///
+/// Left to itself the exporter builds a default `reqwest` 0.13 client, which
+/// verifies against the platform trust store — and the server runs `FROM
+/// scratch` with none, so that client cannot be built and an HTTPS collector
+/// (Grafana Cloud in production) is unreachable. This client carries the
+/// bundled Mozilla roots every other outbound client here uses
+/// ([`crate::tls_config`]). A client handed to the exporter does not inherit
+/// the exporter's timeout, so it sets the OTLP default (10 s) itself. Built on
+/// its own thread, as the exporter builds its default, because a blocking
+/// client must not be constructed inside the tokio runtime `main` runs in.
+fn otlp_http_client() -> reqwest::blocking::Client {
+    std::thread::spawn(|| {
+        reqwest::blocking::Client::builder()
+            .tls_backend_preconfigured(crate::tls_config())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build OTLP HTTP client")
+    })
+    .join()
+    .expect("OTLP HTTP client thread panicked")
+}
+
 /// Create OTel providers for traces, metrics, and logs via OTLP/HTTP.
 fn init_otel_providers() -> Option<OtelGuard> {
     // Only enable when an endpoint is configured.
     std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
+
+    // `reqwest::blocking::Client` is a handle to one shared connection pool,
+    // so the three exporters share it by clone.
+    let http_client = otlp_http_client();
 
     let service_name =
         std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "eidola-server".to_string());
@@ -225,6 +253,7 @@ fn init_otel_providers() -> Option<OtelGuard> {
     // ordinary traffic.
     let trace_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
+        .with_http_client(http_client.clone())
         .build()
         .expect("failed to create OTLP trace exporter");
 
@@ -238,6 +267,7 @@ fn init_otel_providers() -> Option<OtelGuard> {
     // --- Metrics ---
     let metrics_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
+        .with_http_client(http_client.clone())
         .build()
         .expect("failed to create OTLP metrics exporter");
 
@@ -254,6 +284,7 @@ fn init_otel_providers() -> Option<OtelGuard> {
     // --- Logs ---
     let log_exporter = opentelemetry_otlp::LogExporter::builder()
         .with_http()
+        .with_http_client(http_client)
         .build()
         .expect("failed to create OTLP log exporter");
 

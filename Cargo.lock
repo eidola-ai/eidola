@@ -2685,7 +2685,7 @@ dependencies = [
  "p384",
  "rand_core 0.6.4",
  "regex",
- "reqwest 0.13.5",
+ "reqwest",
  "rustls",
  "rustls-native-certs",
  "rustls-rustcrypto",
@@ -2815,8 +2815,7 @@ dependencies = [
  "p384",
  "rand_core 0.6.4",
  "regex",
- "reqwest 0.12.28",
- "reqwest 0.13.5",
+ "reqwest",
  "rustls",
  "rustls-pki-types",
  "rustls-rustcrypto",
@@ -4584,7 +4583,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
@@ -6714,7 +6712,7 @@ dependencies = [
  "bytes",
  "http",
  "opentelemetry",
- "reqwest 0.13.5",
+ "reqwest",
 ]
 
 [[package]]
@@ -6729,7 +6727,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "reqwest 0.13.5",
+ "reqwest",
  "thiserror 2.0.21",
 ]
 
@@ -8344,7 +8342,7 @@ dependencies = [
  "eidola-app-core",
  "eidola-apple",
  "eidola-attestation",
- "reqwest 0.13.5",
+ "reqwest",
  "rpassword",
  "rustls",
  "rustls-rustcrypto",
@@ -8362,43 +8360,6 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
-
-[[package]]
-name = "reqwest"
-version = "0.12.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "futures-core",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "js-sys",
- "log",
- "percent-encoding",
- "pin-project-lite",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tokio-rustls",
- "tower 0.5.3",
- "tower-http",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "webpki-roots",
-]
 
 [[package]]
 name = "reqwest"
@@ -10343,7 +10304,7 @@ dependencies = [
  "p384",
  "rand_core 0.6.4",
  "rcgen",
- "reqwest 0.13.5",
+ "reqwest",
  "rsa",
  "rustls",
  "rustls-rustcrypto",
@@ -10374,7 +10335,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "pem 3.0.6",
- "reqwest 0.13.5",
+ "reqwest",
  "rsa",
  "rustls",
  "serde",

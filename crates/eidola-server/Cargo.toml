@@ -24,8 +24,9 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 utoipa-axum = "0.2"
 
-# HTTP client for upstream requests (using rustls with pure-Rust crypto for cross-compilation)
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream", "form", "query"] }
+# HTTP client for upstream requests (using rustls with pure-Rust crypto for cross-compilation).
+# `blocking` is for the OTLP exporters' client (`telemetry::otlp_http_client`).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream", "form", "query", "blocking"] }
 
 # Pure Rust TLS crypto provider (no C/assembly dependencies)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
@@ -49,11 +50,6 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
 tracing-opentelemetry = "0.33"
 opentelemetry-appender-tracing = "0.32"
-# opentelemetry-otlp pulls in reqwest 0.12 for its HTTP exporter. That transitive
-# dep has no TLS by default, so HTTPS endpoints (like Grafana Cloud) fail. Adding
-# reqwest 0.12 here with rustls-tls-webpki-roots-no-provider enables TLS using
-# the process-global rustls-rustcrypto provider installed in main().
-reqwest-otel = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider"] }
 
 # Anonymous credentials (Privacy Pass)
 anonymous-credit-tokens = "0.4"
