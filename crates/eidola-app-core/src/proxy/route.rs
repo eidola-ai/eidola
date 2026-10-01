@@ -695,6 +695,16 @@ struct ProxyRoute {
     engine_lease: Option<local_models::EngineLease>,
 }
 
+/// A completion that has passed its preflight: a route, the body it will send,
+/// and the hold it took if the route bills.
+struct ProxyPreflight {
+    route: ProxyRoute,
+    body: Value,
+    db_conn: turso::Connection,
+    spend: Option<crate::SpendPrep>,
+    auth_value: Option<String>,
+}
+
 /// Everything a post-send attestation flush needs.
 struct AttestationSink {
     log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>>,
@@ -1339,17 +1349,39 @@ impl Inner {
         }
     }
 
-    /// One non-streaming proxied completion.
-    pub(crate) async fn proxy_chat(
+    /// Everything a completion does **before anything is sent** — and the one
+    /// door its refusals leave through.
+    ///
+    /// A request row per completion is the Record's own contract, and these
+    /// exits were where it broke: each was a `?` between authentication and
+    /// the first `record_proxy_request`, so an authenticated tool asking for a
+    /// model and being refused left nothing behind. They are every exit there
+    /// is before a send — what was refused, and why it wrote no row:
+    ///
+    /// | Exit | What refuses |
+    /// | --- | --- |
+    /// | `resolve_proxy_target` | the backend is not exposed, was removed or disabled; the profile's read failed; a target that cannot be built |
+    /// | `open_proxy_route` | an engine the exposure setting does not permit starting, auto-start off, a load that failed, an engine unloaded while starting; a catalog that did not answer, did not attest, or does not list the model |
+    /// | `db_conn` | the profile's database cannot be opened |
+    /// | the zero-charge refusal | catalog pricing that computes no charge |
+    /// | `acquire_spend` | no account, no credential to spend, the wallet read or write failed |
+    ///
+    /// **Structural rather than remembered:** [`Self::preflighted`] is the only
+    /// caller, and it records whatever this returns as an error — so an exit
+    /// added here later is recorded without anyone adding a line for it, and
+    /// none of the rows above is written per site. Past this point the request
+    /// has a route and a hold, and the transport's own arms record it.
+    async fn proxy_preflight(
         &self,
-        request: ProxyChatRequest,
-    ) -> Result<ProxyChatResponse, AppError> {
+        request: &ProxyChatRequest,
+        stream: bool,
+    ) -> Result<ProxyPreflight, AppError> {
         let (target, epoch) = self.resolve_proxy_target(&request.model).await?;
-        let mut route = self.open_proxy_route(&target, epoch).await?;
+        let route = self.open_proxy_route(&target, epoch).await?;
         let max_completion_tokens =
-            Self::proxy_completion_budget(&request, route.declared_max_output);
+            Self::proxy_completion_budget(request, route.declared_max_output);
         let body =
-            Self::proxy_request_body(&request, &route.wire_model, max_completion_tokens, false);
+            Self::proxy_request_body(request, &route.wire_model, max_completion_tokens, stream);
 
         let cfg = self.load_config();
         let now = now_ms();
@@ -1374,6 +1406,102 @@ impl Inner {
                 Some(auth)
             }
         };
+        Ok(ProxyPreflight {
+            route,
+            body,
+            db_conn,
+            spend,
+            auth_value,
+        })
+    }
+
+    /// [`Self::proxy_preflight`], with every refusal written into the Record
+    /// on its way out.
+    async fn preflighted(
+        &self,
+        request: &ProxyChatRequest,
+        stream: bool,
+    ) -> Result<ProxyPreflight, AppError> {
+        let arrived_at = now_ms();
+        // Boxed: the preflight's state (an engine load, a catalog fetch, a
+        // credential acquisition) is a large future, and nested inline in each
+        // transport's it took a debug build's worker thread past its stack.
+        let result = Box::pin(self.proxy_preflight(request, stream)).await;
+        if let Err(error) = &result {
+            self.record_proxy_refusal(request, stream, error, arrived_at)
+                .await;
+        }
+        result
+    }
+
+    /// The Record row for a completion refused before anything was sent.
+    ///
+    /// **Unattached in every column that would claim something happened.** No
+    /// `connection_id` — no transport carried this request (a catalog fetch
+    /// may have opened one, but this prompt did not go down it); no
+    /// `backend_id` — the refusal may be that there is no such backend, or
+    /// none this proxy may name, and the column is a reference to a row; no
+    /// request headers, response or credential, because none were sent, read
+    /// or spent. What it does keep is what the tool asked for: the request in
+    /// the outer shape every proxied body takes, naming the model as the
+    /// caller named it — the wire name was never resolved — at the size the
+    /// caller asked for, and the refusal in the caller's own words with the
+    /// fact the reader most needs beside it.
+    async fn record_proxy_refusal(
+        &self,
+        request: &ProxyChatRequest,
+        stream: bool,
+        error: &AppError,
+        arrived_at: i64,
+    ) {
+        let Ok(conn) = self.db_conn().await else {
+            return;
+        };
+        let asked = Self::proxy_request_body(
+            request,
+            &request.model,
+            request
+                .max_completion_tokens
+                .unwrap_or(DEFAULT_MAX_COMPLETION_TOKENS),
+            stream,
+        );
+        let refused_at = now_ms();
+        let entry = db::Request {
+            id: Uuid::now_v7().to_string(),
+            connection_id: None,
+            action_id: None,
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            request_headers: None,
+            request_body: Some(recorded_request(&asked)),
+            response_status: None,
+            response_headers: None,
+            response_body: None,
+            request_at: arrived_at,
+            response_at: Some(refused_at),
+            duration_ms: Some(refused_at - arrived_at),
+            error: Some(format!("{error} — refused before anything was sent")),
+            credential_nonce: None,
+            created_at: refused_at,
+            backend_id: None,
+        };
+        if db::insert_request(&conn, &entry).await.is_ok() {
+            self.bus.emit(Change::Record);
+        }
+    }
+
+    /// One non-streaming proxied completion.
+    pub(crate) async fn proxy_chat(
+        &self,
+        request: ProxyChatRequest,
+    ) -> Result<ProxyChatResponse, AppError> {
+        let ProxyPreflight {
+            mut route,
+            body,
+            db_conn,
+            spend,
+            auth_value,
+        } = self.preflighted(&request, false).await?;
         let nonce = spend.as_ref().map(|s| s.cred.nonce.clone());
         // Materialised **once** for this attempt: the wire and the Record row
         // then carry the same `traceparent`, which is the whole point of the
@@ -1588,36 +1716,13 @@ impl Inner {
         request: ProxyChatRequest,
         sender: tokio::sync::mpsc::Sender<ProxyStreamEvent>,
     ) -> Result<(), AppError> {
-        let (target, epoch) = self.resolve_proxy_target(&request.model).await?;
-        let mut route = self.open_proxy_route(&target, epoch).await?;
-        let max_completion_tokens =
-            Self::proxy_completion_budget(&request, route.declared_max_output);
-        let body =
-            Self::proxy_request_body(&request, &route.wire_model, max_completion_tokens, true);
-
-        let cfg = self.load_config();
-        let now = now_ms();
-        let db_conn = self.db_conn().await?;
-        let mut spend = None;
-        let auth_value = match route.pricing {
-            None => route.external_auth.clone(),
-            Some(pricing) => {
-                let charge = estimate_charge_credits(
-                    &request.messages,
-                    request.tool_schemas(),
-                    max_completion_tokens,
-                    pricing,
-                );
-                if charge == 0 {
-                    return Err(AppError::Credential {
-                        message: "computed charge is zero — model pricing may be missing".into(),
-                    });
-                }
-                let (prep, auth) = self.acquire_spend(&cfg, &db_conn, charge, now).await?;
-                spend = Some(prep);
-                Some(auth)
-            }
-        };
+        let ProxyPreflight {
+            mut route,
+            body,
+            db_conn,
+            spend,
+            auth_value,
+        } = self.preflighted(&request, true).await?;
         let nonce = spend.as_ref().map(|s| s.cred.nonce.clone());
         // Materialised **once** for this attempt: the wire and the Record row
         // then carry the same `traceparent`, which is the whole point of the

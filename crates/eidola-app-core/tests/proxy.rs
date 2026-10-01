@@ -382,6 +382,121 @@ fn only_loaded_means_a_request_cannot_start_an_engine() {
 /// refused locally as a zero charge; with nonzero rates it would have held a
 /// sum the server's own worst case does not compute and been refused there.
 /// The hold is read off the spend proof that reached the wire.
+/// The Record's completion rows, newest first.
+fn completion_rows(core: &AppCore) -> Vec<eidola_app_core::RequestInfo> {
+    core.runtime()
+        .block_on(core.list_requests(50, 0))
+        .expect("record")
+        .into_iter()
+        .filter(|r| r.path == "/v1/chat/completions")
+        .collect()
+}
+
+/// Ask for one completion, blocking and then streaming, and return what each
+/// was answered with.
+fn ask_both_ways(core: &Arc<AppCore>, key: &str, model: &str) -> [(u16, String); 2] {
+    [false, true].map(|stream| {
+        core.runtime().block_on(exchange(
+            core,
+            &post(
+                "/v1/chat/completions",
+                key,
+                &format!(
+                    r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
+                ),
+            ),
+        ))
+    })
+}
+
+/// Every row a refusal before sending must be: one per ask, attached to no
+/// transport and no credential, saying it was refused before anything left.
+#[track_caller]
+fn assert_refused_before_sending(core: &AppCore, asks: usize, model: &str) {
+    let rows = completion_rows(core);
+    assert_eq!(
+        rows.len(),
+        asks,
+        "one row per refused completion, blocking and streaming alike: {rows:#?}"
+    );
+    for row in rows {
+        assert_eq!(row.response_status, None, "nothing was sent: {row:?}");
+        assert_eq!(row.transport, None, "no transport carried it: {row:?}");
+        assert_eq!(row.credential_nonce, None, "nothing was spent: {row:?}");
+        let error = row.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("refused before anything was sent"),
+            "the row says what happened: {error}"
+        );
+        let detail = core
+            .runtime()
+            .block_on(core.request_detail(row.id.clone()))
+            .expect("detail")
+            .expect("a recorded row");
+        let body =
+            String::from_utf8_lossy(detail.request_body.as_deref().unwrap_or_default()).to_string();
+        assert!(
+            body.contains(model),
+            "the row keeps what the tool asked for: {body}"
+        );
+    }
+}
+
+/// REGRESSION: **a completion refused before it is sent is still in the
+/// Record.**
+///
+/// Every exit between authentication and the first recorded exchange was a
+/// bare `?` — target resolution, the route's opening, the hold — so a tool
+/// that asked and was refused left nothing behind, while the Record's own
+/// contract is one row per proxied completion. One door now records whatever
+/// the preflight refuses; these are its exits from each stage, both
+/// transports.
+#[test]
+fn a_completion_refused_before_sending_is_still_recorded() {
+    // Resolution: a backend the reader never exposed.
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        for (status, body) in ask_both_ways(&core, &key, "nothing@local") {
+            assert_eq!(status, 404, "{body}");
+        }
+        assert_refused_before_sending(&core, 2, "nothing@local");
+    });
+
+    // The route's opening: an exposed engine backend this proxy may not start.
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let key = core.runtime().block_on(async {
+            core.set_proxy_backend_exposed("local".to_string(), true)
+                .await
+                .expect("expose local");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        let core = Arc::new(core);
+        for (status, body) in ask_both_ways(&core, &key, "nothing-loaded@local") {
+            assert_eq!(status, 404, "{body}");
+        }
+        assert_refused_before_sending(&core, 2, "nothing-loaded@local");
+    });
+
+    // The hold: a billed route with no account to spend from.
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig::default());
+        let key = armed(&core);
+        let core = Arc::new(core);
+        for (status, body) in ask_both_ways(&core, &key, MODEL) {
+            assert!(status >= 400, "{status} {body}");
+        }
+        assert_eq!(mock.chat_hits(), 0, "nothing reached the upstream");
+        assert_refused_before_sending(&core, 2, MODEL);
+    });
+}
+
 #[test]
 fn a_flat_priced_model_is_held_at_its_flat_price() {
     run(|| {
