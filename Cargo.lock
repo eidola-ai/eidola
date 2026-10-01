@@ -2661,7 +2661,7 @@ name = "eidola-app-core"
 version = "0.1.0"
 dependencies = [
  "anonymous-credit-tokens",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bytes",
  "const-oid 0.9.6",
@@ -2797,7 +2797,7 @@ dependencies = [
  "arc-swap",
  "argon2",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "const-oid 0.9.6",
  "deadpool-postgres",
@@ -2846,7 +2846,7 @@ version = "0.1.0"
 dependencies = [
  "pulldown-cmark 0.13.4",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "toml 1.1.6+spec-1.1.0",
 ]
 
@@ -7122,16 +7122,6 @@ dependencies = [
 
 [[package]]
 name = "pem"
-version = "3.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
-dependencies = [
- "base64 0.22.1",
- "serde_core",
-]
-
-[[package]]
-name = "pem"
 version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
@@ -8221,7 +8211,7 @@ version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
 dependencies = [
- "pem 4.0.0",
+ "pem",
  "ring",
  "rustls-pki-types",
  "time",
@@ -8344,7 +8334,7 @@ name = "release-tool"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "cryptoki",
@@ -10306,7 +10296,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "der",
  "hex",
  "hyper",
@@ -10336,7 +10326,7 @@ dependencies = [
 name = "tinfoil-verifier"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "der",
  "getrandom 0.4.3",
  "hex",
@@ -10344,7 +10334,7 @@ dependencies = [
  "httparse",
  "hyper",
  "hyper-util",
- "pem 3.0.6",
+ "pem",
  "reqwest",
  "rsa",
  "rustls",

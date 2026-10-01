@@ -10,5 +10,5 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
+sha2 = "0.11"
 toml = "1.1"

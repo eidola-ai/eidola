@@ -18,7 +18,7 @@ test-support = []
 
 [dependencies]
 anonymous-credit-tokens = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 blake3 = "1"
 const-oid = { version = "0.9", features = ["db"] }
 der = { version = "0.7", features = ["pem", "alloc"] }

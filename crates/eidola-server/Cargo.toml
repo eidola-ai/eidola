@@ -72,7 +72,7 @@ argon2 = "0.6"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Encoding
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 
 # Webhook signature verification
