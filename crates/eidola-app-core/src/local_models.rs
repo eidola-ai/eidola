@@ -1722,7 +1722,11 @@ impl Inner {
     /// Scan one directory of `.gguf`s for a backend, merging live engine
     /// status and standing failures. Shared by the managed local store and
     /// the user-owned llamacpp directories.
-    async fn scan_engine_dir(&self, backend_id: &str, dir: &Path) -> Vec<LocalModelInfo> {
+    pub(crate) async fn scan_engine_dir(
+        &self,
+        backend_id: &str,
+        dir: &Path,
+    ) -> Vec<LocalModelInfo> {
         let mut models: Vec<LocalModelInfo> = Vec::new();
         if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {

@@ -2082,16 +2082,16 @@ struct Inner {
     #[cfg(feature = "test-support")]
     proxy_resolve_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
-    /// Test-only rendezvous **between the read that authorized a proxied
-    /// request and the engine start it permits**. The resolve window above
-    /// stages what happens when the row moves *before* the authorizing read;
-    /// this stages the other side of that read, where the request already holds
-    /// an authorized incarnation and the id behind it is replaced. Only a load
-    /// acting on the row it was handed can tell the two apart, and the gap —
-    /// the exposure read plus the load's own configuration reads — is again far
-    /// too wide to race. Same shape and same reason as [`Inner::anchor_window`].
+    /// Test-only rendezvous **between the read that authorized a proxy action
+    /// and the action it permits** — an engine start, or a catalog scan. The
+    /// resolve window above stages what happens when the row moves *before*
+    /// the authorizing read; this stages the other side of that read, where the
+    /// caller already holds an authorized incarnation and the id behind it is
+    /// replaced. Only an action taken on the row it was handed can tell the two
+    /// apart, and the gap is again far too wide to race. Same shape and same
+    /// reason as [`Inner::anchor_window`].
     #[cfg(feature = "test-support")]
-    proxy_engine_window:
+    proxy_authorized_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
     /// Test-only handshake to plant in the next proxied Eidola route **after
     /// its catalog fetch has been recorded** — the observation the completion's
@@ -3679,7 +3679,14 @@ impl Inner {
 
     async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
         let eidola = self.eidola_resolved().await?;
-        let client = self.build_client(&eidola, None).await?;
+        self.eidola_models(&eidola).await
+    }
+
+    /// The catalog of exactly the Eidola configuration handed in — the
+    /// row-honouring half of [`Self::available_models`], for a caller that
+    /// authorized a specific row and must not read the id again.
+    async fn eidola_models(&self, eidola: &EidolaResolved) -> Result<Vec<ModelInfo>, AppError> {
+        let client = self.build_client(eidola, None).await?;
 
         let models = fetch_models(&client, &eidola.base_url).await?;
         Ok(models
@@ -9683,7 +9690,7 @@ impl AppCore {
                 #[cfg(feature = "test-support")]
                 proxy_resolve_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
-                proxy_engine_window: Mutex::new(None),
+                proxy_authorized_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 proxy_planted_handshake: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
@@ -10964,25 +10971,25 @@ impl AppCore {
         rx
     }
 
-    /// Test-only seam: stop the next proxied request between the read that
-    /// authorized it and the engine start that read permits (see
-    /// `Inner::proxy_engine_window`).
+    /// Test-only seam: stop the next proxy action between the read that
+    /// authorized it and what that read permits — an engine start or a catalog
+    /// scan (see `Inner::proxy_authorized_window`).
     ///
     /// The twin of the resolve window, on the other side of the same read: here
-    /// the request is holding an authorized backend row and the id behind it is
-    /// replaced, so what is under test is whether the load acts on the row it
+    /// the caller is holding an authorized backend row and the id behind it is
+    /// replaced, so what is under test is whether the action uses the row it
     /// was handed or resolves the name all over again.
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
-    pub fn test_open_proxy_engine_window(
+    pub fn test_open_proxy_authorized_window(
         &self,
     ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         *self
             .inner
-            .proxy_engine_window
+            .proxy_authorized_window
             .lock()
-            .expect("proxy engine window lock poisoned") = Some(tx);
+            .expect("proxy authorized window lock poisoned") = Some(tx);
         rx
     }
 

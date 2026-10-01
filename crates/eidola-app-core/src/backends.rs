@@ -661,12 +661,38 @@ impl Inner {
             .ok_or_else(|| AppError::NotConfigured {
                 message: format!("no backend named `{id}` is configured"),
             })?;
+        self.backend_models_for_row(&row).await
+    }
+
+    /// The models **exactly this row** offers — reading no backend row of its
+    /// own.
+    ///
+    /// [`Self::backend_models`] resolves by id, which is right for a picker
+    /// asking about the backend as it is now. A caller that *authorized* a row
+    /// must scan that row and no other: the proxy's `/v1/models` reads the
+    /// exposed row and then scans, and a remove-and-re-add between the two put
+    /// a different URL and a different key behind the same id — so the catalog
+    /// request went to a destination the reader never exposed, carrying the
+    /// replacement's credential, and its answer went back to the caller. Every
+    /// destination here comes from `row`: the Eidola configuration, an external
+    /// backend's URL and key, a `llamacpp` backend's models directory. (The
+    /// managed `local` store is the one exception, and an honest one: it is a
+    /// built-in that cannot be removed or re-added, and its directory is not a
+    /// row field at all.)
+    pub(crate) async fn backend_models_for_row(
+        &self,
+        row: &db::BackendRow,
+    ) -> Result<Vec<ModelInfo>, AppError> {
+        let id = row.id.as_str();
         let kind = BackendKind::parse(&row.kind).ok_or_else(|| AppError::Database {
             message: format!("unknown backend kind `{}`", row.kind),
         })?;
 
         match kind {
-            BackendKind::Eidola => self.available_models().await,
+            BackendKind::Eidola => {
+                self.eidola_models(&crate::EidolaResolved::from_row(Some(row))?)
+                    .await
+            }
             BackendKind::OpenAi => {
                 if let Some(pinned) = parse_overrides(row.model_overrides.as_deref())? {
                     return Ok(pinned
@@ -715,16 +741,17 @@ impl Inner {
                     .collect())
             }
             BackendKind::Local | BackendKind::LlamaCpp => {
-                let state = self.local_models_state().await?;
                 let models = if kind == BackendKind::Local {
-                    state.models
+                    self.local_models_state().await?.models
                 } else {
-                    state
-                        .external
-                        .into_iter()
-                        .find(|b| b.backend_id == row.id)
-                        .map(|b| b.models)
-                        .unwrap_or_default()
+                    // This row's directory, not whatever the id names now.
+                    match row.models_dir.as_deref() {
+                        Some(dir) => {
+                            self.scan_engine_dir(&row.id, std::path::Path::new(dir))
+                                .await
+                        }
+                        None => Vec::new(),
+                    }
                 };
                 // Every on-disk model is selectable — a request against an
                 // unloaded one loads its engine on demand. `on_disk` is the

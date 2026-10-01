@@ -2510,6 +2510,78 @@ fn a_failed_streaming_send_is_recorded_against_its_own_connection() {
     });
 }
 
+/// REGRESSION: **the catalog scanned is the exposed row's, not whatever the id
+/// names by the time the scan runs.**
+///
+/// `/v1/models` read each exposed id and then scanned by id all over again, so a
+/// remove-and-re-add between the two sent the catalog request to the
+/// replacement's URL — with the replacement's key — and handed its answer to the
+/// caller: a destination the reader never exposed, contacted on a proxy
+/// caller's say-so. The replacement here is a second server, so whether it was
+/// ever asked is a count, not an inference.
+#[test]
+fn a_backend_replaced_mid_listing_is_never_asked_for_its_catalog() {
+    run(|| {
+        let (authorized, core, _dir) = core_for(MockConfig::default());
+        let replacement = core
+            .runtime()
+            .block_on(chat_harness::start(MockConfig::default()));
+        let external = |url: &str| eidola_app_core::NewBackend {
+            id: "acme".into(),
+            kind: eidola_app_core::BackendKind::OpenAi,
+            display_name: "Acme".into(),
+            base_url: Some(url.into()),
+            api_key: None,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+        };
+        let key = core.runtime().block_on(async {
+            core.add_backend(external(&authorized.base_url))
+                .await
+                .expect("add");
+            core.set_proxy_backend_exposed("acme".to_string(), true)
+                .await
+                .expect("expose");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let mut window = core.test_open_proxy_authorized_window();
+        let listing = {
+            let core = Arc::clone(&core);
+            runtime.spawn(async move { exchange(&core, &get("/v1/models", Some(&key))).await })
+        };
+        let (status, body) = runtime.block_on(async {
+            let resume = window.recv().await.expect("the listing reaches its scan");
+            core.remove_backend("acme".to_string())
+                .await
+                .expect("remove");
+            core.add_backend(external(&replacement.base_url))
+                .await
+                .expect("re-add a different backend under the same name");
+            let _ = resume.send(());
+            listing.await.expect("the listing finishes")
+        });
+
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            authorized.models_hits() >= 1,
+            "the scan ran, against the row that was exposed"
+        );
+        assert_eq!(
+            replacement.models_hits(),
+            0,
+            "a destination nobody exposed was never contacted"
+        );
+    });
+}
+
 /// REGRESSION: **the incarnation a request was authorized against is the one
 /// whose engine may start.**
 ///
@@ -2559,7 +2631,7 @@ fn a_backend_replaced_mid_request_never_gets_its_engine_started() {
         let core = Arc::new(core);
         let runtime = core.runtime();
 
-        let mut window = core.test_open_proxy_engine_window();
+        let mut window = core.test_open_proxy_authorized_window();
         let asking = {
             let core = Arc::clone(&core);
             runtime.spawn(async move {
@@ -2648,7 +2720,7 @@ fn an_authorized_incarnation_retired_mid_request_starts_nothing() {
         let core = Arc::new(core);
         let runtime = core.runtime();
 
-        let mut window = core.test_open_proxy_engine_window();
+        let mut window = core.test_open_proxy_authorized_window();
         let asking = {
             let core = Arc::clone(&core);
             runtime.spawn(async move {

@@ -787,21 +787,30 @@ impl Inner {
             .collect();
         // The registry rows first — local reads, and what decides how each
         // backend is treated below.
+        //
+        // **Each one is the exposed row, read with its permission, and it is the
+        // row that gets scanned.** The settings snapshot names ids; reading a
+        // row by id and then scanning by id again let a remove-and-re-add
+        // between the two send the catalog request to the replacement's URL
+        // with the replacement's key — a destination the reader never exposed —
+        // and hand its answer to the caller. `db::exposed_backend` is the
+        // resolve chapter's read, and `backend_models_for_row` scans exactly
+        // what it returned.
         let mut plans = Vec::new();
+        let conn = self.db_conn().await?;
         for backend_id in &settings.backends {
-            let row = db::get_backend(&self.db_conn().await?, backend_id).await?;
-            let engine_backed = row
-                .as_ref()
-                .and_then(|row| backends::BackendKind::parse(&row.kind))
+            let Some(row) = db::exposed_backend(&conn, backend_id).await? else {
+                continue;
+            };
+            let engine_backed = backends::BackendKind::parse(&row.kind)
                 .map(|kind| kind.is_engine_backed())
                 .unwrap_or(false);
-            let starts_on_demand = row.map(|row| row.auto_start).unwrap_or(false);
-            plans.push((
-                backend_id,
-                engine_backed,
-                offers_running_engines_only(settings.local_exposure, starts_on_demand),
-            ));
+            let loaded_only = offers_running_engines_only(settings.local_exposure, row.auto_start);
+            plans.push((row, engine_backed, loaded_only));
         }
+        // The gap between the authorizing read and the scan it permits.
+        #[cfg(feature = "test-support")]
+        crate::subspace_driver::pause_in_window(&self.proxy_authorized_window).await;
 
         // **Every catalog is asked at once, and each one is asked with a
         // deadline.** One dead backend must not blank the whole listing — the
@@ -816,8 +825,8 @@ impl Inner {
         //
         // [`MODEL_LIST_TIMEOUT`] is the per-backend bound; a timeout reads as
         // an unavailable backend, which is exactly what it is.
-        let scans = futures_util::future::join_all(plans.iter().map(|(backend_id, _, _)| async {
-            tokio::time::timeout(model_list_timeout(), self.backend_models(backend_id))
+        let scans = futures_util::future::join_all(plans.iter().map(|(row, _, _)| async {
+            tokio::time::timeout(model_list_timeout(), self.backend_models_for_row(row))
                 .await
                 .ok()
                 .and_then(|r| r.ok())
@@ -825,14 +834,14 @@ impl Inner {
         .await;
 
         let mut out = Vec::new();
-        for ((backend_id, engine_backed, loaded_only), scanned) in plans.iter().zip(scans) {
-            let (engine_backed, loaded_only) = (*engine_backed, *loaded_only);
+        for ((row, engine_backed, loaded_only), scanned) in plans.iter().zip(scans) {
+            let (backend_id, engine_backed, loaded_only) = (&row.id, *engine_backed, *loaded_only);
             if engine_backed && loaded_only {
                 // The scan is the *decoration* here, not the membership: it
                 // supplies a context length and capabilities where it has
                 // them, and where it does not the engine still answers for
                 // itself. A scan that failed outright therefore blanks nothing.
-                for engine in ready.iter().filter(|e| &&e.backend_id == backend_id) {
+                for engine in ready.iter().filter(|e| &e.backend_id == backend_id) {
                     let decorated = scanned
                         .as_ref()
                         .and_then(|models| models.iter().find(|m| m.id == engine.id))
@@ -921,7 +930,7 @@ impl Inner {
                 // authorized row is already in hand, and the id behind it can
                 // be replaced before anything acts on it.
                 #[cfg(feature = "test-support")]
-                crate::subspace_driver::pause_in_window(&self.proxy_engine_window).await;
+                crate::subspace_driver::pause_in_window(&self.proxy_authorized_window).await;
                 let leased = self.local.lease_engine(&backend.id, &target.model);
                 let (engine_url, lease) = match leased {
                     Some((url, _ctx, lease)) => (url, lease),
