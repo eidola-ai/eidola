@@ -165,8 +165,7 @@ impl FromRequestParts<AppState> for BasicAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        use argon2::Argon2;
-        use argon2::password_hash::{PasswordHash, PasswordVerifier};
+        use argon2::{Argon2, PasswordHash, PasswordVerifier};
 
         let header = parts
             .headers

@@ -287,7 +287,7 @@ pub(crate) async fn ensure_terms_accepted(
 }
 
 // Bring the trait into scope for fill_bytes.
-use argon2::password_hash::rand_core::RngCore;
+use rand_core::RngCore;
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -307,17 +307,16 @@ pub async fn create_account(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ServerError> {
     use argon2::Argon2;
-    use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+    use argon2::PasswordHasher;
 
     let account_id = Uuid::new_v4();
 
     let mut secret_bytes = [0u8; 32];
-    argon2::password_hash::rand_core::OsRng.fill_bytes(&mut secret_bytes);
+    rand_core::OsRng.fill_bytes(&mut secret_bytes);
     let secret = URL_SAFE_NO_PAD.encode(secret_bytes);
 
-    let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
-        .hash_password(secret.as_bytes(), &salt)
+        .hash_password(secret.as_bytes())
         .map_err(|e| ServerError::Internal(format!("hash error: {}", e)))?
         .to_string();
 
