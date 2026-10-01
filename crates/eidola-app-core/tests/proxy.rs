@@ -2310,6 +2310,83 @@ fn engine_backend(
     }
 }
 
+/// One streamed ask whose upstream sent a head and then reset before the body;
+/// returns what the caller saw and what the Record row says.
+fn a_cut_pre_stream_body(status: u16, content_type: &'static str) -> (u16, String, Option<String>) {
+    let (_mock, core, _dir) = core_for(MockConfig {
+        chat: ChatBehavior::HeadThenCut {
+            status,
+            content_type,
+        },
+        ..Default::default()
+    });
+    with_account(&core);
+    let key = armed(&core);
+    let core = Arc::new(core);
+    let runtime = core.runtime();
+    let (seen, body) = runtime.block_on(exchange(
+        &core,
+        &post(
+            "/v1/chat/completions",
+            &key,
+            &format!(
+                r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+            ),
+        ),
+    ));
+    let row = runtime
+        .block_on(core.list_requests(20, 0))
+        .expect("record")
+        .into_iter()
+        .find(|r| r.path == "/v1/chat/completions")
+        .expect("the exchange is recorded");
+    let wallet = runtime.block_on(core.wallet_lifecycle()).expect("wallet");
+    assert!(
+        !wallet.iter().any(|c| c.state == "spending"),
+        "a failed read still settles the hold: {wallet:?}"
+    );
+    (seen, body, row.error)
+}
+
+/// REGRESSION: **a non-2xx whose body could not be read is a read failure, not
+/// the upstream's status with nothing behind it.**
+///
+/// The pre-stream error body was read with `unwrap_or_default()`, so an upstream
+/// that reset after its head became a clean read of an empty body: the caller
+/// was handed the upstream's `503` as though that were the whole story, and the
+/// Record row carried no error. The blocking transport already treats this as
+/// the transport failure it is.
+#[test]
+fn a_pre_stream_error_body_cut_short_is_reported_as_the_read_failure() {
+    run(|| {
+        let (status, body, error) = a_cut_pre_stream_body(503, "application/json");
+        assert_ne!(
+            status, 503,
+            "the upstream's status is not the answer when its body never arrived: {body}"
+        );
+        assert!(
+            error.is_some(),
+            "and the Record says the read failed rather than storing a silent empty body"
+        );
+    });
+}
+
+/// The same defect on the other pre-stream arm: a `2xx` that is not a stream,
+/// cut short, was recorded as only the shape refusal — the read failure that
+/// actually ended it went nowhere.
+#[test]
+fn a_non_stream_body_cut_short_is_reported_as_the_read_failure() {
+    run(|| {
+        let (status, body, error) = a_cut_pre_stream_body(200, "application/json");
+        assert_ne!(status, 200, "{body}");
+        let error = error.expect("the row carries an error");
+        assert!(
+            !error.contains("server-sent events"),
+            "the row names the read failure, not a shape verdict on bytes that never came: {error}"
+        );
+    });
+}
+
 /// One proxied exchange whose completion opened a connection of its own and
 /// then failed before the response head; returns the attestation its Record
 /// row is attached to.

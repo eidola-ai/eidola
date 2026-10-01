@@ -144,6 +144,17 @@ pub enum ChatBehavior {
     /// real token stream looks like, and what the incremental strip must cope
     /// with.
     OkStreamingWithSplitHeader,
+    /// A response head naming `status` and `content_type`, a `Content-Length`
+    /// the body never reaches, and then the connection dropped — an upstream
+    /// that reset **after** its head and **before** any stream could open.
+    ///
+    /// The body read fails in the transport, which is the whole point: a reader
+    /// that defaults a failed read to an empty body turns this into a clean
+    /// answer of nothing under whatever status the head claimed.
+    HeadThenCut {
+        status: u16,
+        content_type: &'static str,
+    },
     /// 200 SSE stream that the server aborts mid-event (writes a partial event,
     /// then drops the TCP connection). Exercises the mid-SSE read failure arm.
     StreamingMidAbort,
@@ -1372,6 +1383,17 @@ async fn handle_chat(
             .await
         }
         ChatBehavior::StreamingMidAbort => write_sse_stream(stream, false, &[STREAM_CONTENT]).await,
+        ChatBehavior::HeadThenCut {
+            status,
+            content_type,
+        } => {
+            let head = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: 4096\r\nConnection: close\r\n\r\n{{\"error\":"
+            );
+            stream.write_all(head.as_bytes()).await?;
+            stream.flush().await
+        }
         ChatBehavior::StreamingUnterminatedFlood => write_sse_flood(stream).await,
         ChatBehavior::StreamingEndsWithoutDone => {
             write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await

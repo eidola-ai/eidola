@@ -1596,7 +1596,33 @@ impl Inner {
             // Bounded like every other blocking read on this path: an error
             // body is a body, and an intermediary's is the one most likely to
             // be enormous.
-            let answer = read_capped_body(response).await.unwrap_or_default();
+            // **A body that could not be read is a read failure, not an empty
+            // answer.** Defaulting it turned an upstream that reset mid-body
+            // into a clean read of nothing: the caller got the upstream's status
+            // (or a shape refusal) instead of the transport failure that really
+            // happened, and the Record row carried no error at all. The blocking
+            // transport's arm, for the same reason: settle, record the failure,
+            // return it.
+            let answer = match read_capped_body(response).await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                        .await;
+                    self.record_proxy_request(
+                        &route,
+                        &headers,
+                        &body,
+                        Some(status.as_u16()),
+                        Vec::new(),
+                        Some(error.to_string()),
+                        nonce,
+                        request_at,
+                        now_ms(),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
             let text = answer.text();
             // **A stream that never opened can still carry its refund.** The
             // server spends the credential before it dispatches, so every
@@ -1655,7 +1681,33 @@ impl Inner {
         // completion, refund and all — the credential is spent either way, so
         // the body is read for its token before this fails.
         if !is_event_stream(response.headers()) {
-            let answer = read_capped_body(response).await.unwrap_or_default();
+            // **A body that could not be read is a read failure, not an empty
+            // answer.** Defaulting it turned an upstream that reset mid-body
+            // into a clean read of nothing: the caller got the upstream's status
+            // (or a shape refusal) instead of the transport failure that really
+            // happened, and the Record row carried no error at all. The blocking
+            // transport's arm, for the same reason: settle, record the failure,
+            // return it.
+            let answer = match read_capped_body(response).await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                        .await;
+                    self.record_proxy_request(
+                        &route,
+                        &headers,
+                        &body,
+                        Some(status.as_u16()),
+                        Vec::new(),
+                        Some(error.to_string()),
+                        nonce,
+                        request_at,
+                        now_ms(),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
             let text = answer.text();
             let inline = serde_json::from_str::<Value>(&text)
                 .ok()
