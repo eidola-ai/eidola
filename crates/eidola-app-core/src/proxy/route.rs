@@ -1037,19 +1037,7 @@ impl Inner {
     ) -> Result<String, AppError> {
         let conn = self.db_conn().await?;
         let provider_id = db::ensure_provider(&conn, backend_id, "inference", now).await?;
-        let id = Uuid::now_v7().to_string();
-        db::insert_connection(
-            &conn,
-            &id,
-            &provider_id,
-            base_url,
-            "clearnet",
-            None,
-            now,
-            now,
-        )
-        .await?;
-        Ok(id)
+        crate::insert_plain_connection(&conn, &provider_id, base_url, now).await
     }
 
     /// The completion ceiling this request asks for.

@@ -23,3 +23,7 @@ ALPN is pinned to HTTP/1.1 so the inline attestation and application request sha
 ## Threat-model note
 
 The nonce defeats stale-document replay and the quote authenticates the peer certificate's long-lived SPKI. It does **not** bind the live TLS session. An attacker holding an exfiltrated TLS private key can terminate TLS outside the enclave while relaying a fresh nonce-bound document from a genuine enclave. Closing that gap requires channel binding, such as committing TLS exporter material to `REPORT_DATA`; Tinfoil's current v3 implementation does not do this.
+
+## Redirects
+
+The client **follows no redirect** (`redirect::Policy::none()`); a `3xx` is handed back as the answer. Per-handshake attestation is not an origin pin: a redirect opens a fresh connection that is attested in its own right, so a cross-origin `Location` is refused only when the new peer cannot prove an allowed measurement over its own TLS key — every plain `http://` target fails (no TLS info), as does every host that is not an enclave running a pinned measurement — while another enclave running a pinned measurement under a different hostname would pass and receive the replayed body. Refusing every redirect keeps each request at the origin it was made to, and turns what would have been an attestation failure into the upstream's own status. There is no same-origin exception. Every consumer inherits this: app-core's chat turns and the server's upstream client alike.

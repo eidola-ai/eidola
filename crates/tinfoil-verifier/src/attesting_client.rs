@@ -133,8 +133,20 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         attestation_observer,
     });
 
+    // **No redirects.** reqwest's default follows up to ten and replays a
+    // cloneable body on `307`/`308`. Attestation alone does not pin the
+    // origin: a redirect opens a fresh connection that is attested in its own
+    // right, so a cross-origin `Location` is refused only when the new peer
+    // cannot prove an allowed measurement over its own TLS key (every plain
+    // `http://` target, every non-enclave host) — another enclave running a
+    // pinned measurement under a different hostname would pass, and receive
+    // the body. Refusing every redirect keeps a request at the origin it was
+    // made to and turns the rest into the upstream's own `3xx` rather than an
+    // attestation failure. No same-origin exception: the Eidola server has no
+    // redirecting route, so a `3xx` from it is an error answer either way.
     reqwest::Client::builder()
         .use_preconfigured_tls(tls_config)
+        .redirect(reqwest::redirect::Policy::none())
         .http1_only()
         .tls_info(true)
         .connect_timeout(Duration::from_secs(10))

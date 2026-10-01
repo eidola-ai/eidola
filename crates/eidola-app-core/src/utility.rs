@@ -197,7 +197,7 @@ impl Inner {
                     }
                 };
                 Ok(UtilityRoute {
-                    client: self.plain_client()?,
+                    client: self.completion_client()?,
                     base_url: engine_url,
                     wire_model: target.canonical.clone(),
                     pricing: None,
@@ -213,7 +213,7 @@ impl Inner {
                         message: format!("backend `{}` has no base URL", backend.id),
                     })?;
                 Ok(UtilityRoute {
-                    client: self.plain_client()?,
+                    client: self.completion_client()?,
                     base_url,
                     wire_model: target.model.clone(),
                     pricing: None,

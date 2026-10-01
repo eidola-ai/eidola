@@ -205,6 +205,17 @@ pub enum ChatBehavior {
     /// truncated recording is what a reader must be told about rather than
     /// handed silently.
     OkStreamingOversized,
+    /// A `200` SSE stream of **ordinary, well-framed events that never stops
+    /// coming** — far more content than any completion, each event small, and
+    /// a `[DONE]` only at the very end.
+    ///
+    /// Not [`ChatBehavior::StreamingUnterminatedFlood`]: every event here ends
+    /// properly, so a frame-buffer ceiling never trips. What has to end it is a
+    /// ceiling on the stream as a whole, because a turn assembles the deltas
+    /// into an answer in memory and a stream without end is an answer without
+    /// end. The total is spelled here rather than imported — the mock is the
+    /// peer and must not learn this app's ceilings.
+    StreamingPastReadCeiling,
     /// Accept the request, then drop the connection before sending any
     /// response bytes (network error after send).
     DropBeforeResponse,
@@ -444,6 +455,17 @@ pub enum RefundMode {
     /// next `begin_next_round` then settles it on its own last-chance attempt,
     /// which is a durable commit that must announce itself.
     FailFirst(u64),
+    /// **The server whose own persistence of the refund token failed.** Every
+    /// arm that carries a refund in band carries it — the server sends the
+    /// token whether or not it managed to store it — and
+    /// `/v1/credentials/refund` answers the permanent `404` the real endpoint
+    /// gives for a token it never stored.
+    ///
+    /// The one configuration in which the in-band copy is the *only* copy: a
+    /// client that discards it and asks recovery instead strands the credential
+    /// in `spending` for good, which `Fail` cannot model (it omits the in-band
+    /// token too) and `Succeed` cannot detect (recovery would answer).
+    NotStored,
 }
 
 /// Mock upstream configuration.
@@ -1249,6 +1271,9 @@ async fn handle_refund(
         RefundMode::Fail => true,
         RefundMode::FailFirst(n) => attempt <= n,
         RefundMode::Succeed => false,
+        RefundMode::NotStored => {
+            return write_json(stream, 404, &error_body("refund token not found")).await;
+        }
     };
     if failing {
         return write_json(stream, 500, &error_body("refund unavailable")).await;
@@ -1279,7 +1304,7 @@ async fn handle_chat(
         tokio::time::sleep(std::time::Duration::from_millis(config.chat_delay_ms)).await;
     }
     // Compute an inline refund object once (shared by the blocking happy path).
-    let inline_refund = if config.refund == RefundMode::Succeed {
+    let inline_refund = if matches!(config.refund, RefundMode::Succeed | RefundMode::NotStored) {
         auth.and_then(Issuer::spend_proof_from_auth)
             .and_then(|sp| issuer.refund_for(&sp))
             .map(|refund_b64| {
@@ -1350,6 +1375,13 @@ async fn handle_chat(
                     serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
             }
             write_json(stream, status, &body.to_string()).await
+        }
+        ChatBehavior::StreamingPastReadCeiling => {
+            // 160 × 64 KiB of content: ten megabytes, past an eight-megabyte
+            // ceiling, in events no larger than any frame bound.
+            let piece = "y".repeat(64 * 1024);
+            let pieces: Vec<&str> = std::iter::repeat_n(piece.as_str(), 160).collect();
+            write_sse_stream(stream, true, &pieces).await
         }
         ChatBehavior::OkStreamingOversized => {
             // One very large content delta — far past what a Record row keeps,
@@ -2563,6 +2595,77 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// runtime so it shares the runtime that will drive the chat. Returns the mock,
 /// the core, and the tempdir backing its config + data (kept alive by the
 /// caller). This is the canonical entry point for chat-path tests.
+/// A backend that answers **every** request with a `307` pointing at a second
+/// listener, and that listener — which records whether anything reached it and
+/// answers whatever does with an ordinary success.
+///
+/// The fixture for the redirect rule: a client that follows replays the
+/// request body — the whole prompt — to the `Location`, an origin nobody
+/// configured. Returns the redirecting backend's base URL and the flag the
+/// other origin sets. Plain threads rather than the mock's runtime, because a
+/// test that holds a redirect policy has to run on an **ordinary** core (the
+/// harness's injected client would answer for the one under test) and must
+/// not depend on that core's runtime to serve its peer.
+pub fn redirecting_upstream() -> (String, Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{Read, Write};
+
+    fn read_head_and_body(stream: &mut std::net::TcpStream) {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => return,
+            }
+        }
+        let text = String::from_utf8_lossy(&head).to_string();
+        let length: usize = text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())?
+            })
+            .unwrap_or(0);
+        let mut rest = vec![0u8; length];
+        let _ = stream.read_exact(&mut rest);
+    }
+
+    let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let elsewhere_port = elsewhere.local_addr().expect("addr").port();
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw = Arc::clone(&reached);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = elsewhere.accept() {
+            saw.store(true, Ordering::SeqCst);
+            read_head_and_body(&mut stream);
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"elsewhere"}}]}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+
+    let backend = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let backend_port = backend.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = backend.accept() {
+            read_head_and_body(&mut stream);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\n\
+                 Location: http://127.0.0.1:{elsewhere_port}/v1/chat/completions\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+    (format!("http://127.0.0.1:{backend_port}"), reached)
+}
+
 pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) {
     // The injected plain client is built before `AppCore` (which installs the
     // rustls provider), so install it here first. Idempotent across tests.

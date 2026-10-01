@@ -2694,6 +2694,21 @@ impl Inner {
         local_models::plain_http_client()
     }
 
+    /// The client a chat turn's or a chore's completion goes out on, to an
+    /// engine or an external backend: [`Inner::plain_client`] **without
+    /// following redirects**, so the conversation reaches the origin the
+    /// reader configured or nowhere. See
+    /// [`local_models::completion_http_client`]. Under the `test-support`
+    /// feature an injected test client takes its place, so a test of the
+    /// policy itself runs on an ordinary core.
+    fn completion_client(&self) -> Result<reqwest::Client, AppError> {
+        #[cfg(feature = "test-support")]
+        if let Some(client) = &self.http_override {
+            return Ok(client.clone());
+        }
+        local_models::completion_http_client()
+    }
+
     /// The client a **proxied** completion goes out on: [`Inner::plain_client`]
     /// without the identifying `User-Agent`, because the proxy's upstream
     /// header set is an allowlist the Record repeats back to the reader and a
@@ -6334,7 +6349,7 @@ impl Inner {
                 engine_lease = Some(lease);
                 let provider_id =
                     db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
-                let client = self.plain_client()?;
+                let client = self.completion_client()?;
                 (
                     provider_id,
                     client,
@@ -6355,7 +6370,7 @@ impl Inner {
                     })?;
                 let provider_id =
                     db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
-                let client = self.plain_client()?;
+                let client = self.completion_client()?;
                 let auth = backend.api_key.as_ref().map(|k| format!("Bearer {k}"));
                 // Context length is unknown for a generic server — 0
                 // resolves to the 4096 completion default below.
@@ -7161,6 +7176,7 @@ impl Inner {
             // refund; a turn with no spend at all has nothing to settle.
             spend_settled: spend_is_none,
             auth_value,
+            plain_route: backend_kind != BackendKind::Eidola,
             bus: self.bus.clone(),
         })
     }
@@ -7585,6 +7601,7 @@ impl Inner {
             response_at,
             http_status,
             response_body,
+            None,
         )
         .await?;
         self.bus.emit(Change::Space(prep.space_id.clone()));
@@ -7621,23 +7638,41 @@ impl Inner {
         if let Some(auth_value) = &prep.auth_value {
             request = request.header("Authorization", auth_value);
         }
-        let chat_result = request.send().await;
+        let chat_result = prep.send(request).await;
         let response_at = now_ms();
 
-        let (status, response_text, body) = match chat_result {
+        let (status, response_text, body, response_record) = match chat_result {
             Ok(resp) => {
                 prep.flush_new_attestations()
                     .await
                     .inspect_err(|_| emit_user_turn())?;
 
                 let status = resp.status();
-                let text = resp
-                    .text()
-                    .await
-                    .map_err(|e| AppError::Network {
-                        message: format!("failed to read response: {e}"),
-                    })
-                    .inspect_err(|_| emit_user_turn())?;
+                // **Bounded as it arrives** (`peer_read`'s class rule), and a
+                // read that fails is a failure of an exchange that happened:
+                // the hold settles and the Record keeps the row, with the
+                // failure as its error.
+                let answer =
+                    match peer_read::read_bounded(resp, peer_read::MAX_RESPONSE_BYTES).await {
+                        Ok(answer) => answer,
+                        Err(e) => {
+                            prep.settle(None).await;
+                            prep.insert_unattached_request(
+                                &request_body_json,
+                                request_at,
+                                now_ms(),
+                                status.as_u16(),
+                                Vec::new(),
+                                Some(e.to_string()),
+                            )
+                            .await?;
+                            self.bus.emit(Change::Space(prep.space_id.clone()));
+                            self.bus.emit(Change::Record);
+                            return Err(e);
+                        }
+                    };
+                let text = answer.text().into_owned();
+                let response_record = recorded::recorded_answer(&answer);
                 // **The status classifies the response, not the body shape.**
                 // A non-2xx body is an error document and is never required to
                 // parse: a rejection raised by the endpoint's own body
@@ -7652,19 +7687,49 @@ impl Inner {
                 // A **2xx** that is not JSON is a genuine protocol failure with
                 // no completion to read, and still fails as `Network` — with a
                 // refund recovery first, since nothing below this point runs to
-                // settle the hold this round took.
-                let parsed: serde_json::Value = match serde_json::from_str(&text) {
+                // settle the hold this round took, and the exchange recorded
+                // with the refusal as its error.
+                //
+                // **And a body the ceiling stopped is refused whatever it parses
+                // as.** A complete object followed by enough whitespace to cross
+                // the ceiling parses perfectly, so `over_ceiling` — this app's own
+                // decision to stop reading — is asked *before* the parse rather
+                // than inferred from it (the `whole_text` rule, `peer_read`).
+                let parsed = if answer.over_ceiling {
+                    Err(AppError::Network {
+                        message: format!(
+                            "the model's answer was larger than the {}-byte ceiling this app \
+                             reads",
+                            peer_read::MAX_RESPONSE_BYTES
+                        ),
+                    })
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+                        AppError::Network {
+                            message: format!("failed to parse response JSON: {e}"),
+                        }
+                    })
+                };
+                let parsed: serde_json::Value = match parsed {
                     Ok(parsed) => parsed,
                     Err(_) if !status.is_success() => serde_json::Value::Null,
-                    Err(e) => {
-                        let _ = prep.try_refund_recovery().await;
-                        emit_user_turn();
-                        return Err(AppError::Network {
-                            message: format!("failed to parse response JSON: {e}"),
-                        });
+                    Err(refusal) => {
+                        prep.settle(None).await;
+                        prep.insert_unattached_request(
+                            &request_body_json,
+                            request_at,
+                            response_at,
+                            status.as_u16(),
+                            response_record,
+                            Some(refusal.to_string()),
+                        )
+                        .await?;
+                        self.bus.emit(Change::Space(prep.space_id.clone()));
+                        self.bus.emit(Change::Record);
+                        return Err(refusal);
                     }
                 };
-                (status, text, parsed)
+                (status, text, parsed, response_record)
             }
             Err(e) => {
                 // Network error — the server may or may not have received the
@@ -7754,7 +7819,8 @@ impl Inner {
                         request_at,
                         response_at,
                         status.as_u16(),
-                        response_text.as_bytes().to_vec(),
+                        response_record.clone(),
+                        None,
                     )
                     .await?;
                     self.bus.emit(Change::Space(prep.space_id.clone()));
@@ -7778,7 +7844,7 @@ impl Inner {
                 request_at,
                 response_at,
                 status.as_u16(),
-                response_text.as_bytes().to_vec(),
+                response_record.clone(),
             )
             .await?;
 
@@ -7839,7 +7905,8 @@ impl Inner {
                     request_at,
                     response_at,
                     status.as_u16(),
-                    response_text.as_bytes().to_vec(),
+                    response_record.clone(),
+                    None,
                 )
                 .await?;
                 self.bus.emit(Change::Space(prep.space_id.clone()));
@@ -7869,7 +7936,7 @@ impl Inner {
                     request_at,
                     response_at,
                     status.as_u16(),
-                    response_text.as_bytes().to_vec(),
+                    response_record.clone(),
                 )
                 .await;
         }
@@ -7894,7 +7961,7 @@ impl Inner {
                 request_at,
                 response_at,
                 status.as_u16(),
-                response_text.as_bytes().to_vec(),
+                response_record.clone(),
             )
             .await?;
         if response_action_id.is_none() {
@@ -8185,11 +8252,14 @@ impl Inner {
     /// the v1 simplification.
     ///
     /// Refund handling differs from `run_turn` only in *where* the refund
-    /// token comes from: SSE responses have no inline body to carry it, so we
-    /// always go through the `/v1/credentials/refund` recovery endpoint
-    /// after each round's stream ends. The credential is left in
-    /// `pre_credential` state until that recovery completes, same as the
-    /// network-error path.
+    /// token comes from: the Eidola server closes a stream with a metadata
+    /// event (`eidola.chat.completion.metadata`) carrying it, ahead of
+    /// `[DONE]`, and a stream that never opened carries it in its error body.
+    /// Whichever arm the round ended on, the token the server handed over
+    /// settles the hold and the `/v1/credentials/refund` recovery endpoint is
+    /// asked only when none arrived ([`TurnPrep::settle`]) — the server's own
+    /// persistence of that token is best-effort, so the in-band copy can be
+    /// the only one there is.
     #[allow(clippy::too_many_arguments)]
     async fn run_turn_stream(
         &self,
@@ -8250,7 +8320,7 @@ impl Inner {
 
     /// One round of the streaming turn loop: send the request, pump the SSE
     /// body (forwarding content/reasoning deltas and assembling any
-    /// `tool_calls`), recover the refund, and either persist the round as a
+    /// `tool_calls`), settle the refund, and either persist the round as a
     /// tool round or persist the `inference` and finish.
     async fn run_turn_stream_round(
         &self,
@@ -8285,7 +8355,7 @@ impl Inner {
         if let Some(auth_value) = &prep.auth_value {
             request = request.header("Authorization", auth_value);
         }
-        let chat_result = request.send().await;
+        let chat_result = prep.send(request).await;
 
         let resp = match chat_result {
             Ok(resp) => {
@@ -8305,36 +8375,101 @@ impl Inner {
 
         let status = resp.status();
 
-        // Non-2xx: server returned an error body (typically JSON, not SSE).
-        // Read it normally so we can surface a useful message. (Unlike the
-        // blocking twin there is no inference action to attach — the stream
-        // never produced one — so the request row stands alone.)
-        if !status.is_success() {
-            let response_text = resp.text().await.unwrap_or_default();
-            let _ = prep.try_refund_recovery().await;
+        // **Two arms answer before any stream exists, and each can carry the
+        // round's refund in its body.** A non-2xx is an error document — the
+        // server spends the credential before it dispatches, so a stream that
+        // fails to open after the nullifier is recorded answers with a
+        // refund-bearing JSON error body (`eidola-server`'s
+        // `error_response_with_refund`). A **2xx that is not server-sent
+        // events** is a backend that ignored `stream: true` and answered a
+        // whole completion, refund and all, or an intermediary's page; parsed
+        // as SSE it yields no events, ends without `[DONE]`, and its refund is
+        // never read. Both are read whole (bounded), settle from the token
+        // their body carried, fall back to recovery for its absence, and are
+        // recorded — the shape refusal with this app's verdict as the row's
+        // error, since the upstream's `200` does not describe it. (There is no
+        // inference to attach either to — no stream produced one.)
+        //
+        // The shape check is strict when `Content-Type` is present and
+        // permissive when it is absent — see [`is_event_stream`].
+        if !status.is_success() || !is_event_stream(resp.headers()) {
+            let answer = match peer_read::read_bounded(resp, peer_read::MAX_RESPONSE_BYTES).await {
+                Ok(answer) => answer,
+                // **A body that could not be read is a read failure, not
+                // an empty answer** — defaulting it would report the
+                // upstream's status (or a shape refusal about bytes that
+                // never arrived) for what was a transport failure.
+                Err(e) => {
+                    prep.settle(None).await;
+                    prep.insert_unattached_request(
+                        &request_body_json,
+                        request_at,
+                        now_ms(),
+                        status.as_u16(),
+                        Vec::new(),
+                        Some(e.to_string()),
+                    )
+                    .await?;
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    self.bus.emit(Change::Record);
+                    return Err(e);
+                }
+            };
+            let response_text = answer.text().into_owned();
+            // A body the ceiling stopped is never parsed (the `whole_text`
+            // rule): its refund is unreadable and recovery answers for it.
+            let inline = (!answer.over_ceiling)
+                .then(|| serde_json::from_str::<serde_json::Value>(&response_text).ok())
+                .flatten()
+                .and_then(|body| body.get("refund").cloned());
+            prep.settle(inline.as_ref()).await;
+            let failure = if status.is_success() {
+                AppError::Network {
+                    message: format!(
+                        "`{}` answered {} to a streaming request with a body that is not \
+                         server-sent events",
+                        prep.backend_id,
+                        status.as_u16()
+                    ),
+                }
+            } else {
+                AppError::Server {
+                    status: status.as_u16(),
+                    message: parse_server_error_message(&response_text),
+                }
+            };
             prep.insert_unattached_request(
                 &request_body_json,
                 request_at,
                 now_ms(),
                 status.as_u16(),
-                response_text.as_bytes().to_vec(),
+                recorded::recorded_answer(&answer),
+                // A non-2xx needs no error column: its status already says
+                // what happened, and nothing of this app's was refused.
+                status.is_success().then(|| failure.to_string()),
             )
             .await?;
             // Request row committed; Wallet was emitted at spend start (and
-            // again if refund recovery succeeded). post owns the user-turn
+            // again when the hold settled). post owns the user-turn
             // SpaceIndex.
             self.bus.emit(Change::Space(prep.space_id.clone()));
             self.bus.emit(Change::Record);
-            return Err(AppError::Server {
-                status: status.as_u16(),
-                message: parse_server_error_message(&response_text),
-            });
+            return Err(failure);
         }
 
-        // Consume the SSE body. We accumulate bytes in a small buffer and
-        // split on the SSE event boundary `\n\n`. Each event is a sequence
-        // of `field: value\n` lines; we only care about `data:` lines (the
-        // chunk JSON) and the sentinel `[DONE]`.
+        // Consume the SSE body. Bytes accumulate in a frame buffer that is
+        // split at every event boundary the format allows
+        // (`find_event_boundary`); each event's data is assembled once from
+        // all of its `data:` fields (`sse_event_data`) and parsed once.
+        //
+        // **Three bounds, because a peer chooses every byte here.** What the
+        // Record keeps (`RecordedBody`, the retention cap), what one event may
+        // accumulate before it is refused (`MAX_SSE_EVENT_BYTES`, the frame
+        // buffer's ceiling — a backend that never ends an event would
+        // otherwise grow it until the process dies), and what the whole
+        // stream may deliver (`MAX_RESPONSE_BYTES` — the deltas below are
+        // assembled into an answer in memory, so a stream without end is an
+        // answer without end).
         let mut byte_stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut full_content = String::new();
@@ -8356,21 +8491,38 @@ impl Inner {
         // chunk or on a trailing one with an empty delta — so it is read off
         // every chunk, before the delta gate, and the last one named wins.
         let mut finish_reason: Option<String> = None;
-        let mut response_buf: Vec<u8> = Vec::new();
+        // The raw bytes for the request log, kept to the retention cap.
+        let mut raw = recorded::RecordedBody::default();
+        // **The refund the server closed the stream with**, if it sent one —
+        // the terminal `eidola.chat.completion.metadata` event, emitted before
+        // `[DONE]` even when the server's own persistence of that token failed
+        // (the one case recovery can never answer).
+        let mut inline_refund: Option<serde_json::Value> = None;
+        // What stopped the read before the upstream's own end, if anything did.
+        let mut read_error: Option<AppError> = None;
         let mut finished = false;
 
         while let Some(chunk) = byte_stream.next().await {
-            let bytes = chunk
-                .map_err(|e| AppError::Network {
-                    message: format!("stream read failed: {e}"),
-                })
-                // Mid-stream read failure: the user turn is committed (the
-                // request row is not yet) — emit the user turn so other windows
-                // see it, then wrap with the space id for blank-space adoption.
-                .inspect_err(|_| emit_user_turn())?;
-            // Keep the raw bytes for the request log so we can debug
-            // upstream behaviour the same way as the non-streaming path.
-            response_buf.extend_from_slice(&bytes);
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    read_error = Some(AppError::Network {
+                        message: format!("stream read failed: {e}"),
+                    });
+                    break;
+                }
+            };
+            raw.push(&bytes);
+            if raw.received > peer_read::MAX_RESPONSE_BYTES {
+                read_error = Some(AppError::Network {
+                    message: format!(
+                        "the model's response stream passed the {}-byte ceiling this app reads \
+                         for one answer",
+                        peer_read::MAX_RESPONSE_BYTES
+                    ),
+                });
+                break;
+            }
             buf.extend_from_slice(&bytes);
 
             while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
@@ -8395,6 +8547,12 @@ impl Inner {
                         Ok(v) => v,
                         Err(_) => continue, // ignore comments/heartbeats
                     };
+
+                    // Read before every other field and before the delta gate:
+                    // the metadata event carries no `choices` at all.
+                    if let Some(refund) = json.get("refund") {
+                        inline_refund = Some(refund.clone());
+                    }
 
                     if let Some(usage) = json.get("usage") {
                         if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
@@ -8465,11 +8623,73 @@ impl Inner {
                 }
             }
 
+            // **What is left over is an event still being accumulated**, and
+            // a backend that never terminates one grows it without end. Checked
+            // after the drain, so what is measured is an event with no boundary
+            // in it rather than a chunk that happened to straddle one.
+            if buf.len() > peer_read::MAX_SSE_EVENT_BYTES {
+                read_error = Some(AppError::Network {
+                    message: format!(
+                        "`{}` sent a single event past the {}-byte ceiling this app will hold, \
+                         or never ended one",
+                        prep.backend_id,
+                        peer_read::MAX_SSE_EVENT_BYTES
+                    ),
+                });
+                buf.clear();
+                break;
+            }
+
             if finished {
                 break;
             }
         }
         let response_at = now_ms();
+
+        // An unterminated final event is not an event the format delivers, so
+        // nothing in it becomes part of the answer — but a refund in it is
+        // still the credential's successor, and wallet material settles
+        // wherever the server put it.
+        if read_error.is_none()
+            && !finished
+            && let Ok(tail) = std::str::from_utf8(&buf)
+            && let Some(payload) = sse_event_data(tail)
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(payload.trim_start())
+            && let Some(refund) = json.get("refund")
+        {
+            inline_refund = Some(refund.clone());
+        }
+
+        // **The in-band token first, recovery only for its absence** — see
+        // [`TurnPrep::settle`]. A tool round settles its hold here, before the
+        // next round's; the final `Wallet` emission below covers a successor.
+        prep.settle(inline_refund.as_ref()).await;
+
+        // A read this app stopped — a transport failure, or a ceiling — knows
+        // how far it got and not how large the response was; the seal says
+        // which.
+        let response_buf = raw.seal_response(read_error.is_none());
+
+        // **A stream whose read failed is a failure of an exchange that
+        // happened**: the deltas already forwarded are partial data from a
+        // connection that died (or that this app refused to read further), the
+        // hold has settled above, and the Record keeps the raw exchange with
+        // the failure as its error. No `inference` — the upstream never claimed
+        // a completion.
+        if let Some(e) = read_error {
+            prep.insert_unattached_request(
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_buf,
+                Some(e.to_string()),
+            )
+            .await?;
+            self.bus.emit(Change::Space(prep.space_id.clone()));
+            self.bus.emit(Change::Record);
+            return Err(e);
+        }
 
         // Release whatever the live filter still held (a stream that ended
         // mid-first-line), so the caller's accumulated text ends up equal to
@@ -8485,11 +8705,6 @@ impl Inner {
         // time — what lands in the durable trail (and in `ChatResult`) is what
         // the reader watched arrive.
         let full_content = strip_leading_header(&full_content).to_string();
-
-        // SSE carries no inline refund — always consult the recovery endpoint
-        // (best-effort; the final Wallet emission below covers a successor).
-        // A tool round settles its hold here, before the next round's.
-        let _ = prep.try_refund_recovery().await;
 
         // **A stream that stopped without ever saying it was over is a
         // transport failure, not an answer.** The body ended: no `[DONE]`, and
@@ -8517,7 +8732,7 @@ impl Inner {
         // in `DelegationFailure::Upstream` for a delegated room and leaves it
         // retryable for a window — re-asking is the right remedy for a dropped
         // connection. The blocking twin needs no equivalent: a body that ends
-        // early fails in `resp.text()` and never reaches persistence.
+        // early fails in its bounded read and never reaches persistence.
         //
         // `finish_reason` is checked beside `[DONE]` so a provider that ends a
         // stream without the sentinel — the spec does not require it — is not
@@ -8529,6 +8744,7 @@ impl Inner {
                 response_at,
                 status.as_u16(),
                 response_buf,
+                None,
             )
             .await?;
             self.bus.emit(Change::Space(prep.space_id.clone()));
@@ -8551,6 +8767,7 @@ impl Inner {
                     response_at,
                     status.as_u16(),
                     response_buf,
+                    None,
                 )
                 .await?;
                 self.bus.emit(Change::Space(prep.space_id.clone()));
@@ -12426,9 +12643,14 @@ struct TurnPrep {
     engine_lease: Option<local_models::EngineLease>,
     attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>>,
     client: reqwest::Client,
-    /// Connection row adopted from the most recent attestation flush; the
-    /// request row records it.
+    /// The `connection` row the request rows record: adopted from the most
+    /// recent attestation flush on an attested route, or written once before
+    /// the first send on a plain one ([`Self::attach_plain_connection`]).
     connection_id: Option<String>,
+    /// Whether this turn's route is one **no enclave vouches for** — an
+    /// engine or an external backend — so its destination is recorded by a
+    /// plain `connection` row rather than by a handshake.
+    plain_route: bool,
     base_url: String,
     /// The preparation timestamp — spend/refund rows key off it.
     now: i64,
@@ -12710,6 +12932,81 @@ impl TurnPrep {
         }
     }
 
+    /// Build `request`, record a plain route's destination, then send it —
+    /// the one door both transports send a round through, so the destination
+    /// row is written exactly between a build that succeeded and a send that
+    /// was attempted ([`Self::attach_plain_connection`]).
+    async fn send(
+        &mut self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let request = request.build()?;
+        self.attach_plain_connection().await;
+        self.client.execute(request).await
+    }
+
+    /// Settle this round's hold: **the refund the server handed us first, and
+    /// recovery only for its absence** — the proxy's order, for the proxy's
+    /// reason.
+    ///
+    /// The server spends the credential before it dispatches, and its own
+    /// persistence of the refund token for `/v1/credentials/refund` is
+    /// best-effort: on any arm where that persistence failed, the copy carried
+    /// in band is the only one there will ever be, and recovery answers a
+    /// permanent `404` for a token it never stored. Asking recovery first
+    /// would spend a credential and get nothing back. An in-band token that
+    /// fails to apply is not retried through recovery here — the server would
+    /// hand back the same token — and stays unsettled for
+    /// [`Inner::begin_next_round`]'s last-chance attempt and the startup sweep.
+    ///
+    /// Returns whether a successor was written; the `Wallet` emission is
+    /// [`Self::process_refund_obj`]'s. A no-op for a turn with no spend.
+    async fn settle(&mut self, inline: Option<&serde_json::Value>) -> bool {
+        if self.spend.is_none() {
+            return false;
+        }
+        match inline {
+            Some(refund_obj) => match self.process_refund_obj(refund_obj).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("warning: a turn's in-band refund failed to apply: {e}");
+                    false
+                }
+            },
+            None => self.try_refund_recovery().await,
+        }
+    }
+
+    /// Give a plain route its `connection` row — **once a send is about to be
+    /// attempted, and not before**, and once per turn (an engine's address and
+    /// an external backend's URL do not move under a held lease or a resolved
+    /// row).
+    ///
+    /// **The Record's question is where the prompt went, and it has to stay
+    /// answerable after every mutation.** An attested route answers it through
+    /// the `connection` row its handshake writes; a plain route wrote none, so
+    /// the request row's only path to a URL was its `backend_id` — a key to a
+    /// row the reader can edit, or remove and re-add under the same name with
+    /// another URL, and an engine's address is a port that changes on every
+    /// start. The row written here is the URL this turn sends to, transport
+    /// `clearnet`, and **no** attestation, which is the truthful statement that
+    /// nothing was verified ([`insert_plain_connection`]). Written after the
+    /// request is built and before it is sent, because a `connection` row is a
+    /// statement that a transport was used and a build that refuses sends
+    /// nothing. Best-effort, like the proxy's: a failed insert costs the row,
+    /// never the turn.
+    async fn attach_plain_connection(&mut self) {
+        if !self.plain_route || self.connection_id.is_some() {
+            return;
+        }
+        match insert_plain_connection(&self.db_conn, &self.provider_id, &self.base_url, now_ms())
+            .await
+        {
+            Ok(id) => self.connection_id = Some(id),
+            Err(e) => eprintln!("warning: a turn's destination was not recorded: {e}"),
+        }
+    }
+
     /// The nonce of the spending credential, if this turn carries a spend.
     /// Recorded on request rows; `None` keeps local turns honest in the
     /// Record.
@@ -12723,6 +13020,12 @@ impl TurnPrep {
     /// structurally-malformed `tool_calls` exit, and the streaming non-2xx arm
     /// (which has the same shape). The Record still shows the exchange, which
     /// is the whole point of keeping raw bodies.
+    ///
+    /// `error` is this app's own verdict on the exchange where it refused or
+    /// lost one the upstream's status does not describe — a body that was not
+    /// the shape asked for, a read that failed or met a ceiling — so the row
+    /// never presents as an answered request what the turn did not accept.
+    #[allow(clippy::too_many_arguments)]
     async fn insert_unattached_request(
         &self,
         request_body_json: &serde_json::Value,
@@ -12730,6 +13033,7 @@ impl TurnPrep {
         response_at: i64,
         http_status: u16,
         response_body: Vec<u8>,
+        error: Option<String>,
     ) -> Result<(), AppError> {
         db::insert_request(
             &self.db_conn,
@@ -12740,14 +13044,14 @@ impl TurnPrep {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
                 request_headers: None,
-                request_body: Some(request_body_json.to_string().into_bytes()),
+                request_body: Some(recorded::recorded_request(request_body_json)),
                 response_status: Some(http_status as i64),
                 response_headers: None,
                 response_body: Some(response_body),
                 request_at,
                 response_at: Some(response_at),
                 duration_ms: Some(response_at - request_at),
-                error: None,
+                error,
                 credential_nonce: self.credential_nonce(),
                 created_at: now_ms(),
                 backend_id: Some(self.backend_id.clone()),
@@ -12910,7 +13214,7 @@ impl TurnPrep {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
                 request_headers: None,
-                request_body: Some(request_body_json.to_string().into_bytes()),
+                request_body: Some(recorded::recorded_request(request_body_json)),
                 response_status: Some(http_status as i64),
                 response_headers: None,
                 response_body: Some(response_body),
@@ -13267,6 +13571,7 @@ impl TurnPrep {
                     response_at,
                     http_status,
                     response_body,
+                    None,
                 )
                 .await?;
                 return Ok(None);
@@ -13393,7 +13698,7 @@ impl TurnPrep {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
                 request_headers: None,
-                request_body: Some(request_body_json.to_string().into_bytes()),
+                request_body: Some(recorded::recorded_request(request_body_json)),
                 response_status: Some(http_status as i64),
                 response_headers: None,
                 response_body: Some(response_body),
@@ -16516,6 +16821,36 @@ async fn flush_attestations(
         connection_id = Some(cid);
     }
     Ok(connection_id)
+}
+
+/// Record the destination of a route **no enclave vouches for** — an engine or
+/// an external backend: a `connection` row naming the URL a request is about to
+/// be sent to, transport `clearnet`, and **no** `attestation_hash`.
+///
+/// The schema already admits the honest shape, so nothing is claimed that did
+/// not happen: a row with no attestation is the statement that nothing was
+/// verified. Shared by the chat turn ([`TurnPrep::attach_plain_connection`])
+/// and the proxy, so both plain routes record their destination in the same
+/// place an attested route records its own.
+async fn insert_plain_connection(
+    db_conn: &turso::Connection,
+    provider_id: &str,
+    base_url: &str,
+    now: i64,
+) -> Result<String, AppError> {
+    let id = Uuid::now_v7().to_string();
+    db::insert_connection(
+        db_conn,
+        &id,
+        provider_id,
+        base_url,
+        "clearnet",
+        None,
+        now,
+        now,
+    )
+    .await?;
+    Ok(id)
 }
 
 // ============================================================================
