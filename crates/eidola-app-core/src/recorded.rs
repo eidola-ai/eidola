@@ -119,10 +119,15 @@ impl BodyRead {
             // **No claim about what is above**: the retention cap may have
             // kept less than was read, and its own note says so. What this
             // note knows is where reading stopped and what that cost.
+            // One boundary, the ceiling's: the count is what was accepted,
+            // so the response is stated as at least that large, and the bytes
+            // beyond it — the rest of the crossing chunk, and whatever the
+            // upstream would have sent after — as not kept, which is all this
+            // app knows of them.
             BodyRead::CeilingReached => Some(format!(
                 "\n\n[eidola: the read stopped at the {MAX_RESPONSE_BYTES}-byte ceiling this app \
-                 holds for one answer. Anything the upstream sent beyond it was never read, and \
-                 no answer was passed on.]\n"
+                 holds for one answer, so the response was at least that large. Nothing past \
+                 the ceiling was kept, and no answer was passed on.]\n"
             )),
         }
     }
@@ -208,9 +213,6 @@ pub(crate) fn recorded_request(body: &Value) -> Vec<u8> {
 pub(crate) fn recorded_answer(answer: &BoundedBody) -> Vec<u8> {
     let mut kept = RecordedBody::default();
     kept.push(&answer.bytes);
-    // The ceiling can stop the read part-way through a chunk, so more arrived
-    // than was kept to parse; the Record states the larger number.
-    kept.received = answer.received;
     kept.seal_blocking(if answer.over_ceiling {
         BodyRead::CeilingReached
     } else {
@@ -225,7 +227,6 @@ pub(crate) fn recorded_answer(answer: &BoundedBody) -> Vec<u8> {
 pub(crate) fn recorded_cut_answer(partial: &BoundedBody) -> Vec<u8> {
     let mut kept = RecordedBody::default();
     kept.push(&partial.bytes);
-    kept.received = partial.received;
     kept.seal_response(false)
 }
 

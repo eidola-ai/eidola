@@ -7696,14 +7696,12 @@ impl Inner {
                 // the ceiling parses perfectly, so `over_ceiling` — this app's own
                 // decision to stop reading — is asked *before* the parse rather
                 // than inferred from it (the `whole_text` rule, `peer_read`).
+                //
+                // The ceiling decides **whatever the status**: the lenient
+                // reading of a non-2xx error document below is for a body that
+                // arrived whole, and a fragment is not one.
                 let parsed = if answer.over_ceiling {
-                    Err(AppError::Network {
-                        message: format!(
-                            "the model's answer was larger than the {}-byte ceiling this app \
-                             reads",
-                            peer_read::MAX_RESPONSE_BYTES
-                        ),
-                    })
+                    Err(peer_read::answer_past_ceiling(&prep.backend_id))
                 } else {
                     serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
                         AppError::Network {
@@ -7713,7 +7711,9 @@ impl Inner {
                 };
                 let parsed: serde_json::Value = match parsed {
                     Ok(parsed) => parsed,
-                    Err(_) if !status.is_success() => serde_json::Value::Null,
+                    Err(_) if !status.is_success() && !answer.over_ceiling => {
+                        serde_json::Value::Null
+                    }
                     Err(refusal) => {
                         prep.settle(None).await;
                         prep.insert_unattached_request(
@@ -8425,7 +8425,11 @@ impl Inner {
                 .flatten()
                 .and_then(|body| body.get("refund").cloned());
             prep.settle(inline.as_ref()).await;
-            let failure = if status.is_success() {
+            // The ceiling decides first, whatever the status
+            // (`peer_read::answer_past_ceiling`).
+            let failure = if answer.over_ceiling {
+                peer_read::answer_past_ceiling(&prep.backend_id)
+            } else if status.is_success() {
                 AppError::Network {
                     message: format!(
                         "`{}` answered {} to a streaming request with a body that is not \
@@ -8446,9 +8450,11 @@ impl Inner {
                 now_ms(),
                 status.as_u16(),
                 recorded::recorded_answer(&answer),
-                // A non-2xx needs no error column: its status already says
-                // what happened, and nothing of this app's was refused.
-                status.is_success().then(|| failure.to_string()),
+                // A non-2xx read whole needs no error column: its status
+                // already says what happened, and nothing of this app's was
+                // refused. A body the ceiling stopped was refused, whatever
+                // its status.
+                (status.is_success() || answer.over_ceiling).then(|| failure.to_string()),
             )
             .await?;
             // Request row committed; Wallet was emitted at spend start (and

@@ -89,6 +89,13 @@ pub enum ChatBehavior {
     /// the retained prefix parses perfectly, which is exactly why the ceiling
     /// has to be asked about rather than inferred from the parse.
     OkBlockingPaddedPastCeiling,
+    /// A **non-2xx** whose body is a complete JSON error document followed by
+    /// enough whitespace to cross the read ceiling — in whichever transport
+    /// asked. The status is the only thing that differs from
+    /// [`ChatBehavior::OkBlockingPaddedPastCeiling`], which is the point: a
+    /// reader that lets an unsuccessful status excuse a body from parsing must
+    /// not let it excuse a fragment from the ceiling.
+    Non2xxPaddedPastCeiling(u16),
     /// A `200` whose body is valid JSON and not a completion: an error document
     /// answered with a success status, carrying a refund.
     ///
@@ -1355,6 +1362,14 @@ async fn handle_chat(
             // learn this app's ceilings.
             let padded = format!("{body}{}", " ".repeat(9 * 1024 * 1024));
             write_json(stream, 200, &padded).await
+        }
+        ChatBehavior::Non2xxPaddedPastCeiling(status) => {
+            let padded = format!(
+                "{}{}",
+                error_body("upstream model error"),
+                " ".repeat(9 * 1024 * 1024)
+            );
+            write_json(stream, status, &padded).await
         }
         ChatBehavior::OkBlockingNotACompletion => {
             let mut body: serde_json::Value =

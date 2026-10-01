@@ -3592,6 +3592,55 @@ fn an_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
     });
 }
 
+/// REGRESSION: **the ceiling refuses whatever the status**, on both
+/// transports. An oversized non-2xx was passed through as the upstream's own
+/// status with a message read off the fragment, and the row carried no
+/// refusal; the pre-stream arm also parsed the fragment for a refund.
+#[test]
+fn a_non_2xx_answer_past_the_read_ceiling_is_refused_too() {
+    for stream in [false, true] {
+        run(move || {
+            let (_mock, core, _dir) = core_for(MockConfig {
+                chat: ChatBehavior::Non2xxPaddedPastCeiling(500),
+                ..Default::default()
+            });
+            with_account(&core);
+            let key = armed(&core);
+            let core = Arc::new(core);
+            let runtime = core.runtime();
+            let (status, body) = runtime.block_on(exchange(
+                &core,
+                &post(
+                    "/v1/chat/completions",
+                    &key,
+                    &format!(
+                        r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
+                    ),
+                ),
+            ));
+            assert_ne!(
+                status, 500,
+                "stream={stream}: not the fragment's status: {body}"
+            );
+            assert!(body.contains("ceiling"), "stream={stream}: {body}");
+            let recorded = runtime
+                .block_on(core.list_requests(20, 0))
+                .expect("record")
+                .into_iter()
+                .find(|r| r.path == "/v1/chat/completions")
+                .expect("the exchange is recorded");
+            assert!(
+                recorded
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("ceiling")),
+                "stream={stream}: {:?}",
+                recorded.error
+            );
+        });
+    }
+}
+
 /// REGRESSION: **a `200` that parses is not yet an answer.**
 ///
 /// Syntax was the whole test: `{}`, `null` and an upstream's error document all

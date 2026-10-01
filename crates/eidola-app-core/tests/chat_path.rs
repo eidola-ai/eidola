@@ -7327,6 +7327,64 @@ fn a_blocking_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
     });
 }
 
+/// REGRESSION: **the ceiling refuses whatever the status.** A non-2xx is
+/// excused from parsing — an error document need not be JSON — and that
+/// excuse swallowed the ceiling: a fragment of an oversized error body became
+/// an error generation and a `Server` error carrying a message read off the
+/// fragment. Both transports.
+#[test]
+fn a_non_2xx_body_past_the_read_ceiling_is_refused_too() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xxPaddedPastCeiling(500),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "the ceiling, not the status: {err:?}"
+        );
+        assert_settled(&core);
+        let space_id = only_space(&core);
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space_id.clone()))
+            .expect("tree");
+        assert!(
+            !tree.iter().any(|n| n.action_type == "inference"),
+            "no error generation is written from a fragment"
+        );
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+
+        let err = stream_once(&core, "stream me").expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "the streaming pre-stream read too: {err:?}"
+        );
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+    });
+}
+
 /// REGRESSION: **what the Record keeps of an answer is bounded, and a partial
 /// says so** — while the answer itself is untouched.
 #[test]

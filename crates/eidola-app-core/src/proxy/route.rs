@@ -1459,17 +1459,25 @@ impl Inner {
         // not accept is recorded as an error too, or the Record shows the
         // exchange as the success the caller was explicitly not given. A
         // non-2xx needs no such column — its status already says what happened.
-        let refusal = status
-            .is_success()
-            .then(|| match parsed.as_ref() {
-                None if answer.over_ceiling => Some(oversized_answer(&route.backend_id)),
-                None => Some(malformed_json_answer(&route.backend_id, status.as_u16())),
-                Some(body) if !is_completion(body) => {
-                    Some(shapeless_answer(&route.backend_id, status.as_u16()))
-                }
-                Some(_) => None,
-            })
-            .flatten();
+        //
+        // **And the ceiling refuses whatever the status.** A non-2xx is passed
+        // through as the upstream's own answer only when it arrived whole; a
+        // fragment of one is this app's refusal like any other
+        // (`answer_past_ceiling`).
+        let refusal = if answer.over_ceiling {
+            Some(crate::peer_read::answer_past_ceiling(&route.backend_id))
+        } else {
+            status
+                .is_success()
+                .then(|| match parsed.as_ref() {
+                    None => Some(malformed_json_answer(&route.backend_id, status.as_u16())),
+                    Some(body) if !is_completion(body) => {
+                        Some(shapeless_answer(&route.backend_id, status.as_u16()))
+                    }
+                    Some(_) => None,
+                })
+                .flatten()
+        };
         self.settle_proxy_refund(
             &db_conn,
             &spend,
@@ -1491,6 +1499,11 @@ impl Inner {
         )
         .await;
 
+        if answer.over_ceiling
+            && let Some(refusal) = refusal
+        {
+            return Err(refusal);
+        }
         if !status.is_success() {
             return Err(AppError::Server {
                 status: status.as_u16(),
@@ -1667,9 +1680,15 @@ impl Inner {
             // to. This is the arm the blocking transport already covered by
             // reading `refund` off the parsed body before it looks at the
             // status.
-            let inline = serde_json::from_str::<Value>(&text)
-                .ok()
+            // A body the ceiling stopped is never parsed (the `whole_text`
+            // rule) and is refused whatever its status.
+            let inline = (!answer.over_ceiling)
+                .then(|| serde_json::from_str::<Value>(&text).ok())
+                .flatten()
                 .and_then(|body| body.get("refund").cloned());
+            let refusal = answer
+                .over_ceiling
+                .then(|| crate::peer_read::answer_past_ceiling(&route.backend_id));
             self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
@@ -1678,16 +1697,16 @@ impl Inner {
                 &body,
                 Some(status.as_u16()),
                 recorded_answer(&answer),
-                None,
+                refusal.as_ref().map(ToString::to_string),
                 nonce,
                 request_at,
                 now_ms(),
             )
             .await;
-            return Err(AppError::Server {
+            return Err(refusal.unwrap_or_else(|| AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&text),
-            });
+            }));
         }
 
         // **A `200` is not an answer until it is the *shape* that was asked
@@ -1740,13 +1759,19 @@ impl Inner {
                 }
             };
             let text = answer.text();
-            let inline = serde_json::from_str::<Value>(&text)
-                .ok()
+            let inline = (!answer.over_ceiling)
+                .then(|| serde_json::from_str::<Value>(&text).ok())
+                .flatten()
                 .and_then(|body| body.get("refund").cloned());
             // The refusal is this app's, so the row carries it: the upstream
             // said `200` and nothing was forwarded, which a row holding only
-            // that status would present as an answered request.
-            let refusal = malformed_stream_answer(&route.backend_id, status.as_u16());
+            // that status would present as an answered request. The ceiling,
+            // where it stopped the read, is the refusal that names it.
+            let refusal = if answer.over_ceiling {
+                crate::peer_read::answer_past_ceiling(&route.backend_id)
+            } else {
+                malformed_stream_answer(&route.backend_id, status.as_u16())
+            };
             self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
@@ -2180,17 +2205,6 @@ fn shapeless_answer(backend_id: &str, status: u16) -> AppError {
     AppError::Network {
         message: format!(
             "`{backend_id}` answered {status} with JSON that is not a chat completion"
-        ),
-    }
-}
-
-/// A `2xx` whose body crossed [`MAX_RESPONSE_BYTES`] — refused on the app's own
-/// decision to stop reading, never on what the fragment happens to parse as.
-fn oversized_answer(backend_id: &str) -> AppError {
-    AppError::Network {
-        message: format!(
-            "`{backend_id}` sent an answer past the {MAX_RESPONSE_BYTES}-byte ceiling this app \
-             reads, so what arrived is a fragment rather than an answer"
         ),
     }
 }
@@ -2712,8 +2726,21 @@ mod tests {
             "the retention cap still speaks"
         );
         assert!(
-            row.contains("never read"),
+            row.contains("Nothing past the ceiling was kept"),
             "and a read this app ended is not an upstream that finished"
+        );
+        // **One boundary on the row.** The crossing chunk is cut at the
+        // ceiling and its remainder dropped unexamined, so the count every
+        // note states is the ceiling itself — never a larger "received" figure
+        // beside a note saying nothing past the ceiling was read.
+        assert!(
+            row.contains(&format!("of the {MAX_RESPONSE_BYTES} bytes this app read")),
+            "the cap's count is the ceiling's: {}",
+            &row[row.len().saturating_sub(600)..]
+        );
+        assert!(
+            !row.contains("never read"),
+            "and no note claims more than it knows"
         );
         // **And the row never names a prefix as the size.** The read stopped
         // at the ceiling, so what it counted is how far it got: the cap's note
@@ -2725,7 +2752,7 @@ mod tests {
             &row[row.len().saturating_sub(600)..]
         );
         assert!(
-            !row.contains(&format!("{}-byte response", answer.received)),
+            !row.contains(&format!("{}-byte response", answer.bytes.len())),
             "a prefix is not reported as the response's size"
         );
         assert!(

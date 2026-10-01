@@ -94,6 +94,21 @@ pub(crate) fn event_past_ceiling(complete: Option<usize>, residual: usize) -> bo
     complete.is_some_and(|len| len > MAX_SSE_EVENT_BYTES) || residual > MAX_SSE_EVENT_BYTES
 }
 
+/// The refusal a completion body past [`MAX_RESPONSE_BYTES`] is answered with,
+/// on every consumer and **whatever its status**: the ceiling is this app's own
+/// decision to stop reading, so it decides before anything else is asked of
+/// the bytes — before the parse (a padded complete object parses perfectly),
+/// and before a non-2xx's lenient reading of an error document (a status does
+/// not make a fragment whole).
+pub(crate) fn answer_past_ceiling(backend_id: &str) -> AppError {
+    AppError::Network {
+        message: format!(
+            "`{backend_id}` sent an answer past the {MAX_RESPONSE_BYTES}-byte ceiling this app \
+             reads, so what arrived is a fragment rather than an answer"
+        ),
+    }
+}
+
 /// The refusal an oversized event is answered with, on every streaming
 /// consumer.
 pub(crate) fn oversized_event(backend_id: &str) -> AppError {
@@ -108,11 +123,13 @@ pub(crate) fn oversized_event(backend_id: &str) -> AppError {
 /// One answer read from a peer, bounded.
 #[derive(Debug, Default)]
 pub(crate) struct BoundedBody {
-    /// What was read, to the ceiling.
+    /// What was read, to the ceiling — and **the only count there is**. The
+    /// chunk that crosses the ceiling is cut at it and its remainder dropped
+    /// unexamined, so a body that stopped at the ceiling is known to be at
+    /// least this large and nothing more; a second, larger count would put two
+    /// boundaries on one row (bytes "received" past the point the row says
+    /// reading stopped).
     pub(crate) bytes: Vec<u8>,
-    /// How much arrived — larger than `bytes` only where the ceiling stopped
-    /// the read part-way through a chunk.
-    pub(crate) received: usize,
     /// Whether the ceiling is why the read stopped.
     pub(crate) over_ceiling: bool,
 }
@@ -173,7 +190,6 @@ pub(crate) async fn read_bounded(
                 });
             }
         };
-        body.received += chunk.len();
         let room = ceiling.saturating_sub(body.bytes.len());
         if chunk.len() > room {
             body.bytes.extend_from_slice(&chunk[..room]);
