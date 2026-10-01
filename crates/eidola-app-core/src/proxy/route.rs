@@ -50,9 +50,9 @@ use super::LocalExposure;
 use crate::changes::Change;
 use crate::error::AppError;
 use crate::{
-    EidolaResolved, Inner, ModelInfo, backends, db, estimate_charge_credits, fetch_models,
-    find_event_boundary, flush_attestations, local_models, now_ms, parse_server_error_message,
-    process_refund, recover_refund,
+    ChargePricing, EidolaResolved, Inner, ModelInfo, backends, db, estimate_charge_credits,
+    fetch_models, find_event_boundary, flush_attestations, local_models, now_ms,
+    parse_server_error_message, process_refund, recover_refund,
 };
 
 /// The completion ceiling a request that named none gets.
@@ -672,7 +672,7 @@ struct ProxyRoute {
     backend_id: String,
     /// `(prompt_rate, completion_rate, scale_factor)` — `Some` only for a
     /// route that bills.
-    pricing: Option<(u128, u128, u128)>,
+    pricing: Option<ChargePricing>,
     /// An external backend's own bearer key, when it has one.
     external_auth: Option<String>,
     /// The connection row this request will be recorded against — present
@@ -1130,11 +1130,7 @@ impl Inner {
                     wire_model: target.model.clone(),
                     canonical: target.canonical.clone(),
                     backend_id: backend.id.clone(),
-                    pricing: Some((
-                        entry.pricing.per_prompt_token.value as u128,
-                        entry.pricing.per_completion_token.value as u128,
-                        entry.pricing.per_prompt_token.scale_factor as u128,
-                    )),
+                    pricing: Some(ChargePricing::from_catalog(&entry.pricing)),
                     external_auth: None,
                     connection_id,
                     attestations: Some(AttestationSink {

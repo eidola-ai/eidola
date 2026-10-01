@@ -353,6 +353,12 @@ pub const ROUTER_MODEL: &str = "router@local";
 /// inference) while still dispatching separately from the turns.
 pub const ROUTER_REMOTE_MODEL: &str = "router-remote";
 
+/// A model the mock's catalog prices **per request** — the flat-pricing shape
+/// (zero token rates, the price in `per_request`).
+pub const FLAT_MODEL: &str = "flat-priced";
+/// The flat price, in credits, [`FLAT_MODEL`] costs per request.
+pub const FLAT_PRICE: u64 = 7;
+
 /// The head of `eidola_app_core::summaries::SUMMARY_SYSTEM_PROMPT`. Branch
 /// summaries share the router's *model*, so the mock tells the two chores apart
 /// by their system prompt, not by the wire model.
@@ -479,6 +485,9 @@ pub struct MockConfig {
     /// reaches this mock through a base-URL override and an override is a
     /// hint, never a declaration.
     pub declared_tool_calling: Option<bool>,
+    /// List [`FLAT_MODEL`], the flat-priced entry, in the catalog. Opt-in so
+    /// the listings every other test pins are unchanged.
+    pub list_flat_model: bool,
     /// How long a chat request is held before it is answered.
     ///
     /// A real model request takes time — that is the whole reason a surface
@@ -500,6 +509,7 @@ impl Default for MockConfig {
             catalog_omits: catalog_omissions(),
             tool_script: tool_script(),
             declared_tool_calling: None,
+            list_flat_model: false,
             chat_delay_ms: 0,
         }
     }
@@ -556,6 +566,19 @@ impl MockServer {
     /// Per-chat-request raw `Authorization` values (see `chat_auth_values`).
     pub fn chat_auth_values(&self) -> Vec<Option<String>> {
         self.chat_auth_values.lock().unwrap().clone()
+    }
+    /// The charge each `POST /v1/chat/completions` spend proof carried, in
+    /// arrival order — `None` for a request that spent nothing. This is the
+    /// hold the client sized, read off the wire the way the server reads it.
+    pub fn chat_charges(&self) -> Vec<Option<u128>> {
+        self.chat_auth_values()
+            .iter()
+            .map(|auth| {
+                auth.as_deref()
+                    .and_then(Issuer::spend_proof_from_auth)
+                    .and_then(|proof| scalar_to_credit::<128>(&proof.charge()).ok())
+            })
+            .collect()
     }
     /// The loopback port the mock listens on — used by local-model tests to
     /// register a fake "loaded engine" at the mock's address.
@@ -2406,6 +2429,18 @@ fn models_body(config: &MockConfig) -> String {
             "per_completion_token": { "value": 1u64, "scale_factor": 1u64 }
         }
     });
+    // **A model priced per request, not per token** — the shape the server's
+    // catalog gives a flat-priced model: zero token rates, and the price in
+    // `per_request`. A client that drops the flat price holds zero and refuses.
+    let flat = serde_json::json!({
+        "id": FLAT_MODEL,
+        "context_length": 8192u64,
+        "pricing": {
+            "per_prompt_token": { "value": 0u64, "scale_factor": 1_000_000u64 },
+            "per_completion_token": { "value": 0u64, "scale_factor": 1_000_000u64 },
+            "per_request": { "value": FLAT_PRICE * 1_000_000, "scale_factor": 1_000_000u64 }
+        }
+    });
     let omitted = config
         .catalog_omits
         .lock()
@@ -2413,6 +2448,7 @@ fn models_body(config: &MockConfig) -> String {
         .clone();
     let listed: Vec<serde_json::Value> = [primary, router]
         .into_iter()
+        .chain(config.list_flat_model.then_some(flat))
         .filter(|entry| {
             let id = entry["id"].as_str().unwrap_or_default();
             !omitted.iter().any(|o| o == id)

@@ -24,7 +24,8 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, MODEL, MockConfig, RefundMode, STREAM_WIRE_MODEL, core_for, with_account,
+    ChatBehavior, FLAT_MODEL, FLAT_PRICE, MODEL, MockConfig, RefundMode, STREAM_WIRE_MODEL,
+    core_for, with_account,
 };
 use eidola_app_core::AppCore;
 use eidola_app_core::ipc::Shutdown;
@@ -372,6 +373,46 @@ fn only_loaded_means_a_request_cannot_start_an_engine() {
 // ---------------------------------------------------------------------------
 // A proxied turn
 // ---------------------------------------------------------------------------
+
+/// REGRESSION: **a flat-priced model is held at its flat price, blocking and
+/// streaming.**
+///
+/// The route copied the catalog's token rates and dropped `per_request`, so a
+/// model the server prices per request — zero token rates, the price flat — was
+/// refused locally as a zero charge; with nonzero rates it would have held a
+/// sum the server's own worst case does not compute and been refused there.
+/// The hold is read off the spend proof that reached the wire.
+#[test]
+fn a_flat_priced_model_is_held_at_its_flat_price() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            list_flat_model: true,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{FLAT_MODEL}","messages":[{{"role":"user","content":"hello"}}]}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 200, "a flat price is not a zero charge: {body}");
+        assert_eq!(
+            mock.chat_charges(),
+            vec![Some(FLAT_PRICE as u128)],
+            "the hold is the flat price, whatever the request holds"
+        );
+    });
+}
 
 #[test]
 fn a_proxied_completion_pays_records_and_creates_no_conversation() {

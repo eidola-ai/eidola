@@ -24,9 +24,10 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, DEFAULT_AGENT_LABEL, HUMAN_LABEL, MODEL, MockConfig, MockServer, RefundMode,
-    Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, TRAILING_BLOCK_NOTE, flat_messages, map_entry,
-    roster, system_message, system_message_with, thread_map, trailing, with_account,
+    ChatBehavior, DEFAULT_AGENT_LABEL, FLAT_MODEL, FLAT_PRICE, HUMAN_LABEL, MODEL, MockConfig,
+    MockServer, RefundMode, Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, TRAILING_BLOCK_NOTE,
+    flat_messages, map_entry, roster, system_message, system_message_with, thread_map, trailing,
+    with_account,
 };
 use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::error::AppError;
@@ -322,6 +323,34 @@ fn a_first_message_into_a_pre_created_space_instantiates_nothing() {
             .expect("messages");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
+    });
+}
+
+/// REGRESSION: **a turn on a flat-priced model is held at its flat price.**
+///
+/// The turn path copied the catalog's token rates into its pricing tuple and
+/// dropped `per_request`, so a model the server prices per request — zero
+/// token rates — was refused as a zero charge before it was asked anything.
+/// The hold is the server's `worst_case_cost` for that model: the flat price,
+/// whatever the request holds. Read off the spend proof the turn presented.
+#[test]
+fn a_turn_on_a_flat_priced_model_is_held_at_its_flat_price() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            list_flat_model: true,
+            ..Default::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), FLAT_MODEL.into(), None))
+            .expect("a flat price is not a zero charge");
+        let charges = mock.chat_charges();
+        assert_eq!(
+            charges.first().copied().flatten(),
+            Some(FLAT_PRICE as u128),
+            "the turn's hold is the flat price: {charges:?}"
+        );
     });
 }
 

@@ -25,8 +25,8 @@
 
 use crate::error::AppError;
 use crate::{
-    Change, EidolaResolved, Inner, backends, db, estimate_charge_credits, fetch_models,
-    local_models, now_ms, process_refund, recover_refund,
+    Change, ChargePricing, EidolaResolved, Inner, backends, db, estimate_charge_credits,
+    fetch_models, local_models, now_ms, process_refund, recover_refund,
 };
 
 /// Where a chore call would go, and what it would cost — resolved without
@@ -50,7 +50,7 @@ struct UtilityRoute {
     wire_model: String,
     /// `(prompt_rate, completion_rate, scale_factor)` — `Some` only for a
     /// remote (billing) call.
-    pricing: Option<(u128, u128, u128)>,
+    pricing: Option<ChargePricing>,
     /// An external backend's bearer key, when it has one.
     external_auth: Option<String>,
     /// Held for the life of the call so the engine is not evicted underneath
@@ -244,11 +244,7 @@ impl Inner {
                     client,
                     base_url: eidola.base_url.clone(),
                     wire_model: target.model.clone(),
-                    pricing: Some((
-                        entry.pricing.per_prompt_token.value as u128,
-                        entry.pricing.per_completion_token.value as u128,
-                        entry.pricing.per_prompt_token.scale_factor as u128,
-                    )),
+                    pricing: Some(ChargePricing::from_catalog(&entry.pricing)),
                     external_auth: None,
                     engine_lease: None,
                 })

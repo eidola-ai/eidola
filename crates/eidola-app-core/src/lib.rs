@@ -6406,11 +6406,7 @@ impl Inner {
                         .ok_or_else(|| AppError::ModelUnavailable {
                             model: model.to_string(),
                         })?;
-                let pricing = (
-                    model_entry.pricing.per_prompt_token.value as u128,
-                    model_entry.pricing.per_completion_token.value as u128,
-                    model_entry.pricing.per_prompt_token.scale_factor as u128,
-                );
+                let pricing = ChargePricing::from_catalog(&model_entry.pricing);
                 // Whose catalog is this? Declarations are acted on only when
                 // the client is talking to the trust root it was built with:
                 // an overridden base URL or measurement set means some other
@@ -12490,7 +12486,7 @@ struct TurnPrep {
     tool_policy: ToolPolicy,
     /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
     /// for every non-spend backend. Kept so a later round can re-estimate.
-    remote_pricing: Option<(u128, u128, u128)>,
+    remote_pricing: Option<ChargePricing>,
     /// The per-turn spend ceiling, checked **per round** against that round's
     /// own estimate over the grown messages array.
     budget: Option<i64>,
@@ -13830,27 +13826,163 @@ async fn execute_tool_calls(
     out
 }
 
-/// The worst-case charge in credits for one request over `messages` and the
-/// `tool_schemas` that request advertises.
+/// One model's catalog pricing, as a hold computation reads it.
 ///
-/// `pricing` is `(prompt_rate, completion_rate, scale_factor)` from the model
-/// catalog. The prompt side is the shared contract's **single walk**,
-/// `eidola_common::prompt_charge` — the same function the server calls over
-/// the same request, which is what makes hold ≥ charge structural rather
-/// than a property two crates must keep agreeing on. The completion side is
-/// the full `max_completion_tokens` ceiling.
+/// **Built in one place, from the catalog row itself** ([`Self::from_catalog`]),
+/// so no path can carry part of the price and drop the rest. The three that
+/// spend — a space turn, a utility chore, a proxied completion — each built a
+/// `(prompt_rate, completion_rate, scale_factor)` tuple by hand, and every one
+/// dropped `per_request`: a flat-priced model was then held on its token rates,
+/// which the server does not charge by — zero rates refused locally as a zero
+/// charge, nonzero ones held a sum the server's own worst case disagrees with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChargePricing {
+    prompt_rate: u128,
+    completion_rate: u128,
+    scale_factor: u128,
+    /// `(value, scale_factor)` of a flat per-request price, for a model the
+    /// catalog prices per request rather than per token.
+    per_request: Option<(u128, u128)>,
+}
+
+impl ChargePricing {
+    fn from_catalog(pricing: &ModelPricingInfo) -> Self {
+        Self {
+            prompt_rate: pricing.per_prompt_token.value as u128,
+            completion_rate: pricing.per_completion_token.value as u128,
+            scale_factor: pricing.per_prompt_token.scale_factor as u128,
+            per_request: pricing
+                .per_request
+                .as_ref()
+                .map(|p| (p.value as u128, p.scale_factor as u128)),
+        }
+    }
+
+    /// Token pricing alone (tests).
+    #[cfg(test)]
+    pub(crate) fn per_token(prompt_rate: u128, completion_rate: u128, scale_factor: u128) -> Self {
+        Self {
+            prompt_rate,
+            completion_rate,
+            scale_factor,
+            per_request: None,
+        }
+    }
+}
+
+/// The worst-case charge in credits for one request over `messages` and the
+/// `tool_schemas` that request advertises — **the client half of the server's
+/// `worst_case_cost`, branch for branch**.
+///
+/// A model priced per request costs its flat price whatever the request
+/// holds, rounded up exactly as the server rounds it; that branch comes first
+/// and nothing else is consulted, as on the server. Otherwise the prompt side
+/// is the shared contract's **single walk**, `eidola_common::prompt_charge` —
+/// the same function the server calls over the same request, which is what
+/// makes hold ≥ charge structural rather than a property two crates must keep
+/// agreeing on — and the completion side is the full `max_completion_tokens`
+/// ceiling. A flat price with a zero scale factor is no price at all and
+/// answers zero, which every caller refuses as a zero charge rather than
+/// dividing by it.
 fn estimate_charge_credits(
     messages: &[serde_json::Value],
     tool_schemas: &[serde_json::Value],
     max_completion_tokens: u32,
-    pricing: (u128, u128, u128),
+    pricing: ChargePricing,
 ) -> u128 {
-    let (prompt_rate, completion_rate, sf) = pricing;
+    if let Some((value, scale_factor)) = pricing.per_request {
+        return if scale_factor == 0 {
+            0
+        } else {
+            value.div_ceil(scale_factor)
+        };
+    }
+    let sf = pricing.scale_factor;
     let chargeable_prompt =
         eidola_common::prompt_charge(messages, Some(tool_schemas)).chargeable_prompt_tokens();
-    let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
-    let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
+    let prompt_credits = (chargeable_prompt as u128 * pricing.prompt_rate).div_ceil(sf);
+    let completion_credits = (max_completion_tokens as u128 * pricing.completion_rate).div_ceil(sf);
     prompt_credits + completion_credits
+}
+
+#[cfg(test)]
+mod charge_pricing_tests {
+    use super::*;
+
+    /// The server's own scale (`PRICING_SCALE_FACTOR`), so the values below
+    /// are the ones its `worst_case_cost` tests use.
+    const SF: u64 = 1_000_000;
+
+    fn catalog(per_request: Option<u64>, token_rate: u64) -> ModelPricingInfo {
+        let mut pricing = serde_json::json!({
+            "per_prompt_token": { "value": token_rate, "scale_factor": SF },
+            "per_completion_token": { "value": token_rate, "scale_factor": SF },
+        });
+        if let Some(value) = per_request {
+            pricing["per_request"] = serde_json::json!({ "value": value, "scale_factor": SF });
+        }
+        serde_json::from_value(pricing).expect("a catalog pricing row")
+    }
+
+    fn messages(prompt: &str) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({ "role": "user", "content": prompt })]
+    }
+
+    /// REGRESSION: **a flat-priced model is held at its flat price.** The
+    /// catalog's `per_request` was dropped where the pricing was copied out,
+    /// so a model the server charges per request was held on its token rates:
+    /// zero rates refused locally as a zero charge, and nonzero ones held a
+    /// sum the server's own worst case does not compute. The server returns
+    /// the flat price, rounded up, whatever the request holds — so must this.
+    #[test]
+    fn a_flat_priced_model_is_held_at_its_flat_price() {
+        // The server's fixture: 5 credits flat, with no token rates at all.
+        let flat = ChargePricing::from_catalog(&catalog(Some(5 * SF), 0));
+        assert_eq!(estimate_charge_credits(&messages("hi"), &[], 100, flat), 5);
+        // Whatever the request holds, and whatever its token rates say.
+        let flat_with_rates = ChargePricing::from_catalog(&catalog(Some(5 * SF), 7 * SF));
+        let long = "x".repeat(10_000);
+        assert_eq!(
+            estimate_charge_credits(&messages(&long), &[], 4096, flat_with_rates),
+            5
+        );
+        // Rounded up, as the server's `div_ceil` rounds it.
+        let fractional = ChargePricing::from_catalog(&catalog(Some(5 * SF + 1), 0));
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, fractional),
+            6
+        );
+    }
+
+    /// A token-priced row is unchanged by the flat branch: the same sum the
+    /// shared contract walk always produced.
+    #[test]
+    fn a_token_priced_model_is_held_on_its_rates() {
+        let from_catalog = ChargePricing::from_catalog(&catalog(None, SF));
+        assert_eq!(
+            from_catalog,
+            ChargePricing::per_token(SF as u128, SF as u128, SF as u128)
+        );
+        let prompt = eidola_common::prompt_charge(&messages("hi"), Some(&[]))
+            .chargeable_prompt_tokens() as u128;
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, from_catalog),
+            prompt + 100
+        );
+    }
+
+    /// A flat price with no scale is no price: zero, which every caller
+    /// refuses as a zero charge, rather than a division by zero.
+    #[test]
+    fn a_flat_price_with_no_scale_is_a_zero_charge() {
+        let mut row = catalog(Some(5), 0);
+        row.per_request.as_mut().expect("flat").scale_factor = 0;
+        let pricing = ChargePricing::from_catalog(&row);
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, pricing),
+            0
+        );
+    }
 }
 
 /// The per-round spend ceiling check. `budget` caps *each* request's estimated
