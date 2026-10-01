@@ -54,6 +54,7 @@ proxy-stale = 无法刷新 — 显示的是上次的结果。
 
 proxy-error-not-an-address = { $value } 不是 IP 地址。代理监听的是地址，而不是名称。
 proxy-error-no-port = 代理需要一个端口。端口 0 会随便占用一个空闲端口，那不是能告诉工具的地址。
+proxy-error-not-a-port = { $value } 不是端口。端口是 1 到 65535 之间的整数。
 proxy-error-key-needs-name = 密钥需要一个名称，以便你日后分辨是哪个工具持有它。
 proxy-error-cannot-listen = 无法在 { $address } 上监听 —— { $reason }
 proxy-error-stopped-accepting = 代理已停止接受连接 —— { $reason }

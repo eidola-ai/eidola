@@ -54,6 +54,7 @@ proxy-stale = 無法重新整理 — 顯示的是上次的結果。
 
 proxy-error-not-an-address = { $value } 不是 IP 位址。代理監聽的是位址，而不是名稱。
 proxy-error-no-port = 代理需要一個連接埠。連接埠 0 會隨意佔用一個空閒的連接埠，那不是能告訴工具的位址。
+proxy-error-not-a-port = { $value } 不是連接埠。連接埠是 1 到 65535 之間的整數。
 proxy-error-key-needs-name = 金鑰需要一個名稱，以便你日後分辨是哪個工具持有它。
 proxy-error-cannot-listen = 無法在 { $address } 上監聽 —— { $reason }
 proxy-error-stopped-accepting = 代理已停止接受連線 —— { $reason }

@@ -9741,6 +9741,81 @@ fn proxy_refusals_stand_under_their_own_controls_and_dismiss_apart(cx: &mut Test
     );
 }
 
+/// REGRESSION: **a port that is not one is refused out loud, and the editor
+/// stays open with what was typed.**
+///
+/// Save returned without a word on text that did not parse as a `u16` — a
+/// letter, or a number past 65535 — so the button looked broken and nothing
+/// said what to correct. The refusal is app-core's typed one
+/// (`parse_bind_port`), filed under the binding's key, so it renders in the
+/// band beneath the row exactly as a refused write there does; `0` answers
+/// with the same sentence the write itself gives it.
+#[gpui::test]
+fn a_port_that_is_not_one_is_refused_where_it_was_typed(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(false, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_binding_edit(window, cx));
+    })
+    .unwrap();
+
+    for (typed, expected) in [
+        ("abc", "abc is not a port."),
+        ("70000", "70000 is not a port."),
+        ("0", "The proxy needs a port."),
+    ] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.set_binding_port_for_test(typed, window, cx);
+                v.commit_binding_edit(window, cx);
+            });
+        })
+        .unwrap();
+        assert!(
+            view.read_with(cx, |v, _| v.is_editing_binding()),
+            "{typed:?}: the editor stays open with what was typed"
+        );
+        let entries = fresh_entries(cx, window);
+        let band = entries
+            .iter()
+            .find(|(n, _)| n == "settings/proxy/binding/error")
+            .unwrap_or_else(|| panic!("{typed:?}: the refusal is shown"));
+        assert_eq!(band.1.role, gpui::Role::Alert);
+        assert!(
+            band.1.label.starts_with(&format!("Address: {expected}")),
+            "{typed:?}: {}",
+            band.1.label
+        );
+    }
+
+    // A port that is one goes through, and the write clears the refusal.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_binding_port_for_test("11438", window, cx);
+            v.commit_binding_edit(window, cx);
+        });
+    })
+    .unwrap();
+    assert!(!view.read_with(cx, |v, _| v.is_editing_binding()));
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "settings/proxy/binding/error"),
+        "the next write clears the binding's refusal"
+    );
+}
+
 /// REGRESSION: **the binding row spells an IPv6 endpoint the way a client
 /// parses it.**
 ///

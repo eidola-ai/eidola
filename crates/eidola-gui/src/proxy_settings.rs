@@ -29,7 +29,7 @@
 use eidola_app_core::BackendInfo;
 use eidola_app_core::error::AppError;
 use eidola_app_core::proxy::{
-    LocalExposure, ProxyKeyInfo, ProxyRefusal, ProxySettings, parse_bind_address,
+    LocalExposure, ProxyKeyInfo, ProxyRefusal, ProxySettings, parse_bind_address, parse_bind_port,
 };
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
@@ -143,6 +143,20 @@ impl ProxySettingsView {
         key_slot(id)
     }
 
+    /// Test seam: type into the open binding editor's port field.
+    #[doc(hidden)]
+    pub fn set_binding_port_for_test(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(edit) = self.binding_edit.as_ref() {
+            edit.port
+                .update(cx, |s, cx| s.set_value(text.to_string(), window, cx));
+        }
+    }
+
     /// Whether the address row is being edited (test seam).
     pub fn is_editing_binding(&self) -> bool {
         self.binding_edit.is_some()
@@ -176,16 +190,28 @@ impl ProxySettingsView {
 
     /// Commit the edit.
     ///
-    /// A port that does not parse is refused **here**, before the write, so a
-    /// typo leaves the stored binding untouched and the field still holding
-    /// what was typed — there is nothing to reconcile because nothing moved.
+    /// A port that is not one is refused **here**, before the write, so a typo
+    /// leaves the stored binding untouched and the field still holding what was
+    /// typed — there is nothing to reconcile because nothing moved. **And the
+    /// refusal is said, not swallowed**: a Save that did nothing left the
+    /// reader at a button that seemed broken. It is app-core's own typed
+    /// refusal (`parse_bind_port` — `NotAPort`, or the `NoPort` the write would
+    /// give `0`), filed under the binding's key, so it renders in the band
+    /// beneath this row exactly as a refused write to it does, and the next
+    /// Save clears it. The editor stays open with the text in it.
     pub fn commit_binding_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(edit) = self.binding_edit.as_ref() else {
             return;
         };
         let address = edit.address.read(cx).value().to_string();
-        let Ok(port) = edit.port.read(cx).value().trim().parse::<u16>() else {
-            return;
+        let port = match parse_bind_port(&edit.port.read(cx).value()) {
+            Ok(port) => port,
+            Err(refusal) => {
+                self.proxy
+                    .update(cx, |s, cx| s.refuse(ProxyOp::Binding, refusal, cx));
+                cx.notify();
+                return;
+            }
         };
         self.proxy
             .update(cx, |s, cx| s.set_binding(address, port, cx));
@@ -844,7 +870,8 @@ pub fn binding_text(settings: &ProxySettings) -> SharedString {
 /// **at render** — so a locale change repaints a refusal already on screen.
 ///
 /// Every `ProxyRefusal` has words of its own: those are the refusals this pane
-/// can actually provoke (an address that is not an IP literal, port 0, a key
+/// can actually provoke (an address that is not an IP literal, port 0, text
+/// that is no port at all, a key
 /// with no name, a bind the OS refused), and each variant carries what its
 /// sentence needs. **Anything else shows the typed error's own text**, which is
 /// English — stated rather than silent, and for the same reason the startup
@@ -858,6 +885,7 @@ pub fn refusal_copy(error: &AppError, cx: &App) -> SharedString {
                 msg::proxy_error_not_an_address(cx, value.clone())
             }
             ProxyRefusal::NoPort => msg::proxy_error_no_port(cx),
+            ProxyRefusal::NotAPort { value } => msg::proxy_error_not_a_port(cx, value.clone()),
             ProxyRefusal::KeyNeedsName => msg::proxy_error_key_needs_name(cx),
             ProxyRefusal::CannotListen { address, reason } => {
                 msg::proxy_error_cannot_listen(cx, address.clone(), reason.clone())

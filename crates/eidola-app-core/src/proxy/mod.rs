@@ -278,6 +278,31 @@ pub fn parse_bind_address(value: &str) -> Result<IpAddr, AppError> {
         })
 }
 
+/// Read a port the reader typed: a whole number from 1 to 65535.
+///
+/// **The refusal a surface shows for a port it cannot send.** The core takes a
+/// `u16`, so text that is not one never reaches it — and a surface that
+/// silently did nothing on such a Save left the reader looking at a button
+/// that appeared broken. So the rule lives here, beside
+/// [`parse_bind_address`], and answers in the same typed family: text that is
+/// no port at all is [`ProxyRefusal::NotAPort`], and `0` is the
+/// [`ProxyRefusal::NoPort`] the write itself refuses, so one value has one
+/// sentence whichever door it came through.
+pub fn parse_bind_port(value: &str) -> Result<u16, AppError> {
+    let trimmed = value.trim();
+    match trimmed.parse::<u16>() {
+        Ok(0) => Err(AppError::ProxyRefused {
+            refusal: ProxyRefusal::NoPort,
+        }),
+        Ok(port) => Ok(port),
+        Err(_) => Err(AppError::ProxyRefused {
+            refusal: ProxyRefusal::NotAPort {
+                value: trimmed.to_string(),
+            },
+        }),
+    }
+}
+
 /// Why a proxy setting or key operation was refused — **typed, so the surface
 /// that shows it can choose the words.**
 ///
@@ -296,6 +321,9 @@ pub enum ProxyRefusal {
     /// Port `0`, which asks the OS for whatever is free — not an address a
     /// tool can be told about.
     NoPort,
+    /// Text that is not a port number from 1 to 65535 — refused where it was
+    /// typed ([`parse_bind_port`]), since the core's own port is a `u16`.
+    NotAPort { value: String },
     /// A key with no name, which no reader could later tell apart.
     KeyNeedsName,
     /// The operating system refused the socket. `reason` is the OS's own text,
@@ -314,6 +342,12 @@ impl std::fmt::Display for ProxyRefusal {
                 "the proxy needs a port to bind; 0 would take whatever was free, \
                  which is not an address a tool can be told about",
             ),
+            ProxyRefusal::NotAPort { value } => {
+                write!(
+                    f,
+                    "`{value}` is not a port — a port is a whole number from 1 to 65535"
+                )
+            }
             ProxyRefusal::KeyNeedsName => {
                 f.write_str("a key needs a name, so a reader can tell later which tool holds it")
             }
@@ -631,6 +665,30 @@ impl AppCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typed port answers in the refusal family the write does: text that
+    /// is no port is `NotAPort` (carrying what was typed), `0` is the same
+    /// `NoPort` the write refuses, and every value a `u16` can carry but zero
+    /// is accepted — whitespace around it included.
+    #[test]
+    fn a_typed_port_is_parsed_into_the_refusal_family() {
+        let refusal = |value: &str| match parse_bind_port(value) {
+            Err(AppError::ProxyRefused { refusal }) => Some(refusal),
+            _ => None,
+        };
+        assert_eq!(parse_bind_port(" 11437 ").ok(), Some(11437));
+        assert_eq!(parse_bind_port("65535").ok(), Some(65535));
+        assert_eq!(refusal("0"), Some(ProxyRefusal::NoPort));
+        for bad in ["", "abc", "65536", "-1", "11437x"] {
+            assert_eq!(
+                refusal(bad),
+                Some(ProxyRefusal::NotAPort {
+                    value: bad.trim().to_string()
+                }),
+                "{bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_generated_key_is_prefixed_and_never_repeats() {

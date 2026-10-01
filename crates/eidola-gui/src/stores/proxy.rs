@@ -282,11 +282,20 @@ impl ProxyStore {
         !self.op_errors.is_empty()
     }
 
+    /// Stand a refusal a surface decided **before any write** — text in a field
+    /// that could not be sent at all (`parse_bind_port`). Filed under the
+    /// control's own key, so it renders where a refused write to that control
+    /// would, is dismissed the same way, and is cleared by the next write that
+    /// control makes.
+    pub fn refuse(&mut self, op: ProxyOp, error: AppError, cx: &mut Context<Self>) {
+        self.op_errors.insert(op, error);
+        cx.notify();
+    }
+
     /// Test seam: stand a refusal for one control, as a refused write would.
     #[doc(hidden)]
     pub fn set_op_error_for_test(&mut self, op: ProxyOp, error: AppError, cx: &mut Context<Self>) {
-        self.op_errors.insert(op, error);
-        cx.notify();
+        self.refuse(op, error, cx);
     }
 
     /// Forget the refusals whose control the pane no longer has.
