@@ -9255,6 +9255,75 @@ fn proxy_keys_fixture() -> Vec<eidola_app_core::proxy::ProxyKeyInfo> {
     ]
 }
 
+/// Press the centre of the switch probed as `probe_name` and return what
+/// `state` read before and after — the press aimed at the widget itself, the
+/// primary pointer target, never at the wrapper's padding.
+fn press_proxy_switch(
+    cx: &mut TestAppContext,
+    probe_name: &str,
+    state: impl Fn(&eidola_app_core::proxy::ProxySettings) -> bool,
+) -> (bool, bool) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+    use gpui::{Modifiers, VisualTestContext};
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let entries = fresh_entries(cx, window);
+    let (_, control) = entries
+        .iter()
+        .find(|(n, _)| n == probe_name)
+        .unwrap_or_else(|| panic!("{probe_name} painted"));
+    // The wrapper holds the widget and nothing else, so its centre is the
+    // switch track — a small `Switch` is 28×16.
+    assert!(
+        control.bounds.size.width <= gpui::px(30.) && control.bounds.size.height <= gpui::px(18.),
+        "the press lands on the widget, not on padding around it: {:?}",
+        control.bounds
+    );
+    let centre = control.bounds.center();
+    let read = |cx: &mut TestAppContext| {
+        cx.update(|cx| state(stores.proxy.read(cx).settings().value().expect("settings")))
+    };
+    let before = read(cx);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_click(centre, Modifiers::default());
+    vcx.run_until_parked();
+    (before, read(cx))
+}
+
+/// **A pointer press on a backend's switch changes that backend's exposure —
+/// exactly once.** "Not at all" is the pressed-and-eaten failure (a widget that
+/// takes the press and has no handler); "twice" is the double-fire one (wrapper
+/// and widget both answering), which reads as no change. Both fail here.
+#[gpui::test]
+fn proxy_pane_backend_switch_answers_a_pointer_press(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (before, after) = press_proxy_switch(cx, "settings/proxy/backends/eidola", |s| {
+        s.exposed_ids.contains(&"eidola".to_string())
+    });
+    assert!(before, "precondition: the backend starts exposed");
+    assert!(
+        !after,
+        "one press on the switch takes the exposure away, once"
+    );
+}
+
+/// The Serve switch, held to the same rule by the same press.
+#[gpui::test]
+fn proxy_pane_serve_switch_answers_a_pointer_press(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (before, after) = press_proxy_switch(cx, "settings/proxy/serve", |s| s.enabled);
+    assert!(before, "precondition: serving");
+    assert!(!after, "one press on the switch stops serving, once");
+}
+
 #[gpui::test]
 fn proxy_pane_probes_its_switch_binding_backends_and_keys(cx: &mut TestAppContext) {
     use eidola_gui::proxy_settings::ProxySettingsView;

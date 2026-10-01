@@ -795,6 +795,7 @@ impl ProxySettingsView {
         let theme = cx.theme();
         let exposed = settings.exposed_ids.contains(&backend.id);
         let id = backend.id.clone();
+        let switch_id = backend.id.clone();
         let name = SharedString::from(backend.display_name.clone());
         h_flex()
             .gap_2()
@@ -812,12 +813,27 @@ impl ProxySettingsView {
                         this.set_backend_exposed(id.clone(), !exposed, cx)
                     }))
                     .child(
+                        // Wired the way every other `Switch` in the app is
+                        // (`serve_switch`, the auto-start toggles, the login
+                        // item): the wrapper is the control for the keyboard
+                        // and the accessibility tree, and the widget takes the
+                        // pointer press itself and stops it, so the two never
+                        // double-fire. At this gpui-component rev a `Switch`
+                        // *without* an `on_click` registers no mouse-down at
+                        // all and the press reaches the wrapper anyway; this
+                        // site was the one exception, resting on that detail
+                        // where every other rests on the stop.
                         Switch::new(SharedString::from(format!(
                             "proxy-backend-switch-{}",
                             backend.id
                         )))
                         .small()
-                        .checked(exposed),
+                        .checked(exposed)
+                        .on_click(cx.listener(
+                            move |this, checked: &bool, _, cx| {
+                                this.set_backend_exposed(switch_id.clone(), *checked, cx);
+                            },
+                        )),
                     ),
             )
             .child(
