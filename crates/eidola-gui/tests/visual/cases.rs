@@ -85,6 +85,50 @@ fn register_space(s: &mut Snapshots) {
         },
     );
 
+    // The Find-all overlay, expanded over a branched conversation: the
+    // topological map down the left, and every result grouped under its post's
+    // attribution — matches on branches the reader is not looking at included,
+    // which is the whole point of the surface.
+    s.add(
+        "space_find_overlay",
+        size(px(980.), px(760.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let mut view =
+                    SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
+                });
+                view.seed_find_for_test("justice", window, cx);
+                view.toggle_find_overlay(window, cx);
+                view
+            })
+        },
+    );
+
+    // The same surface with nothing to show. Reachable only by the query
+    // ceasing to match while the overlay stands, since the disclosure that
+    // opens it appears with the total.
+    s.add(
+        "space_find_overlay_empty",
+        size(px(980.), px(760.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let mut view =
+                    SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
+                });
+                view.seed_find_for_test("justice", window, cx);
+                view.toggle_find_overlay(window, cx);
+                view.seed_find_for_test("zzzznothing", window, cx);
+                view
+            })
+        },
+    );
+
     // The space inspector (tasks 26.2 + 26.3): the per-space settings panel
     // splitting the window — chrome type beside the paper, with a remote router
     // selected so the mandatory per-call cost copy is in frame, and the

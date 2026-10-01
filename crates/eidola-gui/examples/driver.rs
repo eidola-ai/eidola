@@ -441,6 +441,30 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_find_overlay",
+                description: "Space view: the Find-all overlay expanded over a branched conversation — the topological map beside every result",
+                default_size: size(px(980.), px(760.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        let mut view = SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        );
+                        view.space().update(cx, |space, cx| {
+                            space.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                        });
+                        view.seed_find_for_test("justice", window, cx);
+                        view.toggle_find_overlay(window, cx);
+                        view
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_long_post",
                 description: "Space view: a conversation whose assistant reply is far taller than the window (selection repro)",
                 default_size: size(px(760.), px(680.)),
