@@ -97,3 +97,10 @@ proxy-error-no-port = The proxy needs a port. Port 0 would take whatever happene
 proxy-error-key-needs-name = A key needs a name, so you can tell later which tool holds it.
 proxy-error-cannot-listen = Couldn't listen on { $address } — { $reason }
 proxy-error-stopped-accepting = The proxy stopped accepting connections — { $reason }
+
+# A refusal stands under the control it was about, so its visible text needs no
+# subject. Its accessible name carries one, because a screen reader meets the
+# alert without the row above it. `$subject` is the control's own name (a row
+# label, a backend's or a key's name); `$message` is the refusal sentence.
+proxy-error-about = { $subject }: { $message }
+proxy-error-dismiss-name = Dismiss the message about { $subject }

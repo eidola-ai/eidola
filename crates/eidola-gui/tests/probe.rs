@@ -9545,10 +9545,11 @@ fn a_proxy_refusal_is_localized_and_follows_the_locale(cx: &mut TestAppContext) 
     });
     cx.update(|cx| {
         stores.proxy.update(cx, |s, cx| {
-            s.settle_for_test(
-                Err(AppError::ProxyRefused {
+            s.set_op_error_for_test(
+                eidola_gui::stores::proxy::ProxyOp::Binding,
+                AppError::ProxyRefused {
                     refusal: ProxyRefusal::NoPort,
-                }),
+                },
                 cx,
             );
             s.set_listen_error_for_test(
@@ -9575,14 +9576,14 @@ fn a_proxy_refusal_is_localized_and_follows_the_locale(cx: &mut TestAppContext) 
                 .to_string()
         };
         (
-            label("settings/proxy/error"),
+            label("settings/proxy/binding/error"),
             label("settings/proxy/listen-error"),
         )
     };
 
     let (refusal, listen) = labels(cx);
     assert!(
-        refusal.starts_with("The proxy needs a port."),
+        refusal.starts_with("Address: The proxy needs a port."),
         "the pane's own words, not the error's Display: {refusal}"
     );
     assert!(!refusal.contains("config error"), "{refusal}");
@@ -9595,17 +9596,17 @@ fn a_proxy_refusal_is_localized_and_follows_the_locale(cx: &mut TestAppContext) 
     for (tag, refusal_starts, listen_expected) in [
         (
             "fr",
-            "Le proxy a besoin d'un port.",
+            "Adresse : Le proxy a besoin d'un port.",
             "Impossible d'écouter sur 127.0.0.1:11437 — Address already in use",
         ),
         (
             "zh-Hans",
-            "代理需要一个端口。",
+            "地址：代理需要一个端口。",
             "无法在 127.0.0.1:11437 上监听 —— Address already in use",
         ),
         (
             "en",
-            "The proxy needs a port.",
+            "Address: The proxy needs a port.",
             "Couldn't listen on 127.0.0.1:11437 — Address already in use",
         ),
     ] {
@@ -9618,6 +9619,126 @@ fn a_proxy_refusal_is_localized_and_follows_the_locale(cx: &mut TestAppContext) 
         );
         assert_eq!(listen, listen_expected, "{tag}");
     }
+}
+
+/// REGRESSION: **each refused control's report stands under that control,
+/// and goes when that one is dismissed.**
+///
+/// The store kept one refusal slot for the whole pane, so a refused exposure
+/// checkbox and a refused switch could not both be on screen — the later one
+/// erased the earlier — and the single band at the foot of the pane said
+/// nothing about which control it was about. Keyed by control, each refusal is
+/// drawn beneath its own control, its accessible name says which, and its
+/// dismiss takes back that one alone.
+#[gpui::test]
+fn proxy_refusals_stand_under_their_own_controls_and_dismiss_apart(cx: &mut TestAppContext) {
+    use eidola_app_core::error::AppError;
+    use eidola_app_core::proxy::ProxyRefusal;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+    use eidola_gui::stores::proxy::ProxyOp;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let refusal = || AppError::ProxyRefused {
+        refusal: ProxyRefusal::NoPort,
+    };
+    cx.update(|cx| {
+        stores.proxy.update(cx, |s, cx| {
+            s.set_op_error_for_test(ProxyOp::Enabled, refusal(), cx);
+            s.set_op_error_for_test(ProxyOp::Backend("my-box".into()), refusal(), cx);
+            // A refusal about a backend the registry has answered without is
+            // about nothing on this pane, so it is forgotten, not drawn.
+            s.set_op_error_for_test(ProxyOp::Backend("removed".into()), refusal(), cx);
+        })
+    });
+
+    let entries = fresh_entries(cx, window);
+    let find = |name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, e)| e.clone())
+    };
+    let serve_band = find("settings/proxy/serve/error").expect("the switch's refusal painted");
+    let backend_band =
+        find("settings/proxy/backends/my-box/error").expect("the checkbox's refusal painted");
+    assert_eq!(serve_band.role, gpui::Role::Alert);
+    assert!(
+        serve_band
+            .label
+            .starts_with("Serve requests: The proxy needs a port."),
+        "the alert says which control it is about: {}",
+        serve_band.label
+    );
+    assert!(
+        backend_band
+            .label
+            .starts_with("My box: The proxy needs a port."),
+        "{}",
+        backend_band.label
+    );
+    assert!(
+        find("settings/proxy/error").is_none(),
+        "no pane-wide band stands in for the per-control ones"
+    );
+    assert!(
+        cx.update(|cx| {
+            stores
+                .proxy
+                .read(cx)
+                .op_error(&ProxyOp::Backend("removed".into()))
+                .is_none()
+        }),
+        "a refusal with no control left to stand under is forgotten"
+    );
+
+    // **Where its control is**: each band sits directly below the control it
+    // is about and above the row that follows.
+    let y = |name: &str| {
+        find(name)
+            .unwrap_or_else(|| panic!("{name} painted"))
+            .bounds
+            .origin
+            .y
+    };
+    assert!(y("settings/proxy/serve") < y("settings/proxy/serve/error"));
+    assert!(y("settings/proxy/serve/error") < y("settings/proxy/binding/change"));
+    assert!(y("settings/proxy/backends/my-box") < y("settings/proxy/backends/my-box/error"));
+    assert!(y("settings/proxy/backends/local") < y("settings/proxy/backends/my-box"));
+    assert_probe(
+        &entries,
+        "settings/proxy/serve/error/dismiss",
+        gpui::Role::Button,
+        "Dismiss the message about Serve requests",
+    );
+
+    // Dismissing one leaves the other standing.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.dismiss_refusal(ProxyOp::Enabled, "settings/proxy/serve/error", window, cx)
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    let names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+    assert!(
+        !names.iter().any(|n| *n == "settings/proxy/serve/error"),
+        "the dismissed refusal is gone: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| *n == "settings/proxy/backends/my-box/error"),
+        "the other control's refusal still stands: {names:?}"
+    );
 }
 
 /// Press the centre of the switch probed as `probe_name` and return what

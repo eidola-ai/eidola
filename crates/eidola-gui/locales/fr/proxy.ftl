@@ -57,3 +57,5 @@ proxy-error-no-port = Le proxy a besoin d'un port. Le port 0 prendrait n'importe
 proxy-error-key-needs-name = Une clé a besoin d'un nom, pour que vous sachiez plus tard quel outil la détient.
 proxy-error-cannot-listen = Impossible d'écouter sur { $address } — { $reason }
 proxy-error-stopped-accepting = Le proxy a cessé d'accepter des connexions — { $reason }
+proxy-error-about = { $subject } : { $message }
+proxy-error-dismiss-name = Ignorer le message concernant { $subject }

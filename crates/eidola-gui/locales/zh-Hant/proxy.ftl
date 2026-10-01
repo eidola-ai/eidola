@@ -57,3 +57,5 @@ proxy-error-no-port = 代理需要一個連接埠。連接埠 0 會隨意佔用�
 proxy-error-key-needs-name = 金鑰需要一個名稱，以便你日後分辨是哪個工具持有它。
 proxy-error-cannot-listen = 無法在 { $address } 上監聽 —— { $reason }
 proxy-error-stopped-accepting = 代理已停止接受連線 —— { $reason }
+proxy-error-about = { $subject }：{ $message }
+proxy-error-dismiss-name = 關閉關於「{ $subject }」的訊息

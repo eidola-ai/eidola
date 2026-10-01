@@ -390,6 +390,8 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("address", "127.0.0.1:11437");
                 args.set("backend", "Eidola");
                 args.set("value", "my-laptop.local");
+                args.set("subject", "Address");
+                args.set("message", "The proxy needs a port.");
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),

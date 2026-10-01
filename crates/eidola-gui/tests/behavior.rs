@@ -24896,10 +24896,10 @@ fn space_find_results_cursor_brings_its_card_into_view(cx: &mut TestAppContext) 
 /// window was left on a handle nobody paints: silent arrows, silent Escape, and
 /// Tab restarting from the window root.
 ///
-/// The class is "a verb whose press removes the verb", and the pane has five
+/// The class is "a verb whose press removes the verb", and the pane has six
 /// members — Revoke and Generate and the two Retrys join the two named above,
-/// which is why the question is asked of a per-subtree handle rather than
-/// patched per verb.
+/// and so does each refusal band's dismiss — which is why the question is
+/// asked of a per-subtree handle rather than patched per verb.
 #[gpui::test]
 fn a_proxy_verb_that_unmounts_itself_hands_the_keyboard_back(cx: &mut TestAppContext) {
     use eidola_gui::proxy_settings::{BINDING_SLOT, CREATE_SLOT, MINTED_SLOT, ProxySettingsView};
@@ -24980,6 +24980,38 @@ fn a_proxy_verb_that_unmounts_itself_hands_the_keyboard_back(cx: &mut TestAppCon
         cx.update_window(window, |_, window, _| root.is_focused(window))
             .unwrap(),
         "Done took the banner away, so it owed the keyboard back"
+    );
+
+    // --- a refusal's band: its dismiss takes the band away -----------------
+    let band_name = "settings/proxy/exposure/error";
+    stores.proxy.update(cx, |s, cx| {
+        s.set_op_error_for_test(
+            eidola_gui::stores::proxy::ProxyOp::Exposure,
+            eidola_app_core::error::AppError::ProxyRefused {
+                refusal: eidola_app_core::proxy::ProxyRefusal::NoPort,
+            },
+            cx,
+        )
+    });
+    draw_window(cx, window);
+    let band = slot(cx, band_name);
+    cx.update_window(window, |_, window, cx| window.focus(&band, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.dismiss_refusal(
+                eidola_gui::stores::proxy::ProxyOp::Exposure,
+                band_name,
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "dismissing took the band away, so it owed the keyboard back"
     );
 
     // --- and a reader working elsewhere in the pane keeps their caret ------

@@ -30,6 +30,7 @@ use eidola_app_core::changes::{Change, ChangeOrigin};
 use eidola_app_core::{AppCore, SpaceMessage};
 use gpui::{AppContext, TestAppContext};
 
+use eidola_gui::stores::proxy::{Landing, ProxyOp, SettingsEdit};
 use eidola_gui::stores::{self, SpacesStore, Stores};
 
 /// A real `AppCore` over tempdirs with an unreachable base URL. Its async
@@ -3403,7 +3404,7 @@ fn the_second_press_of_a_proxy_control_is_the_one_that_stands(cx: &mut TestAppCo
     wait_until(cx, "the batch settles", |cx| {
         stores
             .proxy
-            .read_with(cx, |s, _| s.op_error().is_some() || !s.writing())
+            .read_with(cx, |s, _| s.any_op_error() || !s.writing())
     });
     assert_eq!(
         stores
@@ -3470,7 +3471,7 @@ fn two_presses_of_the_proxy_switch_derive_from_each_other(cx: &mut TestAppContex
     wait_until(cx, "the batch settles", |cx| {
         stores
             .proxy
-            .read_with(cx, |s, _| s.op_error().is_some() || !s.writing())
+            .read_with(cx, |s, _| s.any_op_error() || !s.writing())
     });
     assert!(
         !core
@@ -3536,9 +3537,15 @@ fn a_settling_write_leaves_a_pending_siblings_edit_alone(cx: &mut TestAppContext
             settings
         })
         .expect("a snapshot to age");
-    stores
-        .proxy
-        .update(cx, |s, cx| s.settle_for_test(Ok(stale), cx));
+    stores.proxy.update(cx, |s, cx| {
+        s.settle_for_test(
+            ProxyOp::Enabled,
+            SettingsEdit::Enabled(true),
+            Landing::Current,
+            Ok(stale),
+            cx,
+        )
+    });
 
     assert!(
         exposed(cx),
@@ -3551,9 +3558,240 @@ fn a_settling_write_leaves_a_pending_siblings_edit_alone(cx: &mut TestAppContext
     wait_until(cx, "the batch settles", |cx| {
         stores
             .proxy
-            .read_with(cx, |s, _| s.op_error().is_some() || !s.writing())
+            .read_with(cx, |s, _| s.any_op_error() || !s.writing())
     });
     assert!(exposed(cx), "and the database agrees");
+}
+
+/// Load the proxy settings into a backed store and wait until nothing about
+/// them is still moving — no write in flight and no read on its way — so a
+/// test can stage a landing without a real one arriving behind it.
+fn settle_proxy(stores: &Stores, cx: &mut TestAppContext) {
+    stores.proxy.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the proxy settings stand still", |cx| {
+        stores.proxy.read_with(cx, |s, _| {
+            !s.writing() && s.settings().value().is_some() && !s.settings().is_stale()
+        })
+    });
+}
+
+fn a_refusal() -> eidola_app_core::error::AppError {
+    eidola_app_core::error::AppError::ProxyRefused {
+        refusal: eidola_app_core::proxy::ProxyRefusal::NoPort,
+    }
+}
+
+/// REGRESSION: **a refused enable is taken back before the resolving read, so
+/// a read that fails too cannot start the listener on it.**
+///
+/// The switch advances the cached settings as its write leaves, and the
+/// resolving read was trusted to put a refusal right. But that read can fail,
+/// and `Failed { prior }` keeps whatever the cell held — the refused `true` —
+/// and the reconcile then acts on the value the cell holds: a listener bound
+/// against the database's old intent, standing until something unrelated
+/// re-read. The refused op now restores what it displaced before the read is
+/// taken, so the kept value is the database's.
+///
+/// The interleaving is staged: a real core neither refuses an enable nor fails
+/// a read on demand. The listener half is real — the reconcile has a core, and
+/// a free port to bind if it is wrongly told to.
+#[gpui::test]
+fn a_refused_enable_does_not_start_the_listener_when_the_read_fails_too(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let port = a_free_port();
+    stores
+        .proxy
+        .update(cx, |s, cx| s.set_binding("127.0.0.1".into(), port, cx));
+    settle_proxy(&stores, cx);
+    assert!(!stores.proxy.read_with(cx, |s, _| s.is_running()));
+
+    stores.proxy.update(cx, |s, _| {
+        s.begin_settings_edit_for_test(ProxyOp::Enabled, SettingsEdit::Enabled(true))
+    });
+    assert_eq!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.enabled)),
+        Some(true),
+        "the press shows what it is writing"
+    );
+
+    stores.proxy.update(cx, |s, cx| {
+        s.settle_for_test(
+            ProxyOp::Enabled,
+            SettingsEdit::Enabled(true),
+            Landing::Current,
+            Err(a_refusal()),
+            cx,
+        );
+        s.land_settings_read_for_test(
+            Err(eidola_app_core::error::AppError::Database {
+                message: "database is locked".into(),
+            }),
+            cx,
+        );
+    });
+
+    let (running, enabled, failed, refused, handle) = stores.proxy.read_with(cx, |s, _| {
+        (
+            s.is_running(),
+            s.settings().value().map(|v| v.enabled),
+            s.settings().error().is_some(),
+            s.op_error(&ProxyOp::Enabled).is_some(),
+            s.handle(),
+        )
+    });
+    // Teardown first, so a failing assertion leaves no accept loop holding the
+    // core for the drain barrier to wait on.
+    handle.stop();
+    cx.run_until_parked();
+    assert!(failed, "the resolving read really failed");
+    assert!(refused, "the refusal is reported under the switch");
+    assert!(
+        !running,
+        "a refused enable must not start the listener against the database's intent"
+    );
+    assert_eq!(
+        enabled,
+        Some(false),
+        "the kept value is what the database holds, not the refused press"
+    );
+}
+
+/// REGRESSION: **a refused write restores what the database holds for its
+/// key — its accepted predecessor's value — and nothing of a sibling's.**
+///
+/// Two presses on one control are chained, and the first can land accepted
+/// while the second is refused. The database then holds the *first* press, so
+/// that is what the rollback restores to; the value from before the chain began
+/// would be a guess, and a wrong one. And the restore is this key's columns
+/// alone: a differently-keyed sibling's pending edit is still what will be true,
+/// and a snapshot restore would take it back too.
+#[gpui::test]
+fn a_refused_proxy_write_restores_its_keys_confirmed_value_and_nothing_else(
+    cx: &mut TestAppContext,
+) {
+    let (stores, _backing) = backed_stores(cx);
+    settle_proxy(&stores, cx);
+
+    stores.proxy.update(cx, |s, _| {
+        // A sibling still travelling: its edit is on screen.
+        s.begin_settings_edit_for_test(
+            ProxyOp::Backend("eidola".into()),
+            SettingsEdit::Backend {
+                id: "eidola".into(),
+                exposed: true,
+            },
+        );
+        // Two presses of the switch, chained.
+        s.begin_settings_edit_for_test(ProxyOp::Enabled, SettingsEdit::Enabled(true));
+        s.begin_settings_edit_for_test(ProxyOp::Enabled, SettingsEdit::Enabled(false));
+    });
+    let any = stores
+        .proxy
+        .read_with(cx, |s, _| s.settings().value().cloned())
+        .expect("a loaded snapshot");
+    stores.proxy.update(cx, |s, cx| {
+        // The first press lands accepted, superseded by the second…
+        s.settle_for_test(
+            ProxyOp::Enabled,
+            SettingsEdit::Enabled(true),
+            Landing::Superseded,
+            Ok(any.clone()),
+            cx,
+        );
+        // …which is refused.
+        s.settle_for_test(
+            ProxyOp::Enabled,
+            SettingsEdit::Enabled(false),
+            Landing::Current,
+            Err(a_refusal()),
+            cx,
+        );
+    });
+
+    let (enabled, exposed) = stores.proxy.read_with(cx, |s, _| {
+        let v = s.settings().value().expect("a loaded snapshot");
+        (v.enabled, v.exposed_ids.iter().any(|b| b == "eidola"))
+    });
+    assert!(
+        enabled,
+        "the database holds the accepted first press, so that is what is restored"
+    );
+    assert!(
+        exposed,
+        "a sibling's pending edit is not this refusal's to take back"
+    );
+}
+
+/// REGRESSION: **two refused controls each keep their own refusal, and a write
+/// clears only its own.**
+///
+/// One `op_error` slot served the whole pane: the second refusal erased the
+/// first, and the opening of *any* write — a press anywhere in the pane — took
+/// every standing report off the screen. Keyed by control, like the slots.
+#[gpui::test]
+fn two_refused_proxy_controls_each_keep_their_own_refusal(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    settle_proxy(&stores, cx);
+    let backend = ProxyOp::Backend("eidola".into());
+
+    stores.proxy.update(cx, |s, cx| {
+        s.settle_for_test(
+            ProxyOp::Enabled,
+            SettingsEdit::Enabled(true),
+            Landing::Current,
+            Err(a_refusal()),
+            cx,
+        );
+        s.settle_for_test(
+            backend.clone(),
+            SettingsEdit::Backend {
+                id: "eidola".into(),
+                exposed: true,
+            },
+            Landing::Current,
+            Err(a_refusal()),
+            cx,
+        );
+    });
+    let standing = |cx: &mut TestAppContext| {
+        stores.proxy.read_with(cx, |s, _| {
+            (
+                s.op_error(&ProxyOp::Enabled).is_some(),
+                s.op_error(&backend).is_some(),
+            )
+        })
+    };
+    assert_eq!(standing(cx), (true, true), "both refusals stand");
+
+    // A write to a third control says nothing about either.
+    stores.proxy.update(cx, |s, cx| {
+        s.set_local_exposure(eidola_app_core::proxy::LocalExposure::Downloaded, cx)
+    });
+    assert_eq!(
+        standing(cx),
+        (true, true),
+        "another control's write clears neither"
+    );
+
+    // A write to one of them clears its own report only.
+    stores.proxy.update(cx, |s, cx| s.set_enabled(false, cx));
+    assert_eq!(
+        standing(cx),
+        (false, true),
+        "the switch's write clears the switch's"
+    );
+    wait_until(cx, "the batch settles", |cx| {
+        stores.proxy.read_with(cx, |s, _| !s.writing())
+    });
+    assert_eq!(standing(cx), (false, true));
+
+    // And each is dismissed on its own.
+    stores
+        .proxy
+        .update(cx, |s, cx| s.clear_op_error(&backend, cx));
+    assert_eq!(standing(cx), (false, false));
 }
 
 /// REGRESSION: **a listener that gave up says why, and is started again.**

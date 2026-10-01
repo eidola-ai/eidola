@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use crate::i18n::msg;
 use crate::participants::{ghost_button, ghost_button_labeled, load_error_panel};
 use crate::probe::Probe as _;
-use crate::stores::proxy::ListenFailure;
+use crate::stores::proxy::{ListenFailure, ProxyOp};
 use crate::stores::{BackendsStore, ProxyStore, Stores};
 
 /// The subtrees a verb in this pane can unmount from under the keyboard.
@@ -293,6 +293,101 @@ impl ProxySettingsView {
         self.backends.update(cx, |s, cx| s.refresh(cx));
         cx.notify();
     }
+
+    /// Acknowledge one control's refusal. **The band is what its × takes
+    /// away**, and the × is a tab stop inside it — so the press asks the band
+    /// whether it was holding the keyboard, as every other verb here that
+    /// unmounts itself does.
+    pub fn dismiss_refusal(
+        &mut self,
+        op: ProxyOp,
+        band: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hand_back_focus_from(band, window, cx);
+        self.proxy.update(cx, |s, cx| s.clear_op_error(&op, cx));
+        cx.notify();
+    }
+
+    /// Tell the store which rows this pane still has, so a refusal about a
+    /// backend that was removed, or a key the listing no longer carries, is
+    /// forgotten rather than kept with nowhere to stand. Only a listing that
+    /// has answered is evidence of absence, so a side still loading — or whose
+    /// first read failed — is not asked about.
+    fn forget_absent_refusals(&mut self, cx: &mut Context<Self>) {
+        let backends: Option<Vec<String>> = self
+            .backends
+            .read(cx)
+            .state()
+            .value()
+            .map(|rows| rows.iter().map(|b| b.id.clone()).collect());
+        let keys: Option<Vec<String>> = self
+            .proxy
+            .read(cx)
+            .keys()
+            .value()
+            .map(|rows| rows.iter().map(|k| k.id.clone()).collect());
+        self.proxy.update(cx, |s, _| {
+            s.forget_op_errors_absent_from(backends.as_deref(), keys.as_deref())
+        });
+    }
+
+    /// One control's refusal, **rendered under that control** — `None` when
+    /// its last write was not refused.
+    ///
+    /// The store keys refusals per control, so the surface does too: two can
+    /// stand at once, and a single pane-wide band could neither say which of
+    /// two presses was refused nor show the second without discarding the
+    /// first (the Agents pane's per-row band). The control above it is the
+    /// visible context, so the band's text needs no subject; its **accessible
+    /// name carries one**, because a screen reader meets the alert without the
+    /// row above it. `probe_base` is the control's own probe name, so the
+    /// band's probes and element ids are unique wherever the control's are.
+    fn refusal_band(
+        &self,
+        op: ProxyOp,
+        probe_base: &str,
+        subject: SharedString,
+        cx: &Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let message = refusal_copy(self.proxy.read(cx).op_error(&op)?, cx);
+        let theme = cx.theme();
+        let band = format!("{probe_base}/error");
+        let dismiss = format!("{band}/dismiss");
+        let slot = band.clone();
+        Some(
+            h_flex()
+                .id(SharedString::from(band.clone()))
+                .track_focus(&self.slot(&band, cx))
+                .probe(
+                    band.clone(),
+                    gpui::Role::Alert,
+                    msg::proxy_error_about(cx, subject.to_string(), message.to_string()),
+                )
+                .w_full()
+                .gap_2()
+                .items_start()
+                .child(div().flex_1().min_w_0().child(notice_band(message, cx)))
+                .child(
+                    div()
+                        .id(SharedString::from(dismiss.clone()))
+                        .probe(
+                            dismiss,
+                            gpui::Role::Button,
+                            msg::proxy_error_dismiss_name(cx, subject.to_string()),
+                        )
+                        .cursor_pointer()
+                        .text_color(theme.muted_foreground)
+                        .hover(|s| s.text_color(theme.foreground))
+                        .child("×")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.dismiss_refusal(op.clone(), &slot, window, cx)
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
 }
 
 impl Focusable for ProxySettingsView {
@@ -303,12 +398,13 @@ impl Focusable for ProxySettingsView {
 
 impl Render for ProxySettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.forget_absent_refusals(cx);
         let theme = cx.theme();
         let store = self.proxy.read(cx);
         let settings = store.settings().clone();
         // Words chosen here, from the typed values the store holds — never a
-        // sentence cached there (see `refusal_copy`).
-        let op_error = store.op_error().map(|e| refusal_copy(e, cx));
+        // sentence cached there (see `refusal_copy`). Each control's own
+        // refusal is read where that control is drawn (`refusal_band`).
         let listen_error = store.listen_error().map(|f| listen_copy(&f, cx));
         let address = store.address().map(|a| a.to_string());
         let minted = store
@@ -415,6 +511,15 @@ impl Render for ProxySettingsView {
                                 .child(status),
                         ),
                 )
+                .when_some(
+                    self.refusal_band(
+                        ProxyOp::Enabled,
+                        "settings/proxy/serve",
+                        msg::proxy_serve(cx),
+                        cx,
+                    ),
+                    |el, band| el.child(band),
+                )
                 .when_some(listen_error, |el, message| {
                     el.child(
                         div()
@@ -433,7 +538,18 @@ impl Render for ProxySettingsView {
         col = col.child(field_row(
             msg::proxy_address(cx),
             cx,
-            self.binding_row(&settings, cx),
+            v_flex()
+                .gap_1()
+                .child(self.binding_row(&settings, cx))
+                .when_some(
+                    self.refusal_band(
+                        ProxyOp::Binding,
+                        "settings/proxy/binding",
+                        msg::proxy_address(cx),
+                        cx,
+                    ),
+                    |el, band| el.child(band),
+                ),
         ));
         if !settings.is_loopback() {
             col = col.child(
@@ -508,6 +624,14 @@ impl Render for ProxySettingsView {
                 }
                 for backend in rows {
                     col = col.child(self.backend_row(backend, &settings, cx));
+                    if let Some(band) = self.refusal_band(
+                        ProxyOp::Backend(backend.id.clone()),
+                        &format!("settings/proxy/backends/{}", backend.id),
+                        SharedString::from(backend.display_name.clone()),
+                        cx,
+                    ) {
+                        col = col.child(band);
+                    }
                 }
             }
         }
@@ -548,6 +672,14 @@ impl Render for ProxySettingsView {
                     .child(msg::proxy_exposure_note(cx)),
             ),
         );
+        if let Some(band) = self.refusal_band(
+            ProxyOp::Exposure,
+            "settings/proxy/exposure",
+            msg::proxy_exposure(cx),
+            cx,
+        ) {
+            col = col.child(band);
+        }
 
         // --- 5. Keys ---------------------------------------------------------
         col = col.child(section_header(msg::proxy_keys(cx), cx));
@@ -612,6 +744,14 @@ impl Render for ProxySettingsView {
                 }
                 for (index, key) in rows.iter().enumerate() {
                     col = col.child(self.key_row(index, key, cx));
+                    if let Some(band) = self.refusal_band(
+                        ProxyOp::Revoke(key.id.clone()),
+                        &format!("settings/proxy/keys/{index}"),
+                        SharedString::from(key.label.clone()),
+                        cx,
+                    ) {
+                        col = col.child(band);
+                    }
                 }
             }
         }
@@ -669,13 +809,13 @@ impl Render for ProxySettingsView {
                 }),
         );
 
-        if let Some(message) = op_error {
-            col = col.child(
-                div()
-                    .id("proxy-error")
-                    .probe("settings/proxy/error", gpui::Role::Alert, message.clone())
-                    .child(notice_band(message, cx)),
-            );
+        if let Some(band) = self.refusal_band(
+            ProxyOp::CreateKey,
+            "settings/proxy/keys/create",
+            msg::proxy_keys(cx),
+            cx,
+        ) {
+            col = col.child(band);
         }
         col
     }
@@ -1066,7 +1206,7 @@ fn loading_line(probe_name: &'static str, message: SharedString, cx: &App) -> im
 ///
 /// `participants::error_banner` lays its label out in an `h_flex` with no
 /// width discipline, which is right for the one-line refusals every other pane
-/// puts in it and wrong for a sentence: this pane's two bands are a whole
+/// puts in it and wrong for a sentence: this pane's bands are a whole
 /// explanation each, and an unwrapped one runs off the edge of the panel.
 /// Written locally rather than by widening the shared helper, because the
 /// helper's callers are sized around its current shape and a sentence is this
