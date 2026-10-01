@@ -47,8 +47,8 @@ struct BasicAuthAddon;
 impl Modify for BasicAuthAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         let components = openapi.components.get_or_insert_default();
-        components.security_schemes.insert(
-            "basic".to_string(),
+        components.add_security_scheme(
+            "basic",
             SecurityScheme::Http(
                 HttpBuilder::new()
                     .scheme(HttpAuthScheme::Basic)
