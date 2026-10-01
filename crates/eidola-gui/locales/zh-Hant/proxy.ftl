@@ -1,6 +1,6 @@
 # 設定 ▸ 代理 —— 本機推論代理（src/proxy_settings.rs），繁體中文。
 
-proxy-lead = 讓這台電腦上的其他工具使用你透過 Eidola 取用的模型。它們說 OpenAI API；每個請求仍然經過 Eidola —— 經過證明、由你的錢包付費，並寫入記錄。
+proxy-lead = 讓這台電腦上的其他工具使用你透過 Eidola 取用的模型。它們說 OpenAI API，送出的每個請求都會寫入記錄。其餘取決於請求前往何處：Eidola 託管服務經過證明，由你的錢包付費；裝置端模型在這台電腦上執行，不產生費用；你自己新增的伺服器會被直接存取，沒有證明，適用該伺服器自己的條款。
 
 proxy-serve = 處理請求
 proxy-serve-name = 透過 Eidola 處理本機請求

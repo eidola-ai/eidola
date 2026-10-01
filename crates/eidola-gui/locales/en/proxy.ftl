@@ -9,8 +9,11 @@
 # beside the other five, and it is also what the nav row's probe name derives
 # from — and a probe name is a stable selector that must never localize.
 
-# What the pane is for, above everything else on it.
-proxy-lead = Let other tools on this computer use the models you reach through Eidola. They speak the OpenAI API; every request still goes through Eidola — attested, paid for from your wallet, and written into the Record.
+# What the pane is for, above everything else on it. Attestation and wallet
+# payment belong to the hosted Eidola route alone; an on-device model and an
+# external server get neither, so the sentence says which is which rather
+# than lending every route the hosted one's properties.
+proxy-lead = Let other tools on this computer use the models you reach through Eidola. They speak the OpenAI API, and every request they send is written into the Record. What else a request gets depends on where it goes: the hosted Eidola service is attested and paid for from your wallet; an on-device model runs on this computer and costs nothing; a server you added yourself is reached directly, with no attestation, on that server's own terms.
 
 # The switch that starts and stops the listener.
 proxy-serve = Serve requests

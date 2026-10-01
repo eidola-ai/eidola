@@ -1,6 +1,6 @@
 # Réglages ▸ Proxy — le proxy d'inférence local (src/proxy_settings.rs), français.
 
-proxy-lead = Laissez d'autres outils de cet ordinateur utiliser les modèles que vous atteignez via Eidola. Ils parlent l'API OpenAI ; chaque requête passe toujours par Eidola — attestée, payée depuis votre portefeuille et inscrite au Registre.
+proxy-lead = Laissez d'autres outils de cet ordinateur utiliser les modèles que vous atteignez via Eidola. Ils parlent l'API OpenAI, et chaque requête qu'ils envoient est inscrite au Registre. Le reste dépend de sa destination : le service hébergé d'Eidola est attesté et payé depuis votre portefeuille ; un modèle sur l'appareil tourne sur cet ordinateur et ne coûte rien ; un serveur que vous avez ajouté vous-même est joint directement, sans attestation, selon ses propres conditions.
 
 proxy-serve = Répondre aux requêtes
 proxy-serve-name = Répondre aux requêtes locales via Eidola
