@@ -1064,6 +1064,9 @@ impl WireError {
             // value whose whole purpose is the sentence it renders to. The
             // reader gets `message` — the sentence — and the variant name.
             AppError::SpawnRefused { .. } => ("SpawnRefused", json!({})),
+            // The same reasoning, for the same shape: a typed refusal whose
+            // purpose on this side is the sentence `message` already carries.
+            AppError::ProxyRefused { .. } => ("ProxyRefused", json!({})),
             AppError::Network { message } => ("Network", json!({ "message": message })),
             AppError::Attestation { message } => ("Attestation", json!({ "message": message })),
             AppError::Server { status, message } => {

@@ -9388,3 +9388,850 @@ fn the_find_overlay_keeps_the_tab_order_to_itself(cx: &mut TestAppContext) {
 
     probe::set_probes_enabled(false);
 }
+
+/// REGRESSION: **a registry that has not answered is not "no backends".**
+///
+/// `BackendsStore::list` answers `&[]` for a read in flight and for a failed
+/// one exactly as it does for a registry that is really empty, so the pane said
+/// "No backends are configured yet" over a proxy whose own settings may name
+/// several exposed ones it is serving this minute — hiding what is reachable
+/// and offering nothing that could cause a second read. The registry's read is
+/// independent of the proxy's, so it fails independently too.
+#[gpui::test]
+fn the_proxy_panes_backend_cell_reads_its_states_apart(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.backends = backends_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+
+    // A read in flight.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::Loading);
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/loading".to_string()),
+        "a read in flight says so: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/backends/empty".to_string()),
+        "and does not describe the reader's registry: {names:?}"
+    );
+
+    // A failed initial read: the way back is a retry, not a sentence about
+    // backends nobody has read.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: None,
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/retry".to_string()),
+        "a failed read offers the only thing that can cause another: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/backends/empty".to_string()),
+        "'Failed is not empty': {names:?}"
+    );
+
+    // A failed refresh over rows we hold: the checkboxes stay, and the line
+    // says they are as of the last successful read.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: Some(backends_fixture()),
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/eidola".to_string()),
+        "a re-fetch never blanks a page: {names:?}"
+    );
+    assert!(
+        names.contains(&"settings/proxy/backends/stale".to_string()),
+        "and says what it is showing: {names:?}"
+    );
+
+    // Only an answered, empty registry is the sentence.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::loaded(Vec::new()));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/empty".to_string()),
+        "an answered empty registry is the one state that says there are none: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/backends/loading".to_string()),
+        "and it is not still loading: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// A proxy configured the way a reader who has just set it up would have it:
+/// on, loopback, one backend ticked, one key live and one revoked.
+fn proxy_settings_fixture(enabled: bool, address: &str) -> eidola_app_core::proxy::ProxySettings {
+    eidola_app_core::proxy::ProxySettings {
+        enabled,
+        bind_address: address.into(),
+        bind_port: 11437,
+        local_exposure: eidola_app_core::proxy::LocalExposure::Loaded,
+        backends: vec!["eidola".into()],
+        exposed_ids: vec!["eidola".into()],
+        live_key_count: 1,
+    }
+}
+
+fn proxy_keys_fixture() -> Vec<eidola_app_core::proxy::ProxyKeyInfo> {
+    vec![
+        eidola_app_core::proxy::ProxyKeyInfo {
+            id: "k-live".into(),
+            label: "My editor".into(),
+            prefix: "eid-Ab3xQ9".into(),
+            created_at: 0,
+            last_used_at: None,
+            revoked_at: None,
+        },
+        eidola_app_core::proxy::ProxyKeyInfo {
+            id: "k-dead".into(),
+            label: "An old script".into(),
+            prefix: "eid-Zz00Kk".into(),
+            created_at: 0,
+            last_used_at: Some(1),
+            revoked_at: Some(2),
+        },
+    ]
+}
+
+/// REGRESSION: **a proxy refusal speaks the reader's language, and keeps
+/// speaking it through a locale change.**
+///
+/// The store cached `AppError`'s English `Display`, so a reader in any other
+/// locale met this crate's English in the middle of a localized pane — and a
+/// cached sentence cannot follow a locale change. The store now holds the typed
+/// error and the pane chooses the words at render; switching locale **without
+/// re-emitting the failure** is what tells the two apart (a test that re-failed
+/// after each switch would pass against a cache).
+#[gpui::test]
+fn a_proxy_refusal_is_localized_and_follows_the_locale(cx: &mut TestAppContext) {
+    use eidola_app_core::error::AppError;
+    use eidola_app_core::proxy::ProxyRefusal;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update(|cx| {
+        stores.proxy.update(cx, |s, cx| {
+            s.set_op_error_for_test(
+                eidola_gui::stores::proxy::ProxyOp::Binding,
+                AppError::ProxyRefused {
+                    refusal: ProxyRefusal::NoPort,
+                },
+                cx,
+            );
+            s.set_listen_error_for_test(
+                AppError::ProxyRefused {
+                    refusal: ProxyRefusal::CannotListen {
+                        address: "127.0.0.1:11437".into(),
+                        reason: "Address already in use".into(),
+                    },
+                },
+                cx,
+            );
+        })
+    });
+
+    let labels = |cx: &mut TestAppContext| {
+        let entries = fresh_entries(cx, window);
+        let label = |name: &str| {
+            entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} painted"))
+                .1
+                .label
+                .to_string()
+        };
+        (
+            label("settings/proxy/binding/error"),
+            label("settings/proxy/listen-error"),
+        )
+    };
+
+    let (refusal, listen) = labels(cx);
+    assert!(
+        refusal.starts_with("Address: The proxy needs a port."),
+        "the pane's own words, not the error's Display: {refusal}"
+    );
+    assert!(!refusal.contains("config error"), "{refusal}");
+    assert_eq!(
+        listen,
+        "Couldn't listen on 127.0.0.1:11437 — Address already in use"
+    );
+
+    // Nothing is re-emitted between these — only the locale changes.
+    for (tag, refusal_starts, listen_expected) in [
+        (
+            "fr",
+            "Adresse : Le proxy a besoin d'un port.",
+            "Impossible d'écouter sur 127.0.0.1:11437 — Address already in use",
+        ),
+        (
+            "zh-Hans",
+            "地址：代理需要一个端口。",
+            "无法在 127.0.0.1:11437 上监听 —— Address already in use",
+        ),
+        (
+            "en",
+            "Address: The proxy needs a port.",
+            "Couldn't listen on 127.0.0.1:11437 — Address already in use",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        cx.run_until_parked();
+        let (refusal, listen) = labels(cx);
+        assert!(
+            refusal.starts_with(refusal_starts),
+            "{tag} repaints the refusal already on screen: {refusal}"
+        );
+        assert_eq!(listen, listen_expected, "{tag}");
+    }
+}
+
+/// REGRESSION: **each refused control's report stands under that control,
+/// and goes when that one is dismissed.**
+///
+/// The store kept one refusal slot for the whole pane, so a refused exposure
+/// checkbox and a refused switch could not both be on screen — the later one
+/// erased the earlier — and the single band at the foot of the pane said
+/// nothing about which control it was about. Keyed by control, each refusal is
+/// drawn beneath its own control, its accessible name says which, and its
+/// dismiss takes back that one alone.
+#[gpui::test]
+fn proxy_refusals_stand_under_their_own_controls_and_dismiss_apart(cx: &mut TestAppContext) {
+    use eidola_app_core::error::AppError;
+    use eidola_app_core::proxy::ProxyRefusal;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+    use eidola_gui::stores::proxy::ProxyOp;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let refusal = || AppError::ProxyRefused {
+        refusal: ProxyRefusal::NoPort,
+    };
+    cx.update(|cx| {
+        stores.proxy.update(cx, |s, cx| {
+            s.set_op_error_for_test(ProxyOp::Enabled, refusal(), cx);
+            s.set_op_error_for_test(ProxyOp::Backend("my-box".into()), refusal(), cx);
+            // A refusal about a backend the registry has answered without is
+            // about nothing on this pane, so it is forgotten, not drawn.
+            s.set_op_error_for_test(ProxyOp::Backend("removed".into()), refusal(), cx);
+        })
+    });
+
+    let entries = fresh_entries(cx, window);
+    let find = |name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, e)| e.clone())
+    };
+    let serve_band = find("settings/proxy/serve/error").expect("the switch's refusal painted");
+    let backend_band =
+        find("settings/proxy/backends/my-box/error").expect("the checkbox's refusal painted");
+    assert_eq!(serve_band.role, gpui::Role::Alert);
+    assert!(
+        serve_band
+            .label
+            .starts_with("Serve requests: The proxy needs a port."),
+        "the alert says which control it is about: {}",
+        serve_band.label
+    );
+    assert!(
+        backend_band
+            .label
+            .starts_with("My box: The proxy needs a port."),
+        "{}",
+        backend_band.label
+    );
+    assert!(
+        find("settings/proxy/error").is_none(),
+        "no pane-wide band stands in for the per-control ones"
+    );
+    assert!(
+        cx.update(|cx| {
+            stores
+                .proxy
+                .read(cx)
+                .op_error(&ProxyOp::Backend("removed".into()))
+                .is_none()
+        }),
+        "a refusal with no control left to stand under is forgotten"
+    );
+
+    // **Where its control is**: each band sits directly below the control it
+    // is about and above the row that follows.
+    let y = |name: &str| {
+        find(name)
+            .unwrap_or_else(|| panic!("{name} painted"))
+            .bounds
+            .origin
+            .y
+    };
+    assert!(y("settings/proxy/serve") < y("settings/proxy/serve/error"));
+    assert!(y("settings/proxy/serve/error") < y("settings/proxy/binding/change"));
+    assert!(y("settings/proxy/backends/my-box") < y("settings/proxy/backends/my-box/error"));
+    assert!(y("settings/proxy/backends/local") < y("settings/proxy/backends/my-box"));
+    assert_probe(
+        &entries,
+        "settings/proxy/serve/error/dismiss",
+        gpui::Role::Button,
+        "Dismiss the message about Serve requests",
+    );
+
+    // Dismissing one leaves the other standing.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.dismiss_refusal(ProxyOp::Enabled, "settings/proxy/serve/error", window, cx)
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    let names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+    assert!(
+        !names.iter().any(|n| *n == "settings/proxy/serve/error"),
+        "the dismissed refusal is gone: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| *n == "settings/proxy/backends/my-box/error"),
+        "the other control's refusal still stands: {names:?}"
+    );
+}
+
+/// REGRESSION: **a port that is not one is refused out loud, and the editor
+/// stays open with what was typed.**
+///
+/// Save returned without a word on text that did not parse as a `u16` — a
+/// letter, or a number past 65535 — so the button looked broken and nothing
+/// said what to correct. The refusal is app-core's typed one
+/// (`parse_bind_port`), filed under the binding's key, so it renders in the
+/// band beneath the row exactly as a refused write there does; `0` answers
+/// with the same sentence the write itself gives it.
+#[gpui::test]
+fn a_port_that_is_not_one_is_refused_where_it_was_typed(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(false, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_binding_edit(window, cx));
+    })
+    .unwrap();
+
+    for (typed, expected) in [
+        ("abc", "abc is not a port."),
+        ("70000", "70000 is not a port."),
+        ("0", "The proxy needs a port."),
+    ] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.set_binding_port_for_test(typed, window, cx);
+                v.commit_binding_edit(window, cx);
+            });
+        })
+        .unwrap();
+        assert!(
+            view.read_with(cx, |v, _| v.is_editing_binding()),
+            "{typed:?}: the editor stays open with what was typed"
+        );
+        let entries = fresh_entries(cx, window);
+        let band = entries
+            .iter()
+            .find(|(n, _)| n == "settings/proxy/binding/error")
+            .unwrap_or_else(|| panic!("{typed:?}: the refusal is shown"));
+        assert_eq!(band.1.role, gpui::Role::Alert);
+        assert!(
+            band.1.label.starts_with(&format!("Address: {expected}")),
+            "{typed:?}: {}",
+            band.1.label
+        );
+    }
+
+    // A port that is one goes through, and the write clears the refusal.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_binding_port_for_test("11438", window, cx);
+            v.commit_binding_edit(window, cx);
+        });
+    })
+    .unwrap();
+    assert!(!view.read_with(cx, |v, _| v.is_editing_binding()));
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "settings/proxy/binding/error"),
+        "the next write clears the binding's refusal"
+    );
+}
+
+/// REGRESSION: **the binding row spells an IPv6 endpoint the way a client
+/// parses it.**
+///
+/// The row joined host and port, so `::1` read `::1:11437` — not an address
+/// any client accepts — while the status line beside it, spelled by
+/// `SocketAddr`, read `[::1]:11437`. One pane, two spellings of one binding,
+/// and the one a reader copies into a tool was the invalid one.
+#[gpui::test]
+fn the_binding_row_brackets_an_ipv6_endpoint(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    for (address, expected) in [("::1", "[::1]:11437"), ("127.0.0.1", "127.0.0.1:11437")] {
+        let stores = stub_stores(cx, |s| {
+            s.config_state = Some(probe_config_state());
+            s.backends = backends_fixture();
+            s.proxy_settings = Some(proxy_settings_fixture(false, address));
+            s.proxy_keys = proxy_keys_fixture();
+        });
+        let (window, _view) = open_view(cx, |window, cx| {
+            cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+        });
+        let entries = fresh_entries(cx, window);
+        assert_probe_value(
+            &entries,
+            "settings/proxy/binding/value",
+            gpui::Role::Label,
+            expected,
+            expected,
+        );
+    }
+}
+
+/// Press the centre of the switch probed as `probe_name` and return what
+/// `state` read before and after — the press aimed at the widget itself, the
+/// primary pointer target, never at the wrapper's padding.
+fn press_proxy_switch(
+    cx: &mut TestAppContext,
+    probe_name: &str,
+    state: impl Fn(&eidola_app_core::proxy::ProxySettings) -> bool,
+) -> (bool, bool) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+    use gpui::{Modifiers, VisualTestContext};
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let entries = fresh_entries(cx, window);
+    let (_, control) = entries
+        .iter()
+        .find(|(n, _)| n == probe_name)
+        .unwrap_or_else(|| panic!("{probe_name} painted"));
+    // The wrapper holds the widget and nothing else, so its centre is the
+    // switch track — a small `Switch` is 28×16.
+    assert!(
+        control.bounds.size.width <= gpui::px(30.) && control.bounds.size.height <= gpui::px(18.),
+        "the press lands on the widget, not on padding around it: {:?}",
+        control.bounds
+    );
+    let centre = control.bounds.center();
+    let read = |cx: &mut TestAppContext| {
+        cx.update(|cx| state(stores.proxy.read(cx).settings().value().expect("settings")))
+    };
+    let before = read(cx);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_click(centre, Modifiers::default());
+    vcx.run_until_parked();
+    (before, read(cx))
+}
+
+/// **A pointer press on a backend's switch changes that backend's exposure —
+/// exactly once.** "Not at all" is the pressed-and-eaten failure (a widget that
+/// takes the press and has no handler); "twice" is the double-fire one (wrapper
+/// and widget both answering), which reads as no change. Both fail here.
+#[gpui::test]
+fn proxy_pane_backend_switch_answers_a_pointer_press(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (before, after) = press_proxy_switch(cx, "settings/proxy/backends/eidola", |s| {
+        s.exposed_ids.contains(&"eidola".to_string())
+    });
+    assert!(before, "precondition: the backend starts exposed");
+    assert!(
+        !after,
+        "one press on the switch takes the exposure away, once"
+    );
+}
+
+/// The Serve switch, held to the same rule by the same press.
+#[gpui::test]
+fn proxy_pane_serve_switch_answers_a_pointer_press(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (before, after) = press_proxy_switch(cx, "settings/proxy/serve", |s| s.enabled);
+    assert!(before, "precondition: serving");
+    assert!(!after, "one press on the switch stops serving, once");
+}
+
+#[gpui::test]
+fn proxy_pane_probes_its_switch_binding_backends_and_keys(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    for expected in [
+        "settings/proxy/pane",
+        "settings/proxy/serve",
+        "settings/proxy/status",
+        "settings/proxy/binding/change",
+        "settings/proxy/backends/eidola",
+        "settings/proxy/backends/local",
+        "settings/proxy/backends/my-box",
+        "settings/proxy/exposure/loaded",
+        "settings/proxy/exposure/downloaded",
+        "settings/proxy/keys/0",
+        "settings/proxy/keys/0/revoke",
+        "settings/proxy/keys/1",
+        "settings/proxy/keys/label",
+        "settings/proxy/keys/create",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "proxy pane probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // **The status reads the listener, not the setting.** A stub store binds
+    // nothing, so a pane whose settings say "enabled" still says it is not
+    // listening — which is the honest answer and the whole reason the two are
+    // read apart.
+    assert_probe_value(
+        &entries,
+        "settings/proxy/status",
+        gpui::Role::Label,
+        "Not listening",
+        "Not listening",
+    );
+
+    // A revoked key keeps its row — the label is what tells a reader which
+    // tool lost access — and loses only its verb.
+    assert!(
+        !names.contains(&"settings/proxy/keys/1/revoke".to_string()),
+        "a revoked key offers no second revocation: {names:?}"
+    );
+    let live = entries
+        .iter()
+        .find(|(n, _)| n == "settings/proxy/keys/0")
+        .expect("the live key's row");
+    assert!(
+        live.1
+            .value
+            .as_ref()
+            .is_some_and(|v| v.contains("eid-Ab3xQ9")),
+        "the row shows enough of the key to tell rows apart: {:?}",
+        live.1.value
+    );
+    assert!(
+        !names.iter().any(|n| n == "settings/proxy/keys/minted"),
+        "nothing is revealed until a key is generated: {names:?}"
+    );
+
+    // The binding row is display-then-editor: the value stands until a verb
+    // swaps the fields in.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_binding_edit(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/proxy/binding/address",
+        "settings/proxy/binding/port",
+        "settings/proxy/binding/save",
+        "settings/proxy/binding/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "binding editor probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/proxy/binding/change".to_string()),
+        "the verb the editor replaced is gone while it stands: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// REGRESSION: **a key cell that has not answered is not "no keys".**
+///
+/// `key_list` answers `&[]` for a read in flight and for a failed one exactly
+/// as it does for a proxy that really has no keys, so one sentence covered all
+/// three — and it is the worst of the three to be wrong about: "No keys yet —
+/// nothing can reach the proxy until you make one" invites a reader whose keys
+/// are perfectly alive to generate another, and a failed read left nothing on
+/// the page that could ever cause a second one.
+///
+/// Four states, four readings: in flight says so, a failed *initial* read says
+/// so and offers the retry, a failed *refresh* keeps the rows it has and adds
+/// the quiet line, and only an answered empty listing is the invitation.
+#[gpui::test]
+fn the_proxy_panes_key_cell_reads_its_states_apart(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+
+    // A read in flight.
+    stores.proxy.update(cx, |s, _| {
+        s.set_keys_for_test(Loadable::Loading);
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/loading".to_string()),
+        "a read in flight says so: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/keys/empty".to_string()),
+        "and does not claim the proxy has no keys: {names:?}"
+    );
+
+    // A failed initial read: the way back is a retry, not an invitation.
+    stores.proxy.update(cx, |s, _| {
+        s.set_keys_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: None,
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/retry".to_string()),
+        "a failed read offers the only thing that can cause another: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/keys/empty".to_string()),
+        "'Failed is not empty': {names:?}"
+    );
+
+    // A failed refresh over rows we hold: the rows stay, and the line says they
+    // are as of the last successful read.
+    stores.proxy.update(cx, |s, _| {
+        s.set_keys_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: Some(proxy_keys_fixture()),
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/0".to_string()),
+        "a re-fetch never blanks a page: {names:?}"
+    );
+    for expected in [
+        "settings/proxy/keys/stale",
+        "settings/proxy/keys/stale-retry",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "the stale strip and its way back: {expected:?} missing from {names:?}"
+        );
+    }
+
+    // And only an answered, empty listing is the invitation.
+    stores.proxy.update(cx, |s, _| {
+        s.set_keys_for_test(Loadable::loaded(Vec::new()));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/empty".to_string()),
+        "an answered empty listing is the one state that says there are no keys: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/keys/loading".to_string()),
+        "and it is not still loading: {names:?}"
+    );
+
+    // The settings cell takes the same reading: a failed refresh keeps the
+    // values on screen and says they may be stale.
+    stores.proxy.update(cx, |s, _| {
+        s.set_settings_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: Some(proxy_settings_fixture(true, "127.0.0.1")),
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/serve".to_string()),
+        "the rows a stale read still describes stay on screen: {names:?}"
+    );
+    assert!(
+        names.contains(&"settings/proxy/stale".to_string()),
+        "with the line that says so: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// REGRESSION: **no live row whose secret was never shown.**
+///
+/// A key exists in full for exactly one render. While one stands unread — or
+/// while a generation is still travelling — a second press would insert a live
+/// credential the banner never showed, and the pane would go on offering the
+/// verb that does it. The control is therefore not merely refused but not
+/// painted: one predicate decides the press and the painting, so an offered
+/// verb and an accepted press cannot disagree.
+#[gpui::test]
+fn a_key_waiting_to_be_read_withholds_the_verb_that_would_replace_it(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/create".to_string()),
+        "with nothing standing, the verb is offered: {names:?}"
+    );
+
+    stores.proxy.update(cx, |s, _| {
+        s.set_minted_for_test(eidola_app_core::proxy::MintedProxyKey {
+            info: eidola_app_core::proxy::ProxyKeyInfo {
+                id: "k-new".into(),
+                label: "A new tool".into(),
+                prefix: "eid-Qq11Ww".into(),
+                created_at: 0,
+                last_used_at: None,
+                revoked_at: None,
+            },
+            key: "eid-Qq11Ww-the-whole-secret".into(),
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/minted".to_string()),
+        "the key is on screen: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/keys/create".to_string()),
+        "and the verb that would replace it is not a control while it stands: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_proxy_bound_off_loopback_says_what_that_costs(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+
+    // Loopback: nothing to warn about.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"settings/proxy/exposed-warning".to_string()),
+        "a loopback bind is the shape this is safe in: {names:?}"
+    );
+
+    // A routable address is a plaintext inference endpoint on the network, and
+    // nothing underneath refuses it — this band *is* the honesty.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "0.0.0.0"));
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let entries = fresh_entries(cx, window);
+    let warning = entries
+        .iter()
+        .find(|(n, _)| n == "settings/proxy/exposed-warning")
+        .expect("the danger band");
+    assert_eq!(warning.1.role, gpui::Role::Alert);
+    assert!(
+        warning.1.label.contains("in the clear"),
+        "the band names what it costs: {:?}",
+        warning.1.label
+    );
+
+    probe::set_probes_enabled(false);
+}

@@ -395,6 +395,13 @@ struct EngineEntry {
     /// Turns currently running against this engine. `Arc` so an
     /// [`EngineLease`]'s decrement survives the entry being removed.
     in_flight: Arc<AtomicU64>,
+    /// The backend's [`BackendEpoch`] when this entry was reserved — **which
+    /// incarnation of the backend this engine belongs to**. A slug is not an
+    /// identity: a remove-and-re-add can load the same slug again under the
+    /// same backend id, and only this tells the replacement's engine from the
+    /// one a caller was authorized against. See
+    /// [`LocalRuntime::lease_authorized_engine`].
+    epoch: u64,
 }
 
 /// An in-flight-turn hold on an engine: taken when a turn routes to it,
@@ -556,6 +563,92 @@ impl LocalRuntime {
         ))
     }
 
+    /// Lease a ready engine **only if it belongs to the incarnation the caller
+    /// was authorized against** — the epoch read beside the authorized row,
+    /// compared with the one the entry was reserved under, inside the same
+    /// critical section a retirement's sweep takes.
+    ///
+    /// [`Self::lease_engine`] answers by `(backend, slug)` alone, which is right
+    /// for a caller that resolved the backend a moment ago and wrong for one
+    /// that authorized it earlier: a remove-and-re-add in between, followed by
+    /// the replacement loading the same slug, leaves a ready engine under that
+    /// key that belongs to a backend nobody exposed — and a by-slug lease hands
+    /// it the prompt. "A leased engine is already running" is true and is not
+    /// the question; *whose* engine it is, is. `None` for absent, warming, or
+    /// another incarnation's — the caller's start path then refuses the last of
+    /// those itself ([`Self::engine_joinable`]).
+    pub(crate) fn lease_authorized_engine(
+        &self,
+        backend_id: &str,
+        slug: &str,
+        epoch: BackendEpoch,
+    ) -> Option<(String, u32, EngineLease)> {
+        let mut engines = self.engines.lock().expect("engines lock");
+        if self.epoch_locked(backend_id) != epoch.0 {
+            return None;
+        }
+        let entry = engines.get_mut(&(backend_id.to_string(), slug.to_string()))?;
+        if !entry.ready || entry.epoch != epoch.0 {
+            return None;
+        }
+        entry.last_used_ms = crate::now_ms();
+        entry.in_flight.fetch_add(1, Ordering::SeqCst);
+        Some((
+            format!("http://127.0.0.1:{}", entry.port),
+            entry.context_tokens,
+            EngineLease {
+                in_flight: entry.in_flight.clone(),
+            },
+        ))
+    }
+
+    /// The engines [`Self::lease_authorized_engine`] would lease for this
+    /// backend's authorized incarnation — **the listing's question asked with
+    /// the lease's own predicate**, under the same lock, so nothing can be
+    /// advertised that the lease is certain to refuse.
+    ///
+    /// A ready engine under the backend's id is not evidence it is the exposed
+    /// backend's: a remove-and-re-add between the registry snapshot and the
+    /// authorizing read left the retired incarnation's engine in the map, and a
+    /// listing matching by id published its model while every request for it
+    /// was refused. `(slug, context_tokens)` per engine, sorted by slug.
+    pub(crate) fn leasable_engines(
+        &self,
+        backend_id: &str,
+        epoch: BackendEpoch,
+    ) -> Vec<(String, u32)> {
+        let engines = self.engines.lock().expect("engines lock");
+        if self.epoch_locked(backend_id) != epoch.0 {
+            return Vec::new();
+        }
+        let mut out: Vec<(String, u32)> = engines
+            .iter()
+            .filter(|((id, _), entry)| id == backend_id && entry.ready && entry.epoch == epoch.0)
+            .map(|((_, slug), entry)| (slug.clone(), entry.context_tokens))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Whether an existing entry for `key` may be **joined** by a load acting
+    /// for `epoch`: `Ok(true)` to join, `Ok(false)` when there is nothing to
+    /// join, `Err` when the entry belongs to another incarnation of the backend
+    /// (or the authorized one has been retired since). Asked under the engines
+    /// lock, for the warming-engine shortcut's sake — joining a load by slug
+    /// would wait on the replacement's engine and then serve from it.
+    fn engine_joinable(&self, key: &EngineKey, epoch: BackendEpoch) -> Result<bool, String> {
+        let engines = self.engines.lock().expect("engines lock");
+        let current = self.epoch_locked(&key.0);
+        match engines.get(key) {
+            None if current == epoch.0 => Ok(false),
+            Some(entry) if current == epoch.0 && entry.epoch == epoch.0 => Ok(true),
+            _ => Err(format!(
+                "backend `{}` changed while the model was loading — try again",
+                key.0
+            )),
+        }
+    }
+
     /// This backend's current epoch. Caller must hold the `engines` lock.
     fn epoch_locked(&self, backend_id: &str) -> u64 {
         *self
@@ -643,6 +736,7 @@ impl LocalRuntime {
                 pinned: false,
                 last_used_ms: crate::now_ms(),
                 in_flight: Arc::new(AtomicU64::new(0)),
+                epoch: epoch.0,
             },
         );
         Ok(Some((instance, victims)))
@@ -932,19 +1026,64 @@ impl LocalRuntime {
         pinned: bool,
         last_used_ms: i64,
     ) {
+        self.insert_engine_for_test(
+            backend_id,
+            slug,
+            port,
+            footprint,
+            pinned,
+            last_used_ms,
+            true,
+        );
+    }
+
+    /// Test seam: an engine that is **still warming** — present in the
+    /// registry, not yet leasable. What a load in flight looks like to another
+    /// caller.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub(crate) fn register_warming_for_test(&self, backend_id: &str, slug: &str, port: u16) {
+        self.insert_engine_for_test(
+            backend_id,
+            slug,
+            port,
+            ENGINE_OVERHEAD_BYTES,
+            false,
+            0,
+            false,
+        );
+    }
+
+    /// Every test registration belongs to the backend's **current**
+    /// incarnation, exactly as a real reservation does.
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_engine_for_test(
+        &self,
+        backend_id: &str,
+        slug: &str,
+        port: u16,
+        footprint: u64,
+        pinned: bool,
+        last_used_ms: i64,
+        ready: bool,
+    ) {
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        self.engines.lock().expect("engines lock").insert(
+        let mut engines = self.engines.lock().expect("engines lock");
+        let epoch = self.epoch_locked(backend_id);
+        engines.insert(
             (backend_id.to_string(), slug.to_string()),
             EngineEntry {
                 instance: EngineInstance::next(),
                 port,
                 context_tokens: LOCAL_CONTEXT_TOKENS,
-                ready: true,
+                ready,
                 shutdown: tx,
                 footprint,
                 pinned,
                 last_used_ms,
                 in_flight: Arc::new(AtomicU64::new(0)),
+                epoch,
             },
         );
     }
@@ -1510,18 +1649,75 @@ pub(crate) fn resolve_external_engine(engine_path: Option<&str>) -> Option<PathB
 
 /// A plain (non-attesting) HTTPS-capable client: native trust roots, used
 /// for model downloads and loopback engine traffic.
+///
+/// **Follows redirects, deliberately**: a model download is a `GET` for public
+/// bytes whose integrity is checked afterwards, and every large-file host
+/// redirects to a CDN. See [`proxy_http_client`] for the client that does not,
+/// and why the difference is about what the request *carries*.
 pub(crate) fn plain_http_client() -> Result<reqwest::Client, AppError> {
+    plain_client(
+        Some(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION"))),
+        Redirects::Follow,
+    )
+}
+
+/// Whether a client follows a redirect, or hands it back as the answer.
+pub(crate) enum Redirects {
+    Follow,
+    Refuse,
+}
+
+/// The client the **local inference proxy's** own upstream requests go out on.
+///
+/// Two differences from [`plain_http_client`], and both are about the fact that
+/// a proxied request carries somebody's prompt to a destination the reader
+/// ticked by name:
+///
+/// - **No `User-Agent`.** The proxy's upstream header set is an enumerated
+///   allowlist whose "and nothing else" is a claim the Record repeats back to
+///   the reader (`proxy::route::UpstreamHeaders::for_record`), so a header the
+///   *builder* adds would travel on every proxied completion — a version
+///   fingerprint on an external backend's wire — while the row said it did not.
+/// - **No redirects.** reqwest's default follows up to ten and replays a
+///   cloneable body on `307`/`308`, so an exposed external backend could answer
+///   `/v1/chat/completions` with a `Location` pointing anywhere and receive the
+///   whole prompt at an origin the reader never exposed — while the Record went
+///   on naming the configured backend, because that is the backend the request
+///   was made to. reqwest strips a cross-origin `Authorization`; it does not
+///   strip the body, and the body is the sensitive part here. A redirect is
+///   therefore handed back as the answer it is: the caller sees the upstream's
+///   own `3xx`, the Record shows it, and nothing of the reader's leaves for a
+///   destination they did not choose.
+///
+/// *Known twins, not cured here:* the turn path's own external completions
+/// (`Inner::plain_client` at the chat and chore call sites) and the attested
+/// client (`tinfoil_verifier::attesting_client`) set no redirect policy either,
+/// so both inherit reqwest's default. The attested one is bounded by its own
+/// per-connection verification against the configured host; the turn path's is
+/// the same exposure as this one and wants the same cure, but it is the chat
+/// path and belongs with the harness extension that rule requires.
+pub(crate) fn proxy_http_client() -> Result<reqwest::Client, AppError> {
+    plain_client(None, Redirects::Refuse)
+}
+
+fn plain_client(
+    user_agent: Option<&'static str>,
+    redirects: Redirects,
+) -> Result<reqwest::Client, AppError> {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(crate::load_native_root_store())
         .with_no_client_auth();
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(tls_config)
-        .user_agent(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| AppError::LocalModel {
-            message: format!("constructing HTTP client: {e}"),
-        })
+    let mut builder = reqwest::Client::builder().tls_backend_preconfigured(tls_config);
+    if let Some(agent) = user_agent {
+        builder = builder.user_agent(agent);
+    }
+    if matches!(redirects, Redirects::Refuse) {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
+    builder.build().map_err(|e| AppError::LocalModel {
+        message: format!("constructing HTTP client: {e}"),
+    })
 }
 
 /// Pick a free loopback port by binding port 0 and reading the assignment
@@ -1665,7 +1861,11 @@ impl Inner {
     /// Scan one directory of `.gguf`s for a backend, merging live engine
     /// status and standing failures. Shared by the managed local store and
     /// the user-owned llamacpp directories.
-    async fn scan_engine_dir(&self, backend_id: &str, dir: &Path) -> Vec<LocalModelInfo> {
+    pub(crate) async fn scan_engine_dir(
+        &self,
+        backend_id: &str,
+        dir: &Path,
+    ) -> Vec<LocalModelInfo> {
         let mut models: Vec<LocalModelInfo> = Vec::new();
         if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
@@ -1934,22 +2134,70 @@ impl Inner {
     /// exits unexpectedly.
     pub(crate) async fn load_local_model(&self, id: &str) -> Result<(), AppError> {
         let key = engine_key_for_id(id);
-        let (backend_id, slug) = (key.0.clone(), key.1.clone());
+        let backend_id = key.0.clone();
+        // The epoch is read **before** the backend row, and handed to the
+        // reservation to validate — see [`BackendEpoch`]. Everything from here
+        // to the reservation is configuration this load is about to act on, and
+        // all of it can be retired while this future awaits.
+        let epoch = self.local.backend_epoch(&backend_id);
+        // The backend row is required for **every** engine backend, the `local`
+        // singleton included: disabling a backend retires its engines, and a
+        // rule that only the chat path enforced would let the explicit verb
+        // (`eidola model load`, the Load button) start another `llama-server`
+        // the moment after the disable stopped one — a disabled backend still
+        // holding gigabytes, which is precisely what disabling it asked for.
+        // Managing *files* (download, delete) stays open: those are not
+        // processes, and a disabled backend's models are still the user's.
+        let db_conn = self.db_conn().await?;
+        let row = self.require_backend(&db_conn, &backend_id).await?;
+        self.load_authorized_engine(&row, &key.1, epoch).await
+    }
+
+    /// The load itself, acting on **the configuration it was handed** and
+    /// reading no backend row of its own.
+    ///
+    /// **A caller that authorized a backend authorizes an incarnation, and this
+    /// is where that survives to the subprocess.** `load_local_model` resolves
+    /// its row by id at load time, which is right for the explicit verbs (the
+    /// reader just pressed Load) and wrong for anything that decided earlier:
+    /// the proxy authorizes an exposed backend row, then opens a route, and a
+    /// remove-and-re-add landing in that window put a **different** models
+    /// directory and a different `llama-server` behind the same id — so the
+    /// engine started was the replacement's, and the prompt was leased to a
+    /// destination nobody had exposed. Handing the row in makes reading the
+    /// replacement's configuration unrepresentable rather than merely checked.
+    ///
+    /// The `epoch` is the other half and cannot be folded into the row: the
+    /// authorized incarnation may itself have been retired since, and only a
+    /// value validated inside [`LocalRuntime::reserve_engine`]'s critical
+    /// section can say so. Unrepresentable for the replacement, refused for the
+    /// retired original — the two questions the caller cannot answer alone.
+    pub(crate) async fn load_authorized_engine(
+        &self,
+        backend: &crate::db::BackendRow,
+        slug: &str,
+        epoch: BackendEpoch,
+    ) -> Result<(), AppError> {
+        let backend_id = backend.id.clone();
+        let key: EngineKey = (backend_id.clone(), slug.to_string());
+        let slug = slug.to_string();
         let cfg = self.load_config();
 
-        // Already present: ready → done; warming → join the in-flight load.
-        if self.local.engine_present(&key) {
+        // Already present: ready → done; warming → join the in-flight load —
+        // **but only a load of the incarnation this caller acts for**
+        // (`engine_joinable`). Joining by slug alone would wait on, and then
+        // report ready, an engine a remove-and-re-add put under this key for a
+        // backend nobody authorized.
+        if self
+            .local
+            .engine_joinable(&key, epoch)
+            .map_err(|message| AppError::LocalModel { message })?
+        {
             if self.local.ready_engine(&backend_id, &slug).is_some() {
                 return Ok(());
             }
             return self.await_engine_ready(&key).await;
         }
-
-        // The epoch is read **before** the backend row, and handed to the
-        // reservation to validate — see [`BackendEpoch`]. Everything between
-        // here and the reservation is configuration this load is about to act
-        // on, and all of it can be retired while this future awaits.
-        let epoch = self.local.backend_epoch(&backend_id);
 
         // Resolve the model file's directory by backend, and note how the
         // engine binary resolves for it: the managed `local` store served by
@@ -1963,29 +2211,22 @@ impl Inner {
             /// A `llamacpp` backend's explicit path (`Some`) or discovery.
             External(Option<String>),
         }
-        // The backend row is required for **every** engine backend, the `local`
-        // singleton included: disabling a backend retires its engines, and a
-        // rule that only the chat path enforced would let the explicit verb
-        // (`eidola model load`, the Load button) start another `llama-server`
-        // the moment after the disable stopped one — a disabled backend still
-        // holding gigabytes, which is precisely what disabling it asked for.
-        // Managing *files* (download, delete) stays open: those are not
-        // processes, and a disabled backend's models are still the user's.
-        let db_conn = self.db_conn().await?;
-        let row = self.require_backend(&db_conn, &backend_id).await?;
-        let (dir, engine_source) = if backend_id == crate::backends::LOCAL_BACKEND_ID {
-            (models_dir(&self.data_dir), EngineSource::Bundled)
-        } else {
-            if row.kind != crate::backends::BackendKind::LlamaCpp.as_str() {
-                return Err(AppError::LocalModel {
-                    message: format!("backend `{backend_id}` does not serve local engines"),
-                });
-            }
-            let dir = PathBuf::from(row.models_dir.ok_or_else(|| AppError::LocalModel {
-                message: format!("backend `{backend_id}` has no models directory"),
-            })?);
-            (dir, EngineSource::External(row.engine_path))
-        };
+        let (dir, engine_source) =
+            if backend_id == crate::backends::LOCAL_BACKEND_ID {
+                (models_dir(&self.data_dir), EngineSource::Bundled)
+            } else {
+                if backend.kind != crate::backends::BackendKind::LlamaCpp.as_str() {
+                    return Err(AppError::LocalModel {
+                        message: format!("backend `{backend_id}` does not serve local engines"),
+                    });
+                }
+                let dir = PathBuf::from(backend.models_dir.clone().ok_or_else(|| {
+                    AppError::LocalModel {
+                        message: format!("backend `{backend_id}` has no models directory"),
+                    }
+                })?);
+                (dir, EngineSource::External(backend.engine_path.clone()))
+            };
 
         let model_path =
             find_model_file(&dir, &slug)

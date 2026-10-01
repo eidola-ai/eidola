@@ -81,6 +81,13 @@ pub enum AppError {
         refusal: crate::subspaces::SpawnRefusal,
     },
 
+    /// A proxy setting or key operation was refused before anything was
+    /// written — typed ([`crate::proxy::ProxyRefusal`]) so a surface can choose
+    /// its own words for which one. Prints as the configuration error it
+    /// always was.
+    #[error("config error: {refusal}")]
+    ProxyRefused { refusal: crate::proxy::ProxyRefusal },
+
     /// An HTTP request failed at the transport layer.
     #[error("network error: {message}")]
     Network { message: String },

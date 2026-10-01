@@ -25,8 +25,8 @@
 
 use crate::error::AppError;
 use crate::{
-    Change, EidolaResolved, Inner, backends, db, estimate_charge_credits, fetch_models,
-    local_models, now_ms, process_refund, recover_refund,
+    Change, ChargePricing, EidolaResolved, Inner, backends, db, estimate_charge_credits,
+    fetch_models, local_models, now_ms, process_refund, recover_refund,
 };
 
 /// Where a chore call would go, and what it would cost — resolved without
@@ -50,7 +50,7 @@ struct UtilityRoute {
     wire_model: String,
     /// `(prompt_rate, completion_rate, scale_factor)` — `Some` only for a
     /// remote (billing) call.
-    pricing: Option<(u128, u128, u128)>,
+    pricing: Option<ChargePricing>,
     /// An external backend's bearer key, when it has one.
     external_auth: Option<String>,
     /// Held for the life of the call so the engine is not evicted underneath
@@ -121,6 +121,32 @@ pub(crate) fn clip_middle(text: &str, max_bytes: usize) -> String {
     format!("{}…{}", &text[..head], &text[tail..])
 }
 
+/// Build the target from a backend row already read, so the two callers that
+/// read that row differently still produce the same target.
+///
+/// The chore runner reads it by id ([`Inner::resolve_utility_target`]); the
+/// proxy reads it **joined to its own permission**, because there the row's
+/// liveness is not the whole question (`proxy::route`'s
+/// `resolve_proxy_target`). Everything after the read is identical, and this is
+/// that everything.
+pub(crate) fn utility_target_for(
+    backend: db::BackendRow,
+    mref: backends::ModelRef,
+    chore: &'static str,
+) -> Result<UtilityTarget, AppError> {
+    let kind = backends::BackendKind::parse(&backend.kind).ok_or_else(|| AppError::Database {
+        message: format!("unknown backend kind `{}`", backend.kind),
+    })?;
+    let canonical = backends::qualified_model_id(&mref.model, &backend.id);
+    Ok(UtilityTarget {
+        backend,
+        kind,
+        model: mref.model,
+        canonical,
+        chore,
+    })
+}
+
 impl Inner {
     /// Resolve a chore's model reference through the backend registry.
     ///
@@ -135,18 +161,7 @@ impl Inner {
     ) -> Result<UtilityTarget, AppError> {
         let mref = backends::parse_model_ref(model_ref);
         let backend = self.require_backend(db_conn, &mref.backend_id).await?;
-        let kind =
-            backends::BackendKind::parse(&backend.kind).ok_or_else(|| AppError::Database {
-                message: format!("unknown backend kind `{}`", backend.kind),
-            })?;
-        let canonical = backends::qualified_model_id(&mref.model, &backend.id);
-        Ok(UtilityTarget {
-            backend,
-            kind,
-            model: mref.model,
-            canonical,
-            chore,
-        })
+        utility_target_for(backend, mref, chore)
     }
 
     /// Open the route: lease or start the engine, build the client, and read
@@ -229,11 +244,7 @@ impl Inner {
                     client,
                     base_url: eidola.base_url.clone(),
                     wire_model: target.model.clone(),
-                    pricing: Some((
-                        entry.pricing.per_prompt_token.value as u128,
-                        entry.pricing.per_completion_token.value as u128,
-                        entry.pricing.per_prompt_token.scale_factor as u128,
-                    )),
+                    pricing: Some(ChargePricing::from_catalog(&entry.pricing)),
                     external_auth: None,
                     engine_lease: None,
                 })
@@ -317,20 +328,32 @@ impl Inner {
         // would strand the credential in `spending`, and the very next turn
         // would burn its bounded provisioning wait on a refund that is never
         // coming.
-        let text = match response.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
-                    .await;
-                return Err(AppError::Network {
-                    message: format!(
-                        "failed to read the {} response: {}",
-                        target.chore,
-                        crate::error::request_error_text(e)
-                    ),
-                });
-            }
-        };
+        // Bounded as it arrives, like every other read from a peer on this
+        // crate's side of a socket (`peer_read`): a chore's answer is one
+        // completion, and an engine or an external backend chooses its size.
+        //
+        // **And the ceiling is an answer, not a note.** `over_ceiling` says the
+        // bytes in hand are a prefix; parsing them anyway degrades a chore
+        // silently in the common case (truncated JSON becomes `Null`, so a
+        // successful call returns nothing usable) and lies outright in the
+        // dangerous one (a complete object followed by padding parses
+        // perfectly, and a partial answer is taken for a whole one). The hold
+        // is settled first, exactly as for a read that failed outright.
+        let what = format!("the {} response", target.chore);
+        let text =
+            match crate::peer_read::read_bounded(response, crate::peer_read::API_ANSWER_MAX_BYTES)
+                .await
+                .and_then(|body| crate::peer_read::whole_text(body, &what))
+            {
+                Ok(text) => text,
+                Err(e) => {
+                    self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
+                        .await;
+                    return Err(AppError::Network {
+                        message: format!("failed to read the {} response: {e}", target.chore),
+                    });
+                }
+            };
         let parsed: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
 

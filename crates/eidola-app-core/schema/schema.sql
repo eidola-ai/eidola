@@ -919,6 +919,99 @@ CREATE INDEX idx_request_credential
 
 
 -- ############################################################
+-- #  LAYER 4 — THE LOCAL INFERENCE PROXY                     #
+-- ############################################################
+
+-- ============================================================
+-- Proxy settings: the singleton row describing the local
+-- OpenAI-compatible surface other tools on this machine reach
+-- Eidola through.
+--
+-- It lives here rather than in config.toml because it is
+-- configuration *about destinations* — which backends may be
+-- reached, whether an on-device model may be started on demand
+-- — and because `proxy_backend` below needs a foreign key into
+-- `backend`. config.toml is the client's preference file and
+-- must resolve without the database; nothing about the proxy
+-- can, since the proxy exists to serve the backend registry.
+--
+-- bind_address is a textual IP (an `IpAddr` at the reading end).
+-- Loopback is the default and the only shape this iteration is
+-- safe for: there is no TLS yet, so a non-loopback address puts
+-- prompts on the wire in the clear. The surface that sets it
+-- says so; nothing here refuses it.
+--
+-- local_exposure decides what an engine-backed backend offers:
+--   loaded      only models with an engine already running
+--   downloaded  every downloaded model, starting its engine on
+--               the first request that names it
+-- ============================================================
+CREATE TABLE proxy_settings (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton
+    enabled        INTEGER NOT NULL DEFAULT 0,
+    bind_address   TEXT NOT NULL DEFAULT '127.0.0.1',
+    bind_port      INTEGER NOT NULL DEFAULT 11437,
+    local_exposure TEXT NOT NULL DEFAULT 'loaded' CHECK (
+                       local_exposure IN ('loaded', 'downloaded')
+                   ),
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+
+-- ============================================================
+-- Which backends the proxy makes available. Opt-in, one row per
+-- exposed backend: an empty table exposes nothing, which is the
+-- honest default for a surface that can spend money.
+--
+-- The FK is to the soft-removable `backend` row, but the
+-- exposure does not outlive a removal: `db::remove_backend`
+-- deletes it in the same transaction. Removal is soft and
+-- re-adding the same id *revives* the row with a whole new
+-- configuration, so an exposure that survived would grant a
+-- destination the reader never ticked — and while the backend
+-- was gone the listing hid it, so the standing permission was
+-- unseeable too. The `removed_at IS NULL` join remains, which
+-- is what covers a backend merely disabled.
+-- ============================================================
+CREATE TABLE proxy_backend (
+    backend_id  TEXT PRIMARY KEY REFERENCES backend(id),
+    created_at  INTEGER NOT NULL
+);
+
+-- ============================================================
+-- The API keys downstream tools authenticate to the proxy with.
+--
+-- **The key itself is never stored.** `key_hash` is a
+-- domain-separated SHA-256 of the generated secret — the same
+-- one-way shape `config::account_fingerprint` uses, and for the
+-- same reason: the value is server-generated and high-entropy,
+-- so a password KDF would buy nothing a hash does not already
+-- give and would put its cost on every proxied request. The
+-- consequence is that a key is displayed exactly once, when it
+-- is generated; there is nothing on disk to show afterwards.
+--
+-- `prefix` is the leading characters of the key, kept so a row
+-- is identifiable in a list without holding the secret.
+--
+-- Revocation is a soft delete: `revoked_at` keeps the row (and
+-- its label) legible after the key stops working.
+-- ============================================================
+CREATE TABLE proxy_key (
+    id            TEXT PRIMARY KEY,             -- UUIDv7
+    label         TEXT NOT NULL,
+    prefix        TEXT NOT NULL,
+    key_hash      TEXT NOT NULL UNIQUE,
+    created_at    INTEGER NOT NULL,
+    last_used_at  INTEGER,
+    revoked_at    INTEGER
+);
+
+CREATE INDEX idx_proxy_key_live
+    ON proxy_key (key_hash)
+    WHERE revoked_at IS NULL;
+
+
+-- ############################################################
 -- #  CONVENIENCE VIEWS                                       #
 -- ############################################################
 

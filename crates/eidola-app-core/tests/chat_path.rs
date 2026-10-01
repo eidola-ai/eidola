@@ -24,9 +24,10 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, DEFAULT_AGENT_LABEL, HUMAN_LABEL, MODEL, MockConfig, MockServer, RefundMode,
-    Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, TRAILING_BLOCK_NOTE, flat_messages, map_entry,
-    roster, system_message, system_message_with, thread_map, trailing, with_account,
+    ChatBehavior, DEFAULT_AGENT_LABEL, FLAT_MODEL, FLAT_PRICE, HUMAN_LABEL, MODEL, MockConfig,
+    MockServer, RefundMode, Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, TRAILING_BLOCK_NOTE,
+    flat_messages, map_entry, roster, system_message, system_message_with, thread_map, trailing,
+    with_account,
 };
 use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::error::AppError;
@@ -325,6 +326,34 @@ fn a_first_message_into_a_pre_created_space_instantiates_nothing() {
     });
 }
 
+/// REGRESSION: **a turn on a flat-priced model is held at its flat price.**
+///
+/// The turn path copied the catalog's token rates into its pricing tuple and
+/// dropped `per_request`, so a model the server prices per request — zero
+/// token rates — was refused as a zero charge before it was asked anything.
+/// The hold is the server's `worst_case_cost` for that model: the flat price,
+/// whatever the request holds. Read off the spend proof the turn presented.
+#[test]
+fn a_turn_on_a_flat_priced_model_is_held_at_its_flat_price() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            list_flat_model: true,
+            ..Default::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), FLAT_MODEL.into(), None))
+            .expect("a flat price is not a zero charge");
+        let charges = mock.chat_charges();
+        assert_eq!(
+            charges.first().copied().flatten(),
+            Some(FLAT_PRICE as u128),
+            "the turn's hold is the flat price: {charges:?}"
+        );
+    });
+}
+
 #[test]
 fn blocking_chat_into_existing_space_does_not_emit_space_index_again() {
     run(|| {
@@ -400,6 +429,98 @@ fn blocking_chat_recovers_refund_when_no_inline_refund() {
 // ===========================================================================
 // Happy path — streaming chat
 // ===========================================================================
+
+/// **A stream framed with bare carriage returns is still a stream.**
+///
+/// The event-stream format takes `\r\n`, `\n` and a bare `\r` as line endings,
+/// and any two in a row end an event — so a reader recognising only `\n\n` and
+/// `\r\n\r\n` never split such a stream at all: every event piled into one
+/// frame, deltas arrived (if at all) as one lump at EOF, and on the proxy's own
+/// path the per-event ceiling refused the stream outright. The turn path shares
+/// `find_event_boundary` with the proxy, so it is asserted here too: the
+/// ordinary outcome over unusual framing is what proves the framing was read.
+#[test]
+fn a_stream_framed_with_bare_carriage_returns_still_delivers_its_deltas() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreamingBareCarriageReturns,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content, reasoning, deltas) = core.runtime().block_on(async {
+            let collector = async {
+                let mut content = String::new();
+                let mut reasoning = String::new();
+                let mut deltas = 0usize;
+                while let Some(ev) = events_rx.recv().await {
+                    deltas += 1;
+                    match ev {
+                        ChatStreamEvent::ContentDelta(t) => content.push_str(&t),
+                        ChatStreamEvent::ReasoningDelta(t) => reasoning.push_str(&t),
+                    }
+                }
+                (content, reasoning, deltas)
+            };
+            let chat = core.chat_stream("stream me".into(), MODEL.into(), None, tx);
+            let (res, (content, reasoning, deltas)) = tokio::join!(chat, collector);
+            (res, content, reasoning, deltas)
+        });
+
+        let res = res.expect("a bare-CR stream completes like any other");
+        assert_eq!(content, "Hello from the stream.");
+        assert_eq!(reasoning, "thinking…");
+        assert_eq!(res.input_tokens, Some(11));
+        assert_eq!(res.output_tokens, Some(5));
+        assert_eq!(
+            deltas, 2,
+            "the events arrived one at a time rather than as one undivided frame"
+        );
+        assert!(mock.refund_hits() >= 1);
+    });
+}
+
+/// REGRESSION: **an event's data is its `data:` fields joined, then parsed
+/// once.**
+///
+/// The format lets a sender split one payload across as many `data:` fields as
+/// it likes; the receiver joins them with `\n`. Parsing field by field read
+/// every piece of a split payload as a fragment that is not JSON and skipped it
+/// — nothing failed, the deltas and the usage simply never arrived.
+#[test]
+fn a_payload_split_across_data_fields_is_read_as_one() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingSplitDataFields,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content) = core.runtime().block_on(async {
+            let collector = async {
+                let mut content = String::new();
+                while let Some(ev) = events_rx.recv().await {
+                    if let ChatStreamEvent::ContentDelta(t) = ev {
+                        content.push_str(&t);
+                    }
+                }
+                content
+            };
+            let chat = core.chat_stream("stream me".into(), MODEL.into(), None, tx);
+            tokio::join!(chat, collector)
+        });
+
+        let res = res.expect("a split-data stream completes like any other");
+        assert_eq!(
+            content, "Hello from the stream.",
+            "the split delta was read"
+        );
+        assert_eq!(res.input_tokens, Some(11), "and so was the split usage");
+        assert_eq!(res.output_tokens, Some(5));
+    });
+}
 
 #[test]
 fn streaming_chat_delivers_deltas_and_persists() {

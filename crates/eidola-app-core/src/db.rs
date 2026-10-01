@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 11;
+const LATEST_VERSION: i64 = 12;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -1114,9 +1114,41 @@ pub async fn update_backend_config(
     Ok(n > 0)
 }
 
-/// Soft-remove a backend (forensic rows keep their FK target). Returns
-/// whether a live row was removed.
+/// Soft-remove a backend (forensic rows keep their FK target) **and drop the
+/// proxy exposure that named it**. Returns whether a live row was removed.
+///
+/// **The exposure dies with the incarnation it was granted to.** Removal is
+/// soft — `request.backend_id` keeps a resolvable target forever — and
+/// `insert_backend` *revives* a row of the same id, overwriting every
+/// configuration column. The `proxy_backend` row survived both, so re-adding
+/// `acme` with a different base URL and a different key came back **already
+/// exposed**, and any holder of a proxy key could send prompts to a destination
+/// the reader had never ticked. Nothing on the way says so either: the listing
+/// joins `removed_at IS NULL`, so while the backend is gone the exposure is
+/// invisible — a permission standing where nobody can see it, waiting to apply
+/// to something else.
+///
+/// So the permission is not tied to a name; it is ended with the thing it was
+/// about. One `BEGIN IMMEDIATE`, because a removal that dropped one of the two
+/// is exactly the half-state this exists to prevent, and only where a live row
+/// was really removed — a call naming an already-removed backend must not clear
+/// an exposure some concurrent re-add just granted.
 pub async fn remove_backend(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
+    begin_write(conn).await?;
+    match remove_backend_tx_body(conn, id, now).await {
+        Ok(removed) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(removed)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn remove_backend_tx_body(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
     let n = conn
         .execute(
             "UPDATE backend SET removed_at = ?2, updated_at = ?2 \
@@ -1125,7 +1157,16 @@ pub async fn remove_backend(conn: &Connection, id: &str, now: i64) -> Result<boo
         )
         .await
         .map_err(AppError::db)?;
-    Ok(n > 0)
+    if n == 0 {
+        return Ok(false);
+    }
+    conn.execute(
+        "DELETE FROM proxy_backend WHERE backend_id = ?1",
+        (Value::Text(id.to_string()),),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -8593,12 +8634,467 @@ pub async fn list_credential_lifecycle(
 }
 
 // ---------------------------------------------------------------------------
+// The local inference proxy
+// ---------------------------------------------------------------------------
+
+/// The `proxy_settings` singleton, as stored. Read-only: writes go through
+/// [`update_proxy_settings`], which moves columns rather than rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxySettingsRow {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub bind_port: i64,
+    pub local_exposure: String,
+}
+
+/// One `proxy_key` row. The key itself is not here and never was — see the
+/// table's comment in `schema.sql`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyKeyRow {
+    pub id: String,
+    pub label: String,
+    pub prefix: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+/// Read the proxy settings, or `None` when the singleton has never been
+/// written. A profile that has never opened the pane has no row, and that is
+/// not an error: the caller resolves the compiled-in defaults instead, exactly
+/// as `Config`'s `*_override` resolvers do.
+pub async fn get_proxy_settings(conn: &Connection) -> Result<Option<ProxySettingsRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT enabled, bind_address, bind_port, local_exposure \
+             FROM proxy_settings WHERE id = 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(ProxySettingsRow {
+            enabled: row.get::<i64>(0).map_err(AppError::db)? != 0,
+            bind_address: row.get::<String>(1).map_err(AppError::db)?,
+            bind_port: row.get::<i64>(2).map_err(AppError::db)?,
+            local_exposure: row.get::<String>(3).map_err(AppError::db)?,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Move the columns a write actually names, and no others.
+///
+/// **Column-partial, in one statement, because two controls are two writes.**
+/// A read-modify-write of the whole row lets two settings changes made before
+/// the first settles both read the same snapshot, and whichever commits last
+/// silently restores the other's old value — the reader watches a switch they
+/// flipped flip back. `COALESCE` over a `NULL` parameter is what makes each
+/// write touch only its own column, so the interleaving is not merely unlikely
+/// but unrepresentable: two writes to two columns compose whatever order they
+/// land in, and two writes to *one* column are last-writer-wins, which is the
+/// honest meaning of pressing one control twice.
+///
+/// The literals in the insert arm are the compiled-in defaults a row that has
+/// never been written resolves to; they must stay in step with
+/// `proxy::DEFAULT_BIND_ADDRESS` / `DEFAULT_BIND_PORT` and
+/// `LocalExposure::default`.
+pub async fn update_proxy_settings(
+    conn: &Connection,
+    enabled: Option<bool>,
+    bind_address: Option<&str>,
+    bind_port: Option<i64>,
+    local_exposure: Option<&str>,
+    now: i64,
+) -> Result<(), AppError> {
+    let opt_int = |v: Option<i64>| v.map(Value::Integer).unwrap_or(Value::Null);
+    let opt_str = |v: Option<&str>| v.map(|s| Value::Text(s.to_string())).unwrap_or(Value::Null);
+    conn.execute(
+        "INSERT INTO proxy_settings \
+             (id, enabled, bind_address, bind_port, local_exposure, created_at, updated_at) \
+         VALUES (1, COALESCE(?1, 0), COALESCE(?2, '127.0.0.1'), COALESCE(?3, 11437), \
+                 COALESCE(?4, 'loaded'), ?5, ?5) \
+         ON CONFLICT(id) DO UPDATE SET \
+             enabled = COALESCE(?1, enabled), \
+             bind_address = COALESCE(?2, bind_address), \
+             bind_port = COALESCE(?3, bind_port), \
+             local_exposure = COALESCE(?4, local_exposure), \
+             updated_at = ?5",
+        (
+            opt_int(enabled.map(i64::from)),
+            opt_str(bind_address),
+            opt_int(bind_port),
+            opt_str(local_exposure),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// The backend ids the proxy exposes, in registry order (the same order
+/// `list_backends` presents, so the pane and the listing agree). Backends
+/// soft-removed or disabled since they were exposed are **not** returned:
+/// exposure is a permission, and a permission over something that is not
+/// there offers nothing.
+pub async fn list_proxy_backends(conn: &Connection) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.id FROM proxy_backend p \
+             JOIN backend b ON b.id = p.backend_id \
+             WHERE b.removed_at IS NULL AND b.enabled = 1 \
+             ORDER BY CASE b.kind WHEN 'eidola' THEN 0 WHEN 'local' THEN 1 ELSE 2 END, \
+             b.created_at, b.id",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        ids.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(ids)
+}
+
+/// The live backend of that id **if the proxy is allowed to reach it**, in one
+/// statement.
+///
+/// **The permission and the row it is about are read together, or neither is
+/// what the other was granted for.** Exposure is granted to an *incarnation*:
+/// removal is soft, `insert_backend` revives a row of the same id overwriting
+/// every configuration column, and `remove_backend` therefore drops the
+/// exposure with the row (see there). So a caller that checks a settings
+/// snapshot for the id and *then* reads the backend is checking one incarnation
+/// and using another: a remove-and-re-add landing in between clears the
+/// permission the snapshot still shows, and the request goes to whatever base
+/// URL and key the new row carries — a destination nobody ticked. The
+/// snapshot's age is not the defect; asking two questions is, and the gap is
+/// wide because a request pauses between them for network and engine work.
+///
+/// One statement is one point in time, which is the same shape the write side
+/// takes for the same reason ([`set_proxy_backend`]'s single transaction):
+/// whichever of this read and a concurrent removal reaches the database first,
+/// the other sees a committed state and decides against *that*. What comes back
+/// is the row the request will actually be sent to, and its being here at all
+/// is the authorization.
+pub async fn exposed_backend(conn: &Connection, id: &str) -> Result<Option<BackendRow>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {BACKEND_COLUMNS} FROM backend WHERE id = ?1 \
+             AND removed_at IS NULL AND enabled = 1 \
+             AND id IN (SELECT backend_id FROM proxy_backend)"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(backend_row_from(&row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Every exposure row, live backend or not — what the settings pane's
+/// checkboxes read, so a backend the user disabled still shows its exposure
+/// choice rather than silently losing it.
+pub async fn list_proxy_backend_rows(conn: &Connection) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT backend_id FROM proxy_backend ORDER BY backend_id")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        ids.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(ids)
+}
+
+/// Expose or withdraw one backend. Idempotent in both directions.
+/// What an exposure write did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExposureWrite {
+    /// The permission now says what the caller asked it to.
+    Applied,
+    /// There is no live backend of that id to grant a permission over, so
+    /// nothing was written.
+    NoLiveBackend,
+}
+
+/// Grant or withdraw the proxy's permission over one backend.
+///
+/// **The write carries its own premise** (the decide-at-the-write rule). A
+/// caller that checks the backend is live and *then* writes leaves a gap that
+/// `remove_backend` fits inside: the check passes, the removal's transaction
+/// soft-deletes the row and drops the exposure with it, and the insert then
+/// lands anyway — the foreign key is satisfied, because removal is soft, so the
+/// permission stands invisibly on a removed backend and re-adding that id
+/// revives it already exposed. That is exactly the implicit exposure the
+/// removal cure exists to prevent, reached through the other door.
+///
+/// So the liveness read and the insert are one `BEGIN IMMEDIATE` transaction,
+/// which turso serializes against the removal's own: whichever reserves the
+/// writer first, the loser sees the winner's committed state and decides
+/// against *that*. Withdrawing needs no premise — ending a permission over
+/// something that is not there is what the caller asked for either way.
+pub async fn set_proxy_backend(
+    conn: &Connection,
+    backend_id: &str,
+    exposed: bool,
+    now: i64,
+) -> Result<ExposureWrite, AppError> {
+    if !exposed {
+        conn.execute(
+            "DELETE FROM proxy_backend WHERE backend_id = ?1",
+            (Value::Text(backend_id.to_string()),),
+        )
+        .await
+        .map_err(AppError::db)?;
+        return Ok(ExposureWrite::Applied);
+    }
+    begin_write(conn).await?;
+    match expose_proxy_backend_tx_body(conn, backend_id, now).await {
+        Ok(wrote) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(wrote)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn expose_proxy_backend_tx_body(
+    conn: &Connection,
+    backend_id: &str,
+    now: i64,
+) -> Result<ExposureWrite, AppError> {
+    let live = get_backend(conn, backend_id)
+        .await?
+        .is_some_and(|row| row.removed_at.is_none());
+    if !live {
+        return Ok(ExposureWrite::NoLiveBackend);
+    }
+    conn.execute(
+        "INSERT INTO proxy_backend (backend_id, created_at) VALUES (?1, ?2) \
+         ON CONFLICT(backend_id) DO NOTHING",
+        (Value::Text(backend_id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(ExposureWrite::Applied)
+}
+
+/// Every key ever generated, newest first — live ones and revoked ones alike,
+/// because a revoked row's label is what tells a reader which tool lost access.
+pub async fn list_proxy_keys(conn: &Connection) -> Result<Vec<ProxyKeyRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, label, prefix, created_at, last_used_at, revoked_at \
+             FROM proxy_key ORDER BY created_at DESC, id DESC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut keys = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        keys.push(ProxyKeyRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            label: row.get::<String>(1).map_err(AppError::db)?,
+            prefix: row.get::<String>(2).map_err(AppError::db)?,
+            created_at: row.get::<i64>(3).map_err(AppError::db)?,
+            last_used_at: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+            revoked_at: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+        });
+    }
+    Ok(keys)
+}
+
+/// Record a newly generated key. `key_hash` is the one-way digest; the key is
+/// the caller's to display once and then forget.
+pub async fn insert_proxy_key(
+    conn: &Connection,
+    id: &str,
+    label: &str,
+    prefix: &str,
+    key_hash: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO proxy_key (id, label, prefix, key_hash, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(label.to_string()),
+            Value::Text(prefix.to_string()),
+            Value::Text(key_hash.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Revoke one key. Answers whether a live row was actually revoked, so the
+/// caller reports what happened rather than assuming (the decide-at-the-write
+/// rule).
+pub async fn revoke_proxy_key(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
+    let affected = conn
+        .execute(
+            "UPDATE proxy_key SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            (Value::Text(id.to_string()), Value::Integer(now)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(affected > 0)
+}
+
+/// The live key with this hash — its id, and when it was last used. The lookup
+/// is by digest, so nothing here ever holds a presented secret beyond the
+/// caller's own frame.
+///
+/// The `last_used_at` rides along because the caller has to know whether the
+/// stamp it is about to write *changes what any surface shows*: the pane draws
+/// "used" or "never used" and nothing finer, so a key already used needs no
+/// invalidation and one being used for the first time needs exactly one. Read
+/// here rather than in a second query, because the row is already in hand.
+pub async fn find_live_proxy_key(
+    conn: &Connection,
+    key_hash: &str,
+) -> Result<Option<(String, Option<i64>)>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, last_used_at FROM proxy_key WHERE key_hash = ?1 AND revoked_at IS NULL",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(key_hash.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<Option<i64>>(1).map_err(AppError::db)?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// How many keys are live — what decides whether the proxy has anyone to let
+/// in at all.
+pub async fn live_proxy_key_count(conn: &Connection) -> Result<i64, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM proxy_key WHERE revoked_at IS NULL")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(row.get::<i64>(0).map_err(AppError::db)?),
+        None => Ok(0),
+    }
+}
+
+/// Stamp a key's last use. Best-effort telemetry for the pane — a failure here
+/// must never cost a request that was already authenticated.
+pub async fn touch_proxy_key(conn: &Connection, id: &str, now: i64) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE proxy_key SET last_used_at = ?2 WHERE id = ?1",
+        (Value::Text(id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSION: **the exposure write carries its own premise.**
+    ///
+    /// Asking whether the backend is live and *then* inserting leaves a gap a
+    /// concurrent `remove_backend` fits inside: the check passes, the removal
+    /// soft-deletes the row and drops the exposure it is deleting, and the
+    /// insert lands anyway — the foreign key is satisfied, because removal is
+    /// soft. The permission then stands on a removed backend where no listing
+    /// shows it, and re-adding that id revives it already exposed, which is the
+    /// implicit exposure the removal cure exists to prevent, reached through the
+    /// other door. The race cannot be scheduled from a test; what can be held is
+    /// the property that makes it harmless — a write that decides for itself.
+    #[test]
+    fn exposing_a_removed_backend_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        runtime.block_on(async move {
+            let database = open(dir.path()).await.expect("open");
+            let conn = connect(&database).await.expect("connect");
+            let row = BackendRow {
+                id: "acme".into(),
+                kind: "openai".into(),
+                display_name: "Acme".into(),
+                enabled: true,
+                base_url: Some("https://first.example".into()),
+                api_key: None,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                trusted_measurements: None,
+                hardware_root_ca: None,
+                hardware_intermediate_ca: None,
+                created_at: 1,
+                updated_at: 1,
+                removed_at: None,
+            };
+            insert_backend(&conn, &row).await.expect("add");
+            assert_eq!(
+                set_proxy_backend(&conn, "acme", true, 2)
+                    .await
+                    .expect("expose"),
+                ExposureWrite::Applied,
+                "a live backend takes the permission"
+            );
+
+            // The state the race leaves behind: the backend is gone (softly),
+            // and a write that had already passed its check arrives.
+            assert!(remove_backend(&conn, "acme", 3).await.expect("remove"));
+            assert_eq!(
+                set_proxy_backend(&conn, "acme", true, 4)
+                    .await
+                    .expect("expose"),
+                ExposureWrite::NoLiveBackend,
+                "and a removed one refuses at the write"
+            );
+            assert!(
+                list_proxy_backend_rows(&conn)
+                    .await
+                    .expect("rows")
+                    .is_empty(),
+                "nothing stands where no listing would ever show it"
+            );
+
+            // Withdrawing needs no premise: it is what the caller asked for
+            // whether or not the backend is there.
+            assert_eq!(
+                set_proxy_backend(&conn, "acme", false, 5)
+                    .await
+                    .expect("withdraw"),
+                ExposureWrite::Applied
+            );
+        });
+    }
 
     /// A reference edge quoting a post's text — what the two edge-level
     /// predicates are asked about. *Whether the quoted post can be named by

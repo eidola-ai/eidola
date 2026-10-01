@@ -349,6 +349,9 @@ impl DelegationFailure {
             AppError::NotConfigured { .. }
             | AppError::ModelUnavailable { .. }
             | AppError::Config { .. }
+            // Unreachable from a driven turn (no turn writes proxy settings);
+            // placed where the variant it replaced would have landed.
+            | AppError::ProxyRefused { .. }
             | AppError::NotAParticipant { .. }
             | AppError::WrongPostKind { .. }
             | AppError::SpawnRefused { .. }
@@ -2089,7 +2092,7 @@ fn with(mut leaves: Vec<String>, post: String) -> Vec<String> {
 /// Hold here until whoever opened this window lets go. A no-op — one lock and a
 /// `None` — whenever nobody has.
 #[cfg(feature = "test-support")]
-async fn pause_in_window(
+pub(crate) async fn pause_in_window(
     window: &std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
     >,

@@ -624,7 +624,7 @@ impl ChromeRoot {
         use crate::actions::{
             About, ActualSize, CheckForUpdates, FindInSpace, NewSpace, NewSpaceFromTemplate,
             OpenLibrary, OpenRecord, OpenSettings, Quit, Quote, QuoteElsewhere, QuoteInReply,
-            ToggleInspector, ZoomIn, ZoomOut, primary_alt_chord, primary_chord,
+            ToggleInspector, ToggleProxy, ZoomIn, ZoomOut, primary_alt_chord, primary_chord,
             primary_shift_chord,
         };
         let theme = cx.theme();
@@ -768,6 +768,13 @@ impl ChromeRoot {
                 "Record…",
                 Some(primary_shift_chord("L")),
                 |w, cx| w.dispatch_action(Box::new(OpenRecord), cx),
+                cx,
+            ))
+            .child(menu_item(
+                "proxy",
+                "Start/Stop Proxy",
+                None,
+                |w, cx| w.dispatch_action(Box::new(ToggleProxy), cx),
                 cx,
             ))
             .child(menu_item(

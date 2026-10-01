@@ -8,6 +8,8 @@ pub mod error;
 pub mod ipc;
 pub mod local_models;
 pub mod memory;
+mod peer_read;
+pub mod proxy;
 pub mod router;
 pub mod search;
 pub mod subspace_driver;
@@ -2071,6 +2073,34 @@ struct Inner {
     #[cfg(feature = "test-support")]
     claim_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **between a proxied request's settings snapshot
+    /// and the read that authorizes it**. A backend removed and re-added in
+    /// that gap keeps its id and loses its exposure, so what the authorization
+    /// is *about* is the thing that can change — and the gap is a whole
+    /// request's latency wide, which no test can hit by racing. Same shape and
+    /// same reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    proxy_resolve_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **between the read that authorized a proxy action
+    /// and the action it permits** — an engine start, or a catalog scan. The
+    /// resolve window above stages what happens when the row moves *before*
+    /// the authorizing read; this stages the other side of that read, where the
+    /// caller already holds an authorized incarnation and the id behind it is
+    /// replaced. Only an action taken on the row it was handed can tell the two
+    /// apart, and the gap is again far too wide to race. Same shape and same
+    /// reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    proxy_authorized_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only handshake to plant in the next proxied Eidola route **after
+    /// its catalog fetch has been recorded** — the observation the completion's
+    /// own connection would make. The plain test client never invokes an
+    /// attestation observer, so without this the one case that matters (the
+    /// completion riding a connection the catalog fetch never opened) cannot
+    /// occur in a test at all.
+    #[cfg(feature = "test-support")]
+    proxy_planted_handshake: Mutex<Option<String>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
@@ -2661,6 +2691,19 @@ impl Inner {
             return Ok(client.clone());
         }
         local_models::plain_http_client()
+    }
+
+    /// The client a **proxied** completion goes out on: [`Inner::plain_client`]
+    /// without the identifying `User-Agent`, because the proxy's upstream
+    /// header set is an allowlist the Record repeats back to the reader and a
+    /// header the builder adds would travel outside it. See
+    /// [`local_models::proxy_http_client`].
+    fn proxy_client(&self) -> Result<reqwest::Client, AppError> {
+        #[cfg(feature = "test-support")]
+        if let Some(client) = &self.http_override {
+            return Ok(client.clone());
+        }
+        local_models::proxy_http_client()
     }
 
     /// Is what this eidola connection says about its models a fact this
@@ -3636,7 +3679,14 @@ impl Inner {
 
     async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
         let eidola = self.eidola_resolved().await?;
-        let client = self.build_client(&eidola, None).await?;
+        self.eidola_models(&eidola).await
+    }
+
+    /// The catalog of exactly the Eidola configuration handed in — the
+    /// row-honouring half of [`Self::available_models`], for a caller that
+    /// authorized a specific row and must not read the id again.
+    async fn eidola_models(&self, eidola: &EidolaResolved) -> Result<Vec<ModelInfo>, AppError> {
+        let client = self.build_client(eidola, None).await?;
 
         let models = fetch_models(&client, &eidola.base_url).await?;
         Ok(models
@@ -6356,11 +6406,7 @@ impl Inner {
                         .ok_or_else(|| AppError::ModelUnavailable {
                             model: model.to_string(),
                         })?;
-                let pricing = (
-                    model_entry.pricing.per_prompt_token.value as u128,
-                    model_entry.pricing.per_completion_token.value as u128,
-                    model_entry.pricing.per_prompt_token.scale_factor as u128,
-                );
+                let pricing = ChargePricing::from_catalog(&model_entry.pricing);
                 // Whose catalog is this? Declarations are acted on only when
                 // the client is talking to the trust root it was built with:
                 // an overridden base URL or measurement set means some other
@@ -8326,22 +8372,19 @@ impl Inner {
             response_buf.extend_from_slice(&bytes);
             buf.extend_from_slice(&bytes);
 
-            while let Some(pos) = find_event_boundary(&buf) {
+            while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
                 let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
-                // Drop the boundary itself (\n\n or \r\n\r\n).
-                let boundary_len = if buf.starts_with(b"\r\n\r\n") { 4 } else { 2 };
-                if buf.len() >= boundary_len {
-                    buf.drain(..boundary_len);
-                }
+                // Drop the boundary itself — 2, 3 or 4 bytes, whichever pair of
+                // line terminators `find_event_boundary` matched.
+                buf.drain(..boundary_len);
                 let event_str = match std::str::from_utf8(&event_bytes) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                for line in event_str.lines() {
-                    let line = line.trim_end_matches('\r');
-                    let Some(payload) = line.strip_prefix("data:") else {
-                        continue;
-                    };
+                // One data value per event, however many `data:` fields the
+                // sender split it across (`sse_event_data`); each `continue`
+                // below moves on to the next event.
+                if let Some(payload) = sse_event_data(event_str) {
                     let payload = payload.trim_start();
                     if payload == "[DONE]" {
                         finished = true;
@@ -8936,19 +8979,132 @@ impl Inner {
     }
 }
 
-/// Find the byte offset of the next SSE event boundary (`\n\n` or
-/// `\r\n\r\n`) in `buf`, if any. Returns the position *before* the boundary
-/// — i.e. the length of the next event's body.
-fn find_event_boundary(buf: &[u8]) -> Option<usize> {
+/// The length of the SSE line terminator starting at `i`, or `None` if none
+/// starts there.
+///
+/// The event-stream format takes three line endings — `\r\n`, `\n` and a bare
+/// `\r` — and treats any two in a row as the blank line that ends an event.
+///
+/// **A `\r` at the very end of `buf` is read as a terminator, and the residual
+/// is stated rather than avoided.** It is genuinely ambiguous — it may be the
+/// first half of a `\r\n` the next chunk carries, the classic split-across-
+/// chunk-edges trap — but the two ways of resolving it are not symmetric.
+/// Waiting for the byte that decides it strands the **last** event of any
+/// `\r`-terminated stream, which is exactly `[DONE]`: the read reaches EOF with
+/// the terminator still unresolved and the turn reports a stream that ended
+/// without finishing. Reading it eagerly splits `\r\r` out of a stream that
+/// really said `\r\r\n` and leaves a stray `\n` heading the next event — which
+/// **both** consumers already tolerate: the proxy forwards each event with the
+/// terminator it consumed, so the bytes a downstream parser sees are unchanged
+/// in total, and the turn path's field walk skips a line carrying no `data:`
+/// prefix. A harmless mis-split beats a lost completion.
+fn terminator_len(buf: &[u8], i: usize) -> Option<usize> {
+    match buf.get(i)? {
+        b'\r' if buf.get(i + 1) == Some(&b'\n') => Some(2),
+        b'\r' | b'\n' => Some(1),
+        _ => None,
+    }
+}
+
+/// Find the next SSE event boundary in `buf`: the offset *before* it (the
+/// length of the next event's body) and the boundary's own length.
+///
+/// **Every valid line ending, not the two that are common.** Recognising only
+/// `\n\n` and `\r\n\r\n` meant a backend emitting bare-`\r` SSE — valid, and
+/// what the format explicitly allows — never split at all: its events piled
+/// into one frame until the per-event ceiling rejected the stream or EOF
+/// forwarded the whole tail at once, so nothing streamed and no per-event
+/// rewriting happened. The boundary's length is returned rather than
+/// re-derived, since it is now 2, 3 or 4 bytes depending on which pair of
+/// terminators was found.
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     for i in 0..buf.len() {
-        if buf[i..].starts_with(b"\r\n\r\n") {
-            return Some(i);
-        }
-        if buf[i..].starts_with(b"\n\n") {
-            return Some(i);
-        }
+        let Some(first) = terminator_len(buf, i) else {
+            continue;
+        };
+        let Some(second) = terminator_len(buf, i + first) else {
+            continue;
+        };
+        return Some((i, first + second));
     }
     None
+}
+
+/// Split one SSE event's text into its fields: each line with the terminator
+/// that ended it, `""` for a final line the event ended without one.
+///
+/// **The same scanner that separates events separates their fields.** An event
+/// is a run of lines, and the format's line endings are the format's line
+/// endings in both places — but `str::lines()` knows only `\n` and `\r\n`, so a
+/// bare-`\r` event arrived as a single line: `id: 1\rdata: {…}` has no `data:`
+/// prefix, so the payload inside it was invisible to both consumers. Splitting
+/// events correctly and then parsing their fields the old way cures half a
+/// defect and hides the other half, because the failure is now silent instead
+/// of loud — the proxy stops rewriting the model name and, worse, stops finding
+/// the refund that settles a spent credential; the turn path drops the deltas
+/// and never sees `[DONE]`.
+///
+/// Terminators are returned rather than normalized so a caller rebuilding an
+/// event emits the bytes the sender chose. Every terminator byte is ASCII, so
+/// the slice boundaries are always char boundaries.
+fn split_event_lines(text: &str) -> Vec<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    while i < bytes.len() {
+        match terminator_len(bytes, i) {
+            Some(len) => {
+                lines.push((&text[start..i], &text[i..i + len]));
+                i += len;
+                start = i;
+            }
+            None => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        lines.push((&text[start..], ""));
+    }
+    lines
+}
+
+/// The value of one `data:` field line, or `None` for any other field.
+///
+/// The format strips exactly **one** space after the colon, and a bare `data`
+/// line (no colon at all) is a data field with an empty value.
+fn sse_data_field(line: &str) -> Option<&str> {
+    if line == "data" {
+        return Some("");
+    }
+    let value = line.strip_prefix("data:")?;
+    Some(value.strip_prefix(' ').unwrap_or(value))
+}
+
+/// An SSE event's data: every `data:` field's value, **joined with `\n`**, or
+/// `None` when the event has no data field at all.
+///
+/// **An event has one data value, not one per line.** The format says so — a
+/// sender may split a payload across as many `data:` fields as it likes and the
+/// receiver joins them back — so parsing each field on its own read a valid
+/// split JSON payload as several fragments that are each not JSON. Nothing
+/// failed loudly: the turn path dropped the delta, and the proxy forwarded the
+/// event untouched, which skipped the model rewrite and, on the metadata event,
+/// lost the refund that settles a spent credential. Both consumers assemble the
+/// value here once and parse it once.
+fn sse_event_data(event: &str) -> Option<String> {
+    let mut data: Option<String> = None;
+    for (line, _) in split_event_lines(event) {
+        let Some(value) = sse_data_field(line) else {
+            continue;
+        };
+        match data.as_mut() {
+            Some(joined) => {
+                joined.push('\n');
+                joined.push_str(value);
+            }
+            None => data = Some(value.to_string()),
+        }
+    }
+    data
 }
 
 // ============================================================================
@@ -9527,6 +9683,12 @@ impl AppCore {
                 persist_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 claim_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                proxy_resolve_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                proxy_authorized_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                proxy_planted_handshake: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 plan_faults: std::sync::atomic::AtomicU32::new(0),
@@ -10482,6 +10644,17 @@ impl AppCore {
         self.inner.local.register_for_test(backend_id, slug, port);
     }
 
+    /// Test-only seam: register an engine that is **still warming** for
+    /// `backend_id`'s current incarnation — a load in flight, as another
+    /// caller would find it.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_register_warming_local_model(&self, backend_id: &str, slug: &str, port: u16) {
+        self.inner
+            .local
+            .register_warming_for_test(backend_id, slug, port);
+    }
+
     /// Test-only seam: register a fake ready engine with explicit
     /// footprint / pin / LRU timestamp — the eviction tests' fixture.
     #[doc(hidden)]
@@ -10780,6 +10953,65 @@ impl AppCore {
             .lock()
             .expect("anchor window lock poisoned") = Some(tx);
         rx
+    }
+
+    /// Test-only seam: stop the next proxied request between its settings
+    /// snapshot and the read that authorizes it (see
+    /// `Inner::proxy_resolve_window`).
+    ///
+    /// The exposure a request is authorized by is a permission over a backend
+    /// *incarnation*, and the row behind an id can be replaced while a request
+    /// is in flight — which is exactly the interleaving nothing outside can
+    /// stage. Each request that reaches the window sends a resume handle down
+    /// the returned channel and blocks until it is used.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_proxy_resolve_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .proxy_resolve_window
+            .lock()
+            .expect("proxy resolve window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: stop the next proxy action between the read that
+    /// authorized it and what that read permits — an engine start or a catalog
+    /// scan (see `Inner::proxy_authorized_window`).
+    ///
+    /// The twin of the resolve window, on the other side of the same read: here
+    /// the caller is holding an authorized backend row and the id behind it is
+    /// replaced, so what is under test is whether the action uses the row it
+    /// was handed or resolves the name all over again.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_proxy_authorized_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .proxy_authorized_window
+            .lock()
+            .expect("proxy authorized window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: the next proxied Eidola route observes one more
+    /// handshake, named `attestation_hash`, after its catalog fetch was
+    /// recorded — as though the completion opened a fresh connection (see
+    /// `Inner::proxy_planted_handshake`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_plant_proxy_completion_handshake(&self, attestation_hash: &str) {
+        *self
+            .inner
+            .proxy_planted_handshake
+            .lock()
+            .expect("planted handshake lock poisoned") = Some(attestation_hash.to_string());
     }
 
     /// Test-only seam: shorten how long an anchor wait holds out before its own
@@ -12254,7 +12486,7 @@ struct TurnPrep {
     tool_policy: ToolPolicy,
     /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
     /// for every non-spend backend. Kept so a later round can re-estimate.
-    remote_pricing: Option<(u128, u128, u128)>,
+    remote_pricing: Option<ChargePricing>,
     /// The per-turn spend ceiling, checked **per round** against that round's
     /// own estimate over the grown messages array.
     budget: Option<i64>,
@@ -13239,13 +13471,8 @@ async fn recover_refund(
         .await
         .map_err(AppError::from_request)?;
 
-    let status = resp.status();
-    let body_text = resp.text().await.map_err(|e| AppError::Network {
-        message: format!(
-            "failed to read recovery response: {}",
-            crate::error::request_error_text(e)
-        ),
-    })?;
+    let (status, body_text) =
+        crate::peer_read::read_api_answer(resp, "the recovery response").await?;
     let body: serde_json::Value =
         serde_json::from_str(&body_text).map_err(|e| AppError::Network {
             message: format!("failed to parse recovery response: {e}"),
@@ -13599,27 +13826,163 @@ async fn execute_tool_calls(
     out
 }
 
-/// The worst-case charge in credits for one request over `messages` and the
-/// `tool_schemas` that request advertises.
+/// One model's catalog pricing, as a hold computation reads it.
 ///
-/// `pricing` is `(prompt_rate, completion_rate, scale_factor)` from the model
-/// catalog. The prompt side is the shared contract's **single walk**,
-/// `eidola_common::prompt_charge` — the same function the server calls over
-/// the same request, which is what makes hold ≥ charge structural rather
-/// than a property two crates must keep agreeing on. The completion side is
-/// the full `max_completion_tokens` ceiling.
+/// **Built in one place, from the catalog row itself** ([`Self::from_catalog`]),
+/// so no path can carry part of the price and drop the rest. The three that
+/// spend — a space turn, a utility chore, a proxied completion — each built a
+/// `(prompt_rate, completion_rate, scale_factor)` tuple by hand, and every one
+/// dropped `per_request`: a flat-priced model was then held on its token rates,
+/// which the server does not charge by — zero rates refused locally as a zero
+/// charge, nonzero ones held a sum the server's own worst case disagrees with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChargePricing {
+    prompt_rate: u128,
+    completion_rate: u128,
+    scale_factor: u128,
+    /// `(value, scale_factor)` of a flat per-request price, for a model the
+    /// catalog prices per request rather than per token.
+    per_request: Option<(u128, u128)>,
+}
+
+impl ChargePricing {
+    fn from_catalog(pricing: &ModelPricingInfo) -> Self {
+        Self {
+            prompt_rate: pricing.per_prompt_token.value as u128,
+            completion_rate: pricing.per_completion_token.value as u128,
+            scale_factor: pricing.per_prompt_token.scale_factor as u128,
+            per_request: pricing
+                .per_request
+                .as_ref()
+                .map(|p| (p.value as u128, p.scale_factor as u128)),
+        }
+    }
+
+    /// Token pricing alone (tests).
+    #[cfg(test)]
+    pub(crate) fn per_token(prompt_rate: u128, completion_rate: u128, scale_factor: u128) -> Self {
+        Self {
+            prompt_rate,
+            completion_rate,
+            scale_factor,
+            per_request: None,
+        }
+    }
+}
+
+/// The worst-case charge in credits for one request over `messages` and the
+/// `tool_schemas` that request advertises — **the client half of the server's
+/// `worst_case_cost`, branch for branch**.
+///
+/// A model priced per request costs its flat price whatever the request
+/// holds, rounded up exactly as the server rounds it; that branch comes first
+/// and nothing else is consulted, as on the server. Otherwise the prompt side
+/// is the shared contract's **single walk**, `eidola_common::prompt_charge` —
+/// the same function the server calls over the same request, which is what
+/// makes hold ≥ charge structural rather than a property two crates must keep
+/// agreeing on — and the completion side is the full `max_completion_tokens`
+/// ceiling. A flat price with a zero scale factor is no price at all and
+/// answers zero, which every caller refuses as a zero charge rather than
+/// dividing by it.
 fn estimate_charge_credits(
     messages: &[serde_json::Value],
     tool_schemas: &[serde_json::Value],
     max_completion_tokens: u32,
-    pricing: (u128, u128, u128),
+    pricing: ChargePricing,
 ) -> u128 {
-    let (prompt_rate, completion_rate, sf) = pricing;
+    if let Some((value, scale_factor)) = pricing.per_request {
+        return if scale_factor == 0 {
+            0
+        } else {
+            value.div_ceil(scale_factor)
+        };
+    }
+    let sf = pricing.scale_factor;
     let chargeable_prompt =
         eidola_common::prompt_charge(messages, Some(tool_schemas)).chargeable_prompt_tokens();
-    let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
-    let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
+    let prompt_credits = (chargeable_prompt as u128 * pricing.prompt_rate).div_ceil(sf);
+    let completion_credits = (max_completion_tokens as u128 * pricing.completion_rate).div_ceil(sf);
     prompt_credits + completion_credits
+}
+
+#[cfg(test)]
+mod charge_pricing_tests {
+    use super::*;
+
+    /// The server's own scale (`PRICING_SCALE_FACTOR`), so the values below
+    /// are the ones its `worst_case_cost` tests use.
+    const SF: u64 = 1_000_000;
+
+    fn catalog(per_request: Option<u64>, token_rate: u64) -> ModelPricingInfo {
+        let mut pricing = serde_json::json!({
+            "per_prompt_token": { "value": token_rate, "scale_factor": SF },
+            "per_completion_token": { "value": token_rate, "scale_factor": SF },
+        });
+        if let Some(value) = per_request {
+            pricing["per_request"] = serde_json::json!({ "value": value, "scale_factor": SF });
+        }
+        serde_json::from_value(pricing).expect("a catalog pricing row")
+    }
+
+    fn messages(prompt: &str) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({ "role": "user", "content": prompt })]
+    }
+
+    /// REGRESSION: **a flat-priced model is held at its flat price.** The
+    /// catalog's `per_request` was dropped where the pricing was copied out,
+    /// so a model the server charges per request was held on its token rates:
+    /// zero rates refused locally as a zero charge, and nonzero ones held a
+    /// sum the server's own worst case does not compute. The server returns
+    /// the flat price, rounded up, whatever the request holds — so must this.
+    #[test]
+    fn a_flat_priced_model_is_held_at_its_flat_price() {
+        // The server's fixture: 5 credits flat, with no token rates at all.
+        let flat = ChargePricing::from_catalog(&catalog(Some(5 * SF), 0));
+        assert_eq!(estimate_charge_credits(&messages("hi"), &[], 100, flat), 5);
+        // Whatever the request holds, and whatever its token rates say.
+        let flat_with_rates = ChargePricing::from_catalog(&catalog(Some(5 * SF), 7 * SF));
+        let long = "x".repeat(10_000);
+        assert_eq!(
+            estimate_charge_credits(&messages(&long), &[], 4096, flat_with_rates),
+            5
+        );
+        // Rounded up, as the server's `div_ceil` rounds it.
+        let fractional = ChargePricing::from_catalog(&catalog(Some(5 * SF + 1), 0));
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, fractional),
+            6
+        );
+    }
+
+    /// A token-priced row is unchanged by the flat branch: the same sum the
+    /// shared contract walk always produced.
+    #[test]
+    fn a_token_priced_model_is_held_on_its_rates() {
+        let from_catalog = ChargePricing::from_catalog(&catalog(None, SF));
+        assert_eq!(
+            from_catalog,
+            ChargePricing::per_token(SF as u128, SF as u128, SF as u128)
+        );
+        let prompt = eidola_common::prompt_charge(&messages("hi"), Some(&[]))
+            .chargeable_prompt_tokens() as u128;
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, from_catalog),
+            prompt + 100
+        );
+    }
+
+    /// A flat price with no scale is no price: zero, which every caller
+    /// refuses as a zero charge, rather than a division by zero.
+    #[test]
+    fn a_flat_price_with_no_scale_is_a_zero_charge() {
+        let mut row = catalog(Some(5), 0);
+        row.per_request.as_mut().expect("flat").scale_factor = 0;
+        let pricing = ChargePricing::from_catalog(&row);
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, pricing),
+            0
+        );
+    }
 }
 
 /// The per-round spend ceiling check. `budget` caps *each* request's estimated
@@ -16020,15 +16383,12 @@ fn params_from_domain_separator(ds: &str) -> Result<Params, AppError> {
     Ok(Params::new(parts[1], parts[2], parts[3], parts[4]))
 }
 
+/// Read one server answer — **bounded as it arrives** (`peer_read`'s class
+/// rule). This is the shared reader for every call this app makes to the Eidola
+/// server, so the ceiling lands on all of them at once; attested or not, the
+/// bytes are still chosen by the other end.
 async fn read_response(resp: reqwest::Response) -> Result<(reqwest::StatusCode, String), AppError> {
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| AppError::Network {
-        message: format!(
-            "failed to read response body: {}",
-            crate::error::request_error_text(e)
-        ),
-    })?;
-    Ok((status, body))
+    crate::peer_read::read_api_answer(resp, "the server's answer").await
 }
 
 fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError> {
@@ -16141,6 +16501,118 @@ async fn flush_attestations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An event ends at any two line terminators the format allows.**
+    ///
+    /// The event-stream format takes `\r\n`, `\n` and a bare `\r`, so a blank
+    /// line is any two of them in a row — six pairs, not the two that are
+    /// common. Recognising only `\n\n` and `\r\n\r\n` meant a backend emitting
+    /// bare-`\r` SSE never split at all: every event piled into one frame until
+    /// the per-event ceiling refused the stream or EOF forwarded the whole tail
+    /// in one piece, so nothing streamed and no per-event work ran.
+    #[test]
+    fn an_event_ends_at_every_line_ending_the_format_allows() {
+        for (sep, len) in [
+            ("\n\n", 2),
+            ("\r\r", 2),
+            ("\r\n\r\n", 4),
+            ("\r\n\n", 3),
+            ("\n\r\n", 3),
+            ("\r\n\r", 3),
+        ] {
+            let buf = format!("data: one{sep}data: two\n\n");
+            assert_eq!(
+                find_event_boundary(buf.as_bytes()),
+                Some((9, len)),
+                "separator {sep:?} ends the first event"
+            );
+        }
+
+        // Nothing that is not a blank line ends one.
+        assert_eq!(find_event_boundary(b"data: one\ndata: two\n"), None);
+        assert_eq!(find_event_boundary(b""), None);
+    }
+
+    /// **A `\r` at a chunk edge is split eagerly, and the residual is what
+    /// makes that the right choice** — the classic split-across-chunk-edges
+    /// trap, resolved by comparing what each answer costs.
+    ///
+    /// Waiting for the byte that decides it strands the last event of any
+    /// `\r`-terminated stream (exactly `[DONE]`, at EOF, where no byte is
+    /// coming): the turn reports a stream that ended without finishing. Reading
+    /// it eagerly can split `\r\r` out of a `\r\r\n`, leaving a stray `\n`
+    /// heading the next event — which both readers already tolerate.
+    #[test]
+    fn a_carriage_return_at_a_chunk_edge_still_ends_its_event() {
+        // The end of the buffer is the end of the evidence.
+        assert_eq!(find_event_boundary(b"data: one\r\r"), Some((9, 2)));
+        assert_eq!(find_event_boundary(b"data: one\r"), None, "one is not two");
+
+        // With the next byte in hand the length follows what really arrived.
+        assert_eq!(find_event_boundary(b"data: one\r\rd"), Some((9, 2)));
+        assert_eq!(find_event_boundary(b"data: one\r\r\nd"), Some((9, 3)));
+        assert_eq!(find_event_boundary(b"data: one\r\n\r\nd"), Some((9, 4)));
+
+        // The residual, named: the `\r\r\n` split across a chunk edge leaves a
+        // `\n` heading the next event. It carries no `data:` prefix, so the
+        // turn path's line walk skips it, and the proxy forwards every byte it
+        // consumed either way — so the split is invisible downstream.
+        let (pos, len) = find_event_boundary(b"data: one\r\r").expect("a boundary");
+        assert_eq!(&b"data: one\r\r"[pos..pos + len], b"\r\r");
+        assert!(
+            !"\ndata: two"
+                .lines()
+                .next()
+                .expect("a line")
+                .starts_with("data:"),
+            "the stray newline heads a line no reader acts on"
+        );
+    }
+
+    /// **An event's fields are split the same way its edges are.**
+    ///
+    /// `str::lines()` knows two of the format's three line endings, so a
+    /// bare-`\r` event arrived as one line: `id: 1\rdata: {…}` has no `data:`
+    /// prefix and its payload was invisible to every reader. Terminators come
+    /// back with their lines so a caller rebuilding an event frames it the way
+    /// the sender did.
+    #[test]
+    fn an_events_fields_are_split_at_every_line_ending_too() {
+        assert_eq!(
+            split_event_lines("id: 1\rdata: {}"),
+            vec![("id: 1", "\r"), ("data: {}", "")],
+            "a bare carriage return separates two fields"
+        );
+        assert_eq!(
+            split_event_lines("id: 1\r\ndata: {}\n"),
+            vec![("id: 1", "\r\n"), ("data: {}", "\n")],
+            "and the mixed endings each come back as themselves"
+        );
+        assert_eq!(split_event_lines(""), vec![]);
+        assert_eq!(split_event_lines("\n"), vec![("", "\n")], "a blank line");
+
+        // Rebuilt from the pieces, an event is the bytes it arrived as.
+        let event = "id: 1\rdata: {}\r\nretry: 10";
+        let rebuilt: String = split_event_lines(event)
+            .iter()
+            .map(|(line, terminator)| format!("{line}{terminator}"))
+            .collect();
+        assert_eq!(rebuilt, event);
+    }
+
+    /// **An event carries one data value**: its `data:` fields joined with
+    /// `\n`, exactly one leading space stripped from each, a bare `data` line
+    /// counting as an empty field.
+    #[test]
+    fn an_events_data_fields_are_joined_into_one_value() {
+        assert_eq!(
+            sse_event_data("id: 1\ndata: {\"a\":\ndata:  1}\n"),
+            Some("{\"a\":\n 1}".to_string()),
+            "joined with a newline, and only one space taken from each"
+        );
+        assert_eq!(sse_event_data("data\rdata: x"), Some("\nx".to_string()));
+        assert_eq!(sse_event_data(": a comment\nid: 7"), None, "no data field");
+    }
 
     /// A model list from a server that publishes no capabilities at all — the
     /// shape every generic backend sends, and the shape our own server sent

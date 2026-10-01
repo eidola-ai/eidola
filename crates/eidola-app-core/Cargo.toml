@@ -34,6 +34,15 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8
 p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 regex = "1"
+# The local inference proxy's HTTP surface (`src/proxy/http.rs`). Every one of
+# these is **already in this crate's dependency graph** through `reqwest`, so
+# the proxy adds features to crates that are compiled anyway rather than
+# packages to the client payload — which is why hyper is preferred here over
+# axum, whose routing and extractors this three-route surface has no use for.
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 futures-util = { version = "0.3", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }

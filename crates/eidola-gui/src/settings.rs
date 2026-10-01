@@ -30,6 +30,7 @@ use crate::backends_settings::BackendsSettingsView;
 use crate::focus::TabRegion as _;
 use crate::general::GeneralView;
 use crate::probe::Probe as _;
+use crate::proxy_settings::ProxySettingsView;
 use crate::stores::{BackendsStore, Stores};
 use crate::templates_settings::TemplatesSettingsView;
 use crate::wallet::WalletView;
@@ -48,6 +49,7 @@ pub enum SettingsPane {
     Backends,
     Templates,
     Agents,
+    Proxy,
     Account,
     Wallet,
 }
@@ -59,6 +61,7 @@ impl SettingsPane {
             SettingsPane::Backends => "Backends",
             SettingsPane::Templates => "Templates",
             SettingsPane::Agents => "Agents",
+            SettingsPane::Proxy => "Proxy",
             SettingsPane::Account => "Account",
             SettingsPane::Wallet => "Wallet",
         }
@@ -80,6 +83,7 @@ pub struct SettingsView {
     activated: Option<SettingsPane>,
     general: Entity<GeneralView>,
     backends: Entity<BackendsSettingsView>,
+    proxy: Entity<ProxySettingsView>,
     templates: Entity<TemplatesSettingsView>,
     agents: Entity<AgentsSettingsView>,
     account: Entity<AccountView>,
@@ -105,6 +109,7 @@ impl SettingsView {
         let backends = cx.new(|cx| BackendsSettingsView::new(stores.clone(), window, cx));
         let templates = cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx));
         let agents = cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx));
+        let proxy = cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx));
         let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
         let wallet = cx.new(|cx| WalletView::new(stores.clone(), window, cx));
         let backends_store = stores.backends.clone();
@@ -128,6 +133,7 @@ impl SettingsView {
             activated: None,
             general,
             backends,
+            proxy,
             templates,
             agents,
             account,
@@ -164,6 +170,7 @@ impl SettingsView {
             | SettingsPane::Backends
             | SettingsPane::Templates
             | SettingsPane::Agents
+            | SettingsPane::Proxy
             | SettingsPane::Wallet => {}
         }
     }
@@ -196,6 +203,7 @@ impl SettingsView {
             SettingsPane::Backends,
             SettingsPane::Templates,
             SettingsPane::Agents,
+            SettingsPane::Proxy,
         ];
         if self.eidola_enabled(cx) {
             panes.push(SettingsPane::Account);
@@ -254,6 +262,12 @@ impl SettingsView {
         self.agents.clone()
     }
 
+    /// The Proxy pane entity — exposed for behavior tests asserting the
+    /// binding editor and the key lifecycle.
+    pub fn proxy_pane(&self) -> Entity<ProxySettingsView> {
+        self.proxy.clone()
+    }
+
     fn nav_item(
         &self,
         pane: SettingsPane,
@@ -303,6 +317,7 @@ impl Render for SettingsView {
             SettingsPane::Backends => self.backends.clone().into_any_element(),
             SettingsPane::Templates => self.templates.clone().into_any_element(),
             SettingsPane::Agents => self.agents.clone().into_any_element(),
+            SettingsPane::Proxy => self.proxy.clone().into_any_element(),
             SettingsPane::Account => self.account.clone().into_any_element(),
             SettingsPane::Wallet => self.wallet.clone().into_any_element(),
         };
