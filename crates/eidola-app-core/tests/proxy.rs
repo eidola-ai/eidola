@@ -1365,6 +1365,28 @@ fn a_request_that_cannot_be_built_is_still_recorded() {
             "and the row says what happened: {:?}",
             refused.error
         );
+
+        // **No transport is claimed for a request nothing sent** — and the
+        // destination it would have used is still on the record, in the row's
+        // own words rather than on a connection that was never opened.
+        let detail = runtime
+            .block_on(core.request_detail(refused.id.clone()))
+            .expect("detail")
+            .expect("a recorded row");
+        assert_eq!(
+            detail.base_url, None,
+            "a build that failed opened no connection to name"
+        );
+        assert_eq!(detail.transport, None);
+        let error = detail.error.expect("an error");
+        assert!(
+            error.contains("nothing was sent") && error.contains("http://127.0.0.1:1"),
+            "the row still says where it would have gone: {error}"
+        );
+        assert!(
+            !body.contains("127.0.0.1:1"),
+            "the caller is not told the reader's configuration: {body}"
+        );
     });
 }
 

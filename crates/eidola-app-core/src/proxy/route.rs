@@ -989,12 +989,6 @@ impl Inner {
                             })?
                     }
                 };
-                // The engine's address is a port this process picked, and the
-                // next start will pick another: only a row written now can say
-                // where this prompt went. See `record_plain_connection`.
-                let connection_id = self
-                    .record_plain_connection(&backend.id, &engine_url, now)
-                    .await?;
                 Ok(ProxyRoute {
                     // Not `plain_client`: its builder adds a `User-Agent`, which
                     // would travel outside the enumerated header set the Record
@@ -1006,7 +1000,9 @@ impl Inner {
                     backend_id: backend.id.clone(),
                     pricing: None,
                     external_auth: None,
-                    connection_id: Some(connection_id),
+                    // Written once a send is attempted, never at open — see
+                    // `attach_plain_connection`.
+                    connection_id: None,
                     attestations: None,
                     declared_max_output: None,
                     engine_lease: Some(lease),
@@ -1019,9 +1015,6 @@ impl Inner {
                     .ok_or_else(|| AppError::NotConfigured {
                         message: format!("backend `{}` has no base URL", backend.id),
                     })?;
-                let connection_id = self
-                    .record_plain_connection(&backend.id, &base_url, now)
-                    .await?;
                 Ok(ProxyRoute {
                     // Not `plain_client`: its builder adds a `User-Agent`, which
                     // would travel outside the enumerated header set the Record
@@ -1033,7 +1026,9 @@ impl Inner {
                     backend_id: backend.id.clone(),
                     pricing: None,
                     external_auth: backend.api_key.as_ref().map(|k| format!("Bearer {k}")),
-                    connection_id: Some(connection_id),
+                    // Written once a send is attempted, never at open — see
+                    // `attach_plain_connection`.
+                    connection_id: None,
                     attestations: None,
                     declared_max_output: None,
                     engine_lease: None,
@@ -1137,6 +1132,33 @@ impl Inner {
                     engine_lease: None,
                 })
             }
+        }
+    }
+
+    /// Give a plain route its `connection` row — **once a send is about to be
+    /// attempted, and not before.**
+    ///
+    /// A `connection` row is a statement that a transport was used. Written at
+    /// route open, it outran the one failure that sends nothing at all: the
+    /// request build, which refuses on a user-typed key that is not a header
+    /// value or a base URL that does not parse — and the Record then attached
+    /// that refusal to a connection nothing ever opened. So the row is written
+    /// between the build and the send, which is the earliest moment the claim
+    /// is true; a pre-send failure keeps its destination in its own error text
+    /// instead ([`unsent_error`]). An attested route needs none of this — its
+    /// rows come from handshakes, which are evidence of a transport by
+    /// construction. Best-effort like every other Record write here: a failed
+    /// insert costs the row, never the request.
+    async fn attach_plain_connection(&self, route: &mut ProxyRoute) {
+        if route.attestations.is_some() || route.connection_id.is_some() {
+            return;
+        }
+        match self
+            .record_plain_connection(&route.backend_id, &route.base_url, now_ms())
+            .await
+        {
+            Ok(id) => route.connection_id = Some(id),
+            Err(e) => eprintln!("warning: a proxied request's destination was not recorded: {e}"),
         }
     }
 
@@ -1369,7 +1391,7 @@ impl Inner {
                     &body,
                     None,
                     Vec::new(),
-                    Some(error.to_string()),
+                    Some(unsent_error(&route, &error)),
                     nonce,
                     request_at,
                     now_ms(),
@@ -1378,6 +1400,9 @@ impl Inner {
                 return Err(error);
             }
         };
+        // A send is about to be attempted, so a plain route's destination is
+        // now a connection this request used.
+        self.attach_plain_connection(&mut route).await;
 
         let response = match route.client.execute(outbound).await {
             Ok(response) => response,
@@ -1608,7 +1633,7 @@ impl Inner {
                     &body,
                     None,
                     Vec::new(),
-                    Some(error.to_string()),
+                    Some(unsent_error(&route, &error)),
                     nonce,
                     request_at,
                     now_ms(),
@@ -1617,6 +1642,9 @@ impl Inner {
                 return Err(error);
             }
         };
+        // A send is about to be attempted, so a plain route's destination is
+        // now a connection this request used.
+        self.attach_plain_connection(&mut route).await;
 
         let response = match route.client.execute(outbound).await {
             Ok(response) => response,
@@ -2161,6 +2189,26 @@ fn malformed_json_answer(backend_id: &str, status: u16) -> AppError {
     AppError::Network {
         message: format!("`{backend_id}` answered {status} with a body that is not JSON"),
     }
+}
+
+/// The Record's sentence for a request that was never sent.
+///
+/// Nothing was opened, so there is no `connection` row to say where it would
+/// have gone — and the question "where would this prompt have left the
+/// machine" still deserves an answer, so a plain route's refusal carries its
+/// destination in its own words. What reaches the *caller* is the error alone:
+/// the backend's URL is the reader's configuration, not the tool's business.
+/// An attested route says nothing extra — its build cannot fail on a URL the
+/// catalog fetch has already used, and the connection it is recorded against
+/// is one that handshake really opened.
+fn unsent_error(route: &ProxyRoute, error: &AppError) -> String {
+    if route.attestations.is_some() {
+        return error.to_string();
+    }
+    format!(
+        "{error} — nothing was sent; the request would have gone to {}",
+        route.base_url
+    )
 }
 
 /// Whether a parsed `2xx` body is a completion at all.
