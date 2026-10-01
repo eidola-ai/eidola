@@ -28,7 +28,9 @@
 
 use eidola_app_core::BackendInfo;
 use eidola_app_core::error::AppError;
-use eidola_app_core::proxy::{LocalExposure, ProxyKeyInfo, ProxyRefusal, ProxySettings};
+use eidola_app_core::proxy::{
+    LocalExposure, ProxyKeyInfo, ProxyRefusal, ProxySettings, parse_bind_address,
+};
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
@@ -44,6 +46,7 @@ use gpui_component::{h_flex, label::Label};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use crate::i18n::msg;
 use crate::participants::{ghost_button, ghost_button_labeled, load_error_panel};
@@ -821,6 +824,22 @@ impl Render for ProxySettingsView {
     }
 }
 
+/// The binding as an endpoint a tool can be pointed at.
+///
+/// **Spelled by `SocketAddr`, never by joining host and port** — the rule the
+/// listener's reconcile already follows, and the one the status line above it
+/// uses. A join renders `::1` as `::1:11437`, which is not an address any
+/// client parses, so the pane showed two spellings of one binding and the one
+/// in the row a reader copies was the invalid one. A stored address always
+/// parses (app-core refuses one that does not), so the join below is only what
+/// a value nothing validated would fall back to.
+pub fn binding_text(settings: &ProxySettings) -> SharedString {
+    match parse_bind_address(&settings.bind_address) {
+        Ok(ip) => SharedString::from(SocketAddr::new(ip, settings.bind_port).to_string()),
+        Err(_) => SharedString::from(format!("{}:{}", settings.bind_address, settings.bind_port)),
+    }
+}
+
 /// The pane's sentence for a refused operation, chosen from the typed error
 /// **at render** — so a locale change repaints a refusal already on screen.
 ///
@@ -893,27 +912,37 @@ impl ProxySettingsView {
     fn binding_row(&self, settings: &ProxySettings, cx: &Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme();
         match self.binding_edit.as_ref() {
-            None => h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(SharedString::from(format!(
-                            "{}:{}",
-                            settings.bind_address, settings.bind_port
-                        ))),
-                )
-                .child(ghost_button(
-                    SharedString::from("proxy-binding-change"),
-                    SharedString::from("settings/proxy/binding/change"),
-                    msg::proxy_binding_change(cx),
-                    false,
-                    cx,
-                    cx.listener(|this, _, window, cx| this.begin_binding_edit(window, cx)),
-                ))
-                .into_any_element(),
+            None => {
+                let endpoint = binding_text(settings);
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .id("proxy-binding-value")
+                            // A settled readout a reader copies into a tool, so it
+                            // rides its own `Label` node with the endpoint as its
+                            // value — the status line's shape.
+                            .probe_value(
+                                "settings/proxy/binding/value",
+                                gpui::Role::Label,
+                                endpoint.clone(),
+                                endpoint.clone(),
+                            )
+                            .text_sm()
+                            .text_color(theme.foreground)
+                            .child(endpoint),
+                    )
+                    .child(ghost_button(
+                        SharedString::from("proxy-binding-change"),
+                        SharedString::from("settings/proxy/binding/change"),
+                        msg::proxy_binding_change(cx),
+                        false,
+                        cx,
+                        cx.listener(|this, _, window, cx| this.begin_binding_edit(window, cx)),
+                    ))
+                    .into_any_element()
+            }
             // The editor is what Save and Cancel replace, so it is the subtree
             // their handback asks about — the fields inside it are where the
             // keyboard is, and the pane around it survives either press.

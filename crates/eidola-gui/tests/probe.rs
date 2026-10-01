@@ -9741,6 +9741,39 @@ fn proxy_refusals_stand_under_their_own_controls_and_dismiss_apart(cx: &mut Test
     );
 }
 
+/// REGRESSION: **the binding row spells an IPv6 endpoint the way a client
+/// parses it.**
+///
+/// The row joined host and port, so `::1` read `::1:11437` — not an address
+/// any client accepts — while the status line beside it, spelled by
+/// `SocketAddr`, read `[::1]:11437`. One pane, two spellings of one binding,
+/// and the one a reader copies into a tool was the invalid one.
+#[gpui::test]
+fn the_binding_row_brackets_an_ipv6_endpoint(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    for (address, expected) in [("::1", "[::1]:11437"), ("127.0.0.1", "127.0.0.1:11437")] {
+        let stores = stub_stores(cx, |s| {
+            s.config_state = Some(probe_config_state());
+            s.backends = backends_fixture();
+            s.proxy_settings = Some(proxy_settings_fixture(false, address));
+            s.proxy_keys = proxy_keys_fixture();
+        });
+        let (window, _view) = open_view(cx, |window, cx| {
+            cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+        });
+        let entries = fresh_entries(cx, window);
+        assert_probe_value(
+            &entries,
+            "settings/proxy/binding/value",
+            gpui::Role::Label,
+            expected,
+            expected,
+        );
+    }
+}
+
 /// Press the centre of the switch probed as `probe_name` and return what
 /// `state` read before and after — the press aimed at the widget itself, the
 /// primary pointer target, never at the wrapper's padding.
