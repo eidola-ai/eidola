@@ -917,6 +917,11 @@ impl Inner {
         let now = now_ms();
         match target.kind {
             backends::BackendKind::Local | backends::BackendKind::LlamaCpp => {
+                // The gap this stages is the one the load's doc is about: an
+                // authorized row is already in hand, and the id behind it can
+                // be replaced before anything acts on it.
+                #[cfg(feature = "test-support")]
+                crate::subspace_driver::pause_in_window(&self.proxy_engine_window).await;
                 let leased = self.local.lease_engine(&backend.id, &target.model);
                 let (engine_url, lease) = match leased {
                     Some((url, _ctx, lease)) => (url, lease),

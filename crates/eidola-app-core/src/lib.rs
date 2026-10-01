@@ -2082,6 +2082,17 @@ struct Inner {
     #[cfg(feature = "test-support")]
     proxy_resolve_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **between the read that authorized a proxied
+    /// request and the engine start it permits**. The resolve window above
+    /// stages what happens when the row moves *before* the authorizing read;
+    /// this stages the other side of that read, where the request already holds
+    /// an authorized incarnation and the id behind it is replaced. Only a load
+    /// acting on the row it was handed can tell the two apart, and the gap —
+    /// the exposure read plus the load's own configuration reads — is again far
+    /// too wide to race. Same shape and same reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    proxy_engine_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
@@ -9623,6 +9634,8 @@ impl AppCore {
                 claim_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 proxy_resolve_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                proxy_engine_window: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 plan_faults: std::sync::atomic::AtomicU32::new(0),
@@ -10898,6 +10911,28 @@ impl AppCore {
             .proxy_resolve_window
             .lock()
             .expect("proxy resolve window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: stop the next proxied request between the read that
+    /// authorized it and the engine start that read permits (see
+    /// `Inner::proxy_engine_window`).
+    ///
+    /// The twin of the resolve window, on the other side of the same read: here
+    /// the request is holding an authorized backend row and the id behind it is
+    /// replaced, so what is under test is whether the load acts on the row it
+    /// was handed or resolves the name all over again.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_proxy_engine_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .proxy_engine_window
+            .lock()
+            .expect("proxy engine window lock poisoned") = Some(tx);
         rx
     }
 
