@@ -203,8 +203,15 @@ pub enum ChatBehavior {
     Non2xxWithRefund(u16),
     /// A `200` SSE stream carrying **more bytes than the Record keeps**, so a
     /// truncated recording is what a reader must be told about rather than
-    /// handed silently.
+    /// handed silently — in events each well under the frame ceiling, so the
+    /// stream itself is one a reader accepts.
     OkStreamingOversized,
+    /// A `200` SSE stream whose one content event is **larger than the frame
+    /// ceiling and properly terminated**. Not
+    /// [`ChatBehavior::StreamingUnterminatedFlood`]: the blank line that ends
+    /// it arrives, so a reader that measures only what is left after draining
+    /// complete events takes this one whole.
+    StreamingOneOversizedEvent,
     /// A `200` SSE stream of **ordinary, well-framed events that never stops
     /// coming** — far more content than any completion, each event small, and
     /// a `[DONE]` only at the very end.
@@ -1384,9 +1391,16 @@ async fn handle_chat(
             write_sse_stream(stream, true, &pieces).await
         }
         ChatBehavior::OkStreamingOversized => {
-            // One very large content delta — far past what a Record row keeps,
-            // and nothing else about the stream unusual.
-            let big = "x".repeat(1_200_000);
+            // Three large content deltas — together far past what a Record row
+            // keeps, each well under any frame bound, nothing else unusual.
+            let piece = "x".repeat(400_000);
+            write_sse_stream(stream, true, &[&piece, &piece, &piece]).await
+        }
+        ChatBehavior::StreamingOneOversizedEvent => {
+            // One content delta past a one-megabyte frame ceiling, ended
+            // properly. Spelled here rather than imported: the mock is the
+            // peer and must not learn this app's ceilings.
+            let big = "z".repeat(1_200_000);
             write_sse_stream(stream, true, &[&big]).await
         }
         ChatBehavior::DropBeforeResponse => {

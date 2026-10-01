@@ -7655,14 +7655,15 @@ impl Inner {
                 let answer =
                     match peer_read::read_bounded(resp, peer_read::MAX_RESPONSE_BYTES).await {
                         Ok(answer) => answer,
-                        Err(e) => {
+                        Err(failure) => {
+                            let e = failure.error;
                             prep.settle(None).await;
                             prep.insert_unattached_request(
                                 &request_body_json,
                                 request_at,
                                 now_ms(),
                                 status.as_u16(),
-                                Vec::new(),
+                                recorded::recorded_cut_answer(&failure.partial),
                                 Some(e.to_string()),
                             )
                             .await?;
@@ -8399,14 +8400,15 @@ impl Inner {
                 // an empty answer** — defaulting it would report the
                 // upstream's status (or a shape refusal about bytes that
                 // never arrived) for what was a transport failure.
-                Err(e) => {
+                Err(failure) => {
+                    let e = failure.error;
                     prep.settle(None).await;
                     prep.insert_unattached_request(
                         &request_body_json,
                         request_at,
                         now_ms(),
                         status.as_u16(),
-                        Vec::new(),
+                        recorded::recorded_cut_answer(&failure.partial),
                         Some(e.to_string()),
                     )
                     .await?;
@@ -8525,7 +8527,14 @@ impl Inner {
             }
             buf.extend_from_slice(&bytes);
 
+            let mut oversized = false;
             while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
+                // The frame ceiling is asked of a complete event **before** it
+                // is drained (`peer_read::event_past_ceiling`).
+                if peer_read::event_past_ceiling(Some(pos), 0) {
+                    oversized = true;
+                    break;
+                }
                 let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
                 // Drop the boundary itself — 2, 3 or 4 bytes, whichever pair of
                 // line terminators `find_event_boundary` matched.
@@ -8624,18 +8633,11 @@ impl Inner {
             }
 
             // **What is left over is an event still being accumulated**, and
-            // a backend that never terminates one grows it without end. Checked
-            // after the drain, so what is measured is an event with no boundary
-            // in it rather than a chunk that happened to straddle one.
-            if buf.len() > peer_read::MAX_SSE_EVENT_BYTES {
-                read_error = Some(AppError::Network {
-                    message: format!(
-                        "`{}` sent a single event past the {}-byte ceiling this app will hold, \
-                         or never ended one",
-                        prep.backend_id,
-                        peer_read::MAX_SSE_EVENT_BYTES
-                    ),
-                });
+            // a backend that never terminates one grows it without end — the
+            // other half of the frame ceiling, beside the complete event the
+            // drain refused above. Either way the event is refused, not used.
+            if oversized || peer_read::event_past_ceiling(None, buf.len()) {
+                read_error = Some(peer_read::oversized_event(&prep.backend_id));
                 buf.clear();
                 break;
             }

@@ -7114,8 +7114,49 @@ fn a_pre_stream_body_cut_short_is_reported_as_the_read_failure() {
             let rows = completion_rows(&core);
             assert_eq!(rows.len(), 1, "the exchange is in the Record");
             assert!(rows[0].error.is_some(), "with the failure as its error");
+            assert_cut_prefix_recorded(&core, &rows[0].id);
         });
     }
+}
+
+/// **What arrived before the reset is part of the exchange**, so the Record
+/// keeps it: `HeadThenCut` sends a head, the first bytes of a JSON body and
+/// then nothing. A row holding an empty body would describe an exchange in
+/// which no bytes came back.
+fn assert_cut_prefix_recorded(core: &AppCore, id: &str) {
+    let recorded = request_detail(core, id).response_body.unwrap_or_default();
+    assert!(
+        recorded.starts_with(br#"{"error":"#),
+        "the prefix that arrived is recorded: {:?}",
+        String::from_utf8_lossy(&recorded)
+    );
+}
+
+/// The blocking twin: a body cut short fails the turn as the read failure it
+/// is, settles the hold, and keeps what arrived.
+#[test]
+fn a_blocking_body_cut_short_is_recorded_with_what_arrived() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::HeadThenCut {
+                status: 200,
+                content_type: "application/json",
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("the body never arrived");
+        assert!(matches!(err, AppError::Network { .. }), "{err:?}");
+        assert!(mock.refund_hits() >= 1, "the hold went to recovery");
+        assert_settled(&core);
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1, "the exchange is in the Record");
+        assert!(rows[0].error.is_some(), "with the failure as its error");
+        assert_cut_prefix_recorded(&core, &rows[0].id);
+    });
 }
 
 // ===========================================================================
@@ -7149,6 +7190,39 @@ fn an_event_that_never_ends_fails_the_turn_rather_than_accumulating() {
                 .is_some_and(|e| e.contains("ceiling")),
             "{:?}",
             rows[0].error
+        );
+    });
+}
+
+/// REGRESSION: **the frame ceiling holds for an event that arrives whole.**
+/// The ceiling was measured only on what was left in the buffer after complete
+/// events were drained, so an oversized event whose terminating blank line
+/// came in the same read was taken whole — any size up to the whole-stream
+/// ceiling, parsed, forwarded and persisted. It is now asked of each complete
+/// event before it is drained.
+#[test]
+fn an_oversized_complete_event_fails_the_turn() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingOneOversizedEvent,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = stream_once(&core, "stream me").expect_err("refused at the frame ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("single event")),
+            "{err:?}"
+        );
+        assert_settled(&core);
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.len(),
+            1,
+            "no answer is written from a refused event"
         );
     });
 }

@@ -343,6 +343,7 @@ impl Inner {
         let text =
             match crate::peer_read::read_bounded(response, crate::peer_read::API_ANSWER_MAX_BYTES)
                 .await
+                .map_err(AppError::from)
                 .and_then(|body| crate::peer_read::whole_text(body, &what))
             {
                 Ok(text) => text,

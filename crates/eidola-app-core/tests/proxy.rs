@@ -2175,6 +2175,57 @@ fn an_event_that_never_ends_is_refused_rather_than_accumulated() {
     });
 }
 
+/// REGRESSION: **the frame ceiling holds for an event that arrives whole.**
+/// Measured only on the residual after draining, an oversized event whose
+/// terminating blank line arrived in the same read was drained whole and
+/// forwarded. It is now refused before it is drained, and never forwarded.
+#[test]
+fn an_oversized_complete_event_is_refused_rather_than_forwarded() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::StreamingOneOversizedEvent,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+                ),
+            ),
+        ));
+        assert_eq!(
+            status, 200,
+            "the head was committed before the event arrived"
+        );
+        assert!(
+            !body.contains("zzzz"),
+            "the refused event is not forwarded: {} bytes",
+            body.len()
+        );
+        let requests = runtime.block_on(core.list_requests(20, 0)).expect("record");
+        let completion = requests
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is recorded");
+        assert!(
+            completion
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            completion.error
+        );
+    });
+}
+
 /// REGRESSION: **the request column is bounded too, and it is the durable
 /// half.**
 ///
@@ -2663,7 +2714,61 @@ fn a_cut_pre_stream_body(status: u16, content_type: &'static str) -> (u16, Strin
         !wallet.iter().any(|c| c.state == "spending"),
         "a failed read still settles the hold: {wallet:?}"
     );
+    assert_cut_prefix_recorded(&core, &row.id);
     (seen, body, row.error)
+}
+
+/// **What arrived before the reset is part of the exchange**, so the Record
+/// keeps it: `HeadThenCut` sends a head, the first bytes of a JSON body and
+/// then nothing. A row holding an empty body would describe an exchange in
+/// which no bytes came back.
+fn assert_cut_prefix_recorded(core: &AppCore, id: &str) {
+    let detail = core
+        .runtime()
+        .block_on(core.request_detail(id.to_string()))
+        .expect("detail")
+        .expect("the row");
+    let recorded = detail.response_body.unwrap_or_default();
+    assert!(
+        recorded.starts_with(br#"{"error":"#),
+        "the prefix that arrived is recorded: {:?}",
+        String::from_utf8_lossy(&recorded)
+    );
+}
+
+/// The blocking transport's twin: a body cut short keeps what arrived.
+#[test]
+fn a_blocking_body_cut_short_keeps_what_arrived() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::HeadThenCut {
+                status: 200,
+                content_type: "application/json",
+            },
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#),
+            ),
+        ));
+        assert_ne!(status, 200, "{body}");
+        let row = runtime
+            .block_on(core.list_requests(20, 0))
+            .expect("record")
+            .into_iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is recorded");
+        assert!(row.error.is_some());
+        assert_cut_prefix_recorded(&core, &row.id);
+    });
 }
 
 /// REGRESSION: **a non-2xx whose body could not be read is a read failure, not

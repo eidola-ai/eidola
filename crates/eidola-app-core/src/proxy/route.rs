@@ -49,8 +49,8 @@ use uuid::Uuid;
 use super::LocalExposure;
 use crate::changes::Change;
 use crate::error::AppError;
-use crate::peer_read::{MAX_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES};
-use crate::recorded::{RecordedBody, recorded_answer, recorded_request};
+use crate::peer_read::MAX_RESPONSE_BYTES;
+use crate::recorded::{RecordedBody, recorded_answer, recorded_cut_answer, recorded_request};
 use crate::{
     ChargePricing, EidolaResolved, Inner, ModelInfo, backends, db, estimate_charge_credits,
     fetch_models, find_event_boundary, flush_attestations, is_event_stream, local_models, now_ms,
@@ -137,7 +137,9 @@ impl RecordedBody {
 /// [`MAX_RESPONSE_BYTES`] rather than the retention cap: what the Record keeps
 /// and what this app may hold to answer one caller are different numbers, and
 /// only the second bounds the process.
-async fn read_capped_body(response: reqwest::Response) -> Result<CappedBody, AppError> {
+async fn read_capped_body(
+    response: reqwest::Response,
+) -> Result<CappedBody, crate::peer_read::ReadFailure> {
     crate::peer_read::read_bounded(response, MAX_RESPONSE_BYTES).await
 }
 
@@ -1401,7 +1403,8 @@ impl Inner {
         let status = response.status();
         let answer = match read_capped_body(response).await {
             Ok(answer) => answer,
-            Err(error) => {
+            Err(failure) => {
+                let error = failure.error;
                 self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
                     .await;
                 self.record_proxy_request(
@@ -1409,7 +1412,7 @@ impl Inner {
                     &headers,
                     &body,
                     Some(status.as_u16()),
-                    Vec::new(),
+                    recorded_cut_answer(&failure.partial),
                     Some(error.to_string()),
                     nonce,
                     request_at,
@@ -1631,7 +1634,8 @@ impl Inner {
             // return it.
             let answer = match read_capped_body(response).await {
                 Ok(answer) => answer,
-                Err(error) => {
+                Err(failure) => {
+                    let error = failure.error;
                     self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
                         .await;
                     self.record_proxy_request(
@@ -1639,7 +1643,7 @@ impl Inner {
                         &headers,
                         &body,
                         Some(status.as_u16()),
-                        Vec::new(),
+                        recorded_cut_answer(&failure.partial),
                         Some(error.to_string()),
                         nonce,
                         request_at,
@@ -1716,7 +1720,8 @@ impl Inner {
             // return it.
             let answer = match read_capped_body(response).await {
                 Ok(answer) => answer,
-                Err(error) => {
+                Err(failure) => {
+                    let error = failure.error;
                     self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
                         .await;
                     self.record_proxy_request(
@@ -1724,7 +1729,7 @@ impl Inner {
                         &headers,
                         &body,
                         Some(status.as_u16()),
-                        Vec::new(),
+                        recorded_cut_answer(&failure.partial),
                         Some(error.to_string()),
                         nonce,
                         request_at,
@@ -1809,7 +1814,14 @@ impl Inner {
             };
             raw.push(&bytes);
             buf.extend_from_slice(&bytes);
+            let mut oversized = false;
             while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
+                // The frame ceiling is asked of a complete event **before** it
+                // is drained and forwarded (`peer_read::event_past_ceiling`).
+                if crate::peer_read::event_past_ceiling(Some(pos), 0) {
+                    oversized = true;
+                    break;
+                }
                 let event: Vec<u8> = buf.drain(..pos).collect();
                 let terminator: Vec<u8> = buf.drain(..boundary_len).collect();
                 let (mut out, refund) = forward_sse_event(&event, &route.canonical);
@@ -1846,18 +1858,13 @@ impl Inner {
             // it is the one buffer on this path with no ceiling of its own: the
             // retention cap bounds the Record and the queue bounds delivery,
             // while a backend that never terminates an event grows this until
-            // the process dies. Checked after the drain, so what is measured is
-            // an event with no boundary in it rather than a chunk that happened
-            // to straddle one; the residual is a single transport chunk of
-            // overshoot, which is the transport's own bound rather than ours.
-            if buf.len() > MAX_SSE_EVENT_BYTES {
-                read_error = Some(AppError::Network {
-                    message: format!(
-                        "`{}` sent a single event past the {MAX_SSE_EVENT_BYTES}-byte ceiling \
-                         this app will hold, or never ended one",
-                        route.backend_id
-                    ),
-                });
+            // the process dies. That residual half is measured after the drain;
+            // the complete half — an oversized event whose boundary arrived in
+            // the same read, which the drain would otherwise have taken whole —
+            // is refused before it (`oversized`). The residual overshoot is a
+            // single transport chunk, the transport's own bound rather than ours.
+            if oversized || crate::peer_read::event_past_ceiling(None, buf.len()) {
+                read_error = Some(crate::peer_read::oversized_event(&route.backend_id));
                 // Refused, so not forwarded: the tail below exists to hand a
                 // downstream parser the bytes the upstream really sent, and
                 // these are the bytes this app has just declined to accept.

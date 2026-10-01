@@ -79,8 +79,34 @@ pub(crate) const MAX_RESPONSE_BYTES: usize = 8 << 20;
 /// ends and the Record says why.
 pub(crate) const MAX_SSE_EVENT_BYTES: usize = 1 << 20;
 
+/// Whether an event that has **not** been taken out of the frame buffer yet
+/// passes [`MAX_SSE_EVENT_BYTES`]: `complete` is the length of the next
+/// complete event, if a boundary has arrived, and `residual` the bytes in the
+/// buffer.
+///
+/// **Both, and the complete one before it is drained.** Checking only what is
+/// left after the drain measures an event still accumulating, which is the
+/// half that catches a backend that never ends one — and misses the half
+/// where the oversized event arrives with its boundary in the same read: the
+/// drain takes it whole, the residual is small, and an event of any size up to
+/// the whole-stream ceiling is parsed and used.
+pub(crate) fn event_past_ceiling(complete: Option<usize>, residual: usize) -> bool {
+    complete.is_some_and(|len| len > MAX_SSE_EVENT_BYTES) || residual > MAX_SSE_EVENT_BYTES
+}
+
+/// The refusal an oversized event is answered with, on every streaming
+/// consumer.
+pub(crate) fn oversized_event(backend_id: &str) -> AppError {
+    AppError::Network {
+        message: format!(
+            "`{backend_id}` sent a single event past the {MAX_SSE_EVENT_BYTES}-byte ceiling this \
+             app will hold, or never ended one"
+        ),
+    }
+}
+
 /// One answer read from a peer, bounded.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct BoundedBody {
     /// What was read, to the ceiling.
     pub(crate) bytes: Vec<u8>,
@@ -97,27 +123,56 @@ impl BoundedBody {
     }
 }
 
+/// A read that failed part-way, with **what had arrived before it failed**.
+///
+/// The prefix is part of the exchange: a peer that sent half a body and then
+/// reset sent that half, and a surface that records exchanges records it — a
+/// row claiming an empty response where bytes arrived is a trail describing an
+/// exchange that did not happen. A caller with no record to write converts
+/// this into its error (`?` does, through the `From` below) and the prefix is
+/// dropped there, deliberately rather than by the reader.
+#[derive(Debug)]
+pub(crate) struct ReadFailure {
+    pub(crate) error: AppError,
+    /// Everything read before the failure, to the ceiling.
+    pub(crate) partial: BoundedBody,
+}
+
+impl From<ReadFailure> for AppError {
+    fn from(failure: ReadFailure) -> Self {
+        failure.error
+    }
+}
+
 /// Read a response body, stopping at `ceiling` bytes.
 ///
 /// The bound is applied **while reading**: `Response::text()` and
 /// `Response::json()` buffer whatever the peer sends before anything can cap
 /// it, so a ceiling checked afterwards is a ceiling on the value and not on the
-/// cost.
+/// cost. A read that fails hands back the prefix it had ([`ReadFailure`]).
 pub(crate) async fn read_bounded(
     response: reqwest::Response,
     ceiling: usize,
-) -> Result<BoundedBody, AppError> {
+) -> Result<BoundedBody, ReadFailure> {
     use futures_util::StreamExt;
 
     let mut stream = response.bytes_stream();
     let mut body = BoundedBody::default();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| AppError::Network {
-            message: format!(
-                "failed to read the response: {}",
-                crate::error::request_error_text(e)
-            ),
-        })?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                return Err(ReadFailure {
+                    error: AppError::Network {
+                        message: format!(
+                            "failed to read the response: {}",
+                            crate::error::request_error_text(e)
+                        ),
+                    },
+                    partial: body,
+                });
+            }
+        };
         body.received += chunk.len();
         let room = ceiling.saturating_sub(body.bytes.len());
         if chunk.len() > room {

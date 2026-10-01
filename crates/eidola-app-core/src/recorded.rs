@@ -218,6 +218,17 @@ pub(crate) fn recorded_answer(answer: &BoundedBody) -> Vec<u8> {
     })
 }
 
+/// What the Record keeps of a body whose read **failed** part-way: the prefix
+/// that arrived, sealed as a read this app did not finish (a lower bound where
+/// the cap applied). The failure itself is the row's `error`, which is where
+/// every surface states an ending it did not choose.
+pub(crate) fn recorded_cut_answer(partial: &BoundedBody) -> Vec<u8> {
+    let mut kept = RecordedBody::default();
+    kept.push(&partial.bytes);
+    kept.received = partial.received;
+    kept.seal_response(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
