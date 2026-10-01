@@ -2310,6 +2310,55 @@ fn engine_backend(
     }
 }
 
+/// REGRESSION: **the proxy reads an event's data as one value, so a payload
+/// split across `data:` fields is still rewritten — and its refund still
+/// settles.**
+///
+/// Parsing field by field saw fragments that are each not JSON and forwarded
+/// the event untouched: the chunk kept the upstream's unqualified model name,
+/// and the metadata event's refund was never found. `RefundMode::Fail` makes
+/// that refund the only copy, so a parser that misses it strands the credential.
+#[test]
+fn a_payload_split_across_data_fields_is_rewritten_and_settles() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::StreamingSplitDataFields,
+            refund: RefundMode::Fail,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !body.contains(STREAM_WIRE_MODEL),
+            "every split chunk's model was rewritten: {body}"
+        );
+        assert!(
+            !body.contains("\"refund\""),
+            "and no credential material travels downstream: {body}"
+        );
+        let wallet = runtime.block_on(core.wallet_lifecycle()).expect("wallet");
+        assert!(
+            !wallet.iter().any(|c| c.state == "spending"),
+            "the split refund was found and settled the hold: {wallet:?}"
+        );
+        assert_eq!(mock.refund_hits(), 0, "in band, not by recovery");
+    });
+}
+
 /// One streamed ask whose upstream sent a head and then reset before the body;
 /// returns what the caller saw and what the Record row says.
 fn a_cut_pre_stream_body(status: u16, content_type: &'static str) -> (u16, String, Option<String>) {

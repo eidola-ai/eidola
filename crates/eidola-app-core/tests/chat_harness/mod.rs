@@ -129,6 +129,17 @@ pub enum ChatBehavior {
     /// with `RefundMode::Fail` is therefore the honest model of the one case
     /// where the in-band token is the *only* copy.
     StreamingWithMetadataRefund,
+    /// [`ChatBehavior::StreamingWithMetadataRefund`] with **every JSON payload
+    /// split across several `data:` fields** — one per line of its
+    /// pretty-printed form — and each chunk naming the model in the upstream's
+    /// own spelling ([`STREAM_WIRE_MODEL`]).
+    ///
+    /// Valid event-stream: an event's data is its `data:` fields joined with
+    /// `\n`, and pretty-printed JSON joined back that way is the same JSON. A
+    /// reader that parses field by field sees fragments that are each not JSON
+    /// and silently skips them — the deltas, the model rewrite, and the refund in
+    /// the metadata event all go missing without anything failing.
+    StreamingSplitDataFields,
     /// A plain success in **whichever transport asked** — SSE for a streaming
     /// request, JSON for a blocking one. One behaviour for a test that must
     /// exercise both twins against one upstream, which is otherwise impossible:
@@ -1353,6 +1364,15 @@ async fn handle_chat(
                 });
             write_sse_stream_with_metadata(stream, &[STREAM_CONTENT], refund).await
         }
+        ChatBehavior::StreamingSplitDataFields => {
+            let refund = auth
+                .and_then(Issuer::spend_proof_from_auth)
+                .and_then(|sp| issuer.refund_for(&sp))
+                .map(|refund_b64| {
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                });
+            write_sse_stream_split_data(stream, &[STREAM_CONTENT], refund).await
+        }
         ChatBehavior::OkStreamingWithHeader => {
             write_sse_stream(
                 stream,
@@ -2142,6 +2162,67 @@ async fn write_sse_stream_with_metadata(
     }
     stream.write_all(&send_event(metadata.to_string())).await?;
     stream.write_all(&send_event("[DONE]".to_string())).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// The metadata stream with each JSON payload split across one `data:` field
+/// per line of its pretty-printed form. See
+/// [`ChatBehavior::StreamingSplitDataFields`].
+async fn write_sse_stream_split_data(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+    refund: Option<serde_json::Value>,
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let send_event = |payload: &serde_json::Value| -> Vec<u8> {
+        let pretty = serde_json::to_string_pretty(payload).expect("serialize");
+        let mut event = String::new();
+        for line in pretty.lines() {
+            event.push_str("data: ");
+            event.push_str(line);
+            event.push('\n');
+        }
+        event.push('\n');
+        let mut out = format!("{:x}\r\n", event.len()).into_bytes();
+        out.extend_from_slice(event.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "model": STREAM_WIRE_MODEL,
+            "choices": [{ "delta": { "content": chunk } }]
+        });
+        stream.write_all(&send_event(&content)).await?;
+        stream.flush().await?;
+    }
+    let usage = serde_json::json!({
+        "model": STREAM_WIRE_MODEL,
+        "choices": [],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 5 }
+    });
+    stream.write_all(&send_event(&usage)).await?;
+    let mut metadata = serde_json::json!({
+        "object": "eidola.chat.completion.metadata",
+        "id": "chatcmpl-mock",
+    });
+    if let Some(refund) = refund {
+        metadata["refund"] = refund;
+    }
+    stream.write_all(&send_event(&metadata)).await?;
+    let done = "data: [DONE]\n\n";
+    stream
+        .write_all(format!("{:x}\r\n{done}\r\n", done.len()).as_bytes())
+        .await?;
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())

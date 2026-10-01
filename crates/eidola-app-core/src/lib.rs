@@ -8378,10 +8378,10 @@ impl Inner {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                for (line, _) in split_event_lines(event_str) {
-                    let Some(payload) = line.strip_prefix("data:") else {
-                        continue;
-                    };
+                // One data value per event, however many `data:` fields the
+                // sender split it across (`sse_event_data`); each `continue`
+                // below moves on to the next event.
+                if let Some(payload) = sse_event_data(event_str) {
                     let payload = payload.trim_start();
                     if payload == "[DONE]" {
                         finished = true;
@@ -9062,6 +9062,46 @@ fn split_event_lines(text: &str) -> Vec<(&str, &str)> {
         lines.push((&text[start..], ""));
     }
     lines
+}
+
+/// The value of one `data:` field line, or `None` for any other field.
+///
+/// The format strips exactly **one** space after the colon, and a bare `data`
+/// line (no colon at all) is a data field with an empty value.
+fn sse_data_field(line: &str) -> Option<&str> {
+    if line == "data" {
+        return Some("");
+    }
+    let value = line.strip_prefix("data:")?;
+    Some(value.strip_prefix(' ').unwrap_or(value))
+}
+
+/// An SSE event's data: every `data:` field's value, **joined with `\n`**, or
+/// `None` when the event has no data field at all.
+///
+/// **An event has one data value, not one per line.** The format says so — a
+/// sender may split a payload across as many `data:` fields as it likes and the
+/// receiver joins them back — so parsing each field on its own read a valid
+/// split JSON payload as several fragments that are each not JSON. Nothing
+/// failed loudly: the turn path dropped the delta, and the proxy forwarded the
+/// event untouched, which skipped the model rewrite and, on the metadata event,
+/// lost the refund that settles a spent credential. Both consumers assemble the
+/// value here once and parse it once.
+fn sse_event_data(event: &str) -> Option<String> {
+    let mut data: Option<String> = None;
+    for (line, _) in split_event_lines(event) {
+        let Some(value) = sse_data_field(line) else {
+            continue;
+        };
+        match data.as_mut() {
+            Some(joined) => {
+                joined.push('\n');
+                joined.push_str(value);
+            }
+            None => data = Some(value.to_string()),
+        }
+    }
+    data
 }
 
 // ============================================================================
@@ -16408,6 +16448,20 @@ mod tests {
             .map(|(line, terminator)| format!("{line}{terminator}"))
             .collect();
         assert_eq!(rebuilt, event);
+    }
+
+    /// **An event carries one data value**: its `data:` fields joined with
+    /// `\n`, exactly one leading space stripped from each, a bare `data` line
+    /// counting as an empty field.
+    #[test]
+    fn an_events_data_fields_are_joined_into_one_value() {
+        assert_eq!(
+            sse_event_data("id: 1\ndata: {\"a\":\ndata:  1}\n"),
+            Some("{\"a\":\n 1}".to_string()),
+            "joined with a newline, and only one space taken from each"
+        );
+        assert_eq!(sse_event_data("data\rdata: x"), Some("\nx".to_string()));
+        assert_eq!(sse_event_data(": a comment\nid: 7"), None, "no data field");
     }
 
     /// A model list from a server that publishes no capabilities at all — the

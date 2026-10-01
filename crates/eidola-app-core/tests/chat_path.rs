@@ -452,6 +452,47 @@ fn a_stream_framed_with_bare_carriage_returns_still_delivers_its_deltas() {
     });
 }
 
+/// REGRESSION: **an event's data is its `data:` fields joined, then parsed
+/// once.**
+///
+/// The format lets a sender split one payload across as many `data:` fields as
+/// it likes; the receiver joins them with `\n`. Parsing field by field read
+/// every piece of a split payload as a fragment that is not JSON and skipped it
+/// — nothing failed, the deltas and the usage simply never arrived.
+#[test]
+fn a_payload_split_across_data_fields_is_read_as_one() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingSplitDataFields,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content) = core.runtime().block_on(async {
+            let collector = async {
+                let mut content = String::new();
+                while let Some(ev) = events_rx.recv().await {
+                    if let ChatStreamEvent::ContentDelta(t) = ev {
+                        content.push_str(&t);
+                    }
+                }
+                content
+            };
+            let chat = core.chat_stream("stream me".into(), MODEL.into(), None, tx);
+            tokio::join!(chat, collector)
+        });
+
+        let res = res.expect("a split-data stream completes like any other");
+        assert_eq!(
+            content, "Hello from the stream.",
+            "the split delta was read"
+        );
+        assert_eq!(res.input_tokens, Some(11), "and so was the split usage");
+        assert_eq!(res.output_tokens, Some(5));
+    });
+}
+
 #[test]
 fn streaming_chat_delivers_deltas_and_persists() {
     run(|| {

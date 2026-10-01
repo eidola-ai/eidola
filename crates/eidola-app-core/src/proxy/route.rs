@@ -2208,43 +2208,47 @@ fn forward_sse_event(event: &[u8], canonical: &str) -> (Vec<u8>, Option<Value>) 
     // `data:` prefix and its payload was invisible: no model rewrite, and no
     // refund found in the metadata event that settles the credential.
     let lines = crate::split_event_lines(text);
-    let payloads = || {
-        lines.iter().filter_map(|(line, _)| {
-            line.strip_prefix("data:")
-                .map(str::trim_start)
-                .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-        })
+    // **And the event's data is assembled before it is parsed** — one value,
+    // the `data:` fields joined with `\n`, which is what the format says an
+    // event carries (`sse_event_data`). Parsing field by field read a payload
+    // the sender split across lines as fragments that are each not JSON, and
+    // the event went out untouched: no model rewrite, no refund.
+    let Some(mut value) = crate::sse_event_data(text)
+        .and_then(|data| serde_json::from_str::<Value>(data.trim_start()).ok())
+    else {
+        return (event.to_vec(), None);
     };
-    let refund = payloads().find_map(|value| value.get("refund").cloned());
-    let misnames = payloads().any(|value| {
-        value
-            .get("model")
-            .and_then(Value::as_str)
-            .is_some_and(|model| model != canonical)
-    });
+    let refund = value.get("refund").cloned();
+    let misnames = value
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| model != canonical);
     if refund.is_none() && !misnames {
         return (event.to_vec(), None);
     }
+    if let Some(object) = value.as_object_mut() {
+        object.remove("refund");
+        if object.contains_key("model") {
+            object.insert("model".to_string(), Value::String(canonical.to_string()));
+        }
+    }
     // Rebuilt line by line with the terminator each line actually carried, so
-    // an event this app rewrites is framed the way the sender framed it.
+    // an event this app rewrites is framed the way the sender framed it. The
+    // rewritten value takes the place of the **first** data field and the rest
+    // are dropped: it is one value, and re-serialised JSON has no newline in it
+    // to split across fields again. Every other field keeps its place.
     let mut out = String::with_capacity(text.len());
+    let mut written = false;
     for (line, terminator) in &lines {
-        match line
-            .strip_prefix("data:")
-            .map(str::trim_start)
-            .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-        {
-            Some(mut value) if value.get("refund").is_some() || value.get("model").is_some() => {
-                if let Some(object) = value.as_object_mut() {
-                    object.remove("refund");
-                    if object.contains_key("model") {
-                        object.insert("model".to_string(), Value::String(canonical.to_string()));
-                    }
-                }
-                out.push_str("data: ");
-                out.push_str(&value.to_string());
+        if crate::sse_data_field(line).is_some() {
+            if written {
+                continue;
             }
-            _ => out.push_str(line),
+            written = true;
+            out.push_str("data: ");
+            out.push_str(&value.to_string());
+        } else {
+            out.push_str(line);
         }
         out.push_str(terminator);
     }
