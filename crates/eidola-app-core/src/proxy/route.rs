@@ -180,8 +180,17 @@ impl RecordedBody {
     /// **Neither transport has an unqualified `seal` to reach for**: an ending
     /// is not optional information about a body, and a blocking read has an
     /// ending of its own now that it is bounded — see [`RecordedBody::seal_blocking`].
-    fn seal_stream(self, delivery: StreamDelivery) -> Vec<u8> {
-        let mut out = seal_recorded_body(self.kept, self.received, RecordedSide::Response);
+    ///
+    /// `read_to_end` is whether the upstream read ran to the upstream's own
+    /// end — false where the caller's departure, a transport failure or an
+    /// oversized event stopped it — because only then is `received` the
+    /// response's size rather than how far this app got.
+    fn seal_stream(self, delivery: StreamDelivery, read_to_end: bool) -> Vec<u8> {
+        let mut out = seal_recorded_body(
+            self.kept,
+            self.received,
+            RecordedSide::Response { read_to_end },
+        );
         if let Some(note) = delivery.note() {
             out.extend_from_slice(note.as_bytes());
         }
@@ -208,7 +217,13 @@ impl RecordedBody {
     /// The bytes to record for a blocking answer, with the note when the
     /// ceiling — not the upstream — is why the read stopped.
     fn seal_blocking(self, read: BodyRead) -> Vec<u8> {
-        let mut out = seal_recorded_body(self.kept, self.received, RecordedSide::Response);
+        let mut out = seal_recorded_body(
+            self.kept,
+            self.received,
+            RecordedSide::Response {
+                read_to_end: read == BodyRead::Complete,
+            },
+        );
         if let Some(note) = read.note() {
             out.extend_from_slice(note.as_bytes());
         }
@@ -235,10 +250,13 @@ impl BodyRead {
     fn note(self) -> Option<String> {
         match self {
             BodyRead::Complete => None,
+            // **No claim about what is above**: the retention cap may have
+            // kept less than was read, and its own note says so. What this
+            // note knows is where reading stopped and what that cost.
             BodyRead::CeilingReached => Some(format!(
                 "\n\n[eidola: the read stopped at the {MAX_RESPONSE_BYTES}-byte ceiling this app \
-                 holds for one answer. What is above is everything this app received; the rest \
-                 was never read, and no answer was passed on.]\n"
+                 holds for one answer. Anything the upstream sent beyond it was never read, and \
+                 no answer was passed on.]\n"
             )),
         }
     }
@@ -334,10 +352,14 @@ impl StreamDelivery {
                 "\n\n[eidola: the caller disconnected before the end. The upstream response above \
                  was read in full and is not what was delivered.]\n",
             ),
+            // No cause is claimed for the read's end: a departure ends it on
+            // a route with nothing to settle, and a transport failure or an
+            // oversized event can end it while a drain was running — each
+            // with the same consequence, which is all this note states.
             StreamDelivery::CallerGoneReadEnded => Some(
-                "\n\n[eidola: the caller disconnected and the upstream read ended with it. The \
-                 response above stops where this app stopped reading, not where the upstream \
-                 stopped sending.]\n",
+                "\n\n[eidola: the caller disconnected, and the upstream read did not run to its \
+                 end. The response above stops where this app stopped reading, not where the \
+                 upstream stopped sending.]\n",
             ),
         }
     }
@@ -358,16 +380,22 @@ impl StreamDelivery {
 enum RecordedSide {
     /// A body this app constructed and sent upstream in one piece.
     Request,
-    /// A body an upstream sent to this app.
-    Response,
+    /// A body an upstream sent to this app. `read_to_end` is whether the read
+    /// ran to the upstream's own end — only then is the byte count read the
+    /// response's size; otherwise it is a lower bound, and the note says so.
+    Response { read_to_end: bool },
 }
 
 impl RecordedSide {
     fn cap_note(self, kept: usize, received: usize) -> String {
         match self {
+            // The size is known — this app built the body whole — but not
+            // whether it was sent: a row is also written for a request
+            // refused before sending or one whose send failed, and the row's
+            // status and error are what say which.
             RecordedSide::Request => format!(
                 "\n\n[eidola: this Record entry keeps the first {kept} bytes of a {received}-byte \
-                 request. The whole request was sent upstream; the rest was not retained.]\n"
+                 request. The rest was not retained.]\n"
             ),
             // Received, never "delivered": whether these bytes reached a caller
             // is not this note's to say. A caller can go while a billed stream
@@ -375,9 +403,18 @@ impl RecordedSide {
             // is forwarded, and a blocking answer can be refused outright — and
             // `StreamDelivery` / `BodyRead` are the notes that answer for each.
             // Claiming delivery here contradicted them on the same row.
-            RecordedSide::Response => format!(
+            RecordedSide::Response { read_to_end: true } => format!(
                 "\n\n[eidola: this Record entry keeps the first {kept} bytes of a {received}-byte \
                  response. The rest was received and not retained.]\n"
+            ),
+            // **A read this app stopped knows how far it got, not how large the
+            // response was** — `received` is a prefix, so naming it as the
+            // size would understate the body and contradict the ending's note
+            // on the same row. Stated as the lower bound it is.
+            RecordedSide::Response { read_to_end: false } => format!(
+                "\n\n[eidola: this Record entry keeps the first {kept} of the {received} bytes \
+                 this app read of the response before it stopped reading; the response was at \
+                 least that large. The rest of what was read was not retained.]\n"
             ),
         }
     }
@@ -800,15 +837,13 @@ impl Inner {
         // not do: `/v1/models` is a capability statement, and a model the proxy
         // will serve has to be in it.
         //
-        // **Ready, not merely present**: `reserve_engine` inserts the entry
-        // before the subprocess is up and `lease_engine` refuses it until it
-        // is, so listing a warming engine would be the same disagreement read
-        // the other way round.
-        let ready: Vec<local_models::RunningEngine> = self
-            .running_engines()
-            .into_iter()
-            .filter(|engine| engine.ready)
-            .collect();
+        // **And it lists exactly what the lease would take** — ready, not merely
+        // present (`reserve_engine` inserts the entry before the subprocess is
+        // up), and of the incarnation the row below was authorized as
+        // (`LocalRuntime::leasable_engines`, the lease's own predicate). A
+        // snapshot taken by backend id alone, before the authorizing read,
+        // published a retired incarnation's engine across a remove-and-re-add:
+        // a model in the listing that every request for it was refused.
         // The registry rows first — local reads, and what decides how each
         // backend is treated below.
         //
@@ -823,6 +858,9 @@ impl Inner {
         let mut plans = Vec::new();
         let conn = self.db_conn().await?;
         for backend_id in &settings.backends {
+            // Read **before** the row, as the resolve chapter reads it: the
+            // epoch must be no newer than the configuration it vouches for.
+            let epoch = self.local.backend_epoch(backend_id);
             let Some(row) = db::exposed_backend(&conn, backend_id).await? else {
                 continue;
             };
@@ -830,7 +868,7 @@ impl Inner {
                 .map(|kind| kind.is_engine_backed())
                 .unwrap_or(false);
             let loaded_only = offers_running_engines_only(settings.local_exposure, row.auto_start);
-            plans.push((row, engine_backed, loaded_only));
+            plans.push((row, engine_backed, loaded_only, epoch));
         }
         // The gap between the authorizing read and the scan it permits.
         #[cfg(feature = "test-support")]
@@ -849,7 +887,7 @@ impl Inner {
         //
         // [`MODEL_LIST_TIMEOUT`] is the per-backend bound; a timeout reads as
         // an unavailable backend, which is exactly what it is.
-        let scans = futures_util::future::join_all(plans.iter().map(|(row, _, _)| async {
+        let scans = futures_util::future::join_all(plans.iter().map(|(row, _, _, _)| async {
             tokio::time::timeout(model_list_timeout(), self.backend_models_for_row(row))
                 .await
                 .ok()
@@ -858,19 +896,20 @@ impl Inner {
         .await;
 
         let mut out = Vec::new();
-        for ((row, engine_backed, loaded_only), scanned) in plans.iter().zip(scans) {
+        for ((row, engine_backed, loaded_only, epoch), scanned) in plans.iter().zip(scans) {
             let (backend_id, engine_backed, loaded_only) = (&row.id, *engine_backed, *loaded_only);
             if engine_backed && loaded_only {
                 // The scan is the *decoration* here, not the membership: it
                 // supplies a context length and capabilities where it has
                 // them, and where it does not the engine still answers for
                 // itself. A scan that failed outright therefore blanks nothing.
-                for engine in ready.iter().filter(|e| &e.backend_id == backend_id) {
+                for (slug, context_tokens) in self.local.leasable_engines(backend_id, *epoch) {
+                    let id = local_models::engine_model_id(backend_id, &slug);
                     let decorated = scanned
                         .as_ref()
-                        .and_then(|models| models.iter().find(|m| m.id == engine.id))
+                        .and_then(|models| models.iter().find(|m| m.id == id))
                         .cloned();
-                    out.push(decorated.unwrap_or_else(|| engine_model_info(engine)));
+                    out.push(decorated.unwrap_or_else(|| engine_model_info(id, context_tokens)));
                 }
                 continue;
             }
@@ -985,7 +1024,30 @@ impl Inner {
                                 model: target.canonical.clone(),
                             });
                         }
-                        if target.kind == backends::BackendKind::LlamaCpp && !backend.auto_start {
+                        // **The backend's own permissions are read here too,
+                        // for the same reason.** The resolved row carries two
+                        // things: an *identity and configuration* (kind, URL,
+                        // key, models directory, engine path — carried, and
+                        // made safe to carry by the epoch) and *permissions*.
+                        // Of the permissions, `enabled` retires the backend's
+                        // engines and bumps its epoch, so the load and the
+                        // lease already refuse a withdrawn one; the proxy's
+                        // exposure of the backend and its `auto_start` move
+                        // nothing of the kind, so the row's copies were a stale
+                        // licence to start a subprocess. One read of the
+                        // exposed row answers both, at the decision.
+                        let starts_on_demand = {
+                            let conn = self.db_conn().await?;
+                            match db::exposed_backend(&conn, &backend.id).await? {
+                                None => {
+                                    return Err(AppError::ModelUnavailable {
+                                        model: target.canonical.clone(),
+                                    });
+                                }
+                                Some(current) => current.auto_start,
+                            }
+                        };
+                        if target.kind == backends::BackendKind::LlamaCpp && !starts_on_demand {
                             return Err(AppError::NotConfigured {
                                 message: format!(
                                     "`{}` is not loaded and backend `{}` has auto-start disabled",
@@ -2081,7 +2143,12 @@ impl Inner {
             &headers,
             &body,
             Some(status.as_u16()),
-            raw.seal_stream(stream_delivery(downstream_gone, read_ended_early)),
+            {
+                // The read reached the upstream's own end only if nothing
+                // stopped it — neither the caller's departure nor a failure.
+                let read_to_end = !read_ended_early && read_error.is_none();
+                raw.seal_stream(stream_delivery(downstream_gone, !read_to_end), read_to_end)
+            },
             read_error.as_ref().map(ToString::to_string),
             nonce,
             request_at,
@@ -2159,10 +2226,10 @@ impl Inner {
 /// plus the context length the engine was actually started with. Zero pricing
 /// is not a claim: an engine-backed model is free by construction, which is
 /// exactly what `plain_model_info` says for every other locally-served row.
-fn engine_model_info(engine: &local_models::RunningEngine) -> ModelInfo {
+fn engine_model_info(id: String, context_tokens: u32) -> ModelInfo {
     ModelInfo {
-        id: engine.id.clone(),
-        context_length: u64::from(engine.context_tokens),
+        id,
+        context_length: u64::from(context_tokens),
         max_output_tokens: None,
         output_budget_class: None,
         capabilities: Default::default(),
@@ -2822,7 +2889,7 @@ mod tests {
         let received = body.received;
         assert_eq!(received, 40 * chunk.len(), "and it counts what really came");
 
-        let sealed = body.seal_stream(StreamDelivery::Complete);
+        let sealed = body.seal_stream(StreamDelivery::Complete, true);
         let text = String::from_utf8_lossy(&sealed);
         assert!(
             text.contains(&format!("{received}-byte response")),
@@ -2903,6 +2970,23 @@ mod tests {
         assert!(
             row.contains("never read"),
             "and a read this app ended is not an upstream that finished"
+        );
+        // **And the row never names a prefix as the size.** The read stopped
+        // at the ceiling, so what it counted is how far it got: the cap's note
+        // states a lower bound, and nothing on the row says the response was
+        // that many bytes — or that everything above is all that was received.
+        assert!(
+            row.contains("at least that large"),
+            "the count is stated as the lower bound it is: {}",
+            &row[row.len().saturating_sub(600)..]
+        );
+        assert!(
+            !row.contains(&format!("{}-byte response", answer.received)),
+            "a prefix is not reported as the response's size"
+        );
+        assert!(
+            !row.contains("everything this app received"),
+            "and the ceiling's note claims nothing about what the cap kept"
         );
 
         // An ordinary answer is read whole and claims nothing.
@@ -3037,7 +3121,10 @@ mod tests {
 
 ",
             );
-            String::from_utf8(body.seal_stream(ending)).expect("utf-8")
+            String::from_utf8(
+                body.seal_stream(ending, ending != StreamDelivery::CallerGoneReadEnded),
+            )
+            .expect("utf-8")
         };
         assert_eq!(
             whole(StreamDelivery::Complete),
@@ -3058,12 +3145,19 @@ mod tests {
         // short carries both facts.
         let mut big = RecordedBody::default();
         big.push(&vec![b'x'; RECORD_BODY_MAX_BYTES + 4096]);
-        let sealed = String::from_utf8_lossy(&big.seal_stream(StreamDelivery::CallerGoneReadEnded))
-            .to_string();
+        let big_received = big.received;
+        let sealed =
+            String::from_utf8_lossy(&big.seal_stream(StreamDelivery::CallerGoneReadEnded, false))
+                .to_string();
         assert!(sealed.contains("keeps the first"), "the cap still speaks");
         assert!(
             sealed.contains("stops where this app stopped"),
             "and so does the ending"
+        );
+        assert!(
+            sealed.contains("at least that large")
+                && !sealed.contains(&format!("{big_received}-byte response")),
+            "a read that ended early states its count as a lower bound: {sealed}"
         );
 
         // **And the two never contradict each other.** The cap note claims
@@ -3074,7 +3168,7 @@ mod tests {
         let mut drained = RecordedBody::default();
         drained.push(&vec![b'x'; RECORD_BODY_MAX_BYTES + 4096]);
         let sealed =
-            String::from_utf8_lossy(&drained.seal_stream(StreamDelivery::CallerGoneReadOn))
+            String::from_utf8_lossy(&drained.seal_stream(StreamDelivery::CallerGoneReadOn, true))
                 .to_string();
         assert!(
             sealed.contains("was received and not retained"),

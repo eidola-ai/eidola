@@ -602,6 +602,34 @@ impl LocalRuntime {
         ))
     }
 
+    /// The engines [`Self::lease_authorized_engine`] would lease for this
+    /// backend's authorized incarnation — **the listing's question asked with
+    /// the lease's own predicate**, under the same lock, so nothing can be
+    /// advertised that the lease is certain to refuse.
+    ///
+    /// A ready engine under the backend's id is not evidence it is the exposed
+    /// backend's: a remove-and-re-add between the registry snapshot and the
+    /// authorizing read left the retired incarnation's engine in the map, and a
+    /// listing matching by id published its model while every request for it
+    /// was refused. `(slug, context_tokens)` per engine, sorted by slug.
+    pub(crate) fn leasable_engines(
+        &self,
+        backend_id: &str,
+        epoch: BackendEpoch,
+    ) -> Vec<(String, u32)> {
+        let engines = self.engines.lock().expect("engines lock");
+        if self.epoch_locked(backend_id) != epoch.0 {
+            return Vec::new();
+        }
+        let mut out: Vec<(String, u32)> = engines
+            .iter()
+            .filter(|((id, _), entry)| id == backend_id && entry.ready && entry.epoch == epoch.0)
+            .map(|((_, slug), entry)| (slug.clone(), entry.context_tokens))
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Whether an existing entry for `key` may be **joined** by a load acting
     /// for `epoch`: `Ok(true)` to join, `Ok(false)` when there is nothing to
     /// join, `Err` when the entry belongs to another incarnation of the backend

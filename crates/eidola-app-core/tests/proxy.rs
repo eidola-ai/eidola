@@ -2250,8 +2250,12 @@ fn an_enormous_prompt_is_recorded_as_the_truncation_it_is() {
         // sent, on the one trail whose value is that it describes itself.
         let tail = &text[text.len().saturating_sub(300)..];
         assert!(
-            tail.contains("-byte request") && tail.contains("sent upstream"),
+            tail.contains("-byte request"),
             "a truncated request says it is a request: {tail}"
+        );
+        assert!(
+            !tail.contains("sent upstream"),
+            "and claims no send — a row is also written for a request never sent: {tail}"
         );
         assert!(
             !tail.contains("response") && !tail.contains("delivered"),
@@ -2457,6 +2461,93 @@ fn a_local_exposure_withdrawn_mid_request_starts_no_engine() {
         );
         assert!(body.contains("model_not_found"), "{body}");
     });
+}
+
+/// REGRESSION: **a backend's auto-start is read where the engine would start,
+/// and so is its exposure.**
+///
+/// `auto_start` came from the row captured at resolution, and turning it off
+/// neither bumps the backend's epoch nor retires anything — so a request that
+/// had resolved before the reader withdrew it still started `llama-server`.
+/// The proxy's exposure of the backend is the same kind of permission and was
+/// carried the same way. Both are now one read at the start decision; the
+/// spawn counter says whether a subprocess was started at all.
+#[test]
+fn a_backend_permission_withdrawn_mid_request_starts_no_engine() {
+    for withdraw_exposure in [false, true] {
+        run(move || {
+            let (_mock, core, dir) = core_for(MockConfig::default());
+            let models = dir.path().join("models");
+            std::fs::create_dir_all(&models).expect("models dir");
+            std::fs::write(models.join("m.gguf"), b"gguf").expect("model file");
+            let engine = write_exiting_engine(dir.path());
+            let key = core.runtime().block_on(async {
+                core.update_proxy_settings(ProxySettingsUpdate {
+                    local_exposure: Some(eidola_app_core::proxy::LocalExposure::Downloaded),
+                    ..Default::default()
+                })
+                .await
+                .expect("open the permission");
+                core.add_backend(engine_backend("acme", &models, &engine))
+                    .await
+                    .expect("add");
+                core.set_proxy_backend_exposed("acme".to_string(), true)
+                    .await
+                    .expect("expose");
+                core.create_proxy_key("a tool".to_string())
+                    .await
+                    .expect("mint")
+                    .key
+            });
+            let core = Arc::new(core);
+            let runtime = core.runtime();
+
+            let mut window = core.test_open_proxy_authorized_window();
+            let asking = {
+                let core = Arc::clone(&core);
+                runtime.spawn(async move {
+                    exchange(
+                        &core,
+                        &post(
+                            "/v1/chat/completions",
+                            &key,
+                            r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
+                        ),
+                    )
+                    .await
+                })
+            };
+            let (status, body) = runtime.block_on(async {
+                // Past resolution: the row is in hand. Withdraw while the
+                // request waits between its authorization and the start.
+                let resume = window.recv().await.expect("the authorized request waits");
+                if withdraw_exposure {
+                    core.set_proxy_backend_exposed("acme".to_string(), false)
+                        .await
+                        .expect("withdraw the exposure");
+                } else {
+                    core.update_backend(
+                        "acme".to_string(),
+                        eidola_app_core::BackendUpdate {
+                            auto_start: Some(false),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("turn auto-start off");
+                }
+                let _ = resume.send(());
+                asking.await.expect("the request finishes")
+            });
+            assert!(status >= 400, "{status} {body}");
+            assert_eq!(
+                core.test_engine_spawn_count(),
+                0,
+                "no subprocess was started after the permission was withdrawn \
+                 (exposure withdrawn: {withdraw_exposure}): {status} {body}"
+            );
+        });
+    }
 }
 
 /// A `llama-server` stand-in that starts and exits at once: enough for the
@@ -2757,6 +2848,78 @@ fn a_backend_replaced_mid_listing_is_never_asked_for_its_catalog() {
             0,
             "a destination nobody exposed was never contacted"
         );
+    });
+}
+
+/// REGRESSION: **the listing offers only engines the lease would take.**
+///
+/// `/v1/models` matched a registry snapshot taken *before* its authorizing read
+/// to the authorized row by backend id alone, so a remove-and-re-add between
+/// the two published the retired incarnation's engine — a model in the
+/// capability statement that every request for it was refused. The listing now
+/// asks the lease's own predicate for the incarnation it authorized.
+#[test]
+fn a_retired_incarnations_engine_is_not_listed() {
+    run(|| {
+        let (mock, core, dir) = core_for(MockConfig::default());
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).expect("models dir");
+        let engine = write_exiting_engine(dir.path());
+        let key = core.runtime().block_on(async {
+            core.add_backend(engine_backend("acme", &models, &engine))
+                .await
+                .expect("add");
+            core.set_proxy_backend_exposed("acme".to_string(), true)
+                .await
+                .expect("expose");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        core.test_register_loaded_local_model("acme", "m", mock.port());
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        // Control: the authorized incarnation's ready engine is listed.
+        let (status, body) = runtime.block_on(exchange(&core, &get("/v1/models", Some(&key))));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("m@acme"), "a ready engine is offered: {body}");
+
+        let mut window = core.test_open_proxy_authorized_window();
+        let listing = {
+            let core = Arc::clone(&core);
+            let key = key.clone();
+            runtime.spawn(async move { exchange(&core, &get("/v1/models", Some(&key))).await })
+        };
+        let (status, body) = runtime.block_on(async {
+            let resume = window.recv().await.expect("the listing reaches its scan");
+            core.remove_backend("acme".to_string())
+                .await
+                .expect("remove");
+            core.add_backend(engine_backend("acme", &models, &engine))
+                .await
+                .expect("re-add under the same name");
+            let _ = resume.send(());
+            listing.await.expect("the listing finishes")
+        });
+        drop(window);
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !body.contains("m@acme"),
+            "a retired incarnation's engine is not offered: {body}"
+        );
+
+        // And what the listing withholds is what the proxy refuses.
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        ));
+        assert_eq!(status, 404, "{body}");
     });
 }
 
