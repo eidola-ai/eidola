@@ -25,10 +25,12 @@
 //! - **An API answer** (a model catalog, an account call) is refused. A
 //!   truncated JSON document is not a smaller answer, it is no answer, and the
 //!   caller has somewhere honest to put the failure.
-//! - **A proxied completion** keeps what it read, records it as the truncation
-//!   it is, and answers the caller a gateway failure — because the Record is
-//!   evidence a reader goes looking for, and a body that stopped at this app's
-//!   ceiling is a fact about the exchange rather than a reason to forget it.
+//! - **A completion** — proxied, or a chat turn's own — keeps what it read and
+//!   records it as the truncation it is, and the exchange fails: the proxy
+//!   answers its caller a gateway failure, the turn writes no answer. The
+//!   Record is evidence a reader goes looking for, and a body that stopped at
+//!   this app's ceiling is a fact about the exchange rather than a reason to
+//!   forget it.
 //!
 //! Both come out of [`read_bounded`]; only the ending differs.
 
@@ -44,6 +46,38 @@ use crate::error::AppError;
 /// than a size, generous enough that no honest server meets it and small enough
 /// that a dishonest one cannot spend this process's memory through it.
 pub(crate) const API_ANSWER_MAX_BYTES: usize = 2 << 20;
+
+/// The most of one **completion** this app will read at all — a blocking
+/// answer, or the whole of a stream.
+///
+/// **The retention cap's other half, and the one the process feels.**
+/// [`crate::recorded::RECORD_BODY_MAX_BYTES`] bounds what a `request` row
+/// keeps; it cannot bound what reading the answer costs, because a blocking
+/// transport buffers the whole body before anything can seal it, and a turn's
+/// stream accumulates the deltas it is assembling into an answer. A backend
+/// that answers without end — or an intermediary streaming an enormous error
+/// page — would otherwise cost this process the whole answer in memory.
+///
+/// Eight megabytes is far past any completion a model produces (a 128k-token
+/// answer is around half a megabyte, and a turn asks for at most 4096 tokens)
+/// and far short of a size worth holding. A body that reaches it is not an
+/// answer this app can use, so the read stops there and the exchange is
+/// recorded as the truncation it is.
+pub(crate) const MAX_RESPONSE_BYTES: usize = 8 << 20;
+
+/// The most one server-sent event may accumulate before it is refused.
+///
+/// **The frame accumulator's ceiling.** A stream's bytes go into a buffer and
+/// only come out when [`crate::find_event_boundary`] finds the blank line that
+/// ends an event, so a backend that sends one enormous event — or never sends a
+/// terminator at all — grows that buffer until the process is out of memory,
+/// with every other bound on the stream looking perfectly healthy.
+///
+/// A megabyte is orders of magnitude past any real event: a completion chunk is
+/// hundreds of bytes and the terminal metadata event carrying a refund is a few
+/// kilobytes. What passes it is not an event this app can use, so the stream
+/// ends and the Record says why.
+pub(crate) const MAX_SSE_EVENT_BYTES: usize = 1 << 20;
 
 /// One answer read from a peer, bounded.
 #[derive(Default)]

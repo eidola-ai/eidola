@@ -10,6 +10,7 @@ pub mod local_models;
 pub mod memory;
 mod peer_read;
 pub mod proxy;
+mod recorded;
 pub mod router;
 pub mod search;
 pub mod subspace_driver;
@@ -9105,6 +9106,29 @@ fn sse_event_data(event: &str) -> Option<String> {
         }
     }
     data
+}
+
+/// Whether a response's own headers say it is server-sent events.
+///
+/// The media type only — parameters (`; charset=utf-8`) are the sender's
+/// business — and an **absent** header answers `true`, which is the permissive
+/// half of the rule each streaming transport states at its shape check: the
+/// shapes it exists for (a JSON completion, an HTML error page) both name a
+/// content type, while a compliant SSE server always sets one.
+pub(crate) fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+    let Some(value) = headers.get(reqwest::header::CONTENT_TYPE) else {
+        return true;
+    };
+    value
+        .to_str()
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
+        .unwrap_or(false)
 }
 
 // ============================================================================
