@@ -2816,6 +2816,122 @@ fn a_backend_replaced_mid_request_never_gets_its_engine_started() {
     });
 }
 
+/// Stage the lease regressions: an exposed `llamacpp` backend authorizes a
+/// request, and while it waits past its authorization the backend is removed,
+/// re-added under the same name, and `replace` puts an engine for the same
+/// slug under the replacement. Returns what the caller saw, how long it took,
+/// and how many requests reached the replacement's engine.
+fn a_replacement_engine_under_the_same_slug(
+    replace: impl FnOnce(&AppCore, u16),
+) -> (u16, String, std::time::Duration, u64) {
+    let (mock, core, dir) = core_for(MockConfig {
+        chat: ChatBehavior::OkBlocking,
+        ..Default::default()
+    });
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(&models).expect("models dir");
+    std::fs::write(models.join("m.gguf"), b"gguf").expect("model file");
+    let engine = write_exiting_engine(dir.path());
+    let key = core.runtime().block_on(async {
+        core.update_proxy_settings(ProxySettingsUpdate {
+            local_exposure: Some(eidola_app_core::proxy::LocalExposure::Downloaded),
+            ..Default::default()
+        })
+        .await
+        .expect("open the permission");
+        core.add_backend(engine_backend("acme", &models, &engine))
+            .await
+            .expect("add");
+        core.set_proxy_backend_exposed("acme".to_string(), true)
+            .await
+            .expect("expose");
+        core.create_proxy_key("a tool".to_string())
+            .await
+            .expect("mint")
+            .key
+    });
+    // A join that waits must still end, so a hang reads as a failure.
+    core.test_set_engine_ready_timeout(std::time::Duration::from_secs(30));
+    let core = Arc::new(core);
+    let runtime = core.runtime();
+
+    let mut window = core.test_open_proxy_authorized_window();
+    let asking = {
+        let core = Arc::clone(&core);
+        runtime.spawn(async move {
+            exchange(
+                &core,
+                &post(
+                    "/v1/chat/completions",
+                    &key,
+                    r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
+                ),
+            )
+            .await
+        })
+    };
+    let started = std::time::Instant::now();
+    let (status, body) = runtime.block_on(async {
+        let resume = window.recv().await.expect("the authorized request waits");
+        core.remove_backend("acme".to_string())
+            .await
+            .expect("remove");
+        core.add_backend(engine_backend("acme", &models, &engine))
+            .await
+            .expect("re-add under the same name");
+        replace(&core, mock.port());
+        let _ = resume.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(10), asking)
+            .await
+            .expect("the request must end rather than wait on another incarnation's engine")
+            .expect("the request finishes")
+    });
+    (status, body, started.elapsed(), mock.chat_hits())
+}
+
+/// REGRESSION: **a ready engine is leased only to the incarnation that loaded
+/// it.**
+///
+/// The authorized row and its epoch reached the engine *start*, but the lease
+/// in front of it asked `(backend, slug)` alone — so a remove-and-re-add whose
+/// replacement had loaded the same slug left a ready engine under that key, and
+/// the request leased it: the prompt went to an engine belonging to a backend
+/// nobody exposed. "A leased engine is already running" was true; whose engine
+/// it was had not been asked.
+#[test]
+fn a_ready_engine_of_the_replacement_is_never_leased() {
+    run(|| {
+        let (status, body, _, hits) = a_replacement_engine_under_the_same_slug(|core, port| {
+            core.test_register_loaded_local_model("acme", "m", port);
+        });
+        assert_ne!(status, 200, "the request cannot be served: {body}");
+        assert_eq!(
+            hits, 0,
+            "no prompt reached the engine of a backend nobody exposed"
+        );
+    });
+}
+
+/// The warming-engine shortcut, held to the same rule: a load already in flight
+/// under this slug is joined only if it is the authorized incarnation's. A join
+/// by slug waited on the replacement's engine — here one that never becomes
+/// ready, so the uncured path is a wait the test bounds, and the cured path a
+/// refusal at once.
+#[test]
+fn a_warming_engine_of_the_replacement_is_never_joined() {
+    run(|| {
+        let (status, body, took, hits) = a_replacement_engine_under_the_same_slug(|core, port| {
+            core.test_register_warming_local_model("acme", "m", port);
+        });
+        assert_ne!(status, 200, "{body}");
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "refused at once rather than waiting on another incarnation's load: {took:?}"
+        );
+        assert_eq!(hits, 0);
+    });
+}
+
 /// REGRESSION: **the epoch that vouches for a request's configuration is read
 /// where that configuration was authorized.**
 ///

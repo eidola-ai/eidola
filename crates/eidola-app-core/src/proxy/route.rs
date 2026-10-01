@@ -931,7 +931,14 @@ impl Inner {
                 // be replaced before anything acts on it.
                 #[cfg(feature = "test-support")]
                 crate::subspace_driver::pause_in_window(&self.proxy_authorized_window).await;
-                let leased = self.local.lease_engine(&backend.id, &target.model);
+                // **Leased only from the incarnation this request was
+                // authorized against** (`lease_authorized_engine`). A ready
+                // engine under this slug is not evidence it is the exposed
+                // backend's: a remove-and-re-add that loads the same slug
+                // leaves the replacement's engine under this key.
+                let leased = self
+                    .local
+                    .lease_authorized_engine(&backend.id, &target.model, epoch);
                 let (engine_url, lease) = match leased {
                     Some((url, _ctx, lease)) => (url, lease),
                     None => {
@@ -972,7 +979,7 @@ impl Inner {
                         self.load_authorized_engine(backend, &target.model, epoch)
                             .await?;
                         self.local
-                            .lease_engine(&backend.id, &target.model)
+                            .lease_authorized_engine(&backend.id, &target.model, epoch)
                             .map(|(url, _ctx, lease)| (url, lease))
                             .ok_or_else(|| AppError::LocalModel {
                                 message: format!(

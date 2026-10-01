@@ -395,6 +395,13 @@ struct EngineEntry {
     /// Turns currently running against this engine. `Arc` so an
     /// [`EngineLease`]'s decrement survives the entry being removed.
     in_flight: Arc<AtomicU64>,
+    /// The backend's [`BackendEpoch`] when this entry was reserved — **which
+    /// incarnation of the backend this engine belongs to**. A slug is not an
+    /// identity: a remove-and-re-add can load the same slug again under the
+    /// same backend id, and only this tells the replacement's engine from the
+    /// one a caller was authorized against. See
+    /// [`LocalRuntime::lease_authorized_engine`].
+    epoch: u64,
 }
 
 /// An in-flight-turn hold on an engine: taken when a turn routes to it,
@@ -556,6 +563,64 @@ impl LocalRuntime {
         ))
     }
 
+    /// Lease a ready engine **only if it belongs to the incarnation the caller
+    /// was authorized against** — the epoch read beside the authorized row,
+    /// compared with the one the entry was reserved under, inside the same
+    /// critical section a retirement's sweep takes.
+    ///
+    /// [`Self::lease_engine`] answers by `(backend, slug)` alone, which is right
+    /// for a caller that resolved the backend a moment ago and wrong for one
+    /// that authorized it earlier: a remove-and-re-add in between, followed by
+    /// the replacement loading the same slug, leaves a ready engine under that
+    /// key that belongs to a backend nobody exposed — and a by-slug lease hands
+    /// it the prompt. "A leased engine is already running" is true and is not
+    /// the question; *whose* engine it is, is. `None` for absent, warming, or
+    /// another incarnation's — the caller's start path then refuses the last of
+    /// those itself ([`Self::engine_joinable`]).
+    pub(crate) fn lease_authorized_engine(
+        &self,
+        backend_id: &str,
+        slug: &str,
+        epoch: BackendEpoch,
+    ) -> Option<(String, u32, EngineLease)> {
+        let mut engines = self.engines.lock().expect("engines lock");
+        if self.epoch_locked(backend_id) != epoch.0 {
+            return None;
+        }
+        let entry = engines.get_mut(&(backend_id.to_string(), slug.to_string()))?;
+        if !entry.ready || entry.epoch != epoch.0 {
+            return None;
+        }
+        entry.last_used_ms = crate::now_ms();
+        entry.in_flight.fetch_add(1, Ordering::SeqCst);
+        Some((
+            format!("http://127.0.0.1:{}", entry.port),
+            entry.context_tokens,
+            EngineLease {
+                in_flight: entry.in_flight.clone(),
+            },
+        ))
+    }
+
+    /// Whether an existing entry for `key` may be **joined** by a load acting
+    /// for `epoch`: `Ok(true)` to join, `Ok(false)` when there is nothing to
+    /// join, `Err` when the entry belongs to another incarnation of the backend
+    /// (or the authorized one has been retired since). Asked under the engines
+    /// lock, for the warming-engine shortcut's sake — joining a load by slug
+    /// would wait on the replacement's engine and then serve from it.
+    fn engine_joinable(&self, key: &EngineKey, epoch: BackendEpoch) -> Result<bool, String> {
+        let engines = self.engines.lock().expect("engines lock");
+        let current = self.epoch_locked(&key.0);
+        match engines.get(key) {
+            None if current == epoch.0 => Ok(false),
+            Some(entry) if current == epoch.0 && entry.epoch == epoch.0 => Ok(true),
+            _ => Err(format!(
+                "backend `{}` changed while the model was loading — try again",
+                key.0
+            )),
+        }
+    }
+
     /// This backend's current epoch. Caller must hold the `engines` lock.
     fn epoch_locked(&self, backend_id: &str) -> u64 {
         *self
@@ -643,6 +708,7 @@ impl LocalRuntime {
                 pinned: false,
                 last_used_ms: crate::now_ms(),
                 in_flight: Arc::new(AtomicU64::new(0)),
+                epoch: epoch.0,
             },
         );
         Ok(Some((instance, victims)))
@@ -932,19 +998,64 @@ impl LocalRuntime {
         pinned: bool,
         last_used_ms: i64,
     ) {
+        self.insert_engine_for_test(
+            backend_id,
+            slug,
+            port,
+            footprint,
+            pinned,
+            last_used_ms,
+            true,
+        );
+    }
+
+    /// Test seam: an engine that is **still warming** — present in the
+    /// registry, not yet leasable. What a load in flight looks like to another
+    /// caller.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub(crate) fn register_warming_for_test(&self, backend_id: &str, slug: &str, port: u16) {
+        self.insert_engine_for_test(
+            backend_id,
+            slug,
+            port,
+            ENGINE_OVERHEAD_BYTES,
+            false,
+            0,
+            false,
+        );
+    }
+
+    /// Every test registration belongs to the backend's **current**
+    /// incarnation, exactly as a real reservation does.
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_engine_for_test(
+        &self,
+        backend_id: &str,
+        slug: &str,
+        port: u16,
+        footprint: u64,
+        pinned: bool,
+        last_used_ms: i64,
+        ready: bool,
+    ) {
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        self.engines.lock().expect("engines lock").insert(
+        let mut engines = self.engines.lock().expect("engines lock");
+        let epoch = self.epoch_locked(backend_id);
+        engines.insert(
             (backend_id.to_string(), slug.to_string()),
             EngineEntry {
                 instance: EngineInstance::next(),
                 port,
                 context_tokens: LOCAL_CONTEXT_TOKENS,
-                ready: true,
+                ready,
                 shutdown: tx,
                 footprint,
                 pinned,
                 last_used_ms,
                 in_flight: Arc::new(AtomicU64::new(0)),
+                epoch,
             },
         );
     }
@@ -2044,8 +2155,16 @@ impl Inner {
         let slug = slug.to_string();
         let cfg = self.load_config();
 
-        // Already present: ready → done; warming → join the in-flight load.
-        if self.local.engine_present(&key) {
+        // Already present: ready → done; warming → join the in-flight load —
+        // **but only a load of the incarnation this caller acts for**
+        // (`engine_joinable`). Joining by slug alone would wait on, and then
+        // report ready, an engine a remove-and-re-add put under this key for a
+        // backend nobody authorized.
+        if self
+            .local
+            .engine_joinable(&key, epoch)
+            .map_err(|message| AppError::LocalModel { message })?
+        {
             if self.local.ready_engine(&backend_id, &slug).is_some() {
                 return Ok(());
             }

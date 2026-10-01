@@ -10648,6 +10648,17 @@ impl AppCore {
         self.inner.local.register_for_test(backend_id, slug, port);
     }
 
+    /// Test-only seam: register an engine that is **still warming** for
+    /// `backend_id`'s current incarnation — a load in flight, as another
+    /// caller would find it.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_register_warming_local_model(&self, backend_id: &str, slug: &str, port: u16) {
+        self.inner
+            .local
+            .register_warming_for_test(backend_id, slug, port);
+    }
+
     /// Test-only seam: register a fake ready engine with explicit
     /// footprint / pin / LRU timestamp — the eviction tests' fixture.
     #[doc(hidden)]
