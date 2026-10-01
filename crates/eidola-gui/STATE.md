@@ -50,6 +50,7 @@ One gpui entity per domain, created at startup, held by `AppGlobal`, observed by
 | `SpacesStore` | the Library index **and** the space-entity registry (below); creating a new space | Also owns rename/archive — the space inspector's title row writes through it; both edit the cached row optimistically and compose `write; re-list` in a **per-space** mutation slot, so a refusal stands in that space's `op_error` (`None` keys a create) and the index reconciles on every exit |
 | `SpaceSettingsStore` | per-space settings (cascade limit, router model) | Keyed per space; refreshed on `Change::Space` for **cached** spaces only (every post emits it); write-through with the ordered refresh/mutation slot split, each setter advancing the cached snapshot as its write leaves |
 | `UpdateStore` | `UpdateCheckSnapshot`, polling, accept-claims | Mostly exists already; the pattern to which everything else converges |
+| `ProxyStore` | the local inference proxy's stored configuration **and** its listener | Refreshed on `Proxy`, and the refresh is what reconciles the socket with the settings; writes take the keyed, chained shape (see `crates/eidola-gui/AGENTS.md` → Stores) |
 
 Store method shape (the only sanctioned async idiom):
 
@@ -141,6 +142,9 @@ pub enum Change {
     UpdateState,
     LocalModels,        // local model downloads / engine lifecycle
     Backends,           // the backend registry (add/update/enable/remove)
+    Participants,       // a space's membership / participant config
+    Templates,          // the space-template registry
+    Proxy,              // the local proxy's settings, exposed backends, keys
 }
 ```
 
@@ -169,6 +173,7 @@ Any list that can exceed roughly one screen renders through gpui's virtualized p
 | Library index | global | `SpacesStore` |
 | Transcript, streaming turns (keyed fan-out), submit, failed-turn record | per-space, shared | `Space` entity (registry) |
 | Update check state | global | `UpdateStore` |
+| Local inference proxy (settings, exposed backends, keys, listener) | global | `ProxyStore` |
 | Record listings, cursors, detail | per-window | reader entity |
 | Checkout balance poll | per-window task | initiating view (dies with window; outcome lands in `AccountStore` via the bus) |
 | Per-space settings (cascade limit, router model) | global, keyed per space | `SpaceSettingsStore` |
