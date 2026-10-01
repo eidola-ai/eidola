@@ -2359,7 +2359,7 @@ fn a_backend_replaced_mid_request_never_gets_its_engine_started() {
         let core = Arc::new(core);
         let runtime = core.runtime();
 
-        let mut window = core.test_open_proxy_resolve_window();
+        let mut window = core.test_open_proxy_engine_window();
         let asking = {
             let core = Arc::clone(&core);
             runtime.spawn(async move {
@@ -2376,7 +2376,10 @@ fn a_backend_replaced_mid_request_never_gets_its_engine_started() {
         };
 
         let (status, body) = runtime.block_on(async {
-            let resume = window.recv().await.expect("the request reaches the window");
+            let resume = window
+                .recv()
+                .await
+                .expect("the authorized request reaches the engine start");
             core.remove_backend("acme".to_string())
                 .await
                 .expect("remove");
@@ -2445,7 +2448,7 @@ fn an_authorized_incarnation_retired_mid_request_starts_nothing() {
         let core = Arc::new(core);
         let runtime = core.runtime();
 
-        let mut window = core.test_open_proxy_resolve_window();
+        let mut window = core.test_open_proxy_engine_window();
         let asking = {
             let core = Arc::clone(&core);
             runtime.spawn(async move {
@@ -2462,7 +2465,10 @@ fn an_authorized_incarnation_retired_mid_request_starts_nothing() {
         };
 
         let (status, body) = runtime.block_on(async {
-            let resume = window.recv().await.expect("the request reaches the window");
+            let resume = window
+                .recv()
+                .await
+                .expect("the authorized request reaches the engine start");
             core.remove_backend("acme".to_string())
                 .await
                 .expect("remove");
