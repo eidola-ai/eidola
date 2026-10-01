@@ -349,15 +349,16 @@ impl StreamDelivery {
 /// value is that it describes itself.** One wording for both columns had the
 /// `request_body` column saying it kept part of a "response" whose remainder
 /// "was delivered" — response words, on the bytes this app *sent*, so a reader
-/// looking at a truncated exchange could not tell which half was cut. And the
-/// two sides are not truncated for the same reason: a response's remainder went
-/// downstream to the caller, while a request's remainder went **upstream** —
-/// the prompt travels whole, and only the retention is bounded.
+/// looking at a truncated exchange could not tell which half was cut. And each
+/// side's note says exactly what it knows: a request's remainder **went
+/// upstream** — the prompt travels whole, and only the retention is bounded —
+/// while a response's remainder was **received**, and whether it then reached a
+/// caller is the ending's to say (`StreamDelivery`, `BodyRead`), not this note's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecordedSide {
     /// A body this app constructed and sent upstream in one piece.
     Request,
-    /// A body an upstream sent, whose kept prefix is what a caller received.
+    /// A body an upstream sent to this app.
     Response,
 }
 
@@ -368,9 +369,15 @@ impl RecordedSide {
                 "\n\n[eidola: this Record entry keeps the first {kept} bytes of a {received}-byte \
                  request. The whole request was sent upstream; the rest was not retained.]\n"
             ),
+            // Received, never "delivered": whether these bytes reached a caller
+            // is not this note's to say. A caller can go while a billed stream
+            // drains on for its refund, an oversized event is refused before it
+            // is forwarded, and a blocking answer can be refused outright — and
+            // `StreamDelivery` / `BodyRead` are the notes that answer for each.
+            // Claiming delivery here contradicted them on the same row.
             RecordedSide::Response => format!(
                 "\n\n[eidola: this Record entry keeps the first {kept} bytes of a {received}-byte \
-                 response. The rest was delivered and not retained.]\n"
+                 response. The rest was received and not retained.]\n"
             ),
         }
     }
@@ -614,13 +621,20 @@ impl ProxyChatRequest {
         Ok(ProxyChatRequest {
             model,
             messages,
+            // `max_tokens` is the older spelling half the ecosystem still sends.
+            // Reading it is not a second construction — it lands in the one
+            // field the outer shape carries.
+            //
+            // **Each spelling is converted before the fallback is taken**, so a
+            // field that is present but not a number — `null` above all, which
+            // SDKs emit for "unset" — reads as absent. Falling back on the *raw*
+            // value instead let `"max_completion_tokens": null` win the `or`,
+            // turn into `None`, and discard the caller's own `max_tokens` cap for
+            // the 4096 default: more output produced, and billed, than asked for.
             max_completion_tokens: object
                 .get("max_completion_tokens")
-                // `max_tokens` is the older spelling half the ecosystem still
-                // sends. Reading it is not a second construction — it lands in
-                // the one field the outer shape carries.
-                .or_else(|| object.get("max_tokens"))
                 .and_then(Value::as_u64)
+                .or_else(|| object.get("max_tokens").and_then(Value::as_u64))
                 .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
             temperature: object.get("temperature").cloned(),
             top_p: object.get("top_p").cloned(),
@@ -2949,6 +2963,73 @@ mod tests {
         assert!(
             sealed.contains("stops where this app stopped"),
             "and so does the ending"
+        );
+
+        // **And the two never contradict each other.** The cap note claims
+        // only what the cap knows — the rest was received — so a row whose
+        // ending says the caller went away is not also told the bytes reached
+        // them. The caller-gone-but-read-on ending is the sharpest case: the
+        // refund's drain is exactly a read past a caller who has gone.
+        let mut drained = RecordedBody::default();
+        drained.push(&vec![b'x'; RECORD_BODY_MAX_BYTES + 4096]);
+        let sealed =
+            String::from_utf8_lossy(&drained.seal_stream(StreamDelivery::CallerGoneReadOn))
+                .to_string();
+        assert!(
+            sealed.contains("was received and not retained"),
+            "the cap says what it knows: {sealed}"
+        );
+        assert!(
+            !sealed.contains("delivered and not retained"),
+            "and never that bytes the ending says nobody received were delivered: {sealed}"
+        );
+    }
+
+    /// **`null` is not a cap, so the legacy spelling still counts.** SDKs emit
+    /// `null` for an unset field; reading it as present discarded the caller's
+    /// `max_tokens` for the 4096 default — more output, and more billed, than
+    /// asked for. Each spelling is converted before the fallback is taken.
+    #[test]
+    fn a_null_completion_cap_falls_back_to_the_legacy_one() {
+        let cap = |body: Value| {
+            ProxyChatRequest::from_json(&body)
+                .expect("read")
+                .max_completion_tokens
+        };
+        let base = |extra: Value| {
+            let mut body = serde_json::json!({"model": "m", "messages": []});
+            body.as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            body
+        };
+        assert_eq!(
+            cap(base(
+                serde_json::json!({"max_completion_tokens": null, "max_tokens": 128})
+            )),
+            Some(128),
+            "null first, the legacy cap behind it"
+        );
+        assert_eq!(
+            cap(base(
+                serde_json::json!({"max_tokens": null, "max_completion_tokens": 64})
+            )),
+            Some(64),
+            "the current spelling wins wherever it is a number"
+        );
+        assert_eq!(
+            cap(base(
+                serde_json::json!({"max_completion_tokens": 64, "max_tokens": 128})
+            )),
+            Some(64),
+            "and outranks the legacy one when both are set"
+        );
+        assert_eq!(
+            cap(base(
+                serde_json::json!({"max_completion_tokens": null, "max_tokens": null})
+            )),
+            None,
+            "both null is no cap at all, so the budget's default applies"
         );
     }
 
