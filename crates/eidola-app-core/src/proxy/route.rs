@@ -982,6 +982,12 @@ impl Inner {
                             })?
                     }
                 };
+                // The engine's address is a port this process picked, and the
+                // next start will pick another: only a row written now can say
+                // where this prompt went. See `record_plain_connection`.
+                let connection_id = self
+                    .record_plain_connection(&backend.id, &engine_url, now)
+                    .await?;
                 Ok(ProxyRoute {
                     // Not `plain_client`: its builder adds a `User-Agent`, which
                     // would travel outside the enumerated header set the Record
@@ -993,7 +999,7 @@ impl Inner {
                     backend_id: backend.id.clone(),
                     pricing: None,
                     external_auth: None,
-                    connection_id: None,
+                    connection_id: Some(connection_id),
                     attestations: None,
                     declared_max_output: None,
                     engine_lease: Some(lease),
@@ -1006,6 +1012,9 @@ impl Inner {
                     .ok_or_else(|| AppError::NotConfigured {
                         message: format!("backend `{}` has no base URL", backend.id),
                     })?;
+                let connection_id = self
+                    .record_plain_connection(&backend.id, &base_url, now)
+                    .await?;
                 Ok(ProxyRoute {
                     // Not `plain_client`: its builder adds a `User-Agent`, which
                     // would travel outside the enumerated header set the Record
@@ -1017,7 +1026,7 @@ impl Inner {
                     backend_id: backend.id.clone(),
                     pricing: None,
                     external_auth: backend.api_key.as_ref().map(|k| format!("Bearer {k}")),
-                    connection_id: None,
+                    connection_id: Some(connection_id),
                     attestations: None,
                     declared_max_output: None,
                     engine_lease: None,
@@ -1122,6 +1131,45 @@ impl Inner {
                 })
             }
         }
+    }
+
+    /// Record the destination of a route **no enclave vouches for**: a
+    /// `connection` row with the URL this request is about to be sent to, and
+    /// no attestation.
+    ///
+    /// **The Record's question is where the prompt went, and it has to be
+    /// answerable after every mutation.** An attested route answers it through
+    /// the `connection` row its handshake writes; a plain route wrote none, so
+    /// the request row's only path to a URL was its `backend_id` — a foreign
+    /// key to a row the reader can edit, or remove and re-add with a different
+    /// URL under the same name, and an engine's address is a port that changes
+    /// on every start. After any of those, the trail could no longer say where
+    /// an earlier prompt left the machine, which is the question it exists to
+    /// answer. The schema already admits the honest shape — `attestation_hash`
+    /// is nullable and `clearnet` is the transport a plain HTTP connection is —
+    /// so nothing is claimed that did not happen: a row with no attestation is
+    /// a statement that nothing was verified.
+    async fn record_plain_connection(
+        &self,
+        backend_id: &str,
+        base_url: &str,
+        now: i64,
+    ) -> Result<String, AppError> {
+        let conn = self.db_conn().await?;
+        let provider_id = db::ensure_provider(&conn, backend_id, "inference", now).await?;
+        let id = Uuid::now_v7().to_string();
+        db::insert_connection(
+            &conn,
+            &id,
+            &provider_id,
+            base_url,
+            "clearnet",
+            None,
+            now,
+            now,
+        )
+        .await?;
+        Ok(id)
     }
 
     /// The completion ceiling this request asks for.

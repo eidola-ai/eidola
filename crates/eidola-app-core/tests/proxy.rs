@@ -2582,6 +2582,93 @@ fn a_backend_replaced_mid_listing_is_never_asked_for_its_catalog() {
     });
 }
 
+/// REGRESSION: **the Record says where a plain route's prompt went, after
+/// anything is done to the backend that sent it.**
+///
+/// An attested route answers "where did this go?" through the connection row
+/// its handshake writes. An external or engine route wrote none, so the request
+/// row's only path to a URL was its `backend_id` — a key to a row the reader
+/// can edit or replace under the same name — and the trail lost the answer the
+/// moment that happened. The row is now written as the route opens: the URL,
+/// `clearnet`, and no attestation, which is the truthful statement that nothing
+/// was verified.
+#[test]
+fn a_plain_routes_destination_survives_the_backend_being_replaced() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            ..Default::default()
+        });
+        let external = |url: &str| eidola_app_core::NewBackend {
+            id: "acme".into(),
+            kind: eidola_app_core::BackendKind::OpenAi,
+            display_name: "Acme".into(),
+            base_url: Some(url.into()),
+            api_key: None,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+        };
+        let key = core.runtime().block_on(async {
+            core.add_backend(external(&mock.base_url))
+                .await
+                .expect("add");
+            core.set_proxy_backend_exposed("acme".to_string(), true)
+                .await
+                .expect("expose");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        ));
+        assert_eq!(status, 200, "{body}");
+
+        // The reader replaces the backend under the same name.
+        runtime.block_on(async {
+            core.remove_backend("acme".to_string())
+                .await
+                .expect("remove");
+            core.add_backend(external("https://somewhere-else.example"))
+                .await
+                .expect("re-add");
+        });
+
+        let id = runtime
+            .block_on(core.list_requests(20, 0))
+            .expect("record")
+            .into_iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is recorded")
+            .id;
+        let detail = runtime
+            .block_on(core.request_detail(id))
+            .expect("detail")
+            .expect("a recorded row");
+        assert_eq!(
+            detail.base_url.as_deref(),
+            Some(mock.base_url.as_str()),
+            "the Record still says where the prompt went"
+        );
+        assert_eq!(detail.transport.as_deref(), Some("clearnet"));
+        assert_eq!(
+            detail.attestation_hash, None,
+            "and claims no verification that never happened"
+        );
+    });
+}
+
 /// REGRESSION: **the incarnation a request was authorized against is the one
 /// whose engine may start.**
 ///
