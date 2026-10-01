@@ -222,6 +222,65 @@ pub fn is_tab_stop(role: Role) -> bool {
     )
 }
 
+thread_local! {
+    /// Whether the elements being built right now sit **behind** a surface that
+    /// covers them. See [`Covered`].
+    static COVERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a control built at this moment should be left out of the tab order —
+/// read by `probe`, which is where a role becomes a stop.
+pub fn tab_stops_suppressed() -> bool {
+    COVERED.with(|c| c.get())
+}
+
+/// **A surface that covers the window takes the tab order with it.**
+///
+/// gpui builds the frame's tab order from what *painted*, and painting on top
+/// takes nothing away: a full-window overlay leaves every control beneath it
+/// mounted and reachable, so Tab walks out of the visible surface into
+/// affordances the reader cannot see and Enter activates one. `Overlay`
+/// containment answers the mouse and `transient_overlay_open` answers the
+/// *root's* key handler, but neither touches traversal, and a covered control
+/// runs its own listeners once focus reaches it.
+///
+/// The cure is gpui's own bit rather than a second focus system: while one of
+/// these guards stands, `probe` derives **no tab stop** from a role, so a
+/// covered subtree contributes nothing to the frame's tab map — the same
+/// `tab_stop(false)` a disabled control takes, applied at the one place a role
+/// becomes a stop rather than at every site. Nothing else changes: the roles,
+/// the labels and `focusable()` all stay, so the covered content is still
+/// readable to assistive technology and still focusable programmatically.
+///
+/// **It is a render-time scope, so it covers what is *built* inside it.** A
+/// child produced later — a `uniform_list`'s item closure, which runs at
+/// prepaint — escapes, and so does a **tracked** focus handle, whose own
+/// `tab_stop` gpui reads instead of the element's. Both are true of the covered
+/// content today: its lists are `probe_delegating` rows (no stops of their own)
+/// and its tracked handles are containers rather than controls.
+///
+/// Restores the previous value on drop, so a surface that covers content inside
+/// another one nests, and a panic mid-render cannot leave the flag set.
+pub struct Covered {
+    previous: bool,
+}
+
+impl Covered {
+    /// Suppress tab stops while this guard lives, when `covered` is true.
+    /// Passing `false` **un**-covers: the surface doing the covering builds its
+    /// own controls inside one of these, which is what keeps them reachable.
+    pub fn new(covered: bool) -> Self {
+        let previous = COVERED.with(|c| c.replace(covered));
+        Self { previous }
+    }
+}
+
+impl Drop for Covered {
+    fn drop(&mut self) {
+        COVERED.with(|c| c.set(self.previous));
+    }
+}
+
 /// Whether a role names an element that can hold focus at all — every tab
 /// stop, plus the post article, which the space tree's arrow keys focus
 /// directly.

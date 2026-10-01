@@ -45,3 +45,34 @@ find-branch-count = { $count } more in this branch
 # nothing placing them in one breath. The unqualified line above stays for a
 # query nothing anywhere matches.
 find-no-results-in-branch = None on this branch
+# --- The Find-all overlay (src/space_view/find_overlay.rs) -------------------
+# The disclosure beside the cross-branch total. Its name says what the click
+# does, in both directions, because the chevron alone says nothing to a screen
+# reader — and the total beside it already speaks the number, so this does not.
+find-show-all = Show every result
+find-hide-all = Hide every result
+# The overlay's landmark name. It is the whole of what the window shows while
+# it stands, so it is named for what it holds rather than for the bar it came
+# from.
+find-overlay-label = Every result
+# The topological map down the overlay's left: the whole conversation's shape,
+# one circle per post, with no regard to how long any of them is. Deliberately
+# a different surface from the minimap, which is the scroll handle.
+find-map-label = Conversation map
+# A map node, labelled by who wrote the post and whether it holds matches —
+# never by how many, because the map carries no counts.
+find-map-node = { $byline }
+find-map-node-matches = { $byline } — has matches
+# The results column beside the map.
+find-results-label = Results
+# A result whose text is a draft the reader has written but not posted. It has
+# no byline row of its own, so the overlay names it for what it is.
+find-result-draft = Draft
+# The overlay with nothing to show. Reachable only when the query stops
+# matching while the surface is open, since the disclosure that opens it
+# appears with the total.
+find-overlay-empty = Nothing matches anywhere in this conversation
+# A result row, spoken as who wrote it and the opening of what it says.
+# Joined here rather than in code so the punctuation and the order are the
+# translation's to choose.
+find-result-name = { $byline }: { $snippet }

@@ -250,7 +250,12 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         // ring and the activation.
         if derive_focus && crate::focus::is_focusable(role) {
             this = this.focusable();
-            if crate::focus::is_tab_stop(role) {
+            // **A covered control is not a tab stop** ([`crate::focus::Covered`]):
+            // painting a surface over the window takes nothing out of the tab
+            // order, so without this Tab walks off the visible surface into
+            // affordances the reader cannot see. The role, the label and
+            // focusability all stay — only the stop goes.
+            if crate::focus::is_tab_stop(role) && !crate::focus::tab_stops_suppressed() {
                 this = this.tab_index(0);
                 let shadows = crate::focus::ring_shadows(crate::focus::ring_colors());
                 this = this.focus_visible(move |s| s.shadow(shadows));
