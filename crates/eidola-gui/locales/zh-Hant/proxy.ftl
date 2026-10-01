@@ -1,6 +1,6 @@
 # 設定 ▸ 代理 —— 本機推論代理（src/proxy_settings.rs），繁體中文。
 
-proxy-lead = 讓這台電腦上的其他工具使用你透過 Eidola 取用的模型。它們說 OpenAI API，送出的每個請求都會寫入記錄。其餘取決於請求前往何處：Eidola 託管服務經過證明，由你的錢包付費；裝置端模型在這台電腦上執行，不產生費用；你自己新增的伺服器會被直接存取，沒有證明，適用該伺服器自己的條款。
+proxy-lead = 讓這台電腦上的其他工具使用你透過 Eidola 取用的模型。它們說 OpenAI API，它們請求的每次補全都會寫入記錄。其餘取決於請求前往何處：Eidola 託管服務經過證明，由你的錢包付費；裝置端模型在這台電腦上執行，不產生費用；你自己新增的伺服器會被直接存取，沒有證明，適用該伺服器自己的條款。
 
 proxy-serve = 處理請求
 proxy-serve-name = 透過 Eidola 處理本機請求
@@ -19,7 +19,7 @@ proxy-binding-save = 儲存
 proxy-binding-cancel = 取消
 
 proxy-backends = 後端
-proxy-backends-note = 只有你在這裡勾選的才可存取。工具指定其他任何內容都會被告知該模型不存在。
+proxy-backends-note = 只有你在這裡勾選的才可存取。工具指定其他任何內容都會被告知該模型不存在。請求模型清單不會寫入記錄；對於你自己新增的伺服器，它會用該伺服器的金鑰向其索取模型目錄。
 proxy-backend-name = 透過代理提供 { $backend }
 proxy-backends-empty = 尚未設定任何後端。
 

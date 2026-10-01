@@ -2745,6 +2745,32 @@ fn an_engine_routes_destination_is_recorded() {
     });
 }
 
+/// **A model listing writes no Record row — and the pane says so.**
+///
+/// A pin rather than a regression: the Proxy pane's copy claims the Record for
+/// *completions* and tells the reader, beside the backend list, that a listing
+/// is not recorded (and that for a server they added it fetches that server's
+/// catalog with its key). That sentence is only true while this is, so a change
+/// that starts recording listings fails here and has to move the copy with it.
+#[test]
+fn a_model_listing_writes_no_record_row() {
+    run(|| {
+        let (_mock, core, _dir) = core_for(MockConfig::default());
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(&core, &get("/v1/models", Some(&key))));
+        assert_eq!(status, 200, "{body}");
+        let requests = runtime.block_on(core.list_requests(20, 0)).expect("record");
+        assert!(
+            requests.iter().all(|r| !r.path.contains("models")),
+            "a listing leaves no request row: {:?}",
+            requests.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+    });
+}
+
 /// REGRESSION: **the incarnation a request was authorized against is the one
 /// whose engine may start.**
 ///

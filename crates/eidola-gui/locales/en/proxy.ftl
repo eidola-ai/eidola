@@ -9,11 +9,14 @@
 # beside the other five, and it is also what the nav row's probe name derives
 # from — and a probe name is a stable selector that must never localize.
 
-# What the pane is for, above everything else on it. Attestation and wallet
+# What the pane is for, above everything else on it. The Record claim is
+# about completions, deliberately: a model listing writes no row (nor does the
+# app's own model picker), so the backends note below says so where the reader
+# chooses which servers a tool may list. Attestation and wallet
 # payment belong to the hosted Eidola route alone; an on-device model and an
 # external server get neither, so the sentence says which is which rather
 # than lending every route the hosted one's properties.
-proxy-lead = Let other tools on this computer use the models you reach through Eidola. They speak the OpenAI API, and every request they send is written into the Record. What else a request gets depends on where it goes: the hosted Eidola service is attested and paid for from your wallet; an on-device model runs on this computer and costs nothing; a server you added yourself is reached directly, with no attestation, on that server's own terms.
+proxy-lead = Let other tools on this computer use the models you reach through Eidola. They speak the OpenAI API, and every completion they ask for is written into the Record. What else a completion gets depends on where it goes: the hosted Eidola service is attested and paid for from your wallet; an on-device model runs on this computer and costs nothing; a server you added yourself is reached directly, with no attestation, on that server's own terms.
 
 # The switch that starts and stops the listener.
 proxy-serve = Serve requests
@@ -41,7 +44,7 @@ proxy-binding-cancel = Cancel
 
 # Which backends may be reached.
 proxy-backends = Backends
-proxy-backends-note = Only what you tick here can be reached. A tool naming anything else is told the model does not exist.
+proxy-backends-note = Only what you tick here can be reached. A tool naming anything else is told the model does not exist. Asking for the model list is not written into the Record, and for a server you added it asks that server for its catalog, with that server's key.
 proxy-backend-name = Offer { $backend } through the proxy
 proxy-backends-empty = No backends are configured yet.
 

@@ -1,6 +1,6 @@
 # Réglages ▸ Proxy — le proxy d'inférence local (src/proxy_settings.rs), français.
 
-proxy-lead = Laissez d'autres outils de cet ordinateur utiliser les modèles que vous atteignez via Eidola. Ils parlent l'API OpenAI, et chaque requête qu'ils envoient est inscrite au Registre. Le reste dépend de sa destination : le service hébergé d'Eidola est attesté et payé depuis votre portefeuille ; un modèle sur l'appareil tourne sur cet ordinateur et ne coûte rien ; un serveur que vous avez ajouté vous-même est joint directement, sans attestation, selon ses propres conditions.
+proxy-lead = Laissez d'autres outils de cet ordinateur utiliser les modèles que vous atteignez via Eidola. Ils parlent l'API OpenAI, et chaque réponse qu'ils demandent est inscrite au Registre. Le reste dépend de sa destination : le service hébergé d'Eidola est attesté et payé depuis votre portefeuille ; un modèle sur l'appareil tourne sur cet ordinateur et ne coûte rien ; un serveur que vous avez ajouté vous-même est joint directement, sans attestation, selon ses propres conditions.
 
 proxy-serve = Répondre aux requêtes
 proxy-serve-name = Répondre aux requêtes locales via Eidola
@@ -19,7 +19,7 @@ proxy-binding-save = Enregistrer
 proxy-binding-cancel = Annuler
 
 proxy-backends = Fournisseurs
-proxy-backends-note = Seul ce que vous cochez ici est joignable. Un outil qui nomme autre chose s'entend répondre que le modèle n'existe pas.
+proxy-backends-note = Seul ce que vous cochez ici est joignable. Un outil qui nomme autre chose s'entend répondre que le modèle n'existe pas. La demande de la liste des modèles n'est pas inscrite au Registre, et pour un serveur que vous avez ajouté, elle lui demande son catalogue, avec la clé de ce serveur.
 proxy-backend-name = Proposer { $backend } via le proxy
 proxy-backends-empty = Aucun fournisseur n'est encore configuré.
 
