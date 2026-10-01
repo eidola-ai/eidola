@@ -2859,7 +2859,7 @@ fn a_backend_replaced_mid_listing_is_never_asked_for_its_catalog() {
 /// capability statement that every request for it was refused. The listing now
 /// asks the lease's own predicate for the incarnation it authorized.
 #[test]
-fn a_retired_incarnations_engine_is_not_listed() {
+fn a_listing_offers_only_the_engines_of_the_incarnation_it_authorized() {
     run(|| {
         let (mock, core, dir) = core_for(MockConfig::default());
         let models = dir.path().join("models");
@@ -2900,6 +2900,12 @@ fn a_retired_incarnations_engine_is_not_listed() {
             core.add_backend(engine_backend("acme", &models, &engine))
                 .await
                 .expect("re-add under the same name");
+            core.set_proxy_backend_exposed("acme".to_string(), true)
+                .await
+                .expect("expose the replacement");
+            // The replacement loads the same slug: a ready engine under the
+            // same key, belonging to an incarnation this listing never read.
+            core.test_register_loaded_local_model("acme", "m", mock.port());
             let _ = resume.send(());
             listing.await.expect("the listing finishes")
         });
@@ -2910,16 +2916,15 @@ fn a_retired_incarnations_engine_is_not_listed() {
             "a retired incarnation's engine is not offered: {body}"
         );
 
-        // And what the listing withholds is what the proxy refuses.
-        let (status, body) = runtime.block_on(exchange(
-            &core,
-            &post(
-                "/v1/chat/completions",
-                &key,
-                r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
-            ),
-        ));
-        assert_eq!(status, 404, "{body}");
+        // And a listing that authorizes the replacement offers the
+        // replacement's engine: each listing answers for the incarnation it
+        // read, exactly as the lease does.
+        let (status, body) = runtime.block_on(exchange(&core, &get("/v1/models", Some(&key))));
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("m@acme"),
+            "the authorized incarnation's engine is offered: {body}"
+        );
     });
 }
 
