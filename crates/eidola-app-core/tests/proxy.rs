@@ -2669,6 +2669,60 @@ fn a_plain_routes_destination_survives_the_backend_being_replaced() {
     });
 }
 
+/// The engine-route twin: an engine's address is a port this process picked,
+/// and the next start picks another, so only a row written as the route opens
+/// can say where a prompt went.
+#[test]
+fn an_engine_routes_destination_is_recorded() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            ..Default::default()
+        });
+        let key = core.runtime().block_on(async {
+            core.set_proxy_backend_exposed("local".to_string(), true)
+                .await
+                .expect("expose local");
+            core.create_proxy_key("a tool".to_string())
+                .await
+                .expect("mint")
+                .key
+        });
+        // A ready engine answering at the mock's address.
+        core.test_register_loaded_local_model("local", "engine", mock.port());
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                r#"{"model":"engine@local","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        ));
+        assert_eq!(status, 200, "{body}");
+
+        let id = runtime
+            .block_on(core.list_requests(20, 0))
+            .expect("record")
+            .into_iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is recorded")
+            .id;
+        let detail = runtime
+            .block_on(core.request_detail(id))
+            .expect("detail")
+            .expect("a recorded row");
+        assert_eq!(
+            detail.base_url.as_deref(),
+            Some(format!("http://127.0.0.1:{}", mock.port()).as_str()),
+            "the engine's address at the time is in the Record"
+        );
+        assert_eq!(detail.attestation_hash, None);
+    });
+}
+
 /// REGRESSION: **the incarnation a request was authorized against is the one
 /// whose engine may start.**
 ///
