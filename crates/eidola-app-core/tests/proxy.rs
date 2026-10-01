@@ -2310,6 +2310,80 @@ fn engine_backend(
     }
 }
 
+/// One proxied exchange whose completion opened a connection of its own and
+/// then failed before the response head; returns the attestation its Record
+/// row is attached to.
+fn failed_send_records_against(streaming: bool) -> Option<String> {
+    let (_mock, core, _dir) = core_for(MockConfig {
+        chat: ChatBehavior::DropBeforeResponse,
+        ..Default::default()
+    });
+    with_account(&core);
+    let key = armed(&core);
+    core.test_plant_proxy_completion_handshake("completion-handshake");
+    let core = Arc::new(core);
+    let runtime = core.runtime();
+
+    let (status, body) = runtime.block_on(exchange(
+        &core,
+        &post(
+            "/v1/chat/completions",
+            &key,
+            &format!(
+                r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":{streaming}}}"#
+            ),
+        ),
+    ));
+    assert_ne!(status, 200, "the send failed: {body}");
+
+    let id = runtime
+        .block_on(core.list_requests(20, 0))
+        .expect("record")
+        .into_iter()
+        .find(|r| r.path == "/v1/chat/completions")
+        .expect("a failed send is still recorded")
+        .id;
+    runtime
+        .block_on(core.request_detail(id))
+        .expect("detail")
+        .expect("a recorded row")
+        .attestation_hash
+}
+
+/// REGRESSION: **a send that failed is recorded against the connection it
+/// actually opened** — on the blocking transport.
+///
+/// The handshake completes before a byte of the request is written, so a
+/// completion that dies before the response head can already have verified a
+/// fresh enclave the catalog fetch never reached. The flush ran only after a
+/// response arrived, so the failure row named the catalog's connection and the
+/// fresh handshake sat unrecorded in the observer: the Record said the prompt
+/// went somewhere it did not, on exactly the exchange someone opens the Record
+/// to look at.
+#[test]
+fn a_failed_blocking_send_is_recorded_against_its_own_connection() {
+    run(|| {
+        assert_eq!(
+            failed_send_records_against(false).as_deref(),
+            Some("completion-handshake"),
+            "the row names the connection the prompt went down"
+        );
+    });
+}
+
+/// The streaming twin of the arm above: the same exit, written once more on the
+/// other transport, so it is pinned once more.
+#[test]
+fn a_failed_streaming_send_is_recorded_against_its_own_connection() {
+    run(|| {
+        assert_eq!(
+            failed_send_records_against(true).as_deref(),
+            Some("completion-handshake"),
+            "the row names the connection the prompt went down"
+        );
+    });
+}
+
 /// REGRESSION: **the incarnation a request was authorized against is the one
 /// whose engine may start.**
 ///

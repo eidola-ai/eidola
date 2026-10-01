@@ -1061,6 +1061,28 @@ impl Inner {
                 if connection_id.is_some() {
                     self.bus.emit(Change::Record);
                 }
+                // The completion's own handshake, as the plain test client can
+                // never produce one: observed after the catalog's was recorded.
+                #[cfg(feature = "test-support")]
+                if let Some(hash) = self
+                    .proxy_planted_handshake
+                    .lock()
+                    .expect("planted handshake lock poisoned")
+                    .take()
+                {
+                    log.lock()
+                        .unwrap()
+                        .push(tinfoil_verifier::VerifiedAttestation {
+                            platform: tinfoil_verifier::Platform::SevSnp,
+                            matched_measurement: tinfoil_verifier::MatchedMeasurement::SevSnp(
+                                "a".repeat(96),
+                            ),
+                            attestation_hash: hash,
+                            attestation_doc: b"report".to_vec(),
+                            pcr_digest: "b".repeat(96),
+                            peer_spki_hash: "c".repeat(64),
+                        });
+                }
                 let entry = models
                     .data
                     .iter()
@@ -1297,6 +1319,17 @@ impl Inner {
             Ok(response) => response,
             Err(e) => {
                 let error = AppError::from_request(e);
+                // **A send that failed may still have opened a connection.** The
+                // handshake completes before a byte of the request is written,
+                // so an attempt that dies before the response head can have
+                // verified a fresh enclave the catalog fetch never reached —
+                // and the row below would name the catalog's connection as the
+                // one this prompt went down. Flushed before the settlement,
+                // whose own recovery call may handshake again on a connection
+                // that is not this request's.
+                if route.flush_new_attestations(&db_conn).await {
+                    self.bus.emit(Change::Record);
+                }
                 self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
                     .await;
                 self.record_proxy_request(
@@ -1525,6 +1558,17 @@ impl Inner {
             Ok(response) => response,
             Err(e) => {
                 let error = AppError::from_request(e);
+                // **A send that failed may still have opened a connection.** The
+                // handshake completes before a byte of the request is written,
+                // so an attempt that dies before the response head can have
+                // verified a fresh enclave the catalog fetch never reached —
+                // and the row below would name the catalog's connection as the
+                // one this prompt went down. Flushed before the settlement,
+                // whose own recovery call may handshake again on a connection
+                // that is not this request's.
+                if route.flush_new_attestations(&db_conn).await {
+                    self.bus.emit(Change::Record);
+                }
                 self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
                     .await;
                 self.record_proxy_request(

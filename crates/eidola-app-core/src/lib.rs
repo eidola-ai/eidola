@@ -2093,6 +2093,14 @@ struct Inner {
     #[cfg(feature = "test-support")]
     proxy_engine_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only handshake to plant in the next proxied Eidola route **after
+    /// its catalog fetch has been recorded** — the observation the completion's
+    /// own connection would make. The plain test client never invokes an
+    /// attestation observer, so without this the one case that matters (the
+    /// completion riding a connection the catalog fetch never opened) cannot
+    /// occur in a test at all.
+    #[cfg(feature = "test-support")]
+    proxy_planted_handshake: Mutex<Option<String>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
@@ -9636,6 +9644,8 @@ impl AppCore {
                 proxy_resolve_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 proxy_engine_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                proxy_planted_handshake: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 plan_faults: std::sync::atomic::AtomicU32::new(0),
@@ -10934,6 +10944,20 @@ impl AppCore {
             .lock()
             .expect("proxy engine window lock poisoned") = Some(tx);
         rx
+    }
+
+    /// Test-only seam: the next proxied Eidola route observes one more
+    /// handshake, named `attestation_hash`, after its catalog fetch was
+    /// recorded — as though the completion opened a fresh connection (see
+    /// `Inner::proxy_planted_handshake`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_plant_proxy_completion_handshake(&self, attestation_hash: &str) {
+        *self
+            .inner
+            .proxy_planted_handshake
+            .lock()
+            .expect("planted handshake lock poisoned") = Some(attestation_hash.to_string());
     }
 
     /// Test-only seam: shorten how long an anchor wait holds out before its own
