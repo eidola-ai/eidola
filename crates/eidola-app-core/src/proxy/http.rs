@@ -553,7 +553,7 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
             Some("model_not_found"),
             Disclosure::Detail,
         ),
-        AppError::Config { .. } => (
+        AppError::Config { .. } | AppError::ProxyRefused { .. } => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             None,

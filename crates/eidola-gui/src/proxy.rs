@@ -209,8 +209,11 @@ impl ProxyServer {
 pub fn serve(core: &Arc<AppCore>, settings: &ProxySettings) -> Result<ProxyServer, AppError> {
     let ip = parse_bind_address(&settings.bind_address)?;
     let address = SocketAddr::new(ip, settings.bind_port);
-    let listener = bind_listener(address).map_err(|e| AppError::Config {
-        message: format!("could not listen on {address}: {e}"),
+    let listener = bind_listener(address).map_err(|e| AppError::ProxyRefused {
+        refusal: eidola_app_core::proxy::ProxyRefusal::CannotListen {
+            address: address.to_string(),
+            reason: e.to_string(),
+        },
     })?;
     // The bound address rather than the requested one — they differ if a port
     // of 0 is ever allowed, and a surface that tells a reader where to point

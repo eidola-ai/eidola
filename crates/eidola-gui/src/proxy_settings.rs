@@ -27,7 +27,8 @@
 //! must never localize); everything the pane itself says is Fluent.
 
 use eidola_app_core::BackendInfo;
-use eidola_app_core::proxy::{LocalExposure, ProxyKeyInfo, ProxySettings};
+use eidola_app_core::error::AppError;
+use eidola_app_core::proxy::{LocalExposure, ProxyKeyInfo, ProxyRefusal, ProxySettings};
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
@@ -47,6 +48,7 @@ use std::collections::HashMap;
 use crate::i18n::msg;
 use crate::participants::{ghost_button, ghost_button_labeled, load_error_panel};
 use crate::probe::Probe as _;
+use crate::stores::proxy::ListenFailure;
 use crate::stores::{BackendsStore, ProxyStore, Stores};
 
 /// The subtrees a verb in this pane can unmount from under the keyboard.
@@ -304,8 +306,10 @@ impl Render for ProxySettingsView {
         let theme = cx.theme();
         let store = self.proxy.read(cx);
         let settings = store.settings().clone();
-        let op_error = store.op_error().map(str::to_string);
-        let listen_error = store.listen_error();
+        // Words chosen here, from the typed values the store holds — never a
+        // sentence cached there (see `refusal_copy`).
+        let op_error = store.op_error().map(|e| refusal_copy(e, cx));
+        let listen_error = store.listen_error().map(|f| listen_copy(&f, cx));
         let address = store.address().map(|a| a.to_string());
         let minted = store
             .minted()
@@ -418,9 +422,9 @@ impl Render for ProxySettingsView {
                             .probe(
                                 "settings/proxy/listen-error",
                                 gpui::Role::Alert,
-                                msg::proxy_listen_failed(cx, message.clone()),
+                                message.clone(),
                             )
-                            .child(notice_band(msg::proxy_listen_failed(cx, message), cx)),
+                            .child(notice_band(message, cx)),
                     )
                 }),
         ));
@@ -670,10 +674,50 @@ impl Render for ProxySettingsView {
                 div()
                     .id("proxy-error")
                     .probe("settings/proxy/error", gpui::Role::Alert, message.clone())
-                    .child(notice_band(SharedString::from(message), cx)),
+                    .child(notice_band(message, cx)),
             );
         }
         col
+    }
+}
+
+/// The pane's sentence for a refused operation, chosen from the typed error
+/// **at render** — so a locale change repaints a refusal already on screen.
+///
+/// Every `ProxyRefusal` has words of its own: those are the refusals this pane
+/// can actually provoke (an address that is not an IP literal, port 0, a key
+/// with no name, a bind the OS refused), and each variant carries what its
+/// sentence needs. **Anything else shows the typed error's own text**, which is
+/// English — stated rather than silent, and for the same reason the startup
+/// alert keeps its body: app-core is locale-free, and a store failure or an
+/// unexpected variant carries no payload a sentence of ours could honestly say
+/// more with.
+pub fn refusal_copy(error: &AppError, cx: &App) -> SharedString {
+    match error {
+        AppError::ProxyRefused { refusal } => match refusal {
+            ProxyRefusal::NotAnAddress { value } => {
+                msg::proxy_error_not_an_address(cx, value.clone())
+            }
+            ProxyRefusal::NoPort => msg::proxy_error_no_port(cx),
+            ProxyRefusal::KeyNeedsName => msg::proxy_error_key_needs_name(cx),
+            ProxyRefusal::CannotListen { address, reason } => {
+                msg::proxy_error_cannot_listen(cx, address.clone(), reason.clone())
+            }
+        },
+        other => SharedString::from(other.to_string()),
+    }
+}
+
+/// The listen band's sentence: a typed refusal reads as itself, the loop
+/// giving up has its own words, and anything else is introduced by the
+/// listen-failed sentence around the error's own text.
+pub fn listen_copy(failure: &ListenFailure, cx: &App) -> SharedString {
+    match failure {
+        ListenFailure::StoppedAccepting(reason) => {
+            msg::proxy_error_stopped_accepting(cx, reason.clone())
+        }
+        ListenFailure::Refused(error @ AppError::ProxyRefused { .. }) => refusal_copy(error, cx),
+        ListenFailure::Refused(other) => msg::proxy_listen_failed(cx, other.to_string()),
     }
 }
 

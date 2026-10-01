@@ -51,3 +51,9 @@ proxy-keys-failed = No se pudieron listar las claves de API.
 proxy-backends-failed = No se pudo leer el registro de proveedores.
 proxy-loading = Cargando…
 proxy-stale = No se pudo actualizar — se muestra la última respuesta.
+
+proxy-error-not-an-address = { $value } no es una dirección IP. El proxy escucha en una dirección, no en un nombre.
+proxy-error-no-port = El proxy necesita un puerto. El puerto 0 tomaría cualquiera que estuviera libre, y esa no es una dirección que se le pueda indicar a una herramienta.
+proxy-error-key-needs-name = Una clave necesita un nombre, para que más adelante sepas qué herramienta la tiene.
+proxy-error-cannot-listen = No se pudo escuchar en { $address } — { $reason }
+proxy-error-stopped-accepting = El proxy dejó de aceptar conexiones — { $reason }

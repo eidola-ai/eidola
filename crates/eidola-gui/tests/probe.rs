@@ -9518,6 +9518,108 @@ fn proxy_keys_fixture() -> Vec<eidola_app_core::proxy::ProxyKeyInfo> {
     ]
 }
 
+/// REGRESSION: **a proxy refusal speaks the reader's language, and keeps
+/// speaking it through a locale change.**
+///
+/// The store cached `AppError`'s English `Display`, so a reader in any other
+/// locale met this crate's English in the middle of a localized pane — and a
+/// cached sentence cannot follow a locale change. The store now holds the typed
+/// error and the pane chooses the words at render; switching locale **without
+/// re-emitting the failure** is what tells the two apart (a test that re-failed
+/// after each switch would pass against a cache).
+#[gpui::test]
+fn a_proxy_refusal_is_localized_and_follows_the_locale(cx: &mut TestAppContext) {
+    use eidola_app_core::error::AppError;
+    use eidola_app_core::proxy::ProxyRefusal;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update(|cx| {
+        stores.proxy.update(cx, |s, cx| {
+            s.settle_for_test(
+                Err(AppError::ProxyRefused {
+                    refusal: ProxyRefusal::NoPort,
+                }),
+                cx,
+            );
+            s.set_listen_error_for_test(
+                AppError::ProxyRefused {
+                    refusal: ProxyRefusal::CannotListen {
+                        address: "127.0.0.1:11437".into(),
+                        reason: "Address already in use".into(),
+                    },
+                },
+                cx,
+            );
+        })
+    });
+
+    let labels = |cx: &mut TestAppContext| {
+        let entries = fresh_entries(cx, window);
+        let label = |name: &str| {
+            entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} painted"))
+                .1
+                .label
+                .to_string()
+        };
+        (
+            label("settings/proxy/error"),
+            label("settings/proxy/listen-error"),
+        )
+    };
+
+    let (refusal, listen) = labels(cx);
+    assert!(
+        refusal.starts_with("The proxy needs a port."),
+        "the pane's own words, not the error's Display: {refusal}"
+    );
+    assert!(!refusal.contains("config error"), "{refusal}");
+    assert_eq!(
+        listen,
+        "Couldn't listen on 127.0.0.1:11437 — Address already in use"
+    );
+
+    // Nothing is re-emitted between these — only the locale changes.
+    for (tag, refusal_starts, listen_expected) in [
+        (
+            "fr",
+            "Le proxy a besoin d'un port.",
+            "Impossible d'écouter sur 127.0.0.1:11437 — Address already in use",
+        ),
+        (
+            "zh-Hans",
+            "代理需要一个端口。",
+            "无法在 127.0.0.1:11437 上监听 —— Address already in use",
+        ),
+        (
+            "en",
+            "The proxy needs a port.",
+            "Couldn't listen on 127.0.0.1:11437 — Address already in use",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        cx.run_until_parked();
+        let (refusal, listen) = labels(cx);
+        assert!(
+            refusal.starts_with(refusal_starts),
+            "{tag} repaints the refusal already on screen: {refusal}"
+        );
+        assert_eq!(listen, listen_expected, "{tag}");
+    }
+}
+
 /// Press the centre of the switch probed as `probe_name` and return what
 /// `state` read before and after — the press aimed at the widget itself, the
 /// primary pointer target, never at the wrapper's padding.

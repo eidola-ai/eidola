@@ -349,6 +349,9 @@ impl DelegationFailure {
             AppError::NotConfigured { .. }
             | AppError::ModelUnavailable { .. }
             | AppError::Config { .. }
+            // Unreachable from a driven turn (no turn writes proxy settings);
+            // placed where the variant it replaced would have landed.
+            | AppError::ProxyRefused { .. }
             | AppError::NotAParticipant { .. }
             | AppError::WrongPostKind { .. }
             | AppError::SpawnRefused { .. }

@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use eidola_app_core::AppCore;
+use eidola_app_core::error::AppError;
 use eidola_app_core::proxy::{
     LocalExposure, MintedProxyKey, ProxyKeyInfo, ProxySettings, ProxySettingsUpdate,
     parse_bind_address,
@@ -28,6 +29,19 @@ use gpui::{Context, Task};
 use crate::bridge::bridge;
 use crate::loadable::Loadable;
 use crate::proxy::ProxyHandle;
+
+/// Why nothing is listening where the reader asked for something to be.
+///
+/// Two different facts, kept apart because they want different sentences: the
+/// operating system refused the bind (a typed [`AppError`], usually
+/// `ProxyRefusal::CannotListen`), or a listener that was running gave up
+/// accepting (`reason` is this crate's own diagnostic of the loop's last
+/// failure).
+#[derive(Clone, Debug)]
+pub enum ListenFailure {
+    Refused(AppError),
+    StoppedAccepting(String),
+}
 
 /// The one slot a key generation ever occupies. Named, because the re-entry
 /// refusal and the operation itself have to mean the same slot.
@@ -50,11 +64,17 @@ pub struct ProxyStore {
     /// [`Self::start_op`].
     op_tasks: HashMap<String, (u64, Task<()>)>,
     next_op_gen: u64,
-    op_error: Option<String>,
+    /// **The typed error, never its text** — the pane chooses the words at
+    /// render (`proxy_settings::refusal_copy`), so a locale change repaints a
+    /// refusal already on screen and a localized pane never prints this
+    /// crate's English (the "state holds the value, render chooses the words"
+    /// rule).
+    op_error: Option<AppError>,
     /// Why the listener is not running, when the reader asked for it to be.
     /// Separate from `op_error` because the write succeeded — what failed is
-    /// the socket, and the two want different words.
-    listen_error: Option<String>,
+    /// the socket, and the two want different words. Typed for the same
+    /// reason `op_error` is.
+    listen_error: Option<AppError>,
     /// A key at the one moment it exists in full. Held until the reader
     /// dismisses it, because there is no second chance to show it.
     minted: Option<MintedProxyKey>,
@@ -150,8 +170,8 @@ impl ProxyStore {
         self.handle.is_running()
     }
 
-    pub fn op_error(&self) -> Option<&str> {
-        self.op_error.as_deref()
+    pub fn op_error(&self) -> Option<&AppError> {
+        self.op_error.as_ref()
     }
 
     /// Whether any write is still in flight. What the resolving read waits for,
@@ -169,10 +189,18 @@ impl ProxyStore {
     /// pane's question is "why is nothing listening", and the loop that stopped
     /// is the truest answer available. A bind that failed left no listener at
     /// all, so the two can never both answer.
-    pub fn listen_error(&self) -> Option<String> {
+    pub fn listen_error(&self) -> Option<ListenFailure> {
         self.handle
             .accept_failure()
-            .or_else(|| self.listen_error.clone())
+            .map(ListenFailure::StoppedAccepting)
+            .or_else(|| self.listen_error.clone().map(ListenFailure::Refused))
+    }
+
+    /// Test seam: stand a listen failure in the slot, as a refused bind would.
+    #[doc(hidden)]
+    pub fn set_listen_error_for_test(&mut self, error: AppError, cx: &mut Context<Self>) {
+        self.listen_error = Some(error);
+        cx.notify();
     }
 
     /// The key just generated, if one is waiting to be read.
@@ -310,7 +338,7 @@ impl ProxyStore {
                 // so a refused address leaves the proxy **stopped** rather than
                 // still answering on the old one: a reader who changed the
                 // binding must not be told it moved when it did not.
-                self.listen_error = Some(e.to_string());
+                self.listen_error = Some(e);
             }
         }
         cx.notify();
@@ -420,7 +448,7 @@ impl ProxyStore {
             // still in flight rather than after this one.
             |this, result, _cx| match result {
                 Ok(minted) => this.minted = Some(minted),
-                Err(e) => this.op_error = Some(e.to_string()),
+                Err(e) => this.op_error = Some(e),
             },
         );
     }
@@ -437,7 +465,7 @@ impl ProxyStore {
             },
             |this, result, _cx| match result {
                 Ok(_) => {}
-                Err(e) => this.op_error = Some(e.to_string()),
+                Err(e) => this.op_error = Some(e),
             },
         );
     }
@@ -579,7 +607,7 @@ impl ProxyStore {
                 // listener moves with the batch-end read, for the same reason.
             }
             Err(e) => {
-                self.op_error = Some(e.to_string());
+                self.op_error = Some(e);
                 // A refused write changed nothing, so nothing about the
                 // listener has to move — and the batch-end read that follows is
                 // what puts a stale cache right, which a refusal is the moment

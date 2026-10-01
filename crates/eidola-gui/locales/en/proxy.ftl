@@ -84,3 +84,13 @@ proxy-retry = Retry
 # failed over values still on screen is not a fresh read of them.
 proxy-loading = Loading…
 proxy-stale = Couldn't refresh — showing the last answer.
+
+# Why a proxy setting or key was refused — one sentence per typed refusal
+# (`ProxyRefusal`). Any other failure shows the error's own text, which is
+# English: app-core is locale-free, and those variants carry nothing more for a
+# sentence of ours to say.
+proxy-error-not-an-address = { $value } is not an IP address. The proxy listens on an address, not a name.
+proxy-error-no-port = The proxy needs a port. Port 0 would take whatever happened to be free, which is not an address a tool can be told about.
+proxy-error-key-needs-name = A key needs a name, so you can tell later which tool holds it.
+proxy-error-cannot-listen = Couldn't listen on { $address } — { $reason }
+proxy-error-stopped-accepting = The proxy stopped accepting connections — { $reason }

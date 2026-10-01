@@ -271,12 +271,57 @@ pub fn parse_bind_address(value: &str) -> Result<IpAddr, AppError> {
     value
         .trim()
         .parse::<IpAddr>()
-        .map_err(|_| AppError::Config {
-            message: format!(
-                "`{}` is not an IP address — the proxy binds an address, not a name",
-                value.trim()
-            ),
+        .map_err(|_| AppError::ProxyRefused {
+            refusal: ProxyRefusal::NotAnAddress {
+                value: value.trim().to_string(),
+            },
         })
+}
+
+/// Why a proxy setting or key operation was refused — **typed, so the surface
+/// that shows it can choose the words.**
+///
+/// These were `AppError::Config { message }` with the sentence inside, which
+/// gave a localized pane nothing to route on but English prose: the variant
+/// said "configuration", the message said everything else, and a reader in
+/// any other language got this crate's English in the middle of their own.
+/// The `Display` keeps the sentences the command line has always printed, so a
+/// consumer that renders the error as text sees no change; the GUI matches the
+/// variant and renders its own. [`AppError::SpawnRefused`] is the precedent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyRefusal {
+    /// A bind address that is not an IP literal (a hostname is refused, not
+    /// resolved — see [`parse_bind_address`]).
+    NotAnAddress { value: String },
+    /// Port `0`, which asks the OS for whatever is free — not an address a
+    /// tool can be told about.
+    NoPort,
+    /// A key with no name, which no reader could later tell apart.
+    KeyNeedsName,
+    /// The operating system refused the socket. `reason` is the OS's own text,
+    /// which is a payload inside a sentence rather than the sentence.
+    CannotListen { address: String, reason: String },
+}
+
+impl std::fmt::Display for ProxyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProxyRefusal::NotAnAddress { value } => write!(
+                f,
+                "`{value}` is not an IP address — the proxy binds an address, not a name"
+            ),
+            ProxyRefusal::NoPort => f.write_str(
+                "the proxy needs a port to bind; 0 would take whatever was free, \
+                 which is not an address a tool can be told about",
+            ),
+            ProxyRefusal::KeyNeedsName => {
+                f.write_str("a key needs a name, so a reader can tell later which tool holds it")
+            }
+            ProxyRefusal::CannotListen { address, reason } => {
+                write!(f, "could not listen on {address}: {reason}")
+            }
+        }
+    }
 }
 
 impl Inner {
@@ -335,10 +380,8 @@ impl Inner {
             parse_bind_address(address)?;
         }
         if update.bind_port == Some(0) {
-            return Err(AppError::Config {
-                message: "the proxy needs a port to bind; 0 would take whatever was free, \
-                          which is not an address a tool can be told about"
-                    .into(),
+            return Err(AppError::ProxyRefused {
+                refusal: ProxyRefusal::NoPort,
             });
         }
 
@@ -404,9 +447,8 @@ impl Inner {
     pub(crate) async fn create_proxy_key(&self, label: String) -> Result<MintedProxyKey, AppError> {
         let label = label.trim().to_string();
         if label.is_empty() {
-            return Err(AppError::Config {
-                message: "a key needs a name, so a reader can tell later which tool holds it"
-                    .into(),
+            return Err(AppError::ProxyRefused {
+                refusal: ProxyRefusal::KeyNeedsName,
             });
         }
         let key = generate_key();

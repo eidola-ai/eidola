@@ -3582,7 +3582,12 @@ fn a_proxy_that_stopped_accepting_says_why_and_is_reconciled_again(cx: &mut Test
     wait_until(cx, "the reconcile binds the socket", |cx| {
         stores.proxy.read_with(cx, |s, _| s.is_running())
     });
-    assert_eq!(stores.proxy.read_with(cx, |s, _| s.listen_error()), None);
+    assert!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.listen_error())
+            .is_none()
+    );
 
     let handle = stores.proxy.read_with(cx, |s, _| s.handle());
     handle.fail_accepting_for_test("too many open files");
@@ -3591,9 +3596,12 @@ fn a_proxy_that_stopped_accepting_says_why_and_is_reconciled_again(cx: &mut Test
         !stores.proxy.read_with(cx, |s, _| s.is_running()),
         "a socket that admits nobody is not somewhere to point a tool"
     );
-    assert_eq!(
-        stores.proxy.read_with(cx, |s, _| s.listen_error()),
-        Some("too many open files".to_string()),
+    assert!(
+        matches!(
+            stores.proxy.read_with(cx, |s, _| s.listen_error()),
+            Some(eidola_gui::stores::proxy::ListenFailure::StoppedAccepting(reason))
+                if reason == "too many open files"
+        ),
         "no write failed, so only the loop's own reason can explain this"
     );
 
@@ -3614,7 +3622,12 @@ fn a_proxy_that_stopped_accepting_says_why_and_is_reconciled_again(cx: &mut Test
         }
     }
     assert!(restarted, "a reconcile starts a listener that gave up");
-    assert_eq!(stores.proxy.read_with(cx, |s, _| s.listen_error()), None);
+    assert!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.listen_error())
+            .is_none()
+    );
 
     // Teardown: an accept loop is a task holding the core, so the drain barrier
     // would wait on it forever. Stopping the handle is what the disable path
@@ -3684,9 +3697,11 @@ fn a_refresh_leaves_a_correct_ipv6_listener_alone(cx: &mut TestAppContext) {
         bound_once,
         "a listener that already matches is not closed and rebound"
     );
-    assert_eq!(
-        stores.proxy.read_with(cx, |s, _| s.listen_error()),
-        None,
+    assert!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.listen_error())
+            .is_none(),
         "so nothing could have failed to come back"
     );
     assert_eq!(
