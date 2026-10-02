@@ -25,10 +25,12 @@
 //! - **An API answer** (a model catalog, an account call) is refused. A
 //!   truncated JSON document is not a smaller answer, it is no answer, and the
 //!   caller has somewhere honest to put the failure.
-//! - **A proxied completion** keeps what it read, records it as the truncation
-//!   it is, and answers the caller a gateway failure — because the Record is
-//!   evidence a reader goes looking for, and a body that stopped at this app's
-//!   ceiling is a fact about the exchange rather than a reason to forget it.
+//! - **A completion** — proxied, or a chat turn's own — keeps what it read and
+//!   records it as the truncation it is, and the exchange fails: the proxy
+//!   answers its caller a gateway failure, the turn writes no answer. The
+//!   Record is evidence a reader goes looking for, and a body that stopped at
+//!   this app's ceiling is a fact about the exchange rather than a reason to
+//!   forget it.
 //!
 //! Both come out of [`read_bounded`]; only the ending differs.
 
@@ -45,14 +47,89 @@ use crate::error::AppError;
 /// that a dishonest one cannot spend this process's memory through it.
 pub(crate) const API_ANSWER_MAX_BYTES: usize = 2 << 20;
 
+/// The most of one **completion** this app will read at all — a blocking
+/// answer, or the whole of a stream.
+///
+/// **The retention cap's other half, and the one the process feels.**
+/// [`crate::recorded::RECORD_BODY_MAX_BYTES`] bounds what a `request` row
+/// keeps; it cannot bound what reading the answer costs, because a blocking
+/// transport buffers the whole body before anything can seal it, and a turn's
+/// stream accumulates the deltas it is assembling into an answer. A backend
+/// that answers without end — or an intermediary streaming an enormous error
+/// page — would otherwise cost this process the whole answer in memory.
+///
+/// Eight megabytes is far past any completion a model produces (a 128k-token
+/// answer is around half a megabyte, and a turn asks for at most 4096 tokens)
+/// and far short of a size worth holding. A body that reaches it is not an
+/// answer this app can use, so the read stops there and the exchange is
+/// recorded as the truncation it is.
+pub(crate) const MAX_RESPONSE_BYTES: usize = 8 << 20;
+
+/// The most one server-sent event may accumulate before it is refused.
+///
+/// **The frame accumulator's ceiling.** A stream's bytes go into a buffer and
+/// only come out when [`crate::find_event_boundary`] finds the blank line that
+/// ends an event, so a backend that sends one enormous event — or never sends a
+/// terminator at all — grows that buffer until the process is out of memory,
+/// with every other bound on the stream looking perfectly healthy.
+///
+/// A megabyte is orders of magnitude past any real event: a completion chunk is
+/// hundreds of bytes and the terminal metadata event carrying a refund is a few
+/// kilobytes. What passes it is not an event this app can use, so the stream
+/// ends and the Record says why.
+pub(crate) const MAX_SSE_EVENT_BYTES: usize = 1 << 20;
+
+/// Whether an event that has **not** been taken out of the frame buffer yet
+/// passes [`MAX_SSE_EVENT_BYTES`]: `complete` is the length of the next
+/// complete event, if a boundary has arrived, and `residual` the bytes in the
+/// buffer.
+///
+/// **Both, and the complete one before it is drained.** Checking only what is
+/// left after the drain measures an event still accumulating, which is the
+/// half that catches a backend that never ends one — and misses the half
+/// where the oversized event arrives with its boundary in the same read: the
+/// drain takes it whole, the residual is small, and an event of any size up to
+/// the whole-stream ceiling is parsed and used.
+pub(crate) fn event_past_ceiling(complete: Option<usize>, residual: usize) -> bool {
+    complete.is_some_and(|len| len > MAX_SSE_EVENT_BYTES) || residual > MAX_SSE_EVENT_BYTES
+}
+
+/// The refusal a completion body past [`MAX_RESPONSE_BYTES`] is answered with,
+/// on every consumer and **whatever its status**: the ceiling is this app's own
+/// decision to stop reading, so it decides before anything else is asked of
+/// the bytes — before the parse (a padded complete object parses perfectly),
+/// and before a non-2xx's lenient reading of an error document (a status does
+/// not make a fragment whole).
+pub(crate) fn answer_past_ceiling(backend_id: &str) -> AppError {
+    AppError::Network {
+        message: format!(
+            "`{backend_id}` sent an answer past the {MAX_RESPONSE_BYTES}-byte ceiling this app \
+             reads, so what arrived is a fragment rather than an answer"
+        ),
+    }
+}
+
+/// The refusal an oversized event is answered with, on every streaming
+/// consumer.
+pub(crate) fn oversized_event(backend_id: &str) -> AppError {
+    AppError::Network {
+        message: format!(
+            "`{backend_id}` sent a single event past the {MAX_SSE_EVENT_BYTES}-byte ceiling this \
+             app will hold, or never ended one"
+        ),
+    }
+}
+
 /// One answer read from a peer, bounded.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct BoundedBody {
-    /// What was read, to the ceiling.
+    /// What was read, to the ceiling — and **the only count there is**. The
+    /// chunk that crosses the ceiling is cut at it and its remainder dropped
+    /// unexamined, so a body that stopped at the ceiling is known to be at
+    /// least this large and nothing more; a second, larger count would put two
+    /// boundaries on one row (bytes "received" past the point the row says
+    /// reading stopped).
     pub(crate) bytes: Vec<u8>,
-    /// How much arrived — larger than `bytes` only where the ceiling stopped
-    /// the read part-way through a chunk.
-    pub(crate) received: usize,
     /// Whether the ceiling is why the read stopped.
     pub(crate) over_ceiling: bool,
 }
@@ -63,28 +140,56 @@ impl BoundedBody {
     }
 }
 
+/// A read that failed part-way, with **what had arrived before it failed**.
+///
+/// The prefix is part of the exchange: a peer that sent half a body and then
+/// reset sent that half, and a surface that records exchanges records it — a
+/// row claiming an empty response where bytes arrived is a trail describing an
+/// exchange that did not happen. A caller with no record to write converts
+/// this into its error (`?` does, through the `From` below) and the prefix is
+/// dropped there, deliberately rather than by the reader.
+#[derive(Debug)]
+pub(crate) struct ReadFailure {
+    pub(crate) error: AppError,
+    /// Everything read before the failure, to the ceiling.
+    pub(crate) partial: BoundedBody,
+}
+
+impl From<ReadFailure> for AppError {
+    fn from(failure: ReadFailure) -> Self {
+        failure.error
+    }
+}
+
 /// Read a response body, stopping at `ceiling` bytes.
 ///
 /// The bound is applied **while reading**: `Response::text()` and
 /// `Response::json()` buffer whatever the peer sends before anything can cap
 /// it, so a ceiling checked afterwards is a ceiling on the value and not on the
-/// cost.
+/// cost. A read that fails hands back the prefix it had ([`ReadFailure`]).
 pub(crate) async fn read_bounded(
     response: reqwest::Response,
     ceiling: usize,
-) -> Result<BoundedBody, AppError> {
+) -> Result<BoundedBody, ReadFailure> {
     use futures_util::StreamExt;
 
     let mut stream = response.bytes_stream();
     let mut body = BoundedBody::default();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| AppError::Network {
-            message: format!(
-                "failed to read the response: {}",
-                crate::error::request_error_text(e)
-            ),
-        })?;
-        body.received += chunk.len();
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                return Err(ReadFailure {
+                    error: AppError::Network {
+                        message: format!(
+                            "failed to read the response: {}",
+                            crate::error::request_error_text(e)
+                        ),
+                    },
+                    partial: body,
+                });
+            }
+        };
         let room = ceiling.saturating_sub(body.bytes.len());
         if chunk.len() > room {
             body.bytes.extend_from_slice(&chunk[..room]);

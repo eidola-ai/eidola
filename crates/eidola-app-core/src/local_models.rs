@@ -1689,15 +1689,29 @@ pub(crate) enum Redirects {
 ///   own `3xx`, the Record shows it, and nothing of the reader's leaves for a
 ///   destination they did not choose.
 ///
-/// *Known twins, not cured here:* the turn path's own external completions
-/// (`Inner::plain_client` at the chat and chore call sites) and the attested
-/// client (`tinfoil_verifier::attesting_client`) set no redirect policy either,
-/// so both inherit reqwest's default. The attested one is bounded by its own
-/// per-connection verification against the configured host; the turn path's is
-/// the same exposure as this one and wants the same cure, but it is the chat
-/// path and belongs with the harness extension that rule requires.
+/// The app's own completions refuse redirects for the same reason
+/// ([`completion_http_client`]), and so does the attested client
+/// (`tinfoil_verifier::attesting_client`).
 pub(crate) fn proxy_http_client() -> Result<reqwest::Client, AppError> {
     plain_client(None, Redirects::Refuse)
+}
+
+/// The client a **chat turn or a chore** sends its completion on, to a local
+/// engine or an external OpenAI-compatible backend.
+///
+/// **No redirects**, for the proxy's reason ([`proxy_http_client`]): a turn's
+/// body is the conversation, and a `307`/`308` would have reqwest replay it to
+/// whatever origin the `Location` names — one the reader never configured,
+/// while the Record goes on naming the backend they did. A redirect is handed
+/// back as the answer it is, and the turn fails on the upstream's own status.
+/// It keeps [`plain_http_client`]'s `User-Agent`: the turn path's header set is
+/// not an allowlist the Record repeats back, which is the proxy's reason for
+/// dropping it.
+pub(crate) fn completion_http_client() -> Result<reqwest::Client, AppError> {
+    plain_client(
+        Some(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION"))),
+        Redirects::Refuse,
+    )
 }
 
 fn plain_client(

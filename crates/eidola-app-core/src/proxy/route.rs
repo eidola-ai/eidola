@@ -49,9 +49,11 @@ use uuid::Uuid;
 use super::LocalExposure;
 use crate::changes::Change;
 use crate::error::AppError;
+use crate::peer_read::MAX_RESPONSE_BYTES;
+use crate::recorded::{RecordedBody, recorded_answer, recorded_cut_answer, recorded_request};
 use crate::{
     ChargePricing, EidolaResolved, Inner, ModelInfo, backends, db, estimate_charge_credits,
-    fetch_models, find_event_boundary, flush_attestations, local_models, now_ms,
+    fetch_models, find_event_boundary, flush_attestations, is_event_stream, local_models, now_ms,
     parse_server_error_message, process_refund, recover_refund,
 };
 
@@ -61,58 +63,6 @@ use crate::{
 /// context length — one rule, so a proxied request and an in-app one ask for
 /// the same budget from the same model.
 const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4096;
-
-/// The most of one response body a `request` row keeps.
-///
-/// **A bound the Record needs and the delivery does not.** What travels
-/// downstream is streamed through and forgotten; what is *retained* is retained
-/// per connection until the stream ends, so a caller free to name any ceiling
-/// against any exposed backend could otherwise make one request cost this
-/// process the whole answer in memory — and then the same bytes again in the
-/// database. A megabyte is far past any answer a person reads and far short of
-/// a size worth holding: an SSE transcript of a 4k-token completion is tens of
-/// kilobytes.
-///
-/// The turn path's own `response_buf` has no such bound today. It is the same
-/// shape and a different exposure — the app issues those requests itself, one
-/// per turn, against a ceiling it set — so it is recorded as a known twin
-/// rather than changed from here.
-const RECORD_BODY_MAX_BYTES: usize = 1 << 20;
-
-/// The most one server-sent event may accumulate before it is refused.
-///
-/// **The third buffer, and the one two ceilings did not cover.** A stream is
-/// bounded in what it *retains* (`RECORD_BODY_MAX_BYTES`) and in what it may
-/// queue for the caller (`STREAM_QUEUE_EVENTS`), and neither bounds the frame
-/// accumulator: bytes go into `buf` and only come out when
-/// [`find_event_boundary`] finds the blank line that ends an event. A backend
-/// that sends one enormous event — or never sends a terminator at all — grows
-/// that buffer until the process is out of memory, with the Record's cap and
-/// the queue both looking perfectly healthy.
-///
-/// A megabyte is orders of magnitude past any real event: a completion chunk is
-/// hundreds of bytes and the terminal metadata event carrying a refund is a few
-/// kilobytes. What passes it is not an event this app can forward, so the
-/// stream ends and the Record says why.
-const MAX_SSE_EVENT_BYTES: usize = 1 << 20;
-
-/// The most of one upstream answer this app will read at all.
-///
-/// **The retention cap's other half, and the one the process feels.**
-/// [`RECORD_BODY_MAX_BYTES`] bounds what a `request` row keeps; it cannot bound
-/// what reading the answer costs, because a blocking transport buffers the
-/// whole body before anything can seal it. An exposed backend declares no
-/// ceiling of its own and a downstream caller names its own `max_tokens`, so
-/// one request against a backend that answers without end — or an intermediary
-/// streaming an enormous error page — would cost this process the whole answer
-/// in memory, times however many callers the listener admits.
-///
-/// Eight megabytes is far past any completion a model produces (a 128k-token
-/// answer is around half a megabyte) and far short of a size worth holding. A
-/// body that reaches it is not an answer this app can use — it will not parse —
-/// so the read stops there, the exchange is recorded as the truncation it is,
-/// and the caller gets the gateway failure.
-const MAX_RESPONSE_BYTES: usize = 8 << 20;
 
 /// How long one backend has to answer `/v1/models` before it is treated as
 /// unavailable for this listing.
@@ -152,140 +102,28 @@ pub fn set_model_list_timeout_for_test(millis: u64) {
     MODEL_LIST_TIMEOUT_MS.store(millis, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// A response body on its way to the Record, kept to [`RECORD_BODY_MAX_BYTES`].
-///
-/// **Truncation is recorded as truncation.** A Record row holding the first
-/// megabyte of a larger answer and saying nothing would be a partial claiming
-/// to be whole, which is the one thing this trail may never be — a reader opens
-/// it to see what left this machine. So the seal states both numbers, in the
-/// payload itself, in a form no upstream could have sent by accident.
-#[derive(Default)]
-struct RecordedBody {
-    kept: Vec<u8>,
-    received: usize,
-}
+/// One blocking upstream answer, read under [`MAX_RESPONSE_BYTES`].
+type CappedBody = crate::peer_read::BoundedBody;
 
 impl RecordedBody {
-    fn push(&mut self, bytes: &[u8]) {
-        self.received += bytes.len();
-        let room = RECORD_BODY_MAX_BYTES.saturating_sub(self.kept.len());
-        if room > 0 {
-            self.kept.extend_from_slice(&bytes[..room.min(bytes.len())]);
-        }
-    }
-
-    /// The bytes to record for a stream, with the note when they are not all
-    /// of them and the note for how the stream ended.
+    /// The bytes to record for a proxied stream, with the cap's note when they
+    /// are not all of them and the note for how the stream ended.
     ///
-    /// **Neither transport has an unqualified `seal` to reach for**: an ending
-    /// is not optional information about a body, and a blocking read has an
-    /// ending of its own now that it is bounded — see [`RecordedBody::seal_blocking`].
+    /// **Neither transport has an unqualified seal to reach for**: an ending
+    /// is not optional information about a body — see
+    /// [`RecordedBody::seal_blocking`] for the blocking twin.
     ///
     /// `read_to_end` is whether the upstream read ran to the upstream's own
     /// end — false where the caller's departure, a transport failure or an
     /// oversized event stopped it — because only then is `received` the
     /// response's size rather than how far this app got.
     fn seal_stream(self, delivery: StreamDelivery, read_to_end: bool) -> Vec<u8> {
-        let mut out = seal_recorded_body(
-            self.kept,
-            self.received,
-            RecordedSide::Response { read_to_end },
-        );
+        let mut out = self.seal_response(read_to_end);
         if let Some(note) = delivery.note() {
             out.extend_from_slice(note.as_bytes());
         }
         out
     }
-
-    /// The bytes to record for a **request** body.
-    ///
-    /// **There is no ending to state here, and that is why this seal is its
-    /// own.** A request body was constructed by this app and handed to the
-    /// transport in one piece, so nothing about how it *ended* can be in
-    /// question — only the retention cap can make the row a partial, and the
-    /// cap's own note says exactly that. Every seal names its class, so the
-    /// absence of an ending is a stated fact rather than a forgotten one.
-    ///
-    /// **And the cap's note is a request's note** ([`RecordedSide`]): a shared
-    /// wording had this column saying it kept part of a "response" whose
-    /// remainder "was delivered", which is the other side's story told about
-    /// these bytes.
-    fn seal_request(self) -> Vec<u8> {
-        seal_recorded_body(self.kept, self.received, RecordedSide::Request)
-    }
-
-    /// The bytes to record for a blocking answer, with the note when the
-    /// ceiling — not the upstream — is why the read stopped.
-    fn seal_blocking(self, read: BodyRead) -> Vec<u8> {
-        let mut out = seal_recorded_body(
-            self.kept,
-            self.received,
-            RecordedSide::Response {
-                read_to_end: read == BodyRead::Complete,
-            },
-        );
-        if let Some(note) = read.note() {
-            out.extend_from_slice(note.as_bytes());
-        }
-        out
-    }
-}
-
-/// How a blocking answer's read ended.
-///
-/// The same rule the stream's [`StreamDelivery`] states, on the transport that
-/// now needs it for the same reason: a read this app ended at its own ceiling
-/// looks byte-for-byte like an upstream that finished, so a row carrying no
-/// marker would be a partial claiming to be whole.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BodyRead {
-    /// The upstream closed on its own and everything it sent was read.
-    Complete,
-    /// [`MAX_RESPONSE_BYTES`] stopped the read. What is recorded stops where
-    /// this app stopped reading, not where the upstream stopped sending.
-    CeilingReached,
-}
-
-impl BodyRead {
-    fn note(self) -> Option<String> {
-        match self {
-            BodyRead::Complete => None,
-            // **No claim about what is above**: the retention cap may have
-            // kept less than was read, and its own note says so. What this
-            // note knows is where reading stopped and what that cost.
-            BodyRead::CeilingReached => Some(format!(
-                "\n\n[eidola: the read stopped at the {MAX_RESPONSE_BYTES}-byte ceiling this app \
-                 holds for one answer. Anything the upstream sent beyond it was never read, and \
-                 no answer was passed on.]\n"
-            )),
-        }
-    }
-}
-
-/// One blocking upstream answer, read under [`MAX_RESPONSE_BYTES`].
-type CappedBody = crate::peer_read::BoundedBody;
-
-/// What the Record keeps of a proxied request's body — bounded, and honest
-/// about it. See [`RecordedBody::seal_request`].
-fn recorded_request(body: &Value) -> Vec<u8> {
-    let mut kept = RecordedBody::default();
-    kept.push(body.to_string().as_bytes());
-    kept.seal_request()
-}
-
-/// What the Record keeps of a blocking answer, stating both the retention cap
-/// and the ceiling where either applied.
-fn recorded(answer: &CappedBody) -> Vec<u8> {
-    let mut kept = RecordedBody::default();
-    kept.push(&answer.bytes);
-    // The ceiling can stop the read part-way through a chunk, so more arrived
-    // than was kept to parse; the Record states the larger number.
-    kept.received = answer.received;
-    kept.seal_blocking(if answer.over_ceiling {
-        BodyRead::CeilingReached
-    } else {
-        BodyRead::Complete
-    })
 }
 
 /// Read a blocking answer, bounded **as the bytes arrive**.
@@ -299,7 +137,9 @@ fn recorded(answer: &CappedBody) -> Vec<u8> {
 /// [`MAX_RESPONSE_BYTES`] rather than the retention cap: what the Record keeps
 /// and what this app may hold to answer one caller are different numbers, and
 /// only the second bounds the process.
-async fn read_capped_body(response: reqwest::Response) -> Result<CappedBody, AppError> {
+async fn read_capped_body(
+    response: reqwest::Response,
+) -> Result<CappedBody, crate::peer_read::ReadFailure> {
     crate::peer_read::read_bounded(response, MAX_RESPONSE_BYTES).await
 }
 
@@ -363,75 +203,6 @@ impl StreamDelivery {
             ),
         }
     }
-}
-
-/// Which side of an exchange a recorded body is.
-///
-/// **The cap's note names the side it truncated, because the Record's whole
-/// value is that it describes itself.** One wording for both columns had the
-/// `request_body` column saying it kept part of a "response" whose remainder
-/// "was delivered" — response words, on the bytes this app *sent*, so a reader
-/// looking at a truncated exchange could not tell which half was cut. And each
-/// side's note says exactly what it knows: a request's remainder **went
-/// upstream** — the prompt travels whole, and only the retention is bounded —
-/// while a response's remainder was **received**, and whether it then reached a
-/// caller is the ending's to say (`StreamDelivery`, `BodyRead`), not this note's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RecordedSide {
-    /// A body this app constructed and sent upstream in one piece.
-    Request,
-    /// A body an upstream sent to this app. `read_to_end` is whether the read
-    /// ran to the upstream's own end — only then is the byte count read the
-    /// response's size; otherwise it is a lower bound, and the note says so.
-    Response { read_to_end: bool },
-}
-
-impl RecordedSide {
-    fn cap_note(self, kept: usize, received: usize) -> String {
-        match self {
-            // The size is known — this app built the body whole — but not
-            // whether it was sent: a row is also written for a request
-            // refused before sending or one whose send failed, and the row's
-            // status and error are what say which.
-            RecordedSide::Request => format!(
-                "\n\n[eidola: this Record entry keeps the first {kept} bytes of a {received}-byte \
-                 request. The rest was not retained.]\n"
-            ),
-            // Received, never "delivered": whether these bytes reached a caller
-            // is not this note's to say. A caller can go while a billed stream
-            // drains on for its refund, an oversized event is refused before it
-            // is forwarded, and a blocking answer can be refused outright — and
-            // `StreamDelivery` / `BodyRead` are the notes that answer for each.
-            // Claiming delivery here contradicted them on the same row.
-            RecordedSide::Response { read_to_end: true } => format!(
-                "\n\n[eidola: this Record entry keeps the first {kept} bytes of a {received}-byte \
-                 response. The rest was received and not retained.]\n"
-            ),
-            // **A read this app stopped knows how far it got, not how large the
-            // response was** — `received` is a prefix, so naming it as the
-            // size would understate the body and contradict the ending's note
-            // on the same row. Stated as the lower bound it is.
-            RecordedSide::Response { read_to_end: false } => format!(
-                "\n\n[eidola: this Record entry keeps the first {kept} of the {received} bytes \
-                 this app read of the response before it stopped reading; the response was at \
-                 least that large. The rest of what was read was not retained.]\n"
-            ),
-        }
-    }
-}
-
-/// Take a whole body down to what the Record keeps, saying so — and saying
-/// which side it is — if it did.
-fn seal_recorded_body(mut kept: Vec<u8>, received: usize, side: RecordedSide) -> Vec<u8> {
-    if kept.len() > RECORD_BODY_MAX_BYTES {
-        kept.truncate(RECORD_BODY_MAX_BYTES);
-    }
-    if received <= kept.len() {
-        return kept;
-    }
-    let note = side.cap_note(kept.len(), received);
-    kept.extend_from_slice(note.as_bytes());
-    kept
 }
 
 /// Whether the proxy puts a `traceparent` on the upstream request.
@@ -1268,19 +1039,7 @@ impl Inner {
     ) -> Result<String, AppError> {
         let conn = self.db_conn().await?;
         let provider_id = db::ensure_provider(&conn, backend_id, "inference", now).await?;
-        let id = Uuid::now_v7().to_string();
-        db::insert_connection(
-            &conn,
-            &id,
-            &provider_id,
-            base_url,
-            "clearnet",
-            None,
-            now,
-            now,
-        )
-        .await?;
-        Ok(id)
+        crate::insert_plain_connection(&conn, &provider_id, base_url, now).await
     }
 
     /// The completion ceiling this request asks for.
@@ -1644,7 +1403,8 @@ impl Inner {
         let status = response.status();
         let answer = match read_capped_body(response).await {
             Ok(answer) => answer,
-            Err(error) => {
+            Err(failure) => {
+                let error = failure.error;
                 self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
                     .await;
                 self.record_proxy_request(
@@ -1652,7 +1412,7 @@ impl Inner {
                     &headers,
                     &body,
                     Some(status.as_u16()),
-                    Vec::new(),
+                    recorded_cut_answer(&failure.partial),
                     Some(error.to_string()),
                     nonce,
                     request_at,
@@ -1699,17 +1459,25 @@ impl Inner {
         // not accept is recorded as an error too, or the Record shows the
         // exchange as the success the caller was explicitly not given. A
         // non-2xx needs no such column — its status already says what happened.
-        let refusal = status
-            .is_success()
-            .then(|| match parsed.as_ref() {
-                None if answer.over_ceiling => Some(oversized_answer(&route.backend_id)),
-                None => Some(malformed_json_answer(&route.backend_id, status.as_u16())),
-                Some(body) if !is_completion(body) => {
-                    Some(shapeless_answer(&route.backend_id, status.as_u16()))
-                }
-                Some(_) => None,
-            })
-            .flatten();
+        //
+        // **And the ceiling refuses whatever the status.** A non-2xx is passed
+        // through as the upstream's own answer only when it arrived whole; a
+        // fragment of one is this app's refusal like any other
+        // (`answer_past_ceiling`).
+        let refusal = if answer.over_ceiling {
+            Some(crate::peer_read::answer_past_ceiling(&route.backend_id))
+        } else {
+            status
+                .is_success()
+                .then(|| match parsed.as_ref() {
+                    None => Some(malformed_json_answer(&route.backend_id, status.as_u16())),
+                    Some(body) if !is_completion(body) => {
+                        Some(shapeless_answer(&route.backend_id, status.as_u16()))
+                    }
+                    Some(_) => None,
+                })
+                .flatten()
+        };
         self.settle_proxy_refund(
             &db_conn,
             &spend,
@@ -1723,7 +1491,7 @@ impl Inner {
             &headers,
             &body,
             Some(status.as_u16()),
-            recorded(&answer),
+            recorded_answer(&answer),
             refusal.as_ref().map(ToString::to_string),
             nonce,
             request_at,
@@ -1731,6 +1499,11 @@ impl Inner {
         )
         .await;
 
+        if answer.over_ceiling
+            && let Some(refusal) = refusal
+        {
+            return Err(refusal);
+        }
         if !status.is_success() {
             return Err(AppError::Server {
                 status: status.as_u16(),
@@ -1874,7 +1647,8 @@ impl Inner {
             // return it.
             let answer = match read_capped_body(response).await {
                 Ok(answer) => answer,
-                Err(error) => {
+                Err(failure) => {
+                    let error = failure.error;
                     self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
                         .await;
                     self.record_proxy_request(
@@ -1882,7 +1656,7 @@ impl Inner {
                         &headers,
                         &body,
                         Some(status.as_u16()),
-                        Vec::new(),
+                        recorded_cut_answer(&failure.partial),
                         Some(error.to_string()),
                         nonce,
                         request_at,
@@ -1906,9 +1680,15 @@ impl Inner {
             // to. This is the arm the blocking transport already covered by
             // reading `refund` off the parsed body before it looks at the
             // status.
-            let inline = serde_json::from_str::<Value>(&text)
-                .ok()
+            // A body the ceiling stopped is never parsed (the `whole_text`
+            // rule) and is refused whatever its status.
+            let inline = (!answer.over_ceiling)
+                .then(|| serde_json::from_str::<Value>(&text).ok())
+                .flatten()
                 .and_then(|body| body.get("refund").cloned());
+            let refusal = answer
+                .over_ceiling
+                .then(|| crate::peer_read::answer_past_ceiling(&route.backend_id));
             self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
@@ -1916,17 +1696,17 @@ impl Inner {
                 &headers,
                 &body,
                 Some(status.as_u16()),
-                recorded(&answer),
-                None,
+                recorded_answer(&answer),
+                refusal.as_ref().map(ToString::to_string),
                 nonce,
                 request_at,
                 now_ms(),
             )
             .await;
-            return Err(AppError::Server {
+            return Err(refusal.unwrap_or_else(|| AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&text),
-            });
+            }));
         }
 
         // **A `200` is not an answer until it is the *shape* that was asked
@@ -1959,7 +1739,8 @@ impl Inner {
             // return it.
             let answer = match read_capped_body(response).await {
                 Ok(answer) => answer,
-                Err(error) => {
+                Err(failure) => {
+                    let error = failure.error;
                     self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
                         .await;
                     self.record_proxy_request(
@@ -1967,7 +1748,7 @@ impl Inner {
                         &headers,
                         &body,
                         Some(status.as_u16()),
-                        Vec::new(),
+                        recorded_cut_answer(&failure.partial),
                         Some(error.to_string()),
                         nonce,
                         request_at,
@@ -1978,13 +1759,19 @@ impl Inner {
                 }
             };
             let text = answer.text();
-            let inline = serde_json::from_str::<Value>(&text)
-                .ok()
+            let inline = (!answer.over_ceiling)
+                .then(|| serde_json::from_str::<Value>(&text).ok())
+                .flatten()
                 .and_then(|body| body.get("refund").cloned());
             // The refusal is this app's, so the row carries it: the upstream
             // said `200` and nothing was forwarded, which a row holding only
-            // that status would present as an answered request.
-            let refusal = malformed_stream_answer(&route.backend_id, status.as_u16());
+            // that status would present as an answered request. The ceiling,
+            // where it stopped the read, is the refusal that names it.
+            let refusal = if answer.over_ceiling {
+                crate::peer_read::answer_past_ceiling(&route.backend_id)
+            } else {
+                malformed_stream_answer(&route.backend_id, status.as_u16())
+            };
             self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
@@ -1992,7 +1779,7 @@ impl Inner {
                 &headers,
                 &body,
                 Some(status.as_u16()),
-                recorded(&answer),
+                recorded_answer(&answer),
                 Some(refusal.to_string()),
                 nonce,
                 request_at,
@@ -2052,7 +1839,14 @@ impl Inner {
             };
             raw.push(&bytes);
             buf.extend_from_slice(&bytes);
+            let mut oversized = false;
             while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
+                // The frame ceiling is asked of a complete event **before** it
+                // is drained and forwarded (`peer_read::event_past_ceiling`).
+                if crate::peer_read::event_past_ceiling(Some(pos), 0) {
+                    oversized = true;
+                    break;
+                }
                 let event: Vec<u8> = buf.drain(..pos).collect();
                 let terminator: Vec<u8> = buf.drain(..boundary_len).collect();
                 let (mut out, refund) = forward_sse_event(&event, &route.canonical);
@@ -2089,18 +1883,13 @@ impl Inner {
             // it is the one buffer on this path with no ceiling of its own: the
             // retention cap bounds the Record and the queue bounds delivery,
             // while a backend that never terminates an event grows this until
-            // the process dies. Checked after the drain, so what is measured is
-            // an event with no boundary in it rather than a chunk that happened
-            // to straddle one; the residual is a single transport chunk of
-            // overshoot, which is the transport's own bound rather than ours.
-            if buf.len() > MAX_SSE_EVENT_BYTES {
-                read_error = Some(AppError::Network {
-                    message: format!(
-                        "`{}` sent a single event past the {MAX_SSE_EVENT_BYTES}-byte ceiling \
-                         this app will hold, or never ended one",
-                        route.backend_id
-                    ),
-                });
+            // the process dies. That residual half is measured after the drain;
+            // the complete half — an oversized event whose boundary arrived in
+            // the same read, which the drain would otherwise have taken whole —
+            // is refused before it (`oversized`). The residual overshoot is a
+            // single transport chunk, the transport's own bound rather than ours.
+            if oversized || crate::peer_read::event_past_ceiling(None, buf.len()) {
+                read_error = Some(crate::peer_read::oversized_event(&route.backend_id));
                 // Refused, so not forwarded: the tail below exists to hand a
                 // downstream parser the bytes the upstream really sent, and
                 // these are the bytes this app has just declined to accept.
@@ -2420,17 +2209,6 @@ fn shapeless_answer(backend_id: &str, status: u16) -> AppError {
     }
 }
 
-/// A `2xx` whose body crossed [`MAX_RESPONSE_BYTES`] — refused on the app's own
-/// decision to stop reading, never on what the fragment happens to parse as.
-fn oversized_answer(backend_id: &str) -> AppError {
-    AppError::Network {
-        message: format!(
-            "`{backend_id}` sent an answer past the {MAX_RESPONSE_BYTES}-byte ceiling this app \
-             reads, so what arrived is a fragment rather than an answer"
-        ),
-    }
-}
-
 /// The streaming twin: a `2xx` that is not server-sent events.
 fn malformed_stream_answer(backend_id: &str, status: u16) -> AppError {
     AppError::Network {
@@ -2439,27 +2217,6 @@ fn malformed_stream_answer(backend_id: &str, status: u16) -> AppError {
              server-sent events"
         ),
     }
-}
-
-/// Whether a response's own headers say it is server-sent events.
-///
-/// The media type only — parameters (`; charset=utf-8`) are the sender's
-/// business — and an **absent** header answers `true`, which is the permissive
-/// half of the rule stated at the call site.
-fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
-    let Some(value) = headers.get(reqwest::header::CONTENT_TYPE) else {
-        return true;
-    };
-    value
-        .to_str()
-        .map(|v| {
-            v.split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .eq_ignore_ascii_case("text/event-stream")
-        })
-        .unwrap_or(false)
 }
 
 /// One SSE event on its way downstream, and the refund it was carrying.
@@ -2552,6 +2309,7 @@ fn forward_sse_event(event: &[u8], canonical: &str) -> (Vec<u8>, Option<Value>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recorded::RECORD_BODY_MAX_BYTES;
 
     fn headers(auth: Option<&str>, streaming: bool, trace: TraceUpstream) -> UpstreamHeaders {
         UpstreamHeaders {
@@ -2962,14 +2720,27 @@ mod tests {
             answer.bytes.len()
         );
         assert!(answer.over_ceiling, "and it knows why it stopped");
-        let row = String::from_utf8_lossy(&recorded(&answer)).to_string();
+        let row = String::from_utf8_lossy(&recorded_answer(&answer)).to_string();
         assert!(
             row.contains("keeps the first"),
             "the retention cap still speaks"
         );
         assert!(
-            row.contains("never read"),
+            row.contains("Nothing past the ceiling was kept"),
             "and a read this app ended is not an upstream that finished"
+        );
+        // **One boundary on the row.** The crossing chunk is cut at the
+        // ceiling and its remainder dropped unexamined, so the count every
+        // note states is the ceiling itself — never a larger "received" figure
+        // beside a note saying nothing past the ceiling was read.
+        assert!(
+            row.contains(&format!("of the {MAX_RESPONSE_BYTES} bytes this app read")),
+            "the cap's count is the ceiling's: {}",
+            &row[row.len().saturating_sub(600)..]
+        );
+        assert!(
+            !row.contains("never read"),
+            "and no note claims more than it knows"
         );
         // **And the row never names a prefix as the size.** The read stopped
         // at the ceiling, so what it counted is how far it got: the cap's note
@@ -2981,7 +2752,7 @@ mod tests {
             &row[row.len().saturating_sub(600)..]
         );
         assert!(
-            !row.contains(&format!("{}-byte response", answer.received)),
+            !row.contains(&format!("{}-byte response", answer.bytes.len())),
             "a prefix is not reported as the response's size"
         );
         assert!(
@@ -2999,7 +2770,7 @@ mod tests {
         let answer = read_capped_body(response).await.expect("read");
         assert_eq!(answer.text(), r#"{"ok":true}"#);
         assert!(!answer.over_ceiling);
-        assert_eq!(recorded(&answer), br#"{"ok":true}"#.to_vec());
+        assert_eq!(recorded_answer(&answer), br#"{"ok":true}"#.to_vec());
     }
 
     /// **Every send downstream updates the ending the Record will state.**

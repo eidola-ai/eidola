@@ -197,7 +197,7 @@ impl Inner {
                     }
                 };
                 Ok(UtilityRoute {
-                    client: self.plain_client()?,
+                    client: self.completion_client()?,
                     base_url: engine_url,
                     wire_model: target.canonical.clone(),
                     pricing: None,
@@ -213,7 +213,7 @@ impl Inner {
                         message: format!("backend `{}` has no base URL", backend.id),
                     })?;
                 Ok(UtilityRoute {
-                    client: self.plain_client()?,
+                    client: self.completion_client()?,
                     base_url,
                     wire_model: target.model.clone(),
                     pricing: None,
@@ -343,6 +343,7 @@ impl Inner {
         let text =
             match crate::peer_read::read_bounded(response, crate::peer_read::API_ANSWER_MAX_BYTES)
                 .await
+                .map_err(AppError::from)
                 .and_then(|body| crate::peer_read::whole_text(body, &what))
             {
                 Ok(text) => text,

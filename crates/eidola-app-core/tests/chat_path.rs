@@ -567,7 +567,8 @@ fn streaming_chat_delivers_deltas_and_persists() {
         assert!(changes.contains(&Change::Wallet));
         assert!(changes.contains(&Change::Record));
 
-        // Streaming always goes through the recovery endpoint for its refund.
+        // This stream carries no refund event, so recovery answers for its
+        // absence.
         assert!(mock.refund_hits() >= 1);
 
         let messages = core
@@ -3618,7 +3619,7 @@ fn streaming_non_2xx_emits_record_and_space() {
 #[test]
 fn mid_sse_abort_emits_user_turn_and_keeps_the_post() {
     run(|| {
-        let (_mock, core, _dir) = setup(MockConfig {
+        let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::StreamingMidAbort,
             ..MockConfig::default()
         });
@@ -3635,18 +3636,31 @@ fn mid_sse_abort_emits_user_turn_and_keeps_the_post() {
         assert!(matches!(err, AppError::Network { .. }), "got {:?}", err);
 
         let changes = drain(&mut rx);
-        // User turn committed before the stream began reading → Space + SpaceIndex
-        // + Wallet, but no Record (request row not written on mid-stream failure).
+        // User turn committed before the stream began reading → Space +
+        // SpaceIndex + Wallet; and the exchange that died is a Record row with
+        // the read failure as its error — a failure of an exchange that
+        // happened, which is the one a reader opens the Record for.
         assert!(
             changes.contains(&Change::Space(space_id.clone())),
             "got {changes:?}"
         );
         assert!(changes.contains(&Change::SpaceIndex), "got {changes:?}");
         assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1);
         assert!(
-            !changes.contains(&Change::Record),
-            "no Record on mid-SSE abort; got {changes:?}"
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("stream read failed")),
+            "{:?}",
+            rows[0].error
         );
+        // The hold settles on this exit too — the stream died before any
+        // refund event, so recovery answers for its absence.
+        assert!(mock.refund_hits() >= 1, "the hold went to recovery");
+        assert_settled(&core);
 
         let messages = core
             .runtime()
@@ -6835,6 +6849,766 @@ fn a_hold_whose_turn_ended_without_settling_it_is_recovered() {
             recovered.len(),
             1,
             "and nothing holds it out of recovery once its turn is over"
+        );
+    });
+}
+
+// ===========================================================================
+// The refund class on the turn path: every arm on which the server can hand
+// a refund back, settled from the token it handed over — recovery only for its
+// absence. `RefundMode::NotStored` is the server whose own persistence of the
+// token failed: the in-band copy is still sent and recovery answers `404`, so a
+// passing test here cannot be recovery in disguise.
+// ===========================================================================
+
+/// Drive one streaming ask to its end, draining the deltas.
+fn stream_once(core: &AppCore, prompt: &str) -> Result<eidola_app_core::ChatResult, AppError> {
+    let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+    core.runtime().block_on(async {
+        let drain = async { while events_rx.recv().await.is_some() {} };
+        let chat = core.chat_stream(prompt.into(), MODEL.into(), None, tx);
+        let (res, ()) = tokio::join!(chat, drain);
+        res
+    })
+}
+
+/// The wallet holds nothing mid-spend and at least one credential reached
+/// `spent` — the hold this turn took was settled.
+fn assert_settled(core: &AppCore) {
+    let wallet = core
+        .runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("wallet");
+    assert!(
+        wallet.iter().any(|c| c.state == "spent"),
+        "the hold settled: {wallet:?}"
+    );
+    assert!(
+        !wallet.iter().any(|c| c.state == "spending"),
+        "nothing is stranded mid-spend: {wallet:?}"
+    );
+}
+
+/// The completion rows the Record holds, newest first.
+fn completion_rows(core: &AppCore) -> Vec<eidola_app_core::RequestInfo> {
+    core.runtime()
+        .block_on(core.list_requests(50, 0))
+        .expect("record")
+        .into_iter()
+        .filter(|r| r.path == "/v1/chat/completions")
+        .collect()
+}
+
+fn request_detail(core: &AppCore, id: &str) -> eidola_app_core::RequestDetail {
+    core.runtime()
+        .block_on(core.request_detail(id.to_string()))
+        .expect("detail")
+        .expect("a recorded row")
+}
+
+/// REGRESSION: **a streamed turn settles from the refund its metadata event
+/// carried.**
+///
+/// The server closes a stream with an `eidola.chat.completion.metadata` event
+/// carrying the refund, and sends it even when its own best-effort persistence
+/// of that token failed — the arm where recovery can never answer. The turn
+/// used to discard the event and ask recovery anyway, under a comment saying
+/// SSE carries no inline refund, which stranded the credential in `spending`
+/// for good. Both framings: one data field per event, and the payload split
+/// across several (`sse_event_data`).
+#[test]
+fn a_streamed_turn_settles_from_the_refund_its_metadata_event_carried() {
+    for behavior in [
+        ChatBehavior::StreamingWithMetadataRefund,
+        ChatBehavior::StreamingSplitDataFields,
+    ] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: behavior,
+                refund: RefundMode::NotStored,
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let mut rx = core.subscribe_changes();
+
+            let res = stream_once(&core, "stream me").expect("the turn completes");
+            assert_eq!(res.content, "Hello from the stream.", "{behavior:?}");
+            assert_settled(&core);
+            assert_eq!(
+                mock.refund_hits(),
+                0,
+                "{behavior:?}: the token in the stream settled the hold; recovery is for its \
+                 absence"
+            );
+            let changes = drain(&mut rx);
+            assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+            assert!(changes.contains(&Change::Record), "got {changes:?}");
+        });
+    }
+}
+
+/// REGRESSION: **a stream that never opened still settles from the refund its
+/// error body carried.**
+///
+/// A streaming request that fails after the server recorded the nullifier —
+/// request validation, `send_stream`, a spend-proof re-encode — answers with a
+/// refund-bearing JSON error body rather than a stream. The non-2xx arm read
+/// the body for its message only and asked recovery for the token.
+#[test]
+fn a_pre_stream_failure_settles_from_the_refund_its_error_body_carried() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xxWithRefund(503),
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = stream_once(&core, "stream me").expect_err("a stream that never opened");
+        assert!(
+            matches!(err, AppError::Server { status: 503, .. }),
+            "the upstream's own status: {err:?}"
+        );
+        assert_settled(&core);
+        assert_eq!(mock.refund_hits(), 0, "recovery is for an absent token");
+
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].response_status, Some(503));
+        assert_eq!(
+            rows[0].error, None,
+            "a non-2xx needs no error column — its status says what happened"
+        );
+    });
+}
+
+/// REGRESSION: **a `2xx` is not a stream until it is the shape that was asked
+/// for — and the whole completion it carried still settles the hold.**
+///
+/// A backend that ignored `stream: true` answers a whole JSON completion,
+/// refund and all. Parsed as SSE it yields no events and ends without `[DONE]`,
+/// so the turn failed as a dropped connection and the body — the only copy of
+/// the token, where the server's persistence failed — was never read.
+/// `OkBlocking` answers JSON whatever transport asked, which is precisely the
+/// fixture.
+#[test]
+fn a_streamed_ask_answered_with_a_whole_completion_is_refused_and_settles_from_it() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = stream_once(&core, "stream me").expect_err("not a stream");
+        match &err {
+            AppError::Network { message } => assert!(
+                message.contains("server-sent events"),
+                "named for the shape it was not: {message}"
+            ),
+            other => panic!("expected a Network shape refusal, got {other:?}"),
+        }
+        assert_settled(&core);
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "the body's own token settled the hold"
+        );
+
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.len(),
+            1,
+            "no answer is written from a refused shape"
+        );
+
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].response_status, Some(200));
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("server-sent events")),
+            "the row carries this app's refusal, not only the upstream's 200: {:?}",
+            rows[0].error
+        );
+    });
+}
+
+/// **The blocking arms were already clean, and stay pinned.** The blocking
+/// round reads `refund` off the parsed body ahead of the status check, so a
+/// `2xx` answer and a refund-bearing error body both settle from their own
+/// token — asserted here against the server whose persistence failed, where
+/// recovery would have nothing to give.
+#[test]
+fn the_blocking_arms_settle_from_the_refund_their_bodies_carried() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("a blocking answer");
+        assert_settled(&core);
+        assert_eq!(mock.refund_hits(), 0);
+    });
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xxWithRefund(500),
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("an error body");
+        assert!(
+            matches!(err, AppError::Server { status: 500, .. }),
+            "{err:?}"
+        );
+        assert_settled(&core);
+        assert_eq!(mock.refund_hits(), 0);
+    });
+}
+
+/// REGRESSION: **a body that could not be read is a read failure, not an
+/// empty answer** — on both pre-stream arms. An upstream that reset after its
+/// head used to read as an empty error document (the non-2xx arm defaulted the
+/// failed read), so the turn reported the upstream's status for what was a
+/// transport failure and the Record kept nothing of it.
+#[test]
+fn a_pre_stream_body_cut_short_is_reported_as_the_read_failure() {
+    for (status, content_type) in [(503, "application/json"), (200, "application/json")] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::HeadThenCut {
+                    status,
+                    content_type,
+                },
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let err = stream_once(&core, "stream me").expect_err("the body never arrived");
+            assert!(
+                matches!(err, AppError::Network { .. }),
+                "{status}: a transport failure, not the head's claim: {err:?}"
+            );
+            assert!(mock.refund_hits() >= 1, "the hold went to recovery");
+            assert_settled(&core);
+            let rows = completion_rows(&core);
+            assert_eq!(rows.len(), 1, "the exchange is in the Record");
+            assert!(rows[0].error.is_some(), "with the failure as its error");
+            assert_cut_prefix_recorded(&core, &rows[0].id);
+        });
+    }
+}
+
+/// **What arrived before the reset is part of the exchange**, so the Record
+/// keeps it: `HeadThenCut` sends a head, the first bytes of a JSON body and
+/// then nothing. A row holding an empty body would describe an exchange in
+/// which no bytes came back.
+fn assert_cut_prefix_recorded(core: &AppCore, id: &str) {
+    let recorded = request_detail(core, id).response_body.unwrap_or_default();
+    assert!(
+        recorded.starts_with(br#"{"error":"#),
+        "the prefix that arrived is recorded: {:?}",
+        String::from_utf8_lossy(&recorded)
+    );
+}
+
+/// The blocking twin: a body cut short fails the turn as the read failure it
+/// is, settles the hold, and keeps what arrived.
+#[test]
+fn a_blocking_body_cut_short_is_recorded_with_what_arrived() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::HeadThenCut {
+                status: 200,
+                content_type: "application/json",
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("the body never arrived");
+        assert!(matches!(err, AppError::Network { .. }), "{err:?}");
+        assert!(mock.refund_hits() >= 1, "the hold went to recovery");
+        assert_settled(&core);
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1, "the exchange is in the Record");
+        assert!(rows[0].error.is_some(), "with the failure as its error");
+        assert_cut_prefix_recorded(&core, &rows[0].id);
+    });
+}
+
+// ===========================================================================
+// What the turn reads and what it keeps: every peer read bounded as it
+// arrives, and every recorded body bounded and honest about it.
+// ===========================================================================
+
+/// REGRESSION: **one event may not grow without end.** A backend that never
+/// terminates an event grew the frame buffer until the process died; the turn
+/// now refuses it at the frame ceiling, settles the hold, and records why.
+#[test]
+fn an_event_that_never_ends_fails_the_turn_rather_than_accumulating() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingUnterminatedFlood,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = stream_once(&core, "stream me").expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "{err:?}"
+        );
+        assert!(mock.refund_hits() >= 1);
+        assert_settled(&core);
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+    });
+}
+
+/// REGRESSION: **the frame ceiling holds for an event that arrives whole.**
+/// The ceiling was measured only on what was left in the buffer after complete
+/// events were drained, so an oversized event whose terminating blank line
+/// came in the same read was taken whole — any size up to the whole-stream
+/// ceiling, parsed, forwarded and persisted. It is now asked of each complete
+/// event before it is drained.
+#[test]
+fn an_oversized_complete_event_fails_the_turn() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingOneOversizedEvent,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = stream_once(&core, "stream me").expect_err("refused at the frame ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("single event")),
+            "{err:?}"
+        );
+        assert_settled(&core);
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.len(),
+            1,
+            "no answer is written from a refused event"
+        );
+    });
+}
+
+/// REGRESSION: **a stream may not deliver without end either.** Every event
+/// here is small and well framed, so no frame bound trips; the turn assembles
+/// the deltas into an answer in memory, and a stream without end was an answer
+/// without end. It now stops at the read ceiling, writes no answer, and keeps
+/// a Record row that states a lower bound rather than a size.
+#[test]
+fn a_stream_past_the_read_ceiling_fails_the_turn() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingPastReadCeiling,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = stream_once(&core, "stream me").expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "{err:?}"
+        );
+        assert_settled(&core);
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.len(),
+            1,
+            "no answer is written from a refused read"
+        );
+
+        let rows = completion_rows(&core);
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        let text = String::from_utf8_lossy(&recorded);
+        assert!(
+            text.contains("at least that large"),
+            "a stopped read names a lower bound: {}",
+            &text[text.len().saturating_sub(300)..]
+        );
+    });
+}
+
+/// REGRESSION: **a blocking answer is bounded as it arrives, and a body the
+/// ceiling stopped is refused whatever it parses as.** `resp.text()` buffered
+/// the whole answer before anything could cap it; the padded complete object
+/// is the case where a truncated read still parses, so the refusal has to be
+/// decided by the ceiling rather than inferred from the parse.
+#[test]
+fn a_blocking_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingPaddedPastCeiling,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "{err:?}"
+        );
+        assert!(
+            mock.refund_hits() >= 1,
+            "nothing parsed, so recovery answers"
+        );
+        assert_settled(&core);
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "the parsed prefix is not an answer");
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        let text = String::from_utf8_lossy(&recorded);
+        assert!(
+            text.contains("the read stopped at the"),
+            "the row says where reading stopped: {}",
+            &text[text.len().saturating_sub(300)..]
+        );
+    });
+}
+
+/// REGRESSION: **the ceiling refuses whatever the status.** A non-2xx is
+/// excused from parsing — an error document need not be JSON — and that
+/// excuse swallowed the ceiling: a fragment of an oversized error body became
+/// an error generation and a `Server` error carrying a message read off the
+/// fragment. Both transports.
+#[test]
+fn a_non_2xx_body_past_the_read_ceiling_is_refused_too() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xxPaddedPastCeiling(500),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "the ceiling, not the status: {err:?}"
+        );
+        assert_settled(&core);
+        let space_id = only_space(&core);
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space_id.clone()))
+            .expect("tree");
+        assert!(
+            !tree.iter().any(|n| n.action_type == "inference"),
+            "no error generation is written from a fragment"
+        );
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+
+        let err = stream_once(&core, "stream me").expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "the streaming pre-stream read too: {err:?}"
+        );
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+    });
+}
+
+/// REGRESSION: **what the Record keeps of an answer is bounded, and a partial
+/// says so** — while the answer itself is untouched.
+#[test]
+fn a_long_answer_is_kept_whole_and_recorded_as_the_truncation_it_is() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreamingOversized,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let res = stream_once(&core, "stream me").expect("the turn completes");
+        assert_eq!(res.content.len(), 1_200_000, "the answer is whole");
+
+        let rows = completion_rows(&core);
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        assert!(
+            recorded.len() < 1_200_000,
+            "what is retained is bounded: {} bytes",
+            recorded.len()
+        );
+        let text = String::from_utf8_lossy(&recorded);
+        assert!(
+            text.contains("this Record entry keeps the first"),
+            "and a partial says it is one: {}",
+            &text[text.len().saturating_sub(300)..]
+        );
+    });
+}
+
+/// REGRESSION: **the request column is bounded too, and it is the durable
+/// half.** Every turn wrote its whole request body down — a long conversation's
+/// prompt, every round, into the profile database and its WAL with nothing
+/// pruning it. The prompt still travels upstream whole; what is bounded is
+/// what is kept, and a row that keeps less says so in a request's words.
+#[test]
+fn an_enormous_prompt_is_recorded_as_the_truncation_it_is() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        let prompt = "x".repeat(2 * 1024 * 1024);
+        core.runtime()
+            .block_on(core.chat(prompt, MODEL.into(), None))
+            .expect("the turn completes");
+
+        let seen = mock.chat_bodies()[0].to_string();
+        assert!(seen.len() > 2 * 1024 * 1024, "the prompt travels whole");
+
+        let rows = completion_rows(&core);
+        let recorded = request_detail(&core, &rows[0].id)
+            .request_body
+            .expect("a request body");
+        assert!(
+            recorded.len() < seen.len(),
+            "the row keeps less than travelled: {} of {}",
+            recorded.len(),
+            seen.len()
+        );
+        let text = String::from_utf8_lossy(&recorded);
+        let tail = &text[text.len().saturating_sub(300)..];
+        assert!(tail.contains("-byte request"), "a request's note: {tail}");
+        assert!(
+            !tail.contains("response") && !tail.contains("delivered"),
+            "never the response's words: {tail}"
+        );
+    });
+}
+
+// ===========================================================================
+// Where a plain route's prompt went: a `connection` row, not a pointer to a
+// backend row that can change.
+// ===========================================================================
+
+/// REGRESSION: **the Record says where an external backend's prompt went, after
+/// anything is done to the backend.** The turn's external route wrote no
+/// `connection` row, so the request's only path to a URL was its `backend_id`
+/// — a key to a row the reader can replace under the same name.
+#[test]
+fn an_external_turns_destination_survives_the_backend_being_replaced() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        core.runtime()
+            .block_on(core.chat("hi".into(), "qwen3-8b@ext".into(), None))
+            .expect("the turn completes");
+
+        core.runtime().block_on(async {
+            core.remove_backend("ext".to_string())
+                .await
+                .expect("remove");
+        });
+        external_backend(&core, "https://somewhere-else.example");
+
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1);
+        let detail = request_detail(&core, &rows[0].id);
+        assert_eq!(
+            detail.base_url.as_deref(),
+            Some(mock.base_url.as_str()),
+            "the Record still says where the prompt went"
+        );
+        assert_eq!(detail.transport.as_deref(), Some("clearnet"));
+        assert_eq!(
+            detail.attestation_hash, None,
+            "and claims no verification that never happened"
+        );
+    });
+}
+
+/// The engine twin: an engine's address is a port this process picked, and the
+/// next start picks another, so only a row written as the turn sends can say
+/// where its prompt went. Streaming, so both transports are held between this
+/// and the external test.
+#[test]
+fn an_engine_turns_destination_is_recorded() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        core.test_register_loaded_local_model("local", "engine", mock.port());
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(async {
+                let drain = async { while events_rx.recv().await.is_some() {} };
+                let chat = core.chat_stream("hi".into(), "engine@local".into(), None, tx);
+                let (res, ()) = tokio::join!(chat, drain);
+                res
+            })
+            .expect("the turn completes");
+
+        let rows = completion_rows(&core);
+        let detail = request_detail(&core, &rows[0].id);
+        assert_eq!(
+            detail.base_url.as_deref(),
+            Some(format!("http://127.0.0.1:{}", mock.port()).as_str()),
+            "the engine's address at the time is in the Record"
+        );
+        assert_eq!(detail.transport.as_deref(), Some("clearnet"));
+        assert_eq!(detail.attestation_hash, None);
+    });
+}
+
+/// **An attested route writes no plain row.** Its destination comes from the
+/// handshake's own `connection` row, and a clearnet row with no attestation
+/// beside it would claim an unverified transport for a route that verifies
+/// every connection. The harness's injected client observes no handshake, so
+/// the Eidola turn here records no connection at all — which is exactly what
+/// distinguishes "not a plain route" from "a plain route".
+#[test]
+fn an_attested_turn_writes_no_plain_connection() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect("the turn completes");
+        let rows = completion_rows(&core);
+        let detail = request_detail(&core, &rows[0].id);
+        assert_eq!(detail.transport, None, "{:?}", detail.base_url);
+    });
+}
+
+// ===========================================================================
+// Redirects: a turn's prompt goes to the origin the reader configured, or
+// nowhere.
+// ===========================================================================
+
+/// REGRESSION: **a turn does not follow a redirect.**
+///
+/// reqwest's default policy follows up to ten and replays a cloneable body on
+/// `307`/`308`, so an external backend (or anything between) could answer
+/// `/v1/chat/completions` with a `Location` pointing anywhere and be handed the
+/// whole conversation at an origin the reader never configured — while the
+/// Record went on naming the backend that was. The redirect is the answer
+/// instead: the turn fails with the upstream's own status and nothing leaves
+/// for the other origin. Both transports.
+///
+/// An **ordinary** core: the harness's injected client would answer for the
+/// one the turn builds, and the policy is what is being held.
+#[test]
+fn a_turn_does_not_follow_a_redirect() {
+    run(|| {
+        let (backend_url, reached) = chat_harness::redirecting_upstream();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("core");
+        external_backend(&core, &backend_url);
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("a private prompt".into(), "m@ext".into(), None))
+            .expect_err("a redirect is not an answer");
+        assert!(
+            matches!(err, AppError::Server { status: 307, .. }),
+            "the upstream's own status, not a chased one: {err:?}"
+        );
+        let space = only_space(&core);
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let err = core
+            .runtime()
+            .block_on(async {
+                let drain = async { while events_rx.recv().await.is_some() {} };
+                let chat = core.chat_stream(
+                    "another private prompt".into(),
+                    "m@ext".into(),
+                    Some(space.clone()),
+                    tx,
+                );
+                let (res, ()) = tokio::join!(chat, drain);
+                res
+            })
+            .expect_err("a redirect is not a stream");
+        assert!(
+            matches!(err, AppError::Server { status: 307, .. }),
+            "{err:?}"
+        );
+        assert!(
+            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            "and no prompt left for an origin the reader did not configure"
         );
     });
 }
