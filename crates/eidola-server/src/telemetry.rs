@@ -205,27 +205,59 @@ where
         .with_context_activation(false)
 }
 
-/// The HTTP client all three OTLP exporters send through.
+/// The HTTP clients the OTLP exporters send through, one per signal.
 ///
 /// Left to itself the exporter builds a default `reqwest` 0.13 client, which
 /// verifies against the platform trust store — and the server runs `FROM
 /// scratch` with none, so that client cannot be built and an HTTPS collector
-/// (Grafana Cloud in production) is unreachable. This client carries the
+/// (Grafana Cloud in production) is unreachable. These clients carry the
 /// bundled Mozilla roots every other outbound client here uses
-/// ([`crate::tls_config`]). A client handed to the exporter does not inherit
-/// the exporter's timeout, so it sets the OTLP default (10 s) itself. Built on
-/// its own thread, as the exporter builds its default, because a blocking
-/// client must not be constructed inside the tokio runtime `main` runs in.
-fn otlp_http_client() -> reqwest::blocking::Client {
-    std::thread::spawn(|| {
-        reqwest::blocking::Client::builder()
-            .tls_backend_preconfigured(crate::tls_config())
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build OTLP HTTP client")
+/// ([`crate::tls_config`]). A client handed to the exporter does not get the
+/// exporter's timeout, so each one carries the timeout the exporter would have
+/// resolved for its signal ([`otlp_timeout`]). Built on their own thread, as
+/// the exporter builds its default, because a blocking client must not be
+/// constructed inside the tokio runtime `main` runs in.
+struct OtlpHttpClients {
+    traces: reqwest::blocking::Client,
+    metrics: reqwest::blocking::Client,
+    logs: reqwest::blocking::Client,
+}
+
+fn otlp_http_clients() -> OtlpHttpClients {
+    let env = |name: &str| std::env::var(name).ok();
+    let timeouts = [
+        otlp_timeout(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT, env),
+        otlp_timeout(opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_TIMEOUT, env),
+        otlp_timeout(opentelemetry_otlp::OTEL_EXPORTER_OTLP_LOGS_TIMEOUT, env),
+    ];
+    std::thread::spawn(move || {
+        let [traces, metrics, logs] = timeouts.map(|timeout| {
+            reqwest::blocking::Client::builder()
+                .tls_backend_preconfigured(crate::tls_config())
+                .timeout(timeout)
+                .build()
+                .expect("failed to build OTLP HTTP client")
+        });
+        OtlpHttpClients {
+            traces,
+            metrics,
+            logs,
+        }
     })
     .join()
     .expect("OTLP HTTP client thread panicked")
+}
+
+/// The timeout the OTLP exporter resolves for one signal when it builds its
+/// own client: the signal's variable, else `OTEL_EXPORTER_OTLP_TIMEOUT`, else
+/// the 10 s default — milliseconds, and an unparsable value is skipped. The
+/// exporter's resolver is private, so this mirrors it.
+fn otlp_timeout(signal_var: &str, env: impl Fn(&str) -> Option<String>) -> Duration {
+    [signal_var, opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT]
+        .into_iter()
+        .find_map(|name| env(name)?.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
 }
 
 /// Create OTel providers for traces, metrics, and logs via OTLP/HTTP.
@@ -233,9 +265,7 @@ fn init_otel_providers() -> Option<OtelGuard> {
     // Only enable when an endpoint is configured.
     std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
 
-    // `reqwest::blocking::Client` is a handle to one shared connection pool,
-    // so the three exporters share it by clone.
-    let http_client = otlp_http_client();
+    let http_clients = otlp_http_clients();
 
     let service_name =
         std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "eidola-server".to_string());
@@ -253,7 +283,7 @@ fn init_otel_providers() -> Option<OtelGuard> {
     // ordinary traffic.
     let trace_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_http_client(http_client.clone())
+        .with_http_client(http_clients.traces)
         .build()
         .expect("failed to create OTLP trace exporter");
 
@@ -267,7 +297,7 @@ fn init_otel_providers() -> Option<OtelGuard> {
     // --- Metrics ---
     let metrics_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
-        .with_http_client(http_client.clone())
+        .with_http_client(http_clients.metrics)
         .build()
         .expect("failed to create OTLP metrics exporter");
 
@@ -284,7 +314,7 @@ fn init_otel_providers() -> Option<OtelGuard> {
     // --- Logs ---
     let log_exporter = opentelemetry_otlp::LogExporter::builder()
         .with_http()
-        .with_http_client(http_client)
+        .with_http_client(http_clients.logs)
         .build()
         .expect("failed to create OTLP log exporter");
 
@@ -633,6 +663,54 @@ pub mod metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The supplied OTLP clients carry the timeout the exporter would have
+    /// resolved itself: signal variable over the general one over 10 s, in
+    /// milliseconds, skipping a value that does not parse.
+    #[test]
+    fn otlp_timeout_resolves_like_the_exporter() {
+        use opentelemetry_otlp::{
+            OTEL_EXPORTER_OTLP_TIMEOUT, OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT,
+            OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+        };
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let signal = OTEL_EXPORTER_OTLP_TRACES_TIMEOUT;
+        assert_eq!(
+            otlp_timeout(signal, env(&[])),
+            OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT
+        );
+        assert_eq!(
+            otlp_timeout(signal, env(&[(OTEL_EXPORTER_OTLP_TIMEOUT, "2500")])),
+            Duration::from_millis(2500)
+        );
+        assert_eq!(
+            otlp_timeout(
+                signal,
+                env(&[
+                    (OTEL_EXPORTER_OTLP_TRACES_TIMEOUT, "3000"),
+                    (OTEL_EXPORTER_OTLP_TIMEOUT, "2500")
+                ])
+            ),
+            Duration::from_millis(3000)
+        );
+        assert_eq!(
+            otlp_timeout(
+                signal,
+                env(&[
+                    (OTEL_EXPORTER_OTLP_TRACES_TIMEOUT, "soon"),
+                    (OTEL_EXPORTER_OTLP_TIMEOUT, "2500")
+                ])
+            ),
+            Duration::from_millis(2500)
+        );
+    }
 
     /// With no parent — the shape of every ordinary request — the decision
     /// must be `RecordOnly`. That is load-bearing and easy to break by
