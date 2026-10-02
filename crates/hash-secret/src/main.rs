@@ -8,9 +8,7 @@
 //!   cargo run -p hash-secret -- "my-secret"     # from argument
 //!   echo "my-secret" | cargo run -p hash-secret # piped
 
-use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
-use rand_core::OsRng;
 
 fn main() {
     let secret = match std::env::args().nth(1) {
@@ -28,9 +26,8 @@ fn main() {
         std::process::exit(1);
     }
 
-    let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
-        .hash_password(secret.as_bytes(), &salt)
+        .hash_password(secret.as_bytes())
         .expect("failed to hash secret");
 
     println!("{hash}");

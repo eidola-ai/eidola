@@ -53,9 +53,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util
 sha2 = { version = "0.10", features = ["oid"] }
 
 # Encoding
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
-pem = "3"
+pem = "4"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

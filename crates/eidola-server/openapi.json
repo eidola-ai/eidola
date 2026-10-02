@@ -1006,11 +1006,11 @@
           "usage": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Usage",
                 "description": "Usage statistics (included in the final chunk by some providers)."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -1047,11 +1047,11 @@
           "stop": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/StopSequence",
                 "description": "Up to 4 sequences where the API will stop generating."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -1062,11 +1062,11 @@
           "stream_options": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/StreamOptions",
                 "description": "Streaming options. The OpenAI-compatible field; we accept it for\nAPI parity with clients that already set it (e.g. an SDK setting\n`include_usage: true` to capture token counts in the final chunk).\nNote: the server overrides `include_usage` to `true` for any\nstreaming request before forwarding upstream — usage is required\nfor accurate per-token refunds and isn't a client choice."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -1139,11 +1139,11 @@
           "usage": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Usage",
                 "description": "Usage statistics for the request."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -1188,11 +1188,11 @@
           "finish_reason": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/FinishReason",
                 "description": "The reason the model stopped generating."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -1223,11 +1223,11 @@
           "finish_reason": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/FinishReason",
                 "description": "The reason the model stopped generating (only in final chunk)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -1265,10 +1265,10 @@
           "role": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/Role"
               },
               {
-                "$ref": "#/components/schemas/Role"
+                "type": "null"
               }
             ]
           },
@@ -1421,22 +1421,22 @@
           "refund": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/RefundInfo",
                 "description": "Refund token for unspent credits (only present for ACT-authenticated requests)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "usage": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Usage",
                 "description": "Token usage statistics."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -1471,11 +1471,11 @@
           "refund": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/RefundInfo",
                 "description": "Refund token for unspent credits."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -1757,11 +1757,11 @@
           "content": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/MessageContent",
                 "description": "The content of the message.\n\nNullable since tool calling: an assistant message that only called\ntools carries `\"content\": null`. The key is deliberately **always\nserialized** (no `skip_serializing_if`) — several chat templates\nrequire it to exist, and clients send the explicit `null` for that\nreason, so dropping it on the way upstream would change the request."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -1922,11 +1922,11 @@
           "per_request": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ScaledPrice",
                 "description": "Per-request pricing (for models like Whisper or TTS that charge per request\nrather than per token). When present, `per_prompt_token` and\n`per_completion_token` are zero."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -2009,10 +2009,10 @@
           "recurring": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RecurringResponse"
               },
               {
-                "$ref": "#/components/schemas/RecurringResponse"
+                "type": "null"
               }
             ]
           },
@@ -2299,22 +2299,22 @@
           "backend": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/BackendAttestation",
                 "description": "Backend attestation (only for TEE-backed models like phala/*)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "proxy": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ProxyAttestation",
                 "description": "Proxy attestation (None until the proxy runs in a TEE)."
+              },
+              {
+                "type": "null"
               }
             ]
           }

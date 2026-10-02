@@ -581,6 +581,44 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    /// Written by argon2 0.5.3 (`Argon2::default()`, random salt) for the
+    /// secret below. Measured `*_HASH` values in `tinfoil-config.yml` and
+    /// every stored account hash were produced by that version, so an argon2
+    /// upgrade must keep verifying them — or the enclave refuses to start
+    /// (`verify_measured_secrets`) and every account stops authenticating.
+    const ARGON2_0_5_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$6pErOZUqn/EOSXWM1TCvWQ$iGAfGeBFsWcYRHUv3H6CSSISW1RVT8L3V2DeGpWw14Y";
+    const ARGON2_0_5_SECRET: &[u8] = b"argon2-0.5-fixture-secret";
+
+    #[test]
+    fn hashes_written_by_argon2_0_5_still_verify() {
+        use argon2::PasswordVerifier;
+        let parsed = argon2::PasswordHash::new(ARGON2_0_5_HASH).expect("parse 0.5 hash");
+        argon2::Argon2::default()
+            .verify_password(ARGON2_0_5_SECRET, &parsed)
+            .expect("a 0.5-written hash must verify");
+        assert!(
+            argon2::Argon2::default()
+                .verify_password(b"not-the-secret", &parsed)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn new_hashes_keep_the_measured_parameters() {
+        use argon2::PasswordHasher;
+        // `hash-secret` and account creation both rely on the default
+        // parameters; a change here would silently change what new hashes
+        // cost and how they read in `tinfoil-config.yml`.
+        let hash = argon2::Argon2::default()
+            .hash_password(ARGON2_0_5_SECRET)
+            .expect("hash")
+            .to_string();
+        assert!(
+            hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "unexpected parameters: {hash}"
+        );
+    }
+
     #[test]
     fn test_openapi_spec_generation() {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
