@@ -1,1 +1,1 @@
-FROM stripe/stripe-cli:v1.37.2@sha256:c7b88bef6658b125953a35c894b37636e8b1aa8956f017de2ce6a1f15c77314d
+FROM stripe/stripe-cli:v1.51.1@sha256:cb1e2306c4659654494e7b8fc45b0b1f8330ddbb4c3874ee137788e0dabc98de
