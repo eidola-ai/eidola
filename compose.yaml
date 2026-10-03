@@ -81,6 +81,7 @@ services:
     command:
       [
         "listen",
+        "--all-snapshot",
         "--forward-to",
         "https://shim:8443/v1/webhooks/stripe",
         "--skip-verify",
