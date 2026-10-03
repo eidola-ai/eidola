@@ -718,10 +718,21 @@
             tag = "b${llamaServerVersion}";
             hash = "sha256-FheVvdqpF3pqxmovFXBh65iNAH+lSM+jqGrM8CpLHF8=";
           };
-          # python3 is only for the Darwin LC_UUID zeroing in postInstall.
-          nativeBuildInputs = (o.nativeBuildInputs or [ ]) ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
-            pkgs.python3
-          ];
+          # The base recipe builds the tools/ui web app with npm, from
+          # dependencies hashed against its own llama.cpp source, so they
+          # cannot be fetched for this one. The server is all we ship and it
+          # builds without them, so the npm hooks are dropped and the deps
+          # are never fetched. python3 is only for the Darwin LC_UUID zeroing
+          # in postInstall and the linkage check in postFixup.
+          nativeBuildInputs =
+            pkgs.lib.filter (
+              d:
+              !(pkgs.lib.hasPrefix "nodejs" (d.name or "")) && (d.name or "") != "npm-config-hook"
+            ) (o.nativeBuildInputs or [ ])
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+              pkgs.python3
+            ];
+          npmDeps = null;
           preConfigure = ''
             prependToVar cmakeFlags "-DLLAMA_BUILD_COMMIT:STRING=${llamaServerCommit}"
             # $NIX_BUILD_TOP is only knowable at sandbox runtime
@@ -742,13 +753,15 @@
           cmakeFlags = o.cmakeFlags ++ [
             "-DLLAMA_CURL=OFF"
             "-DBUILD_SHARED_LIBS=OFF"
-            # The server auto-detects OpenSSL for httplib TLS; we speak plain
-            # HTTP over loopback only, and a libssl dep would pin the binary
-            # to nix-store paths (not relocatable on user machines). This is
-            # the pre-b9960 spelling of the option, kept because changing it
-            # would move the macOS sidecar's bytes; what makes the detection
-            # miss on Darwin is that nothing in the sandbox provides OpenSSL
-            # once curl is out of buildInputs.
+            # The vendored cpp-httplib links OpenSSL under this option, which
+            # the base recipe turns on. We speak plain HTTP over loopback
+            # only; a libssl dependency would pin the Darwin binary to
+            # nix-store paths (not relocatable on user machines) and drag a
+            # TLS stack's CA-path assumptions into a binary that must run on
+            # any host.
+            "-DLLAMA_OPENSSL=OFF"
+            # The pre-b9960 spelling of the same switch, inert at this
+            # llama.cpp revision.
             "-DLLAMA_SERVER_SSL=OFF"
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
@@ -756,31 +769,27 @@
             # OpenMP costs nothing in linkage, and dropping it for ggml's own
             # threadpool measured ~35% slower token generation.
             "-DGGML_OPENMP=ON"
-            # The vendored cpp-httplib auto-detects OpenSSL under this option
-            # (`LLAMA_SERVER_SSL` above is the older spelling and is inert at
-            # this llama.cpp revision). We speak plain HTTP over loopback
-            # only, and a TLS stack would drag its CA-path assumptions into a
-            # binary that must run on any host.
-            "-DLLAMA_OPENSSL=OFF"
             # tools/ui builds an asset-embedding generator that has to run on
             # the *build* machine; a static build is a cross build, so CMake
             # cannot reuse the target compiler for it.
             "-DHOST_CXX_COMPILER=${pkgs.buildPackages.stdenv.cc}/bin/c++"
           ];
-          # curl is unused with LLAMA_CURL=OFF, and its presence propagates
-          # OpenSSL into the server's auto-detection — drop it entirely.
-          # Matched by prefix because a static build's package names carry a
-          # `-static-<triple>` suffix.
-          buildInputs = pkgs.lib.filter (d: !(pkgs.lib.hasPrefix "curl" (d.pname or ""))) o.buildInputs;
+          # Neither TLS library is used (LLAMA_CURL and LLAMA_OPENSSL are
+          # off), so neither is left where CMake's auto-detection could find
+          # it. Matched by prefix because a static build's package names
+          # carry a `-static-<triple>` suffix.
+          buildInputs = pkgs.lib.filter (
+            d: !(pkgs.lib.hasPrefix "curl" (d.pname or "")) && !(pkgs.lib.hasPrefix "openssl" (d.pname or ""))
+          ) o.buildInputs;
           # Trim the closure to just the one tool we ship. The static build
           # embeds llama.cpp's libs into the binary, so the sibling llama-*
-          # tools, the `llama` symlink, and the installed headers/archives are
-          # all dead weight for a sidecar.
+          # tools, the installed headers/archives and the shell completion
+          # are all dead weight for a sidecar.
           postInstall =
             (o.postInstall or "")
             + ''
               find "$out/bin" -mindepth 1 ! -name llama-server -delete
-              rm -rf "$out/include" "$out/lib"
+              rm -rf "$out/include" "$out/lib" "$out/share"
             ''
             + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
               # ld64's LC_UUID includes nondeterministic linker state even
@@ -819,6 +828,38 @@
                   f.write(data)
               ' "$out/bin/llama-server"
             '';
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          # Darwin's counterpart of the Linux static assertion below: every
+          # dylib the shipped binary loads must be a system one, so a base
+          # recipe that adds a library input fails here instead of shipping
+          # a nix-store reference that does not exist on a user's machine.
+          postFixup = (o.postFixup or "") + ''
+            python3 -c '
+            import struct, sys
+            LOAD_CMDS = {0xC, 0x20, 0x80000018, 0x8000001F, 0x80000023}
+            def dylibs(data, offset):
+                magic = struct.unpack_from("<I", data, offset)[0]
+                assert magic == 0xFEEDFACF, f"bad Mach-O magic at {offset:#x}"
+                ncmds = struct.unpack_from("<I", data, offset + 16)[0]
+                pos = offset + 32
+                for _ in range(ncmds):
+                    cmd, cmdsize, name = struct.unpack_from("<III", data, pos)
+                    if cmd in LOAD_CMDS:
+                        yield data[pos + name : pos + cmdsize].split(b"\0")[0].decode()
+                    pos += cmdsize
+
+            data = open(sys.argv[1], "rb").read()
+            if struct.unpack_from(">I", data, 0)[0] == 0xCAFEBABE:
+                nfat = struct.unpack_from(">I", data, 4)[0]
+                offsets = [struct.unpack_from(">I", data, 8 + i * 20 + 8)[0] for i in range(nfat)]
+            else:
+                offsets = [0]
+            bad = [d for o in offsets for d in dylibs(data, o) if not d.startswith(("/usr/lib/", "/System/Library/"))]
+            if bad:
+                sys.exit("llama-server loads non-system libraries: " + ", ".join(bad))
+            ' "$out/bin/llama-server"
+          '';
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # The build-platform compiler tools/ui's generator needs.
