@@ -51,7 +51,7 @@ use gpui::{
     WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px, size,
 };
 use gpui_component::Root;
-use gpui_component_assets::Assets;
+use gpui_kit_assets::Assets;
 
 use crate::about::AboutView;
 use crate::actions::{

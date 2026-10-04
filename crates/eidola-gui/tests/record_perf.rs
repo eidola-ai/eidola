@@ -7,8 +7,11 @@
 //! nothing) on a Record request detail, and reports two things.
 //!
 //! **Frame cost.** `Window::draw` — the per-frame CPU work a scroll triggers —
-//! timed in four states: `idle`, `scrolled`, after a plain `clicked`, and while
-//! a drag `selecting` is live. The last one is the one that matters: an active
+//! timed in five states: `idle`, `scrolled`, after a plain `clicked`, while a
+//! drag `selecting` is live, and while a drag held *inside* the payload is live
+//! (`sel-inside` — both endpoints in the one large inline, which is the case a
+//! per-line selection short-circuit cannot skip). The selecting states are the
+//! ones that matter: an active
 //! text selection used to make every subsequent frame quadratic in payload
 //! size (see AGENTS.md → The Record), so a payload of a few tens of KB scrolled
 //! at ~2 fps in a dev build. Frame cost must stay flat across all four states
@@ -63,7 +66,7 @@ mod perf {
         VisualTestAppContext, point, px, size,
     };
     use gpui_component::{Root, Theme, ThemeMode};
-    use gpui_component_assets::Assets;
+    use gpui_kit_assets::Assets;
 
     /// One synthetic SSE `data:` chunk, ~135 bytes — the shape a streamed chat
     /// completion actually records.
@@ -125,6 +128,7 @@ mod perf {
         Scrolled,
         Clicked,
         Selecting,
+        SelectingInside,
     }
 
     impl Mode {
@@ -134,11 +138,18 @@ mod perf {
                 Mode::Scrolled => "scrolled",
                 Mode::Clicked => "clicked",
                 Mode::Selecting => "selecting",
+                Mode::SelectingInside => "sel-inside",
             }
         }
     }
 
-    const MODES: &[Mode] = &[Mode::Idle, Mode::Scrolled, Mode::Clicked, Mode::Selecting];
+    const MODES: &[Mode] = &[
+        Mode::Idle,
+        Mode::Scrolled,
+        Mode::Clicked,
+        Mode::Selecting,
+        Mode::SelectingInside,
+    ];
 
     pub fn run() {
         let platform = gpui_platform::current_platform(false);
@@ -296,14 +307,13 @@ mod perf {
         // `draw` hands back the token that owes it — so clear it here rather
         // than dropping it (see `measure` for the same contract).
         cx.update_window(handle, |_, window, cx| {
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         })
         .ok();
 
         let text = cx
             .update_window(handle, |_, window, cx| {
-                use gpui_component::WindowExt as _;
-                window.selected_text(cx)
+                gpui_base::TextSelection::selected_text(window, cx)
             })
             .unwrap_or_default();
 
@@ -384,6 +394,36 @@ mod perf {
                 );
                 cx.run_until_parked();
             }
+            Mode::SelectingInside => {
+                // Scroll into the response body first (the fingerprint pass's
+                // `scrolled` geometry), then hold a drag whose endpoints both
+                // lie inside the payload's one large inline.
+                for _ in 0..6 {
+                    cx.simulate_event(
+                        handle,
+                        ScrollWheelEvent {
+                            position: mid,
+                            delta: ScrollDelta::Pixels(point(px(0.), px(-400.))),
+                            modifiers: Modifiers::default(),
+                            touch_phase: TouchPhase::Moved,
+                        },
+                    );
+                }
+                cx.run_until_parked();
+                cx.simulate_mouse_down(
+                    handle,
+                    point(px(120.), px(300.)),
+                    MouseButton::Left,
+                    Modifiers::default(),
+                );
+                cx.simulate_mouse_move(
+                    handle,
+                    point(px(700.), px(560.)),
+                    Some(MouseButton::Left),
+                    Modifiers::default(),
+                );
+                cx.run_until_parked();
+            }
         }
 
         let mut times = Vec::new();
@@ -401,7 +441,7 @@ mod perf {
                     // because gpui requires the arena empty before the next
                     // draw, so each measured frame starts from the same state.
                     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-                    clear.clear();
+                    clear.clear(cx);
                     elapsed
                 })
                 .expect("draw");

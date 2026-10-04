@@ -19,6 +19,7 @@ use gpui::{
     ParentElement, Pixels, RenderOnce, Role, SharedString, StatefulInteractiveElement, Styled,
     Window, div, prelude::FluentBuilder, px,
 };
+use gpui_component::RoleOverride;
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
@@ -328,7 +329,7 @@ impl RenderOnce for CreateAccount {
                     })
                     .child(
                         Checkbox::new("onboarding-agree-box")
-                            .role(None)
+                            .role(RoleOverride::Presentational)
                             .label(consent)
                             .checked(self.agreed)
                             .disabled(!have_documents)
@@ -366,7 +367,7 @@ impl RenderOnce for CreateAccount {
             })
             .child(
                 Button::new("onboarding-btn-create")
-                    .role(None)
+                    .role(RoleOverride::Presentational)
                     .ghost()
                     .label(label)
                     .disabled(!enabled)
@@ -737,7 +738,7 @@ fn cta_button(
         .on_click(on_click)
         .child(
             Button::new(SharedString::from(format!("onboarding-btn-{key}")))
-                .role(None)
+                .role(RoleOverride::Presentational)
                 .ghost()
                 .label(label)
                 .tab_stop(false),
@@ -929,7 +930,11 @@ fn labeled_input(
                 .id(SharedString::from(format!("{probe_name}-wrap")))
                 .probe_bounds(probe_name, Role::TextInput, label.clone())
                 .w_full()
-                .child(Input::new(state).aria_label(label)),
+                .child(
+                    Input::new(state)
+                        .aria_label(label)
+                        .py(crate::theme::INPUT_PY),
+                ),
         )
 }
 

@@ -102,7 +102,7 @@ mod driver {
         TouchPhase, VisualTestAppContext, point, px, size,
     };
     use gpui_component::{Root, ThemeMode};
-    use gpui_component_assets::Assets;
+    use gpui_kit_assets::Assets;
     use serde::Deserialize;
     use serde_json::{Value, json};
 

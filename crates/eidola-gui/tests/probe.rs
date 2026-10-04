@@ -417,13 +417,13 @@ fn appearance_and_text_size_chips_carry_their_group(cx: &mut TestAppContext) {
         gpui::Role::Button,
         "Larger text, currently 100%",
     );
-    // The login-item switch is a `Switch` with no node of its own; the
-    // probed wrapper is the control, and its name has to be self-contained
-    // (the "Open at login" field label is a node-less `div`).
+    // The login-item `Switch` is its own node (the wrapper is bounds-only),
+    // and its name has to be self-contained (the "Open at login" field label
+    // is a node-less `div`).
     assert_probe(
         &entries,
         "settings/general/login-item",
-        gpui::Role::CheckBox,
+        gpui::Role::Switch,
         "Open Eidola at login",
     );
 
@@ -2482,8 +2482,8 @@ fn the_credential_fields_and_their_suffix_controls_are_each_one_node(cx: &mut Te
     // `Input` carries the label and is the node, its wrapper is bounds-only —
     // and the controls sitting in the secret field's suffix follow the hoist:
     // a probed wrapper is the control, so each is a named, reachable node
-    // rather than a presentational widget nobody can get to. `.role(None)` on
-    // the widgets alone would satisfy the source scan while deleting these
+    // rather than a presentational widget nobody can get to.
+    // `.role(RoleOverride::Presentational)` on the widgets alone would satisfy the source scan while deleting these
     // from the tree, which is precisely what this test refuses.
     let _guard = probes_on();
 
@@ -3810,6 +3810,61 @@ fn eidola_pinned_measurement_copyable_not_untrustable(cx: &mut TestAppContext) {
     }
 
     probe::set_probes_enabled(false);
+}
+
+/// **One pointer press, one Space, one Enter: one activation each.** The
+/// add form's auto-start `Switch` flips its state rather than setting it, so a
+/// second handler answering the same press (a wrapper beside the widget) reads
+/// as no change, and a widget the keyboard cannot reach reads as no change too.
+#[gpui::test]
+fn backends_add_form_switch_activates_once_per_press_and_key(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::{AddKind, BackendsSettingsView, BackendsTab};
+    use gpui::{Modifiers, VisualTestContext};
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.backends = backends_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| v.select_tab(BackendsTab::External, cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_add(AddKind::LlamaCpp, window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    let (_, control) = entries
+        .iter()
+        .find(|(n, _)| n == "settings/backends/add/autostart")
+        .expect("the add form's auto-start switch painted");
+    // The track sits at the row's leading edge; press it, not the label.
+    let track = gpui::point(
+        control.bounds.origin.x + gpui::px(8.),
+        control.bounds.origin.y + gpui::px(8.),
+    );
+    let auto_start = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.add_auto_start_for_test())
+            .expect("the form is open")
+    };
+    assert!(auto_start(cx), "precondition: auto-start begins on");
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_click(track, Modifiers::default());
+    vcx.run_until_parked();
+    assert!(!auto_start(cx), "one press flips the switch exactly once");
+
+    activate_with(cx, window, "space");
+    assert!(
+        auto_start(cx),
+        "Space flips the focused switch exactly once"
+    );
+
+    press_enter(cx, window);
+    assert!(
+        !auto_start(cx),
+        "Enter flips the focused switch exactly once"
+    );
 }
 
 #[gpui::test]
@@ -6185,7 +6240,12 @@ fn press_key(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
 /// key-down only records the pending activation), and `TestAppContext`'s
 /// `dispatch_keystroke` sends the down alone.
 fn press_enter(cx: &mut TestAppContext, window: AnyWindowHandle) {
-    let ks = gpui::Keystroke::parse("enter").unwrap();
+    activate_with(cx, window, "enter");
+}
+
+/// [`press_enter`] for any key: a key-down and its key-up.
+fn activate_with(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
+    let ks = gpui::Keystroke::parse(key).unwrap();
     cx.update_window(window, |_, window, cx| {
         window.dispatch_event(
             gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
@@ -6651,23 +6711,22 @@ fn record_spend_group_header_is_a_readable_node(cx: &mut TestAppContext) {
     );
 }
 
-/// Two regimes for `gpui-component` widgets that self-annotate for AccessKit
-/// at our fork rev, each enforced **immediately after the constructor** (the
-/// placement is what makes this source scan reliable):
+/// Two regimes for `gpui-component` widgets that self-annotate for AccessKit,
+/// each enforced **immediately after the constructor** (the placement is what
+/// makes this source scan reliable):
 ///
 /// - **Hoisted controls** (`Button`, `Checkbox`): the probed wrapper is the
 ///   accessible control (role, label, focus, activation), so the widget is
-///   made presentational via `.role(None)` — without it AT sees two nodes for
-///   one control.
-/// - **Focus-bearing editors** (`Input`): the widget owns the tracked focus
-///   handle, so *it* must be the node or AT reports focus on the window root
-///   — it carries `.aria_label(..)` and the wrapper is a bounds-only probe
-///   (`probe_bounds`, no node).
+///   made presentational via `.role(RoleOverride::Presentational)` — without
+///   it AT sees two nodes for one control.
+/// - **Focus-bearing controls** (`Input`, `Textarea`, `Switch`): the widget
+///   owns the tracked focus handle, so *it* must be the node or AT reports
+///   focus on the window root — it carries its label builder (`.aria_label(..)`;
+///   `Switch`: `.accessibility_label(..)`) and the wrapper is a bounds-only
+///   probe (`probe_bounds`, no node).
 ///
 /// The emitted AccessKit `TreeUpdate` is crate-private, so neither invariant
-/// can be asserted against the tree itself; this scan is the gate. `Switch`
-/// is deliberately absent: it sets no role at our rev (comments at its two
-/// call sites carry the tripwire).
+/// can be asserted against the tree itself; this scan is the gate.
 #[test]
 fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -6685,7 +6744,13 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            for needle in ["Button::new(", "Input::new(", "Checkbox::new("] {
+            for needle in [
+                "Button::new(",
+                "Input::new(",
+                "Textarea::new(",
+                "Checkbox::new(",
+                "Switch::new(",
+            ] {
                 let mut from = 0;
                 while let Some(pos) = text[from..].find(needle) {
                     let start = from + pos;
@@ -6718,10 +6783,10 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
                         seen += 1;
                         let rest = &text[end.expect("unbalanced parens")..];
                         let rest: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
-                        let required = if needle == "Input::new(" {
-                            ".aria_label("
-                        } else {
-                            ".role(None)"
+                        let required = match needle {
+                            "Input::new(" | "Textarea::new(" => ".aria_label(",
+                            "Switch::new(" => ".accessibility_label(",
+                            _ => ".role(RoleOverride::Presentational)",
                         };
                         if !rest.starts_with(required) {
                             let line = text[..start].matches('\n').count() + 1;
@@ -6744,9 +6809,10 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
     assert!(
         offenders.is_empty(),
         "self-annotating widgets missing their regime's annotation \
-         immediately after the constructor (Button/Checkbox: `.role(None)`, \
-         the wrapper is the control; Input: `.aria_label(..)`, the widget is \
-         the node — see AGENTS.md → Accessibility & QA probes):\n{}",
+         immediately after the constructor (Button/Checkbox: \
+         `.role(RoleOverride::Presentational)`, the wrapper is the control; \
+         Input/Textarea: `.aria_label(..)`, Switch: `.accessibility_label(..)`, \
+         the widget is the node — see AGENTS.md → Accessibility & QA probes):\n{}",
         offenders.join("\n")
     );
 }
@@ -9916,6 +9982,61 @@ fn proxy_pane_serve_switch_answers_a_pointer_press(cx: &mut TestAppContext) {
     let (before, after) = press_proxy_switch(cx, "settings/proxy/serve", |s| s.enabled);
     assert!(before, "precondition: serving");
     assert!(!after, "one press on the switch stops serving, once");
+}
+
+/// **The keyboard reaches the `Switch` itself, and each Space or Enter
+/// toggles it exactly once.** The widget is the focus-bearing node, so the
+/// keyboard path is the widget's own: a press focuses it, then each key is one
+/// activation. A wrapper handler left beside the widget's would double every
+/// key into no change; a widget left out of focus would ignore them.
+#[gpui::test]
+fn proxy_pane_serve_switch_answers_space_and_enter_once_each(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+    use gpui::{Modifiers, VisualTestContext};
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let entries = fresh_entries(cx, window);
+    let (_, control) = entries
+        .iter()
+        .find(|(n, _)| n == "settings/proxy/serve")
+        .expect("the serve switch painted");
+    let centre = control.bounds.center();
+    let serving = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            stores
+                .proxy
+                .read(cx)
+                .settings()
+                .value()
+                .expect("settings")
+                .enabled
+        })
+    };
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_click(centre, Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        !serving(cx),
+        "the press toggled once and left the widget focused"
+    );
+
+    activate_with(cx, window, "space");
+    assert!(serving(cx), "Space toggles the focused switch exactly once");
+
+    press_enter(cx, window);
+    assert!(
+        !serving(cx),
+        "Enter toggles the focused switch exactly once"
+    );
 }
 
 #[gpui::test]

@@ -282,16 +282,13 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # One-off pinned repositories outside the allowed orgs.
 allow-git = [
-    "https://github.com/proptest-rs/proptest",
     "https://github.com/virtee/tdx-measure",
 ]
 
 [sources.allow-org]
 # github.com organizations to allow git sources for:
-#   - eidola-ai: our own pinned forks (gpui-component, pulldown-cmark, turso)
-#   - zed-industries: gpui and the sibling repos its workspace pins; a gpui
-#     bump can move or add repos within the org, so the grant is org-level
-github = ["eidola-ai", "zed-industries"]
+#   - eidola-ai: our own pinned forks (pulldown-cmark, turso)
+github = ["eidola-ai"]
 # gitlab.com organizations to allow git sources for
 gitlab = []
 # bitbucket.org organizations to allow git sources for

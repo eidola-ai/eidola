@@ -12,34 +12,36 @@ name = "eidola-gui"
 path = "src/main.rs"
 
 [dependencies]
-# gpui-component pulls gpui/gpui_platform from zed-industries/zed without a rev,
-# so we mirror that spec exactly to avoid resolving two copies of gpui.
-# Cargo.lock is the canonical pin for the resolved zed commit.
+# gpui comes from `gpui-pre`, the crates.io snapshot of Zed's gpui crates that
+# gpui-component itself depends on, aliased so source paths stay `gpui::` /
+# `gpui_platform::`. gpui-component pins `gpui-pre` with `=`, so these pins
+# must name the same version or cargo resolves two gpuis — they move together
+# (see AGENTS.md → gpui / gpui-component pinning).
 #
 # `inspector` enables the in-app element inspector (Window::toggle_inspector +
 # the rich gpui-component renderer). Also auto-enabled in debug builds via
 # `debug_assertions`; the explicit feature ensures it works in release builds.
-# `runtime_shaders` (passed through to `gpui_macos/runtime_shaders` via
+# `runtime_shaders` (passed through to the macOS platform crate via
 # gpui_platform) embeds the raw Metal Shading Language source in the binary and
 # compiles it through MTLDevice at app startup instead of invoking Apple's
 # closed-source `metal` compiler at build time. Two reasons we want it:
 # (1) the Nix sandbox has no access to Xcode tooling, so without this the
 # release build fails with `tool 'metal' not found` and the rest of the
-# gpui-component dep tree fails type-inference transitively from
-# gpui_macos's aborted build script; (2) the precompiled `.metallib`
+# gpui-component dep tree fails type-inference transitively from the
+# platform crate's aborted build script; (2) the precompiled `.metallib`
 # otherwise depends on the local Xcode/metal version, defeating
 # reproducibility across developers and CI. Startup cost is a one-time
 # MTLDevice library compile (~50ms). Zed's own Nix package makes the same
 # trade-off.
-gpui = { git = "https://github.com/zed-industries/zed", features = ["inspector"] }
+gpui = { package = "gpui-pre", version = "=0.3.7", features = ["inspector"] }
 # `wayland` selects gpui's Linux windowing backend. It's gated inside
 # gpui_platform by `cfg(target_os = ...)`, so enabling it universally is a
 # no-op on macOS/Windows — no `[target.'cfg(...)']` split needed. Linux is
 # Wayland-only by decision (see AGENTS.md — cleaner all-open-source story,
 # narrower deployment surface); do not add the `x11` feature back.
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders", "wayland"] }
-gpui-component = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola", features = ["inspector"] }
-gpui-component-assets = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "runtime_shaders", "wayland"] }
+gpui-component = { version = "=0.7.0", features = ["inspector"] }
+gpui-kit-assets = "=0.7.0"
 
 eidola-app-core = { path = "../eidola-app-core" }
 gpui-markdown-editor = { path = "../gpui-markdown-editor" }
@@ -108,16 +110,20 @@ fluent-syntax = "0.12"
 # this with the regular `gpui` dep, so feature flags merge for dev/test builds
 # — and for examples, which is how `examples/driver.rs` reaches the visual
 # test context outside `cargo test`.
-gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.7", features = ["test-support"] }
 # The driver example's JSON-lines protocol.
 serde = { version = "1", features = ["derive"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit", "wayland"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["test-support", "font-kit", "wayland"] }
 # The embed-marker recognition lockstep test (tests/embed_lockstep.rs): this
 # crate is the one place that sees both the editor's parser-driven embed
 # recognition and eidola-common's structural scanner, so the corpus test
 # proving they agree lives here.
 eidola-common = { path = "../eidola-common" }
 image = { version = "0.25", default-features = false, features = ["png"] }
+# `TextSelection::selected_text` for the Record perf harness's selection
+# fingerprints; gpui-component does not re-export it. Same exact pin as
+# gpui-component's own dependency on it.
+gpui-base = "=0.7.0"
 # Store-level tests (tests/stores.rs) build a real `AppCore` over tempdirs and
 # install the crypto provider (mirrors app-core's own test setup).
 tempfile = "3"

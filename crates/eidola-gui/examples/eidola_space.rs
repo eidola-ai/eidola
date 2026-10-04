@@ -2109,7 +2109,7 @@ fn sample_tree() -> Node {
 }
 
 fn main() {
-    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    let app = gpui_platform::application().with_assets(gpui_kit_assets::Assets);
 
     app.run(move |cx| {
         // This must be called before using any GPUI Component features.

@@ -38,7 +38,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, StyledExt as _, h_flex,
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
     v_flex,
 };
 
@@ -77,7 +77,7 @@ pub(crate) struct ParticipantEdit {
     is_referenced: bool,
     reference: Option<ParticipantReference>,
     label: Entity<InputState>,
-    system_prompt: Entity<InputState>,
+    system_prompt: Entity<TextareaState>,
     /// The working model selection (`None` = no model set).
     model_ref: Option<String>,
     notify_policy: String,
@@ -120,7 +120,7 @@ impl ParticipantEdit {
 pub(crate) struct ParticipantAdd {
     focus: gpui::FocusHandle,
     label: Entity<InputState>,
-    system_prompt: Entity<InputState>,
+    system_prompt: Entity<TextareaState>,
     model_ref: Option<String>,
     notify_policy: String,
 }
@@ -346,25 +346,31 @@ impl SpaceView {
     ///
     /// **Weak, because that is the liveness answer a `FocusHandle` cannot
     /// give.** A handle tracked on no element still reports itself focused
-    /// (this window's whole dead-slot family), while an `InputState` entity
+    /// (this window's whole dead-slot family), while an input state entity
     /// dies with the form that owns it — so a form retired while some other
     /// surface held the keyboard simply fails to upgrade.
     pub(crate) fn inspector_participant_focused_input(
         &self,
         window: &Window,
         cx: &gpui::App,
-    ) -> Option<gpui::WeakEntity<InputState>> {
+    ) -> Option<super::inspector::WeakField> {
+        use super::inspector::WeakField;
         let held = |input: &Entity<InputState>| {
             gpui::Focusable::focus_handle(input.read(cx), cx)
                 .is_focused(window)
-                .then(|| input.downgrade())
+                .then(|| WeakField::Input(input.downgrade()))
+        };
+        let held_multi = |input: &Entity<TextareaState>| {
+            gpui::Focusable::focus_handle(input.read(cx), cx)
+                .is_focused(window)
+                .then(|| WeakField::Textarea(input.downgrade()))
         };
         let edit = self.inspector_participant_edit.as_ref();
         let add = self.inspector_participant_add.as_ref();
         edit.and_then(|e| held(&e.label))
-            .or_else(|| edit.and_then(|e| held(&e.system_prompt)))
+            .or_else(|| edit.and_then(|e| held_multi(&e.system_prompt)))
             .or_else(|| add.and_then(|a| held(&a.label)))
-            .or_else(|| add.and_then(|a| held(&a.system_prompt)))
+            .or_else(|| add.and_then(|a| held_multi(&a.system_prompt)))
             .or_else(|| {
                 self.inspector_template_form
                     .as_ref()
@@ -404,7 +410,7 @@ impl SpaceView {
     }
 
     #[doc(hidden)]
-    pub fn inspector_editing_prompt_state(&self) -> Option<Entity<InputState>> {
+    pub fn inspector_editing_prompt_state(&self) -> Option<Entity<TextareaState>> {
         self.inspector_participant_edit
             .as_ref()
             .map(|e| e.system_prompt.clone())
@@ -486,7 +492,7 @@ impl SpaceView {
         // A reveal focuses what it revealed (the Settings idiom's rule).
         label.update(cx, |s, cx| s.focus(window, cx));
         let system_prompt = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 8)
                 .placeholder(PROMPT_PLACEHOLDER)
                 .default_value(p.system_prompt.clone().unwrap_or_default())
@@ -794,7 +800,7 @@ impl SpaceView {
         // starting point the Templates pane offers, so the two surfaces don't
         // contradict each other on what "a new participant" begins as.
         let system_prompt = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 8)
                 .placeholder(PROMPT_PLACEHOLDER)
                 .default_value(DEFAULT_AGENT_SYSTEM_PROMPT)
@@ -1653,7 +1659,11 @@ impl SpaceView {
                     gpui::Role::TextInput,
                     "Name",
                 )
-                .child(Input::new(&edit.label).aria_label("Name")),
+                .child(
+                    Input::new(&edit.label)
+                        .aria_label("Name")
+                        .py(crate::theme::INPUT_PY),
+                ),
         );
 
         if is_agent {
@@ -1673,7 +1683,7 @@ impl SpaceView {
                             gpui::Role::TextInput,
                             "System prompt",
                         )
-                        .child(Input::new(&edit.system_prompt).aria_label("System prompt")),
+                        .child(Textarea::new(&edit.system_prompt).aria_label("System prompt")),
                 )
                 .child(field_label("Responds", cx))
                 .child(self.render_inspector_notify(&edit.notify_policy, "editor", true, cx));
@@ -1854,7 +1864,11 @@ impl SpaceView {
                         gpui::Role::TextInput,
                         "Name",
                     )
-                    .child(Input::new(&add.label).aria_label("Name")),
+                    .child(
+                        Input::new(&add.label)
+                            .aria_label("Name")
+                            .py(crate::theme::INPUT_PY),
+                    ),
             )
             .child(field_label("Model", cx))
             .child(self.render_inspector_participant_model(
@@ -1871,7 +1885,7 @@ impl SpaceView {
                         gpui::Role::TextInput,
                         "System prompt",
                     )
-                    .child(Input::new(&add.system_prompt).aria_label("System prompt")),
+                    .child(Textarea::new(&add.system_prompt).aria_label("System prompt")),
             )
             .child(field_label("Responds", cx))
             .child(self.render_inspector_notify(&add.notify_policy, "add", false, cx))
@@ -2289,7 +2303,11 @@ impl SpaceView {
                         gpui::Role::TextInput,
                         "Template name",
                     )
-                    .child(Input::new(&form.title).aria_label("Template name")),
+                    .child(
+                        Input::new(&form.title)
+                            .aria_label("Template name")
+                            .py(crate::theme::INPUT_PY),
+                    ),
             )
             .child(
                 h_flex()

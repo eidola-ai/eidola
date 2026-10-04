@@ -18,6 +18,7 @@ use gpui::{
     UniformListScrollHandle, Window, actions, div, prelude::FluentBuilder as _, px, rems,
     uniform_list,
 };
+use gpui_component::RoleOverride;
 use gpui_component::{
     ActiveTheme, IconName, Sizable,
     button::{Button, ButtonVariants},
@@ -501,7 +502,12 @@ impl LibraryView {
                     )
                     .flex_1()
                     .flex()
-                    .child(Input::new(input_state).aria_label("Rename space").flex_1())
+                    .child(
+                        Input::new(input_state)
+                            .aria_label("Rename space")
+                            .py(crate::theme::INPUT_PY)
+                            .flex_1(),
+                    )
                     .into_any_element()
             } else {
                 div().flex_1().into_any_element()
@@ -568,7 +574,7 @@ impl LibraryView {
                         )
                         .child(
                             Button::new(("rename-space", idx))
-                                .role(None)
+                                .role(RoleOverride::Presentational)
                                 .ghost()
                                 .xsmall()
                                 // The bundled Lucide icon set has no
@@ -602,7 +608,7 @@ impl LibraryView {
                         )
                         .child(
                             Button::new(("archive-space", idx))
-                                .role(None)
+                                .role(RoleOverride::Presentational)
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Close)

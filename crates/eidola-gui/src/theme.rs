@@ -717,6 +717,14 @@ fn circadian_day(character: LightCharacter, font_scale: f32) -> ThemeConfig {
 /// multiplies it.
 const UI_FONT_SIZE: f32 = 14.;
 
+/// Vertical padding for a single-line gpui-component `Input`, in rems so it
+/// follows the type scale. The widget's default (8px a side inside a 2rem
+/// frame) leaves less room than its 1.25rem line at our font sizes, and the
+/// line is centered and clipped to that room, which cuts off descenders. A
+/// quarter rem a side keeps the frame height and gives the line its full
+/// height. Applied at every `Input` site.
+pub const INPUT_PY: gpui::Rems = gpui::Rems(0.25);
+
 fn day_colors() -> ThemeConfigColors {
     let mut c = ThemeConfigColors::default();
 
@@ -768,13 +776,6 @@ fn day_colors() -> ThemeConfigColors {
     c.info_foreground = some("#fefaf5");
 
     // Chrome
-    // gpui-component Root's built-in Linux CSD frame would paint a 1px
-    // `window_border` rectangle at the window surface's very edge (around
-    // our transparent shadow margin). Our chrome (`chrome.rs`) draws the
-    // real frame; pin this transparent so the vestigial one never shows.
-    // Belt-and-braces: `chrome::themed_root` also disables Root's border
-    // outright via `bordered(false)`.
-    c.window_border = some("#00000000");
     c.title_bar = some("#fafafa");
     c.title_bar_border = some("#e4e4e4");
     c.tab_bar = some("#fafafa");
@@ -886,8 +887,6 @@ fn night_colors() -> ThemeConfigColors {
     c.info_foreground = some("#15191e");
 
     // Chrome
-    // Transparent for the same reason as Day: our chrome owns the frame.
-    c.window_border = some("#00000000");
     c.title_bar = some("#15191e");
     c.title_bar_border = some("#2c343d");
     c.tab_bar = some("#15191e");

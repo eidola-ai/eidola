@@ -18380,7 +18380,7 @@ fn backends_a_catalog_row_stands_down_while_its_transfer_starts(cx: &mut TestApp
         let _probes = probes_on();
         probe::clear_window(window.window_id().as_u64());
         // Synchronous: `draw_window` would run the pending continuation with it.
-        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
             .into_iter()

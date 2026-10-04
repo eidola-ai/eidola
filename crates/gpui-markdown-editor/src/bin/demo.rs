@@ -18,7 +18,7 @@ use gpui::{
     prelude::FluentBuilder, px, rems, size,
 };
 use gpui_component::{Root, Theme, h_flex, text::TextView, v_flex};
-use gpui_component_assets::Assets;
+use gpui_kit_assets::Assets;
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorState, parse};
 
 const DEMO_DOCUMENT: &str = "\

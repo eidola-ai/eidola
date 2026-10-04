@@ -2,7 +2,7 @@
 //!
 //! Every scrollable surface that isn't the space page (whose minimap *is* its
 //! scroll indicator) shares one presentation: a right-edge
-//! [`gpui_component::scroll::Scrollbar`] in [`ScrollbarShow::Scrolling`] mode —
+//! [`gpui_component::scroll::Scrollbar`] in [`ScrollbarMode::Scrolling`] mode —
 //! it appears while scrolling and fades out, the macOS overlay idiom, matching
 //! the calm design voice. It never reserves a permanent gutter and never
 //! shifts layout: the strip is an `absolute` overlay, so a surface that never
@@ -43,7 +43,7 @@
 //! so without a thumb an ordinary mouse has no path to what is clipped there.
 
 use gpui::{Div, InteractiveElement, ParentElement, Pixels, Stateful, Styled, Window, div, px};
-use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarShow};
+use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 
 /// Width of the overlay strip that houses the thumb. Matches the onboarding
 /// window's original inline value.
@@ -66,7 +66,7 @@ where
         .pt(clearance)
         .pb(clearance)
         .w(STRIP_WIDTH)
-        .child(Scrollbar::vertical(handle).scrollbar_show(ScrollbarShow::Scrolling))
+        .child(Scrollbar::vertical(handle).mode(ScrollbarMode::Scrolling))
 }
 
 /// A right-edge vertical scroll indicator for a **window-edge** scroll body,
@@ -115,5 +115,5 @@ where
         .right(STRIP_WIDTH)
         .bottom_0()
         .h(STRIP_WIDTH)
-        .child(Scrollbar::horizontal(handle).scrollbar_show(ScrollbarShow::Scrolling))
+        .child(Scrollbar::horizontal(handle).mode(ScrollbarMode::Scrolling))
 }

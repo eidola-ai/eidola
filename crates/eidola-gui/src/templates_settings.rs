@@ -34,7 +34,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, StyledExt, h_flex,
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
     v_flex,
 };
 
@@ -61,7 +61,7 @@ const ROUTER_HELP: &str = "A small model that decides which participants a post 
 /// One agent participant being edited inside a template draft.
 struct ParticipantDraft {
     label: Entity<InputState>,
-    system_prompt: Entity<InputState>,
+    system_prompt: Entity<TextareaState>,
     model_ref: Option<String>,
     notify_policy: String,
 }
@@ -174,7 +174,7 @@ impl TemplatesSettingsView {
     }
 
     #[doc(hidden)]
-    pub fn draft_participant_prompt_state(&self, idx: usize) -> Option<Entity<InputState>> {
+    pub fn draft_participant_prompt_state(&self, idx: usize) -> Option<Entity<TextareaState>> {
         self.draft
             .as_ref()?
             .participants
@@ -204,7 +204,7 @@ impl TemplatesSettingsView {
     ) -> ParticipantDraft {
         let label_state = cx.new(|cx| InputState::new(window, cx).default_value(label));
         let prompt_state = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 8)
                 .placeholder("A short instruction for how this participant behaves.")
                 .default_value(system_prompt.unwrap_or_default())
@@ -714,7 +714,11 @@ impl TemplatesSettingsView {
                         gpui::Role::TextInput,
                         "Template name",
                     )
-                    .child(Input::new(&draft.title).aria_label("Template name")),
+                    .child(
+                        Input::new(&draft.title)
+                            .aria_label("Template name")
+                            .py(crate::theme::INPUT_PY),
+                    ),
             );
 
         // Cascade limit — a small +/- stepper.
@@ -981,7 +985,11 @@ impl TemplatesSettingsView {
                                 gpui::Role::TextInput,
                                 "Name",
                             )
-                            .child(Input::new(&p.label).aria_label("Name")),
+                            .child(
+                                Input::new(&p.label)
+                                    .aria_label("Name")
+                                    .py(crate::theme::INPUT_PY),
+                            ),
                     )
                     .child(ghost_button_labeled(
                         SharedString::from(format!("tp-remove-{idx}")),
@@ -1011,7 +1019,7 @@ impl TemplatesSettingsView {
                         gpui::Role::TextInput,
                         "System prompt",
                     )
-                    .child(Input::new(&p.system_prompt).aria_label("System prompt")),
+                    .child(Textarea::new(&p.system_prompt).aria_label("System prompt")),
             )
             .child({
                 let mut row = h_flex().gap_2().items_center().child(

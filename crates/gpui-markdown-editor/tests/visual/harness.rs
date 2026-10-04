@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use gpui::{AppContext, Entity, Pixels, Render, Size, VisualTestAppContext};
 use gpui_component::{Root, Theme, ThemeMode};
-use gpui_component_assets::Assets;
+use gpui_kit_assets::Assets;
 use image::RgbaImage;
 
 type BuildRoot = Box<dyn Fn(&mut gpui::Window, &mut gpui::App) -> Entity<Root>>;
