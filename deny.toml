@@ -287,7 +287,7 @@ allow-git = [
 
 [sources.allow-org]
 # github.com organizations to allow git sources for:
-#   - eidola-ai: our own pinned forks (pulldown-cmark, turso)
+#   - eidola-ai: our own pinned forks (gpui-component, pulldown-cmark, turso)
 github = ["eidola-ai"]
 # gitlab.com organizations to allow git sources for
 gitlab = []
