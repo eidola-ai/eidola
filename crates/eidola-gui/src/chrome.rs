@@ -59,9 +59,7 @@ use gpui::{
     SharedString, Size, Stateful, StatefulInteractiveElement, Styled, Tiling, Window, div, point,
     prelude::FluentBuilder, px, size,
 };
-use gpui_component::{
-    ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, ThemeStyled as _, h_flex,
-};
+use gpui_component::{ActiveTheme, Icon, IconName, Root, Sizable, ThemeStyled as _, h_flex};
 
 use crate::probe::Probe;
 
