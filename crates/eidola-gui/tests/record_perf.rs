@@ -14,7 +14,7 @@
 //! ones that matter: an active
 //! text selection used to make every subsequent frame quadratic in payload
 //! size (see AGENTS.md → The Record), so a payload of a few tens of KB scrolled
-//! at ~2 fps in a dev build. Frame cost must stay flat across all four states
+//! at ~2 fps in a dev build. Frame cost must stay flat across all five states
 //! and grow no worse than linearly with payload size.
 //!
 //! **Selection fingerprints.** What a set of fixed drag geometries actually
@@ -22,6 +22,12 @@
 //! selection machinery (ours or upstream's): capture the fingerprints before
 //! and after and diff them — they must be byte-identical, because the Record is
 //! a forensic surface and "faster" must never mean "selects something else".
+//! The one legitimate exception is a change to the *layout* under a drag: when
+//! line wrapping moves, the same window point lies over a different glyph and
+//! the bytes move with it. Then check each build against its own rendering
+//! (`EIDOLA_RECORD_PERF_SHOTS`) — a selection must start at the glyph under
+//! the press and end at the one under the release, or at the end of the
+//! visual row when the release lies past it — before accepting the change.
 //!
 //! Payloads come from real captured bytes when `EIDOLA_RECORD_PERF_REQ` /
 //! `EIDOLA_RECORD_PERF_RESP` point at files (e.g. extracted from a `request`
