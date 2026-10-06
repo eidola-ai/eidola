@@ -308,6 +308,6 @@ cargo run -p gpui-markdown-editor --bin demo
 
 ## Known design notes
 
-- **The `gpui-component` spec is shared with `crates/eidola-gui`** — both track the `eidola` branch of `eidola-ai/gpui-component` (same spec so cargo unifies; `Cargo.lock` holds the resolved rev). Move them in lockstep; carried-patch inventory and update practice live in `crates/eidola-gui/AGENTS.md` → gpui / gpui-component pinning. `pulldown-cmark` tracks the `eidola` branch of `eidola-ai/pulldown-cmark` (empty-nested-lists opt-in + block display math; back to crates.io when the upstream PRs land).
-- **No Eidola-specific symbols.** Deps: `gpui`, `gpui-component`, `gpui-component-assets`, `pulldown-cmark`, `unicode-segmentation`, `smallvec`. Other gpui apps can use it without the rest of the workspace.
+- **The `gpui` / `gpui-component` specs are shared with `crates/eidola-gui`** — the same exact crates.io pins in both (`gpui-component`, `gpui-kit-assets`, and the `gpui-pre` snapshot crates aliased as `gpui` / `gpui_platform`), so cargo unifies on one gpui; the workspace root's `[patch.crates-io]` carries one gpui-component commit for both. Move them in lockstep; the snapshot model and bump procedure live in `crates/eidola-gui/AGENTS.md` → gpui / gpui-component pinning. `pulldown-cmark` tracks the `eidola` branch of `eidola-ai/pulldown-cmark` (empty-nested-lists opt-in + block display math; back to crates.io when the upstream PRs land).
+- **No Eidola-specific symbols.** Deps: `gpui`, `gpui-component`, `gpui-kit-assets`, `pulldown-cmark`, `unicode-segmentation`, `smallvec`. Other gpui apps can use it without the rest of the workspace.
 - **No async / no I/O.** Everything synchronous and pure except the gpui paint hooks. No tokio, no spawned tasks.

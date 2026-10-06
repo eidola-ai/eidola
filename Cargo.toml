@@ -85,3 +85,16 @@ opt-level = 3
 strip = true
 # Explicit overflow check setting
 overflow-checks = false
+
+# gpui-component's `eidola-0.7` branch: the 0.7.0 release plus one commit,
+# an app-level opt-out for its window border
+# (`set_window_border_enabled`), so the GUI's own Linux client-side
+# decorations stay the only ones. Every crate published from that repo that
+# we resolve is patched, so the lock holds one copy of each. The members
+# keep their `=0.7.0` requirements; remove this block when a released
+# gpui-component carries the opt-out.
+[patch.crates-io]
+gpui-component = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }
+gpui-base = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }
+gpui-component-macros = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }
+gpui-kit-assets = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }

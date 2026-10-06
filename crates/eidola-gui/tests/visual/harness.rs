@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use gpui::{AppContext, Entity, Pixels, Render, Size, VisualTestAppContext};
 use gpui_component::{Root, Theme, ThemeMode};
-use gpui_component_assets::Assets;
+use gpui_kit_assets::Assets;
 use image::RgbaImage;
 
 /// Build closure: must be `Fn` so the harness can invoke it once per mode.

@@ -13,6 +13,7 @@ use gpui::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
     WeakEntity, Window, div, prelude::FluentBuilder,
 };
+use gpui_component::RoleOverride;
 use gpui_component::{
     ActiveTheme, IconName, Sizable, StyledExt,
     button::{Button, ButtonVariants},
@@ -495,7 +496,7 @@ impl Render for AccountView {
                                         )
                                         .child(
                                             Button::new("confirm-reset")
-                                                .role(None)
+                                                .role(RoleOverride::Presentational)
                                                 .danger()
                                                 .small()
                                                 .label("Reset account")
@@ -515,7 +516,7 @@ impl Render for AccountView {
                                         )
                                         .child(
                                             Button::new("cancel-reset")
-                                                .role(None)
+                                                .role(RoleOverride::Presentational)
                                                 .ghost()
                                                 .small()
                                                 .label("Keep account")
@@ -574,7 +575,7 @@ impl Render for AccountView {
                             })
                             .child(
                                 Button::new("create-account")
-                                    .role(None)
+                                    .role(RoleOverride::Presentational)
                                     .primary()
                                     .small()
                                     .label("Set up an account…")
@@ -805,8 +806,9 @@ impl Render for AccountView {
                                         // plans below are what that reader
                                         // most likely came for, and two solid
                                         // buttons on one pane are two shouts.
-                                        let door =
-                                            Button::new("billing-portal").role(None).primary();
+                                        let door = Button::new("billing-portal")
+                                            .role(RoleOverride::Presentational)
+                                            .primary();
                                         let door = if subscribed { door } else { door.outline() };
                                         door.small()
                                             .label(if self.manage_pending {
@@ -1062,67 +1064,72 @@ fn account_credential_input(
                 .probe_bounds(id_prefix, gpui::Role::TextInput, label)
                 .w_full()
                 .child(
-                    Input::new(state).aria_label(label).suffix(
-                        h_flex()
-                            .gap_0p5()
-                            .when(show_secret_button, |el| {
-                                el.child(
-                                    // Probed wrapper for the a11y role/label —
-                                    // shrink-wraps the button so its bounds are
-                                    // an honest click target. Both the name and
-                                    // the element id derive from `id_prefix`:
-                                    // this component paints once per credential.
+                    Input::new(state)
+                        .aria_label(label)
+                        .py(crate::theme::INPUT_PY)
+                        .suffix(
+                            h_flex()
+                                .gap_0p5()
+                                .when(show_secret_button, |el| {
+                                    el.child(
+                                        // Probed wrapper for the a11y role/label —
+                                        // shrink-wraps the button so its bounds are
+                                        // an honest click target. Both the name and
+                                        // the element id derive from `id_prefix`:
+                                        // this component paints once per credential.
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "{id_prefix}-reveal-wrap"
+                                            )))
+                                            .probe(
+                                                SharedString::from(format!("{id_prefix}/reveal")),
+                                                gpui::Role::Button,
+                                                reveal_label,
+                                            )
+                                            .on_click(on_toggle_secret)
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "{id_prefix}-reveal"
+                                                )))
+                                                .role(RoleOverride::Presentational)
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(if secret_revealed {
+                                                    IconName::EyeOff
+                                                } else {
+                                                    IconName::Eye
+                                                })
+                                                .tooltip(reveal_label)
+                                                .tab_stop(false),
+                                            ),
+                                    )
+                                })
+                                .child(
                                     div()
-                                        .id(SharedString::from(format!("{id_prefix}-reveal-wrap")))
+                                        .id(SharedString::from(format!("{id_prefix}-copy-wrap")))
                                         .probe(
-                                            SharedString::from(format!("{id_prefix}/reveal")),
+                                            SharedString::from(format!("{id_prefix}/copy")),
                                             gpui::Role::Button,
-                                            reveal_label,
+                                            copy_label.clone(),
                                         )
-                                        .on_click(on_toggle_secret)
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy_value.to_string(),
+                                            ));
+                                        })
                                         .child(
                                             Button::new(SharedString::from(format!(
-                                                "{id_prefix}-reveal"
+                                                "{id_prefix}-copy"
                                             )))
-                                            .role(None)
+                                            .role(RoleOverride::Presentational)
                                             .ghost()
                                             .xsmall()
-                                            .icon(if secret_revealed {
-                                                IconName::EyeOff
-                                            } else {
-                                                IconName::Eye
-                                            })
-                                            .tooltip(reveal_label)
+                                            .icon(IconName::Copy)
+                                            .tooltip(copy_label)
                                             .tab_stop(false),
                                         ),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("{id_prefix}-copy-wrap")))
-                                    .probe(
-                                        SharedString::from(format!("{id_prefix}/copy")),
-                                        gpui::Role::Button,
-                                        copy_label.clone(),
-                                    )
-                                    .on_click(move |_, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            copy_value.to_string(),
-                                        ));
-                                    })
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "{id_prefix}-copy"
-                                        )))
-                                        .role(None)
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Copy)
-                                        .tooltip(copy_label)
-                                        .tab_stop(false),
-                                    ),
-                            ),
-                    ),
+                                ),
+                        ),
                 ),
         )
 }

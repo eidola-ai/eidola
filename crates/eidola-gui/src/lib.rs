@@ -51,7 +51,7 @@ use gpui::{
     WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px, size,
 };
 use gpui_component::Root;
-use gpui_component_assets::Assets;
+use gpui_kit_assets::Assets;
 
 use crate::about::AboutView;
 use crate::actions::{
@@ -153,6 +153,11 @@ pub fn run_with(opts: LaunchOptions) {
 
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        // `chrome.rs` draws this app's client-side decorations; gpui-component's
+        // window border would stack a second set under them. On a
+        // server-decorated window (every macOS window) that border is a
+        // pass-through, so the opt-out needs no platform gate.
+        gpui_component::set_window_border_enabled(false, cx);
         theme::install(cx);
         // The source locale until `i18n::wire_config` below resolves the real
         // one — the same install-then-wire shape the theme uses.

@@ -19,6 +19,7 @@ use gpui::{
     ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
     prelude::FluentBuilder as _,
 };
+use gpui_component::RoleOverride;
 use gpui_component::{
     ActiveTheme, Disableable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
@@ -225,7 +226,7 @@ impl Render for UpdatesView {
             .gap_3()
             .child(
                 // The probed wrapper carries the a11y role/label (the
-                // Button is presentational via `.role(None)` so AT sees one
+                // Button is presentational via `.role(RoleOverride::Presentational)` so AT sees one
                 // control, not two); it shrink-wraps the button so its
                 // bounds are an honest click target.
                 div()
@@ -249,7 +250,7 @@ impl Render for UpdatesView {
                     })
                     .child(
                         Button::new("check-now")
-                            .role(None)
+                            .role(RoleOverride::Presentational)
                             .label(check_label)
                             .small()
                             .disabled(checking)
@@ -433,7 +434,7 @@ fn render_update_available(
             .on_click(cx.listener(|this, _, _, cx| this.open_release_page(cx)))
             .child(
                 Button::new("open-release")
-                    .role(None)
+                    .role(RoleOverride::Presentational)
                     .primary()
                     .label("View Release…")
                     .tab_stop(false),
@@ -583,7 +584,7 @@ fn render_claims_changed(
                     .on_click(cx.listener(|this, _, _, cx| this.accept_claims(cx)))
                     .child(
                         Button::new("treat-as-update")
-                            .role(None)
+                            .role(RoleOverride::Presentational)
                             .outline()
                             .label("Treat as Update")
                             .small()

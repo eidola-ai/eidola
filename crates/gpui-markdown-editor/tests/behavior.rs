@@ -10371,7 +10371,7 @@ fn a_composition_cannot_outlive_the_editor_losing_focus(cx: &mut TestAppContext)
     editor.read_with(cx, |e, _| assert!(e.is_composing()));
 
     let changes = change_counter(cx, &editor);
-    cx.update_window(handle, |_, window, _| window.blur())
+    cx.update_window(handle, |_, window, cx| window.blur(cx))
         .unwrap();
     cx.run_until_parked();
 

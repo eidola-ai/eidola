@@ -33,7 +33,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, StyledExt as _, h_flex,
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
     v_flex,
 };
 
@@ -57,7 +57,7 @@ const RETIRE_NOTE: &str = "Retiring takes this agent out of the library and arch
 struct AgentDraft {
     participant_id: String,
     label: Entity<InputState>,
-    system_prompt: Entity<InputState>,
+    system_prompt: Entity<TextareaState>,
     model_ref: Option<String>,
     notify_policy: String,
     /// The editor subtree's own focus handle — what the handback question is
@@ -168,7 +168,7 @@ impl AgentsSettingsView {
     }
 
     #[doc(hidden)]
-    pub fn editing_prompt_state(&self) -> Option<Entity<InputState>> {
+    pub fn editing_prompt_state(&self) -> Option<Entity<TextareaState>> {
         self.draft.as_ref().map(|d| d.system_prompt.clone())
     }
 
@@ -203,7 +203,7 @@ impl AgentsSettingsView {
         // A reveal focuses what it revealed (the Settings idiom's rule).
         label.update(cx, |s, cx| s.focus(window, cx));
         let system_prompt = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 8)
                 .placeholder(PROMPT_PLACEHOLDER)
                 .default_value(agent.system_prompt.clone().unwrap_or_default())
@@ -784,7 +784,11 @@ impl AgentsSettingsView {
                 div()
                     .id("agent-name-wrap")
                     .probe_bounds("settings/agents/editor/name", gpui::Role::TextInput, "Name")
-                    .child(Input::new(&draft.label).aria_label("Name")),
+                    .child(
+                        Input::new(&draft.label)
+                            .aria_label("Name")
+                            .py(crate::theme::INPUT_PY),
+                    ),
             )
             .child(field_label("Model", cx))
             .child(model_field(
@@ -806,7 +810,7 @@ impl AgentsSettingsView {
                         gpui::Role::TextInput,
                         "Charter",
                     )
-                    .child(Input::new(&draft.system_prompt).aria_label("Charter")),
+                    .child(Textarea::new(&draft.system_prompt).aria_label("Charter")),
             )
             .child(field_label("Responds", cx))
             .child(self.render_notify(&draft.notify_policy, cx))

@@ -831,12 +831,12 @@ pub(crate) struct FindSession {
     /// rather than its focus handle. That is the whole difference: a
     /// `FocusHandle` recorded here would be the dead slot this window's focus
     /// doctrine is built around — tracked on no element, still reporting
-    /// itself focused — where an `InputState` dies with the form that owns it,
+    /// itself focused — where an input state dies with the form that owns it,
     /// so a participant editor closed while the bar stood open simply fails to
     /// upgrade and the handback falls through to `keyboard_home`. Derived at
     /// the moment of use, exactly like the composing arm; only the *identity*
     /// is carried, never the answer.
-    pub(crate) returned_input: Option<gpui::WeakEntity<gpui_component::input::InputState>>,
+    pub(crate) returned_input: Option<super::inspector::WeakField>,
 }
 
 /// What one node holds for the current query — [`FindSession::node_result`]'s
@@ -1410,7 +1410,7 @@ impl SpaceView {
             // **And "still there" is two questions, because one of the
             // panel's fields outlives its panel.** The weak reference answers
             // for a *form* — a participant editor retired while the bar stood
-            // open takes its `InputState` with it — but `set_inspector_open`
+            // open takes its input state with it — but `set_inspector_open`
             // deliberately keeps the title field and the open editor across a
             // close, so a hidden panel's field upgrades perfectly well while
             // its element is unmounted. Focusing it is the dead slot this
@@ -1424,8 +1424,7 @@ impl SpaceView {
             // every other answer here, rather than cleared at the close.
             let back = lender
                 .filter(|_| self.inspector_open)
-                .and_then(|input| input.upgrade())
-                .map(|input| gpui::Focusable::focus_handle(input.read(cx), cx))
+                .and_then(|input| input.focus_handle(cx))
                 .unwrap_or_else(|| self.keyboard_home(cx));
             window.focus(&back, cx);
         }
@@ -2973,7 +2972,8 @@ impl SpaceView {
                     )
                     .child(
                         gpui_component::input::Input::new(&input)
-                            .aria_label(crate::i18n::msg::find_field_label(cx)),
+                            .aria_label(crate::i18n::msg::find_field_label(cx))
+                            .py(crate::theme::INPUT_PY),
                     ),
             )
             .child(self.find_step_button(

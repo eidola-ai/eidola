@@ -437,13 +437,13 @@ impl SpaceView {
         &self,
         window: &Window,
         cx: &gpui::App,
-    ) -> Option<gpui::WeakEntity<gpui_component::input::InputState>> {
+    ) -> Option<WeakField> {
         self.inspector_title
             .as_ref()
             .filter(|(state, _)| {
                 gpui::Focusable::focus_handle(state.read(cx), cx).is_focused(window)
             })
-            .map(|(state, _)| state.downgrade())
+            .map(|(state, _)| WeakField::Input(state.downgrade()))
             .or_else(|| self.inspector_participant_focused_input(window, cx))
     }
 
@@ -734,7 +734,11 @@ impl SpaceView {
                     "Space title",
                 )
                 .when_some(self.inspector_title.as_ref(), |el, (state, _)| {
-                    el.child(Input::new(state).aria_label("Space title"))
+                    el.child(
+                        Input::new(state)
+                            .aria_label("Space title")
+                            .py(crate::theme::INPUT_PY),
+                    )
                 }),
         );
 
@@ -988,5 +992,29 @@ mod tests {
             narrow,
             "an overlay covers the page rather than reflowing it"
         );
+    }
+}
+
+/// One of the inspector's text fields, held weakly: a single-line
+/// [`InputState`](gpui_component::input::InputState) or a multi-line
+/// [`TextareaState`](gpui_component::input::TextareaState). Either entity dies
+/// with the form that owns it, so a field whose form is gone fails to upgrade.
+#[derive(Clone)]
+pub(crate) enum WeakField {
+    Input(gpui::WeakEntity<gpui_component::input::InputState>),
+    Textarea(gpui::WeakEntity<gpui_component::input::TextareaState>),
+}
+
+impl WeakField {
+    /// The field's focus handle, if its entity is still alive.
+    pub(crate) fn focus_handle(&self, cx: &gpui::App) -> Option<gpui::FocusHandle> {
+        match self {
+            WeakField::Input(field) => field
+                .upgrade()
+                .map(|e| gpui::Focusable::focus_handle(e.read(cx), cx)),
+            WeakField::Textarea(field) => field
+                .upgrade()
+                .map(|e| gpui::Focusable::focus_handle(e.read(cx), cx)),
+        }
     }
 }

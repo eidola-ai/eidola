@@ -37,8 +37,8 @@
 //! 2. **A focused element with no a11y node reports no focus at all.**
 //!    `A11y::set_focus` is a no-op unless the node was pushed (which needs a
 //!    role), and `finalize` then falls back to `ROOT_NODE_ID` — so focusing the
-//!    inner widget, which carries no role at our pin, tells assistive
-//!    technology that focus is on the *window*.
+//!    inner widget, which is made presentational, tells assistive technology
+//!    that focus is on the *window*.
 //!
 //! Letting the widget keep the tab stop satisfies (1) and violates (2);
 //! wrapping without hoisting does the reverse. Hoisting satisfies both, and its
@@ -60,11 +60,11 @@
 //!
 //! Two exceptions:
 //!
-//! - **`Switch`** tracks no focus handle at all, so there is nothing inside to
-//!   take out of the tab order; the hoist is the whole fix. It cannot
-//!   double-fire on a pointer click, because `Switch` handles the press in
-//!   `on_mouse_down` and stops propagation, and gpui bubbles mouse listeners
-//!   innermost-first.
+//! - **`Switch`** is not hoisted at all: the widget tracks its own focus
+//!   handle, sets its own role, toggled state and label, and activates from
+//!   its own `on_click` (pointer, Enter and Space alike), so it is the control
+//!   and its wrapper is a bounds-only probe with no handler — the
+//!   focus-bearing regime `Input` follows.
 //! - **`Input` / `MarkdownEditor`** is the model's one remaining hole, which is
 //!   why **`Role::TextInput` is excluded from [`is_focusable`] outright**: a
 //!   tab stop on the wrapper would land focus on a div that cannot type, mere

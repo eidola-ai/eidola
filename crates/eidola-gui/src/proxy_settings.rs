@@ -804,7 +804,8 @@ impl Render for ProxySettingsView {
                         .min_w_0()
                         .child(
                             Input::new(&self.key_label)
-                                .aria_label(msg::proxy_key_label_placeholder(cx)),
+                                .aria_label(msg::proxy_key_label_placeholder(cx))
+                                .py(crate::theme::INPUT_PY),
                         ),
                 )
                 // **A control over a settled decision is not a control.** While
@@ -909,25 +910,20 @@ pub fn listen_copy(failure: &ListenFailure, cx: &App) -> SharedString {
 }
 
 impl ProxySettingsView {
-    /// The enable switch. The probed wrapper **is** the control (role, label,
-    /// keyboard activation) because `Switch` tracks no focus handle at this
-    /// gpui-component rev; the widget handles the pointer press itself with
-    /// `stop_propagation`, so the two never double-fire.
+    /// The enable switch. `Switch` is a focus-bearing control: the widget is
+    /// the accessible node (role, toggled state, focus, activation) and the
+    /// wrapper is a bounds-only probe for the QA driver.
     fn serve_switch(&self, enabled: bool, cx: &Context<Self>) -> impl IntoElement + use<> {
-        let next = !enabled;
         div()
             .id("proxy-serve")
-            .probe(
+            .probe_bounds(
                 "settings/proxy/serve",
-                gpui::Role::CheckBox,
+                gpui::Role::Switch,
                 msg::proxy_serve_name(cx),
             )
-            // `aria_toggled`, not `aria_selected`: `accesskit_macos` reads a
-            // checkbox's value from `toggled()`.
-            .aria_toggled(enabled.into())
-            .on_click(cx.listener(move |this, _, _, cx| this.set_enabled(next, cx)))
             .child(
                 Switch::new("proxy-serve-switch")
+                    .accessibility_label(msg::proxy_serve_name(cx))
                     .small()
                     .checked(enabled)
                     .on_click(cx.listener(move |this, checked: &bool, _, cx| {
@@ -989,7 +985,11 @@ impl ProxySettingsView {
                         )
                         .flex_1()
                         .min_w_0()
-                        .child(Input::new(&edit.address).aria_label(msg::proxy_address_name(cx))),
+                        .child(
+                            Input::new(&edit.address)
+                                .aria_label(msg::proxy_address_name(cx))
+                                .py(crate::theme::INPUT_PY),
+                        ),
                 )
                 .child(
                     div()
@@ -1001,7 +1001,11 @@ impl ProxySettingsView {
                         )
                         .w(px(80.))
                         .flex_none()
-                        .child(Input::new(&edit.port).aria_label(msg::proxy_port_name(cx))),
+                        .child(
+                            Input::new(&edit.port)
+                                .aria_label(msg::proxy_port_name(cx))
+                                .py(crate::theme::INPUT_PY),
+                        ),
                 )
                 .child(ghost_button(
                     SharedString::from("proxy-binding-save"),
@@ -1035,7 +1039,6 @@ impl ProxySettingsView {
     ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let exposed = settings.exposed_ids.contains(&backend.id);
-        let id = backend.id.clone();
         let switch_id = backend.id.clone();
         let name = SharedString::from(backend.display_name.clone());
         h_flex()
@@ -1044,30 +1047,18 @@ impl ProxySettingsView {
             .child(
                 div()
                     .id(SharedString::from(format!("proxy-backend-{}", backend.id)))
-                    .probe(
+                    // The widget is the node; see `serve_switch`.
+                    .probe_bounds(
                         format!("settings/proxy/backends/{}", backend.id),
-                        gpui::Role::CheckBox,
+                        gpui::Role::Switch,
                         msg::proxy_backend_name(cx, name.to_string()),
                     )
-                    .aria_toggled(exposed.into())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_backend_exposed(id.clone(), !exposed, cx)
-                    }))
                     .child(
-                        // Wired the way every other `Switch` in the app is
-                        // (`serve_switch`, the auto-start toggles, the login
-                        // item): the wrapper is the control for the keyboard
-                        // and the accessibility tree, and the widget takes the
-                        // pointer press itself and stops it, so the two never
-                        // double-fire. At this gpui-component rev a `Switch`
-                        // *without* an `on_click` registers no mouse-down at
-                        // all and the press reaches the wrapper anyway; this
-                        // site was the one exception, resting on that detail
-                        // where every other rests on the stop.
                         Switch::new(SharedString::from(format!(
                             "proxy-backend-switch-{}",
                             backend.id
                         )))
+                        .accessibility_label(msg::proxy_backend_name(cx, name.to_string()))
                         .small()
                         .checked(exposed)
                         .on_click(cx.listener(

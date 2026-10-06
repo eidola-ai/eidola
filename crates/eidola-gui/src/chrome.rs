@@ -9,18 +9,16 @@
 //! KDE with the user's "force SSD" preference). macOS never reaches this
 //! module's rendering paths: [`ChromeRoot::wrap`] is an identity there.
 //!
-//! **This module is the single CSD authority.** `gpui_component::Root` ships
-//! its own Linux CSD layer (`window_border()`: 12px shadow padding, a 1px
-//! `theme.window_border` frame, resize hit zones, and an opaque
-//! `bg(theme.background)` across the whole window). Left active it stacks
-//! under ours: its background fills our shadow padding with an opaque cliff
-//! and its resize cursors land at the wrong edge. [`themed_root`] therefore
-//! constructs every window's `Root` with that layer disabled outright via
-//! `Root::bordered(false)` (upstream gpui-component `#2466`: `render` returns
-//! the inner content directly, skipping the `window_border()` wrapper
-//! entirely) plus a transparent background. Belt-and-braces, the Circadian
-//! palettes also pin `window_border` transparent so a vestigial frame could
-//! never paint even if the flag regressed.
+//! **This module is the single CSD authority.** gpui-component's root plugin
+//! would wrap every client-decorated window in its own CSD layer
+//! (`window_border()`: 20px shadow padding, a 1px frame in a hard-coded grey,
+//! `set_client_inset`, and resize hit zones), stacking a second ring of
+//! shadow padding, a second frame, and resize zones at the wrong edge under
+//! ours. The app switches that wrapper off once at startup
+//! (`gpui_component::set_window_border_enabled(false, cx)`, carried on our
+//! gpui-component branch until upstream releases it). The root also paints an
+//! opaque `bg(theme.background)`; [`themed_root`] makes it transparent so it
+//! cannot fill our shadow padding.
 //!
 //! The layer has three parts:
 //!
@@ -61,7 +59,7 @@ use gpui::{
     SharedString, Size, Stateful, StatefulInteractiveElement, Styled, Tiling, Window, div, point,
     prelude::FluentBuilder, px, size,
 };
-use gpui_component::{ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, h_flex};
+use gpui_component::{ActiveTheme, Icon, IconName, Root, Sizable, ThemeStyled as _, h_flex};
 
 use crate::probe::Probe;
 
@@ -124,12 +122,8 @@ pub(crate) fn controls_reserve(window: &Window) -> Pixels {
     CONTROL_WIDTH * buttons as f32
 }
 
-/// Construct the `gpui_component::Root` for an Eidola window. On Linux,
-/// Root's built-in CSD layer is disabled outright — `bordered(false)` makes
-/// `Root::render` return its inner content directly instead of wrapping it in
-/// `window_border()`, so there is no second ring of shadow padding, no
-/// competing resize hit zones at the wrong edge, and no vestigial 1px frame.
-/// The background is made transparent (Root's default opaque
+/// Construct the `gpui_component::Root` for an Eidola window. On Linux the
+/// background is made transparent (Root's default opaque
 /// `bg(theme.background)` would fill [`ChromeRoot`]'s shadow padding with a
 /// hard-edged cliff instead of letting the desktop show through). The
 /// background moves into the chrome layer: the client frame paints it inside
@@ -138,7 +132,7 @@ pub(crate) fn controls_reserve(window: &Window) -> Pixels {
 pub(crate) fn themed_root(view: AnyView, window: &mut Window, cx: &mut Context<Root>) -> Root {
     let root = Root::new(view, window, cx);
     if cfg!(target_os = "linux") {
-        root.bordered(false).bg(gpui::transparent_black())
+        root.bg(gpui::transparent_black())
     } else {
         root
     }
@@ -365,9 +359,8 @@ impl ChromeRoot {
             .on_mouse_down(MouseButton::Left, move |e, window, cx| {
                 let size = window.window_bounds().get_bounds().size;
                 if let Some(edge) = resize_edge(e.position, SHADOW_SIZE, size, tiling) {
-                    // Stop the bubble so Root's window_border (which keeps a
-                    // vestigial resize handler of its own) can't issue a
-                    // second, competing resize request.
+                    // The press is the resize and nothing else: stop the
+                    // bubble so no ancestor also answers it.
                     cx.stop_propagation();
                     window.start_window_resize(edge);
                 }

@@ -145,10 +145,11 @@ pub fn block_size(image: &RenderImage, max_width: Pixels) -> Size<Pixels> {
 }
 
 /// Paint `image` filling `bounds`. Thin wrapper around
-/// [`Window::paint_image`] so callers don't have to thread the
+/// [`Window::paint_image`] so callers don't have to thread the image
+/// bounds (the same as `bounds` — the image fills its box) or the
 /// `Corners` / `grayscale` / `frame_index` arguments.
 pub fn paint(image: Arc<RenderImage>, bounds: Bounds<Pixels>, window: &mut Window) {
-    let _ = window.paint_image(bounds, Corners::default(), image, 0, false);
+    let _ = window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
 }
 
 /// Default fraction of a line height to reserve for an inline image

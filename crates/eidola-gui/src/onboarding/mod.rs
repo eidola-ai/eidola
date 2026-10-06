@@ -61,7 +61,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme,
     input::InputState,
-    scroll::{Scrollbar, ScrollbarShow},
+    scroll::{Scrollbar, ScrollbarMode},
 };
 
 use gpui_markdown_editor::MarkdownEditorState;
@@ -1037,7 +1037,7 @@ impl Render for OnboardingView {
                     .children(slides),
             )
             // A right-edge scroll indicator that appears only while scrolling
-            // (`ScrollbarShow::Scrolling`) — the built-in gpui-component
+            // (`ScrollbarMode::Scrolling`) — the built-in gpui-component
             // overlay bound to the same page scroll handle.
             .child(
                 div()
@@ -1046,10 +1046,7 @@ impl Render for OnboardingView {
                     .right_0()
                     .bottom_0()
                     .w(px(14.))
-                    .child(
-                        Scrollbar::vertical(&self.page_scroll)
-                            .scrollbar_show(ScrollbarShow::Scrolling),
-                    ),
+                    .child(Scrollbar::vertical(&self.page_scroll).mode(ScrollbarMode::Scrolling)),
             )
             // The titlebar drag band paints last so it wins hit-testing over the
             // slide content beneath the traffic lights.
