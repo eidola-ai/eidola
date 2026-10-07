@@ -52,13 +52,6 @@ macro_rules! redacted_secret {
                 v.0.copy_from_slice(bytes);
                 v
             }
-
-            /// A fresh allocation filled from the operating system's CSPRNG in place.
-            fn random() -> Self {
-                let mut v = Self(Box::new([0u8; SECRET_LEN]));
-                fill_random(&mut v.0);
-                v
-            }
         }
     };
 }
@@ -96,7 +89,7 @@ impl EngineSalt {
     /// A fresh random salt. Used for requests that carry no cache key: such a request can
     /// only ever hit blocks it computed itself (after a preemption), never anyone else's.
     pub fn fresh() -> Self {
-        Self::random()
+        Self(random_secret())
     }
 
     /// Constructs a salt from raw bytes. Test and integration use only; production salts
@@ -118,7 +111,7 @@ impl EngineSalt {
 impl BootKey {
     /// A fresh random per-boot key.
     pub fn generate() -> Self {
-        Self::random()
+        Self(random_secret())
     }
 
     /// Constructs a boot key from raw bytes (tests only need determinism).
@@ -172,6 +165,13 @@ impl Default for SaltDeriver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A fresh allocation filled from the operating system's CSPRNG in place.
+fn random_secret() -> Box<[u8; SECRET_LEN]> {
+    let mut b = Box::new([0u8; SECRET_LEN]);
+    fill_random(&mut b);
+    b
 }
 
 /// Fills `out` from the operating system's CSPRNG. Failure to obtain randomness is fatal: a
