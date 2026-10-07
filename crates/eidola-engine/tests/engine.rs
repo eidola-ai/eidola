@@ -1015,3 +1015,38 @@ fn no_drafts_are_reserved_at_position_zero() {
         assert_eq!(h.outputs[&id], h.expected(&prompt, &greedy, 2, &[]));
     }
 }
+
+/// Drafts never cost a sequence its output: when plain decoding fits in KV but the
+/// `1 + k` reservation does not, the row drops its drafts instead of finishing with
+/// `Length`. Block size 1 and k = 3; both requests used to end early (the second with
+/// no output at all).
+#[test]
+fn kv_pressure_drops_drafts_before_finishing() {
+    use eidola_engine::mock::mimo_like_spec;
+
+    let greedy = SamplingParams::greedy();
+    // (allocatable blocks + 1, prompt): plain decoding needs prompt + 1 positions.
+    for (blocks, prompt) in [(3, vec![7u32]), (4, vec![7, 9])] {
+        let spec = mimo_like_spec(32, 1, 6, 10, blocks, 4, 3);
+        let mut h = Harness::new(spec, sched(true), MockConfig::default());
+        h.submit(request(1, prompt.clone(), greedy, 2, CacheScope::Private));
+        h.run();
+        assert_eq!(
+            h.outputs[&1],
+            h.expected(&prompt, &greedy, 2, &[]),
+            "{prompt:?}"
+        );
+        assert_eq!(h.outputs[&1].len(), 2);
+        assert_eq!(h.finished[&1], FinishReason::Length);
+        assert_eq!(h.eng.stats().drafted, 0);
+        assert_eq!(h.eng.stats().preemptions, 0);
+    }
+    // Where even plain decoding cannot grow, the documented `Length` still applies.
+    let spec = mimo_like_spec(32, 1, 6, 10, 3, 4, 3);
+    let mut h = Harness::new(spec, sched(true), MockConfig::default());
+    h.submit(request(1, vec![7], greedy, 5, CacheScope::Private));
+    h.run();
+    assert_eq!(h.outputs[&1].len(), 2);
+    assert_eq!(h.outputs[&1], h.expected(&[7], &greedy, 2, &[]));
+    assert_eq!(h.finished[&1], FinishReason::Length);
+}

@@ -458,15 +458,14 @@ impl<E: Executor> Engine<E> {
             if seats == 0 || budget == 0 {
                 break;
             }
-            let Some((entry, cost)) = self.plan_row(id, budget, k) else {
+            let Some((mut entry, mut cost)) = self.plan_row(id, budget, k) else {
                 continue;
             };
-            let upto = entry.context_len + entry.num_tokens + entry.num_drafts;
             let mut scheduled = true;
-            while !self.kv.allocate(id, upto) {
+            while !self.allocate_row(id, &mut entry, &mut cost) {
                 if self.running.len() == 1 {
-                    // Alone, with every unreferenced cache entry already evicted: this
-                    // sequence can never grow further.
+                    // Alone, with every unreferenced cache entry already evicted, and not
+                    // even plain decoding fits: this sequence can never grow further.
                     events.push(self.finish_now(id, FinishReason::Length, now));
                     scheduled = false;
                     break;
@@ -504,7 +503,7 @@ impl<E: Executor> Engine<E> {
                 ) else {
                     break;
                 };
-                let Some((entry, cost)) = self.plan_row(id, budget, k) else {
+                let Some((mut entry, mut cost)) = self.plan_row(id, budget, k) else {
                     self.kv.release(
                         id,
                         Release::Preempt,
@@ -513,8 +512,7 @@ impl<E: Executor> Engine<E> {
                     );
                     break;
                 };
-                let upto = entry.context_len + entry.num_tokens + entry.num_drafts;
-                if !self.kv.allocate(id, upto) {
+                if !self.allocate_row(id, &mut entry, &mut cost) {
                     self.kv.release(
                         id,
                         Release::Preempt,
@@ -565,6 +563,24 @@ impl<E: Executor> Engine<E> {
             finish: Some(reason),
             cached_prompt_tokens: seq.cached_prompt_tokens.unwrap_or(0),
         }
+    }
+
+    /// Maps KV for a planned row. Under memory pressure a speculative row first gives up
+    /// its drafts (all of them: a row drafts `k` or nothing, so decode steps keep at most
+    /// two draft widths) and is retried as plain decoding; only when that does not fit
+    /// either does it return false, leaving the caller to preempt or finish. Drafts are
+    /// an optimisation and never cost a sequence its output.
+    fn allocate_row(&mut self, id: RequestId, entry: &mut SeqEntry, cost: &mut u32) -> bool {
+        let upto = entry.context_len + entry.num_tokens;
+        if self.kv.allocate(id, upto + entry.num_drafts) {
+            return true;
+        }
+        if entry.num_drafts == 0 || !self.kv.allocate(id, upto) {
+            return false;
+        }
+        *cost -= entry.num_drafts;
+        entry.num_drafts = 0;
+        true
     }
 
     /// Plans the row for a running (or just admitted) sequence within `budget` query tokens.
