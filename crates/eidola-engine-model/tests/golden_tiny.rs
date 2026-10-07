@@ -253,3 +253,21 @@ fn integrity_manifest_covers_config_and_index() {
     assert!(store.verify_sha256(&shards_only).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Asking for the last row's logits of an empty input is an input error on both
+/// paths (one `LogitsAt::resolve`), never an underflow panic.
+#[test]
+fn last_logits_of_an_empty_input_are_refused() {
+    let m = model(&LoadOptions::default());
+    let empty = Matrix::zeros(0, m.weights.config.hidden_size);
+    let out = m.mtp_forward(0, &[], &empty, &[], &LogitsAt::Last);
+    assert!(matches!(out, Err(eidola_engine_model::Error::Input(_))));
+    let out = m.forward(
+        &[],
+        &ForwardOptions {
+            logits: LogitsAt::Last,
+            capture_layers: false,
+        },
+    );
+    assert!(matches!(out, Err(eidola_engine_model::Error::Input(_))));
+}

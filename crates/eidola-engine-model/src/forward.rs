@@ -24,7 +24,10 @@ impl LogitsAt {
         Ok(match self {
             LogitsAt::None => vec![],
             LogitsAt::All => (0..len).collect(),
-            LogitsAt::Last => vec![len - 1],
+            LogitsAt::Last => match len.checked_sub(1) {
+                Some(last) => vec![last],
+                None => return Err(Error::Input("last logits of an empty sequence".into())),
+            },
             LogitsAt::Positions(p) => {
                 if let Some(&bad) = p.iter().find(|&&i| i >= len) {
                     return Err(Error::Input(format!("logits row {bad} of {len}")));
@@ -387,6 +390,7 @@ impl ReferenceModel {
         if prev_hidden.rows != tokens.len() || prev_hidden.cols != hsz {
             return Err(Error::Input("prev_hidden must be [tokens, hidden]".into()));
         }
+        let logit_rows = logits.resolve(tokens.len())?;
         let eps = cfg.rms_norm_eps;
         let e = rms_norm_rows(&self.embed(tokens)?, &mw.enorm, eps);
         let hp = rms_norm_rows(prev_hidden, &mw.hnorm, eps);
@@ -406,7 +410,6 @@ impl ReferenceModel {
         add_assign(&mut h, &f);
 
         let hidden_normed = rms_norm_rows(&h, &mw.final_norm, eps);
-        let logit_rows = logits.resolve(tokens.len())?;
         let logits = self.lm_head(&hidden_normed, &logit_rows);
         Ok(MtpOutput {
             logit_rows,
