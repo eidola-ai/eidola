@@ -2852,6 +2852,12 @@ dependencies = [
 [[package]]
 name = "eidola-engine-cpu"
 version = "0.1.0"
+dependencies = [
+ "eidola-engine",
+ "eidola-engine-model",
+ "rayon",
+ "serde_json",
+]
 
 [[package]]
 name = "eidola-engine-kernels"
