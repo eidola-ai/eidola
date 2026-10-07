@@ -195,3 +195,59 @@ fn integrity_manifest_is_enforced() {
     extra.insert("other.safetensors".into(), "0".repeat(64));
     assert!(store.verify_sha256(&extra).is_err());
 }
+
+/// One manifest covers every file the loader reads: the shards, `config.json`,
+/// and the index whose `tp_size` decides how fused QKV rows de-interleave. A
+/// changed index or config fails verification, and the configuration is parsed
+/// from exactly the bytes that were hashed.
+#[test]
+fn integrity_manifest_covers_config_and_index() {
+    let src = fixture();
+    let dir = std::env::temp_dir().join(format!("eidola-model-semantic-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["config.json", "model.safetensors"] {
+        std::fs::copy(src.join(f), dir.join(f)).unwrap();
+    }
+    let index = |tp: u32| format!(r#"{{"metadata": {{"tp_size": "{tp}"}}, "weight_map": {{}}}}"#);
+    std::fs::write(dir.join("model.safetensors.index.json"), index(4)).unwrap();
+
+    let store = WeightSet::open_dir(&dir).unwrap();
+    let manifest = store.sha256_manifest();
+    assert_eq!(
+        manifest.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "config.json",
+            "model.safetensors",
+            "model.safetensors.index.json"
+        ]
+    );
+    store.verify_sha256(&manifest).unwrap();
+    assert_eq!(store.metadata("tp_size"), Some("4"));
+    let config = store.model_config().unwrap();
+    assert_eq!(
+        config.num_layers(),
+        ModelConfig::from_file(&src.join("config.json"))
+            .unwrap()
+            .num_layers()
+    );
+
+    // A stale index (different tp_size) fails the manifest of the original.
+    std::fs::write(dir.join("model.safetensors.index.json"), index(8)).unwrap();
+    let tampered = WeightSet::open_dir(&dir).unwrap();
+    assert!(tampered.verify_sha256(&manifest).is_err());
+    std::fs::write(dir.join("model.safetensors.index.json"), index(4)).unwrap();
+
+    // So does an edited config.
+    let mut cfg = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    cfg.push('\n');
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+    let tampered = WeightSet::open_dir(&dir).unwrap();
+    assert!(tampered.verify_sha256(&manifest).is_err());
+
+    // A manifest that omits a semantic file is not a complete one.
+    let mut shards_only = manifest.clone();
+    shards_only.remove("config.json");
+    assert!(store.verify_sha256(&shards_only).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

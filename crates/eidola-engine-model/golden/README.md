@@ -56,7 +56,7 @@ cd ../../.. && cargo test --release -p eidola-engine-model --test real_flash -- 
 - the embeddings, the final norm and the head;
 - the three MTP layers.
 
-Tensors are re-packed byte for byte into one local file per upstream shard. `local-sha256.json` records their digests, and the Rust test verifies the cache against it before loading. The kept layers are run as a 4-layer model, with every layer keeping its own type.
+Tensors are re-packed byte for byte into one local file per upstream shard. `local-sha256.json` records their digests and those of `config.json` and the index (every file the loader reads), and the Rust test verifies the cache against it before loading. The kept layers are run as a 4-layer model, with every layer keeping its own type.
 
 `real_golden.py` tokenises a fixed public-domain passage (363 tokens). It writes `golden/hf-golden.safetensors` into the checkpoint directory, with:
 

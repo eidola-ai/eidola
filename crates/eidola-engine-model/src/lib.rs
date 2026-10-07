@@ -37,17 +37,23 @@ pub use tensor::Matrix;
 pub use weights::{LoadOptions, ModelWeights};
 
 /// Load `config.json` and every safetensors file in `dir`, optionally keeping
-/// only the listed checkpoint layers.
+/// only the listed checkpoint layers. With `manifest` (file name → sha256), every
+/// file the load reads, `config.json` and the index included, must match it.
 pub fn load_reference(
     dir: &Path,
     keep_layers: Option<&[usize]>,
     opts: &LoadOptions,
+    manifest: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<ReferenceModel> {
-    let mut config = ModelConfig::from_file(&dir.join("config.json"))?;
+    let store = WeightSet::open_dir(dir)?;
+    if let Some(m) = manifest {
+        store.verify_sha256(m)?;
+    }
+    let mut config = store.model_config()?;
     if let Some(keep) = keep_layers {
         config = config.truncated(keep)?;
     }
-    let store = Arc::new(WeightSet::open_dir(dir)?);
+    let store = Arc::new(store);
     Ok(ReferenceModel::new(ModelWeights::load(
         store, config, opts,
     )?))

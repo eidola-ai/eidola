@@ -14,7 +14,7 @@ The reference forward is the golden oracle. Every faster executor (paged CPU, GP
 | Module | Role |
 |---|---|
 | `config` | `RawConfig` (serde) → `ModelConfig`. Builds the per-layer `LayerSpec` table (attention geometry, RoPE, window, sinks, FFN kind) from the config's own fields. Unsupported features are rejected. `truncated()` keeps a subset of checkpoint layers. |
-| `safetensors` | `WeightSet` covers every `*.safetensors` file in a directory. Files are mmapped and tensors read lazily, and a subset of shards or tensors is fine. Index and `__metadata__` values (`tp_size`) are read, and sha256 is checked against a manifest. |
+| `safetensors` | `WeightSet` covers every `*.safetensors` file in a directory. Files are mmapped and tensors read lazily, and a subset of shards or tensors is fine. Index and `__metadata__` values (`tp_size`) are read. One sha256 manifest covers every file the loader reads, shards plus `config.json` and the index (`SEMANTIC_FILES`), whose bytes are read once and only used as hashed (`WeightSet::model_config`). |
 | `numeric` | Exact BF16, FP8 e4m3fn, E2M1 and E8M0 decoders. |
 | `dequant` | FP8 block-scaled linears, MXFP4 experts, and the rank-major pre-sharded fused QKV. |
 | `weights` | `ModelWeights::load`. Dense tensors are dequantised once. Routed experts stay mapped and are dequantised per forward call (`ModelWeights::expert`). Optionally folds the value scale into `o_proj`. |

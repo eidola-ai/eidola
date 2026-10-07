@@ -42,7 +42,7 @@ pub enum Error {
         actual: String,
     },
 
-    #[error("integrity manifest names {0}, which is not among the loaded weight files")]
+    #[error("integrity manifest names {0}, which is not among the loaded files")]
     IntegrityUnknownFile(String),
 
     #[error("invalid input: {0}")]

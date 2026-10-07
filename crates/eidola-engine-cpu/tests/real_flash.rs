@@ -23,7 +23,7 @@ use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
 use eidola_engine_cpu::{CpuExecutorConfig, MtpHidden};
 use eidola_engine_model::safetensors::WeightSet;
-use eidola_engine_model::{LoadOptions, ModelConfig, ModelWeights, ReferenceModel};
+use eidola_engine_model::{LoadOptions, ModelWeights, ReferenceModel};
 
 fn checkpoint_dir() -> PathBuf {
     if let Ok(d) = std::env::var("EIDOLA_MIMO_TRUNCATED_DIR") {
@@ -53,11 +53,13 @@ fn truncated_flash_through_the_engine_matches_the_dense_forward() {
     };
 
     let t0 = Instant::now();
-    let config = ModelConfig::from_file(&dir.join("config.json"))
+    let store = WeightSet::open_dir(&dir).unwrap();
+    let config = store
+        .model_config()
         .unwrap()
         .truncated(&[0, 1, 2, 5])
         .unwrap();
-    let store = Arc::new(WeightSet::open_dir(&dir).unwrap());
+    let store = Arc::new(store);
     let model = Arc::new(ReferenceModel::new(
         ModelWeights::load(store, config, &LoadOptions::default()).unwrap(),
     ));

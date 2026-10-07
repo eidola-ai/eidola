@@ -176,12 +176,26 @@ fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// File names of the non-weight files whose bytes change what a checkpoint
+/// directory loads as: the model configuration, and the index (whose metadata,
+/// such as `tp_size`, decides how fused QKV rows are de-interleaved).
+pub const SEMANTIC_FILES: [&str; 2] = ["config.json", "model.safetensors.index.json"];
+
 /// Every safetensors file in one directory, indexed by tensor name.
+///
+/// **Integrity covers every semantic input.** [`WeightSet::open_dir`] reads the
+/// [`SEMANTIC_FILES`] present in the directory once, keeps their bytes, and
+/// uses only those bytes afterwards ([`WeightSet::model_config`], index
+/// metadata). [`WeightSet::sha256_manifest`] and [`WeightSet::verify_sha256`]
+/// cover them alongside the shards, so one manifest pins everything the loader
+/// reads.
 pub struct WeightSet {
     dir: PathBuf,
     files: Vec<MappedFile>,
     tensors: HashMap<String, TensorEntry>,
     index_metadata: BTreeMap<String, String>,
+    /// The semantic files read, by file name, exactly as hashed.
+    semantic: BTreeMap<String, Vec<u8>>,
 }
 
 impl std::fmt::Debug for WeightSet {
@@ -208,10 +222,16 @@ impl WeightSet {
         let mut set = Self::open_files(&paths)?;
         set.dir = dir.to_path_buf();
 
+        for name in SEMANTIC_FILES {
+            let path = dir.join(name);
+            if path.exists() {
+                let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
+                set.semantic.insert(name.to_string(), bytes);
+            }
+        }
         let index = dir.join("model.safetensors.index.json");
-        if index.exists() {
-            let bytes = std::fs::read(&index).map_err(|e| Error::io(&index, e))?;
-            let v: Value = serde_json::from_slice(&bytes).map_err(|e| Error::Json {
+        if let Some(bytes) = set.semantic.get("model.safetensors.index.json") {
+            let v: Value = serde_json::from_slice(bytes).map_err(|e| Error::Json {
                 what: index.display().to_string(),
                 source: e,
             })?;
@@ -250,6 +270,7 @@ impl WeightSet {
             files,
             tensors,
             index_metadata: BTreeMap::new(),
+            semantic: BTreeMap::new(),
         })
     }
 
@@ -289,12 +310,31 @@ impl WeightSet {
         self.files.iter().map(|f| f.name.as_str()).collect()
     }
 
-    /// sha256 of every loaded file, keyed by file name.
+    /// The model configuration from the `config.json` this set read (and hashed)
+    /// in [`WeightSet::open_dir`].
+    pub fn model_config(&self) -> Result<crate::ModelConfig> {
+        let bytes = self
+            .semantic
+            .get("config.json")
+            .ok_or_else(|| Error::Safetensors {
+                path: self.dir.join("config.json"),
+                reason: "no config.json was read with these weights".into(),
+            })?;
+        crate::ModelConfig::from_json_bytes(bytes, "config.json")
+    }
+
+    /// sha256 of every loaded file (shards and semantic files), keyed by file
+    /// name.
     pub fn sha256_manifest(&self) -> BTreeMap<String, String> {
-        self.files
+        let mut out: BTreeMap<String, String> = self
+            .files
             .par_iter()
             .map(|f| (f.name.clone(), hex::encode(Sha256::digest(&f.map[..]))))
-            .collect()
+            .collect();
+        for (name, bytes) in &self.semantic {
+            out.insert(name.clone(), hex::encode(Sha256::digest(bytes)));
+        }
+        out
     }
 
     /// Check loaded files against an expected `file name → sha256 hex`
@@ -302,7 +342,7 @@ impl WeightSet {
     /// loaded file must be in the manifest.
     pub fn verify_sha256(&self, expected: &BTreeMap<String, String>) -> Result<()> {
         for name in expected.keys() {
-            if !self.files.iter().any(|f| &f.name == name) {
+            if !self.files.iter().any(|f| &f.name == name) && !self.semantic.contains_key(name) {
                 return Err(Error::IntegrityUnknownFile(name.clone()));
             }
         }

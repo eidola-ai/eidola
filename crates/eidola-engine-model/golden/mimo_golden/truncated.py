@@ -4,7 +4,8 @@ Only the tensors of the chosen layers (plus embeddings, final norm, head, and
 optionally the MTP layers) are downloaded. They are re-packed, byte for byte,
 into one local safetensors file per upstream shard, next to the upstream
 `config.json` and an index whose metadata (including `tp_size`) is copied
-from upstream. `local-sha256.json` records the digests of the re-packed files
+from upstream. `local-sha256.json` records the digests of every file the loader
+reads (the re-packed shards, `config.json` and the index)
 so later runs can check the cache.
 """
 
@@ -99,6 +100,9 @@ def fetch(out: Path, layers: list[int], mtp: bool, workers: int = 16) -> Path:
             indent=1,
         )
     )
+    # The manifest covers every file the loader reads, not just the shards.
+    for name in ("config.json", "model.safetensors.index.json"):
+        digests[name] = _sha256(out / name)
     done.write_text(json.dumps(dict(sorted(digests.items())), indent=1))
     return out
 

@@ -18,7 +18,7 @@ use std::time::Instant;
 use eidola_engine_model::compare::{compare_logits, max_abs_diff};
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{
-    ForwardOptions, LoadOptions, LogitsAt, Matrix, ModelConfig, ModelWeights, ReferenceModel,
+    ForwardOptions, LoadOptions, LogitsAt, Matrix, ModelWeights, ReferenceModel,
 };
 
 const REVISION_PREFIX: &str = "2479e2d0029e";
@@ -87,10 +87,7 @@ fn truncated_flash_matches_hf_remote_code() {
         .to_string();
     let store = Arc::new(store);
 
-    let config = ModelConfig::from_file(&dir.join("config.json"))
-        .unwrap()
-        .truncated(&layers)
-        .unwrap();
+    let config = store.model_config().unwrap().truncated(&layers).unwrap();
     let t0 = Instant::now();
     let model =
         ReferenceModel::new(ModelWeights::load(store, config, &LoadOptions::default()).unwrap());
