@@ -65,6 +65,13 @@ build system:
         ;;
     esac
 
+# Build the inference engine's GPU kernels ahead of time on a GPU-less Linux
+# builder (pinned Nix in a pinned container; requires Docker). `--verify` fails
+# unless the result equals the committed kernels.manifest.json byte for byte;
+# `--update` rewrites it. See crates/eidola-engine-kernels/AGENTS.md.
+engine-kernels *args:
+    crates/eidola-engine-kernels/scripts/build-in-docker.sh {{args}}
+
 # Build the bundled on-device inference engine sidecar (static llama.cpp
 # `llama-server`) via Nix and materialize it at
 # crates/eidola-gui/build/llama-server. `just build gui` / `just run gui`
