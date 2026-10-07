@@ -494,6 +494,53 @@ def random_cases(n):
     return out
 
 
+def tokenizer_strings(n):
+    """Extra strings for the tokenizer comparison, aimed at the pre-tokenizer
+    regex (where the Rust and Python builds use different regex engines)."""
+    rng = random.Random(SEED + 1)
+    fixed = list(UNICODE_SAMPLES) + [
+        "I'M HERE, YOU'LL SEE, WE'D GO, IT'S, DON'T, THEY'RE, WE'VE",
+        "i'm here, you'll see, we'd go, it's, don't, they're, we've",
+        "   leading spaces",
+        "trailing spaces   ",
+        "a  b   c    d",
+        "\t\tindent\n\n\nblank lines\r\n\r\n",
+        "nbsp\u00a0ideographic\u3000space\u2003em",
+        "vt\x0bff\x0cfs\x1cgs\x1drs\x1eus\x1fnel\x85",
+        "123456789 3.14159 1e10 ٣٤٥ ४५६ 五六七 ⅷ ½",
+        "!!!??? ... --- ___ *** ### @@@ $$$ %%% ^^^ &&& ((( )))",
+        "def f(x):\n    return x ** 2  # comment\n",
+        "<html><body class=\"x\">&nbsp;</body></html>",
+        "{\"json\": [1, 2, {\"nested\": true}]}",
+        "x" * 300,
+        " " * 50 + "\n" * 5,
+        "\u0300\u0301 leading combining",
+        "ﬀﬁﬂ Å Å Ω Ω",  # NFC-sensitive
+        "𝐀𝐁𝐂 mathematical bold",
+        "<|im_start|><|im_end|><think></think><tool_call></tool_call>",
+        "<|im_start|>user\nhi<|im_end|>",
+    ]
+    pools = [
+        (0x20, 0x7E), (0xA0, 0x24F), (0x370, 0x3FF), (0x400, 0x4FF), (0x590, 0x6FF),
+        (0x900, 0x97F), (0xE00, 0xE7F), (0x1100, 0x11FF), (0x2000, 0x206F), (0x2070, 0x2BFF),
+        (0x3000, 0x30FF), (0x4E00, 0x9FFF), (0xAC00, 0xD7A3), (0xFF00, 0xFFEF), (0x1F300, 0x1FAFF),
+        (0x0, 0x20), (0x10000, 0x1FFFF),
+    ]
+    out = fixed
+    for _ in range(n):
+        chars = []
+        for _ in range(rng.randrange(1, 40)):
+            lo, hi = rng.choice(pools)
+            c = rng.randint(lo, hi)
+            if 0xD800 <= c <= 0xDFFF:
+                continue
+            chars.append(chr(c))
+            if rng.random() < 0.2:
+                chars.append(rng.choice([" ", "  ", "\n", "'s", "'LL", "\t", "1", "."]))
+        out.append("".join(chars))
+    return out
+
+
 # ---------------------------------------------------------------- driver
 
 
@@ -578,6 +625,9 @@ def main():
                 token_ids[c["name"]] = tokenizer.encode(rendered, add_special_tokens=False)
         out_cases.append(entry)
 
+    strings = tokenizer_strings(400)
+    string_ids = [[text, tokenizer.encode(text, add_special_tokens=False)] for text in strings]
+
     meta = {
         "generator": "dev/gen_template_fixtures.py",
         "python": sys.version.split()[0],
@@ -592,7 +642,7 @@ def main():
         json.dump({"meta": meta, "cases": out_cases}, f, ensure_ascii=False, indent=1)
         f.write("\n")
     with open(args.out_dir / "template_token_ids.json", "w", encoding="utf-8") as f:
-        json.dump({"meta": meta, "token_ids": token_ids}, f, ensure_ascii=False, separators=(",", ":"))
+        json.dump({"meta": meta, "token_ids": token_ids, "strings": string_ids}, f, ensure_ascii=False, separators=(",", ":"))
         f.write("\n")
     rendered_count = sum(1 for c in out_cases if "expected" in c)
     print(f"{len(out_cases)} cases ({rendered_count} rendered, {len(out_cases) - rendered_count} rejected)")

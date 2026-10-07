@@ -4,6 +4,8 @@
 pub mod error;
 pub mod json;
 pub mod template;
+pub mod tokenizer;
 
 pub use error::ChatError;
 pub use template::{ChatInput, ChatTemplate, RenderOptions};
+pub use tokenizer::{Detokenizer, MimoTokenizer};
