@@ -25,7 +25,7 @@ The template, tokenizer, and generation config are read from the model directory
 
 The template is executed as-is by minijinja in an environment that mirrors the one `transformers` builds: `trim_blocks`, `lstrip_blocks`, no auto-escaping, lenient undefined, loop controls, `raise_exception`, and these overrides:
 
-- **`tojson`** is Python's `json.dumps` (`json::dumps`), not minijinja's: no HTML escaping, `", "` / `": "` separators, insertion order, `float.__repr__` for floats, unbounded integers, and the `ensure_ascii` / `indent` / `separators` / `sort_keys` keyword arguments. Unknown kwargs are errors.
+- **`tojson`** is Python's `json.dumps` (`json::dumps`), not minijinja's: no HTML escaping, `", "` / `": "` separators, insertion order, `float.__repr__` for floats (Gay's shortest digits with Python's nearest/ties-to-even choice between two shortest candidates, where Rust's `{:e}` can differ; differentially tested on `tests/fixtures/float_repr_cases.json`), unbounded integers, and the `ensure_ascii` / `indent` / `separators` / `sort_keys` keyword arguments. Unknown kwargs are errors.
 - **`is iterable`** follows Python's `iter()`: `none`, booleans and numbers are not iterable (minijinja's built-in says `none` is, which would make the template call `length` on a missing `tools`).
 - Integers beyond `i128` travel as an opaque object that only `tojson` reads.
 
@@ -81,6 +81,7 @@ python -I dev/gen_template_fixtures.py --model-dir <MiMo-V2.6 model dir>
 python -I dev/gen_sglang_fixtures.py --sglang-src <sglang checkout> \
     --sglang-commit <sha from requirements.txt>
 python -I dev/gen_tables.py
+python -I dev/gen_float_repr_cases.py
 ```
 
 `gen_template_fixtures.py` also refreshes the model-file copies in `tests/fixtures/`. Regenerate after changing a pinned artifact, the reference versions, or a case list; review the fixture diff like code. The SGLang harness applies `normalize_json_schema_types` to tools (as SGLang's request validation does) and the per-parameter containment described above, flagging each case where containment fired (`contained`).

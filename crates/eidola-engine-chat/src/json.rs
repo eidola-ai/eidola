@@ -570,12 +570,11 @@ pub fn py_float_repr(x: f64) -> String {
     if x.is_infinite() {
         return if x > 0.0 { "inf" } else { "-inf" }.to_string();
     }
-    // Rust's `{:e}` yields the shortest round-tripping digits, as Python's
-    // repr does; only the layout differs.
-    let sci = format!("{:e}", x.abs());
-    let (mantissa, exponent) = sci.split_once('e').expect("LowerExp has an exponent");
-    let exponent: i32 = exponent.parse().expect("integer exponent");
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let (digits, exponent) = if x == 0.0 {
+        ("0".to_string(), 0)
+    } else {
+        shortest_digits(x.abs())
+    };
     let mut out = String::new();
     if x.is_sign_negative() {
         out.push('-');
@@ -608,6 +607,68 @@ pub fn py_float_repr(x: f64) -> String {
         write!(out, "{:02}", exponent.abs()).expect("write to String");
     }
     out
+}
+
+/// The digits and decimal exponent Python's `repr` chooses for a positive finite
+/// `x` (`d.ddd × 10^exponent`): CPython's `float_repr_style = 'short'`, David Gay's
+/// `dtoa` mode 0. That is the fewest significant digits that read back as `x`, and
+/// among the (at most two) candidates of that length, the one nearest `x`, an exact
+/// tie going to the even last digit.
+///
+/// Rust's `{:e}` also prints the fewest round-tripping digits, but on a tie between
+/// two shortest candidates it does not pick the same one: `181703637716804.12` parses
+/// to exactly `181703637716804.125`, which Python prints as `…804.12` and `{:e}` as
+/// `…804.13`. So this does not use it. Instead, for each length `n`, it takes the
+/// correctly rounded `n`-digit decimal (`{:.(n-1)e}`, exact with ties to even, which is
+/// the nearest candidate) and, if that does not read back as `x`, the `n`-digit decimal
+/// on the other side of `x`; the first length with a round-tripping candidate wins.
+/// Only the two decimals bracketing `x` can round-trip, because the set of decimals
+/// that read back as `x` is an interval containing `x`. Differentially tested against
+/// CPython (`tests/fixtures/float_repr_cases.json`).
+fn shortest_digits(x: f64) -> (String, i32) {
+    for n in 1..=17usize {
+        let sci = format!("{:.*e}", n - 1, x);
+        let (mantissa, exp) = sci.split_once('e').expect("LowerExp has an exponent");
+        let exp: i32 = exp.parse().expect("integer exponent");
+        let int: u64 = mantissa
+            .chars()
+            .filter(|c| *c != '.')
+            .collect::<String>()
+            .parse()
+            .expect("decimal digits");
+        // `value = int × 10^scale`, `int` having exactly `n` digits.
+        let scale = exp - (n as i32 - 1);
+        let reads_back = |int: u64, scale: i32| {
+            format!("{int}e{scale}")
+                .parse::<f64>()
+                .expect("decimal parses")
+                == x
+        };
+        let candidate = if reads_back(int, scale) {
+            Some((int, scale))
+        } else {
+            let low = 10u64.pow(n as u32 - 1);
+            let other = if format!("{int}e{scale}").parse::<f64>().expect("parses") < x {
+                // `int` is below `x`: the next `n`-digit decimal up.
+                (int + 1, scale)
+            } else if int == low {
+                // The next one down is in the decade below: `99…9 × 10^(scale-1)`.
+                (low * 10 - 1, scale - 1)
+            } else {
+                (int - 1, scale)
+            };
+            reads_back(other.0, other.1).then_some(other)
+        };
+        if let Some((int, scale)) = candidate {
+            let mut digits = int.to_string();
+            let exponent = scale + digits.len() as i32 - 1;
+            while digits.len() > 1 && digits.ends_with('0') {
+                digits.pop();
+            }
+            return (digits, exponent);
+        }
+    }
+    unreachable!("17 significant digits always round-trip a binary64")
 }
 
 /// `json.dumps` options.
@@ -783,6 +844,38 @@ mod tests {
         for (x, expected) in cases {
             assert_eq!(py_float_repr(x), expected, "{x:e}");
         }
+    }
+
+    /// Every value in the CPython-generated fixture (`dev/gen_float_repr_cases.py`:
+    /// exact ties between shortest candidates, powers of two, the fixed/exponent
+    /// switch, subnormals, random bit patterns and decimals) prints exactly as
+    /// `float.__repr__` does.
+    #[test]
+    fn float_repr_matches_cpython() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/float_repr_cases.json"
+        );
+        let cases: Vec<(String, String)> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(cases.len() > 10_000);
+        let mut failures = Vec::new();
+        for (bits, expected) in &cases {
+            let x = f64::from_bits(u64::from_str_radix(bits, 16).unwrap());
+            let got = py_float_repr(x);
+            if &got != expected {
+                failures.push(format!("{bits}: {got} != {expected}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} differ, e.g. {:?}",
+            failures.len(),
+            cases.len(),
+            &failures[..failures.len().min(5)]
+        );
+        // The tie that `{:e}` breaks the other way.
+        assert_eq!(py_float_repr(181703637716804.12), "181703637716804.12");
     }
 
     #[test]
