@@ -58,9 +58,9 @@ This is the part of the design a GPU executor must copy.
 
 Rows exist for `s >= d + 1`. The draft for position `p + 1 + i` is depth `i`'s prediction at slot `p + i`, where `p` is the row's last host position.
 
-**Why this layout.** Indexing a row by the token it consumes makes drafter KV at `s` a function of tokens `0 ..= s` alone. That is the determinism contract, so drafter blocks are sealed and shared exactly like target blocks, and `drafter_lag` is 0.
+**Why this layout.** Indexing a row by the token it consumes makes drafter KV at `s` a function of tokens `0 ..= s` alone. That is the core's block invariant (every block depends only on the tokens it covers), so drafter blocks are sealed and shared exactly like target blocks. The core's executor contract makes this layout normative.
 
-The alternative is to index the row by the hidden state it continues from (`p` for `(h_p, t_{p+1})`, as vLLM stores it). Under that indexing, a block's last drafter row depends on the next block's first token, which the block hash does not cover, so a prefix hit with a different continuation would reuse wrong drafter KV. Delaying sealing by a lag does not fix this, because the hash still stops at the block boundary. vLLM avoids the problem by dropping the last matched block on a hit.
+The alternative is to index the row by the hidden state it continues from (`p` for `(h_p, t_{p+1})`, as vLLM stores it). Under that indexing, a block's last drafter row depends on the next block's first token, which the block hash does not cover, so a prefix hit with a different continuation would reuse wrong drafter KV. vLLM avoids the problem by dropping the last matched block on a hit.
 
 **Chaining.** With this layout, every speculative drafter row in the chain sits at a slot the host reserved for drafts (`p + 1 ..= p + k`). Depth `i` needs `i` speculative rows there, at slots `p + 1 ..= p + i`, each consuming drafts `1 ..= i`. Each such row is exact once its drafts are accepted. Step 7 fills in only the accepted rows the chain did not cover.
 

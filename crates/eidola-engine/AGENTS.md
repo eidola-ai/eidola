@@ -1,10 +1,6 @@
 # eidola-engine
 
-The serving core of Eidola's purpose-built inference engine for the MiMo-V2.6 family: the
-executor seam, paged KV manager, salted prefix cache, scheduler, speculative-decoding control
-flow, and the CPU reference sampler. It knows nothing about weights, numerics, tokenizers, or
-HTTP; it speaks token ids to an [`Executor`](src/executor.rs) and events to its caller.
-AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
+The serving core of Eidola's purpose-built inference engine for the MiMo-V2.6 family: the executor seam, paged KV manager, salted prefix cache, scheduler, speculative-decoding control flow, and the CPU reference sampler. It knows nothing about weights, numerics, tokenizers, or HTTP; it speaks token ids to an [`Executor`](src/executor.rs) and events to its caller. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
 
 | Module | Contents |
 |---|---|
@@ -18,128 +14,49 @@ AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
 
 ## The seam
 
-The executor owns all device memory (KV pools, per-slot block tables, per-slot model
-state); the host owns every allocation decision. A step is: maintenance in order (copy,
-zero, reset slot), then table updates in order, then the forward, then on-device sampling
-(and, for speculative rows, draft → verify → accept), with no host interaction in between.
-The batch is padded to a captured bucket; block tables persist on the device indexed by
-slot and change only through explicit updates; so a pure-decode step (one host token per
-row, uniform drafts) can replay one CUDA graph per bucket. Under confidential computing a
-kernel launch costs on the order of 12 µs and every synchronous device-to-host copy is
-expensive, which is why drafting and acceptance live inside the step rather than in the
-host.
+The executor owns all device memory (KV pools, per-slot block tables, per-slot model state); the host owns every allocation decision. A step is: maintenance in order (copy, zero, reset slot), then table updates in order, then the forward, then on-device sampling (and, for speculative rows, draft → verify → accept), with no host interaction in between. The batch is padded to a captured bucket; block tables persist on the device indexed by slot and change only through explicit updates; so a pure-decode step (one host token per row, uniform drafts) can replay one CUDA graph per bucket. Under confidential computing a kernel launch costs on the order of 12 µs and every synchronous device-to-host copy is expensive, which is why drafting and acceptance live inside the step rather than in the host.
 
-**Determinism contract.** The KV an executor writes for a position, and the logits for a
-query, depend only on the token prefix — never on batch composition, chunking, slot, or
-physical block. Recompute preemption and prefix-cache reuse are exact only because of
-this. A GPU executor that is not batch-invariant must document its tolerance.
+**Determinism contract.** The KV an executor writes for a position, and the logits for a query, depend only on the token prefix — never on batch composition, chunking, slot, or physical block. Recompute preemption and prefix-cache reuse are exact only because of this. A GPU executor that is not batch-invariant must document its tolerance.
 
-**Groups.** MiMo has three KV kinds, each a group with its own pool and block table:
-global-attention layers (`AttentionKind::Full`), sliding-window target layers
-(`Sliding { window }`), and drafter context KV (`KvRole::Drafter`: an MTP head's
-sliding-window layers, or a block drafter's context projected from target hidden states).
-All groups share one block size, so logical block `i` of a sequence means the same
-positions everywhere. `window` counts visible positions including the query's own;
-attention-sink logits need no KV. `drafter_lag` covers drafters that write position `p`'s
-KV only once token `p + 1` exists (MTP); a block is sealed only after the lag.
+**Groups.** MiMo has three KV kinds, each a group with its own pool and block table: global-attention layers (`AttentionKind::Full`), sliding-window target layers (`Sliding { window }`), and drafter context KV (`KvRole::Drafter`: an MTP head's sliding-window layers, or a block drafter's context projected from target hidden states). All groups share one block size, so logical block `i` of a sequence means the same positions everywhere. `window` counts visible positions including the query's own; attention-sink logits need no KV.
 
-**Block drafters (DFlash shape).** A block drafter drafting `k` tokens per step uses the
-same row shape (`num_drafts = k`), keeps its context KV in a `Drafter` group (window 1024
-for MiMo's), and keeps target hidden-state taps in per-slot state. Its in-block
-bidirectional KV is step-local scratch and is never paged.
+**Block invariant.** Every block in every KV group depends only on the tokens that block covers (and those before it). That is what makes prefix caching exact for target and drafter groups alike: a block is sealed as soon as it is full and shared with any sequence whose salted chain matches through its end. There is no lag allowance.
+
+**Drafter rows (MTP).** A drafter row is indexed by the token it consumes: MTP depth `d`'s row at position `s` consumes the token at `s` and the level below at `s - 1` (the target's hidden state for depth 0, depth `d - 1`'s output otherwise), uses RoPE position `s - 1`, writes its KV at `s`, and predicts `s + 1`. The draft for `p + 1 + i` is depth `i`'s prediction at `p + i`, so speculative drafter rows land in the positions reserved for drafts. Indexing by the hidden state instead (`(h_p, t_{p+1})` at `p`) would make a block's last drafter row depend on the next block's first token, outside the block's cache key. Resuming at a block boundary `c` needs the drafter's state at `c - 1`, so executors store a **boundary tap** (the levels at the block's last position) in every drafter block, zeroed and copied with it. The CPU reference executor (`eidola-engine-cpu`) implements this and is its oracle; the normative text is in `executor.rs`.
+
+**Block drafters (DFlash shape).** A block drafter drafting `k` tokens per step uses the same row shape (`num_drafts = k`), keeps its context KV in a `Drafter` group (window 1024 for MiMo's), and keeps target hidden-state taps in per-slot state. Its context KV at `s` is projected from target hidden states at `s`, so it meets the block invariant directly; the taps it resumes from at a block boundary are stored like MTP's boundary taps. Its in-block bidirectional KV is step-local scratch and is never paged.
 
 ## KV and prefix cache design
 
-**Paged sliding window, not a ring.** Sliding-window layers are paged exactly like global
-layers, and a sliding block is released once it is behind the window of the sequence's
-newest *sealed* boundary. A per-sequence ring buffer would be simpler on the device but
-cannot share blocks between sequences, so a prefix-cache hit could never supply the
-window. This follows vLLM's hybrid allocator; unlike vLLM, every group has its own pool,
-because MiMo's global and sliding layers have different KV head counts and so different
-bytes per block.
+**Paged sliding window, not a ring.** Sliding-window layers are paged exactly like global layers, and a sliding block is released once it is behind the window of the sequence's newest *sealed* boundary. A per-sequence ring buffer would be simpler on the device but cannot share blocks between sequences, so a prefix-cache hit could never supply the window. This follows vLLM's hybrid allocator; unlike vLLM, every group has its own pool, because MiMo's global and sliding layers have different KV head counts and so different bytes per block.
 
-**Hit points.** A hit of `m` blocks is accepted only if every full-attention block `0..m`
-is cached **and** every sliding group has the blocks covering the window before position
-`m * block_size` attached. Hits are therefore always correct. Windows are retained at
-release only at two points: the last sealed boundary, where a continuation of the
-conversation resumes, and the last full block of the prompt before its final token, where a
-regeneration of the same prompt resumes. Any other point (an edit in the middle of a
-conversation) falls back to the nearest retained point or recomputes. Retention costs at
-most `ceil((window - 1) / block_size) + 1` blocks per sliding group per point.
+**Hit points.** A hit of `m` blocks is accepted only if every full-attention block `0..m` is cached **and** every sliding group has the blocks covering the window before position `m * block_size` attached. Hits are therefore always correct. Windows are retained at release only at two points: the last sealed boundary, where a continuation of the conversation resumes, and the last full block of the prompt before its final token, where a regeneration of the same prompt resumes. Any other point (an edit in the middle of a conversation) falls back to the nearest retained point or recomputes. Retention costs at most `ceil((window - 1) / block_size) + 1` blocks per sliding group per point.
 
-**Eviction.** Entries form a tree (each chains its parent). Under pressure the least
-recently used unreferenced leaf goes first, then ancestors that became unreferenced leaves
-and are not valid hit points themselves. Eviction is not group-targeted: freeing a block in
-one group may evict an entry whose other blocks were not needed.
+**Eviction.** Entries form a tree (each chains its parent). Under pressure the least recently used unreferenced leaf goes first, then ancestors that became unreferenced leaves and are not valid hit points themselves. Eviction is not group-targeted: freeing a block in one group may evict an entry whose other blocks were not needed.
 
-**Preemption** is recompute-based: the newest-arrived running sequence is released (its
-sealed prefix stays cached) and later re-admitted with prompt plus output, normally hitting
-its own blocks. Sampling draws are keyed by `(seed, position, stream)`, so its output is
-identical to an uninterrupted run.
+**Preemption** is recompute-based: the newest-arrived running sequence is released (its sealed prefix stays cached) and later re-admitted with prompt plus output, normally hitting its own blocks. Sampling draws are keyed by `(seed, position, stream)`, so its output is identical to an uninterrupted run.
 
 ## Privacy invariants and where they are enforced
 
-1. **No unsalted namespace.** `BlockHash::root` is the only way to start a chain and it
-   takes an `EngineSalt`. A request without a client key gets `CacheScope::Private`: a
-   fresh random salt, and every entry it sealed is purged when it finishes (`kv.rs`,
-   `Release::Finish`). It can still hit its own blocks after a preemption.
-2. **Salt derivation.** `engine_salt = HMAC-SHA256(boot_key, "eidola/kv/v1" ‖ client_key)`
-   with a random per-process `BootKey` (`secret.rs`). Salts mean nothing after a restart,
-   exactly as the cache does not survive one.
-3. **Secrets are content.** `CacheKey`, `EngineSalt`, `BootKey`, `SaltDeriver` and
-   `BlockHash` print only a redaction marker in `Debug`, have no `Display` or
-   serialization, expose no bytes outside the crate, and the secrets are zeroed on drop.
-   The crate does no logging. `Stats` are content-free counters.
-4. **Zero on free.** `KvManager::decref` is the single place a block's refcount reaches
-   zero, and it always queues `Maintenance::Zero`. Freed by a finishing sequence, a sliding
-   window, a speculative rollback, a preemption, or cache eviction — every free block is
-   zero once the next step's maintenance has run. Released slots get
-   `Maintenance::ResetSlot`, which also scrubs per-sequence model state.
-5. **Bounded retention.** An unreferenced entry idle for `idle_ttl_ms` (default 15 min) or
-   any entry older than `max_age_ms` (default 2 h) is never hit: lookups check expiry
-   inline, and `KvManager::sweep` removes expired subtrees. `Engine::sweep` runs a
-   maintenance-only step when zeros are pending, so scrubbing never waits for traffic;
-   retention is bounded by the policy plus the caller's sweep cadence. An entry in use past
-   its max age is detached at once and its blocks are zeroed when the last user releases
-   them.
+1. **No unsalted namespace.** `BlockHash::root` is the only way to start a chain and it takes an `EngineSalt`. A request without a client key gets `CacheScope::Private`: a fresh random salt, and every entry it sealed is purged when it finishes (`kv.rs`, `Release::Finish`). It can still hit its own blocks after a preemption.
+2. **Salt derivation.** `engine_salt = HMAC-SHA256(boot_key, "eidola/kv/v1" ‖ client_key)` with a random per-process `BootKey` (`secret.rs`). Salts mean nothing after a restart, exactly as the cache does not survive one.
+3. **Secrets are content.** `CacheKey`, `EngineSalt`, `BootKey`, `SaltDeriver` and `BlockHash` print only a redaction marker in `Debug`, have no `Display` or serialization, expose no bytes outside the crate, and the secrets are zeroed on drop. The crate does no logging. `Stats` are content-free counters.
+4. **Zero on free.** `KvManager::decref` is the single place a block's refcount reaches zero, and it always queues `Maintenance::Zero`. Freed by a finishing sequence, a sliding window, a speculative rollback, a preemption, or cache eviction — every free block is zero once the next step's maintenance has run. Released slots get `Maintenance::ResetSlot`, which also scrubs per-sequence model state.
+5. **Bounded retention.** An unreferenced entry idle for `idle_ttl_ms` (default 15 min) or any entry older than `max_age_ms` (default 2 h) is never hit: lookups check expiry inline, and `KvManager::sweep` removes expired subtrees. `Engine::sweep` runs a maintenance-only step when zeros are pending, so scrubbing never waits for traffic; retention is bounded by the policy plus the caller's sweep cadence. An entry in use past its max age is detached at once and its blocks are zeroed when the last user releases them.
 6. **Nothing persisted.** The crate performs no I/O; KV lives only in executor memory.
-7. **Price never depends on hits.** Nothing here prices. `Event::cached_prompt_tokens` is a
-   usage detail for the client only and must never feed billing.
+7. **Price never depends on hits.** Nothing here prices. `Event::cached_prompt_tokens` is a usage detail for the client only and must never feed billing.
 
 ## Scheduling policy
 
-Strict FCFS by arrival. Running sequences are served oldest first; a decoding row costs
-`1 + k` query tokens; prefill is chunked by `max_prefill_chunk` and the step's remaining
-budget. Waiting requests are admitted only in steps that preempted nothing, and the first
-one that does not fit blocks those behind it, so long prompts cannot starve. A sequence that
-cannot grow even when it alone holds memory ends with `FinishReason::Length`. Drafts are
-uniform `k` except near the model length. Stop strings are the caller's job: it cancels.
+Strict FCFS by arrival. Running sequences are served oldest first; a decoding row costs `1 + k` query tokens; prefill is chunked by `max_prefill_chunk` and the step's remaining budget. Waiting requests are admitted only in steps that preempted nothing, and the first one that does not fit blocks those behind it, so long prompts cannot starve. A sequence that cannot grow even when it alone holds memory ends with `FinishReason::Length`. Drafts are uniform `k` except near the model length. Stop strings are the caller's job: it cancels.
 
 ## Testing
 
-`tests/engine.rs` drives the engine over `MockExecutor`, whose fake LM really pages KV
-through the tables it receives and panics on reads of unmapped, zeroed, or foreign slots
-and on writes to shared blocks. Every completed request is compared with
-`mock::reference_generate`, the dense oracle. Covered: chunked versus unchunked prefill,
-preemption and resume, greedy speculation exactness at every agreement rate, a chi-square
-test that speculative sampling preserves the output distribution, salt isolation and
-sharing, sliding-window hit validity, idle-TTL and max-age eviction zeroing exactly the
-evicted blocks, cancellation, bucket choice, and a randomized workload checking
-`KvManager::check_invariants` (exact refcounts, no leak, no double free, LRU and tree
-consistency) plus "every free block is zero or has a zero queued" after every step. Each
-of these was checked to fail under a deliberate bug (no zero on free, disabled window
-check, unsalted root hash, no rollback, eager sliding, TTL off by one, biased acceptance,
-residual ignoring `q`, …); keep that true when changing the tests.
+`tests/engine.rs` drives the engine over `MockExecutor`, whose fake LM really pages KV through the tables it receives and panics on reads of unmapped, zeroed, or foreign slots and on writes to shared blocks. Every completed request is compared with `mock::reference_generate`, the dense oracle. Covered: chunked versus unchunked prefill, preemption and resume, greedy speculation exactness at every agreement rate, a chi-square test that speculative sampling preserves the output distribution, salt isolation and sharing, sliding-window hit validity, idle-TTL and max-age eviction zeroing exactly the evicted blocks, cancellation, bucket choice, and a randomized workload checking `KvManager::check_invariants` (exact refcounts, no leak, no double free, LRU and tree consistency) plus "every free block is zero or has a zero queued" after every step. Each of these was checked to fail under a deliberate bug (no zero on free, disabled window check, unsalted root hash, no rollback, eager sliding, TTL off by one, biased acceptance, residual ignoring `q`, …); keep that true when changing the tests.
 
 ## Extending
 
-* **A real executor** implements `Executor`, honours the module contract in `executor.rs`,
-  and samples with `sampling.rs` semantics (bit-exact on CPU; on the device, equal except
-  when a uniform lies within rounding distance of a CDF boundary). Validate it by running
-  the simulation tests' workloads against it and the model's dense reference.
-* **A new KV kind** is a new `KvGroupSpec`; if it is neither full nor a sliding window,
-  `AttentionKind::first_visible` and the hit-point rule must learn it.
-* **Changing the hash format** changes the domain label in `hash.rs`.
-* **Pipelining.** The trait is synchronous: one step in, one result out. Overlapping host
-  scheduling of step `t + 1` with device execution of step `t` would split `execute` into
-  submit and collect; the data shapes need not change.
+- **A real executor** implements `Executor`, honours the module contract in `executor.rs`, and samples with `sampling.rs` semantics (bit-exact on CPU; on the device, equal except when a uniform lies within rounding distance of a CDF boundary). Validate it by running the simulation tests' workloads against it and the model's dense reference.
+- **A new KV kind** is a new `KvGroupSpec`; if it is neither full nor a sliding window, `AttentionKind::first_visible` and the hit-point rule must learn it.
+- **Changing the hash format** changes the domain label in `hash.rs`.
+- **Pipelining.** The trait is synchronous: one step in, one result out. Overlapping host scheduling of step `t + 1` with device execution of step `t` would split `execute` into submit and collect; the data shapes need not change.

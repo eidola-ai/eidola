@@ -141,7 +141,6 @@ struct SeqKv {
 #[derive(Debug)]
 pub struct KvManager {
     block_size: u32,
-    drafter_lag: u32,
     attention: Vec<AttentionKind>,
     policy: CachePolicy,
     pools: Vec<Pool>,
@@ -161,7 +160,6 @@ impl KvManager {
     pub fn new(spec: &ModelSpec, policy: CachePolicy) -> Self {
         Self {
             block_size: spec.block_size,
-            drafter_lag: spec.drafter_lag,
             attention: spec.kv_groups.iter().map(|g| g.attention).collect(),
             policy,
             pools: spec
@@ -391,8 +389,9 @@ impl KvManager {
             }
         }
 
-        // Seal full blocks whose KV is complete in every group.
-        let sealable = computed.saturating_sub(self.drafter_lag) / bs;
+        // Seal full blocks. Every group's KV for a block depends only on the tokens the
+        // block covers (the executor contract), so a full block is final in every group.
+        let sealable = computed / bs;
         if self.policy.enabled && !seq.chain_broken {
             extend_chain(
                 &seq.salt,
@@ -909,26 +908,6 @@ mod tests {
 
     fn salt() -> EngineSalt {
         EngineSalt::from_bytes([9; 32])
-    }
-
-    #[test]
-    fn drafter_lag_delays_sealing() {
-        let mut spec = mimo_like_spec(32, 4, 6, 10, 64, 4, 3);
-        spec.drafter_lag = 1;
-        let mut kv = KvManager::new(&spec, CachePolicy::default());
-        let tokens: Vec<u32> = (0..12).collect();
-        assert_eq!(kv.admit(1, salt(), true, &tokens, 12, 0), Some(0));
-        assert!(kv.allocate(1, 4));
-        kv.commit(1, 4, &tokens, 0);
-        assert_eq!(
-            kv.cache_entries(),
-            0,
-            "block 0's drafter KV is not complete yet"
-        );
-        assert!(kv.allocate(1, 5));
-        kv.commit(1, 5, &tokens, 0);
-        assert_eq!(kv.cache_entries(), 1);
-        kv.check_invariants();
     }
 
     #[test]

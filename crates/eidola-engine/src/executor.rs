@@ -53,7 +53,41 @@
 //! For a given model, the KV written for a position and the logits produced for a query
 //! must depend only on the sequence's tokens at positions `<= pos`, never on batch
 //! composition, chunking, slot, or physical block ids. The host's preemption and
-//! prefix-cache correctness rest on this. A GPU executor that cannot make attention or GEMMs
+//! prefix-cache correctness rest on this.
+//!
+//! In particular, **every block in every KV group depends only on the tokens that block
+//! covers** (and those before it): the host seals a block into the prefix cache as soon as
+//! it is full and shares it with any sequence whose salted token chain matches up to the
+//! block's end, for target and drafter groups alike. There is no allowance for KV that
+//! is completed later or that depends on a following token.
+//!
+//! # Drafter rows
+//!
+//! A drafter that consumes a token together with a hidden state from the previous
+//! position must index its row by the **token it consumes**. For MTP depth `d` (level 0 is
+//! the target's hidden state, level `d + 1` is depth `d`'s output):
+//!
+//! * the row at position `s` consumes the token at `s` and level `d` at `s - 1`, uses
+//!   RoPE position `s - 1`, writes its KV at `s`, and predicts the token at `s + 1`; rows
+//!   exist for `s >= d + 1`;
+//! * the draft for position `p + 1 + i` (after the last host token `p`) is depth `i`'s
+//!   prediction at `p + i`; depth `i`'s speculative rows occupy `p + 1 ..= p + i`, inside
+//!   the positions the host reserved for drafts.
+//!
+//! Indexing a row by the hidden state it continues from instead (`(h_p, t_{p+1})` at `p`)
+//! would make a block's last drafter row depend on the next block's first token, which
+//! the block's cache key does not cover.
+//!
+//! A sequence resuming at a block boundary `c` (prefix hit or preemption resume) needs the
+//! drafter's levels at `c - 1`, which no KV holds. The executor therefore stores a
+//! **boundary tap** in each drafter block: the levels at the block's last position. Taps
+//! are part of the block (a function of the tokens it covers), are zeroed and copied with
+//! it, and a fresh slot loads its drafter state from the tap of the block ending at
+//! `c - 1`; a running sequence carries it in per-slot state.
+//!
+//! A block drafter (DFlash shape) satisfies the same invariant: its per-position context
+//! KV at `s` is projected from target hidden states at `s`, which depend only on tokens
+//! `<= s`; the target taps it continues from at a resume point are stored the same way. A GPU executor that cannot make attention or GEMMs
 //! batch-invariant must document its tolerance; the CPU reference executor meets it exactly.
 
 use crate::sampling::SamplingParams;

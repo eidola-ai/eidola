@@ -84,7 +84,6 @@ pub fn mimo_like_spec(
             ),
         ],
         max_draft_tokens: k,
-        drafter_lag: 0,
         num_state_slots: slots,
         buckets: vec![
             Bucket {

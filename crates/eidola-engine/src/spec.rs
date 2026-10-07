@@ -31,7 +31,9 @@ pub enum KvRole {
     /// The target model's attention layers.
     Target,
     /// A speculative drafter's per-position context KV (an MTP head's sliding-window
-    /// layers, or a block drafter's context projected from target hidden states).
+    /// layers, or a block drafter's context projected from target hidden states). Like
+    /// every group, each block depends only on the tokens it covers; see
+    /// [`crate::executor`] for the row indexing that guarantees it.
     Drafter,
 }
 
@@ -84,10 +86,6 @@ pub struct ModelSpec {
     pub kv_groups: Vec<KvGroupSpec>,
     /// Drafted tokens per speculative step (`k`); 0 disables speculative decoding.
     pub max_draft_tokens: u32,
-    /// How many trailing positions of a sequence have drafter KV written one step late
-    /// (an MTP head needs token `p + 1` to write its KV for position `p`). A block becomes
-    /// immutable, and therefore cacheable, only once these positions are behind it.
-    pub drafter_lag: u32,
     /// Per-sequence device state rows (block tables, drafter hidden states); the maximum
     /// number of concurrently running sequences.
     pub num_state_slots: u32,

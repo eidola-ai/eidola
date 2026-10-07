@@ -312,7 +312,6 @@ impl CpuExecutor {
             max_model_len: cfg.max_model_len,
             kv_groups,
             max_draft_tokens: depths as u32,
-            drafter_lag: 0,
             num_state_slots: cfg.num_state_slots,
             buckets: cfg.buckets.clone(),
         };
