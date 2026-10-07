@@ -82,6 +82,18 @@ precedence = "closest"
 SPDX-FileCopyrightText = "© 2026 Xiaomi Corporation"
 SPDX-License-Identifier = "MIT"
 
+# Verbatim config.json files from the MiMo-V2.6 model releases (Hugging Face
+# XiaomiMiMo/MiMo-V2.6-Flash-MOPD and MiMo-V2.6-Pro-MOPD, declared MIT), kept as
+# test data.
+[[annotations]]
+path = [
+    "crates/eidola-engine-model/tests/data/flash-mopd.config.json",
+    "crates/eidola-engine-model/tests/data/pro-mopd.config.json",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© 2026 Xiaomi Corporation"
+SPDX-License-Identifier = "MIT"
+
 # Test fixtures generated from the MiMo-V2.6 template and tokenizer.
 [[annotations]]
 path = [
