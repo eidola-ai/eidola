@@ -18,7 +18,9 @@ cudarc = { version = "0.19.10", default-features = false, features = [
     "dynamic-loading",
     "cuda-13000",
 ] }
+eidola-engine = { path = "../eidola-engine" }
 eidola-engine-kernels = { path = "../eidola-engine-kernels" }
+eidola-engine-model = { path = "../eidola-engine-model" }
 
 [dev-dependencies]
-eidola-engine-model = { path = "../eidola-engine-model" }
+serde_json = "1"

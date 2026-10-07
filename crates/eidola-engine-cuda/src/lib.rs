@@ -6,14 +6,26 @@
 //! `eidola-engine-kernels` and is loaded only after its bytes match the
 //! manifest ([`module`]).
 
+pub mod attention;
 pub mod bf16;
 pub mod device;
+pub mod engine_ops;
+pub mod executor;
+pub mod gemm;
+pub mod kv;
+pub mod launch;
+pub mod model;
 pub mod module;
+pub mod moe_gemm;
 pub mod ops;
+pub mod sampler;
+pub mod tma;
+pub mod weights;
 
 use std::fmt;
 
 pub use device::{DeviceInfo, Gpu, ImageArch};
+pub use executor::{CudaExecutor, CudaExecutorConfig};
 pub use module::{ImageSource, Kernel, KernelModule};
 
 /// A CUDA executor failure.

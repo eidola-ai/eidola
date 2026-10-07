@@ -58,8 +58,6 @@ fn foreign_arch_image_is_refused() {
 #[test]
 fn rmsnorm_matches_reference() {
     let Some((gpu, dir)) = setup() else { return };
-    let module = KernelModule::load(&gpu, &dir, "rmsnorm").unwrap();
-    let kernel = module.kernel("eidola_rmsnorm_bf16").unwrap();
     let (rows, hidden) = (37usize, 4096usize);
     let mut s = 1u64;
     let mut next = || {
@@ -75,9 +73,22 @@ fn rmsnorm_matches_reference() {
         stream.clone_htod(&x).unwrap(),
         stream.clone_htod(&w).unwrap(),
     );
-    let mut dout = stream.alloc_zeros::<u16>(rows * hidden).unwrap();
-    ops::rmsnorm_bf16(&gpu, &kernel, &mut dout, &dx, &dw, hidden as u32, 1e-6).unwrap();
-    let out = stream.clone_dtoh(&dout).unwrap();
+    // The device's own cubin and the family cubin.
+    let mut archs = vec![gpu.image_arch().unwrap()];
+    if archs[0] != ImageArch::Sm100f {
+        archs.push(ImageArch::Sm100f);
+    }
+    for arch in archs {
+        let module =
+            KernelModule::load_from(&gpu, &dir, "rmsnorm", ImageSource::Cubin(arch)).unwrap();
+        let kernel = module.kernel("eidola_rmsnorm_bf16").unwrap();
+        let mut dout = stream.alloc_zeros::<u16>(rows * hidden).unwrap();
+        ops::rmsnorm_bf16(&gpu, &kernel, &mut dout, &dx, &dw, hidden as u32, 1e-6).unwrap();
+        check_rmsnorm(&stream.clone_dtoh(&dout).unwrap(), &x, &w, rows, hidden);
+    }
+}
+
+fn check_rmsnorm(out: &[u16], x: &[u16], w: &[u16], rows: usize, hidden: usize) {
     let wf: Vec<f32> = w.iter().map(|&b| bf16::to_f32(b)).collect();
     let mut reference = vec![0f32; hidden];
     for r in 0..rows {

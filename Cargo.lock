@@ -2873,8 +2873,10 @@ name = "eidola-engine-cuda"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "eidola-engine",
  "eidola-engine-kernels",
  "eidola-engine-model",
+ "serde_json",
 ]
 
 [[package]]

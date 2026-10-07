@@ -81,6 +81,10 @@ impl Gpu {
             return Err(CudaError::new("no CUDA driver or device"));
         }
         let ctx = CudaContext::new(ordinal)?;
+        // Everything runs on one stream, in order, so cudarc's per-buffer event
+        // tracking would only add events to every launch.
+        // SAFETY: called before any buffer exists; one stream is used throughout.
+        unsafe { ctx.disable_event_tracking() };
         let attr = |a| ctx.attribute(a).map_err(CudaError::from);
         let mut driver_version = 0;
         // SAFETY: writes one int.
