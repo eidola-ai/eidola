@@ -24,6 +24,8 @@ It follows the seam contract in `eidola-engine/src/executor.rs`, which is normat
 
 A block holds every layer's `[K | V]` rows for `block_size` positions, contiguously. `Maintenance::Zero` overwrites the whole block with zero bytes, including the drafter tap and the tags. `Copy` copies all of it.
 
+Per-slot model state (the drafter's hidden states at the slot's last position) lives in buffers allocated once at full size and only overwritten in place, as device-resident state would be. `ResetSlot` fills them with zeros; it never drops them for fresh allocations, which would leave the activations in freed memory. `slot_state_is_zero` makes that observable. Step-local scratch (a step's activations, logits and draft distributions) is ordinary heap memory: this executor is a reference, not a serving backend, and a GPU executor's equivalent is device scratch overwritten by the next step.
+
 Block tables are per slot and change only through `TableUpdate` and `ResetSlot`. KV is read only through them. Each stored row carries a tag (position and token). A read that lands on an unmapped block, a zeroed row or another position's row panics, and so does a write to a block mapped more than once. Contract violations are host bugs, so they panic rather than return an error.
 
 **A step** runs in this order:
@@ -117,8 +119,8 @@ The random fixture's MTP layers are unrelated to its target, so its greedy accep
 
 | File | What it proves |
 |---|---|
-| `tests/engine.rs` | Through the engine: single requests (greedy and seeded), chunk sizes 1–1000, greedy speculation equals plain at `k` = 1, 2, 3, seeded sampling with three depths, prefix hits and salt isolation (including drafter resume from taps), preemption and resume, idle-TTL eviction and eviction mid-workload (exactly the evicted blocks zeroed in the pools), cancellation, `PreNorm` chaining, unfolded value scale, padded batches, and a randomized workload. The randomized workload covers multi-turn keyed conversations, private requests, cancellations, TTL jumps, small pools and `k` ∈ {1, 2, 3}, and checks the KV invariants and "every free block is zero or queued" after every step. |
-| `tests/executor.rs` | Driven directly through the seam: zero really zeroes (and only the named block), a copied block plus its tap resumes exactly in a fresh slot, and rows are independent of batch, slot and chunking. Panics on unmapped reads, zeroed reads, shared-block writes, resuming off a boundary, and too many drafts. |
+| `tests/engine.rs` | Through the engine: single requests (greedy and seeded), chunk sizes 1–1000, greedy speculation equals plain at `k` = 1, 2, 3, seeded sampling with three depths, prefix hits and salt isolation (including drafter resume from taps), preemption and resume, idle-TTL eviction and eviction mid-workload (exactly the evicted blocks zeroed in the pools), cancellation, `PreNorm` chaining, unfolded value scale, padded batches, and a randomized workload. The randomized workload covers multi-turn keyed conversations, private requests, cancellations, TTL jumps, small pools and `k` ∈ {1, 2, 3}, and checks the KV invariants, "every free block is zero or queued" and "every free slot's model state is zero or its reset queued" after every step. |
+| `tests/executor.rs` | Driven directly through the seam: zero really zeroes (and only the named block), `ResetSlot` really scrubs the slot's model state (and only that slot's), a copied block plus its tap resumes exactly in a fresh slot, and rows are independent of batch, slot and chunking. Panics on unmapped reads, zeroed reads, shared-block writes, resuming off a boundary, and too many drafts. |
 | `tests/speculative.rs` | Echo drafter: greedy speculation equals plain decoding, with about 97 % acceptance and whole chains accepted. Vocabulary 4: the joint distribution of three speculative samples (three chained depths) passes a chi-square fit against the exact dense distribution at p = 0.001, for plain temperature and for filtered sampling. |
 | `tests/real_flash.rs` (ignored) | The truncated real Flash checkpoint (layers 0, 1, 2, 5 plus 3 MTP layers): chunked prefill, MTP-3 speculation and a prefix hit through the engine. Every logit row is bit-exact against the dense forward. |
 
@@ -154,4 +156,4 @@ Measured on a 16-core Apple-silicon machine (128 GB), release build:
 1. Implement `Executor`, honouring the seam contract and the MTP row layout above.
 2. Run this crate's workloads with the faster executor in place of `CpuExecutor`. Compare each step's outputs and returned logits with `CpuExecutor` on the same inputs, or with `DenseOracle` directly.
 3. Where bit equality is impossible (non-batch-invariant GEMMs or attention, lower precision), document the tolerance and why. Greedy outputs must still match except at documented near-ties.
-4. Keep the zero-on-free observable: after maintenance, a freed block must hold no data from its previous owner.
+4. Keep the zero-on-free observable: after maintenance, a freed block must hold no data from its previous owner, and a reset slot no per-sequence model state.

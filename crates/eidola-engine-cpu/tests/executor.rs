@@ -142,6 +142,31 @@ fn zero_really_zeroes_every_byte_and_nothing_else() {
     assert_eq!(e.zero_log().len(), groups(&e) as usize);
 }
 
+/// `ResetSlot` overwrites the slot's per-sequence model state (the drafter's hidden
+/// states) with zeros in place, and touches no other slot.
+#[test]
+fn reset_slot_scrubs_model_state_and_nothing_else() {
+    let mut e = executor();
+    for slot in 0..4 {
+        assert!(e.slot_state_is_zero(slot), "slot {slot} starts zero");
+    }
+    let mut updates = map(&e, 0, 0, 1);
+    updates.extend(map(&e, 0, 1, 2));
+    updates.extend(map(&e, 1, 0, 3));
+    updates.extend(map(&e, 1, 1, 4));
+    e.execute(&step(
+        &[prefill(0, &TOKS[..6]), prefill(1, &TOKS[1..7])],
+        vec![],
+        updates,
+    ))
+    .unwrap();
+    assert!(!e.slot_state_is_zero(0) && !e.slot_state_is_zero(1));
+    e.execute(&step(&[], vec![Maintenance::ResetSlot { slot: 0 }], vec![]))
+        .unwrap();
+    assert!(e.slot_state_is_zero(0), "reset slot holds only zeros");
+    assert!(!e.slot_state_is_zero(1), "other slots untouched");
+}
+
 /// A block copied to a fresh slot carries the drafter's boundary tap with it: the fresh
 /// slot continues exactly like the original one, in the same batch, and both equal the
 /// dense oracle.

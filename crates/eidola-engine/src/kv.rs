@@ -568,6 +568,22 @@ impl KvManager {
             .collect()
     }
 
+    /// Slots with a queued, not yet executed reset (testing).
+    pub fn pending_slot_resets(&self) -> BTreeSet<Slot> {
+        self.pending_maint
+            .iter()
+            .filter_map(|m| match *m {
+                Maintenance::ResetSlot { slot } => Some(slot),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Slots no sequence holds (testing).
+    pub fn free_slot_set(&self) -> BTreeSet<Slot> {
+        self.free_slots.iter().copied().collect()
+    }
+
     /// Free-list blocks as `(group, block)` pairs (testing).
     pub fn free_block_set(&self) -> BTreeSet<(u32, u32)> {
         let mut out = BTreeSet::new();

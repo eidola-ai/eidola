@@ -324,6 +324,15 @@ impl Harness {
                 );
             }
         }
+        let resets = kv.pending_slot_resets();
+        for slot in kv.free_slot_set() {
+            if !resets.contains(&slot) {
+                assert!(
+                    self.eng.executor().slot_state_is_zero(slot),
+                    "free slot {slot} holds model state with no reset pending"
+                );
+            }
+        }
     }
 
     pub fn step(&mut self) {

@@ -112,10 +112,31 @@ pub struct RowRecord {
 
 /// Per-slot model state: the hidden states the drafter continues from, one per chain level
 /// (level 0 is the main model's, level `d` is MTP depth `d - 1`'s), all at position `at`.
-#[derive(Clone, Debug, Default)]
+///
+/// The buffers are allocated once, at full size, and only ever overwritten in place, like
+/// device-resident slot state: storing a new state and `ResetSlot` both write into the
+/// same memory, so no request-derived activations are left behind in a dropped buffer.
+#[derive(Clone, Debug)]
 struct SlotState {
     at: Option<u32>,
     levels: Vec<Vec<f32>>,
+}
+
+impl SlotState {
+    fn zeroed(levels: usize, hidden: usize) -> Self {
+        Self {
+            at: None,
+            levels: vec![vec![0.0; hidden]; levels],
+        }
+    }
+
+    /// Overwrites every level with zeros and forgets the position.
+    fn scrub(&mut self) {
+        self.at = None;
+        for l in &mut self.levels {
+            l.fill(0.0);
+        }
+    }
 }
 
 /// One query row of a paged attention call.
@@ -321,7 +342,7 @@ impl CpuExecutor {
         Self {
             tables: vec![vec![vec![NULL_BLOCK; width]; groups]; cfg.num_state_slots as usize],
             mapped: vec![vec![0; nb]; groups],
-            states: vec![SlotState::default(); cfg.num_state_slots as usize],
+            states: vec![SlotState::zeroed(depths, mc.hidden_size); cfg.num_state_slots as usize],
             records: Mutex::new(Vec::new()),
             zero_log: Vec::new(),
             steps: 0,
@@ -360,6 +381,19 @@ impl CpuExecutor {
         self.pools[group as usize].block_is_zero(block)
     }
 
+    /// Whether a slot's per-sequence model state (the drafter's hidden states) is
+    /// scrubbed: full-size buffers holding only zero bytes, at no position.
+    pub fn slot_state_is_zero(&self, slot: Slot) -> bool {
+        let hsz = self.model.weights.config.hidden_size;
+        let st = &self.states[slot as usize];
+        st.at.is_none()
+            && st.levels.len() == self.levels()
+            && st
+                .levels
+                .iter()
+                .all(|l| l.len() == hsz && l.iter().all(|x| x.to_bits() == 0))
+    }
+
     /// Records kept since the last call (with [`CpuExecutorConfig::record`]). Takes
     /// `&self` so a caller that only borrows the executor (through the engine) can drain
     /// them.
@@ -395,7 +429,7 @@ impl CpuExecutor {
                 }
             }
         }
-        self.states[slot as usize] = SlotState::default();
+        self.states[slot as usize].scrub();
     }
 
     fn block_of(&self, slot: Slot, group: usize, pos: u32) -> u32 {
@@ -784,10 +818,11 @@ impl CpuExecutor {
                 self.pools[g].write_tap(block, pos, &tap);
             }
         }
-        self.states[row.slot as usize] = SlotState {
-            at: Some(to),
-            levels: (0..levels).map(|l| level_at(l, to)).collect(),
-        };
+        let state = &mut self.states[row.slot as usize];
+        for (l, buf) in state.levels.iter_mut().enumerate() {
+            buf.copy_from_slice(&level_at(l, to));
+        }
+        state.at = Some(to);
     }
 }
 
