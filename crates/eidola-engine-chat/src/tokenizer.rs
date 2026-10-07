@@ -321,7 +321,7 @@ impl Detokenizer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
 
@@ -388,7 +388,7 @@ mod tests {
         .to_string()
     }
 
-    fn synthetic() -> MimoTokenizer {
+    pub(crate) fn synthetic() -> MimoTokenizer {
         MimoTokenizer::from_unpinned_bytes(
             synthetic_tokenizer_json().as_bytes(),
             br#"{"eos_token_id": [260, 262]}"#,
