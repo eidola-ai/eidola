@@ -19,7 +19,14 @@ SPDX-License-Identifier = "MIT OR Apache-2.0"
 
 # Server layer.
 [[annotations]]
-path = "crates/eidola-server/**"
+path = [
+    "crates/eidola-server/**",
+    "crates/eidola-engine/**",
+    "crates/eidola-engine-model/**",
+    "crates/eidola-engine-chat/**",
+    "crates/eidola-engine-kernels/**",
+    "crates/eidola-engine-cpu/**",
+]
 precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
 SPDX-License-Identifier = "AGPL-3.0-only"
@@ -62,3 +69,37 @@ path = [
 precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc."
 SPDX-License-Identifier = "LicenseRef-Eidola-Legal"
+
+# Verbatim files from the MiMo-V2.6 model release (Hugging Face
+# XiaomiMiMo/MiMo-V2.6-Flash-MOPD, declared MIT), kept as test fixtures.
+[[annotations]]
+path = [
+    "crates/eidola-engine-chat/tests/fixtures/chat_template.jinja",
+    "crates/eidola-engine-chat/tests/fixtures/generation_config.json",
+    "crates/eidola-engine-chat/tests/fixtures/tokenizer.json.gz",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© 2026 Xiaomi Corporation"
+SPDX-License-Identifier = "MIT"
+
+# Verbatim config.json files from the MiMo-V2.6 model releases (Hugging Face
+# XiaomiMiMo/MiMo-V2.6-Flash-MOPD and MiMo-V2.6-Pro-MOPD, declared MIT), kept as
+# test data.
+[[annotations]]
+path = [
+    "crates/eidola-engine-model/tests/data/flash-mopd.config.json",
+    "crates/eidola-engine-model/tests/data/pro-mopd.config.json",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© 2026 Xiaomi Corporation"
+SPDX-License-Identifier = "MIT"
+
+# Test fixtures generated from the MiMo-V2.6 template and tokenizer.
+[[annotations]]
+path = [
+    "crates/eidola-engine-chat/tests/fixtures/template_cases.json",
+    "crates/eidola-engine-chat/tests/fixtures/template_token_ids.json",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = ["© Eidola, Inc. and contributors", "© 2026 Xiaomi Corporation"]
+SPDX-License-Identifier = "AGPL-3.0-only AND MIT"

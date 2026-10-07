@@ -61,6 +61,17 @@ publish = false
 [profile.dev.package."*"]
 opt-level = 2
 
+# The engine's f32 reference numerics are the exception among our own crates:
+# their tests run real (if tiny) model forwards, and unoptimized they dominate
+# `cargo test` — the CPU executor's suite alone took 6 min wall / ~2,900 CPU-s
+# at opt-level 0, and the model + CPU executor suites together take 18 s at 3
+# (M4 Max). Their tests still run under debug assertions.
+[profile.dev.package.eidola-engine-model]
+opt-level = 3
+
+[profile.dev.package.eidola-engine-cpu]
+opt-level = 3
+
 [profile.docker-dev]
 inherits = "dev"
 opt-level = 1

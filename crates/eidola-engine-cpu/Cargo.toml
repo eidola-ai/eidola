@@ -1,0 +1,16 @@
+[package]
+name = "eidola-engine-cpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "AGPL-3.0-only"
+
+[dependencies]
+eidola-engine = { path = "../eidola-engine" }
+eidola-engine-model = { path = "../eidola-engine-model" }
+rayon = "1"
+
+[dev-dependencies]
+serde_json = "1"

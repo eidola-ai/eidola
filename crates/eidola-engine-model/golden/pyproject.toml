@@ -1,0 +1,25 @@
+[project]
+name = "eidola-engine-model-golden"
+version = "0.0.0"
+description = "Dev-only generator of golden reference outputs for eidola-engine-model (never a build input)."
+requires-python = "==3.12.*"
+dependencies = [
+    "numpy==2.3.4",
+    "safetensors==0.8.0",
+    "torch==2.9.1",
+    "transformers==5.19.0",
+]
+
+[tool.uv]
+package = false
+
+# The generator runs torch on CPU only. Torch comes from PyTorch's CPU-only
+# index, whose wheels carry no CUDA runtime, so no `nvidia-*` or `triton`
+# package enters the lock.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
