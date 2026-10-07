@@ -2752,6 +2752,15 @@ version = "0.1.0"
 [[package]]
 name = "eidola-engine-model"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "memmap2",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "eidola-gui"
