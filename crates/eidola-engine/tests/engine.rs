@@ -1,0 +1,758 @@
+//! End-to-end simulation of the scheduler, KV manager and prefix cache over the mock
+//! executor: outputs against the dense reference, chunking, preemption, speculation,
+//! salt isolation, expiry and zeroing.
+
+mod common;
+
+use std::collections::{BTreeSet, HashMap};
+
+use common::*;
+use eidola_engine::engine::{CacheScope, FinishReason};
+use eidola_engine::mock::{MockConfig, mimo_like_spec};
+use eidola_engine::sampling::SamplingParams;
+use eidola_engine::spec::AttentionKind;
+
+fn params(i: u64) -> SamplingParams {
+    match i % 3 {
+        0 => SamplingParams::greedy(),
+        1 => SamplingParams::random(1.0, 1000 + i),
+        _ => SamplingParams {
+            temperature: 0.7,
+            top_k: 8,
+            top_p: 0.9,
+            min_p: 0.05,
+            seed: 2000 + i,
+        },
+    }
+}
+
+#[test]
+fn single_requests_match_the_dense_reference() {
+    for spec_on in [false, true] {
+        let mut h = Harness::new(small_spec(256), sched(spec_on), MockConfig::default());
+        let mut rng = TestRng(1);
+        let mut cases = Vec::new();
+        for id in 0..12 {
+            let prompt = rng.var_tokens(1, 40, 32);
+            let p = params(id);
+            let max = 1 + rng.below(30) as u32;
+            cases.push((id, prompt.clone(), p, max));
+            h.submit(request(id, prompt, p, max, CacheScope::Private));
+        }
+        h.run();
+        for (id, prompt, p, max) in cases {
+            if spec_on && !p.is_greedy() {
+                continue; // equal in distribution only; see the statistical test
+            }
+            assert_eq!(
+                h.outputs[&id],
+                h.expected(&prompt, &p, max, &[]),
+                "request {id}"
+            );
+            assert_eq!(h.finished[&id], FinishReason::Length);
+        }
+    }
+}
+
+#[test]
+fn chunked_prefill_is_identical_to_unchunked() {
+    let mut rng = TestRng(2);
+    let prompts: Vec<Vec<u32>> = (0..6).map(|_| rng.var_tokens(30, 70, 32)).collect();
+    let mut results = Vec::new();
+    for chunk in [1u32, 3, 4, 7, 16, 1000] {
+        let mut cfg = sched(false);
+        cfg.max_prefill_chunk = chunk;
+        cfg.max_batched_tokens = 64.max(chunk.min(256));
+        let mut h = Harness::new(small_spec(512), cfg, MockConfig::default());
+        for (i, p) in prompts.iter().enumerate() {
+            h.submit(request(
+                i as u64,
+                p.clone(),
+                params(i as u64),
+                12,
+                CacheScope::Private,
+            ));
+        }
+        h.run();
+        let mut out: Vec<Vec<u32>> = Vec::new();
+        for i in 0..prompts.len() as u64 {
+            out.push(h.outputs[&i].clone());
+            assert_eq!(
+                h.outputs[&i],
+                h.expected(&prompts[i as usize], &params(i), 12, &[])
+            );
+        }
+        results.push(out);
+    }
+    for r in &results[1..] {
+        assert_eq!(r, &results[0]);
+    }
+}
+
+#[test]
+fn stop_tokens_and_eos_end_generation() {
+    let mut cfg = sched(true);
+    cfg.eos_token_ids = vec![5];
+    let mut h = Harness::new(small_spec(256), cfg, MockConfig::default());
+    let mut rng = TestRng(3);
+    let mut cases = Vec::new();
+    for id in 0..40 {
+        let prompt = rng.var_tokens(3, 10, 32);
+        let mut req = request(
+            id,
+            prompt.clone(),
+            SamplingParams::greedy(),
+            60,
+            CacheScope::Private,
+        );
+        req.stop_token_ids = vec![7, 9];
+        cases.push(prompt);
+        h.submit(req);
+    }
+    h.run();
+    let mut stopped = 0;
+    for (id, prompt) in cases.iter().enumerate() {
+        let exp = h.expected(prompt, &SamplingParams::greedy(), 60, &[7, 9]);
+        assert_eq!(h.outputs[&(id as u64)], exp);
+        if h.finished[&(id as u64)] == FinishReason::Stop {
+            stopped += 1;
+            assert!([5, 7, 9].contains(exp.last().unwrap()));
+        }
+    }
+    assert!(stopped > 0);
+}
+
+#[test]
+fn greedy_speculation_is_exact_at_every_agreement_rate() {
+    for agreement in [0.0, 0.3, 0.8, 1.0] {
+        let cfg = MockConfig {
+            draft_agreement: agreement,
+            ..MockConfig::default()
+        };
+        let mut h = Harness::new(small_spec(256), sched(true), cfg);
+        let mut rng = TestRng(4);
+        let mut cases = Vec::new();
+        for id in 0..16 {
+            let prompt = rng.var_tokens(2, 30, 32);
+            cases.push(prompt.clone());
+            h.submit(request(
+                id,
+                prompt,
+                SamplingParams::greedy(),
+                40,
+                CacheScope::Private,
+            ));
+        }
+        h.run();
+        for (id, prompt) in cases.iter().enumerate() {
+            assert_eq!(
+                h.outputs[&(id as u64)],
+                h.expected(prompt, &SamplingParams::greedy(), 40, &[]),
+                "agreement {agreement}"
+            );
+        }
+        let s = h.eng.stats();
+        assert!(s.drafted > 0);
+        if agreement == 1.0 {
+            assert_eq!(
+                s.accepted, s.drafted,
+                "a perfect drafter is always accepted"
+            );
+        }
+    }
+}
+
+/// Speculative sampling must produce the same output distribution as plain sampling.
+/// Joint distribution of the first three tokens (vocab 4 ⇒ 64 cells) over 20k seeds each,
+/// compared with a two-sample chi-square test at p = 0.001 (critical value 103.4, df 63).
+#[test]
+fn speculative_sampling_preserves_the_distribution() {
+    let spec = mimo_like_spec(4, 4, 6, 10, 256, 32, 3);
+    let n = 20_000u64;
+    let prompt = vec![1, 2, 3, 0, 1];
+    for (agreement, temperature) in [(0.5, 1.0f32), (0.0, 0.8), (0.9, 1.3)] {
+        let cfg = MockConfig {
+            draft_agreement: agreement,
+            logit_spread: 3.0,
+            ..MockConfig::default()
+        };
+        let mut plain = [0u64; 64];
+        let mut specd = [0u64; 64];
+        let mut h = Harness::new(spec.clone(), sched(true), cfg);
+        h.checks = false; // statistics only; invariants are covered elsewhere
+        for seed in 0..n {
+            let p = SamplingParams::random(temperature, seed);
+            let r = h.expected(
+                &prompt,
+                &SamplingParams::random(temperature, seed + 7_777_777),
+                3,
+                &[],
+            );
+            plain[(r[0] * 16 + r[1] * 4 + r[2]) as usize] += 1;
+            h.submit(request(seed, prompt.clone(), p, 3, CacheScope::Private));
+            if h.eng.unfinished() >= 32 {
+                while h.eng.unfinished() > 0 {
+                    h.step();
+                    h.now += 1;
+                }
+            }
+        }
+        h.run();
+        for seed in 0..n {
+            let r = &h.outputs[&seed];
+            specd[(r[0] * 16 + r[1] * 4 + r[2]) as usize] += 1;
+        }
+        let mut chi = 0.0;
+        for c in 0..64 {
+            let (a, b) = (plain[c] as f64, specd[c] as f64);
+            if a + b > 0.0 {
+                chi += (a - b) * (a - b) / (a + b);
+            }
+        }
+        let s = h.eng.stats();
+        assert!(s.accepted > 0 && s.accepted < s.drafted || agreement == 0.0);
+        assert!(chi < 103.4, "agreement {agreement}: chi-square {chi}");
+    }
+}
+
+#[test]
+fn preemption_and_resume_reproduce_uninterrupted_outputs() {
+    for spec_on in [false, true] {
+        // 40 blocks of 4 tokens per group: far less than 24 concurrent sequences need.
+        let mut h = Harness::new(small_spec(41), sched(spec_on), MockConfig::default());
+        let mut rng = TestRng(5);
+        let mut cases = Vec::new();
+        for id in 0..24 {
+            let prompt = rng.var_tokens(5, 25, 32);
+            let p = if spec_on {
+                SamplingParams::greedy()
+            } else {
+                params(id)
+            };
+            cases.push((prompt.clone(), p));
+            h.submit(request(
+                id,
+                prompt,
+                p,
+                50,
+                CacheScope::Keyed(salt(id as u8)),
+            ));
+        }
+        h.run();
+        assert!(
+            h.eng.stats().preemptions > 0,
+            "workload must force preemption"
+        );
+        for (id, (prompt, p)) in cases.iter().enumerate() {
+            assert_eq!(
+                h.outputs[&(id as u64)],
+                h.expected(prompt, p, 50, &[]),
+                "request {id}"
+            );
+        }
+    }
+}
+
+#[test]
+fn salts_isolate_and_equal_salts_share() {
+    let mut h = Harness::new(small_spec(512), sched(false), MockConfig::default());
+    let mut rng = TestRng(6);
+    let prompt = rng.tokens(40, 32);
+    let g = SamplingParams::greedy();
+    let mut id = 0;
+    let mut run = |h: &mut Harness, prompt: &[u32], cache: CacheScope| {
+        id += 1;
+        h.submit(request(id, prompt.to_vec(), g, 4, cache));
+        h.step();
+        let cached = h.eng.cached_prompt_tokens(id).unwrap();
+        h.run();
+        assert_eq!(h.outputs[&id], h.expected(prompt, &g, 4, &[]));
+        cached
+    };
+    assert_eq!(run(&mut h, &prompt, CacheScope::Keyed(salt(1))), 0);
+    // Same salt, same prompt: the regeneration hit point (last full block before the
+    // final token) is retained.
+    assert_eq!(run(&mut h, &prompt, CacheScope::Keyed(salt(1))), 36);
+    // Different salt: nothing.
+    assert_eq!(run(&mut h, &prompt, CacheScope::Keyed(salt(2))), 0);
+    // No key: nothing, and again nothing.
+    assert_eq!(run(&mut h, &prompt, CacheScope::Private), 0);
+    assert_eq!(run(&mut h, &prompt, CacheScope::Private), 0);
+    // Continuation under the original salt: prompt + output + more resumes at the end of
+    // the previous sequence.
+    let mut cont = prompt.clone();
+    cont.extend(&h.outputs[&1]);
+    cont.extend(rng.tokens(9, 32));
+    let cached = run(&mut h, &cont, CacheScope::Keyed(salt(1)));
+    // The previous sequence wrote KV for 40 + 4 - 1 positions (its last token never
+    // entered KV); its last sealed boundary is the block boundary at or below that.
+    let computed = 40 + 4 - 1;
+    assert_eq!(
+        cached,
+        computed - computed % 4,
+        "continuation resumes at the last sealed block"
+    );
+}
+
+#[test]
+fn private_requests_leave_nothing_cached() {
+    let mut h = Harness::new(small_spec(512), sched(true), MockConfig::default());
+    let mut rng = TestRng(7);
+    for id in 0..10 {
+        h.submit(request(
+            id,
+            rng.tokens(30, 32),
+            params(id),
+            20,
+            CacheScope::Private,
+        ));
+    }
+    h.run();
+    assert_eq!(h.eng.kv().cache_entries(), 0);
+    assert!(h.eng.kv().cache_blocks().is_empty());
+}
+
+/// A hit is only taken where every sliding-window group's window is present; a prefix
+/// whose full-attention blocks are cached but whose window was not retained is recomputed.
+#[test]
+fn sliding_window_hits_require_the_window() {
+    let mut rng = TestRng(8);
+    let base = rng.tokens(40, 32);
+    let mut diverging = base[..20].to_vec();
+    diverging.extend(rng.tokens(20, 32).iter().map(|t| (t + 1) % 32));
+    if diverging[20] == base[20] {
+        diverging[20] = (base[20] + 1) % 32;
+    }
+    let g = SamplingParams::greedy();
+
+    // MiMo-like (full + sliding + drafter): block 5 is not a retained hit point.
+    let mut h = Harness::new(small_spec(512), sched(false), MockConfig::default());
+    h.submit(request(1, base.clone(), g, 4, CacheScope::Keyed(salt(1))));
+    h.run();
+    h.submit(request(
+        2,
+        diverging.clone(),
+        g,
+        4,
+        CacheScope::Keyed(salt(1)),
+    ));
+    h.step();
+    assert_eq!(h.eng.cached_prompt_tokens(2), Some(0));
+    h.run();
+    assert_eq!(h.outputs[&2], h.expected(&diverging, &g, 4, &[]));
+
+    // Full attention only: the same five shared blocks are a valid hit.
+    let mut spec = small_spec(512);
+    spec.kv_groups
+        .retain(|k| k.attention == AttentionKind::Full);
+    let mut h = Harness::new(spec, sched(false), MockConfig::default());
+    h.submit(request(1, base, g, 4, CacheScope::Keyed(salt(1))));
+    h.run();
+    h.submit(request(
+        2,
+        diverging.clone(),
+        g,
+        4,
+        CacheScope::Keyed(salt(1)),
+    ));
+    h.step();
+    assert_eq!(h.eng.cached_prompt_tokens(2), Some(20));
+    h.run();
+    assert_eq!(h.outputs[&2], h.expected(&diverging, &g, 4, &[]));
+}
+
+fn zeros_since(h: &Harness, mark: usize) -> BTreeSet<(u32, u32)> {
+    h.eng.executor().zero_log()[mark..]
+        .iter()
+        .map(|&(_, g, b)| (g, b))
+        .collect()
+}
+
+#[test]
+fn idle_ttl_evicts_and_zeroes_exactly_the_cached_blocks() {
+    let mut cfg = sched(false);
+    cfg.sweep_interval_ms = u64::MAX;
+    let ttl = cfg.cache.idle_ttl_ms;
+    let mut h = Harness::new(small_spec(512), cfg, MockConfig::default());
+    let mut rng = TestRng(9);
+    let prompt = rng.tokens(37, 32);
+    let g = SamplingParams::greedy();
+    h.submit(request(
+        1,
+        prompt.clone(),
+        g,
+        10,
+        CacheScope::Keyed(salt(3)),
+    ));
+    h.run();
+    // Flush the zeros from the sequence's own release.
+    h.eng.sweep(h.now).unwrap();
+    let cached = h.eng.kv().cache_blocks();
+    assert!(!cached.is_empty());
+    let finished_at = h.now - 1;
+
+    let mark = h.eng.executor().zero_log().len();
+    h.eng.sweep(finished_at + ttl - 1).unwrap();
+    assert!(zeros_since(&h, mark).is_empty(), "nothing expires early");
+    assert_eq!(h.eng.kv().cache_blocks(), cached);
+
+    let mark = h.eng.executor().zero_log().len();
+    let steps_before = h.eng.executor().steps();
+    h.eng.sweep(finished_at + ttl).unwrap();
+    assert_eq!(
+        h.eng.executor().steps(),
+        steps_before + 1,
+        "zeroing runs without traffic"
+    );
+    assert_eq!(
+        zeros_since(&h, mark),
+        cached,
+        "exactly the evicted blocks are zeroed"
+    );
+    assert_eq!(h.eng.kv().cache_entries(), 0);
+    for (gr, b) in cached {
+        assert!(h.eng.executor().block_is_zero(gr, b));
+    }
+    h.check();
+}
+
+#[test]
+fn expired_entries_are_never_hit_even_before_a_sweep() {
+    let mut cfg = sched(false);
+    cfg.sweep_interval_ms = u64::MAX;
+    let ttl = cfg.cache.idle_ttl_ms;
+    let mut h = Harness::new(small_spec(512), cfg, MockConfig::default());
+    let prompt = TestRng(10).tokens(30, 32);
+    let g = SamplingParams::greedy();
+    h.submit(request(1, prompt.clone(), g, 3, CacheScope::Keyed(salt(4))));
+    h.run();
+    h.now += ttl;
+    h.submit(request(2, prompt.clone(), g, 3, CacheScope::Keyed(salt(4))));
+    h.step();
+    assert_eq!(h.eng.cached_prompt_tokens(2), Some(0));
+    h.run();
+    assert_eq!(h.outputs[&2], h.outputs[&1]);
+}
+
+#[test]
+fn max_age_evicts_even_entries_kept_warm() {
+    let mut cfg = sched(false);
+    cfg.sweep_interval_ms = u64::MAX;
+    let (ttl, max_age) = (cfg.cache.idle_ttl_ms, cfg.cache.max_age_ms);
+    let mut h = Harness::new(small_spec(512), cfg, MockConfig::default());
+    let prompt = TestRng(11).tokens(30, 32);
+    let g = SamplingParams::greedy();
+    h.submit(request(1, prompt.clone(), g, 3, CacheScope::Keyed(salt(5))));
+    h.run();
+    let created = 0;
+    // Keep it warm: a regeneration every half TTL, each one a hit.
+    let mut id = 2;
+    while h.now + ttl / 2 < created + max_age {
+        h.now += ttl / 2;
+        h.submit(request(
+            id,
+            prompt.clone(),
+            g,
+            3,
+            CacheScope::Keyed(salt(5)),
+        ));
+        h.step();
+        assert_eq!(h.eng.cached_prompt_tokens(id), Some(28), "warm hit");
+        h.run();
+        id += 1;
+    }
+    h.eng.sweep(h.now).unwrap();
+    let cached = h.eng.kv().cache_blocks();
+    let mark = h.eng.executor().zero_log().len();
+    h.eng.sweep(created + max_age).unwrap();
+    assert_eq!(zeros_since(&h, mark), cached);
+    assert_eq!(h.eng.kv().cache_entries(), 0);
+    h.check();
+}
+
+#[test]
+fn an_entry_in_use_past_max_age_is_detached_and_zeroed_on_release() {
+    let mut cfg = sched(false);
+    cfg.sweep_interval_ms = u64::MAX;
+    let max_age = cfg.cache.max_age_ms;
+    let mut h = Harness::new(small_spec(512), cfg, MockConfig::default());
+    let prompt = TestRng(12).tokens(30, 32);
+    let g = SamplingParams::greedy();
+    h.submit(request(1, prompt.clone(), g, 3, CacheScope::Keyed(salt(6))));
+    h.run();
+    // A long-running continuation holds the old entries past their max age.
+    h.submit(request(
+        2,
+        prompt.clone(),
+        g,
+        200,
+        CacheScope::Keyed(salt(6)),
+    ));
+    h.step();
+    assert!(h.eng.cached_prompt_tokens(2).unwrap() > 0);
+    h.now = max_age;
+    h.eng.sweep(h.now).unwrap();
+    h.check();
+    h.run();
+    assert_eq!(h.outputs[&2], h.expected(&prompt, &g, 200, &[]));
+    // Nothing from before the max age survives as a hit.
+    h.submit(request(3, prompt.clone(), g, 3, CacheScope::Keyed(salt(6))));
+    h.step();
+    let hit = h.eng.cached_prompt_tokens(3).unwrap();
+    assert!(
+        hit == 0 || hit == 28,
+        "only entries re-sealed after detachment may hit"
+    );
+    h.run();
+    h.eng.sweep(h.now + 10 * max_age).unwrap();
+    assert_eq!(h.eng.kv().cache_entries(), 0);
+    h.check();
+}
+
+#[test]
+fn cancel_releases_everything() {
+    let mut h = Harness::new(small_spec(256), sched(true), MockConfig::default());
+    let mut rng = TestRng(13);
+    for id in 0..20 {
+        let cache = if id % 2 == 0 {
+            CacheScope::Keyed(salt(id as u8))
+        } else {
+            CacheScope::Private
+        };
+        h.submit(request(id, rng.tokens(20, 32), params(id), 100, cache));
+    }
+    for _ in 0..5 {
+        h.step();
+        h.now += 1;
+    }
+    for id in 0..20 {
+        let e = h.eng.cancel(id, h.now);
+        assert!(e.is_none_or(|e| e.finish == Some(FinishReason::Cancelled)));
+    }
+    assert_eq!(h.eng.unfinished(), 0);
+    h.check();
+    h.eng.sweep(h.now + 100 * 3_600_000).unwrap();
+    h.check();
+    assert!(h.eng.kv().sequence_blocks().is_empty());
+    assert_eq!(h.eng.kv().cache_entries(), 0);
+}
+
+#[test]
+fn decode_steps_use_the_smallest_fitting_bucket() {
+    let mut h = Harness::new(small_spec(256), sched(true), MockConfig::default());
+    h.submit(request(
+        1,
+        vec![1, 2, 3],
+        SamplingParams::greedy(),
+        20,
+        CacheScope::Private,
+    ));
+    h.run();
+    for b in h.eng.executor().buckets_used() {
+        assert_eq!((b.max_seqs, b.max_tokens), (1, 16));
+    }
+}
+
+/// Half the time a shared head plus a random tail, otherwise random.
+fn headed(rng: &mut TestRng, head: &[u32]) -> Vec<u32> {
+    let mut t = if rng.chance(0.5) {
+        head.to_vec()
+    } else {
+        Vec::new()
+    };
+    t.extend(rng.var_tokens(1, 30, 32));
+    t
+}
+
+/// Exact for non-speculative or greedy runs (a prefix when the sequence alone exhausted
+/// KV memory and was ended early), length-only otherwise.
+fn check_output(h: &Harness, id: u64, prompt: &[u32], p: &SamplingParams, max: u32, spec_on: bool) {
+    let out = &h.outputs[&id];
+    let early = h.finished.get(&id) == Some(&FinishReason::Length) && (out.len() as u32) < max;
+    if !spec_on || p.is_greedy() {
+        let exp = h.expected(prompt, p, max, &[]);
+        if early {
+            assert_eq!(out[..], exp[..out.len()], "request {id}");
+        } else {
+            assert_eq!(out, &exp, "request {id}");
+        }
+    } else if !early {
+        assert_eq!(out.len() as u32, max);
+    }
+}
+
+/// Randomized workload: multi-turn keyed conversations (continuations and regenerations),
+/// private requests, random sampling, speculation on or off, cancellations, clock jumps
+/// past the idle TTL, and small pools that force eviction and preemption. Every step
+/// checks the KV invariants (no leak, no double free, exact refcounts) and that every free
+/// block is zero or has a zero queued. Every completed request must equal the dense
+/// reference; cache hits must never exceed what an earlier request under the same salt
+/// computed.
+#[test]
+fn randomized_workloads_hold_every_invariant() {
+    for seed in 0..24u64 {
+        let mut rng = TestRng(100 + seed);
+        let spec_on = seed % 2 == 0;
+        let blocks = 48 + rng.below(80) as u32;
+        let mut cfg = sched(spec_on);
+        cfg.max_prefill_chunk = 1 + rng.below(40) as u32;
+        cfg.max_batched_tokens = 32 + rng.below(100) as u32;
+        cfg.cache.idle_ttl_ms = 500;
+        cfg.cache.max_age_ms = 2000;
+        cfg.sweep_interval_ms = 50;
+        let mut h = Harness::new(small_spec(blocks), cfg, MockConfig::default());
+
+        // Conversation state: salt id -> last full transcript.
+        let mut convo: HashMap<u8, Vec<u32>> = HashMap::new();
+        // salt id -> every token sequence computed under it.
+        let mut history: HashMap<u8, Vec<Vec<u32>>> = HashMap::new();
+        let mut live: HashMap<u64, (Vec<u32>, SamplingParams, u32, Option<u8>)> = HashMap::new();
+        let mut cancelled = BTreeSet::new();
+        let mut hit_checked = std::collections::HashSet::new();
+        // A shared head (a common system prompt) across salts: only salting keeps apart.
+        let head = rng.tokens(13, 32);
+        let mut hits_seen = 0usize;
+        let mut next_id = 0u64;
+
+        for _round in 0..400 {
+            if rng.chance(0.35) && live.len() < 40 {
+                let id = next_id;
+                next_id += 1;
+                let p = if spec_on && rng.chance(0.5) {
+                    SamplingParams::greedy()
+                } else {
+                    params(id)
+                };
+                let max = 1 + rng.below(24) as u32;
+                let (prompt, key) = if rng.chance(0.25) {
+                    (headed(&mut rng, &head), None)
+                } else {
+                    let s = rng.below(5) as u8;
+                    let prompt = match convo.get(&s) {
+                        Some(t) if rng.chance(0.3) => t.clone(),
+                        Some(t) => {
+                            let mut t = t.clone();
+                            t.extend(rng.var_tokens(1, 12, 32));
+                            t
+                        }
+                        None => headed(&mut rng, &head),
+                    };
+                    (prompt, Some(s))
+                };
+                if prompt.len() as u32 > blocks * 4 / 2 {
+                    continue;
+                }
+                let cache = match key {
+                    Some(s) => CacheScope::Keyed(salt(s + 1)),
+                    None => CacheScope::Private,
+                };
+                live.insert(id, (prompt.clone(), p, max, key));
+                h.submit(request(id, prompt, p, max, cache));
+            }
+            if rng.chance(0.03) && !live.is_empty() {
+                let ids: Vec<u64> = live.keys().copied().collect();
+                let victim = ids[rng.below(ids.len() as u64) as usize];
+                if h.eng.cancel(victim, h.now).is_some() {
+                    cancelled.insert(victim);
+                    let (prompt, _, _, key) = live.remove(&victim).unwrap();
+                    if let Some(k) = key {
+                        let mut t = prompt;
+                        t.extend(&h.outputs[&victim]);
+                        history.entry(k).or_default().push(t);
+                    }
+                }
+            }
+            let before: Vec<u64> = live.keys().copied().collect();
+            h.step();
+            for id in before {
+                let c = h
+                    .eng
+                    .cached_prompt_tokens(id)
+                    .or_else(|| h.cached.get(&id).copied());
+                let Some(c) = c else { continue };
+                if !hit_checked.insert(id) {
+                    continue;
+                }
+                let (prompt, _, _, key) = &live[&id];
+                // A first-admission hit can only come from blocks computed under the same
+                // salt: finished or cancelled transcripts and live same-salt sequences.
+                let allowed = match key {
+                    None => 0,
+                    Some(s) => {
+                        let mut sources: Vec<Vec<u32>> =
+                            history.get(s).cloned().unwrap_or_default();
+                        for (j, (pj, _, _, kj)) in &live {
+                            if *j != id && kj == key {
+                                let mut t = pj.clone();
+                                t.extend(&h.outputs[j]);
+                                sources.push(t);
+                            }
+                        }
+                        sources
+                            .iter()
+                            .map(|t| t.iter().zip(prompt).take_while(|(a, b)| a == b).count())
+                            .max()
+                            .unwrap_or(0)
+                    }
+                };
+                assert!(
+                    c as usize <= allowed,
+                    "seed {seed}: hit {c} beyond any same-salt prefix {allowed}"
+                );
+                hits_seen += (c > 0) as usize;
+            }
+            let done: Vec<u64> = live
+                .keys()
+                .copied()
+                .filter(|id| h.finished.contains_key(id))
+                .collect();
+            for id in done {
+                let (prompt, p, max, key) = live.remove(&id).unwrap();
+                check_output(&h, id, &prompt, &p, max, spec_on);
+                if let Some(s) = key {
+                    let mut t = prompt.clone();
+                    t.extend(&h.outputs[&id]);
+                    history.entry(s).or_default().push(t.clone());
+                    convo.insert(s, t);
+                }
+            }
+            h.now += if rng.chance(0.02) {
+                600
+            } else {
+                1 + rng.below(5)
+            };
+        }
+        h.run();
+        for (id, (prompt, p, max, _)) in live {
+            check_output(&h, id, &prompt, &p, max, spec_on);
+        }
+        let hits = hits_seen;
+        assert!(hits > 0, "seed {seed}: workload produced no cache hits");
+        eprintln!(
+            "seed {seed}: blocks {blocks} requests {next_id} stats {:?} cancelled {} zeros {} hits {hits}",
+            h.eng.stats(),
+            cancelled.len(),
+            h.eng.executor().zero_log().len(),
+        );
+        assert!(h.eng.stats().steps > 0);
+        // Drain: everything expires, everything is freed and zeroed.
+        h.eng.sweep(h.now + 10_000).unwrap();
+        h.check();
+        assert_eq!(h.eng.kv().cache_entries(), 0);
+        for (g, gs) in h.spec.kv_groups.iter().enumerate() {
+            assert_eq!(
+                h.eng.kv().free_blocks(g),
+                gs.num_blocks as usize - 1,
+                "seed {seed} group {g} leaked"
+            );
+            for b in 1..gs.num_blocks {
+                assert!(h.eng.executor().block_is_zero(g as u32, b));
+            }
+        }
+        assert!(
+            h.eng.stats().preemptions > 0 || seed > 3 || blocks > 100,
+            "seed {seed}: no pressure"
+        );
+        let _ = cancelled;
+    }
+}
