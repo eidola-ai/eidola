@@ -1,0 +1,10 @@
+[package]
+name = "eidola-engine-kernels"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "AGPL-3.0-only"
+
+[dependencies]

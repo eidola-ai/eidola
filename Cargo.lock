@@ -2732,6 +2732,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidola-engine"
+version = "0.1.0"
+
+[[package]]
+name = "eidola-engine-chat"
+version = "0.1.0"
+
+[[package]]
+name = "eidola-engine-kernels"
+version = "0.1.0"
+
+[[package]]
+name = "eidola-engine-model"
+version = "0.1.0"
+
+[[package]]
 name = "eidola-gui"
 version = "0.1.0"
 dependencies = [
