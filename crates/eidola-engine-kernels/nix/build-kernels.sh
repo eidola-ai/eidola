@@ -102,19 +102,41 @@ for name in $(jq -r '.kernels[].name' "$spec"); do
   fatbinary --64 --compress=false --create="$OUT/fatbin/$name.fatbin" "${images[@]}"
 done
 
-# SASS inspection: entry symbols (with demangled names) and a histogram of the
-# tensor-core instruction families, so the manifest states which MMA path each
-# kernel actually takes.
-entries_json() {
-  local cubin=$1
-  cuobjdump -symbols "$cubin" | awk '$3 == "STO_ENTRY" { print $4 }' | sort | while read -r sym; do
-    jq -n --arg symbol "$sym" --arg demangled "$(cu++filt "$sym")" \
-      '{symbol: $symbol, demangled: $demangled}'
-  done | jq -s .
-}
+# SASS inspection: entry symbols (with demangled names, each bound to its
+# launch-contract record) and a histogram of the tensor-core instruction
+# families, so the manifest states which MMA path each kernel actually takes.
 meta_json() {
   cuobjdump -symbols "$1" | awk '$1 == "STT_OBJECT" && $4 ~ /_meta$/ { print $4 }' | sort |
     jq -R . | jq -s .
+}
+# An entry's record is `<entry>_meta` when the image has one, or the record
+# kernels.json's `meta_aliases` maps to the entry (mangled template instances
+# cannot carry a matching name). Every entry must resolve to exactly one record
+# and every record to exactly one entry, or the build fails.
+entries_json() {
+  local cubin=$1 name=$2 arch=$3 symbols metas aliases
+  symbols=$(cuobjdump -symbols "$cubin" | awk '$3 == "STO_ENTRY" { print $4 }' | sort |
+    while read -r sym; do
+      jq -n --arg symbol "$sym" --arg demangled "$(cu++filt "$sym")" \
+        '{symbol: $symbol, demangled: $demangled}'
+    done | jq -s .)
+  metas=$(meta_json "$cubin")
+  aliases=$(jq -c --arg n "$name" '.kernels[] | select(.name == $n) | .meta_aliases // {}' "$spec")
+  jq -n --argjson entries "$symbols" --argjson metas "$metas" --argjson aliases "$aliases" \
+    --arg where "$name $arch" '
+    def has_meta($m): any($metas[]; . == $m);
+    def records($s):
+      [$aliases | to_entries[] | select(.value == $s) | .key]
+      + [$s + "_meta" | select(has_meta(.))];
+    [$entries[] | . + {records: records(.symbol)}] as $resolved
+    | [$resolved[] | select((.records | length) != 1) | .symbol] as $bad
+    | if ($bad | length) > 0 then
+        error("\($where): entries without exactly one launch-contract record: \($bad)")
+      else . end
+    | [$resolved[] | {symbol, demangled, meta: .records[0]}] as $out
+    | if ([$out[].meta] | sort) != ($metas | sort) then
+        error("\($where): records \($metas) do not correspond one to one with entries \([$out[].meta])")
+      else $out end'
 }
 mma_json() {
   cuobjdump -sass "$1" >"$SCRATCH_DIR/sass.txt"
@@ -136,12 +158,13 @@ while IFS=$'\t' read -r name source profile arch; do
   cubin="$OUT/cubin/$name.$arch.cubin"
   cuobjdump -sass "$cubin" >"$OUT/inspect/$name.$arch.sass"
   cuobjdump -res-usage "$cubin" >"$OUT/inspect/$name.$arch.res-usage" 2>&1
+  entries=$(entries_json "$cubin" "$name" "$arch")
   jq -n \
     --arg name "$name" --arg arch "$arch" --arg source "csrc/$source" --arg profile "$profile" \
     --arg file "cubin/$name.$arch.cubin" \
     --arg sha256 "$(sha256sum "$cubin" | cut -d' ' -f1)" \
     --argjson size "$(stat -c %s "$cubin")" \
-    --argjson entries "$(entries_json "$cubin")" \
+    --argjson entries "$entries" \
     --argjson meta "$(meta_json "$cubin")" \
     --argjson mma "$(mma_json "$cubin")" \
     '{name: $name, arch: $arch, source: $source, profile: $profile, file: $file,
@@ -182,7 +205,7 @@ jq -n \
   --slurpfile kernels "$kernels_json" \
   --slurpfile fatbins "$fatbins_json" \
   '{
-     schema_version: 1,
+     schema_version: 2,
      toolchain: $toolchain,
      sources: $sources,
      compile: {

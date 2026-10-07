@@ -148,44 +148,129 @@ fn sass_uses_the_intended_tensor_core_path() {
         let fa2 = "flashinfer_fa2_sink_paged";
         assert!(mma(manifest, fa2, arch, "HMMA") > 0, "{arch}");
         assert_eq!(mma(manifest, fa2, arch, "UTC"), 0, "{arch}");
-        for plain in ["flashinfer_sampling", "rmsnorm"] {
-            let cubin = manifest.cubin(plain, arch).expect("cubin");
-            assert!(cubin.mma_sass.is_empty(), "{plain} {arch}");
-        }
+        let rmsnorm = manifest.cubin("rmsnorm", arch).expect("cubin");
+        assert!(rmsnorm.mma_sass.is_empty(), "rmsnorm {arch}");
     }
 }
 
-/// Every kernel entry has a launch-contract record, and entries we wrote
-/// ourselves keep their unmangled names.
+/// Every kernel entry is bound to exactly one launch-contract record and every
+/// record to exactly one entry; entries we wrote ourselves keep their unmangled
+/// names and `<entry>_meta` records; mangled entries are bound by the aliases
+/// in kernels.json, and those aliases are exactly the bindings that differ
+/// from the naming convention.
 #[test]
 fn entries_and_meta_records() {
     let manifest = Manifest::embedded();
+    let spec = spec();
     for cubin in &manifest.kernels {
-        assert!(!cubin.meta.is_empty(), "{} {}", cubin.name, cubin.arch);
-        for meta in &cubin.meta {
-            assert!(meta.ends_with("_meta"));
+        let mut records: Vec<&str> = cubin.meta.iter().map(String::as_str).collect();
+        let mut bound: Vec<&str> = cubin.entries.iter().map(|e| e.meta.as_str()).collect();
+        records.sort_unstable();
+        bound.sort_unstable();
+        assert_eq!(records, bound, "{} {}", cubin.name, cubin.arch);
+        let kernel = spec["kernels"]
+            .as_array()
+            .expect("kernels")
+            .iter()
+            .find(|k| k["name"] == cubin.name.as_str())
+            .expect("kernel in spec");
+        let aliases = kernel["meta_aliases"].as_object();
+        for entry in &cubin.entries {
+            assert!(entry.meta.ends_with("_meta"), "{}", entry.meta);
+            let conventional = format!("{}_meta", entry.symbol);
+            if entry.meta == conventional {
+                assert!(!entry.symbol.starts_with("_Z"), "{}", entry.symbol);
+            } else {
+                let alias = aliases
+                    .and_then(|a| a.get(&entry.meta))
+                    .and_then(|v| v.as_str());
+                assert_eq!(alias, Some(entry.symbol.as_str()), "{}", entry.meta);
+            }
+            assert_eq!(
+                cubin.entry_for_meta(&entry.meta).map(|e| &e.symbol),
+                Some(&entry.symbol)
+            );
+        }
+        if let Some(aliases) = aliases {
+            for (meta, symbol) in aliases {
+                let entry = cubin
+                    .entry(symbol.as_str().expect("symbol"))
+                    .unwrap_or_else(|| panic!("{meta}: aliased entry not in {}", cubin.name));
+                assert_eq!(&entry.meta, meta);
+            }
         }
     }
     let rmsnorm = manifest.cubin("rmsnorm", "sm_100a").expect("rmsnorm");
     assert_eq!(rmsnorm.entries[0].symbol, "eidola_rmsnorm_bf16");
+    assert_eq!(rmsnorm.entries[0].meta, "eidola_rmsnorm_bf16_meta");
     let fa2 = manifest
         .cubin("flashinfer_fa2_sink_paged", "sm_103a")
         .expect("fa2");
     for tile in [16, 64, 128] {
         let symbol = format!("eidola_fa2_sink_paged_bf16_q{tile}");
-        assert!(fa2.entries.iter().any(|e| e.symbol == symbol), "{symbol}");
+        assert!(fa2.entry(&symbol).is_some(), "{symbol}");
     }
-    let deepgemm = manifest
-        .cubin("deepgemm_fp8_fp4_grouped", "sm_100a")
-        .expect("deepgemm");
-    assert_eq!(deepgemm.entries.len(), 4);
-    for entry in &deepgemm.entries {
-        assert!(
-            entry
-                .demangled
-                .starts_with("void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<"),
-            "{}",
-            entry.demangled
-        );
+    let merge = fa2
+        .entry_for_meta("eidola_fa2_merge_states_bf16_d128_meta")
+        .expect("merge");
+    assert!(
+        merge
+            .demangled
+            .starts_with("void flashinfer::PersistentVariableLengthMergeStatesKernel<"),
+        "{}",
+        merge.demangled
+    );
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        let deepgemm = manifest
+            .cubin("deepgemm_fp8_fp4_grouped", arch)
+            .expect("deepgemm");
+        assert_eq!(deepgemm.entries.len(), 4);
+        // Each record describes the instance its name says: masked is
+        // GemmType 2, contiguous 1; gate/up has K = 4096, down K = 2048.
+        for (kind, gemm_type) in [("masked", 2), ("contiguous", 1)] {
+            for (proj, shape_k) in [("gate_up", 4096), ("down", 2048)] {
+                let meta = format!("eidola_deepgemm_fp8_fp4_{kind}_{proj}_meta");
+                let entry = deepgemm.entry_for_meta(&meta).expect(&meta);
+                assert!(
+                    entry
+                        .demangled
+                        .starts_with("void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<"),
+                    "{}",
+                    entry.demangled
+                );
+                assert!(
+                    entry
+                        .demangled
+                        .contains(&format!("(deep_gemm::GemmType){gemm_type}")),
+                    "{meta}: {}",
+                    entry.demangled
+                );
+                assert!(
+                    entry.demangled.contains(&format!(
+                        "(unsigned int)0, (unsigned int)4096, (unsigned int){shape_k},"
+                    )),
+                    "{meta}: {}",
+                    entry.demangled
+                );
+            }
+        }
+    }
+}
+
+/// Sampling is not in the AOT set: it is an Eidola kernel that must reproduce
+/// the serving core's sampling semantics bit for bit (see AGENTS.md).
+#[test]
+fn no_third_party_sampling_kernels() {
+    let manifest = Manifest::embedded();
+    for cubin in &manifest.kernels {
+        for entry in &cubin.entries {
+            assert!(
+                !entry.demangled.contains("sampling"),
+                "{} {}: {}",
+                cubin.name,
+                cubin.arch,
+                entry.demangled
+            );
+        }
     }
 }

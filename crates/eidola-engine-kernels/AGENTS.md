@@ -7,14 +7,14 @@ The engine's GPU kernels, compiled ahead of time from open source on a GPU-less 
 | Path | What |
 |---|---|
 | `csrc/*.cu`, `csrc/eidola_kernel.cuh` | Our translation units: one per kernel family, each instantiating upstream templates (or our own code) and exposing entry points |
-| `csrc/kernels.json` | The build matrix: kernels, target archs, flag profiles. The single place a kernel is added |
+| `csrc/kernels.json` | The build matrix: kernels, target archs, flag profiles, and the `meta_aliases` binding mangled entries to their launch-contract records. The single place a kernel is added |
 | `nix/default.nix` | The derivation: pinned nixpkgs, CUDA 13.2, unfree allow-list, inputs → `$out/{cubin,fatbin,inspect,manifest.json}` |
 | `nix/sources.nix` | Upstream pins (commit + NAR hash) |
 | `nix/build-kernels.sh` | Compiles, bundles, inspects, writes `manifest.json`; also runnable by hand inside `nix-shell nix` |
 | `nix/render-flashinfer-sink.sh` | Renders FlashInfer's FA2 config template + attention-sink variant without Python |
 | `scripts/build-in-docker.sh` | The builder: Nix in a pinned `nixos/nix` container; `--check`, `--verify`, `--update` |
 | `kernels.manifest.json` | The committed build manifest, compiled into the crate |
-| `src/lib.rs` | `Manifest` (parse/validate), `ArtifactDir` (verified loading), `KernelMeta` (launch contract decode) |
+| `src/lib.rs` | `Manifest` (parse/validate), `Cubin::entry` / `Cubin::entry_for_meta` (entry ↔ record lookups), `ArtifactDir` (verified loading), `KernelMeta` (launch contract decode) |
 
 ## The closed-tool boundary
 
@@ -41,8 +41,9 @@ Never, in this crate or anything it feeds:
 | Dense FP8 GEMM, f32 scales 1×128 (activations) / 128×128 (weights), BF16 out | CUTLASS 4.8 `KernelScheduleSm100Blockwise` | `eidola_cutlass_fp8_blockwise_gemm_bf16` | tcgen05 (`UTCQMMA`) |
 | Routed-expert grouped GEMM, FP8 × MXFP4, masked (decode) and contiguous (prefill), gate/up and down | DeepGEMM `sm100_fp8_fp4_gemm_1d1d` | 4 mangled `deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<…>` | tcgen05 (`UTCQMMA`, 2-CTA) |
 | Paged attention, learned sinks, sliding window, head dims 192/128, BF16; query tiles 16/64/128 + split-KV merge | FlashInfer FA2 prefill template + `AttentionSink` | `eidola_fa2_sink_paged_bf16_q{16,64,128}`, mangled `PersistentVariableLengthMergeStatesKernel<…>` | `mma.sync` (`HMMA`), no tcgen05 |
-| Sampling: top-k, top-p, top-k+top-p, chain speculative | FlashInfer `sampling.cuh` | 4 mangled `flashinfer::sampling::…` | none |
 | RMSNorm, BF16 | ours | `eidola_rmsnorm_bf16` | none |
+
+**Sampling is not here, and must not come from upstream.** The serving core (`eidola-engine/src/sampling.rs`) defines what a sample is: draws from a SplitMix-based counter RNG keyed by `(seed, position, stream)`, with separate streams for target samples, drafts, speculative acceptance and the residual, and its own filtering, CDF walk and chain acceptance. Recompute preemption and the CPU oracle depend on those exact draws. FlashInfer's sampling kernels draw from Philox with a caller-supplied seed and offset and cannot reproduce them, so the GPU sampler (including speculative accept and residual) will be an Eidola kernel that reproduces `sampling.rs` bit for bit given equal logits. It is not written yet; until it is, nothing in this set samples.
 
 Every kernel is built for all three targets; each fatbin bundles the `sm_100a` and `sm_103a` cubins so the driver picks the exact match. Instantiation choices (tile shapes, stages, thread counts) mirror what the upstream host dispatchers pick for these shapes; each source file explains its own.
 
@@ -54,7 +55,7 @@ Cubins and fatbins are loaded through the CUDA driver API (`cuModuleLoadData`, e
 
 - **Load through `ArtifactDir`.** It reads an image from a build output and returns the bytes only if size and SHA-256 match the compiled-in manifest.
 - **Entries by symbol.** Kernels we wrap are `extern "C"`. Upstream template kernels keep their mangled names, which the manifest lists with their demangled forms. Template instances, DeepGEMM's `__global__ static` kernels and every `_meta` global have local binding (`STB_LOCAL`) in a whole-program cubin. The CUDA runtime resolves exactly such symbols by name for ordinary programs, so `cuModuleGetFunction` / `cuModuleGetGlobal` should accept them. That is inferred, not yet observed on a GPU; the fallback is `cuModuleEnumerateFunctions`.
-- **Launch contract in the image.** Each entry has a `<entry>_meta` device global (`EidolaKernelMeta`, 32 bytes) holding:
+- **Launch contract in the image.** Each entry has a launch-contract device global (`EidolaKernelMeta`, 32 bytes), named by the entry's `meta` field in the manifest. For an entry we name ourselves it is `<entry>_meta`. A mangled template instance cannot carry a matching name, so its record has a readable alias (`eidola_deepgemm_fp8_fp4_masked_gate_up_meta`, …) and `meta_aliases` in `csrc/kernels.json` binds the alias to the mangled symbol. The build fails unless every entry resolves to exactly one record and every record to exactly one entry, `Manifest::parse` re-checks that correspondence, and `Cubin::entry` / `Cubin::entry_for_meta` look it up in either direction. The record holds:
   - block shape,
   - dynamic shared memory,
   - cluster shape,
@@ -62,7 +63,7 @@ Cubins and fatbins are loaded through the CUDA driver API (`cuModuleLoadData`, e
 
   Read it with `cuModuleGetGlobal` plus a 32-byte copy, and decode it with `KernelMeta::from_bytes`. Launches above 48 KiB of dynamic shared memory must first set `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`. Cluster launches need `cuLaunchKernelEx` with the cluster attribute.
 - **Parameters.** These are what the host must build to call each kernel:
-  - **FlashInfer kernels:** a plain `PagedParams` struct (296 bytes) or plain argument lists.
+  - **FlashInfer attention:** a plain `PagedParams` struct (296 bytes); the split-KV merge takes a plain argument list.
   - **DeepGEMM:** five `CUtensorMap`s, which the host encodes with `cuTensorMapEncodeTiled`.
   - **CUTLASS GEMM:** its 2048-byte `Params`, which includes TMA descriptors that CUTLASS builds in host C++. Providing that, either as a host-only C++ shim compiled without device code or as a Rust mirror checked against `params_bytes`, is the first job when the launch path is written.
 - **DeepGEMM SM count.** The persistent scheduler bakes in the SM count (148). The grid must be exactly that, and the part must have at least that many SMs; confirm the B300 count before relying on the `sm_103a` instance.
@@ -111,14 +112,15 @@ Inside the container Nix runs with `sandbox = false` and `filter-syscalls = fals
 - every `csrc/` file and build script hashes as recorded, and no new file has appeared;
 - the pins agree with `nix/sources.nix`;
 - the kernel × arch matrix and flags agree with `kernels.json`;
-- the SASS facts above hold.
+- the SASS facts above hold;
+- every entry is bound to exactly one launch-contract record, and the aliases are exactly the bindings that differ from `<entry>_meta`.
 
 Editing a kernel without rebuilding fails here.
 
 ## Adding a kernel
 
-1. Write `csrc/<name>.cu`. Give each entry point an `extern "C"` wrapper where the upstream code has a `__device__` body to call, or explicitly instantiate the upstream `__global__` template with its full signature. Add an `EIDOLA_KERNEL_META` record for each entry. Do not use `assert`-dependent or path-dependent constructs.
-2. Add it to `csrc/kernels.json` with a flag profile. Add a new profile only when the upstream project's own build flags differ.
+1. Write `csrc/<name>.cu`. Give each entry point an `extern "C"` wrapper where the upstream code has a `__device__` body to call, or explicitly instantiate the upstream `__global__` template with its full signature. Add an `EIDOLA_KERNEL_META` record for each entry: `<entry>` for an `extern "C"` entry, a readable alias for a mangled one. Do not use `assert`-dependent or path-dependent constructs.
+2. Add it to `csrc/kernels.json` with a flag profile, and a `meta_aliases` entry (`"<alias>_meta": "<mangled symbol>"`) for every aliased record; the first build prints the mangled symbols if you do not have them yet. Add a new profile only when the upstream project's own build flags differ.
 3. Run `scripts/build-in-docker.sh --check --update`, inspect `inspect/<name>.<arch>.sass` / `.res-usage` (register spills show as `STACK`), and commit the source and manifest together.
 4. If the kernel exists for a particular tensor-core path, assert it in `tests/manifest.rs`.
 

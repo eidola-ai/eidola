@@ -74,6 +74,10 @@ EIDOLA_DEEPGEMM_INSTANCE(kGateUpN, kGateUpK, GemmType::MGroupedContiguous);
 EIDOLA_DEEPGEMM_INSTANCE(kDownN, kDownK, GemmType::MGroupedContiguous);
 }  // namespace deep_gemm
 
+// The entries' names are mangled, so each launch-contract record is bound to
+// its entry explicitly: `meta_aliases` in kernels.json maps every record below
+// to the mangled symbol it describes, and the build refuses an image whose
+// entries and records do not correspond one to one.
 EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_masked_gate_up, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
 EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_masked_down, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
 EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_contiguous_gate_up, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);

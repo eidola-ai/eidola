@@ -62,6 +62,7 @@ Strict FCFS by arrival. Running sequences are served oldest first; a decoding ro
 ## Extending
 
 - **A real executor** implements `Executor`, honours the module contract in `executor.rs`, and samples with `sampling.rs` semantics (bit-exact on CPU; on the device, equal except when a uniform lies within rounding distance of a CDF boundary). Validate it by running the simulation tests' workloads against it and the model's dense reference.
+- **GPU sampling is an Eidola kernel.** The `(seed, position, stream)` counter RNG, its separate Sample / Draft / Accept / Residual streams, the filters, and chain acceptance with its residual are the contract, not an implementation detail: recompute preemption and the CPU oracle depend on the exact draws. Third-party samplers (FlashInfer's Philox kernels and the like) cannot reproduce them and are not used. The device sampler, speculative accept and residual included, must reproduce `sampling.rs` bit for bit given equal logits (`eidola-engine-kernels/AGENTS.md`).
 - **A new KV kind** is a new `KvGroupSpec`; if it is neither full nor a sliding window, `AttentionKind::first_visible` and the hit-point rule must learn it.
 - **Changing the hash format** changes the domain label in `hash.rs`.
 - **Pipelining.** The trait is synchronous: one step in, one result out. Overlapping host scheduling of step `t + 1` with device execution of step `t` would split `execute` into submit and collect; the data shapes need not change.

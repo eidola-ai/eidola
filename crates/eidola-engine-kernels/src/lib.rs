@@ -11,8 +11,11 @@
 //! and gets back image bytes only after their size and SHA-256 match the
 //! compiled-in manifest; those bytes are what a driver-API loader hands to
 //! `cuModuleLoadData`. Each kernel entry point publishes its launch contract
-//! inside the image as a `<entry>_meta` device global, decoded by
-//! [`KernelMeta::from_bytes`].
+//! inside the image as a device global, decoded by [`KernelMeta::from_bytes`].
+//! The manifest binds every entry to exactly one such record and every record
+//! to exactly one entry ([`Entry::meta`], [`Cubin::entry`],
+//! [`Cubin::entry_for_meta`]): `<entry>_meta` for entries we name ourselves,
+//! an explicit alias for mangled template instances.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -26,7 +29,7 @@ use sha2::{Digest, Sha256};
 pub const MANIFEST_JSON: &str = include_str!("../kernels.manifest.json");
 
 /// The manifest schema this crate reads.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// A kernel build: toolchain, upstream pins, flags, inputs, and every image.
 #[derive(Debug, Clone, Deserialize)]
@@ -107,9 +110,11 @@ pub struct Cubin {
     pub file: String,
     pub sha256: String,
     pub size: u64,
-    /// Kernel entry points, by symbol (as `cuModuleGetFunction` takes it).
+    /// Kernel entry points, by symbol (as `cuModuleGetFunction` takes it),
+    /// each bound to its launch-contract record.
     pub entries: Vec<Entry>,
-    /// Launch-contract globals (`<entry>_meta`, 32 bytes each).
+    /// Every launch-contract global in the image (32 bytes each). In a valid
+    /// manifest these correspond one to one with the entries' records.
     pub meta: Vec<String>,
     /// Count of tensor-core instructions in the SASS, by opcode family
     /// (`UTC*` is tcgen05, `HMMA` is `mma.sync`).
@@ -121,6 +126,10 @@ pub struct Cubin {
 pub struct Entry {
     pub symbol: String,
     pub demangled: String,
+    /// The device global holding this entry's launch contract (read with
+    /// `cuModuleGetGlobal`): `<symbol>_meta` for entries we name ourselves,
+    /// or the alias `csrc/kernels.json` binds to a mangled entry.
+    pub meta: String,
 }
 
 /// The arch-specific cubins of one kernel, bundled for the driver to pick
@@ -169,6 +178,19 @@ impl Manifest {
             if cubin.entries.is_empty() {
                 return invalid(format!("{} {}: no entry points", cubin.name, cubin.arch));
             }
+            let records: BTreeSet<&str> = cubin.meta.iter().map(String::as_str).collect();
+            let bound: BTreeSet<&str> = cubin.entries.iter().map(|e| e.meta.as_str()).collect();
+            let symbols: BTreeSet<&str> = cubin.entries.iter().map(|e| e.symbol.as_str()).collect();
+            if records.len() != cubin.meta.len()
+                || bound.len() != cubin.entries.len()
+                || symbols.len() != cubin.entries.len()
+                || bound != records
+            {
+                return invalid(format!(
+                    "{} {}: entries and launch-contract records do not correspond one to one",
+                    cubin.name, cubin.arch
+                ));
+            }
         }
         let mut fatbin_names = BTreeSet::new();
         for fatbin in &self.fatbins {
@@ -196,6 +218,21 @@ impl Manifest {
 
     pub fn fatbin(&self, name: &str) -> Option<&Fatbin> {
         self.fatbins.iter().find(|f| f.name == name)
+    }
+}
+
+impl Cubin {
+    /// The entry with this symbol, carrying the name of its launch-contract
+    /// record.
+    pub fn entry(&self, symbol: &str) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.symbol == symbol)
+    }
+
+    /// The entry a launch-contract record describes (the inverse of
+    /// [`Entry::meta`]): how a host that names kernels by their record finds
+    /// the mangled symbol to pass to `cuModuleGetFunction`.
+    pub fn entry_for_meta(&self, meta: &str) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.meta == meta)
     }
 }
 
@@ -293,8 +330,9 @@ impl<'m> ArtifactDir<'m> {
     }
 }
 
-/// The launch contract a kernel publishes as its `<entry>_meta` device
-/// global (`EidolaKernelMeta` in `csrc/eidola_kernel.cuh`).
+/// The launch contract a kernel publishes as a device global, the one its
+/// manifest [`Entry::meta`] names (`EidolaKernelMeta` in
+/// `csrc/eidola_kernel.cuh`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelMeta {
     pub block: [u32; 3],

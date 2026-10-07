@@ -106,5 +106,7 @@ template __global__ void flashinfer::PersistentVariableLengthMergeStatesKernel<
     eidola_fa2_sink::kMergeStages, DTypeO, DTypeO, IdType>(DTypeO*, float*, IdType*, DTypeO*,
                                                            float*, uint32_t, uint32_t*, uint32_t);
 
+// The merge kernel's name is mangled; `meta_aliases` in kernels.json binds
+// this record to it.
 EIDOLA_KERNEL_META(eidola_fa2_merge_states_bf16_d128, eidola_fa2_sink::kMergeBdx,
                    eidola_fa2_sink::kMergeBdy, 1, eidola_fa2_sink::kMergeSmem, 1, 1, 1, 0);
