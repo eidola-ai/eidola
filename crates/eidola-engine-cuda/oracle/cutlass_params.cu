@@ -1,18 +1,30 @@
-// Dev-only oracle for the host-side CUTLASS launch parameters. Never part of
-// the engine: it is compiled on a GPU development host with any CUDA 13
-// toolkit and the pinned CUTLASS tree, and it includes the kernels crate's own
-// translation units so its types are exactly the AOT kernels' types.
+// Dev-only oracle for the host-side CUTLASS launch parameters.
 //
-// For a list of problem shapes and fixed fake device addresses it runs
-// CUTLASS's own host path (`GemmKernel::to_underlying_arguments`,
-// `get_grid_shape`, `can_implement`, `get_workspace_size`) and prints, one
-// JSON object per line: the `Params` bytes, the grid, the workspace size, and
-// every `cuTensorMapEncodeTiled` call it made. The Rust mirror in
-// `src/gemm.rs` must reproduce those bytes exactly (`tests/cutlass_params.rs`
-// compares against the committed output in `tests/data/`).
+// Status: a development tool, like the model crate's Python golden
+// generators. It is never a build input and never part of the engine; nothing
+// compiles it automatically. It is our own code (AGPL-3.0-only, as the rest of
+// this crate; see REUSE.toml).
 //
-//   nvcc -std=c++17 -O1 --expt-relaxed-constexpr -arch=sm_100a -DNDEBUG \
-//     -I<cutlass>/include -I<cutlass>/tools/util/include -I<repo>/crates/eidola-engine-kernels/csrc \
+// What it checks: it includes the kernels crate's own CUTLASS translation units
+// (csrc/cutlass_fp8_blockwise_gemm.cu, csrc/cutlass_bf16_gemm.cu), so its types
+// are exactly the AOT kernels' types, and for a list of problem shapes and
+// fixed fake device addresses runs CUTLASS's own host path
+// (`GemmKernel::to_underlying_arguments`, `get_grid_shape`, `can_implement`,
+// `get_workspace_size`). It prints, one JSON object per line: the `Params`
+// bytes, a mask of the bytes CUTLASS defines, the grid, the workspace size,
+// and every `cuTensorMapEncodeTiled` call it made. The Rust mirror in
+// `src/gemm.rs` must reproduce those bytes (`tests/cutlass_params.rs` compares
+// against the committed output in `tests/data/cutlass_params.jsonl`).
+//
+// CUTLASS version: use a checkout of the revision the kernels crate pins
+// (`crates/eidola-engine-kernels/nix/sources.nix`, `cutlass.rev`); any CUDA 13
+// toolkit compiles it. Run it on a host with a GPU (descriptor encoding needs a
+// context), and regenerate the data file whenever that pin or either GEMM
+// instantiation changes:
+//
+//   git clone https://github.com/NVIDIA/cutlass && git -C cutlass checkout <cutlass.rev>
+//   nvcc -std=c++17 -O1 --expt-relaxed-constexpr -arch=sm_100a -DNDEBUG -diag-suppress 20012 \
+//     -Icutlass/include -Icutlass/tools/util/include -Icrates/eidola-engine-kernels/csrc \
 //     crates/eidola-engine-cuda/oracle/cutlass_params.cu -lcuda -ldl -o cutlass-params
 //   ./cutlass-params > crates/eidola-engine-cuda/tests/data/cutlass_params.jsonl
 
