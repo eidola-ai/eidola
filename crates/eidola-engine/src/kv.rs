@@ -409,7 +409,7 @@ impl KvManager {
         let mut seq = self.seqs.remove(&id).expect("live sequence");
         let mut freed = false;
         for g in 0..self.pools.len() {
-            let (lo, hi) = std::mem::replace(&mut seq.pins[g], (0, 0));
+            let (lo, hi) = std::mem::take(&mut seq.pins[g]);
             let behind = hi.min(seq.slide_cursor[g]);
             for idx in lo..behind {
                 if seq.blocks[g]
