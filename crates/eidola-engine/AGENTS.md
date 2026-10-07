@@ -55,7 +55,7 @@ The executor owns all device memory (KV pools, per-slot block tables, per-slot m
 
 Strict FCFS by arrival. Running sequences are served oldest first; a decoding row costs `1 + k` query tokens; prefill is chunked by `max_prefill_chunk` and the step's remaining budget. Waiting requests are admitted only in steps that preempted nothing, and the first one that does not fit blocks those behind it, so long prompts cannot starve. A sequence that cannot grow even when it alone holds memory ends with `FinishReason::Length`. Drafts are uniform `k` except near the model length. Stop strings are the caller's job: it cancels.
 
-`Engine::new` refuses (`ConfigError`) any configuration under which a sequence could be planned and skipped forever: a step must seat at least one sequence, a prefill chunk must be at least one token, and the token budget (`max_batched_tokens` capped by the largest bucket) must hold one decode row at its full `1 + k` cost. Speculation is never silently disabled to make a configuration fit.
+The executor's buckets form a ladder, nondecreasing in both sequences and tokens (`ModelSpec::validate`), so the last bucket bounds every step; trade-off shapes are refused rather than half-used. `Engine::new` refuses (`ConfigError`) any configuration under which a sequence could be planned and skipped forever: a step must seat at least one sequence, a prefill chunk must be at least one token, and the token budget (`max_batched_tokens` capped by the largest bucket) must hold one decode row at its full `1 + k` cost. Speculation is never silently disabled to make a configuration fit.
 
 ## Testing
 

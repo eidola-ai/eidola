@@ -803,6 +803,35 @@ fn engine_refuses_configurations_that_cannot_progress() {
         build(small_spec(64), no_chunk),
         Err(ConfigError::Scheduler(_))
     ));
+    // The bucket ladder must grow in both dimensions: with a trade-off shape the last
+    // bucket would not bound a step (lexicographic order calls this one sorted).
+    let mut tradeoff = small_spec(64);
+    tradeoff.buckets = vec![
+        eidola_engine::spec::Bucket {
+            max_seqs: 1,
+            max_tokens: 100,
+        },
+        eidola_engine::spec::Bucket {
+            max_seqs: 2,
+            max_tokens: 5,
+        },
+    ];
+    assert!(matches!(
+        build(tradeoff, sched(true)),
+        Err(ConfigError::Spec(_))
+    ));
+    let mut equal_steps = small_spec(64);
+    equal_steps.buckets = vec![
+        eidola_engine::spec::Bucket {
+            max_seqs: 1,
+            max_tokens: 64,
+        },
+        eidola_engine::spec::Bucket {
+            max_seqs: 8,
+            max_tokens: 64,
+        },
+    ];
+    assert!(build(equal_steps, sched(true)).is_ok());
     // An inconsistent spec is an error, not a panic.
     let mut bad = small_spec(64);
     bad.buckets.clear();

@@ -67,7 +67,10 @@ pub struct KvGroupSpec {
 /// A captured step shape: the executor can run any batch with at most `max_seqs`
 /// sequences and at most `max_tokens` query tokens (host tokens plus drafted tokens) as
 /// one pre-built graph, after padding to exactly this shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Buckets have no ordering of their own: a lexicographic one would call a ladder
+/// "sorted" that is not (see [`ModelSpec::buckets`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bucket {
     /// Sequence rows.
     pub max_seqs: u32,
@@ -99,7 +102,10 @@ pub struct ModelSpec {
     /// Per-sequence device state rows (block tables, drafter hidden states); the maximum
     /// number of concurrently running sequences.
     pub num_state_slots: u32,
-    /// Captured step shapes, ascending.
+    /// Captured step shapes: a **ladder**, nondecreasing in both `max_seqs` and
+    /// `max_tokens`, so the last bucket dominates every other and is the step capacity
+    /// the scheduler plans against. Trade-off shapes (more sequences but fewer tokens)
+    /// are refused by [`ModelSpec::validate`]: with them, no single bucket bounds a step.
     pub buckets: Vec<Bucket>,
 }
 
@@ -174,8 +180,12 @@ impl ModelSpec {
         if self.buckets.is_empty() {
             return Err("at least one bucket is required".into());
         }
-        if self.buckets.windows(2).any(|w| w[0] > w[1]) {
-            return Err("buckets must be sorted ascending".into());
+        if self
+            .buckets
+            .windows(2)
+            .any(|w| w[0].max_seqs > w[1].max_seqs || w[0].max_tokens > w[1].max_tokens)
+        {
+            return Err("buckets must be nondecreasing in both max_seqs and max_tokens".into());
         }
         Ok(())
     }
