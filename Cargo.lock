@@ -2841,6 +2841,7 @@ dependencies = [
 name = "eidola-engine-chat"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "minijinja",
  "proptest",
  "serde_json",

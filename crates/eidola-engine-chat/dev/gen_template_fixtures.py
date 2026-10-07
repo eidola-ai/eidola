@@ -13,11 +13,15 @@ Usage (versions pinned in requirements.txt):
 `--model-dir` must hold `chat_template.jinja`, `tokenizer.json`,
 `tokenizer_config.json` and `generation_config.json` from the model release.
 Writes `tests/fixtures/template_cases.json` and
-`tests/fixtures/template_token_ids.json` next to this script's crate.
+`tests/fixtures/template_token_ids.json`, and refreshes the copies of the model
+files the tests load (`chat_template.jinja`, `generation_config.json`, and
+`tokenizer.json.gz`, gzip with a zero timestamp so the bytes are reproducible).
 """
 
 import argparse
 import copy
+import gzip
+import shutil
 import hashlib
 import json
 import pathlib
@@ -644,6 +648,10 @@ def main():
     with open(args.out_dir / "template_token_ids.json", "w", encoding="utf-8") as f:
         json.dump({"meta": meta, "token_ids": token_ids, "strings": string_ids}, f, ensure_ascii=False, separators=(",", ":"))
         f.write("\n")
+    for name in ("chat_template.jinja", "generation_config.json"):
+        shutil.copyfile(args.model_dir / name, args.out_dir / name)
+    tokenizer_bytes = (args.model_dir / "tokenizer.json").read_bytes()
+    (args.out_dir / "tokenizer.json.gz").write_bytes(gzip.compress(tokenizer_bytes, compresslevel=9, mtime=0))
     rendered_count = sum(1 for c in out_cases if "expected" in c)
     print(f"{len(out_cases)} cases ({rendered_count} rendered, {len(out_cases) - rendered_count} rejected)")
 

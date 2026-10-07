@@ -468,21 +468,32 @@ pub(crate) mod tests {
 }
 
 /// Comparison against the reference Python tokenizer on the real MiMo
-/// `tokenizer.json`. The file is a model artifact and is not committed, so
-/// this runs only when `EIDOLA_MIMO_MODEL_DIR` names a directory holding it.
+/// `tokenizer.json`. The pinned file is committed gzip-compressed under
+/// `tests/fixtures/`; `EIDOLA_MIMO_MODEL_DIR` may name a model directory to
+/// use instead. Either way the decompressed bytes must match the pin.
 #[cfg(test)]
 mod reference_tests {
     use super::*;
+    use std::io::Read;
     use std::path::PathBuf;
 
     pub const MODEL_DIR_ENV: &str = "EIDOLA_MIMO_MODEL_DIR";
 
-    fn real() -> Option<MimoTokenizer> {
-        let Some(dir) = std::env::var_os(MODEL_DIR_ENV) else {
-            eprintln!("skipping: set {MODEL_DIR_ENV} to a MiMo-V2.6 model directory");
-            return None;
-        };
-        Some(MimoTokenizer::from_model_dir(&PathBuf::from(dir)).expect("pinned tokenizer"))
+    fn fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    fn real() -> MimoTokenizer {
+        if let Some(dir) = std::env::var_os(MODEL_DIR_ENV) {
+            return MimoTokenizer::from_model_dir(&PathBuf::from(dir)).expect("pinned tokenizer");
+        }
+        let compressed = std::fs::read(fixtures_dir().join("tokenizer.json.gz")).unwrap();
+        let mut tokenizer_json = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut tokenizer_json)
+            .unwrap();
+        let generation_config = std::fs::read(fixtures_dir().join(GENERATION_CONFIG_FILE)).unwrap();
+        MimoTokenizer::from_bytes(&tokenizer_json, &generation_config).expect("pinned tokenizer")
     }
 
     fn token_fixtures() -> serde_json::Value {
@@ -501,7 +512,7 @@ mod reference_tests {
 
     #[test]
     fn encodes_like_python_tokenizers() {
-        let Some(t) = real() else { return };
+        let t = real();
         let fixtures = token_fixtures();
         assert_eq!(
             fixtures["meta"]["tokenizer_sha256"].as_str(),
@@ -548,7 +559,7 @@ mod reference_tests {
 
     #[test]
     fn decode_table_matches_tokenizers_for_every_id() {
-        let Some(t) = real() else { return };
+        let t = real();
         assert_eq!(t.eos_token_ids(), &[151643, 151645, 151672]);
         for id in 0..t.vocab_size() as u32 {
             assert_eq!(

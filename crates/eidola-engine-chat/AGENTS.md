@@ -11,14 +11,15 @@ The chat layer of Eidola's inference engine for the MiMo-V2.6 model family (Flas
 | Encode | `tokenizer` | Python `tokenizers` (Oniguruma build) |
 | Decode, incrementally | `tokenizer::Detokenizer` | `tokenizers` `decode(ids)` |
 | Split reasoning | `reasoning` | (own rule, below) |
-| Extract tool calls | `tool_call`, `args`, `pysem` | SGLang's MiMo detector |
+| Extract tool calls | `tool_call` | SGLang's MiMo detector (block structure) |
+| Type arguments | `args`, `pysem` | the template, inverted |
 | Assemble deltas, finish reason | `output` | (own rule, `output.rs` docs) |
 
 ## Model artifacts and pinning
 
 The template, tokenizer, and generation config are read from the model directory at load time — they are part of the measured model artifact, never compiled in or downloaded. `ChatTemplate` and `MimoTokenizer` refuse any `chat_template.jinja` / `tokenizer.json` whose SHA-256 is not in `PINNED_TEMPLATE_SHA256` / `PINNED_TOKENIZER_SHA256`: every guarantee below is a tested property of those exact files. Supporting a new model revision means adding its hash *and* regenerating the fixtures against it.
 
-`tests/fixtures/chat_template.jinja` is a copy of the upstream template (XiaomiMiMo, MIT) used only by tests. `tokenizer.json` (11 MB) is not committed; tests that need it read `EIDOLA_MIMO_MODEL_DIR` and skip, saying so, when it is unset.
+`tests/fixtures/` holds copies of the pinned files the tests load: `chat_template.jinja`, `generation_config.json`, and `tokenizer.json.gz` (the 11 MB tokenizer, gzip-compressed; tests decompress it with `flate2`'s pure-Rust backend and the pin checks the decompressed bytes). They are Xiaomi's (MIT), annotated in `REUSE.toml`. `EIDOLA_MIMO_MODEL_DIR` overrides the fixture copy with a model directory.
 
 ## Template byte-exactness
 
@@ -38,7 +39,7 @@ Tested by `tests/template_fixtures.rs`: every case in `tests/fixtures/template_c
 
 ## Tokenizer
 
-`tokenizers` is built with `default-features = false, features = ["fancy-regex"]` (pure Rust; no Oniguruma, no C++). The Python reference uses Oniguruma for the pre-tokenizer regex, so equality is checked, not assumed: with `EIDOLA_MIMO_MODEL_DIR` set, `tokenizer::reference_tests` encodes every fixture prompt plus a few hundred unicode-heavy strings and compares ids with Python's, and checks the decode table against `tokenizers` for every id and for random sequences. `decode(encode(x))` is *not* `x` in general (the tokenizer NFC-normalizes).
+`tokenizers` is built with `default-features = false, features = ["fancy-regex"]` (pure Rust; no Oniguruma, no C++). The Python reference uses Oniguruma for the pre-tokenizer regex, so equality is checked, not assumed: `tokenizer::reference_tests` encodes every fixture prompt plus a few hundred unicode-heavy strings and compares ids with Python's, and checks the decode table against `tokenizers` for every id and for random sequences. `decode(encode(x))` is *not* `x` in general (the tokenizer NFC-normalizes).
 
 Decoding uses a per-id byte table built from `tokenizers`' byte-level decoder rule. `Detokenizer` holds back at most 3 bytes of an incomplete character and replaces invalid sequences exactly as `String::from_utf8_lossy` does, so the streamed text concatenated equals `decode(ids)` for any split. Special tokens (`<|im_end|>`, …) are skipped; `<think>`, `<tool_call>` and friends are not special and arrive as text. EOS ids come from `generation_config.json`.
 
@@ -48,12 +49,14 @@ Decoding uses a per-id byte table built from `tokenizers`' byte-level decoder ru
 
 **Tool calls** (`tool_call`): SGLang's `detect_and_parse` semantics — content is the text before the first `<tool_call>`; each closed block is a call, an undeclared function's block (plus the text before it) goes back into content, a block without a complete `<function=…>…</function>` is dropped, and other text after the first block is dropped. Calls stream whole, when their closing tag arrives, with a stable `index` and an id from a caller-supplied `CallIdSource` (pass a per-response unique prefix).
 
-**Argument typing** (`args`): two rules, chosen per `ToolSchemas`:
+**Argument typing** (`args`) — the rule is that conversion inverts the template. The template writes a string argument verbatim and anything else as `json.dumps(value)`; the parser takes string-typed (and undeclared) parameters verbatim and parses the others as strict JSON, falling back to a lenient Python spelling for the declared type (`int()`, `float()`, `true`/`false` in any case, `ast.literal_eval`) and finally to the text. For schema-conforming arguments this guarantees:
 
-- `ArgumentTyping::Sglang` (default): SGLang's schema-typed conversion, documented rule by rule in `args.rs` — `html.unescape`, `null` in any case becomes JSON null, then by declared type `int()` / `float()` / boolean word / `json.loads` / `ast.literal_eval`, with SGLang's type-name normalisation. Where SGLang would fail the request or emit `NaN`/`Infinity`, the one parameter degrades to its text instead (listed in `args.rs`).
-- `ArgumentTyping::RoundTrip`: the exact inverse of the template's rendering (string-typed values verbatim, others strict JSON first), so `parse(render(args)) == args`. SGLang's rule breaks that: a string `&amp;` comes back as `&`, a URL's `&copy=` as `©=`, the string `NULL` as null, `4.0` as `4`, and `yes` for a boolean as `false`. Those changes also alter the next turn's prompt relative to what the model generated.
+- `parse(render(arguments)) == arguments` — the tool receives exactly what the model wrote; and
+- when the call comes back as history, the next turn's prompt renders byte for byte what the model generated (trained distribution, reusable KV prefix).
 
-`pysem` reproduces the CPython pieces SGLang relies on (`str.strip`, `int`, `float`, `html.unescape`, `ast.literal_eval`), with tables generated from CPython (`src/pysem/tables.rs`). The one known gap: `\N{NAME}` escapes in a Python literal are not decoded (the parameter stays text).
+SGLang's MiMo detector types by schema too, but its conversion was rejected because it is lossy and breaks both guarantees: it `html.unescape`s text the template wrote verbatim (`&amp;` → `&`, a URL's `?a=1&copy=2` → `?a=1©=2`, `&lt;div&gt;` → `<div>`), turns `null` in any case into JSON null even for strings, turns any boolean word but `true` into `false`, rewrites `4.0` as `4`, and fails whole requests on valid input (list-valued `type`, boolean property schemas, `1e400`) or emits non-JSON `NaN`/`Infinity`. Its rule survives only as `args::convert_parameter_sglang` (selected by `ArgumentTyping::Sglang`), which exists so the Python-semantics pieces both rules share can be differentially tested against SGLang's own code; nothing in the serving path uses it. Rules and edge cases: `args.rs` module docs.
+
+`pysem` reproduces the CPython pieces the lenient fallbacks (and SGLang's rule) rely on (`str.strip`, `int`, `float`, `html.unescape`, `ast.literal_eval`), with tables generated from CPython (`src/pysem/tables.rs`). The one known gap: `\N{NAME}` escapes in a Python literal are not decoded (the parameter stays text).
 
 **Safety rules** (all parsers): no input can panic (property tests over arbitrary text, token ids and splits); scanning is linear; recursion is bounded (JSON 256 levels, Python literals 200); arguments are always a valid JSON object; streaming output equals complete-output parsing for every split.
 
@@ -62,10 +65,10 @@ Decoding uses a per-id byte table built from `tokenizers`' byte-level decoder ru
 ## Tests
 
 - `tests/template_fixtures.rs` — byte-exact template corpus.
-- `tests/sglang_differential.rs` — every value × declared-type case in `sglang_param_cases.json` (28k, including 3k fuzzed literals) and every model output in `sglang_text_cases.json`, against SGLang's own code; the outputs are also re-parsed in 1-, 3- and 7-character chunks.
-- `tests/round_trip.rs` — property test that `RoundTrip` inverts the template; pinned counterexamples for the SGLang rule.
+- `tests/sglang_differential.rs` — with SGLang's rule selected: every value × declared-type case in `sglang_param_cases.json` (28k, including 3k fuzzed literals) and every model output in `sglang_text_cases.json`, against SGLang's own code; the outputs are also re-parsed in 1-, 3- and 7-character chunks.
+- `tests/round_trip.rs` — property test that the rule inverts the real template; pinned counterexamples showing SGLang's rule does not.
 - Unit and property tests in each module (`cargo test -p eidola-engine-chat`).
-- `tokenizer::reference_tests` — needs `EIDOLA_MIMO_MODEL_DIR`.
+- `tokenizer::reference_tests` — encoding and decoding against the Python tokenizer, on the committed pinned tokenizer.
 
 ## Regenerating fixtures
 
@@ -78,4 +81,4 @@ python -I dev/gen_sglang_fixtures.py --sglang-src <sglang checkout> \
 python -I dev/gen_tables.py
 ```
 
-Regenerate after changing a pinned artifact, the reference versions, or a case list; review the fixture diff like code. The SGLang harness applies `normalize_json_schema_types` to tools (as SGLang's request validation does) and the per-parameter containment described above, flagging each case where containment fired (`contained`).
+`gen_template_fixtures.py` also refreshes the model-file copies in `tests/fixtures/`. Regenerate after changing a pinned artifact, the reference versions, or a case list; review the fixture diff like code. The SGLang harness applies `normalize_json_schema_types` to tools (as SGLang's request validation does) and the per-parameter containment described above, flagging each case where containment fired (`contained`).

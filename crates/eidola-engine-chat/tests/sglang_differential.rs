@@ -3,10 +3,14 @@
 //! Expected values were produced by executing SGLang's own sources (see
 //! `dev/gen_sglang_fixtures.py`), with the per-parameter failure containment
 //! documented in `src/args.rs` applied around them.
+//!
+//! The parser's own typing rule is the round-trip one; these tests select
+//! SGLang's rule so that the block structure and the Python-semantics pieces
+//! both rules share can be compared value for value with SGLang.
 
 use std::path::PathBuf;
 
-use eidola_engine_chat::args::{ToolSchemas, convert_parameter};
+use eidola_engine_chat::args::{ArgumentTyping, ToolSchemas, convert_parameter_sglang};
 use eidola_engine_chat::json::{self, Json};
 use eidola_engine_chat::tool_call::{
     ParsedToolCalls, PrefixedCallIds, ToolCallParser, parse_complete,
@@ -20,7 +24,7 @@ fn fixture(name: &str) -> serde_json::Value {
 }
 
 fn schemas(tools: &str) -> ToolSchemas {
-    ToolSchemas::from_tools(&json::parse(tools).unwrap())
+    ToolSchemas::from_tools(&json::parse(tools).unwrap()).with_typing(ArgumentTyping::Sglang)
 }
 
 #[test]
@@ -40,7 +44,7 @@ fn parameter_conversion_matches_sglang() {
                     Some(text) => text.to_string(),
                     None => json::dumps_default(&Json::Str(raw.to_string())),
                 };
-                let got = json::dumps_default(&convert_parameter(raw, &param_type));
+                let got = json::dumps_default(&convert_parameter_sglang(raw, &param_type));
                 if got != expected {
                     failures.push(format!(
                         "type {tools} ({param_type}) raw {:?}: got {:?}, sglang {:?}",

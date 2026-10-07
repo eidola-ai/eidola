@@ -1,58 +1,73 @@
 //! Schema-typed conversion of tool-call parameter values.
 //!
 //! MiMo writes every parameter as text (`<parameter=K>V</parameter>`); the
-//! JSON type is recovered from the tool's schema. The rules follow SGLang's
-//! MiMo detector (`function_call/mimo_detector.py`, Apache-2.0) applied to
-//! tools whose schema types have been normalised the way SGLang's request
-//! validation normalises them (`normalize_json_schema_types`):
+//! JSON type is recovered from the tool's schema.
 //!
-//! 1. The raw text is passed through `html.unescape`.
-//! 2. If it equals `null` case-insensitively, the value is JSON `null`,
-//!    whatever the declared type.
-//! 3. The declared type is the `type` of the parameter's property in the
+//! # The rule: conversion inverts the chat template
+//!
+//! The template renders a string argument verbatim and every other value as
+//! `json.dumps(value)`. The parser applies the exact inverse
+//! ([`convert_parameter_round_trip`]), so for arguments that conform to the
+//! tool schema:
+//!
+//! - `parse(render(arguments)) == arguments`: the tool receives exactly what
+//!   the model wrote; and
+//! - when the client sends the call back as history, the next turn's prompt
+//!   renders byte for byte what the model generated, so the conversation
+//!   stays on the trained distribution and its KV prefix stays reusable.
+//!
+//! Concretely:
+//!
+//! 1. The declared type is the `type` of the parameter's property in the
 //!    tool's `parameters.properties` (or, when the schema has no top-level
 //!    `properties`, the first match among its `anyOf`/`oneOf`/`allOf`
-//!    branches). Undeclared parameters and properties without `type` are
-//!    strings. Type names are normalised first: case-folded, `varchar(255)`
-//!    style parameters dropped, and database aliases mapped (`text`, `uuid`,
+//!    branches). Type names are normalised: case-folded, `varchar(255)`
+//!    style parameters dropped, database aliases mapped (`text`, `uuid`,
 //!    `date`, … → `string`; `bigint`, `int32`, … → `integer`; `double`,
-//!    `float64`, … → `number`; `bool` → `boolean`; `list[...]`, `tuple`, `set`
-//!    → `array`; `dict[...]`, `map` → `object`).
-//! 4. By type:
-//!    - `string` (and `str`, `text`, `varchar`, `char`, `enum`): the text.
-//!    - names starting `int`, `integer`, `uint`, `long`, `short`,
-//!      `unsigned`: Python `int(text)` (surrounding whitespace, `_` digit
-//!      separators and non-ASCII decimal digits allowed); otherwise the text.
-//!    - names starting `num` or `float`: Python `float(text)`, emitted as an
-//!      integer when it has no fractional part; otherwise the text.
-//!    - `boolean`, `bool`, `binary`: `true` iff the text is `true`
-//!      case-insensitively, else `false`.
-//!    - `object`, `array`, `arr`, or names starting `dict`/`list`: Python
-//!      `json.loads(text)` (any JSON type is accepted), falling back to the
-//!      next rule.
-//!    - anything else: Python `ast.literal_eval(text)` (tuples become
-//!      arrays), falling back to the text.
+//!    `float64`, … → `number`; `bool` → `boolean`; `list[...]`, `tuple`,
+//!    `set` → `array`; `dict[...]`, `map` → `object`). An array of types is
+//!    `string` if it contains `string`, else its first non-`null` entry.
+//!    Undeclared parameters, properties without a usable `type`, and
+//!    property schemas that are not objects are `string`.
+//! 2. A string-typed value is the text, verbatim — no unescaping, no
+//!    trimming; the words `null` and `None` stay strings.
+//! 3. Any other value is the text parsed as strict JSON when it is valid
+//!    JSON (whatever JSON type results; validating it against the schema is
+//!    the tool's job).
+//! 4. Otherwise a lenient spelling for the declared type is accepted, as
+//!    Python reads it: `int(text)` for integer types, `float(text)` for
+//!    number types (finite only; integral values become integers), `true` /
+//!    `false` in any case for booleans, and `ast.literal_eval(text)` (tuples
+//!    become arrays) for anything else. These never apply to text the
+//!    template could have produced, so they cannot break the round trip.
+//! 5. Otherwise the value is the text.
 //!
-//! Where SGLang would fail the whole request or emit invalid JSON, this
-//! module instead degrades that one parameter to its (unescaped) text, so the
-//! output is always a valid JSON object:
+//! The output is always a JSON object of finite values. JSON nesting deeper
+//! than 256 and literal nesting deeper than 200 are not decoded.
 //!
-//! - a `type` that is not a string: an array of types resolves to `string`
-//!   if it contains `string`, else to its first non-`null` string entry,
-//!   else to `string`; any other non-string `type` (and a property schema
-//!   that is not an object) resolves to `string`. SGLang raises here.
-//! - `float(text)` overflowing to infinity (SGLang raises `OverflowError`);
-//! - a value containing NaN or an infinity (SGLang emits the non-JSON tokens
-//!   `NaN`/`Infinity`);
-//! - a value `json.dumps` cannot serialise (bytes, complex, set, `...`,
-//!   tuple keys, integers over 4300 digits) or a string holding a surrogate
-//!   (SGLang raises);
-//! - a decimal character reference over 4300 digits, which makes
-//!   `html.unescape` raise: the parameter is the raw text.
+//! # Why not SGLang's rule
 //!
-//! Recursion limits differ from CPython's environment-dependent ones: JSON
-//! nesting deeper than 256 and literal nesting deeper than 200 are not
-//! decoded and the text is kept.
+//! SGLang's MiMo detector (`function_call/mimo_detector.py`) also types by
+//! schema, but its conversion is lossy and does not invert the template:
+//!
+//! - it runs `html.unescape` on text the template wrote verbatim, so a string
+//!   `&amp;` arrives as `&`, a URL's `?a=1&copy=2` as `?a=1©=2` (HTML5 legacy
+//!   entities need no `;`), and `&lt;div&gt;` in a file being written as
+//!   `<div>`;
+//! - `null` in any case becomes JSON `null`, even for a string parameter;
+//! - any word other than `true` for a boolean becomes `false` (`yes` →
+//!   `false`);
+//! - a number written `4.0` becomes `4`;
+//! - it fails the whole request on valid schemas and outputs (a list-valued
+//!   `type`, a boolean property schema, `1e400`), and can emit the non-JSON
+//!   tokens `NaN` / `Infinity`.
+//!
+//! Every coercion above also makes the re-rendered history differ from what
+//! the model generated. That rule is kept as [`convert_parameter_sglang`]
+//! for one purpose: it is differentially tested against SGLang's own code,
+//! which verifies the Python-semantics pieces (`int`, `float`,
+//! `ast.literal_eval`, type normalisation) that rule 4 shares with it. The
+//! parser itself uses it only when a test selects [`ArgumentTyping::Sglang`].
 
 use crate::json::{self, BigInt, Json, ObjectBuilder, PY_MAX_STR_DIGITS};
 use crate::pysem::{self, PyLit};
@@ -67,25 +82,11 @@ pub struct ToolSchemas {
 /// How parameter text becomes a JSON value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ArgumentTyping {
-    /// SGLang's MiMo detector semantics (module docs), with per-parameter
-    /// failure containment.
+    /// The rule (module docs): the exact inverse of the template.
     #[default]
-    Sglang,
-    /// The exact inverse of the chat template's rendering, so that
-    /// `parse(render(arguments)) == arguments` for schema-conforming
-    /// arguments:
-    ///
-    /// - no HTML unescaping;
-    /// - string-typed (and undeclared) parameters are the text verbatim,
-    ///   including the words `null` and `None`;
-    /// - other parameters are the text parsed as strict JSON when it is
-    ///   valid JSON (whatever its JSON type; schema validation is the
-    ///   tool's), else SGLang's lenient spelling for the declared type
-    ///   (`int()`, `float()`, `true`/`false` in any case, a Python literal),
-    ///   else the text. Unlike SGLang, a non-boolean word for a boolean
-    ///   parameter stays a string instead of becoming `false`, and `4.0` for
-    ///   a number stays `4.0`.
     RoundTrip,
+    /// SGLang's lenient rule, for differential tests against SGLang only.
+    Sglang,
 }
 
 #[derive(Clone, Debug)]
@@ -136,7 +137,7 @@ impl ToolSchemas {
     pub fn convert(&self, function: &str, param: &str, raw: &str) -> Json {
         let t = self.param_type(function, param);
         match self.typing {
-            ArgumentTyping::Sglang => convert_parameter(raw, &t),
+            ArgumentTyping::Sglang => convert_parameter_sglang(raw, &t),
             ArgumentTyping::RoundTrip => convert_parameter_round_trip(raw, &t),
         }
     }
@@ -315,9 +316,11 @@ fn literal_value(text: &str) -> Option<Json> {
         .and_then(|lit| literal_to_json(&lit))
 }
 
-/// Converts one parameter's raw text by its declared type, with SGLang's
-/// semantics ([`ArgumentTyping::Sglang`]).
-pub fn convert_parameter(raw: &str, param_type: &str) -> Json {
+/// SGLang's conversion (see "Why not SGLang's rule"), with each of its
+/// failures contained to the one parameter, which degrades to its unescaped
+/// text (or, if unescaping itself fails, the raw text). Not used by the
+/// parser; kept as the bridge to SGLang's differential corpus.
+pub fn convert_parameter_sglang(raw: &str, param_type: &str) -> Json {
     let Ok(value) = pysem::html_unescape(raw) else {
         return Json::Str(raw.to_string());
     };
@@ -352,8 +355,8 @@ pub fn convert_parameter(raw: &str, param_type: &str) -> Json {
     literal_value(&value).unwrap_or_else(text)
 }
 
-/// Converts one parameter's raw text by its declared type, as the inverse of
-/// the template's rendering ([`ArgumentTyping::RoundTrip`]).
+/// Converts one parameter's raw text by its declared type: the rule (module
+/// docs).
 pub fn convert_parameter_round_trip(raw: &str, param_type: &str) -> Json {
     let text = || Json::Str(raw.to_string());
     let t = param_type;
@@ -451,11 +454,11 @@ mod tests {
     use super::*;
 
     fn conv(raw: &str, t: &str) -> String {
-        json::dumps_default(&convert_parameter(raw, t))
+        json::dumps_default(&convert_parameter_sglang(raw, t))
     }
 
     #[test]
-    fn follows_sglang_rules() {
+    fn sglang_rule_matches_sglang() {
         assert_eq!(conv("hello &amp; bye", "string"), "\"hello & bye\"");
         assert_eq!(conv("NULL", "string"), "null");
         assert_eq!(conv(" 42 ", "integer"), "42");
@@ -532,7 +535,7 @@ mod tests {
                 "string", "integer", "number", "boolean", "object", "array", "null", "custom",
             ]),
         ) {
-            for value in [convert_parameter(&raw, t), convert_parameter_round_trip(&raw, t)] {
+            for value in [convert_parameter_sglang(&raw, t), convert_parameter_round_trip(&raw, t)] {
                 let text = json::dumps_default(&value);
                 proptest::prop_assert!(json::parse(&text).is_ok(), "{text}");
             }
