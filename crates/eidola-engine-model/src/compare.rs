@@ -174,7 +174,10 @@ pub fn compare_logits(
     vocab: usize,
 ) -> Result<LogitAgreement, NonFinite> {
     assert_eq!(reference.len(), candidate.len());
-    assert!(vocab > 0 && reference.len() % vocab == 0, "whole rows");
+    assert!(
+        vocab > 0 && reference.len().is_multiple_of(vocab),
+        "whole rows"
+    );
     let mut a = LogitAgreement::default();
     for (row, (r, c)) in reference
         .chunks_exact(vocab)
