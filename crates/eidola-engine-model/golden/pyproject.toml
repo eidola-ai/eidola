@@ -12,3 +12,14 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+# The generator runs torch on CPU only. Torch comes from PyTorch's CPU-only
+# index, whose wheels carry no CUDA runtime, so no `nvidia-*` or `triton`
+# package enters the lock.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

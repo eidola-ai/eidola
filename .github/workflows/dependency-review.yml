@@ -63,10 +63,22 @@ jobs:
           # First-party workspace crates: copyleft by our own choice (see
           # LICENSE.md), exempted so a workspace version bump appearing in the
           # Cargo.lock diff doesn't trip the third-party gate.
+          #
+          # PyPI packages: dev-only test tooling (the inference engine's golden
+          # and fixture generators), never shipped or network-served. Nothing
+          # Eidola ships is Python, so a PyPI package can only ever appear in
+          # dev tooling; that invariant is what makes a package-keyed exemption
+          # safe, since the action cannot scope one by path.
+          #   * regex — Apache-2.0 AND CNRI-Python; CNRI-Python is the
+          #     permissive historical Python licence.
+          #   * typing-extensions — PSF-2.0 upstream; the detector reports a
+          #     garbled expression assembled from the file's license history.
           allow-dependencies-licenses: >-
             pkg:githubactions/Swatinem/rust-cache,
             pkg:githubactions/tinfoilsh/measure-image-action,
             pkg:cargo/eidola-server,
             pkg:cargo/eidola-app-core,
             pkg:cargo/eidola-cli,
-            pkg:cargo/eidola-gui
+            pkg:cargo/eidola-gui,
+            pkg:pypi/regex,
+            pkg:pypi/typing-extensions

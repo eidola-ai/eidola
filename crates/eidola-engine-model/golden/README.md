@@ -2,11 +2,11 @@
 
 Python tooling that produces the reference outputs `eidola-engine-model` is checked against. It is never a build input: `cargo test` reads only the committed fixture under `tests/fixtures/` and needs neither Python nor the network.
 
-The oracle is the Hugging Face remote code for MiMo-V2 (`modeling_mimo_v2.py` / `configuration_mimo_v2.py` from `XiaomiMiMo/MiMo-V2.6-Flash-MOPD` at revision `2479e2d0029eca9a34cc7e7f55a121925f81908e`), downloaded at run time and checked against the sha256 digests in `mimo_golden/remote.py`. It runs in fp32 on CPU with eager attention. Checkpoint tensors are dequantised by `mimo_golden/dequant.py`, written independently of the Rust loader. Beyond placing weights, nothing in the remote code is changed. One call is bridged: the remote code calls transformers' `create_causal_mask` / `create_sliding_window_causal_mask` with the older keyword names (`input_embeds`, `cache_position`), and `mimo_golden/remote.py` renames or drops just those keywords for the pinned transformers. The committed fixture regenerates byte for byte through the bridge (transformers 5.19.0, torch 2.9.1, safetensors 0.8.0), as it does without it on the earlier 5.3.0 / 2.9.0 / 0.6.2 pins.
+The oracle is the Hugging Face remote code for MiMo-V2 (`modeling_mimo_v2.py` / `configuration_mimo_v2.py` from `XiaomiMiMo/MiMo-V2.6-Flash-MOPD` at revision `2479e2d0029eca9a34cc7e7f55a121925f81908e`), downloaded at run time and checked against the sha256 digests in `mimo_golden/remote.py`. It runs in fp32 on CPU with eager attention. Checkpoint tensors are dequantised by `mimo_golden/dequant.py`, written independently of the Rust loader. Beyond placing weights, nothing in the remote code is changed. One call is bridged: the remote code calls transformers' `create_causal_mask` / `create_sliding_window_causal_mask` with the older keyword names (`input_embeds`, `cache_position`), and `mimo_golden/remote.py` renames or drops just those keywords for the pinned transformers. The committed fixture regenerates byte for byte through the bridge (transformers 5.19.0, torch 2.9.1 from the CPU-only index, safetensors 0.8.0), as it does without it on the earlier 5.3.0 / 2.9.0 / 0.6.2 pins.
 
 ## Setup
 
-[uv](https://docs.astral.sh/uv/) and Python 3.12. Versions are pinned in `pyproject.toml` and locked in `uv.lock`:
+[uv](https://docs.astral.sh/uv/) and Python 3.12. Versions are pinned in `pyproject.toml` and locked in `uv.lock`. Everything runs on CPU, so torch comes from PyTorch's CPU-only index and the lock carries no CUDA runtime (`nvidia-*`, `triton`):
 
 ```sh
 cd crates/eidola-engine-model/golden
