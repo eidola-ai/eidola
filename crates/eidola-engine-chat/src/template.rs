@@ -78,6 +78,11 @@ impl ChatInput {
     /// renders a string verbatim (inside `<function=…>`), which is not the
     /// parameter format the model was trained on. Serving must therefore
     /// decode it first; a string that is not a JSON object is an error.
+    ///
+    /// The call body is selected exactly as validation and the template select
+    /// it ([`tool_call_body_key`]): `function`, else `custom`, else the call
+    /// object itself. A body whose `input` is a string is left alone, because
+    /// the template renders that `input` instead of `arguments`.
     pub fn normalize_tool_call_arguments(&mut self) -> Result<(), ChatError> {
         let Json::Array(messages) = &mut self.messages else {
             return Ok(());
@@ -97,27 +102,36 @@ impl ChatInput {
                 continue;
             };
             for (c, call) in calls.iter_mut().enumerate() {
+                let key = tool_call_body_key(call);
                 let Json::Object(call_fields) = call else {
                     continue;
                 };
-                let Some((_, Json::Object(function))) =
-                    call_fields.iter_mut().find(|(k, _)| k == "function")
-                else {
-                    continue;
+                let body = match key {
+                    Some(key) => match call_fields.iter_mut().find(|(k, _)| k == key) {
+                        Some((_, Json::Object(body))) => body,
+                        _ => continue,
+                    },
+                    None => call_fields,
                 };
-                let Some((_, arguments)) = function.iter_mut().find(|(k, _)| k == "arguments")
-                else {
+                if body
+                    .iter()
+                    .any(|(k, v)| k == "input" && matches!(v, Json::Str(_)))
+                {
+                    continue;
+                }
+                let at = key.map_or(String::new(), |k| format!(".{k}"));
+                let Some((_, arguments)) = body.iter_mut().find(|(k, _)| k == "arguments") else {
                     continue;
                 };
                 if let Json::Str(text) = arguments {
                     let parsed = json::parse(text).map_err(|e| {
                         ChatError::InvalidInput(format!(
-                            "messages[{m}].tool_calls[{c}].function.arguments is not valid JSON: {e}"
+                            "messages[{m}].tool_calls[{c}]{at}.arguments is not valid JSON: {e}"
                         ))
                     })?;
                     if !matches!(parsed, Json::Object(_)) {
                         return Err(ChatError::InvalidInput(format!(
-                            "messages[{m}].tool_calls[{c}].function.arguments must be a JSON object"
+                            "messages[{m}].tool_calls[{c}]{at}.arguments must be a JSON object"
                         )));
                     }
                     *arguments = parsed;
@@ -309,19 +323,27 @@ fn validate_content(content: &Json, path: &str) -> Result<(), ChatError> {
     }
 }
 
+/// Which member of a tool call holds its body, as the template selects it:
+/// `function` if present, else `custom`, else `None` for the call object itself.
+/// Validation and argument normalization both go through this, so they can
+/// never disagree with each other or with rendering.
+fn tool_call_body_key(call: &Json) -> Option<&'static str> {
+    ["function", "custom"]
+        .into_iter()
+        .find(|key| call.get(key).is_some())
+}
+
 fn validate_tool_call(call: &Json, path: &str) -> Result<(), ChatError> {
     let invalid = |msg: String| Err(ChatError::InvalidInput(msg));
     let Json::Object(_) = call else {
         return invalid(format!("{path} must be an object"));
     };
-    // The template unwraps `function`, else `custom`, else uses the call
-    // itself.
-    let (inner, inner_path) = if let Some(function) = call.get("function") {
-        (function, format!("{path}.function"))
-    } else if let Some(custom) = call.get("custom") {
-        (custom, format!("{path}.custom"))
-    } else {
-        (call, path.to_string())
+    let (inner, inner_path) = match tool_call_body_key(call) {
+        Some(key) => (
+            call.get(key).expect("selected key"),
+            format!("{path}.{key}"),
+        ),
+        None => (call, path.to_string()),
     };
     let Json::Object(_) = inner else {
         return invalid(format!("{inner_path} must be an object"));
