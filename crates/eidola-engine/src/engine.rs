@@ -111,6 +111,9 @@ pub enum SubmitError {
     DuplicateId,
     /// The prompt can never fit in KV memory.
     ExceedsCapacity,
+    /// A prompt token is outside the sampleable vocabulary (a padded logit row, or no
+    /// row at all): no tokenizer produces it.
+    InvalidToken,
 }
 
 /// Why an [`Engine`] could not be built.
@@ -335,6 +338,13 @@ impl<E: Executor> Engine<E> {
         }
         if self.seqs.contains_key(&req.id) {
             return Err(SubmitError::DuplicateId);
+        }
+        if req
+            .prompt
+            .iter()
+            .any(|&t| t >= self.spec.sampleable_vocab_size)
+        {
+            return Err(SubmitError::InvalidToken);
         }
         // The prompt (plus the first generated token) must fit in every full-attention pool
         // on its own; sliding-window pools are bounded by the window instead.
@@ -636,6 +646,16 @@ impl<E: Executor> Engine<E> {
         };
         let out = self.exec.execute(&step)?;
         self.stats.steps += 1;
+        // A padded logit row has no token: an executor that returns one has broken the
+        // seam contract, and nothing it produced in this step is committed.
+        let limit = self.spec.sampleable_vocab_size;
+        for row in 0..planned.len() {
+            if let Some(&t) = out.row(row).iter().find(|&&t| t >= limit) {
+                return Err(ExecutorError(format!(
+                    "returned token {t} outside the sampleable vocabulary ({limit})"
+                )));
+            }
+        }
 
         let mut events = Vec::new();
         for (row, p) in planned.iter().enumerate() {

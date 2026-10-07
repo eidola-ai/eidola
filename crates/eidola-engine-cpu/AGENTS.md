@@ -43,7 +43,7 @@ The target runs in two passes (steps 2 and 5). Row independence makes that ident
 
 `pad_batches` pads the target batch to the bucket's token count. A test shows the padding rows change nothing.
 
-**Sampling** calls `eidola_engine::sampling` (`sample`, `processed_probs`, `sample_from`, `chain_accept`) directly, so it matches the core's semantics bit for bit. Draft draws use `Stream::Draft` at the drafted token's position. A greedy draft is the drafter's argmax, with a one-hot `q`.
+**Sampling** calls `eidola_engine::sampling` (`sample`, `processed_probs`, `sample_from`, `chain_accept`) directly, so it matches the core's semantics bit for bit. Every row goes through `Logits` with `CpuExecutorConfig::sampleable_vocab_size` (the tokenizer's vocabulary size, never taken from the weights), so target samples, drafts, acceptance and the residual cover only real token ids; `tests/engine.rs` rigs the head's padded rows to win and checks none is ever produced. Draft draws use `Stream::Draft` at the drafted token's position. A greedy draft is the drafter's argmax, with a one-hot `q`.
 
 ## MTP row layout
 

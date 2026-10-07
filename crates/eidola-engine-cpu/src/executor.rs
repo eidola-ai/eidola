@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use eidola_engine::executor::{
     Executor, ExecutorError, Maintenance, SeqEntry, Slot, StepInput, StepOutput,
 };
-use eidola_engine::sampling::{self, SamplingParams, Stream};
+use eidola_engine::sampling::{self, Logits, SamplingParams, Stream};
 use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK};
 use eidola_engine_model::ReferenceModel;
 use eidola_engine_model::attention::{apply_rope, attend, rope_cos_sin};
@@ -47,6 +47,11 @@ pub struct CpuExecutorConfig {
     pub mtp_depths: Vec<usize>,
     /// Hidden-state chaining between the main model and the MTP depths.
     pub mtp_hidden: MtpHidden,
+    /// Token ids the model may emit (the tokenizer's vocabulary, added tokens included);
+    /// the head's rows past it are padding and take no part in sampling, drafting or
+    /// acceptance. Reported as [`ModelSpec::sampleable_vocab_size`]. It comes from the
+    /// tokenizer, never from the weights.
+    pub sampleable_vocab_size: u32,
     /// Run the target forward over the batch padded to the bucket's token count. Padding
     /// rows go through every row-wise kernel and are discarded; with row-independent
     /// kernels they cannot change any real row.
@@ -57,8 +62,9 @@ pub struct CpuExecutorConfig {
 }
 
 impl CpuExecutorConfig {
-    /// A configuration drafting with every loaded MTP layer, at most three.
-    pub fn for_model(model: &ReferenceModel) -> Self {
+    /// A configuration drafting with every loaded MTP layer, at most three, emitting ids
+    /// below `sampleable_vocab_size` (the tokenizer's vocabulary size).
+    pub fn for_model(model: &ReferenceModel, sampleable_vocab_size: u32) -> Self {
         Self {
             block_size: 16,
             num_blocks: 256,
@@ -80,6 +86,7 @@ impl CpuExecutorConfig {
             ],
             mtp_depths: (0..model.weights.mtp.len().min(3)).collect(),
             mtp_hidden: MtpHidden::Normed,
+            sampleable_vocab_size,
             pad_batches: false,
             record: false,
         }
@@ -329,6 +336,7 @@ impl CpuExecutor {
 
         let spec = ModelSpec {
             vocab_size: mc.vocab_size as u32,
+            sampleable_vocab_size: cfg.sampleable_vocab_size,
             block_size: cfg.block_size,
             max_model_len: cfg.max_model_len,
             kv_groups,
@@ -936,7 +944,14 @@ impl Executor for CpuExecutor {
 
         // 3. The draft chain: draft `i + 1` comes from depth `i` at slot `p + i`. Depth
         //    `i` first runs over slots `p + 1 ..= p + i`, consuming drafts `1 ..= i`.
+        let (vocab, sampleable) = (self.spec.vocab_size, self.spec.sampleable_vocab_size);
         let draft_from = |row: &mut Row, logits: &[f32]| {
+            assert_eq!(
+                logits.len(),
+                vocab as usize,
+                "a drafter logit row is a full row"
+            );
+            let logits = Logits::new(logits, sampleable);
             let pos = row.p as u64 + 1 + row.drafts.len() as u64;
             let (d, q) = if row.params.is_greedy() {
                 let d = sampling::argmax(logits);
@@ -997,13 +1012,18 @@ impl Executor for CpuExecutor {
             let params = row.params;
             row.produced = if row.k == 0 {
                 vec![sampling::sample(
-                    &row.target_logits[&row.p],
+                    self.spec.logits(&row.target_logits[&row.p]),
                     &params,
                     row.p as u64 + 1,
                 )]
             } else {
                 let p_rows: Vec<Vec<f64>> = (row.p..=row.p + row.k)
-                    .map(|pos| sampling::processed_probs(&row.target_logits[&pos], &params))
+                    .map(|pos| {
+                        sampling::processed_probs(
+                            self.spec.logits(&row.target_logits[&pos]),
+                            &params,
+                        )
+                    })
                     .collect();
                 sampling::chain_accept(&p_rows, &row.q_rows, &row.drafts, &params, row.p as u64 + 1)
             };

@@ -23,6 +23,7 @@
 //! whose closing tag never arrived is dropped (see [`crate::tool_call`]).
 
 use crate::args::ToolSchemas;
+use crate::error::ChatError;
 use crate::reasoning::ReasoningParser;
 use crate::tokenizer::{Detokenizer, MimoTokenizer};
 use crate::tool_call::{CallIdSource, ToolCall, ToolCallParser};
@@ -159,10 +160,15 @@ impl OutputParser {
         }
     }
 
-    /// Feeds one generated token.
-    pub fn push_token(&mut self, tokenizer: &MimoTokenizer, id: u32) -> ChatDelta {
-        let text = self.detok.push(tokenizer, id);
-        self.push_text(&text)
+    /// Feeds one generated token. An id the tokenizer does not define is refused
+    /// ([`ChatError::UnknownToken`]) and changes nothing.
+    pub fn push_token(
+        &mut self,
+        tokenizer: &MimoTokenizer,
+        id: u32,
+    ) -> Result<ChatDelta, ChatError> {
+        let text = self.detok.push(tokenizer, id)?;
+        Ok(self.push_text(&text))
     }
 
     /// Feeds already-decoded text.
@@ -321,13 +327,25 @@ mod tests {
             let mut one_by_one = parser(thinking, with_tools);
             let mut streamed = ChatDelta::default();
             for &id in &ids {
-                streamed.append(one_by_one.push_token(&tokenizer, id));
+                // Ids past the vocabulary are refused and change nothing.
+                match one_by_one.push_token(&tokenizer, id) {
+                    Ok(delta) => streamed.append(delta),
+                    Err(e) => {
+                        proptest::prop_assert!((id as usize) >= tokenizer.vocab_size());
+                        proptest::prop_assert_eq!(e, ChatError::UnknownToken(id));
+                    }
+                }
             }
             let (rest, reason) = one_by_one.finish(StopCause::EndOfSequence);
             streamed.append(rest);
 
+            let known: Vec<u32> = ids
+                .iter()
+                .copied()
+                .filter(|&id| (id as usize) < tokenizer.vocab_size())
+                .collect();
             let mut whole = parser(thinking, with_tools);
-            let mut at_once = whole.push_text(&tokenizer.decode(&ids, true));
+            let mut at_once = whole.push_text(&tokenizer.decode(&known, true).unwrap());
             let (rest, reason_whole) = whole.finish(StopCause::EndOfSequence);
             at_once.append(rest);
             proptest::prop_assert_eq!(&streamed, &at_once);

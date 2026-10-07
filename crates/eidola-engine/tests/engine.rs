@@ -834,3 +834,115 @@ fn minimal_token_budget_still_finishes() {
         );
     }
 }
+
+/// Padded logit rows (past the tokenizer's last token) are never sampled, drafted or
+/// accepted, even where they would win: with 20 of 32 rows sampleable, unmasked greedy
+/// decoding picks a padded id somewhere in this workload, and the engine never emits one.
+#[test]
+fn padded_vocabulary_is_never_emitted() {
+    use eidola_engine::mock::reference_logits;
+    use eidola_engine::sampling::{Logits, argmax};
+
+    const SAMPLEABLE: u32 = 20;
+    let mut spec = small_spec(256);
+    spec.sampleable_vocab_size = SAMPLEABLE;
+    let mut unmasked_padded_wins = 0;
+    for spec_on in [false, true] {
+        let mut h = Harness::new(spec.clone(), sched(spec_on), MockConfig::default());
+        let mut rng = TestRng(91);
+        let mut cases = Vec::new();
+        for id in 0..12 {
+            let prompt = rng.var_tokens(1, 20, SAMPLEABLE);
+            let p = params(id);
+            cases.push((id, prompt.clone(), p));
+            h.submit(request(id, prompt, p, 16, CacheScope::Private));
+        }
+        h.run();
+        for (id, prompt, p) in cases {
+            let out = &h.outputs[&id];
+            assert!(out.iter().all(|&t| t < SAMPLEABLE), "request {id}: {out:?}");
+            if !spec_on || p.is_greedy() {
+                assert_eq!(*out, h.expected(&prompt, &p, 16, &[]), "request {id}");
+            }
+            let mut seq = prompt.clone();
+            for &t in out {
+                let full = reference_logits(&spec, &h.cfg, &seq, seq.len() as u32 - 1);
+                if argmax(Logits::new(&full, spec.vocab_size)) >= SAMPLEABLE {
+                    unmasked_padded_wins += 1;
+                }
+                seq.push(t);
+            }
+        }
+    }
+    assert!(
+        unmasked_padded_wins > 10,
+        "the workload must include positions where a padded row would win ({unmasked_padded_wins})"
+    );
+}
+
+/// A prompt token outside the sampleable vocabulary is refused at submission, and an
+/// executor that returns one fails the step instead of having it committed.
+#[test]
+fn padded_ids_are_refused_at_both_ends_of_the_seam() {
+    use eidola_engine::engine::{Engine, SubmitError};
+    use eidola_engine::executor::{Executor, ExecutorError, StepInput, StepOutput};
+    use eidola_engine::mock::MockExecutor;
+    use eidola_engine::spec::ModelSpec;
+
+    let mut spec = small_spec(256);
+    spec.sampleable_vocab_size = 20;
+    let mut h = Harness::new(spec, sched(false), MockConfig::default());
+    assert_eq!(
+        h.eng.submit(request(
+            1,
+            vec![3, 25],
+            SamplingParams::greedy(),
+            4,
+            CacheScope::Private
+        )),
+        Err(SubmitError::InvalidToken)
+    );
+
+    /// Samples over all 32 rows while claiming only id 0 is sampleable.
+    struct Lying(MockExecutor, ModelSpec);
+    impl Executor for Lying {
+        fn spec(&self) -> &ModelSpec {
+            &self.1
+        }
+        fn execute(&mut self, step: &StepInput) -> Result<StepOutput, ExecutorError> {
+            self.0.execute(step)
+        }
+    }
+    let honest = small_spec(256);
+    let mut claimed = honest.clone();
+    claimed.sampleable_vocab_size = 1;
+    let mut eng = Engine::new(
+        Lying(MockExecutor::new(honest, MockConfig::default()), claimed),
+        sched(false),
+    )
+    .unwrap();
+    eng.submit(request(
+        1,
+        vec![0, 0, 0],
+        SamplingParams::random(1.0, 5),
+        8,
+        CacheScope::Private,
+    ))
+    .unwrap();
+    let mut failed = false;
+    for now in 0..32 {
+        match eng.step(now) {
+            Ok(events) => {
+                for e in events {
+                    assert!(e.tokens.iter().all(|&t| t == 0), "{:?}", e.tokens);
+                }
+            }
+            Err(e) => {
+                assert!(e.0.contains("sampleable"), "{e}");
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed, "a padded id must fail the step");
+}

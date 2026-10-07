@@ -9,7 +9,7 @@
 //! on tokens `0 ..= s`, which is what lets drafter blocks be prefix-cached like target
 //! blocks. The draft for position `p + 1 + i` is depth `i`'s prediction at slot `p + i`.
 
-use eidola_engine::sampling::{self, SamplingParams};
+use eidola_engine::sampling::{self, Logits, SamplingParams};
 use eidola_engine_model::{ForwardOptions, LogitsAt, Matrix, ReferenceModel, Result};
 
 use crate::executor::MtpHidden;
@@ -46,6 +46,8 @@ pub struct DenseOracle<'a> {
     pub mtp_depths: &'a [usize],
     /// Hidden-state chaining.
     pub mtp_hidden: MtpHidden,
+    /// Token ids sampling may return; the head's rows past it are padding.
+    pub sampleable_vocab_size: u32,
 }
 
 impl DenseOracle<'_> {
@@ -93,6 +95,7 @@ impl DenseOracle<'_> {
 /// keep it to short checks; [`check_generation`] verifies a finished output with one.
 pub fn dense_generate(
     model: &ReferenceModel,
+    sampleable_vocab_size: u32,
     prompt: &[u32],
     params: &SamplingParams,
     max_tokens: u32,
@@ -109,7 +112,8 @@ pub fn dense_generate(
             },
         )?;
         let q = tokens.len() as u64 - 1;
-        let t = sampling::sample(fwd.logits.row(0), params, q + 1);
+        let logits = Logits::new(fwd.logits.row(0), sampleable_vocab_size);
+        let t = sampling::sample(logits, params, q + 1);
         tokens.push(t);
         out.push(t);
         if stop.contains(&t) {
@@ -125,13 +129,15 @@ pub fn dense_generate(
 /// that disagrees.
 pub fn check_generation(
     dense: &DenseRun,
+    sampleable_vocab_size: u32,
     prompt_len: usize,
     output: &[u32],
     params: &SamplingParams,
 ) -> std::result::Result<(), usize> {
     for (i, &t) in output.iter().enumerate() {
         let q = (prompt_len + i - 1) as u32;
-        if sampling::sample(dense.target(q), params, q as u64 + 1) != t {
+        let logits = Logits::new(dense.target(q), sampleable_vocab_size);
+        if sampling::sample(logits, params, q as u64 + 1) != t {
             return Err(q as usize + 1);
         }
     }

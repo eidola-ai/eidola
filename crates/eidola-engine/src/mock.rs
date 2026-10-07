@@ -64,6 +64,7 @@ pub fn mimo_like_spec(
     };
     ModelSpec {
         vocab_size: vocab,
+        sampleable_vocab_size: vocab,
         block_size,
         max_model_len: 4096,
         kv_groups: vec![
@@ -159,7 +160,7 @@ pub fn reference_generate(
     while (out.len() as u32) < max_tokens && (tokens.len() as u32) < spec.max_model_len {
         let q = tokens.len() as u32 - 1;
         let logits = reference_logits(spec, cfg, &tokens, q);
-        let t = sampling::sample(&logits, params, q as u64 + 1);
+        let t = sampling::sample(spec.logits(&logits), params, q as u64 + 1);
         tokens.push(t);
         out.push(t);
         if stop.contains(&t) {
@@ -311,7 +312,7 @@ impl MockExecutor {
             self.spec.vocab_size,
             self.state(slot, KvRole::Target, q)?,
         );
-        let probs = sampling::processed_probs(&logits, params);
+        let probs = sampling::processed_probs(self.spec.logits(&logits), params);
         Ok((logits, probs))
     }
 
@@ -333,7 +334,10 @@ impl MockExecutor {
             mix64(q as u64 ^ 0xabcdef)
         };
         let noise_logits = logits_from_state(&self.cfg, self.spec.vocab_size, noise_state ^ 0x77);
-        let noise = sampling::processed_probs(&noise_logits, &SamplingParams::random(1.0, 0));
+        let noise = sampling::processed_probs(
+            self.spec.logits(&noise_logits),
+            &SamplingParams::random(1.0, 0),
+        );
         let a = self.cfg.draft_agreement;
         let mix: Vec<f64> = target
             .iter()
@@ -431,7 +435,7 @@ impl Executor for MockExecutor {
             let params = e.sampling;
             let produced = if e.num_drafts == 0 {
                 let (logits, _) = self.target_probs(e.slot, last, &params)?;
-                let t = sampling::sample(&logits, &params, last as u64 + 1);
+                let t = sampling::sample(self.spec.logits(&logits), &params, last as u64 + 1);
                 row_logits.push(logits);
                 vec![t]
             } else {

@@ -4,6 +4,12 @@
 //!
 //! Given a logit row `l` (finite or `-inf`) and [`SamplingParams`]:
 //!
+//! 0. **Sampleable vocabulary**: `l` is the row's first `sampleable_vocab_size` entries
+//!    ([`Logits`]). A model's head can be wider than its tokenizer (MiMo's is padded to
+//!    152,576 rows for 151,675 tokens); padded ids have no token and are outside every
+//!    distribution below, so no sample, draft, acceptance or residual draw can return
+//!    one. Every function here takes [`Logits`] or rows derived from it, so the limit is
+//!    applied by construction rather than by each caller remembering to mask.
 //! 1. **Greedy** (`temperature == 0`): the distribution is one-hot at `argmax l`, ties to
 //!    the lowest token id. No random draw is consumed.
 //! 2. Otherwise `z = l / temperature`, `p = softmax(z)` (max-subtracted).
@@ -126,8 +132,45 @@ pub fn uniform(seed: u64, position: u64, stream: Stream) -> f64 {
     (random_word(seed, position, stream) >> 40) as f64 * (1.0 / (1u64 << 24) as f64)
 }
 
+/// A logit row restricted to the sampleable vocabulary (step 0 of the definition).
+///
+/// The only constructors state the limit, so every sampler input has padded ids removed;
+/// every id a sampler returns indexes this prefix.
+#[derive(Clone, Copy, Debug)]
+pub struct Logits<'a>(&'a [f32]);
+
+impl<'a> Logits<'a> {
+    /// The first `sampleable` entries of `row`. Panics unless `0 < sampleable <=
+    /// row.len()`.
+    pub fn new(row: &'a [f32], sampleable: u32) -> Self {
+        let n = sampleable as usize;
+        assert!(
+            n > 0 && n <= row.len(),
+            "sampleable vocabulary {sampleable} outside a logit row of {}",
+            row.len()
+        );
+        Self(&row[..n])
+    }
+
+    /// The sampleable logits.
+    pub fn as_slice(&self) -> &'a [f32] {
+        self.0
+    }
+
+    /// The sampleable vocabulary size.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always false: a sampleable vocabulary is never empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Lowest-id argmax.
-pub fn argmax(logits: &[f32]) -> u32 {
+pub fn argmax(logits: Logits<'_>) -> u32 {
+    let logits = logits.as_slice();
     let mut best = 0usize;
     for (i, &v) in logits.iter().enumerate() {
         if v > logits[best] {
@@ -137,14 +180,15 @@ pub fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
-/// The processed distribution (steps 1–6 above) over the whole vocabulary.
-pub fn processed_probs(logits: &[f32], params: &SamplingParams) -> Vec<f64> {
+/// The processed distribution (steps 1–6 above) over the sampleable vocabulary.
+pub fn processed_probs(logits: Logits<'_>, params: &SamplingParams) -> Vec<f64> {
     let n = logits.len();
     let mut p = vec![0.0f64; n];
     if params.is_greedy() {
         p[argmax(logits) as usize] = 1.0;
         return p;
     }
+    let logits = logits.as_slice();
     let t = params.temperature as f64;
     let max = logits
         .iter()
@@ -213,7 +257,7 @@ pub fn sample_from(probs: &[f64], u: f64) -> u32 {
 }
 
 /// Samples the token at sequence `position` from `logits`.
-pub fn sample(logits: &[f32], params: &SamplingParams, position: u64) -> u32 {
+pub fn sample(logits: Logits<'_>, params: &SamplingParams, position: u64) -> u32 {
     if params.is_greedy() {
         return argmax(logits);
     }
@@ -227,6 +271,9 @@ pub fn sample(logits: &[f32], params: &SamplingParams, position: u64) -> u32 {
 ///   `first_position + i` (`k + 1` rows; row `k` serves the bonus token).
 /// * `draft[i]` is the processed drafter distribution the draft `drafts[i]` was drawn from.
 ///
+/// Every row comes from [`processed_probs`] over the same sampleable vocabulary, so every
+/// accepted draft, residual draw and bonus token is a sampleable id.
+///
 /// Returns the accepted drafts followed by exactly one replacement or bonus token
 /// (`1..=k+1` tokens).
 pub fn chain_accept(
@@ -239,6 +286,15 @@ pub fn chain_accept(
     let k = drafts.len();
     assert_eq!(target.len(), k + 1, "target rows must be k + 1");
     assert_eq!(draft.len(), k, "draft rows must be k");
+    let n = target[0].len();
+    assert!(
+        target.iter().chain(draft).all(|r| r.len() == n),
+        "target and draft rows must cover the same sampleable vocabulary"
+    );
+    assert!(
+        drafts.iter().all(|&d| (d as usize) < n),
+        "draft outside the vocabulary"
+    );
     let mut out = Vec::with_capacity(k + 1);
     for i in 0..k {
         let pos = first_position + i as u64;
@@ -293,8 +349,49 @@ mod tests {
 
     #[test]
     fn greedy_ties_go_low() {
-        assert_eq!(argmax(&[1.0, 3.0, 3.0, 2.0]), 1);
-        assert_eq!(sample(&[1.0, 3.0, 3.0], &SamplingParams::greedy(), 7), 1);
+        assert_eq!(argmax(full(&[1.0, 3.0, 3.0, 2.0])), 1);
+        assert_eq!(
+            sample(full(&[1.0, 3.0, 3.0]), &SamplingParams::greedy(), 7),
+            1
+        );
+    }
+
+    fn full(row: &[f32]) -> Logits<'_> {
+        Logits::new(row, row.len() as u32)
+    }
+
+    /// Padded ids are outside every distribution: the padded entries here would win
+    /// greedy decoding and dominate sampling, yet nothing returns one.
+    #[test]
+    fn padded_ids_are_never_sampled() {
+        let row = [0.0f32, 1.0, 0.5, 40.0, 50.0];
+        let logits = Logits::new(&row, 3);
+        assert_eq!(argmax(full(&row)), 4, "unmasked, the padding wins");
+        assert_eq!(argmax(logits), 1);
+        assert_eq!(sample(logits, &SamplingParams::greedy(), 0), 1);
+        let params = SamplingParams::random(1.0, 9);
+        let probs = processed_probs(logits, &params);
+        assert_eq!(probs.len(), 3);
+        for pos in 0..2000 {
+            assert!(sample(logits, &params, pos) < 3);
+        }
+        let draft = processed_probs(Logits::new(&[3.0, 0.0, 0.0, 9.0], 3), &params);
+        for pos in 0..500 {
+            let out = chain_accept(
+                &[probs.clone(), probs.clone()],
+                std::slice::from_ref(&draft),
+                &[0],
+                &params,
+                pos,
+            );
+            assert!(out.iter().all(|&t| t < 3), "{out:?}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "sampleable vocabulary")]
+    fn empty_sampleable_vocabulary_is_refused() {
+        Logits::new(&[1.0], 0);
     }
 
     #[test]
@@ -312,20 +409,20 @@ mod tests {
         let logits = [0.0f32, 1.0, 2.0, 3.0, 3.0];
         let mut p = SamplingParams::random(1.0, 0);
         p.top_k = 2;
-        let probs = processed_probs(&logits, &p);
+        let probs = processed_probs(full(&logits), &p);
         assert!(probs[3] > 0.0 && probs[4] > 0.0);
         assert_eq!(probs[..3], [0.0, 0.0, 0.0]);
         assert!((probs[3] - 0.5).abs() < 1e-12);
 
         let mut p = SamplingParams::random(1.0, 0);
         p.top_p = 0.5;
-        let probs = processed_probs(&logits, &p);
+        let probs = processed_probs(full(&logits), &p);
         // Tokens 3 and 4 tie; 3 ranks first. Its mass alone is < 0.5, so 4 joins.
         assert!(probs[3] > 0.0 && probs[4] > 0.0 && probs[2] == 0.0);
 
         let mut p = SamplingParams::random(1.0, 0);
         p.min_p = 0.3;
-        let probs = processed_probs(&logits, &p);
+        let probs = processed_probs(full(&logits), &p);
         // exp(-1) = 0.37 >= 0.3 keeps token 2; exp(-2) = 0.135 drops token 1.
         assert!(probs[2] > 0.0 && probs[1] == 0.0);
         assert!((probs.iter().sum::<f64>() - 1.0).abs() < 1e-12);

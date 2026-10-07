@@ -32,6 +32,13 @@
 //!    target over them in the same pass (writing their KV to the slots the host reserved),
 //!    and applies [`crate::sampling::chain_accept`]. The result is `1..=k + 1` tokens.
 //!
+//!    **Only sampleable ids.** Target sampling, the drafter's proposals, acceptance and the
+//!    residual all run over the first [`ModelSpec::sampleable_vocab_size`] entries of each
+//!    logit row ([`ModelSpec::logits`]); the padded rows past the tokenizer's last token
+//!    take no part in any distribution, so no step can return, draft or feed back a padded
+//!    id. A device sampler applies the same limit (it is part of the `sampling` semantics,
+//!    not a separate mask), and the engine refuses a step that returns an id outside it.
+//!
 //! A step reads only the KV of its own sequences' slots and never writes a block it was not
 //! directed to by the tables. Blocks the host shares between sequences (prefix-cache hits)
 //! are never written: the host never schedules a query position inside a shared block.

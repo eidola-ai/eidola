@@ -81,6 +81,9 @@ fn truncated_flash_through_the_engine_matches_the_dense_forward() {
         ],
         mtp_depths: vec![0, 1, 2],
         mtp_hidden: MtpHidden::Normed,
+        // MiMo-V2.6's tokenizer: 151,643 base ids plus 32 added tokens. The head's
+        // remaining 901 rows are padding.
+        sampleable_vocab_size: 151_675,
         pad_batches: false,
         record: true,
     };

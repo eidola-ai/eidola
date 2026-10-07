@@ -33,7 +33,8 @@ pub const PINNED_TOKENIZER_SHA256: &[&str] = &[MIMO_V2_6_TOKENIZER_SHA256];
 /// The MiMo tokenizer plus the per-token byte table used for decoding.
 pub struct MimoTokenizer {
     inner: tokenizers::Tokenizer,
-    /// Bytes each id contributes to decoded text (empty for unknown ids).
+    /// Bytes each id contributes to decoded text; every id below its length is a
+    /// token.
     token_bytes: Vec<Box<[u8]>>,
     /// Ids of added tokens flagged `special` (skipped when decoding).
     special: Vec<bool>,
@@ -106,13 +107,16 @@ impl MimoTokenizer {
         let char_bytes = byte_level_decoder_table();
         let vocab = inner.get_vocab(true);
         let size = vocab.values().copied().max().map_or(0, |m| m as usize + 1);
-        let mut token_bytes: Vec<Box<[u8]>> = vec![Box::default(); size];
+        let mut token_bytes: Vec<Box<[u8]>> = Vec::with_capacity(size);
         for id in 0..size as u32 {
             // `id_to_token` consults the added vocabulary first, exactly as
-            // `Tokenizer::decode` does.
-            if let Some(token) = inner.id_to_token(id) {
-                token_bytes[id as usize] = byte_level_token_bytes(&token, &char_bytes).into();
-            }
+            // `Tokenizer::decode` does. The ids must be dense: `vocab_size` is the
+            // sampleable vocabulary the engine is configured with, so a hole would be
+            // an id the model may emit that has no token.
+            let token = inner.id_to_token(id).ok_or_else(|| {
+                ChatError::InvalidArtifact(format!("tokenizer.json: id {id} has no token"))
+            })?;
+            token_bytes.push(byte_level_token_bytes(&token, &char_bytes).into());
         }
         let mut special = vec![false; size];
         for (id, added) in inner.get_added_tokens_decoder() {
@@ -152,20 +156,24 @@ impl MimoTokenizer {
     }
 
     /// Decodes a complete sequence, identical to `tokenizers`'
-    /// `decode(ids, skip_special_tokens)`.
-    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> String {
+    /// `decode(ids, skip_special_tokens)` for ids the tokenizer defines. An id it does
+    /// not define is an error ([`ChatError::UnknownToken`]), where `tokenizers` would
+    /// silently drop it.
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, ChatError> {
         let mut detok = Detokenizer::new(skip_special_tokens);
         let mut out = String::new();
         for &id in ids {
-            out.push_str(&detok.push(self, id));
+            out.push_str(&detok.push(self, id)?);
         }
         out.push_str(&detok.finish());
-        out
+        Ok(out)
     }
 
-    /// The bytes token `id` contributes to decoded text.
-    pub fn token_bytes(&self, id: u32) -> &[u8] {
-        self.token_bytes.get(id as usize).map_or(&[], |b| b)
+    /// The bytes token `id` contributes to decoded text, or `None` for an id the
+    /// tokenizer does not define (`id >= vocab_size()`): a padded logit row has no
+    /// bytes, and must not be mistaken for a token that decodes to nothing.
+    pub fn token_bytes(&self, id: u32) -> Option<&[u8]> {
+        self.token_bytes.get(id as usize).map(|b| &**b)
     }
 
     /// Whether `id` is an added token flagged special.
@@ -188,7 +196,10 @@ impl MimoTokenizer {
         self.inner.token_to_id(token)
     }
 
-    /// One past the largest token id.
+    /// The number of token ids, `0..vocab_size()`, every one of them defined (base
+    /// vocabulary plus added tokens; 151,675 for MiMo-V2.6). This is the sampleable
+    /// vocabulary the engine must be configured with (`ModelSpec::sampleable_vocab_size`):
+    /// the model's head is padded past it, and those rows are not tokens.
     pub fn vocab_size(&self) -> usize {
         self.token_bytes.len()
     }
@@ -262,12 +273,16 @@ impl Detokenizer {
         }
     }
 
-    /// Feeds one token and returns the text it completes (possibly empty).
-    pub fn push(&mut self, tokenizer: &MimoTokenizer, id: u32) -> String {
+    /// Feeds one token and returns the text it completes (possibly empty). An id the
+    /// tokenizer does not define is refused, leaving the detokenizer unchanged.
+    pub fn push(&mut self, tokenizer: &MimoTokenizer, id: u32) -> Result<String, ChatError> {
+        let bytes = tokenizer
+            .token_bytes(id)
+            .ok_or(ChatError::UnknownToken(id))?;
         if self.skip_special_tokens && tokenizer.is_special(id) {
-            return String::new();
+            return Ok(String::new());
         }
-        self.push_bytes(tokenizer.token_bytes(id))
+        Ok(self.push_bytes(bytes))
     }
 
     /// Feeds raw bytes and returns the text they complete.
@@ -402,6 +417,34 @@ pub(crate) mod tests {
         assert!(matches!(err, Err(ChatError::UnpinnedArtifact { .. })));
     }
 
+    /// Ids past the vocabulary (a padded logit row) are refused, never decoded as
+    /// nothing, and the detokenizer is left as it was.
+    #[test]
+    fn out_of_vocabulary_ids_are_refused() {
+        let t = synthetic();
+        let past = t.vocab_size() as u32;
+        assert_eq!(t.token_bytes(past), None);
+        assert_eq!(
+            t.token_bytes(past - 1).map(<[u8]>::len).map(|n| n > 0),
+            Some(true)
+        );
+        assert_eq!(
+            t.decode(&[0, past], false),
+            Err(ChatError::UnknownToken(past))
+        );
+        let mut detok = Detokenizer::new(false);
+        // The first two bytes of 你, held back as an incomplete character.
+        let partial = t.token_to_id("ä½").unwrap();
+        assert_eq!(detok.push(&t, partial).unwrap(), "");
+        assert_eq!(detok.pending_len(), 2);
+        assert_eq!(detok.push(&t, past), Err(ChatError::UnknownToken(past)));
+        assert_eq!(
+            detok.push(&t, past + 1000),
+            Err(ChatError::UnknownToken(past + 1000))
+        );
+        assert_eq!(detok.pending_len(), 2);
+    }
+
     #[test]
     fn eos_from_generation_config() {
         let t = synthetic();
@@ -416,7 +459,7 @@ pub(crate) mod tests {
         for id in 0..t.vocab_size() as u32 {
             for skip in [false, true] {
                 assert_eq!(
-                    t.decode(&[id], skip),
+                    t.decode(&[id], skip).unwrap(),
                     t.inner.decode(&[id], skip).unwrap(),
                     "id {id} skip {skip}"
                 );
@@ -430,9 +473,9 @@ pub(crate) mod tests {
         let text = "<|im_start|>assistant\n<think>你好 hello</think><tool_call>😀<|im_end|>";
         let ids = t.encode(text).unwrap();
         assert!(ids.contains(&t.token_to_id("<think>").unwrap()));
-        assert_eq!(t.decode(&ids, false), text);
+        assert_eq!(t.decode(&ids, false).unwrap(), text);
         assert_eq!(
-            t.decode(&ids, true),
+            t.decode(&ids, true).unwrap(),
             "assistant\n<think>你好 hello</think><tool_call>😀"
         );
     }
@@ -444,7 +487,12 @@ pub(crate) mod tests {
             let mut detok = Detokenizer::new(skip);
             let mut streamed = String::new();
             for &id in &ids {
-                let piece = detok.push(&t, id);
+                // An id past the vocabulary is refused and leaves the stream as it
+                // was (`tokenizers` drops such ids, so the comparison still holds).
+                let Ok(piece) = detok.push(&t, id) else {
+                    prop_assert!(id as usize >= t.vocab_size());
+                    continue;
+                };
                 prop_assert!(!piece.is_empty() || detok.pending_len() <= 3);
                 streamed.push_str(&piece);
             }
@@ -563,7 +611,7 @@ mod reference_tests {
         assert_eq!(t.eos_token_ids(), &[151643, 151645, 151672]);
         for id in 0..t.vocab_size() as u32 {
             assert_eq!(
-                t.decode(&[id], false),
+                t.decode(&[id], false).unwrap(),
                 t.inner.decode(&[id], false).unwrap(),
                 "id {id}"
             );
@@ -581,8 +629,25 @@ mod reference_tests {
                 })
                 .collect();
             for skip in [false, true] {
-                assert_eq!(t.decode(&seq, skip), t.inner.decode(&seq, skip).unwrap());
+                assert_eq!(
+                    t.decode(&seq, skip).unwrap(),
+                    t.inner.decode(&seq, skip).unwrap()
+                );
             }
         }
+    }
+
+    /// The vocabulary is dense, so `vocab_size` is exactly the set of ids the model may
+    /// emit: the real tokenizer defines 151,643 base ids plus 32 added tokens, and the
+    /// model head's 152,576 rows are padded past them.
+    #[test]
+    fn real_vocabulary_is_dense_with_added_tokens() {
+        let t = real();
+        assert_eq!(t.vocab_size(), 151_675);
+        assert_eq!(t.token_to_id("<|endoftext|>"), Some(151_643));
+        assert_eq!(t.token_to_id("<|mimo_audio_end|>"), Some(151_674));
+        assert!(t.token_bytes(151_674).is_some());
+        assert_eq!(t.token_bytes(151_675), None);
+        assert_eq!(t.token_bytes(152_575), None);
     }
 }

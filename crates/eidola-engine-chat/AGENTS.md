@@ -41,6 +41,8 @@ Tested by `tests/template_fixtures.rs`: every case in `tests/fixtures/template_c
 
 `tokenizers` is built with `default-features = false, features = ["fancy-regex"]` (pure Rust; no Oniguruma, no C++). The Python reference uses Oniguruma for the pre-tokenizer regex, so equality is checked, not assumed: `tokenizer::reference_tests` encodes every fixture prompt plus a few hundred unicode-heavy strings and compares ids with Python's, and checks the decode table against `tokenizers` for every id and for random sequences. `decode(encode(x))` is *not* `x` in general (the tokenizer NFC-normalizes).
 
+**Vocabulary size.** `MimoTokenizer::vocab_size()` is the number of token ids, every one defined (the build refuses a tokenizer with holes): 151,675 for MiMo-V2.6, the 151,643 base ids plus 32 added tokens. It is the sampleable vocabulary the engine must be configured with (`ModelSpec::sampleable_vocab_size`); the model's 152,576-row head is padded past it. An id at or past it is not a token: `token_bytes` returns `None`, and `Detokenizer::push`, `decode` and `OutputParser::push_token` refuse it with `ChatError::UnknownToken` (leaving their state unchanged) instead of rendering it as nothing, as `tokenizers` would.
+
 Decoding uses a per-id byte table built from `tokenizers`' byte-level decoder rule. `Detokenizer` holds back at most 3 bytes of an incomplete character and replaces invalid sequences exactly as `String::from_utf8_lossy` does, so the streamed text concatenated equals `decode(ids)` for any split. Special tokens (`<|im_end|>`, …) are skipped; `<think>`, `<tool_call>` and friends are not special and arrive as text. EOS ids come from `generation_config.json`.
 
 ## Output parsing

@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use eidola_engine::engine::{CacheScope, Engine, FinishReason, Request, SchedulerConfig};
 use eidola_engine::kv::CachePolicy;
-use eidola_engine::sampling::{self, SamplingParams, Stream, mix64};
+use eidola_engine::sampling::{self, Logits, SamplingParams, Stream, mix64};
 use eidola_engine::secret::EngineSalt;
 use eidola_engine::spec::{Bucket, ModelSpec};
 use eidola_engine_cpu::oracle::check_generation;
@@ -87,6 +87,7 @@ pub fn exec_config(blocks: u32, mtp_depths: Vec<usize>) -> CpuExecutorConfig {
         ],
         mtp_depths,
         mtp_hidden: MtpHidden::Normed,
+        sampleable_vocab_size: VOCAB,
         pad_batches: false,
         record: true,
     }
@@ -209,21 +210,26 @@ pub fn check_record(
     }
     let p = r.context_len + r.num_tokens - 1;
     let params = &r.sampling;
+    let logits = |row| Logits::new(row, oracle.sampleable_vocab_size);
     let expected = if r.drafts.is_empty() {
-        vec![sampling::sample(dense.target(p), params, p as u64 + 1)]
+        vec![sampling::sample(
+            logits(dense.target(p)),
+            params,
+            p as u64 + 1,
+        )]
     } else {
         let k = r.drafts.len();
         let mut q_rows = Vec::new();
         for i in 0..k {
-            let logits = dense.drafter(i, p + i as u32).expect("draft row");
+            let drafter = logits(dense.drafter(i, p + i as u32).expect("draft row"));
             let pos = p as u64 + 1 + i as u64;
             let (d, q) = if params.is_greedy() {
-                let d = sampling::argmax(logits);
-                let mut q = vec![0.0; logits.len()];
+                let d = sampling::argmax(drafter);
+                let mut q = vec![0.0; drafter.len()];
                 q[d as usize] = 1.0;
                 (d, q)
             } else {
-                let q = sampling::processed_probs(logits, params);
+                let q = sampling::processed_probs(drafter, params);
                 (
                     sampling::sample_from(&q, sampling::uniform(params.seed, pos, Stream::Draft)),
                     q,
@@ -233,7 +239,7 @@ pub fn check_record(
             q_rows.push(q);
         }
         let p_rows: Vec<Vec<f64>> = (0..=k as u32)
-            .map(|i| sampling::processed_probs(dense.target(p + i), params))
+            .map(|i| sampling::processed_probs(logits(dense.target(p + i)), params))
             .collect();
         let out = sampling::chain_accept(&p_rows, &q_rows, &r.drafts, params, p as u64 + 1);
         sum.drafted += k;
@@ -298,6 +304,7 @@ impl Harness {
             model: &self.model,
             mtp_depths: &self.mtp_depths,
             mtp_hidden: self.mtp_hidden,
+            sampleable_vocab_size: self.spec.sampleable_vocab_size,
         }
     }
 
@@ -375,7 +382,8 @@ impl Harness {
             all.extend(out);
             let dense = cache.get(&oracle, &all[..all.len().max(1)]);
             if (!spec_on || p.is_greedy())
-                && let Err(pos) = check_generation(&dense, prompt.len(), out, p)
+                && let Err(pos) =
+                    check_generation(&dense, oracle.sampleable_vocab_size, prompt.len(), out, p)
             {
                 panic!("request {id}: output diverges from dense generation at {pos}");
             }
@@ -418,6 +426,22 @@ pub fn small_vocab_fixture(vocab: usize, head_scale: f32, layers: &[usize]) -> A
         *x *= head_scale;
     }
     w.config.vocab_size = vocab;
+    Arc::new(ReferenceModel::new(w))
+}
+
+/// The fixture with its head rows from `sampleable` on turned into padding that wins:
+/// each is a real row scaled by `scale`, so unmasked, a padded id is the argmax (and
+/// dominates sampling) at most positions, for the target and every MTP depth alike (they
+/// share the head).
+pub fn padded_head_fixture(sampleable: usize, scale: f32) -> Arc<ReferenceModel> {
+    let mut w = load_fixture(&LoadOptions::default()).weights;
+    let cols = w.lm_head.cols;
+    for r in sampleable..w.lm_head.rows {
+        let src = r - sampleable;
+        for c in 0..cols {
+            w.lm_head.data[r * cols + c] = w.lm_head.data[src * cols + c] * scale;
+        }
+    }
     Arc::new(ReferenceModel::new(w))
 }
 

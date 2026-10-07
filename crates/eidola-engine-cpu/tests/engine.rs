@@ -611,3 +611,47 @@ fn randomized_workloads_match_the_dense_oracle() {
     }
     eprintln!("total: {totals:?}");
 }
+
+/// Padded head rows never reach a token: with the head's rows past 200 rigged to win,
+/// target sampling, drafting (greedy and sampled, two depths) and acceptance still only
+/// return ids below the sampleable vocabulary, every row stays bit-exact against the dense
+/// oracle under the same limit, and the rig really does win unmasked.
+#[test]
+fn padded_head_rows_are_never_sampled_drafted_or_accepted() {
+    use eidola_engine::sampling::{Logits, argmax};
+
+    const SAMPLEABLE: u32 = 200;
+    let m = padded_head_fixture(SAMPLEABLE as usize, 30.0);
+    for spec_on in [false, true] {
+        let mut cfg = exec_config(256, vec![0, 1]);
+        cfg.sampleable_vocab_size = SAMPLEABLE;
+        let mut h = Harness::new(m.clone(), cfg, sched(spec_on));
+        let mut rng = TestRng(61);
+        for id in 0..6 {
+            let prompt = rng.var_tokens(2, 12, SAMPLEABLE);
+            h.submit(request(id, prompt, params(id), 8, CacheScope::Private));
+        }
+        h.run();
+        for id in 0..6 {
+            let out = &h.outputs[&id];
+            assert!(out.iter().all(|&t| t < SAMPLEABLE), "request {id}: {out:?}");
+        }
+        let records = h.records.clone();
+        let mut padded_wins = 0;
+        for r in &records {
+            for (_, l) in &r.target_logits {
+                padded_wins += (argmax(Logits::new(l, VOCAB)) >= SAMPLEABLE) as usize;
+            }
+            for (_, _, l) in &r.drafter_logits {
+                padded_wins += (argmax(Logits::new(l, VOCAB)) >= SAMPLEABLE) as usize;
+            }
+            assert!(r.drafts.iter().all(|&d| d < SAMPLEABLE), "{:?}", r.drafts);
+        }
+        assert!(
+            padded_wins > records.len(),
+            "padded rows must win unmasked ({padded_wins})"
+        );
+        let sum = h.check_all(spec_on);
+        assert_eq!(sum.drafted > 0, spec_on);
+    }
+}

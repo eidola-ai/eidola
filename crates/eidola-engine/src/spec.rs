@@ -1,6 +1,8 @@
 //! The model spec an executor reports: everything the host engine needs to know about the
 //! model and the executor's memory, and nothing about numerics.
 
+use crate::sampling::Logits;
+
 /// How a KV group's layers attend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttentionKind {
@@ -76,8 +78,16 @@ pub struct Bucket {
 /// The executor's description of the model and of the memory it owns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelSpec {
-    /// Logit rows (including padding tokens the model never emits).
+    /// Logit rows the model computes, including padding rows past the tokenizer's last
+    /// token (MiMo's head has 152,576 rows).
     pub vocab_size: u32,
+    /// Token ids the model may emit: `0..sampleable_vocab_size`, every id the tokenizer
+    /// defines (base vocabulary plus added tokens; 151,675 for MiMo-V2.6). Supplied by
+    /// whoever loads the tokenizer, never inferred from the weights. Executors sample,
+    /// draft and accept only over this prefix of each logit row ([`ModelSpec::logits`]),
+    /// so padded ids are unsampleable by construction; the engine also refuses any
+    /// returned id outside it.
+    pub sampleable_vocab_size: u32,
     /// Tokens per KV block, shared by every group.
     pub block_size: u32,
     /// Longest sequence (prompt plus output) the executor supports.
@@ -108,6 +118,17 @@ impl ModelSpec {
         self.blocks_for(self.max_model_len)
     }
 
+    /// The sampleable part of a full logit row (every sampler input goes through this).
+    /// Panics unless `row` has `vocab_size` entries.
+    pub fn logits<'a>(&self, row: &'a [f32]) -> Logits<'a> {
+        assert_eq!(
+            row.len(),
+            self.vocab_size as usize,
+            "a logit row has vocab_size entries"
+        );
+        Logits::new(row, self.sampleable_vocab_size)
+    }
+
     /// Smallest bucket that fits a batch, if any.
     pub fn bucket_for(&self, seqs: u32, tokens: u32) -> Option<Bucket> {
         self.buckets
@@ -121,6 +142,12 @@ impl ModelSpec {
     pub fn validate(&self) -> Result<(), String> {
         if self.block_size == 0 || self.vocab_size == 0 || self.max_model_len == 0 {
             return Err("block_size, vocab_size and max_model_len must be non-zero".into());
+        }
+        if self.sampleable_vocab_size == 0 || self.sampleable_vocab_size > self.vocab_size {
+            return Err(format!(
+                "sampleable_vocab_size {} must be in 1..={}",
+                self.sampleable_vocab_size, self.vocab_size
+            ));
         }
         if self.kv_groups.is_empty() {
             return Err("at least one KV group is required".into());

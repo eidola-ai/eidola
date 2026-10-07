@@ -13,6 +13,10 @@ pub enum ChatError {
     InvalidInput(String),
     /// Template evaluation failed (Jinja raised an error).
     Template(String),
+    /// A token id the tokenizer does not define (a padded logit row, or beyond the
+    /// head): the engine must never produce one, so decoding refuses it rather than
+    /// rendering it as nothing.
+    UnknownToken(u32),
 }
 
 impl std::fmt::Display for ChatError {
@@ -25,6 +29,9 @@ impl std::fmt::Display for ChatError {
             ChatError::InvalidArtifact(m) => write!(f, "invalid model artifact: {m}"),
             ChatError::InvalidInput(m) => write!(f, "invalid chat input: {m}"),
             ChatError::Template(m) => write!(f, "chat template error: {m}"),
+            ChatError::UnknownToken(id) => {
+                write!(f, "token id {id} is outside the tokenizer's vocabulary")
+            }
         }
     }
 }

@@ -103,6 +103,7 @@ fn dense(tokens: &[u32]) -> DenseRun {
         model: &m,
         mtp_depths: &[0, 1],
         mtp_hidden: eidola_engine_cpu::MtpHidden::Normed,
+        sampleable_vocab_size: VOCAB,
     }
     .run(tokens)
     .unwrap()

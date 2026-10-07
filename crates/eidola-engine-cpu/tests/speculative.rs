@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use common::*;
 use eidola_engine::engine::CacheScope;
-use eidola_engine::sampling::{self, SamplingParams};
+use eidola_engine::sampling::{self, Logits, SamplingParams};
 use eidola_engine_cpu::{DenseOracle, MtpHidden};
 use eidola_engine_model::ReferenceModel;
 
@@ -25,7 +25,9 @@ fn greedy_speculation_accepts_drafts_and_equals_plain_decoding() {
     let mut rng = TestRng(21);
     let prompts: Vec<Vec<u32>> = (0..6).map(|_| rng.var_tokens(2, 20, 4)).collect();
     let run = |depths: Vec<usize>, spec_on: bool| {
-        let mut h = Harness::new(m.clone(), exec_config(256, depths), sched(spec_on));
+        let mut cfg = exec_config(256, depths);
+        cfg.sampleable_vocab_size = 4;
+        let mut h = Harness::new(m.clone(), cfg, sched(spec_on));
         for (i, p) in prompts.iter().enumerate() {
             h.submit(request(
                 i as u64,
@@ -86,6 +88,7 @@ fn speculative_sampling_draws_from_the_target_distribution() {
         model: &m,
         mtp_depths: &[0, 1, 0],
         mtp_hidden: MtpHidden::Normed,
+        sampleable_vocab_size: 4,
     };
     for (ci, base) in [
         SamplingParams::random(1.0, 0),
@@ -108,7 +111,8 @@ fn speculative_sampling_draws_from_the_target_distribution() {
                 .entry(seq.to_vec())
                 .or_insert_with(|| {
                     let r = oracle.run(seq).unwrap();
-                    sampling::processed_probs(r.target(seq.len() as u32 - 1), &base)
+                    let row = r.target(seq.len() as u32 - 1);
+                    sampling::processed_probs(Logits::new(row, 4), &base)
                 })
                 .clone()
         };
@@ -124,6 +128,7 @@ fn speculative_sampling_draws_from_the_target_distribution() {
         }
 
         let mut cfg = exec_config(64, vec![0, 1, 0]);
+        cfg.sampleable_vocab_size = 4;
         cfg.record = false;
         let mut h = Harness::new(m.clone(), cfg, sched(true));
         h.checks = false; // statistics only; invariants are covered elsewhere
