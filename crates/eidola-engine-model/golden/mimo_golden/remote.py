@@ -106,7 +106,36 @@ def import_remote_code():
         sys.path.insert(0, root)
     from mimo_remote import configuration_mimo_v2, modeling_mimo_v2  # type: ignore
 
+    _adapt_mask_api(modeling_mimo_v2)
     return configuration_mimo_v2, modeling_mimo_v2
+
+
+def _adapt_mask_api(modeling) -> None:
+    """Bridge the remote code's mask calls to the pinned transformers API.
+
+    The remote code was written against transformers' older
+    `create_causal_mask(input_embeds=..., cache_position=...)`; current releases
+    take `inputs_embeds` and derive positions from `position_ids`. Only the
+    keyword names change here: the remote code's own module and numerics are
+    untouched, and the committed fixture regenerates byte for byte through this
+    bridge (see README.md)."""
+    import inspect
+
+    for name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+        original = getattr(modeling, name)
+        if getattr(original, "_eidola_adapted", False):
+            continue
+        accepted = inspect.signature(original).parameters
+
+        def adapted(*args, _original=original, _accepted=accepted, **kwargs):
+            if "input_embeds" in kwargs and "input_embeds" not in _accepted:
+                kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+            if "cache_position" in kwargs and "cache_position" not in _accepted:
+                kwargs.pop("cache_position")
+            return _original(*args, **kwargs)
+
+        adapted._eidola_adapted = True
+        setattr(modeling, name, adapted)
 
 
 def safetensors_header(path: str) -> tuple[int, dict]:

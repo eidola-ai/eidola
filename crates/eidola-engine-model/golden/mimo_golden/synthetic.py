@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import save
 
 from . import hf_run
 
@@ -218,9 +218,9 @@ def generate(out_dir: Path) -> None:
     cfg = CONFIG
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     tensors = build_checkpoint(cfg)
-    save_file(
+    save_deterministic(
         {k: v.contiguous() for k, v in sorted(tensors.items())},
-        str(out_dir / "model.safetensors"),
+        out_dir / "model.safetensors",
         metadata={"tp_size": str(QKV_CHUNKS)},
     )
 
@@ -252,8 +252,26 @@ def generate(out_dir: Path) -> None:
         golden[f"mtp.{k}.logits"] = out["logits"]
         prev = out["hidden"]
 
-    save_file(
+    save_deterministic(
         {k: v.contiguous() for k, v in golden.items()},
-        str(out_dir / "golden.safetensors"),
+        out_dir / "golden.safetensors",
         metadata={"generator": "hf-remote-code fp32 cpu", "seq_len": str(SEQ_LEN)},
     )
+
+
+def save_deterministic(tensors: dict, path: Path, metadata: dict[str, str]) -> None:
+    """`safetensors.torch.save_file`, with the header's `__metadata__` keys in
+    sorted order. The library keeps metadata in a hash map, so with more than
+    one key its serialized order (and the file's bytes) varies run to run even
+    though every tensor is identical; sorting makes the fixture a function of
+    its contents."""
+    data = save(tensors, metadata=metadata)
+    n = int.from_bytes(data[:8], "little")
+    header = json.loads(data[8 : 8 + n])
+    if "__metadata__" in header:
+        header["__metadata__"] = dict(sorted(header["__metadata__"].items()))
+    text = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode()
+    if len(text) > n:
+        raise ValueError("re-serialized header grew")
+    text += b" " * (n - len(text))
+    path.write_bytes(data[:8] + text + data[8 + n :])

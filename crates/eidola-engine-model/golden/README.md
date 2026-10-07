@@ -2,7 +2,7 @@
 
 Python tooling that produces the reference outputs `eidola-engine-model` is checked against. It is never a build input: `cargo test` reads only the committed fixture under `tests/fixtures/` and needs neither Python nor the network.
 
-The oracle is the Hugging Face remote code for MiMo-V2 (`modeling_mimo_v2.py` / `configuration_mimo_v2.py` from `XiaomiMiMo/MiMo-V2.6-Flash-MOPD` at revision `2479e2d0029eca9a34cc7e7f55a121925f81908e`), downloaded at run time and checked against the sha256 digests in `mimo_golden/remote.py`. It runs in fp32 on CPU with eager attention. Checkpoint tensors are dequantised by `mimo_golden/dequant.py`, written independently of the Rust loader. Beyond placing weights, nothing in the remote code is changed.
+The oracle is the Hugging Face remote code for MiMo-V2 (`modeling_mimo_v2.py` / `configuration_mimo_v2.py` from `XiaomiMiMo/MiMo-V2.6-Flash-MOPD` at revision `2479e2d0029eca9a34cc7e7f55a121925f81908e`), downloaded at run time and checked against the sha256 digests in `mimo_golden/remote.py`. It runs in fp32 on CPU with eager attention. Checkpoint tensors are dequantised by `mimo_golden/dequant.py`, written independently of the Rust loader. Beyond placing weights, nothing in the remote code is changed. One call is bridged: the remote code calls transformers' `create_causal_mask` / `create_sliding_window_causal_mask` with the older keyword names (`input_embeds`, `cache_position`), and `mimo_golden/remote.py` renames or drops just those keywords for the pinned transformers. The committed fixture regenerates byte for byte through the bridge (transformers 5.19.0, torch 2.9.1, safetensors 0.8.0), as it does without it on the earlier 5.3.0 / 2.9.0 / 0.6.2 pins.
 
 ## Setup
 
@@ -27,7 +27,7 @@ This rewrites `tests/fixtures/tiny/`:
 - `model.safetensors`: a 4-layer MiMo-shaped model with seeded random weights in the real storage formats.
 - `golden.safetensors`: the remote code's logits, the residual stream after every layer, and the final normed hidden state. It also holds two chained MTP layers' inputs and outputs.
 
-`mimo_golden/synthetic.py` explains the shape choices. Output is deterministic for a given torch version. After regenerating, run `cargo test -p eidola-engine-model`.
+`mimo_golden/synthetic.py` explains the shape choices. Output is deterministic for a given torch version, down to the file bytes: the safetensors library keeps header metadata in a hash map, so `save_deterministic` rewrites it with sorted keys (without that, `golden.safetensors` changed bytes run to run with identical tensors). After regenerating, run `cargo test -p eidola-engine-model`.
 
 The remote code ignores the MTP weights, so the MTP goldens are built from the remote code's own modules:
 
