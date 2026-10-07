@@ -113,6 +113,27 @@ pub enum SubmitError {
     ExceedsCapacity,
 }
 
+/// Why an [`Engine`] could not be built.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    /// The executor's [`ModelSpec`] is inconsistent.
+    Spec(String),
+    /// The scheduler configuration, against the executor's spec, admits a sequence
+    /// the scheduler could never step (it would be planned and skipped forever).
+    Scheduler(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Spec(e) => write!(f, "invalid model spec: {e}"),
+            ConfigError::Scheduler(e) => write!(f, "invalid scheduler configuration: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 /// Scheduler configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchedulerConfig {
@@ -202,13 +223,19 @@ impl<E: Executor> std::fmt::Debug for Engine<E> {
 }
 
 impl<E: Executor> Engine<E> {
-    /// An engine over `exec`. Panics if the executor's spec is inconsistent.
-    pub fn new(exec: E, config: SchedulerConfig) -> Self {
+    /// An engine over `exec`.
+    ///
+    /// Refuses an inconsistent spec, and any scheduler configuration under which a
+    /// sequence could never be stepped: every step must have room for at least one
+    /// sequence, a prefill chunk of at least one token, and one decode row at its full
+    /// `1 + k` cost (`k` drafts when speculation is on). Speculation is never silently
+    /// turned off to make a configuration fit.
+    pub fn new(exec: E, config: SchedulerConfig) -> Result<Self, ConfigError> {
         let spec = exec.spec().clone();
-        spec.validate().expect("valid model spec");
-        let largest = *spec.buckets.last().expect("at least one bucket");
+        spec.validate().map_err(ConfigError::Spec)?;
+        let largest = *spec.buckets.last().expect("validated: at least one bucket");
         let kv = KvManager::new(&spec, config.cache);
-        Self {
+        let engine = Self {
             exec,
             spec,
             config,
@@ -220,7 +247,35 @@ impl<E: Executor> Engine<E> {
             last_sweep: None,
             stats: Stats::default(),
             largest,
+        };
+        engine.check_progress()?;
+        Ok(engine)
+    }
+
+    /// The scheduler half of [`Engine::new`]'s validation.
+    fn check_progress(&self) -> Result<(), ConfigError> {
+        let err = |m: String| Err(ConfigError::Scheduler(m));
+        if self.seat_budget() == 0 {
+            return err(format!(
+                "no sequence fits a step (max_seqs {}, largest bucket {} sequences)",
+                self.config.max_seqs, self.largest.max_seqs
+            ));
         }
+        if self.config.max_prefill_chunk == 0 {
+            return err("max_prefill_chunk must be non-zero".into());
+        }
+        let decode_row = 1 + self.drafts();
+        if self.token_budget() < decode_row {
+            return err(format!(
+                "a decode row costs {decode_row} query tokens (1 + {} drafts) but a step \
+                 holds {} (max_batched_tokens {}, largest bucket {} tokens)",
+                self.drafts(),
+                self.token_budget(),
+                self.config.max_batched_tokens,
+                self.largest.max_tokens
+            ));
+        }
+        Ok(())
     }
 
     /// The executor (tests inspect the mock through this).

@@ -272,7 +272,7 @@ impl Harness {
         let exec = CpuExecutor::new(model.clone(), cfg);
         let spec = eidola_engine::executor::Executor::spec(&exec).clone();
         Self {
-            eng: Engine::new(exec, sched),
+            eng: Engine::new(exec, sched).expect("valid configuration"),
             spec,
             model,
             mtp_depths,

@@ -756,3 +756,81 @@ fn randomized_workloads_hold_every_invariant() {
         let _ = cancelled;
     }
 }
+
+/// A configuration under which some sequence could never be stepped is refused at
+/// construction. Without the check, a token budget below `1 + k` plans no decode row
+/// ever: the request below would sit unfinished forever.
+#[test]
+fn engine_refuses_configurations_that_cannot_progress() {
+    use eidola_engine::engine::{ConfigError, Engine};
+    use eidola_engine::mock::MockExecutor;
+
+    let build = |spec: eidola_engine::spec::ModelSpec, sched| {
+        Engine::new(MockExecutor::new(spec, MockConfig::default()), sched)
+    };
+    // k = 3: a decode row costs 4 query tokens.
+    let mut tight = sched(true);
+    tight.max_batched_tokens = 3;
+    assert!(matches!(
+        build(small_spec(64), tight.clone()),
+        Err(ConfigError::Scheduler(_))
+    ));
+    // The same budget is fine without speculation, and 4 is fine with it.
+    tight.speculative = false;
+    assert!(build(small_spec(64), tight.clone()).is_ok());
+    tight.speculative = true;
+    tight.max_batched_tokens = 4;
+    assert!(build(small_spec(64), tight.clone()).is_ok());
+    // The largest bucket caps the budget too.
+    let mut spec = small_spec(64);
+    for b in &mut spec.buckets {
+        b.max_tokens = b.max_tokens.min(3);
+    }
+    assert!(matches!(
+        build(spec, sched(true)),
+        Err(ConfigError::Scheduler(_))
+    ));
+    // No seats, no prefill.
+    let mut no_seats = sched(true);
+    no_seats.max_seqs = 0;
+    assert!(matches!(
+        build(small_spec(64), no_seats),
+        Err(ConfigError::Scheduler(_))
+    ));
+    let mut no_chunk = sched(true);
+    no_chunk.max_prefill_chunk = 0;
+    assert!(matches!(
+        build(small_spec(64), no_chunk),
+        Err(ConfigError::Scheduler(_))
+    ));
+    // An inconsistent spec is an error, not a panic.
+    let mut bad = small_spec(64);
+    bad.buckets.clear();
+    assert!(matches!(build(bad, sched(true)), Err(ConfigError::Spec(_))));
+}
+
+/// The smallest accepted budget (exactly one decode row with its drafts) completes
+/// requests and matches the dense reference (greedy: speculative sampling is equal to
+/// it in distribution only).
+#[test]
+fn minimal_token_budget_still_finishes() {
+    let mut cfg = sched(true);
+    cfg.max_batched_tokens = 4;
+    let mut h = Harness::new(small_spec(256), cfg, MockConfig::default());
+    let mut rng = TestRng(77);
+    let mut cases = Vec::new();
+    for id in 0..4 {
+        let prompt = rng.var_tokens(1, 12, 32);
+        let p = SamplingParams::greedy();
+        cases.push((id, prompt.clone(), p));
+        h.submit(request(id, prompt, p, 6, CacheScope::Private));
+    }
+    h.run();
+    for (id, prompt, p) in cases {
+        assert_eq!(
+            h.outputs[&id],
+            h.expected(&prompt, &p, 6, &[]),
+            "request {id}"
+        );
+    }
+}

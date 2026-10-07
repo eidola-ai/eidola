@@ -55,7 +55,8 @@ impl Harness {
     pub fn new(spec: ModelSpec, sched: SchedulerConfig, cfg: MockConfig) -> Self {
         let eos = sched.eos_token_ids.clone();
         Self {
-            eng: Engine::new(MockExecutor::new(spec.clone(), cfg), sched),
+            eng: Engine::new(MockExecutor::new(spec.clone(), cfg), sched)
+                .expect("valid configuration"),
             spec,
             cfg,
             now: 0,
