@@ -15,14 +15,8 @@ use eidola_engine::spec::AttentionKind;
 fn params(i: u64) -> SamplingParams {
     match i % 3 {
         0 => SamplingParams::greedy(),
-        1 => SamplingParams::random(1.0, 1000 + i),
-        _ => SamplingParams {
-            temperature: 0.7,
-            top_k: 8,
-            top_p: 0.9,
-            min_p: 0.05,
-            seed: 2000 + i,
-        },
+        1 => SamplingParams::random(1.0, 1000 + i).unwrap(),
+        _ => SamplingParams::new(0.7, 8, 0.9, 0.05, 2000 + i).unwrap(),
     }
 }
 
@@ -181,10 +175,10 @@ fn speculative_sampling_preserves_the_distribution() {
         let mut h = Harness::new(spec.clone(), sched(true), cfg);
         h.checks = false; // statistics only; invariants are covered elsewhere
         for seed in 0..n {
-            let p = SamplingParams::random(temperature, seed);
+            let p = SamplingParams::random(temperature, seed).unwrap();
             let r = h.expected(
                 &prompt,
-                &SamplingParams::random(temperature, seed + 7_777_777),
+                &SamplingParams::random(temperature, seed + 7_777_777).unwrap(),
                 3,
                 &[],
             );
@@ -953,7 +947,7 @@ fn padded_ids_are_refused_at_both_ends_of_the_seam() {
     eng.submit(request(
         1,
         vec![0, 0, 0],
-        SamplingParams::random(1.0, 5),
+        SamplingParams::random(1.0, 5).unwrap(),
         8,
         CacheScope::Private,
     ))

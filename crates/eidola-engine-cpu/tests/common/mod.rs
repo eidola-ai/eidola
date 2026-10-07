@@ -125,14 +125,8 @@ pub fn request(
 pub fn params(i: u64) -> SamplingParams {
     match i % 3 {
         0 => SamplingParams::greedy(),
-        1 => SamplingParams::random(1.0, 1000 + i),
-        _ => SamplingParams {
-            temperature: 0.7,
-            top_k: 8,
-            top_p: 0.9,
-            min_p: 0.05,
-            seed: 2000 + i,
-        },
+        1 => SamplingParams::random(1.0, 1000 + i).unwrap(),
+        _ => SamplingParams::new(0.7, 8, 0.9, 0.05, 2000 + i).unwrap(),
     }
 }
 
@@ -231,7 +225,7 @@ pub fn check_record(
             } else {
                 let q = sampling::processed_probs(drafter, params);
                 (
-                    sampling::sample_from(&q, sampling::uniform(params.seed, pos, Stream::Draft)),
+                    sampling::sample_from(&q, sampling::uniform(params.seed(), pos, Stream::Draft)),
                     q,
                 )
             };

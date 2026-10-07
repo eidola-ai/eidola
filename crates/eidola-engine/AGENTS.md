@@ -8,7 +8,7 @@ The serving core of Eidola's purpose-built inference engine for the MiMo-V2.6 fa
 | `spec.rs` | `ModelSpec` the executor reports: KV groups, block size, buckets, draft width, slots. |
 | `kv.rs` | Block pools, per-sequence block tables, salted prefix cache, expiry, zero-on-free. |
 | `engine.rs` | Scheduler and request lifecycle. |
-| `sampling.rs` | Reference sampling semantics and chain speculative acceptance. |
+| `sampling.rs` | Reference sampling semantics and chain speculative acceptance. `SamplingParams` is valid by construction (private fields, checked `new`): a NaN or negative temperature, `top_p` outside `(0, 1]` or `min_p` outside `[0, 1]` cannot reach a sampler. |
 | `secret.rs`, `hash.rs` | Cache keys, salts, boot key; the block-hash chain. |
 | `mock.rs` | Deterministic mock executor and the dense reference it must reproduce. |
 

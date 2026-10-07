@@ -964,7 +964,7 @@ impl Executor for CpuExecutor {
                 let q = sampling::processed_probs(logits, &row.params);
                 let d = sampling::sample_from(
                     &q,
-                    sampling::uniform(row.params.seed, pos, Stream::Draft),
+                    sampling::uniform(row.params.seed(), pos, Stream::Draft),
                 );
                 (d, q)
             };

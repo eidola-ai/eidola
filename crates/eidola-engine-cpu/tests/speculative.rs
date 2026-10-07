@@ -91,14 +91,8 @@ fn speculative_sampling_draws_from_the_target_distribution() {
         sampleable_vocab_size: 4,
     };
     for (ci, base) in [
-        SamplingParams::random(1.0, 0),
-        SamplingParams {
-            temperature: 0.8,
-            top_k: 3,
-            top_p: 0.95,
-            min_p: 0.0,
-            seed: 0,
-        },
+        SamplingParams::random(1.0, 0).unwrap(),
+        SamplingParams::new(0.8, 3, 0.95, 0.0, 0).unwrap(),
     ]
     .into_iter()
     .enumerate()
@@ -133,10 +127,7 @@ fn speculative_sampling_draws_from_the_target_distribution() {
         let mut h = Harness::new(m.clone(), cfg, sched(true));
         h.checks = false; // statistics only; invariants are covered elsewhere
         for seed in 0..n {
-            let p = SamplingParams {
-                seed: seed + 1000 * ci as u64,
-                ..base
-            };
+            let p = base.with_seed(seed + 1000 * ci as u64);
             h.submit(request(
                 seed,
                 prompt.clone(),

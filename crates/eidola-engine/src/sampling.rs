@@ -43,21 +43,64 @@
 //! from `p_k`. Output tokens are distributed exactly as non-speculative sampling from `p`.
 
 /// Per-sequence sampling parameters (device-side arrays carry the same five fields).
+///
+/// Always valid: the fields are private and every constructor checks them, so a value the
+/// sampler cannot define (a NaN temperature, `top_p = 0`, …) is unrepresentable rather
+/// than silently turned into wrong tokens. The ranges:
+///
+/// * `temperature`: finite and `>= 0`; 0 means greedy.
+/// * `top_k`: any; 0 disables.
+/// * `top_p`: in `(0, 1]`; 1 disables.
+/// * `min_p`: in `[0, 1]`; 0 disables.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SamplingParams {
-    /// 0 means greedy.
-    pub temperature: f32,
-    /// 0 disables.
-    pub top_k: u32,
-    /// 1.0 disables.
-    pub top_p: f32,
-    /// 0.0 disables.
-    pub min_p: f32,
-    /// Counter-based RNG seed.
-    pub seed: u64,
+    temperature: f32,
+    top_k: u32,
+    top_p: f32,
+    min_p: f32,
+    seed: u64,
 }
 
+/// Sampling parameters outside the ranges [`SamplingParams`] documents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidSampling(pub String);
+
+impl std::fmt::Display for InvalidSampling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid sampling parameters: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidSampling {}
+
 impl SamplingParams {
+    /// Checked construction.
+    pub fn new(
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        min_p: f32,
+        seed: u64,
+    ) -> Result<Self, InvalidSampling> {
+        let bad = |m: String| Err(InvalidSampling(m));
+        if !(temperature.is_finite() && temperature >= 0.0) {
+            return bad(format!("temperature {temperature} must be finite and >= 0"));
+        }
+        if !(top_p > 0.0 && top_p <= 1.0) {
+            return bad(format!("top_p {top_p} must be in (0, 1]"));
+        }
+        if !(0.0..=1.0).contains(&min_p) {
+            return bad(format!("min_p {min_p} must be in [0, 1]"));
+        }
+        Ok(Self {
+            temperature,
+            top_k,
+            top_p,
+            min_p,
+            seed,
+        })
+    }
+
     /// Greedy decoding.
     pub fn greedy() -> Self {
         Self {
@@ -70,14 +113,38 @@ impl SamplingParams {
     }
 
     /// Plain temperature sampling with `seed`.
-    pub fn random(temperature: f32, seed: u64) -> Self {
-        Self {
-            temperature,
-            top_k: 0,
-            top_p: 1.0,
-            min_p: 0.0,
-            seed,
-        }
+    pub fn random(temperature: f32, seed: u64) -> Result<Self, InvalidSampling> {
+        Self::new(temperature, 0, 1.0, 0.0, seed)
+    }
+
+    /// The same parameters with another seed (every seed is valid).
+    pub fn with_seed(self, seed: u64) -> Self {
+        Self { seed, ..self }
+    }
+
+    /// 0 means greedy.
+    pub fn temperature(&self) -> f32 {
+        self.temperature
+    }
+
+    /// 0 disables.
+    pub fn top_k(&self) -> u32 {
+        self.top_k
+    }
+
+    /// 1 disables.
+    pub fn top_p(&self) -> f32 {
+        self.top_p
+    }
+
+    /// 0 disables.
+    pub fn min_p(&self) -> f32 {
+        self.min_p
+    }
+
+    /// Counter-based RNG seed.
+    pub fn seed(&self) -> u64 {
+        self.seed
     }
 
     /// A fresh seed from the operating system's CSPRNG, for requests that did not ask for
@@ -262,7 +329,7 @@ pub fn sample(logits: Logits<'_>, params: &SamplingParams, position: u64) -> u32
         return argmax(logits);
     }
     let p = processed_probs(logits, params);
-    sample_from(&p, uniform(params.seed, position, Stream::Sample))
+    sample_from(&p, uniform(params.seed(), position, Stream::Sample))
 }
 
 /// Chain speculative acceptance.
@@ -303,7 +370,7 @@ pub fn chain_accept(
         let accepted = if params.is_greedy() {
             p[d] > 0.0
         } else {
-            uniform(params.seed, pos, Stream::Accept) * q[d] < p[d]
+            uniform(params.seed(), pos, Stream::Accept) * q[d] < p[d]
         };
         if accepted {
             out.push(drafts[i]);
@@ -318,7 +385,7 @@ pub fn chain_accept(
             } else {
                 p
             };
-            sample_from(row, uniform(params.seed, pos, Stream::Residual))
+            sample_from(row, uniform(params.seed(), pos, Stream::Residual))
         };
         out.push(token);
         return out;
@@ -327,7 +394,7 @@ pub fn chain_accept(
     let bonus = if params.is_greedy() {
         argmax_f64(&target[k])
     } else {
-        sample_from(&target[k], uniform(params.seed, pos, Stream::Sample))
+        sample_from(&target[k], uniform(params.seed(), pos, Stream::Sample))
     };
     out.push(bonus);
     out
@@ -369,7 +436,7 @@ mod tests {
         assert_eq!(argmax(full(&row)), 4, "unmasked, the padding wins");
         assert_eq!(argmax(logits), 1);
         assert_eq!(sample(logits, &SamplingParams::greedy(), 0), 1);
-        let params = SamplingParams::random(1.0, 9);
+        let params = SamplingParams::random(1.0, 9).unwrap();
         let probs = processed_probs(logits, &params);
         assert_eq!(probs.len(), 3);
         for pos in 0..2000 {
@@ -394,6 +461,33 @@ mod tests {
         Logits::new(&[1.0], 0);
     }
 
+    /// Values the sampler cannot define are unrepresentable: a NaN temperature used to
+    /// fall through softmax to token 0.
+    #[test]
+    fn invalid_parameters_are_refused() {
+        for t in [f32::NAN, f32::INFINITY, -0.5] {
+            assert!(SamplingParams::random(t, 0).is_err(), "temperature {t}");
+        }
+        for top_p in [0.0, -0.1, 1.5, f32::NAN] {
+            assert!(
+                SamplingParams::new(1.0, 0, top_p, 0.0, 0).is_err(),
+                "top_p {top_p}"
+            );
+        }
+        for min_p in [-0.1, 1.5, f32::NAN] {
+            assert!(
+                SamplingParams::new(1.0, 0, 1.0, min_p, 0).is_err(),
+                "min_p {min_p}"
+            );
+        }
+        assert!(
+            SamplingParams::new(0.0, 0, 1.0, 0.0, 0)
+                .unwrap()
+                .is_greedy()
+        );
+        assert!(SamplingParams::new(0.7, 8, 0.9, 1.0, 3).is_ok());
+    }
+
     #[test]
     fn uniform_is_deterministic_and_in_range() {
         for pos in 0..1000 {
@@ -407,20 +501,20 @@ mod tests {
     #[test]
     fn filters_compose_as_documented() {
         let logits = [0.0f32, 1.0, 2.0, 3.0, 3.0];
-        let mut p = SamplingParams::random(1.0, 0);
+        let mut p = SamplingParams::random(1.0, 0).unwrap();
         p.top_k = 2;
         let probs = processed_probs(full(&logits), &p);
         assert!(probs[3] > 0.0 && probs[4] > 0.0);
         assert_eq!(probs[..3], [0.0, 0.0, 0.0]);
         assert!((probs[3] - 0.5).abs() < 1e-12);
 
-        let mut p = SamplingParams::random(1.0, 0);
+        let mut p = SamplingParams::random(1.0, 0).unwrap();
         p.top_p = 0.5;
         let probs = processed_probs(full(&logits), &p);
         // Tokens 3 and 4 tie; 3 ranks first. Its mass alone is < 0.5, so 4 joins.
         assert!(probs[3] > 0.0 && probs[4] > 0.0 && probs[2] == 0.0);
 
-        let mut p = SamplingParams::random(1.0, 0);
+        let mut p = SamplingParams::random(1.0, 0).unwrap();
         p.min_p = 0.3;
         let probs = processed_probs(full(&logits), &p);
         // exp(-1) = 0.37 >= 0.3 keeps token 2; exp(-2) = 0.135 drops token 1.

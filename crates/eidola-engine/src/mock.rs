@@ -336,7 +336,7 @@ impl MockExecutor {
         let noise_logits = logits_from_state(&self.cfg, self.spec.vocab_size, noise_state ^ 0x77);
         let noise = sampling::processed_probs(
             self.spec.logits(&noise_logits),
-            &SamplingParams::random(1.0, 0),
+            &SamplingParams::random(1.0, 0).expect("valid constant"),
         );
         let a = self.cfg.draft_agreement;
         let mix: Vec<f64> = target
@@ -456,7 +456,7 @@ impl Executor for MockExecutor {
                     } else {
                         sampling::sample_from(
                             &qd,
-                            sampling::uniform(params.seed, q as u64 + 1, Stream::Draft),
+                            sampling::uniform(params.seed(), q as u64 + 1, Stream::Draft),
                         )
                     };
                     self.write(e.slot, q + 1, d)?;

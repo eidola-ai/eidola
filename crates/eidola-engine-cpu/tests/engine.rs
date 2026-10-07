@@ -119,13 +119,14 @@ fn seeded_sampling_with_three_draft_depths_is_exact_per_step() {
     let mut h = Harness::fixture(256, vec![0, 1, 0], sched(true));
     let mut rng = TestRng(5);
     for id in 0..8 {
-        let p = SamplingParams {
-            temperature: 0.8 + 0.1 * (id % 3) as f32,
-            top_k: [0, 5, 40][id as usize % 3],
-            top_p: [1.0, 0.95, 0.8][id as usize % 3],
-            min_p: 0.0,
-            seed: 77 + id,
-        };
+        let p = SamplingParams::new(
+            0.8 + 0.1 * (id % 3) as f32,
+            [0, 5, 40][id as usize % 3],
+            [1.0, 0.95, 0.8][id as usize % 3],
+            0.0,
+            77 + id,
+        )
+        .unwrap();
         h.submit(request(
             id,
             rng.var_tokens(3, 20, VOCAB),
