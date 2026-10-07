@@ -54,7 +54,7 @@ Every kernel is built for all three targets; each fatbin bundles the `sm_100a` a
 Cubins and fatbins are loaded through the CUDA driver API (`cuModuleLoadData`, e.g. via `cudarc`); there is no host-side object code and no CUDA runtime library involved.
 
 - **Load through `ArtifactDir`.** It reads an image from a build output and returns the bytes only if size and SHA-256 match the compiled-in manifest.
-- **Entries by symbol.** Kernels we wrap are `extern "C"`. Upstream template kernels keep their mangled names, which the manifest lists with their demangled forms. Template instances, DeepGEMM's `__global__ static` kernels and every `_meta` global have local binding (`STB_LOCAL`) in a whole-program cubin. The CUDA runtime resolves exactly such symbols by name for ordinary programs, so `cuModuleGetFunction` / `cuModuleGetGlobal` should accept them. That is inferred, not yet observed on a GPU; the fallback is `cuModuleEnumerateFunctions`.
+- **Entries by symbol.** Kernels we wrap are `extern "C"`. Upstream template kernels keep their mangled names, which the manifest lists with their demangled forms. Template instances, DeepGEMM's `__global__ static` kernels and every `_meta` global have local binding (`STB_LOCAL`) in a whole-program cubin. `cuModuleGetFunction` / `cuModuleGetGlobal` resolve them by name (observed on a B300, R580 driver; `eidola-engine-cuda`'s smoke tests cover every entry and record).
 - **Launch contract in the image.** Each entry has a launch-contract device global (`EidolaKernelMeta`, 32 bytes), named by the entry's `meta` field in the manifest. For an entry we name ourselves it is `<entry>_meta`. A mangled template instance cannot carry a matching name, so its record has a readable alias (`eidola_deepgemm_fp8_fp4_masked_gate_up_meta`, …) and `meta_aliases` in `csrc/kernels.json` binds the alias to the mangled symbol. The build fails unless every entry resolves to exactly one record and every record to exactly one entry, `Manifest::parse` re-checks that correspondence, and `Cubin::entry` / `Cubin::entry_for_meta` look it up in either direction. The record holds:
   - block shape,
   - dynamic shared memory,
@@ -66,7 +66,7 @@ Cubins and fatbins are loaded through the CUDA driver API (`cuModuleLoadData`, e
   - **FlashInfer attention:** a plain `PagedParams` struct (296 bytes); the split-KV merge takes a plain argument list.
   - **DeepGEMM:** five `CUtensorMap`s, which the host encodes with `cuTensorMapEncodeTiled`.
   - **CUTLASS GEMM:** its 2048-byte `Params`, which includes TMA descriptors that CUTLASS builds in host C++. Providing that, either as a host-only C++ shim compiled without device code or as a Rust mirror checked against `params_bytes`, is the first job when the launch path is written.
-- **DeepGEMM SM count.** The persistent scheduler bakes in the SM count (148). The grid must be exactly that, and the part must have at least that many SMs; confirm the B300 count before relying on the `sm_103a` instance.
+- **DeepGEMM SM count.** The persistent scheduler bakes in the SM count (148). The grid must be exactly that, and the part must have at least that many SMs. The B300 has 148 (measured), the same as the B200.
 
 ## Determinism doctrine
 

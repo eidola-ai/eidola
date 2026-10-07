@@ -1,0 +1,24 @@
+[package]
+name = "eidola-engine-cuda"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "AGPL-3.0-only"
+
+[dependencies]
+# Driver API only, loaded at run time: no CUDA runtime, no NVRTC, nothing
+# linked at build time, so the crate builds (and its GPU tests skip) on a
+# machine without a GPU. The bindings are pinned to CUDA 13.0, the oldest
+# driver API the engine targets (R580).
+cudarc = { version = "0.19.10", default-features = false, features = [
+    "std",
+    "driver",
+    "dynamic-loading",
+    "cuda-13000",
+] }
+eidola-engine-kernels = { path = "../eidola-engine-kernels" }
+
+[dev-dependencies]
+eidola-engine-model = { path = "../eidola-engine-model" }
