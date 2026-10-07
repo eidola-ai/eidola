@@ -58,11 +58,12 @@
 //! output is a fixed `[max_seqs, k + 1]` token array plus counts. Drafting, verification,
 //! and acceptance run inside the step, so a speculative decode step needs no host round
 //! trip. Steps with `num_drafts` uniform across rows and one host token per row (pure
-//! decode) are the ones expected to replay a captured graph; mixed prefill steps may run
-//! piecewise. The host gives every row either the full draft width `k` or none (none at
-//! position 0, and none for a row whose drafts do not fit in KV), trimming only near the
-//! model length, so non-uniform decode steps are rare and need no graph of their own. `maintenance` and `table_updates` are applied by small kernels or copies
-//! before the graph replays.
+//! decode) are the ones expected to replay a captured graph; mixed prefill steps may
+//! run piecewise. The host gives every row either the full draft width `k` or none
+//! (none at position 0, and none for every row of a step that ran short of KV),
+//! trimming only near the model length, so non-uniform decode steps are rare and need
+//! no graph of their own. `maintenance` and `table_updates` are applied by small
+//! kernels or copies before the graph replays.
 //!
 //! # Determinism contract
 //!

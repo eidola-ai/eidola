@@ -447,7 +447,9 @@ impl<E: Executor> Engine<E> {
         let mut planned: Vec<Planned> = Vec::new();
         let mut events: Vec<Event> = Vec::new();
         let mut preempted_any = false;
-        let k = self.drafts();
+        // Drafts per decode row; drops to 0 for the rest of the step once KV runs short
+        // (see `allocate_row`).
+        let mut k = self.drafts();
 
         // Running sequences, oldest first.
         let order: Vec<(u64, RequestId)> = self.running.iter().map(|(a, i)| (*a, *i)).collect();
@@ -462,7 +464,7 @@ impl<E: Executor> Engine<E> {
                 continue;
             };
             let mut scheduled = true;
-            while !self.allocate_row(id, &mut entry, &mut cost) {
+            while !self.allocate_row(id, &mut entry, &mut cost, &mut planned, &mut budget, &mut k) {
                 if self.running.len() == 1 {
                     // Alone, with every unreferenced cache entry already evicted, and not
                     // even plain decoding fits: this sequence can never grow further.
@@ -512,7 +514,8 @@ impl<E: Executor> Engine<E> {
                     );
                     break;
                 };
-                if !self.allocate_row(id, &mut entry, &mut cost) {
+                if !self.allocate_row(id, &mut entry, &mut cost, &mut planned, &mut budget, &mut k)
+                {
                     self.kv.release(
                         id,
                         Release::Preempt,
@@ -565,22 +568,43 @@ impl<E: Executor> Engine<E> {
         }
     }
 
-    /// Maps KV for a planned row. Under memory pressure a speculative row first gives up
-    /// its drafts (all of them: a row drafts `k` or nothing, so decode steps keep at most
-    /// two draft widths) and is retried as plain decoding; only when that does not fit
-    /// either does it return false, leaving the caller to preempt or finish. Drafts are
-    /// an optimisation and never cost a sequence its output.
-    fn allocate_row(&mut self, id: RequestId, entry: &mut SeqEntry, cost: &mut u32) -> bool {
+    /// Maps KV for a row being planned.
+    ///
+    /// Draft reservations are always the first thing given up under KV pressure, across
+    /// the whole step: the first time a row does not fit, the step stops speculating. Every
+    /// row already planned gives back its draft reservation ([`KvManager::shrink`], its
+    /// budget returned), this row drops its own drafts, and later rows plan with none
+    /// (`k` becomes 0). The row is then retried as plain decoding. Only when that fails
+    /// too does this return false, leaving the caller to preempt or finish, by which point
+    /// no row in the step holds drafts. Revoking all at once keeps the all-or-nothing rule
+    /// (a row drafts `k` or nothing) and makes a step under pressure a uniform plain
+    /// decode. Drafts are an optimisation and never cost a sequence its output.
+    fn allocate_row(
+        &mut self,
+        id: RequestId,
+        entry: &mut SeqEntry,
+        cost: &mut u32,
+        planned: &mut [Planned],
+        budget: &mut u32,
+        k: &mut u32,
+    ) -> bool {
         let upto = entry.context_len + entry.num_tokens;
         if self.kv.allocate(id, upto + entry.num_drafts) {
             return true;
         }
-        if entry.num_drafts == 0 || !self.kv.allocate(id, upto) {
+        if *k == 0 && entry.num_drafts == 0 {
             return false;
+        }
+        *k = 0;
+        for p in planned.iter_mut().filter(|p| p.entry.num_drafts > 0) {
+            self.kv
+                .shrink(p.id, p.entry.context_len + p.entry.num_tokens);
+            *budget += p.entry.num_drafts;
+            p.entry.num_drafts = 0;
         }
         *cost -= entry.num_drafts;
         entry.num_drafts = 0;
-        true
+        self.kv.allocate(id, upto)
     }
 
     /// Plans the row for a running (or just admitted) sequence within `budget` query tokens.

@@ -365,6 +365,37 @@ impl KvManager {
         true
     }
 
+    /// Gives back blocks [`KvManager::allocate`] mapped for `id` past position `upto`
+    /// during the step being planned (a draft reservation the scheduler revokes). Those
+    /// blocks were taken from the free list this step and nothing has written them, so
+    /// they return to it without a zero; their table entries are reset to the null block.
+    /// `upto` may not cut into positions with valid KV.
+    pub fn shrink(&mut self, id: SeqId, upto: u32) {
+        let mut seq = self.seqs.remove(&id).expect("live sequence");
+        assert!(upto >= seq.computed, "shrink into computed KV");
+        let keep = upto.div_ceil(self.block_size) as usize;
+        for g in 0..self.pools.len() {
+            while seq.blocks[g].len() > keep {
+                let idx = seq.blocks[g].len() - 1;
+                let b = seq.blocks[g].pop().expect("non-empty");
+                if b == NULL_BLOCK {
+                    continue;
+                }
+                let r = &mut self.pools[g].refs[b as usize];
+                assert_eq!(*r, 1, "a reserved block is owned by its sequence alone");
+                *r = 0;
+                self.pools[g].free.push(b);
+                self.pending_tables.push(TableUpdate {
+                    slot: seq.slot,
+                    group: g as u32,
+                    index: idx as u32,
+                    block: NULL_BLOCK,
+                });
+            }
+        }
+        self.seqs.insert(id, seq);
+    }
+
     /// Records that positions `[0, computed)` of `id` hold valid KV after a step: releases
     /// blocks past it (speculative rollback), seals newly full blocks into the cache, and
     /// releases sliding-window blocks that left the window.

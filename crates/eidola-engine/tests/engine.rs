@@ -1050,3 +1050,37 @@ fn kv_pressure_drops_drafts_before_finishing() {
     assert_eq!(h.outputs[&1], h.expected(&[7], &greedy, 2, &[]));
     assert_eq!(h.finished[&1], FinishReason::Length);
 }
+
+/// Draft reservations are the first thing given up across the whole step: when the
+/// younger of two decoding rows does not fit, the older row's drafts are revoked before
+/// anyone is pushed to plain decoding, preempted or finished. Block size 1, k = 3, eight
+/// allocatable blocks: both rows fit decoding plainly (3 blocks each), but the older
+/// row's `1 + 3` reservation (6 blocks) would leave the younger 2, one short, which
+/// used to preempt it.
+#[test]
+fn draft_reservations_yield_before_any_row_is_preempted() {
+    use eidola_engine::mock::mimo_like_spec;
+
+    let greedy = SamplingParams::greedy();
+    let spec = mimo_like_spec(32, 1, 6, 10, 9, 4, 3);
+    let mut h = Harness::new(spec, sched(true), MockConfig::default());
+    let prompts = [vec![7u32, 9], vec![3u32, 5]];
+    for (id, p) in prompts.iter().enumerate() {
+        h.submit(request(
+            id as u64,
+            p.clone(),
+            greedy,
+            2,
+            CacheScope::Private,
+        ));
+    }
+    h.run();
+    for (id, p) in prompts.iter().enumerate() {
+        assert_eq!(h.outputs[&(id as u64)], h.expected(p, &greedy, 2, &[]));
+        assert_eq!(h.finished[&(id as u64)], FinishReason::Length);
+    }
+    let stats = h.eng.stats();
+    assert_eq!(stats.preemptions, 0, "{stats:?}");
+    assert_eq!(stats.drafted, 0, "{stats:?}");
+    assert_eq!(stats.steps, 2, "both rows decode together: {stats:?}");
+}
