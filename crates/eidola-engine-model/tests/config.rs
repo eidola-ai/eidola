@@ -149,3 +149,30 @@ fn unsupported_features_are_rejected() {
     v["rope_parameters"]["rope_type"] = "yarn".into();
     assert!(parse(&v).is_err());
 }
+
+/// Float fields are validated as the forward stores them (f32), not as JSON doubles:
+/// a value that is fine in f64 but overflows or underflows in f32 is refused.
+#[test]
+fn float_fields_are_validated_after_conversion_to_f32() {
+    let base = data("flash-mopd.config.json");
+    let refused = |edit: &dyn Fn(&mut Value)| {
+        let mut v = base.clone();
+        edit(&mut v);
+        matches!(parse(&v), Err(Error::InvalidConfig(_)))
+    };
+    // rope_theta: 1e40 is finite in f64 and infinite in f32.
+    assert!(refused(&|v| {
+        v["rope_theta"] = 1e40.into();
+        v["rope_parameters"]["rope_theta"] = 1e40.into();
+    }));
+    assert!(refused(&|v| v["swa_rope_theta"] = 1e40.into()));
+    assert!(refused(&|v| v["swa_rope_theta"] = 1e-50.into()));
+    assert!(refused(&|v| v["layernorm_epsilon"] = 1e-50.into()));
+    assert!(refused(&|v| v["layernorm_epsilon"] = 0.0.into()));
+    assert!(refused(&|v| v["attention_value_scale"] = 1e39.into()));
+    assert!(refused(&|v| v["attention_value_scale"] = (-0.5).into()));
+    assert!(refused(&|v| v["routed_scaling_factor"] = 1e39.into()));
+    assert!(refused(&|v| v["routed_scaling_factor"] = 0.0.into()));
+    // The published values still parse.
+    assert!(parse(&base).is_ok());
+}

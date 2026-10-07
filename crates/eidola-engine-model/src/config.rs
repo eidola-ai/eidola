@@ -408,7 +408,10 @@ impl ModelConfig {
                 top_k,
                 intermediate_size,
                 norm_topk_prob: raw.norm_topk_prob,
-                routed_scaling_factor: raw.routed_scaling_factor.unwrap_or(1.0) as f32,
+                routed_scaling_factor: positive_f32(
+                    "routed_scaling_factor",
+                    raw.routed_scaling_factor.unwrap_or(1.0),
+                )?,
             })
         } else {
             None
@@ -446,8 +449,11 @@ impl ModelConfig {
             Some(q) => Some(quant_spec(q)?),
         };
 
-        let rms_norm_eps = raw.layernorm_epsilon as f32;
-        let attention_value_scale = raw.attention_value_scale.map(|s| s as f32);
+        let rms_norm_eps = positive_f32("layernorm_epsilon", raw.layernorm_epsilon)?;
+        let attention_value_scale = raw
+            .attention_value_scale
+            .map(|s| positive_f32("attention_value_scale", s))
+            .transpose()?;
 
         Ok(ModelConfig {
             hidden_size: raw.hidden_size,
@@ -549,9 +555,11 @@ fn attention_spec(
             "rotary dim {rope_dim} from head_dim {head_dim_qk} × {partial_rotary_factor}"
         )));
     }
-    if theta.is_nan() || theta <= 0.0 {
-        return Err(Error::InvalidConfig(format!("rope theta {theta}")));
+    if head_dim_qk == 0 {
+        return Err(Error::InvalidConfig("head_dim 0".into()));
     }
+    let rope_theta = positive_f32("rope theta", theta)?;
+    let softmax_scale = positive_f32("softmax scale", (head_dim_qk as f64).powf(-0.5))?;
     Ok(AttentionSpec {
         kind,
         num_q_heads,
@@ -559,10 +567,26 @@ fn attention_spec(
         head_dim_qk,
         head_dim_v,
         rope_dim,
-        rope_theta: theta as f32,
+        rope_theta,
         has_sinks,
-        softmax_scale: (head_dim_qk as f64).powf(-0.5) as f32,
+        softmax_scale,
     })
+}
+
+/// A config float as the forward stores it: converted to f32 first, then required to
+/// be finite and strictly positive. Validating the f64 instead would let a value that
+/// is fine in double precision but overflows (`rope_theta: 1e40` becomes infinity) or
+/// underflows (an epsilon of `1e-50` becomes 0) in f32 through, silently computing a
+/// different model.
+fn positive_f32(name: &str, value: f64) -> Result<f32> {
+    let stored = value as f32;
+    if stored.is_finite() && stored > 0.0 {
+        Ok(stored)
+    } else {
+        Err(Error::InvalidConfig(format!(
+            "{name} {value} is {stored} as f32; it must be finite and positive"
+        )))
+    }
 }
 
 fn quant_spec(q: &RawQuantConfig) -> Result<QuantSpec> {
