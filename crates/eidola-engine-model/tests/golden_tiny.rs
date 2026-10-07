@@ -51,7 +51,7 @@ fn assert_close(what: &str, reference: &Matrix, ours: &Matrix, rel: f32) {
         (ours.rows, ours.cols),
         "{what}"
     );
-    let (d, m) = max_abs_diff(&reference.data, &ours.data);
+    let (d, m) = max_abs_diff(&reference.data, &ours.data).expect("finite values");
     assert!(
         d <= rel * m.max(1.0),
         "{what}: max |Δ| {d:e} vs scale {m:e}"
@@ -91,7 +91,8 @@ fn main_model_matches_hf_remote_code() {
     );
     let reference = g.matrix("logits");
     assert_close("logits", &reference, &out.logits, REL);
-    let a = compare_logits(&reference.data, &out.logits.data, reference.cols);
+    let a =
+        compare_logits(&reference.data, &out.logits.data, reference.cols).expect("finite logits");
     assert_eq!(a.top1_matches, a.rows, "{a}");
     assert!(a.kl_max < 1e-9, "{a}");
 }
@@ -122,7 +123,8 @@ fn mtp_layers_match_hf_modules() {
         );
         let reference = g.matrix(&format!("mtp.{k}.logits"));
         assert_close(&format!("mtp.{k}.logits"), &reference, &out.logits, REL);
-        let a = compare_logits(&reference.data, &out.logits.data, reference.cols);
+        let a = compare_logits(&reference.data, &out.logits.data, reference.cols)
+            .expect("finite logits");
         assert_eq!(a.top1_matches, a.rows, "mtp {k}: {a}");
     }
 }

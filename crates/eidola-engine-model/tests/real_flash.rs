@@ -109,12 +109,13 @@ fn truncated_flash_matches_hf_remote_code() {
 
     for (i, h) in out.layer_outputs.iter().enumerate() {
         let r = matrix(&golden, &format!("hidden.{i}"));
-        let (d, m) = max_abs_diff(&r.data, &h.data);
+        let (d, m) = max_abs_diff(&r.data, &h.data).expect("finite values");
         let worst_row = (0..r.rows)
             .max_by(|&a, &b| {
                 max_abs_diff(r.row(a), h.row(a))
+                    .expect("finite values")
                     .0
-                    .total_cmp(&max_abs_diff(r.row(b), h.row(b)).0)
+                    .total_cmp(&max_abs_diff(r.row(b), h.row(b)).expect("finite values").0)
             })
             .unwrap();
         println!(
@@ -133,7 +134,8 @@ fn truncated_flash_matches_hf_remote_code() {
         println!("wrote our logits to {path}");
     }
     let reference = matrix(&golden, "logits");
-    let a = compare_logits(&reference.data, &out.logits.data, reference.cols);
+    let a =
+        compare_logits(&reference.data, &out.logits.data, reference.cols).expect("finite logits");
     println!("main logits: {a}");
     assert!(a.top1_rate() >= 0.999, "{a}");
     assert!(a.kl_mean < 1e-3, "{a}");
@@ -147,10 +149,12 @@ fn truncated_flash_matches_hf_remote_code() {
             .mtp_forward(0, &mt, &prev, &positions, &LogitsAt::All)
             .unwrap();
         println!("mtp 0 forward in {:.1?}", t0.elapsed());
-        let (d, s) = max_abs_diff(&matrix(&golden, "mtp.0.hidden").data, &m.hidden.data);
+        let (d, s) = max_abs_diff(&matrix(&golden, "mtp.0.hidden").data, &m.hidden.data)
+            .expect("finite values");
         println!("mtp 0 hidden: max |Δ| {d:.3e} (scale {s:.3e})");
         let reference = matrix(&golden, "mtp.0.logits");
-        let a = compare_logits(&reference.data, &m.logits.data, reference.cols);
+        let a =
+            compare_logits(&reference.data, &m.logits.data, reference.cols).expect("finite logits");
         println!("mtp 0 logits: {a}");
         assert!(a.top1_rate() >= 0.999, "{a}");
         assert!(a.kl_mean < 1e-3, "{a}");

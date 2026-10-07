@@ -21,7 +21,7 @@ The reference forward is the golden oracle. Every faster executor (paged CPU, GP
 | `tensor` | `Matrix` plus the kernels: `dot`, `linear`, `rms_norm`, `silu` and `sigmoid`. |
 | `attention` | RoPE tables, partial rotate-half, window visibility, and single-query attention with a sink. |
 | `forward` | `ReferenceModel::forward` (logits at chosen positions, plus optional per-layer residual streams), `mtp_forward`, `route` and `swiglu`. |
-| `compare` | Top-1 agreement, KL divergence and max-abs-diff for golden checks. |
+| `compare` | Top-1 agreement, KL divergence and max-abs-diff for golden checks, and for certifying faster executors. Fail-closed: any NaN or infinity on either side is a `NonFinite` error, never a metric (a NaN off the winning logit would otherwise pass with perfect top-1, zero KL and zero max-abs-diff). |
 | `golden/` | Dev-only Python that produces goldens from the HF remote code. See `golden/README.md`. |
 
 ## Numerics contract
