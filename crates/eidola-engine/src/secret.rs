@@ -1,8 +1,17 @@
 //! Prefix-cache secrets: the client's cache key, the per-boot key, and the engine salt.
 //!
 //! All three are content-class values. They never appear in `Debug` output (every type here
-//! prints a fixed redaction marker), are never compared in variable time by this crate, are
-//! zeroed on drop, and have no `Display`, serialization, or byte accessor outside this crate.
+//! prints a fixed redaction marker), are never compared in variable time by this crate, and
+//! have no `Display`, serialization, or byte accessor outside this crate.
+//!
+//! **Zeroed on drop, with no stale copies.** Each value keeps its bytes in one fixed heap
+//! allocation that is overwritten with zeros when the value is dropped. Moving the value
+//! (into a request, through a `HashMap` rehash or a `Vec` reallocation) moves only the
+//! pointer, so the collections that hold salts never leave copies of the bytes behind. A
+//! clone is a separate allocation, zeroed on its own drop. Constructors write the bytes
+//! straight into that allocation; `from_bytes` copies its argument, whose own copy is the
+//! caller's to scrub. The HMAC's internal state during [`SaltDeriver::derive`] is transient
+//! stack memory and is not scrubbed by this crate.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -18,7 +27,7 @@ macro_rules! redacted_secret {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(Clone)]
-        pub struct $name([u8; SECRET_LEN]);
+        pub struct $name(Box<[u8; SECRET_LEN]>);
 
         impl Drop for $name {
             fn drop(&mut self) {
@@ -35,6 +44,20 @@ macro_rules! redacted_secret {
         impl $name {
             pub(crate) fn expose(&self) -> &[u8; SECRET_LEN] {
                 &self.0
+            }
+
+            /// Copies `bytes` into a fresh allocation.
+            fn copy_from(bytes: &[u8; SECRET_LEN]) -> Self {
+                let mut v = Self(Box::new([0u8; SECRET_LEN]));
+                v.0.copy_from_slice(bytes);
+                v
+            }
+
+            /// A fresh allocation filled from the operating system's CSPRNG in place.
+            fn random() -> Self {
+                let mut v = Self(Box::new([0u8; SECRET_LEN]));
+                fill_random(&mut v.0);
+                v
             }
         }
     };
@@ -65,7 +88,7 @@ redacted_secret!(
 impl CacheKey {
     /// Wraps a client-supplied key.
     pub fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
-        Self(bytes)
+        Self::copy_from(&bytes)
     }
 }
 
@@ -73,13 +96,13 @@ impl EngineSalt {
     /// A fresh random salt. Used for requests that carry no cache key: such a request can
     /// only ever hit blocks it computed itself (after a preemption), never anyone else's.
     pub fn fresh() -> Self {
-        Self(random_bytes())
+        Self::random()
     }
 
     /// Constructs a salt from raw bytes. Test and integration use only; production salts
     /// come from [`SaltDeriver`] or [`EngineSalt::fresh`].
     pub fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
-        Self(bytes)
+        Self::copy_from(&bytes)
     }
 
     /// Constant-time equality.
@@ -95,12 +118,12 @@ impl EngineSalt {
 impl BootKey {
     /// A fresh random per-boot key.
     pub fn generate() -> Self {
-        Self(random_bytes())
+        Self::random()
     }
 
     /// Constructs a boot key from raw bytes (tests only need determinism).
     pub fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
-        Self(bytes)
+        Self::copy_from(&bytes)
     }
 }
 
@@ -129,10 +152,11 @@ impl SaltDeriver {
             .expect("HMAC accepts any key length");
         mac.update(SALT_DERIVATION_LABEL);
         mac.update(key.expose());
-        let out = mac.finalize().into_bytes();
-        let mut bytes = [0u8; SECRET_LEN];
-        bytes.copy_from_slice(&out);
-        EngineSalt(bytes)
+        let mut out = mac.finalize().into_bytes();
+        let mut salt = EngineSalt(Box::new([0u8; SECRET_LEN]));
+        salt.0.copy_from_slice(&out);
+        out.as_mut_slice().zeroize();
+        salt
     }
 
     /// Resolves the salt for a request: derived when a key is present, fresh otherwise.
@@ -150,12 +174,10 @@ impl Default for SaltDeriver {
     }
 }
 
-/// 32 bytes from the operating system's CSPRNG. Failure to obtain randomness is fatal: a
+/// Fills `out` from the operating system's CSPRNG. Failure to obtain randomness is fatal: a
 /// predictable salt or boot key would silently weaken isolation.
-pub(crate) fn random_bytes() -> [u8; SECRET_LEN] {
-    let mut b = [0u8; SECRET_LEN];
-    getrandom::fill(&mut b).expect("operating-system randomness unavailable");
-    b
+fn fill_random(out: &mut [u8; SECRET_LEN]) {
+    getrandom::fill(out).expect("operating-system randomness unavailable");
 }
 
 /// A random `u64` from the operating system's CSPRNG.
@@ -211,6 +233,26 @@ mod tests {
         mac.update(&msg);
         let expected = mac.finalize().into_bytes();
         assert_eq!(d.derive(&k).expose().as_slice(), expected.as_slice());
+    }
+
+    /// Moving a secret, including through the rehashes of a growing `HashMap`, never
+    /// moves its bytes: there is one allocation to zero and no stale copy left behind.
+    #[test]
+    fn moves_never_copy_the_secret_bytes() {
+        let salt = EngineSalt::from_bytes([0x5A; 32]);
+        let addr = salt.expose().as_ptr();
+        let mut map = std::collections::HashMap::new();
+        map.insert(0u32, salt);
+        for i in 1..10_000u32 {
+            map.insert(i, EngineSalt::fresh());
+        }
+        let moved = map.remove(&0).unwrap();
+        assert_eq!(moved.expose().as_ptr(), addr);
+        assert_eq!(moved.expose(), &[0x5A; 32]);
+        let key = CacheKey::from_bytes([1; 32]);
+        let key_addr = key.expose().as_ptr();
+        let boxed = vec![key];
+        assert_eq!(boxed[0].expose().as_ptr(), key_addr);
     }
 
     #[test]

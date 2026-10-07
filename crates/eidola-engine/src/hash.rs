@@ -14,8 +14,18 @@ use crate::secret::EngineSalt;
 
 const DOMAIN: &[u8] = b"eidola/kv-block/v1";
 
-/// A block hash. It is an opaque but stable linkage tag for a (salt, prefix) pair, so it
-/// is treated like the salt: `Debug` is redacted and nothing outside this crate sees it.
+/// A block hash. It is an opaque but stable linkage tag for a (salt, prefix) pair: two
+/// equal hashes mean "same salt and same tokens up to here", and nothing about the tokens
+/// can be recovered from it. `Debug` is redacted, it has no `Display`, serialization or
+/// byte accessor, and nothing outside this crate sees it.
+///
+/// It is not a secret and is not scrubbed. Hashes are `Copy` values held in growable
+/// collections (the prefix-cache map's keys, each sequence's chain), and a rehash or
+/// reallocation leaves earlier copies in freed memory that no type can reach, so zeroing
+/// "every copy" could not be promised honestly. What bounds its exposure instead: it never
+/// leaves the process, the process memory lives inside the encrypted confidential VM, and
+/// it links only to a salt that is itself per-boot (or per-request for private requests).
+/// The retention promises (TTL, zero on free) are about KV contents, not these tags.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockHash([u8; 32]);
 
