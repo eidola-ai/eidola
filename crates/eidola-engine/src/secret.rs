@@ -251,8 +251,12 @@ mod tests {
         assert_eq!(moved.expose(), &[0x5A; 32]);
         let key = CacheKey::from_bytes([1; 32]);
         let key_addr = key.expose().as_ptr();
-        let boxed = vec![key];
-        assert_eq!(boxed[0].expose().as_ptr(), key_addr);
+        let mut grown = Vec::with_capacity(1);
+        grown.push(key);
+        for i in 0..=255u8 {
+            grown.push(CacheKey::from_bytes([i; 32]));
+        }
+        assert_eq!(grown[0].expose().as_ptr(), key_addr);
     }
 
     #[test]
