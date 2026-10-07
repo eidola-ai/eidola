@@ -1084,3 +1084,32 @@ fn draft_reservations_yield_before_any_row_is_preempted() {
     assert_eq!(stats.drafted, 0, "{stats:?}");
     assert_eq!(stats.steps, 2, "both rows decode together: {stats:?}");
 }
+
+/// Block size 2, sliding window 4, three allocatable blocks in the sliding groups (the
+/// full-attention pool is ample): enough for any one window plus the block being
+/// written, provided blocks behind the window are recycled.
+fn tight_sliding_spec() -> eidola_engine::spec::ModelSpec {
+    let mut spec = eidola_engine::mock::mimo_like_spec(32, 2, 4, 4, 64, 4, 3);
+    for g in &mut spec.kv_groups {
+        if g.attention != AttentionKind::Full {
+            g.num_blocks = 4;
+        }
+    }
+    spec
+}
+
+/// With caching off, no regeneration pins are taken: nothing could ever attach them to a
+/// cache entry, and holding the prompt's window would stop the sliding groups recycling
+/// (a five-token prompt used to end with `Length` once decoding needed a fourth block).
+#[test]
+fn no_regeneration_pins_without_caching() {
+    let mut cfg = sched(false);
+    cfg.cache.enabled = false;
+    let mut h = Harness::new(tight_sliding_spec(), cfg, MockConfig::default());
+    let greedy = SamplingParams::greedy();
+    let prompt = vec![1u32, 2, 3, 4, 5];
+    h.submit(request(1, prompt.clone(), greedy, 8, CacheScope::Private));
+    h.run();
+    assert_eq!(h.outputs[&1], h.expected(&prompt, &greedy, 8, &[]));
+    assert_eq!(h.outputs[&1].len(), 8);
+}

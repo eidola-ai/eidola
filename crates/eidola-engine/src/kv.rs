@@ -252,8 +252,13 @@ impl KvManager {
             pins: vec![(0, 0); groups],
             slide_cursor: vec![0; groups],
         };
+        // Regeneration pins keep the prompt's last window mapped so `release` can attach it
+        // to a cache entry; with caching off nothing can use them, so none are taken.
         let regen_point = (prompt_len.max(1) - 1) / bs;
         for g in 0..groups {
+            if !self.policy.enabled {
+                break;
+            }
             if let AttentionKind::Sliding { .. } = self.attention[g] {
                 let lo = self.attention[g].first_visible(regen_point * bs) / bs;
                 seq.pins[g] = (lo, regen_point);
