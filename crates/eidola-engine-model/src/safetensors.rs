@@ -361,9 +361,10 @@ fn map_file(path: &Path, file_index: usize) -> Result<(MappedFile, Vec<(String, 
     if map.len() < 8 {
         return Err(bad("shorter than the 8-byte header length".into()));
     }
-    let header_len = u64::from_le_bytes(map[..8].try_into().unwrap()) as usize;
-    let data_start = 8usize
-        .checked_add(header_len)
+    let header_len = u64::from_le_bytes(map[..8].try_into().unwrap());
+    let data_start = usize::try_from(header_len)
+        .ok()
+        .and_then(|h| h.checked_add(8))
         .filter(|&s| s <= map.len())
         .ok_or_else(|| bad(format!("header length {header_len} exceeds file size")))?;
     let header: serde_json::Map<String, Value> = serde_json::from_slice(&map[8..data_start])
@@ -390,23 +391,21 @@ fn map_file(path: &Path, file_index: usize) -> Result<(MappedFile, Vec<(String, 
             .and_then(Value::as_array)
             .ok_or_else(|| bad(format!("{name}: missing shape")))?
             .iter()
-            .map(|d| d.as_u64().map(|d| d as usize))
+            .map(|d| d.as_u64().and_then(|d| usize::try_from(d).ok()))
             .collect::<Option<_>>()
             .ok_or_else(|| bad(format!("{name}: non-integer shape")))?;
         let offs = v
             .get("data_offsets")
             .and_then(Value::as_array)
             .filter(|a| a.len() == 2)
-            .and_then(|a| Some((a[0].as_u64()? as usize, a[1].as_u64()? as usize)))
+            .and_then(|a| Some((a[0].as_u64()?, a[1].as_u64()?)))
             .ok_or_else(|| bad(format!("{name}: missing data_offsets")))?;
-        let start = data_start + offs.0;
-        let end = data_start + offs.1;
-        let want = shape.iter().product::<usize>() * dtype.size();
-        if offs.1 < offs.0 || end > map.len() || end - start != want {
-            return Err(bad(format!(
-                "{name}: data_offsets {offs:?} do not hold {dtype:?} {shape:?}"
-            )));
-        }
+        let (start, end) = tensor_range(data_start, offs, &shape, dtype.size(), map.len())
+            .ok_or_else(|| {
+                bad(format!(
+                    "{name}: data_offsets {offs:?} do not hold {dtype:?} {shape:?}"
+                ))
+            })?;
         entries.push((
             name,
             TensorEntry {
@@ -433,9 +432,122 @@ fn map_file(path: &Path, file_index: usize) -> Result<(MappedFile, Vec<(String, 
     ))
 }
 
+/// The absolute byte range `[start, end)` of a tensor whose header gives
+/// `offs` (relative to the data section at `data_start`), or `None` unless the
+/// range lies inside a file of `file_len` bytes and holds exactly
+/// `product(shape) * elem_size` bytes. Every header-derived quantity is
+/// untrusted, so all arithmetic is checked: an overflowing header is refused,
+/// never wrapped into a range over unrelated bytes.
+fn tensor_range(
+    data_start: usize,
+    offs: (u64, u64),
+    shape: &[usize],
+    elem_size: usize,
+    file_len: usize,
+) -> Option<(usize, usize)> {
+    let rel_start = usize::try_from(offs.0).ok()?;
+    let rel_end = usize::try_from(offs.1).ok()?;
+    let start = data_start.checked_add(rel_start)?;
+    let end = data_start.checked_add(rel_end)?;
+    let want = shape
+        .iter()
+        .try_fold(elem_size, |acc, &d| acc.checked_mul(d))?;
+    (start <= end && end <= file_len && end - start == want).then_some((start, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write a safetensors file with `header` and `data` and open it.
+    fn open_with_header(tag: &str, header: &str, data: &[u8]) -> Result<WeightSet> {
+        let dir = std::env::temp_dir().join(format!(
+            "eidola-engine-model-st-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(data);
+        std::fs::write(&path, bytes).unwrap();
+        let result = WeightSet::open_files(std::slice::from_ref(&path));
+        std::fs::remove_dir_all(&dir).unwrap();
+        result
+    }
+
+    fn assert_refused(tag: &str, header: &str) {
+        match open_with_header(tag, header, &[0; 16]) {
+            Err(Error::Safetensors { .. }) => {}
+            Err(other) => panic!("{tag}: wrong error {other}"),
+            Ok(_) => panic!("{tag}: malformed header accepted"),
+        }
+    }
+
+    #[test]
+    fn well_formed_header_opens() {
+        let set = open_with_header(
+            "ok",
+            r#"{"t":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}}"#,
+            &[0; 16],
+        )
+        .unwrap();
+        assert_eq!(set.get("t").unwrap().data.len(), 16);
+    }
+
+    /// Header-derived sizes and offsets that overflow `usize` arithmetic are
+    /// refused with `Error::Safetensors`; unchecked, the debug build panics
+    /// and the release build wraps into a range that passes the bounds check.
+    #[test]
+    fn overflowing_headers_are_refused() {
+        let max = u64::MAX;
+        // The shape product overflows; wrapped, 2^62 * 2^2 * 4 bytes is 0,
+        // which an empty range would satisfy.
+        assert_refused(
+            "shape-product",
+            r#"{"t":{"dtype":"F32","shape":[4611686018427387904,4],"data_offsets":[0,0]}}"#,
+        );
+        // The element-size multiplication overflows (2^62 * 4 = 2^64).
+        assert_refused(
+            "elem-size",
+            r#"{"t":{"dtype":"F32","shape":[4611686018427387904],"data_offsets":[0,0]}}"#,
+        );
+        // `data_start + offset` overflows for both ends; wrapped, the range
+        // lands just inside the header and holds exactly 16 bytes.
+        assert_refused(
+            "offset-add",
+            &format!(
+                r#"{{"t":{{"dtype":"F32","shape":[4],"data_offsets":[{},{max}]}}}}"#,
+                max - 16
+            ),
+        );
+        // Offsets out of order.
+        assert_refused(
+            "reversed",
+            r#"{"t":{"dtype":"F32","shape":[0],"data_offsets":[8,0]}}"#,
+        );
+        // Past the end of the file.
+        assert_refused(
+            "past-end",
+            r#"{"t":{"dtype":"F32","shape":[8],"data_offsets":[0,32]}}"#,
+        );
+    }
+
+    #[test]
+    fn oversized_header_length_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "eidola-engine-model-st-{}-header-len",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        let mut bytes = u64::MAX.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}");
+        std::fs::write(&path, bytes).unwrap();
+        let result = WeightSet::open_files(std::slice::from_ref(&path));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(result, Err(Error::Safetensors { .. })));
+    }
 
     #[test]
     fn f16_decode() {
