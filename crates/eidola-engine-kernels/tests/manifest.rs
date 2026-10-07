@@ -46,14 +46,17 @@ fn inputs_match_committed_files() {
         );
         checked += 1;
     }
-    // And nothing new appeared in csrc/ that the build has not seen.
-    for entry in std::fs::read_dir(dir.join("csrc")).expect("csrc") {
-        let name = entry.expect("csrc entry").file_name();
-        let path = format!("csrc/{}", name.to_string_lossy());
-        assert!(
-            manifest.inputs.iter().any(|i| i.path == path),
-            "{path} is not in the manifest; rebuild the kernels"
-        );
+    // And nothing new appeared in csrc/ or nix/ (the sources and the whole build
+    // recipe, `default.nix` and `sources.nix` included) that the build has not seen.
+    for sub in ["csrc", "nix"] {
+        for entry in std::fs::read_dir(dir.join(sub)).expect(sub) {
+            let name = entry.expect("entry").file_name();
+            let path = format!("{sub}/{}", name.to_string_lossy());
+            assert!(
+                manifest.inputs.iter().any(|i| i.path == path),
+                "{path} is not in the manifest; rebuild the kernels"
+            );
+        }
     }
     assert!(checked >= 3);
 }

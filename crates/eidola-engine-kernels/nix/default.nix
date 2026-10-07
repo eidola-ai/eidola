@@ -70,10 +70,14 @@ cuda.backendStdenv.mkDerivation {
 
   src = lib.fileset.toSource {
     root = ../.;
+    # Everything this derivation evaluates or reads, so the build can hash it
+    # into the manifest's inputs: the recipe itself included.
     fileset = lib.fileset.unions [
       ../csrc
       ./build-kernels.sh
+      ./default.nix
       ./render-flashinfer-sink.sh
+      ./sources.nix
     ];
   };
 

@@ -127,11 +127,19 @@
     },
     {
       "path": "nix/build-kernels.sh",
-      "sha256": "c4a965c83f1d5e56088ecf6199f00d178e5acc9caa851742d1532927eb747e8a"
+      "sha256": "f7fc05c41f3441c4ed45e567ac1ef6bf77c2d97b26e8c6e42c5bc68fb49518e3"
+    },
+    {
+      "path": "nix/default.nix",
+      "sha256": "6830bd19cbcb2a1473bbe15918e3fb9ef41341c7d19a6d34f60a5159d8e61813"
     },
     {
       "path": "nix/render-flashinfer-sink.sh",
       "sha256": "213f75476961f9834b7f844bee7df93da2b4bba2407cf281223f582ead51a334"
+    },
+    {
+      "path": "nix/sources.nix",
+      "sha256": "0cdf20c2b25bfcd2f71ba7b42993ccc94b39a9e3e1ee7e6a4c692fa104bf5dcb"
     }
   ],
   "kernels": [

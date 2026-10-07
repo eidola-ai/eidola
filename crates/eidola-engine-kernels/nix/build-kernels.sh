@@ -186,7 +186,8 @@ done
 inputs_json="$SCRATCH_DIR/inputs.json"
 (
   cd "$KERNELS_DIR"
-  for f in csrc/* nix/build-kernels.sh nix/render-flashinfer-sink.sh; do
+  # Every committed file the build reads, the Nix recipe included.
+  for f in csrc/* nix/*; do
     jq -n --arg path "$f" --arg sha256 "$(sha256sum "$f" | cut -d' ' -f1)" \
       '{path: $path, sha256: $sha256}'
   done

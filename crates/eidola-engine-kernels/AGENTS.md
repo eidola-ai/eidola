@@ -109,13 +109,13 @@ Inside the container Nix runs with `sandbox = false` and `filter-syscalls = fals
 
 `cargo test -p eidola-engine-kernels` needs no toolkit. It checks that the committed manifest still describes the committed sources:
 
-- every `csrc/` file and build script hashes as recorded, and no new file has appeared;
+- every file under `csrc/` and `nix/` (the sources and the whole build recipe: `default.nix`, `sources.nix` and both scripts, all in the derivation's source set) hashes as recorded, and no new file has appeared in either;
 - the pins agree with `nix/sources.nix`;
 - the kernel × arch matrix and flags agree with `kernels.json`;
 - the SASS facts above hold;
 - every entry is bound to exactly one launch-contract record, and the aliases are exactly the bindings that differ from `<entry>_meta`.
 
-Editing a kernel without rebuilding fails here.
+Editing a kernel or the build recipe without rebuilding fails here.
 
 ## Adding a kernel
 
