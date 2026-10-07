@@ -975,3 +975,43 @@ fn padded_ids_are_refused_at_both_ends_of_the_seam() {
     }
     assert!(failed, "a padded id must fail the step");
 }
+
+/// A row sampling at position 0 (a one-token prompt) has nothing to draft from, so the
+/// scheduler reserves no drafts for it. With block size 1, k = 3 and two allocatable
+/// blocks, reserving them would make a request that plain decoding serves end with
+/// `Length` and no output; and the draft counter would count drafts that never existed.
+#[test]
+fn no_drafts_are_reserved_at_position_zero() {
+    use eidola_engine::mock::mimo_like_spec;
+
+    // Block size 1, 3 blocks per group (2 allocatable), k = 3.
+    let spec = mimo_like_spec(32, 1, 6, 10, 3, 4, 3);
+    let mut h = Harness::new(spec, sched(true), MockConfig::default());
+    let greedy = SamplingParams::greedy();
+    h.submit(request(1, vec![7], greedy, 1, CacheScope::Private));
+    h.run();
+    assert_eq!(h.outputs[&1], h.expected(&[7], &greedy, 1, &[]));
+    assert_eq!(h.outputs[&1].len(), 1);
+    assert_eq!(h.finished[&1], FinishReason::Length);
+    assert_eq!(h.eng.stats().drafted, 0);
+
+    // With room to speculate, only rows past position 0 draft: one-token prompts each
+    // contribute exactly k drafts per later decode step and none for their first token.
+    let mut h = Harness::new(small_spec(256), sched(true), MockConfig::default());
+    for id in 0..4 {
+        h.submit(request(
+            id,
+            vec![id as u32 + 1],
+            greedy,
+            2,
+            CacheScope::Private,
+        ));
+    }
+    h.run();
+    let stats = h.eng.stats();
+    assert_eq!(stats.drafted, 4 * 3, "{stats:?}");
+    for id in 0..4u64 {
+        let prompt = [id as u32 + 1];
+        assert_eq!(h.outputs[&id], h.expected(&prompt, &greedy, 2, &[]));
+    }
+}

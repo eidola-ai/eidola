@@ -32,6 +32,13 @@
 //!    target over them in the same pass (writing their KV to the slots the host reserved),
 //!    and applies [`crate::sampling::chain_accept`]. The result is `1..=k + 1` tokens.
 //!
+//!    **No drafts at position 0.** A drafter's first proposal continues from the state at
+//!    `p - 1` (MTP depth 0's row at `p` consumes the target's hidden state there), so a
+//!    row whose last host position is `p = 0` has nothing to draft from. The host never
+//!    gives such a row drafts, and an executor treats a request for them as a host bug
+//!    rather than quietly sampling plainly: KV reserved for drafts that cannot exist would
+//!    be wasted, and the draft counts would lie.
+//!
 //!    **Only sampleable ids.** Target sampling, the drafter's proposals, acceptance and the
 //!    residual all run over the first [`ModelSpec::sampleable_vocab_size`] entries of each
 //!    logit row ([`ModelSpec::logits`]); the padded rows past the tokenizer's last token
@@ -158,7 +165,9 @@ pub struct SeqEntry {
     /// Positions already in KV before this step (the first host token's position).
     pub context_len: u32,
     /// Tokens the executor drafts and verifies after the host tokens; the host has
-    /// reserved KV for them. Only meaningful with `sample`.
+    /// reserved KV for them. Only meaningful with `sample`, and always 0 when the last
+    /// host position is 0 (see the module docs: a drafter continues from the position
+    /// before it, and position 0 has none).
     pub num_drafts: u32,
     /// Whether this row produces tokens (false for a prefill chunk that does not reach the
     /// end of the known tokens).

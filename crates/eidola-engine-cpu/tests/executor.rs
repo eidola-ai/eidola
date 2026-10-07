@@ -325,3 +325,11 @@ fn more_drafts_than_depths_panics() {
     e.execute(&step(&[decode(0, 1, 6, 3)], vec![], vec![]))
         .unwrap();
 }
+
+#[test]
+#[should_panic(expected = "drafts requested at position 0")]
+fn drafts_at_position_zero_panic() {
+    let mut e = executor();
+    e.execute(&step(&[decode(0, 0, 5, 1)], vec![], map(&e, 0, 0, 1)))
+        .unwrap();
+}

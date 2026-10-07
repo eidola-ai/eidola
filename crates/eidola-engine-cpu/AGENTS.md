@@ -84,7 +84,7 @@ Taps are a function of the prefix, are zeroed and copied with their block, and c
 
 **Depths.** `mtp_depths` maps each depth to a loaded MTP layer, and its length is `k`. Flash ships 3 layers, so the default is `[0, 1, 2]` (SGLang's multi-layer MTP). The committed fixture ships 2, so the tests also run `[0, 1, 0]` to get `k = 3`.
 
-A row at position 0 cannot draft, because no hidden state precedes it, so it samples plainly.
+A row at position 0 cannot draft, because no hidden state precedes it. The seam forbids the host from asking (it never reserves drafts there), and the executor panics if asked, rather than quietly sampling plainly.
 
 Block drafters (DFlash) fit the same seam: `num_drafts = k`, context KV in the drafter group, and target taps in per-slot state. Nothing here assumes MTP outside the drafter code.
 

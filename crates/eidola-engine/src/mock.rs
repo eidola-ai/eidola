@@ -432,6 +432,11 @@ impl Executor for MockExecutor {
                 continue;
             }
             let last = e.context_len + e.num_tokens - 1;
+            if last == 0 && e.num_drafts > 0 {
+                return Err(ExecutorError(
+                    "drafts requested at position 0, where none can exist".into(),
+                ));
+            }
             let params = e.sampling;
             let produced = if e.num_drafts == 0 {
                 let (logits, _) = self.target_probs(e.slot, last, &params)?;

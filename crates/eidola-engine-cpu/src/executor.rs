@@ -876,16 +876,18 @@ impl Executor for CpuExecutor {
                 );
             }
             let p = e.context_len + e.num_tokens - 1;
-            let mut k = if e.sample { e.num_drafts } else { 0 };
+            let k = if e.sample { e.num_drafts } else { 0 };
             assert!(
                 k as usize <= depths,
                 "{k} drafts requested; the drafter has {depths} depths"
             );
-            if p == 0 {
-                // No drafter row exists for position 0 (MTP continues from the previous
-                // position's hidden state): the row samples plainly.
-                k = 0;
-            }
+            // No drafter row exists for position 0 (MTP continues from the previous
+            // position's hidden state), and the seam forbids asking for one.
+            assert!(
+                p > 0 || k == 0,
+                "slot {}: {k} drafts requested at position 0",
+                e.slot
+            );
             rows.push(Row {
                 slot: e.slot,
                 c: e.context_len,

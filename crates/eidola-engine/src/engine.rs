@@ -576,9 +576,15 @@ impl<E: Executor> Engine<E> {
         debug_assert!(pending >= 1);
         let (num_tokens, num_drafts) = if pending == 1 {
             // Never draft past the model length: the last written position is
-            // `computed + drafts` and the output may grow by `drafts + 1`.
+            // `computed + drafts` and the output may grow by `drafts + 1`. Never draft
+            // from position 0 either: there is no earlier state to draft from (seam rule
+            // in `executor.rs`).
             let room = self.spec.max_model_len.saturating_sub(len);
-            let d = k.min(room.saturating_sub(1));
+            let d = if computed == 0 {
+                0
+            } else {
+                k.min(room.saturating_sub(1))
+            };
             (1, d)
         } else {
             (pending.min(self.config.max_prefill_chunk), 0)
