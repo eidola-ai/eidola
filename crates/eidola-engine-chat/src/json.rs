@@ -142,6 +142,17 @@ pub enum Json {
 }
 
 impl Json {
+    /// Whether every float in the tree is finite, so that `dumps` writes strict JSON
+    /// (a non-finite float prints as `NaN` or `Infinity`).
+    pub fn is_finite(&self) -> bool {
+        match self {
+            Json::Float(f) => f.is_finite(),
+            Json::Array(items) => items.iter().all(Json::is_finite),
+            Json::Object(members) => members.iter().all(|(_, v)| v.is_finite()),
+            _ => true,
+        }
+    }
+
     /// Looks up an object member.
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
@@ -287,6 +298,23 @@ impl std::error::Error for ParseError {}
 /// Parses RFC 8259 JSON with Python value semantics.
 pub fn parse(text: &str) -> Result<Json, ParseError> {
     Parser::new(text, false).parse_document()
+}
+
+/// Parses RFC 8259 JSON whose every number is representable: [`parse`], refusing a
+/// document in which any float overflowed to infinity (`1e400`). Python's `json.loads`
+/// yields `inf` there and `json.dumps` writes it back as `Infinity`, which is not JSON;
+/// a value that must reach a strict JSON consumer (tool-call `arguments`) goes through
+/// this instead.
+pub fn parse_strict(text: &str) -> Result<Json, ParseError> {
+    let value = parse(text)?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(ParseError {
+            message: "number out of range".into(),
+            offset: 0,
+        })
+    }
 }
 
 /// Parses like Python's default `json.loads`, which also accepts the `NaN`,

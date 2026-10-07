@@ -351,7 +351,7 @@ mod tests {
             proptest::prop_assert_eq!(&streamed, &at_once);
             proptest::prop_assert_eq!(reason, reason_whole);
             for call in &streamed.tool_calls {
-                proptest::prop_assert!(matches!(json::parse(&call.arguments), Ok(json::Json::Object(_))));
+                proptest::prop_assert!(matches!(json::parse_strict(&call.arguments), Ok(json::Json::Object(_))));
             }
         }
 

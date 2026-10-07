@@ -475,6 +475,9 @@ mod tests {
         "call>",
         "</tool",
         "=",
+        "1e400",
+        "[-1e400]",
+        "{\"x\": 1e999}",
     ];
 
     proptest! {
@@ -486,7 +489,31 @@ mod tests {
             let text: String = pieces.iter().map(|&i| FRAGMENTS[i]).collect();
             let mut cuts = cuts;
             cuts.sort();
-            prop_assert_eq!(stream(&text, &cuts), parse_complete(&text, &schemas()));
+            let streamed = stream(&text, &cuts);
+            prop_assert_eq!(&streamed, &parse_complete(&text, &schemas()));
+            // Every `arguments` is strict JSON (no `Infinity` from an overflowing
+            // number) and an object.
+            for (_, arguments) in streamed.calls {
+                prop_assert!(matches!(json::parse_strict(&arguments), Ok(json::Json::Object(_))), "{arguments}");
+            }
+        }
+
+        /// Overflowing numbers in every non-string parameter, streamed whole.
+        #[test]
+        fn overflowing_parameters_stay_strict_json(
+            days in proptest::sample::select(vec!["1e400", "-1e400", "[1e400]", "{\"a\": [1e999]}"]),
+            opts in proptest::sample::select(vec!["1e400", "{\"a\": -1e400}", "[1, 1e400]"]),
+        ) {
+            let text = format!(
+                "<tool_call><function=get_weather><parameter=days>{days}</parameter></function></tool_call>\
+                 <tool_call><function=run><parameter=opts>{opts}</parameter></function></tool_call>"
+            );
+            let parsed = parse_complete(&text, &schemas());
+            prop_assert_eq!(parsed.calls.len(), 2);
+            for (_, arguments) in parsed.calls {
+                prop_assert!(matches!(json::parse_strict(&arguments), Ok(json::Json::Object(_))), "{arguments}");
+                prop_assert!(serde_json::from_str::<serde_json::Value>(&arguments).is_ok(), "{arguments}");
+            }
         }
 
         #[test]
@@ -496,7 +523,7 @@ mod tests {
             let streamed = stream(&text, &cuts);
             prop_assert_eq!(&streamed, &parse_complete(&text, &schemas()));
             for (_, arguments) in streamed.calls {
-                prop_assert!(matches!(json::parse(&arguments), Ok(json::Json::Object(_))));
+                prop_assert!(matches!(json::parse_strict(&arguments), Ok(json::Json::Object(_))));
             }
         }
     }

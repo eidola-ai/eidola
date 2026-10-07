@@ -134,11 +134,20 @@ impl ToolSchemas {
     }
 
     /// Converts the raw text of `param` in a call to `function`.
+    ///
+    /// Whatever the rule, the result is finite, so the `arguments` object it goes into
+    /// always serializes to strict JSON: a value with a non-finite float anywhere in it
+    /// (which `dumps` would write as `NaN` or `Infinity`) degrades to the raw text.
     pub fn convert(&self, function: &str, param: &str, raw: &str) -> Json {
         let t = self.param_type(function, param);
-        match self.typing {
+        let value = match self.typing {
             ArgumentTyping::Sglang => convert_parameter_sglang(raw, &t),
             ArgumentTyping::RoundTrip => convert_parameter_round_trip(raw, &t),
+        };
+        if value.is_finite() {
+            value
+        } else {
+            Json::Str(raw.to_string())
         }
     }
 
@@ -346,11 +355,7 @@ pub fn convert_parameter_sglang(raw: &str, param_type: &str) -> Json {
     if is_json_container_type(t)
         && let Ok(parsed) = json::parse_python_lenient(&value)
     {
-        return if is_finite_json(&parsed) {
-            parsed
-        } else {
-            text()
-        };
+        return if parsed.is_finite() { parsed } else { text() };
     }
     literal_value(&value).unwrap_or_else(text)
 }
@@ -363,7 +368,9 @@ pub fn convert_parameter_round_trip(raw: &str, param_type: &str) -> Json {
     if STRING_TYPES.contains(&t) {
         return text();
     }
-    if let Ok(parsed) = json::parse(raw) {
+    // Strict: a number that overflows (`1e400`) is not taken as JSON here, and falls
+    // through to the typed fallbacks, which refuse non-finite values too.
+    if let Ok(parsed) = json::parse_strict(raw) {
         return parsed;
     }
     if starts_with_any(t, INT_PREFIXES) {
@@ -380,15 +387,6 @@ pub fn convert_parameter_round_trip(raw: &str, param_type: &str) -> Json {
         };
     }
     literal_value(raw).unwrap_or_else(text)
-}
-
-fn is_finite_json(value: &Json) -> bool {
-    match value {
-        Json::Float(f) => f.is_finite(),
-        Json::Array(items) => items.iter().all(is_finite_json),
-        Json::Object(members) => members.iter().all(|(_, v)| is_finite_json(v)),
-        _ => true,
-    }
 }
 
 /// `json.dumps` of a literal value, as a [`Json`]; `None` where `json.dumps`
@@ -524,10 +522,51 @@ mod tests {
         assert_eq!(schemas.param_type("nope", "x"), "string");
     }
 
+    /// A number that overflows binary64 (`1e400`), at the top level or nested, never
+    /// reaches `arguments` as `Infinity`: under either rule the converted value
+    /// serializes to strict JSON (checked with serde_json too), and the round-trip rule
+    /// keeps the model's text.
+    #[test]
+    fn overflowing_numbers_never_become_infinity() {
+        let tools = json::parse(
+            r#"[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{
+                "n":{"type":"number"},"i":{"type":"integer"},"a":{"type":"array"},"o":{"type":"object"},
+                "u":{"type":"custom"}}}}}]"#,
+        )
+        .unwrap();
+        for typing in [ArgumentTyping::RoundTrip, ArgumentTyping::Sglang] {
+            let schemas = ToolSchemas::from_tools(&tools).with_typing(typing);
+            for (param, raw) in [
+                ("n", "1e400"),
+                ("n", "-1e400"),
+                ("i", "1e400"),
+                ("a", "[1, 1e400]"),
+                ("o", r#"{"x": {"y": -1e999}}"#),
+                ("u", "1e400"),
+            ] {
+                let value = schemas.convert("f", param, raw);
+                let text = json::dumps_default(&value);
+                assert!(
+                    json::parse_strict(&text).is_ok(),
+                    "{typing:?} {param}: {text}"
+                );
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+                    "{typing:?} {param}: {text}"
+                );
+                if typing == ArgumentTyping::RoundTrip {
+                    assert_eq!(value, Json::Str(raw.to_string()), "{param}");
+                }
+            }
+        }
+    }
+
     proptest::proptest! {
         #[test]
         fn any_text_converts_to_valid_json(
             raw in proptest::prop_oneof![
+                "-?[0-9]e[34][0-9]{2}",
+                "\\[[0-9]e400(, -?1e[0-9]{3})*\\]",
                 "\\PC{0,40}",
                 "[\\[\\]{}(),:'\"\\\\#\n +\\-.0-9eEjxXbBoO_a-zA-Z&;]{0,40}",
             ],
@@ -537,7 +576,7 @@ mod tests {
         ) {
             for value in [convert_parameter_sglang(&raw, t), convert_parameter_round_trip(&raw, t)] {
                 let text = json::dumps_default(&value);
-                proptest::prop_assert!(json::parse(&text).is_ok(), "{text}");
+                proptest::prop_assert!(json::parse_strict(&text).is_ok(), "{text}");
             }
         }
     }

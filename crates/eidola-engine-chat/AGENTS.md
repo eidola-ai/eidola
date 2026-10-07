@@ -60,7 +60,7 @@ SGLang's MiMo detector types by schema too, but its conversion was rejected beca
 
 `pysem` reproduces the CPython pieces the lenient fallbacks (and SGLang's rule) rely on (`str.strip`, `int`, `float`, `html.unescape`, `ast.literal_eval`), with tables generated from CPython (`src/pysem/tables.rs`). The one known gap: `\N{NAME}` escapes in a Python literal are not decoded (the parameter stays text).
 
-**Safety rules** (all parsers): no input can panic (property tests over arbitrary text, token ids and splits); scanning is linear; recursion is bounded (JSON 256 levels, Python literals 200); arguments are always a valid JSON object; streaming output equals complete-output parsing for every split.
+**Safety rules** (all parsers): no input can panic (property tests over arbitrary text, token ids and splits); scanning is linear; recursion is bounded (JSON 256 levels, Python literals 200); arguments are always a valid, strict JSON object (`ToolSchemas::convert` degrades any value with a non-finite float to its text, and the round-trip rule parses with `json::parse_strict`, so an overflowing `1e400` never becomes `Infinity`; the property tests re-parse every `arguments` strictly); streaming output equals complete-output parsing for every split.
 
 **Format limits**: a string value containing `</parameter>`, `</function>` or `</tool_call>`, or a name containing `>`, cannot be represented in MiMo's format by any parser.
 
