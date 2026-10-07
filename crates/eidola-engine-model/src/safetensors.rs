@@ -249,6 +249,17 @@ impl WeightSet {
         let mut tensors = HashMap::new();
         for (fi, path) in paths.iter().enumerate() {
             let (mapped, entries) = map_file(path, fi)?;
+            // The integrity manifest is keyed by file name, so two shards with
+            // one name would leave one of them unverified.
+            if files.iter().any(|f: &MappedFile| f.name == mapped.name) {
+                return Err(Error::Safetensors {
+                    path: path.clone(),
+                    reason: format!(
+                        "another loaded file is also named {}; integrity keys files by name",
+                        mapped.name
+                    ),
+                });
+            }
             for (name, entry) in entries {
                 if tensors.contains_key(&name) {
                     return Err(Error::Safetensors {
@@ -522,6 +533,29 @@ mod tests {
             Err(other) => panic!("{tag}: wrong error {other}"),
             Ok(_) => panic!("{tag}: malformed header accepted"),
         }
+    }
+
+    /// Two shards with one file name (from different directories) are refused:
+    /// the manifest could only ever cover one of them.
+    #[test]
+    fn duplicate_file_names_are_refused() {
+        let root =
+            std::env::temp_dir().join(format!("eidola-engine-model-st-{}-dup", std::process::id()));
+        let mut paths = Vec::new();
+        for (dir, tensor) in [("a", "x"), ("b", "y")] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            let header =
+                format!(r#"{{"{tensor}":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#);
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&[0; 4]);
+            let path = root.join(dir).join("model.safetensors");
+            std::fs::write(&path, bytes).unwrap();
+            paths.push(path);
+        }
+        let result = WeightSet::open_files(&paths);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(result, Err(Error::Safetensors { .. })));
     }
 
     #[test]
