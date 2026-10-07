@@ -401,6 +401,30 @@ impl KvManager {
         self.seqs.insert(id, seq);
     }
 
+    /// Drops `id`'s regeneration pins and releases the sliding-window blocks they alone
+    /// kept mapped (those already behind the window). The prompt's regeneration point is
+    /// then no longer retained at release; the sequence itself loses nothing. Returns
+    /// whether any block was freed.
+    pub fn unpin(&mut self, id: SeqId) -> bool {
+        let mut seq = self.seqs.remove(&id).expect("live sequence");
+        let mut freed = false;
+        for g in 0..self.pools.len() {
+            let (lo, hi) = std::mem::replace(&mut seq.pins[g], (0, 0));
+            let behind = hi.min(seq.slide_cursor[g]);
+            for idx in lo..behind {
+                if seq.blocks[g]
+                    .get(idx as usize)
+                    .is_some_and(|&b| b != NULL_BLOCK)
+                {
+                    self.unmap(&mut seq, g, idx as usize);
+                    freed = true;
+                }
+            }
+        }
+        self.seqs.insert(id, seq);
+        freed
+    }
+
     /// Records that positions `[0, computed)` of `id` hold valid KV after a step: releases
     /// blocks past it (speculative rollback), seals newly full blocks into the cache, and
     /// releases sliding-window blocks that left the window.

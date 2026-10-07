@@ -1113,3 +1113,35 @@ fn no_regeneration_pins_without_caching() {
     assert_eq!(h.outputs[&1], h.expected(&prompt, &greedy, 8, &[]));
     assert_eq!(h.outputs[&1].len(), 8);
 }
+
+/// `Length` means the sequence cannot make its minimum progress even holding every
+/// reclaimable block. Under the tight sliding geometry, before concluding that the
+/// scheduler sheds drafts, then the prefill chunk (down to one block), then the
+/// sequence's own regeneration pins. Each case used to end with `Length` early (the
+/// 8-token prompt with no output at all).
+#[test]
+fn optional_reservations_are_shed_before_length() {
+    let greedy = SamplingParams::greedy();
+    for spec_on in [false, true] {
+        for (prompt, chunk) in [
+            // Needs the prefill chunk cut: 8 tokens at once is four sliding blocks.
+            (vec![1u32, 2, 3, 4, 5, 6, 7, 8], 8),
+            // Needs the regeneration pins dropped (caching on): the prompt's window
+            // stays pinned behind the sliding window once decoding moves on.
+            (vec![1u32, 2, 3, 4, 5], 2),
+        ] {
+            let mut cfg = sched(spec_on);
+            cfg.max_prefill_chunk = chunk;
+            let mut h = Harness::new(tight_sliding_spec(), cfg, MockConfig::default());
+            h.submit(request(1, prompt.clone(), greedy, 8, CacheScope::Private));
+            h.run();
+            assert_eq!(
+                h.outputs[&1],
+                h.expected(&prompt, &greedy, 8, &[]),
+                "speculative {spec_on}, prompt {prompt:?}"
+            );
+            assert_eq!(h.outputs[&1].len(), 8);
+            assert_eq!(h.eng.stats().preemptions, 0);
+        }
+    }
+}

@@ -568,17 +568,30 @@ impl<E: Executor> Engine<E> {
         }
     }
 
-    /// Maps KV for a row being planned.
+    /// Maps KV for a row being planned, shedding optional reservations under pressure.
     ///
-    /// Draft reservations are always the first thing given up under KV pressure, across
-    /// the whole step: the first time a row does not fit, the step stops speculating. Every
-    /// row already planned gives back its draft reservation ([`KvManager::shrink`], its
-    /// budget returned), this row drops its own drafts, and later rows plan with none
-    /// (`k` becomes 0). The row is then retried as plain decoding. Only when that fails
-    /// too does this return false, leaving the caller to preempt or finish, by which point
-    /// no row in the step holds drafts. Revoking all at once keeps the all-or-nothing rule
-    /// (a row drafts `k` or nothing) and makes a step under pressure a uniform plain
-    /// decode. Drafts are an optimisation and never cost a sequence its output.
+    /// A row's **minimum progress unit** is one host token for a decode row, and for a
+    /// prefill row the tokens up to the next block boundary: at most one new block per
+    /// group, after which the block seals and sliding windows can recycle behind it.
+    /// Anything beyond that is optional and is given up, in this order, each step
+    /// followed by a retry:
+    ///
+    /// 1. **Drafts, across the whole step.** The first time a row does not fit, the step
+    ///    stops speculating: every row already planned gives back its draft reservation
+    ///    ([`KvManager::shrink`], its budget returned), this row drops its own, and later
+    ///    rows plan with none (`k` becomes 0). Revoking all at once keeps the
+    ///    all-or-nothing rule (a row drafts `k` or nothing) and makes a step under
+    ///    pressure a uniform plain decode.
+    /// 2. **The prefill chunk**, cut to the minimum progress unit.
+    /// 3. **This sequence's regeneration pins** ([`KvManager::unpin`]): retention of the
+    ///    prompt's last window for a future regeneration hit, which the sequence itself
+    ///    never needs.
+    ///
+    /// Only when the minimum progress unit still does not fit does this return false;
+    /// the caller then preempts the newest peer and retries, and a sequence that is
+    /// alone ends with `Length`. So `Length` means exactly "cannot make minimum progress
+    /// even holding every reclaimable block" (evictable cache entries are reclaimed by
+    /// [`KvManager::allocate`] itself).
     fn allocate_row(
         &mut self,
         id: RequestId,
@@ -588,23 +601,40 @@ impl<E: Executor> Engine<E> {
         budget: &mut u32,
         k: &mut u32,
     ) -> bool {
-        let upto = entry.context_len + entry.num_tokens;
-        if self.kv.allocate(id, upto + entry.num_drafts) {
+        let fits = |kv: &mut KvManager, e: &SeqEntry| {
+            kv.allocate(id, e.context_len + e.num_tokens + e.num_drafts)
+        };
+        if fits(&mut self.kv, entry) {
             return true;
         }
-        if *k == 0 && entry.num_drafts == 0 {
-            return false;
+        // 1. Drafts, step-wide.
+        if *k > 0 || entry.num_drafts > 0 {
+            *k = 0;
+            for p in planned.iter_mut().filter(|p| p.entry.num_drafts > 0) {
+                self.kv
+                    .shrink(p.id, p.entry.context_len + p.entry.num_tokens);
+                *budget += p.entry.num_drafts;
+                p.entry.num_drafts = 0;
+            }
+            *cost -= entry.num_drafts;
+            entry.num_drafts = 0;
+            if fits(&mut self.kv, entry) {
+                return true;
+            }
         }
-        *k = 0;
-        for p in planned.iter_mut().filter(|p| p.entry.num_drafts > 0) {
-            self.kv
-                .shrink(p.id, p.entry.context_len + p.entry.num_tokens);
-            *budget += p.entry.num_drafts;
-            p.entry.num_drafts = 0;
+        // 2. The prefill chunk, down to the next block boundary.
+        let unit = self.spec.block_size - entry.context_len % self.spec.block_size;
+        if entry.num_tokens > unit {
+            let len = self.seqs[&id].tokens.len() as u32;
+            *cost -= entry.num_tokens - unit;
+            entry.num_tokens = unit;
+            entry.sample = entry.context_len + unit == len;
+            if fits(&mut self.kv, entry) {
+                return true;
+            }
         }
-        *cost -= entry.num_drafts;
-        entry.num_drafts = 0;
-        self.kv.allocate(id, upto)
+        // 3. This sequence's regeneration pins.
+        self.kv.unpin(id) && fits(&mut self.kv, entry)
     }
 
     /// Plans the row for a running (or just admitted) sequence within `budget` query tokens.
