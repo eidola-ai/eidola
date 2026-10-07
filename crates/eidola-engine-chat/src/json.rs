@@ -311,7 +311,7 @@ pub fn parse_strict(text: &str) -> Result<Json, ParseError> {
         Ok(value)
     } else {
         Err(ParseError {
-            message: "number out of range".into(),
+            message: "number out of range",
             offset: 0,
         })
     }
