@@ -1,0 +1,157 @@
+# eidola-engine-cpu
+
+The CPU reference executor for the MiMo-V2.6 engine: `CpuExecutor` implements the serving core's `Executor` (`eidola-engine`) with the model crate's f32 reference numerics (`eidola-engine-model`), over paged KV, with MTP drafting and sampling inside the step. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
+
+It is not a serving backend. It exists for two reasons:
+
+- **It is the oracle for every other executor.** A GPU executor is diffed against it row for row: same step inputs, same tokens, logits equal within that executor's documented tolerance.
+- **It proves the contract can be met exactly.** Paged, chunked, prefix-cached, preempted and speculative execution through the real scheduler reproduces the dense reference forward bit for bit.
+
+| Module | Contents |
+|---|---|
+| `executor.rs` | `CpuExecutor`, `CpuExecutorConfig`, `MtpHidden`, `RowRecord`. |
+| `pool.rs` | Physical KV pools, laid out by block, with per-row position tags. |
+| `oracle.rs` | `DenseOracle`: the dense forward plus the MTP chain in the executor's row layout; `dense_generate`, `check_generation`. |
+
+## What the executor does
+
+It follows the seam contract in `eidola-engine/src/executor.rs`, which is normative. This section covers only what that contract leaves to the executor.
+
+**Memory.** There is one pool per KV group:
+
+- target groups, one per (attention kind, KV shape): global and sliding for MiMo;
+- one drafter group (`KvRole::Drafter`), whose layers are the draft depths.
+
+A block holds every layer's `[K | V]` rows for `block_size` positions, contiguously. `Maintenance::Zero` overwrites the whole block with zero bytes, including the drafter tap and the tags. `Copy` copies all of it.
+
+Block tables are per slot and change only through `TableUpdate` and `ResetSlot`. KV is read only through them. Each stored row carries a tag (position and token). A read that lands on an unmapped block, a zeroed row or another position's row panics, and so does a write to a block mapped more than once. Contract violations are host bugs, so they panic rather than return an error.
+
+**A step** runs in this order:
+
+1. Maintenance, then table updates.
+2. The target over every host token.
+3. The drafter over every host position, depth by depth.
+4. The draft chain.
+5. The target over the drafts.
+6. Sampling and `chain_accept`.
+7. Drafter rows for accepted drafts that the chain did not already compute.
+8. Drafter state and boundary taps.
+
+The target runs in two passes (steps 2 and 5). Row independence makes that identical to one pass. A GPU executor runs one pass, ordering the drafter first for decode rows (their drafter inputs all come from earlier steps).
+
+`pad_batches` pads the target batch to the bucket's token count. A test shows the padding rows change nothing.
+
+**Sampling** calls `eidola_engine::sampling` (`sample`, `processed_probs`, `sample_from`, `chain_accept`) directly, so it matches the core's semantics bit for bit. Draft draws use `Stream::Draft` at the drafted token's position. A greedy draft is the drafter's argmax, with a one-hot `q`.
+
+## MTP row layout
+
+This is the part of the design a GPU executor must copy.
+
+**Rows.** MTP depth `d`'s row at **slot** `s`:
+
+- consumes the token at `s`, and chain level `d` at `s - 1`;
+  - level 0 is the main model's hidden state;
+  - level `d` is depth `d - 1`'s output;
+- uses RoPE position `s - 1`;
+- writes its KV at `s`;
+- predicts the token at `s + 1`.
+
+Rows exist for `s >= d + 1`. The draft for position `p + 1 + i` is depth `i`'s prediction at slot `p + i`, where `p` is the row's last host position.
+
+**Why this layout.** Indexing a row by the token it consumes makes drafter KV at `s` a function of tokens `0 ..= s` alone. That is the determinism contract, so drafter blocks are sealed and shared exactly like target blocks, and `drafter_lag` is 0.
+
+The alternative is to index the row by the hidden state it continues from (`p` for `(h_p, t_{p+1})`, as vLLM stores it). Under that indexing, a block's last drafter row depends on the next block's first token, which the block hash does not cover, so a prefix hit with a different continuation would reuse wrong drafter KV. Delaying sealing by a lag does not fix this, because the hash still stops at the block boundary. vLLM avoids the problem by dropping the last matched block on a hit.
+
+**Chaining.** With this layout, every speculative drafter row in the chain sits at a slot the host reserved for drafts (`p + 1 ..= p + k`). Depth `i` needs `i` speculative rows there, at slots `p + 1 ..= p + i`, each consuming drafts `1 ..= i`. Each such row is exact once its drafts are accepted. Step 7 fills in only the accepted rows the chain did not cover.
+
+**Boundary taps.** A row continuing at context `c` needs chain levels `0 .. k` at `c - 1`.
+
+- For a running sequence they are per-slot state, left by the previous step at its last valid position.
+- After a prefix hit or a resume, the slot is fresh. The host only resumes on block boundaries, so the executor stores, in every drafter block, the levels at the block's last position (the *tap*). A fresh slot loads its state from the tap of the block ending at `c - 1`.
+
+Taps are a function of the prefix, are zeroed and copied with their block, and cost `k · hidden` floats per drafter block. Resuming anywhere else panics.
+
+**Chaining semantics.** The oracles disagree on which hidden state feeds MTP depth 0 and each following depth:
+
+| Source | State fed forward |
+|---|---|
+| vLLM and SGLang (the vendor's serving path) | the normed state (after the main model's `norm`, or after the MTP layer's `final_layernorm`) |
+| llama.cpp | the pre-norm state |
+
+`MtpHidden::Normed` is the default and `MtpHidden::PreNorm` is selectable. Both are exact against their oracle. The two are different functions (a test asserts this). Which one the checkpoint was trained for is settled by measuring acceptance rates on a GPU against the vendor's serving stack. The random-weight fixture cannot tell them apart.
+
+**Depths.** `mtp_depths` maps each depth to a loaded MTP layer, and its length is `k`. Flash ships 3 layers, so the default is `[0, 1, 2]` (SGLang's multi-layer MTP). The committed fixture ships 2, so the tests also run `[0, 1, 0]` to get `k = 3`.
+
+A row at position 0 cannot draft, because no hidden state precedes it, so it samples plainly.
+
+Block drafters (DFlash) fit the same seam: `num_drafts = k`, context KV in the drafter group, and target taps in per-slot state. Nothing here assumes MTP outside the drafter code.
+
+## Numerics: why it is bit-exact
+
+The executor calls the model crate's public kernels in the reference's order:
+
+- `linear`, `rms_norm_rows`, `rope_cos_sin`/`apply_rope`, `attend`;
+- `ReferenceModel::moe` and `dense_ffn`;
+- the shared `lm_head`.
+
+Attention gathers keys and values through the block tables in ascending position, which is exactly the set and order the dense reference passes to `attend`.
+
+Every kernel computes one output row at a time in a fixed order, so a row's bits do not depend on the batch, the padding, the slot, the physical block or the chunking. KV is stored and read as exact f32 copies.
+
+No tolerance is needed anywhere. The tests compare `f32::to_bits`.
+
+## Proofs and how to run them
+
+```sh
+cargo test -p eidola-engine-cpu          # ~6 min unoptimised; no network, no Python
+```
+
+The tests use the model crate's committed synthetic fixture (4 layers, window 8, 2 MTP layers, vocabulary 256), plus models derived from it in Rust:
+
+- the vocabulary cut to its first few ids, for statistics;
+- an *echo* drafter, whose MTP layers carry the target's state forward, so greedy chains are accepted whole.
+
+The random fixture's MTP layers are unrelated to its target, so its greedy acceptance is near zero. Under sampling it accepts about 5–20 %.
+
+**Checking.** With `record`, the executor logs every row's tokens (the prefix read back through the block tables), its target logits at every computed position, its drafter logits at every drafter row, its drafts and its output. `tests/common` checks each record bit for bit against `DenseOracle` on the same tokens. It also recomputes every draft draw and `chain_accept` from the dense logits, and checks every finished output against dense generation.
+
+| File | What it proves |
+|---|---|
+| `tests/engine.rs` | Through the engine: single requests (greedy and seeded), chunk sizes 1–1000, greedy speculation equals plain at `k` = 1, 2, 3, seeded sampling with three depths, prefix hits and salt isolation (including drafter resume from taps), preemption and resume, idle-TTL eviction and eviction mid-workload (exactly the evicted blocks zeroed in the pools), cancellation, `PreNorm` chaining, unfolded value scale, padded batches, and a randomized workload. The randomized workload covers multi-turn keyed conversations, private requests, cancellations, TTL jumps, small pools and `k` ∈ {1, 2, 3}, and checks the KV invariants and "every free block is zero or queued" after every step. |
+| `tests/executor.rs` | Driven directly through the seam: zero really zeroes (and only the named block), a copied block plus its tap resumes exactly in a fresh slot, and rows are independent of batch, slot and chunking. Panics on unmapped reads, zeroed reads, shared-block writes, resuming off a boundary, and too many drafts. |
+| `tests/speculative.rs` | Echo drafter: greedy speculation equals plain decoding, with about 97 % acceptance and whole chains accepted. Vocabulary 4: the joint distribution of three speculative samples (three chained depths) passes a chi-square fit against the exact dense distribution at p = 0.001, for plain temperature and for filtered sampling. |
+| `tests/real_flash.rs` (ignored) | The truncated real Flash checkpoint (layers 0, 1, 2, 5 plus 3 MTP layers): chunked prefill, MTP-3 speculation and a prefix hit through the engine. Every logit row is bit-exact against the dense forward. |
+
+**Every proof fails under a deliberate bug.** Each of these mutations was checked to fail the suite:
+
+- drafter RoPE at `s` instead of `s - 1`;
+- no post-acceptance drafter rows;
+- no boundary taps;
+- `Zero` leaving the data;
+- the window off by one;
+- ignoring per-slot state;
+- the wrong random stream for drafts;
+- a chain row skipped;
+- a drafter reading below its first row.
+
+Keep that true when changing the tests.
+
+The ignored real-weights test needs the cached checkpoint that the model crate's `golden/fetch_truncated.py` produces:
+
+```sh
+cargo test --release -p eidola-engine-cpu --test real_flash -- --ignored --nocapture
+```
+
+Measured on a 16-core Apple-silicon machine (128 GB), release build:
+
+- **Load:** 5 s.
+- **Run:** request 1 (40-token prompt, chunk 16, 4 greedy tokens with MTP-3) takes 6 steps in 4.2 s. Request 2 (60-token prompt, 32-token hit, 6 tokens) takes 7 steps in 2.8 s. Every computed position's logits go through the 152k-row head (`record`).
+- **Check:** 21 s against the dense forward. 100 target rows and 246 drafter rows, all bit-exact. 45 s wall in total.
+- **Acceptance:** 0 of 24 drafts. Four of 48 target layers do not predict like the model the MTP heads were trained against, so this run says nothing about acceptance on the full model.
+
+## The contract a faster executor must meet
+
+1. Implement `Executor`, honouring the seam contract and the MTP row layout above.
+2. Run this crate's workloads with the faster executor in place of `CpuExecutor`. Compare each step's outputs and returned logits with `CpuExecutor` on the same inputs, or with `DenseOracle` directly.
+3. Where bit equality is impossible (non-batch-invariant GEMMs or attention, lower precision), document the tolerance and why. Greedy outputs must still match except at documented near-ties.
+4. Keep the zero-on-free observable: after maintenance, a freed block must hold no data from its previous owner.
