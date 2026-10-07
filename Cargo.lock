@@ -2850,6 +2850,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidola-engine-cpu"
+version = "0.1.0"
+
+[[package]]
 name = "eidola-engine-kernels"
 version = "0.1.0"
 dependencies = [
