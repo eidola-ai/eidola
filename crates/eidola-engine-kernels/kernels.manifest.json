@@ -98,6 +98,10 @@
   },
   "inputs": [
     {
+      "path": "csrc/cutlass_bf16_gemm.cu",
+      "sha256": "202854c0dae292662ed5f5c9ebc7cac30c3b3ec280fff48d499ef35518765c5e"
+    },
+    {
       "path": "csrc/cutlass_fp8_blockwise_gemm.cu",
       "sha256": "0d0b0a25f98192d772de6e56da1e25366882604006f8eb6a0dcde595932efc5c"
     },
@@ -110,16 +114,24 @@
       "sha256": "1981aeed1a06e214fdb23c4723dfeac389c76d0df311fc31a4295a2627a399fb"
     },
     {
+      "path": "csrc/engine_ops.cu",
+      "sha256": "9774f0329d72efb17dffde3460542c9fc20e56a677d04568a665e7d2a93b2d7e"
+    },
+    {
       "path": "csrc/flashinfer_fa2_sink_paged.cu",
       "sha256": "8157a71f063d7857c7c1123337859f37c4de247675fc70f5f2cf0daa8a643645"
     },
     {
       "path": "csrc/kernels.json",
-      "sha256": "bc1ca978070cbd8528daf1ee29259ef19776bbfc5be4e298e4cd9abdec645e9e"
+      "sha256": "76aaf1305070f9413d5383a21e2eb13af65b7f5cb3c49b9d50e81cf9ffbb6011"
     },
     {
       "path": "csrc/rmsnorm.cu",
       "sha256": "a59065bb35f28e42b0876e2b2fb2e824daab63f134e55aba6d1d9d9106a4c291"
+    },
+    {
+      "path": "csrc/sampling.cu",
+      "sha256": "565a7ebd513510c0afb71694ba22c5361dc9b36a378e46f24bd392341d0457f0"
     },
     {
       "path": "generated/flashinfer_sink/batch_prefill_config.inc",
@@ -143,6 +155,78 @@
     }
   ],
   "kernels": [
+    {
+      "name": "cutlass_bf16_gemm",
+      "arch": "sm_100a",
+      "source": "csrc/cutlass_bf16_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_bf16_gemm.sm_100a.cubin",
+      "sha256": "70b0c4765baa1a54fb69fa0da62fff585087d9314d8fa2f627a2248447c1ac55",
+      "size": 65808,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_bf16_gemm_f32",
+          "demangled": "eidola_cutlass_bf16_gemm_f32",
+          "meta": "eidola_cutlass_bf16_gemm_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_bf16_gemm_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCHMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_bf16_gemm",
+      "arch": "sm_100f",
+      "source": "csrc/cutlass_bf16_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_bf16_gemm.sm_100f.cubin",
+      "sha256": "b4fa4df03f8f2c54e411ea9019445531996e90f0f2dc6d86464b748006300355",
+      "size": 65808,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_bf16_gemm_f32",
+          "demangled": "eidola_cutlass_bf16_gemm_f32",
+          "meta": "eidola_cutlass_bf16_gemm_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_bf16_gemm_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCHMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_bf16_gemm",
+      "arch": "sm_103a",
+      "source": "csrc/cutlass_bf16_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_bf16_gemm.sm_103a.cubin",
+      "sha256": "c20d01f44099d056e355707e561ae42bb6cc427e3b50919f7323a8dc3547775d",
+      "size": 65808,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_bf16_gemm_f32",
+          "demangled": "eidola_cutlass_bf16_gemm_f32",
+          "meta": "eidola_cutlass_bf16_gemm_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_bf16_gemm_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCHMMA": 4
+      }
+    },
     {
       "name": "cutlass_fp8_blockwise_gemm",
       "arch": "sm_100a",
@@ -345,6 +429,282 @@
       }
     },
     {
+      "name": "engine_ops",
+      "arch": "sm_100a",
+      "source": "csrc/engine_ops.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops.sm_100a.cubin",
+      "sha256": "f9513ee34289a2db805106ccfe73ac135480e994f67396356f62cd1a994df193",
+      "size": 174448,
+      "entries": [
+        {
+          "symbol": "eidola_add_bf16",
+          "demangled": "eidola_add_bf16",
+          "meta": "eidola_add_bf16_meta"
+        },
+        {
+          "symbol": "eidola_add_f32",
+          "demangled": "eidola_add_f32",
+          "meta": "eidola_add_f32_meta"
+        },
+        {
+          "symbol": "eidola_embed",
+          "demangled": "eidola_embed",
+          "meta": "eidola_embed_meta"
+        },
+        {
+          "symbol": "eidola_gather_quant_ue8m0",
+          "demangled": "eidola_gather_quant_ue8m0",
+          "meta": "eidola_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_gather_rows_bf16",
+          "demangled": "eidola_gather_rows_bf16",
+          "meta": "eidola_gather_rows_bf16_meta"
+        },
+        {
+          "symbol": "eidola_moe_combine",
+          "demangled": "eidola_moe_combine",
+          "meta": "eidola_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute",
+          "demangled": "eidola_moe_permute",
+          "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_qkv_rope_kv",
+          "demangled": "eidola_qkv_rope_kv",
+          "meta": "eidola_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_quant_fp8_f32scale",
+          "demangled": "eidola_quant_fp8_f32scale",
+          "meta": "eidola_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_rmsnorm_f32",
+          "demangled": "eidola_rmsnorm_f32",
+          "meta": "eidola_rmsnorm_f32_meta"
+        },
+        {
+          "symbol": "eidola_router_topk",
+          "demangled": "eidola_router_topk",
+          "meta": "eidola_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_add_bf16_meta",
+        "eidola_add_f32_meta",
+        "eidola_embed_meta",
+        "eidola_gather_quant_ue8m0_meta",
+        "eidola_gather_rows_bf16_meta",
+        "eidola_moe_combine_meta",
+        "eidola_moe_permute_meta",
+        "eidola_qkv_rope_kv_meta",
+        "eidola_quant_fp8_f32scale_meta",
+        "eidola_rmsnorm_f32_meta",
+        "eidola_router_topk_meta",
+        "eidola_swiglu_quant_fp8_f32scale_meta",
+        "eidola_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops",
+      "arch": "sm_100f",
+      "source": "csrc/engine_ops.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops.sm_100f.cubin",
+      "sha256": "47e8f2d95e328ea01de855435117ebda7f7bfbc1e36fe08f5f4993568483907c",
+      "size": 174448,
+      "entries": [
+        {
+          "symbol": "eidola_add_bf16",
+          "demangled": "eidola_add_bf16",
+          "meta": "eidola_add_bf16_meta"
+        },
+        {
+          "symbol": "eidola_add_f32",
+          "demangled": "eidola_add_f32",
+          "meta": "eidola_add_f32_meta"
+        },
+        {
+          "symbol": "eidola_embed",
+          "demangled": "eidola_embed",
+          "meta": "eidola_embed_meta"
+        },
+        {
+          "symbol": "eidola_gather_quant_ue8m0",
+          "demangled": "eidola_gather_quant_ue8m0",
+          "meta": "eidola_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_gather_rows_bf16",
+          "demangled": "eidola_gather_rows_bf16",
+          "meta": "eidola_gather_rows_bf16_meta"
+        },
+        {
+          "symbol": "eidola_moe_combine",
+          "demangled": "eidola_moe_combine",
+          "meta": "eidola_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute",
+          "demangled": "eidola_moe_permute",
+          "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_qkv_rope_kv",
+          "demangled": "eidola_qkv_rope_kv",
+          "meta": "eidola_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_quant_fp8_f32scale",
+          "demangled": "eidola_quant_fp8_f32scale",
+          "meta": "eidola_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_rmsnorm_f32",
+          "demangled": "eidola_rmsnorm_f32",
+          "meta": "eidola_rmsnorm_f32_meta"
+        },
+        {
+          "symbol": "eidola_router_topk",
+          "demangled": "eidola_router_topk",
+          "meta": "eidola_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_add_bf16_meta",
+        "eidola_add_f32_meta",
+        "eidola_embed_meta",
+        "eidola_gather_quant_ue8m0_meta",
+        "eidola_gather_rows_bf16_meta",
+        "eidola_moe_combine_meta",
+        "eidola_moe_permute_meta",
+        "eidola_qkv_rope_kv_meta",
+        "eidola_quant_fp8_f32scale_meta",
+        "eidola_rmsnorm_f32_meta",
+        "eidola_router_topk_meta",
+        "eidola_swiglu_quant_fp8_f32scale_meta",
+        "eidola_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops",
+      "arch": "sm_103a",
+      "source": "csrc/engine_ops.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops.sm_103a.cubin",
+      "sha256": "35c9d75ffbd66300b4a5cf563b2fb7ecca365e4ab98088d8c04e5f36e45469ab",
+      "size": 174448,
+      "entries": [
+        {
+          "symbol": "eidola_add_bf16",
+          "demangled": "eidola_add_bf16",
+          "meta": "eidola_add_bf16_meta"
+        },
+        {
+          "symbol": "eidola_add_f32",
+          "demangled": "eidola_add_f32",
+          "meta": "eidola_add_f32_meta"
+        },
+        {
+          "symbol": "eidola_embed",
+          "demangled": "eidola_embed",
+          "meta": "eidola_embed_meta"
+        },
+        {
+          "symbol": "eidola_gather_quant_ue8m0",
+          "demangled": "eidola_gather_quant_ue8m0",
+          "meta": "eidola_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_gather_rows_bf16",
+          "demangled": "eidola_gather_rows_bf16",
+          "meta": "eidola_gather_rows_bf16_meta"
+        },
+        {
+          "symbol": "eidola_moe_combine",
+          "demangled": "eidola_moe_combine",
+          "meta": "eidola_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute",
+          "demangled": "eidola_moe_permute",
+          "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_qkv_rope_kv",
+          "demangled": "eidola_qkv_rope_kv",
+          "meta": "eidola_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_quant_fp8_f32scale",
+          "demangled": "eidola_quant_fp8_f32scale",
+          "meta": "eidola_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_rmsnorm_f32",
+          "demangled": "eidola_rmsnorm_f32",
+          "meta": "eidola_rmsnorm_f32_meta"
+        },
+        {
+          "symbol": "eidola_router_topk",
+          "demangled": "eidola_router_topk",
+          "meta": "eidola_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_add_bf16_meta",
+        "eidola_add_f32_meta",
+        "eidola_embed_meta",
+        "eidola_gather_quant_ue8m0_meta",
+        "eidola_gather_rows_bf16_meta",
+        "eidola_moe_combine_meta",
+        "eidola_moe_permute_meta",
+        "eidola_qkv_rope_kv_meta",
+        "eidola_quant_fp8_f32scale_meta",
+        "eidola_rmsnorm_f32_meta",
+        "eidola_router_topk_meta",
+        "eidola_swiglu_quant_fp8_f32scale_meta",
+        "eidola_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
       "name": "flashinfer_fa2_sink_paged",
       "arch": "sm_100a",
       "source": "csrc/flashinfer_fa2_sink_paged.cu",
@@ -523,9 +883,97 @@
         "eidola_rmsnorm_bf16_meta"
       ],
       "mma_sass": {}
+    },
+    {
+      "name": "sampling",
+      "arch": "sm_100a",
+      "source": "csrc/sampling.cu",
+      "profile": "own",
+      "file": "cubin/sampling.sm_100a.cubin",
+      "sha256": "94907c9867e5f5df66b6e466235712deba215da846fefcb1f23c39ab08259864",
+      "size": 190840,
+      "entries": [
+        {
+          "symbol": "eidola_chain_accept",
+          "demangled": "eidola_chain_accept",
+          "meta": "eidola_chain_accept_meta"
+        },
+        {
+          "symbol": "eidola_sample",
+          "demangled": "eidola_sample",
+          "meta": "eidola_sample_meta"
+        }
+      ],
+      "meta": [
+        "eidola_chain_accept_meta",
+        "eidola_sample_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "sampling",
+      "arch": "sm_100f",
+      "source": "csrc/sampling.cu",
+      "profile": "own",
+      "file": "cubin/sampling.sm_100f.cubin",
+      "sha256": "ad6497473ce79163fa2270467d5d1a913ca470578f40864fdbf89fd181491817",
+      "size": 190840,
+      "entries": [
+        {
+          "symbol": "eidola_chain_accept",
+          "demangled": "eidola_chain_accept",
+          "meta": "eidola_chain_accept_meta"
+        },
+        {
+          "symbol": "eidola_sample",
+          "demangled": "eidola_sample",
+          "meta": "eidola_sample_meta"
+        }
+      ],
+      "meta": [
+        "eidola_chain_accept_meta",
+        "eidola_sample_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "sampling",
+      "arch": "sm_103a",
+      "source": "csrc/sampling.cu",
+      "profile": "own",
+      "file": "cubin/sampling.sm_103a.cubin",
+      "sha256": "c153e6bc705b0821c807bd77a9b32210bd41aa4e0129826981b54d324f9d4fb5",
+      "size": 242280,
+      "entries": [
+        {
+          "symbol": "eidola_chain_accept",
+          "demangled": "eidola_chain_accept",
+          "meta": "eidola_chain_accept_meta"
+        },
+        {
+          "symbol": "eidola_sample",
+          "demangled": "eidola_sample",
+          "meta": "eidola_sample_meta"
+        }
+      ],
+      "meta": [
+        "eidola_chain_accept_meta",
+        "eidola_sample_meta"
+      ],
+      "mma_sass": {}
     }
   ],
   "fatbins": [
+    {
+      "name": "cutlass_bf16_gemm",
+      "file": "fatbin/cutlass_bf16_gemm.fatbin",
+      "sha256": "fdd448d2975772448f45e8dd621ec927fa2919b17a16c226b4194328a0ada157",
+      "size": 131848,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
     {
       "name": "cutlass_fp8_blockwise_gemm",
       "file": "fatbin/cutlass_fp8_blockwise_gemm.fatbin",
@@ -547,6 +995,16 @@
       ]
     },
     {
+      "name": "engine_ops",
+      "file": "fatbin/engine_ops.fatbin",
+      "sha256": "52d33f5e519f126f73ed619c1f259aa1341122bea6aa52ac1b21b6668dd317e3",
+      "size": 349128,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
       "name": "flashinfer_fa2_sink_paged",
       "file": "fatbin/flashinfer_fa2_sink_paged.fatbin",
       "sha256": "fd2bb6cdb694942a0c1e56f778e097e5edb29a65bdf540d2d211095f9d0690ba",
@@ -561,6 +1019,16 @@
       "file": "fatbin/rmsnorm.fatbin",
       "sha256": "f7910af91ef02140c407a9f0d10efdfb811efcfafd239114e20fd1e53c3b58c2",
       "size": 43784,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "sampling",
+      "file": "fatbin/sampling.fatbin",
+      "sha256": "d860d7051302c3467dba1dc262a06ad1e18b36e8e4ab4b56171b93981d3ae488",
+      "size": 433352,
       "archs": [
         "sm_100a",
         "sm_103a"

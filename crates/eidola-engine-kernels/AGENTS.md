@@ -39,11 +39,14 @@ Never, in this crate or anything it feeds:
 | Kernel | Source | Entries | Tensor-core path (SASS) |
 |---|---|---|---|
 | Dense FP8 GEMM, f32 scales 1×128 (activations) / 128×128 (weights), BF16 out | CUTLASS 4.8 `KernelScheduleSm100Blockwise` | `eidola_cutlass_fp8_blockwise_gemm_bf16` | tcgen05 (`UTCQMMA`) |
+| Dense BF16 GEMM, f32 out, runtime `alpha` (`o_proj`, `eh_proj`, `lm_head`) | CUTLASS 4.8 collective-builder default schedule | `eidola_cutlass_bf16_gemm_f32` | tcgen05 (`UTCHMMA`) |
 | Routed-expert grouped GEMM, FP8 × MXFP4, masked (decode) and contiguous (prefill), gate/up and down | DeepGEMM `sm100_fp8_fp4_gemm_1d1d` | 4 mangled `deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<…>` | tcgen05 (`UTCQMMA`, 2-CTA) |
 | Paged attention, learned sinks, sliding window, head dims 192/128, BF16; query tiles 16/64/128 + split-KV merge | FlashInfer FA2 prefill template + `AttentionSink` | `eidola_fa2_sink_paged_bf16_q{16,64,128}`, mangled `PersistentVariableLengthMergeStatesKernel<…>` | `mma.sync` (`HMMA`), no tcgen05 |
+| Sampling (filters, inverse-CDF draw) and chain speculative acceptance | ours (`sampling.cu`) | `eidola_sample`, `eidola_chain_accept` | none |
+| The executor's glue: embedding, RMSNorm, FP8 activation quantization (f32-scale and UE8M0 recipes), fused-QKV RoPE + paged KV write, SwiGLU + quantization, router top-k, expert placement, gather, combine | ours (`engine_ops.cu`) | 13 `eidola_*` entries | none |
 | RMSNorm, BF16 | ours | `eidola_rmsnorm_bf16` | none |
 
-**Sampling is not here, and must not come from upstream.** The serving core (`eidola-engine/src/sampling.rs`) defines what a sample is: draws from a SplitMix-based counter RNG keyed by `(seed, position, stream)`, with separate streams for target samples, drafts, speculative acceptance and the residual, and its own filtering, CDF walk and chain acceptance. Recompute preemption and the CPU oracle depend on those exact draws. FlashInfer's sampling kernels draw from Philox with a caller-supplied seed and offset and cannot reproduce them, so the GPU sampler (including speculative accept and residual) will be an Eidola kernel that reproduces `sampling.rs` bit for bit given equal logits. It is not written yet; until it is, nothing in this set samples.
+**Sampling never comes from upstream.** The serving core (`eidola-engine/src/sampling.rs`) defines what a sample is: draws from a SplitMix-based counter RNG keyed by `(seed, position, stream)`, with separate streams for target samples, drafts, speculative acceptance and the residual, its own filtering, CDF walk and chain acceptance, and pinned `f64` arithmetic (its own `exp`, sums in a fixed chunked order). Recompute preemption and the CPU oracle depend on those exact draws. FlashInfer's sampling kernels draw from Philox with a caller-supplied seed and offset and cannot reproduce them. `sampling.cu` performs the core's operations in the core's grouping with explicit round-to-nearest intrinsics (nvcc never contracts those into FMAs; the `DFMA`s in its SASS belong to the correctly rounded division routine), so it returns the same probabilities and tokens bit for bit given equal logits; `eidola-engine-cuda`'s `tests/sampler.rs` checks every probability and token against the core on both device images.
 
 Every kernel is built for all three targets; each fatbin bundles the `sm_100a` and `sm_103a` cubins so the driver picks the exact match. Instantiation choices (tile shapes, stages, thread counts) mirror what the upstream host dispatchers pick for these shapes; each source file explains its own.
 
@@ -54,7 +57,7 @@ Every kernel is built for all three targets; each fatbin bundles the `sm_100a` a
 Cubins and fatbins are loaded through the CUDA driver API (`cuModuleLoadData`, e.g. via `cudarc`); there is no host-side object code and no CUDA runtime library involved.
 
 - **Load through `ArtifactDir`.** It reads an image from a build output and returns the bytes only if size and SHA-256 match the compiled-in manifest.
-- **Entries by symbol.** Kernels we wrap are `extern "C"`. Upstream template kernels keep their mangled names, which the manifest lists with their demangled forms. Template instances, DeepGEMM's `__global__ static` kernels and every `_meta` global have local binding (`STB_LOCAL`) in a whole-program cubin. The CUDA runtime resolves exactly such symbols by name for ordinary programs, so `cuModuleGetFunction` / `cuModuleGetGlobal` should accept them. That is inferred, not yet observed on a GPU; the fallback is `cuModuleEnumerateFunctions`.
+- **Entries by symbol.** Kernels we wrap are `extern "C"`. Upstream template kernels keep their mangled names, which the manifest lists with their demangled forms. Template instances, DeepGEMM's `__global__ static` kernels and every `_meta` global have local binding (`STB_LOCAL`) in a whole-program cubin. `cuModuleGetFunction` / `cuModuleGetGlobal` resolve them by name (observed on a B300, R580 driver; `eidola-engine-cuda`'s smoke tests cover every entry and record).
 - **Launch contract in the image.** Each entry has a launch-contract device global (`EidolaKernelMeta`, 32 bytes), named by the entry's `meta` field in the manifest. For an entry we name ourselves it is `<entry>_meta`. A mangled template instance cannot carry a matching name, so its record has a readable alias (`eidola_deepgemm_fp8_fp4_masked_gate_up_meta`, …) and `meta_aliases` in `csrc/kernels.json` binds the alias to the mangled symbol. The build fails unless every entry resolves to exactly one record and every record to exactly one entry, `Manifest::parse` re-checks that correspondence, and `Cubin::entry` / `Cubin::entry_for_meta` look it up in either direction. The record holds:
   - block shape,
   - dynamic shared memory,
@@ -65,8 +68,8 @@ Cubins and fatbins are loaded through the CUDA driver API (`cuModuleLoadData`, e
 - **Parameters.** These are what the host must build to call each kernel:
   - **FlashInfer attention:** a plain `PagedParams` struct (296 bytes); the split-KV merge takes a plain argument list.
   - **DeepGEMM:** five `CUtensorMap`s, which the host encodes with `cuTensorMapEncodeTiled`.
-  - **CUTLASS GEMM:** its 2048-byte `Params`, which includes TMA descriptors that CUTLASS builds in host C++. Providing that, either as a host-only C++ shim compiled without device code or as a Rust mirror checked against `params_bytes`, is the first job when the launch path is written.
-- **DeepGEMM SM count.** The persistent scheduler bakes in the SM count (148). The grid must be exactly that, and the part must have at least that many SMs; confirm the B300 count before relying on the `sm_103a` instance.
+  - **CUTLASS GEMMs:** their 2048-byte `GemmUniversal::Params`, including TMA descriptors that CUTLASS builds in host C++. `eidola-engine-cuda` builds the same bytes in Rust (`src/gemm.rs`), pinned against CUTLASS's own host path by a dev-only oracle.
+- **DeepGEMM SM count.** The persistent scheduler bakes in the SM count (148). The grid must be exactly that, and the part must have at least that many SMs. The B300 has 148 (measured), the same as the B200.
 
 ## Determinism doctrine
 
