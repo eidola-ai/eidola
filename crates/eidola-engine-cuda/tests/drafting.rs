@@ -54,9 +54,13 @@ const SAMPLEABLE: u32 = 151_675;
 /// against the reference on this truncation is 1.18 (`engine.rs`).
 const MARGIN: f32 = 1.5;
 /// Two candidates whose logits in one run differ by at most this much may
-/// swap in another run of a different batch shape (the measured batch effect
-/// is 0.052; see the crate AGENTS.md).
-const NEAR_TIE: f32 = 0.25;
+/// swap in another run of a different batch shape. A decode row alone
+/// against beside a prefill moves by at most 0.052, but drafted against
+/// undrafted greedy runs of the full checkpoint (240 prompts) first diverged
+/// where the two tokens' log-probabilities differed by a median 0.15, p90
+/// 0.34, at most 1.47: the verify pass's other query tiles and expert
+/// layouts compound over a long decode (the crate AGENTS.md → Numerics).
+const NEAR_TIE: f32 = 1.5;
 
 struct Env {
     store: Arc<WeightSet>,
@@ -80,7 +84,7 @@ fn env() -> Option<&'static Env> {
             return None;
         }
         let g = WeightSet::open_files(&[PathBuf::from(golden)]).unwrap();
-        let text = g
+        let text: Vec<u32> = g
             .get("tokens")
             .unwrap()
             .to_i64("tokens")
@@ -92,6 +96,11 @@ fn env() -> Option<&'static Env> {
         let reference = Arc::new(ReferenceModel::new(
             ModelWeights::load(store.clone(), config, &LoadOptions::default()).unwrap(),
         ));
+        assert!(
+            text.len() >= MIN_TEXT,
+            "the golden holds {} tokens; the tests need {MIN_TEXT}",
+            text.len()
+        );
         Some(Env {
             store,
             reference,
@@ -114,17 +123,19 @@ fn buckets() -> Vec<Bucket> {
     ]
 }
 
-fn gpu_executor(depths: u32, blocks: u32, graphs: CudaGraphs) -> Option<CudaExecutor> {
-    let env = env()?;
-    let su = setup()?;
-    let cfg = CudaExecutorConfig {
+/// State slots of every executor here: the most any test seats at once
+/// (`graphs_and_eager_agree_with_drafting`'s three copies of three rows).
+const SLOTS: u32 = 9;
+
+fn gpu_config(depths: u32, blocks: u32, graphs: CudaGraphs) -> CudaExecutorConfig {
+    CudaExecutorConfig {
         block_size: BS,
         num_blocks: KvBlocks {
             global: blocks,
             sliding: blocks,
             drafter: if depths > 0 { blocks } else { 0 },
         },
-        num_state_slots: 8,
+        num_state_slots: SLOTS,
         max_model_len: 1024,
         buckets: buckets(),
         sampleable_vocab_size: SAMPLEABLE,
@@ -132,15 +143,21 @@ fn gpu_executor(depths: u32, blocks: u32, graphs: CudaGraphs) -> Option<CudaExec
         graphs,
         draft_tokens: depths,
         mtp_hidden: MtpHidden::Normed,
-    };
+    }
+}
+
+fn gpu_executor(depths: u32, blocks: u32, graphs: CudaGraphs) -> Option<CudaExecutor> {
+    let env = env()?;
+    let su = setup()?;
+    let cfg = gpu_config(depths, blocks, graphs);
     let t0 = std::time::Instant::now();
     let mut ex = CudaExecutor::new(su.gpu, &su.dir, env.store.clone(), Some(&KEEP), cfg).unwrap();
     ex.record_drafts = true;
     if let Some(g) = ex.draft_graphs() {
         println!(
-            "D {depths}: loaded and captured in {:.1?}, rungs {:?}, capture bytes {:?}",
+            "D {depths}: loaded and captured in {:.1?}, rungs (width, rows) {:?}, capture bytes {:?}",
             t0.elapsed(),
-            g.ladder(),
+            g.rungs(),
             g.capture_bytes()
         );
     }
@@ -152,7 +169,7 @@ fn cpu_executor(depths: u32, blocks: u32) -> CpuExecutor {
     let mut cfg = CpuExecutorConfig::for_model(&env.reference, SAMPLEABLE);
     cfg.block_size = BS;
     cfg.num_blocks = blocks;
-    cfg.num_state_slots = 8;
+    cfg.num_state_slots = SLOTS;
     cfg.max_model_len = 1024;
     cfg.buckets = buckets();
     cfg.mtp_depths = (0..depths as usize).collect();
@@ -223,18 +240,84 @@ fn job(
 
 /// The workload: greedy and seeded rows, a prompt sharing a keyed prefix
 /// with a later one (which resumes from a cached block, its drafter from
-/// the block's tap), prompts of every length class.
+/// the block's tap), prompts of every length class. The other prompts are
+/// disjoint spans spread over whatever text the golden holds (at least
+/// [`MIN_TEXT`] tokens).
 fn workload(text: &[u32]) -> Vec<Job> {
     let seeded = |id: u64| SamplingParams::new(0.8, 40, 0.95, 0.0, 1000 + id).unwrap();
     let g = SamplingParams::greedy;
+    // Spans after the shared prefix's 70 tokens, separated by equal gaps.
+    let lens = [17usize, 3, 65, 33];
+    let gap = text.len().saturating_sub(70 + lens.iter().sum::<usize>()) / lens.len();
+    let mut start = 70;
+    let mut span = |len: usize| {
+        start += gap;
+        let s = &text[start..start + len];
+        start += len;
+        s
+    };
+    let (a, b, c, d) = (span(lens[0]), span(lens[1]), span(lens[2]), span(lens[3]));
     vec![
         job(0, 0, &text[..40], g(), 24, Some(1)),
-        job(0, 1, &text[100..117], seeded(1), 16, None),
-        job(0, 2, &text[200..203], g(), 20, None),
+        job(0, 1, a, seeded(1), 16, None),
+        job(0, 2, b, g(), 20, None),
         job(6, 3, &text[..70], g(), 16, Some(1)),
-        job(6, 4, &text[300..365], seeded(4), 12, None),
-        job(8, 5, &text[400..433], g(), 18, None),
+        job(6, 4, c, seeded(4), 12, None),
+        job(8, 5, d, g(), 18, None),
     ]
+}
+
+/// The fewest golden tokens the tests' prompts need: the pressure prompts'
+/// 225 (the workload needs 188, the graph test 165).
+const MIN_TEXT: usize = 225;
+
+/// `drafting_under_kv_pressure_preempts_and_resumes`' prompts: six greedy
+/// 40-token spans, 37 apart.
+fn pressure_prompts(text: &[u32]) -> HashMap<u64, (Vec<u32>, SamplingParams)> {
+    (0..6u64)
+        .map(|id| {
+            let start = usize::try_from(id * 37).unwrap();
+            (
+                id,
+                (text[start..start + 40].to_vec(), SamplingParams::greedy()),
+            )
+        })
+        .collect()
+}
+
+/// `graphs_and_eager_agree_with_drafting`'s rows: contexts across a block
+/// boundary and past the drafter's window, three copies of each.
+const GRAPH_CONTEXTS: [u32; 3] = [21, 32, 150];
+
+/// Row `slot`'s prefix and next token in the graph test.
+fn graph_row_tokens(text: &[u32], slot: u32) -> Vec<u32> {
+    let c = GRAPH_CONTEXTS[(slot % 3) as usize] as usize;
+    text[(slot % 3) as usize * 7..][..c + 1].to_vec()
+}
+
+/// The GPU tests' host-side setup, run without a device: the prompts fit a
+/// text of [`MIN_TEXT`] tokens, the graph test's rows fit the executors'
+/// slots and its text. A setup bug then fails here, not on the GPU host.
+#[test]
+fn setup_fits_without_a_device() {
+    let text: Vec<u32> = (0..u32::try_from(MIN_TEXT).unwrap()).collect();
+    let w = workload(&text);
+    assert_eq!(w.len(), 6);
+    // Disjoint but for the shared prefix.
+    let mut seen = std::collections::HashSet::new();
+    for j in w.iter().filter(|j| j.id != 3) {
+        for &t in &j.prompt {
+            assert!(seen.insert(t), "job {} overlaps", j.id);
+        }
+    }
+    assert_eq!(w[3].prompt[..40], w[0].prompt[..]);
+    assert_eq!(pressure_prompts(&text).len(), 6);
+    let cfg = gpu_config(3, 64, CudaGraphs::On);
+    assert_eq!(cfg.num_state_slots, SLOTS);
+    for slot in 0..3 * 3u32 {
+        assert!(slot < cfg.num_state_slots, "graph test slot {slot}");
+        graph_row_tokens(&text, slot);
+    }
 }
 
 /// Runs an engine over `workload`, submitting each request at its step.
@@ -621,42 +704,24 @@ fn drafting_under_kv_pressure_preempts_and_resumes() {
     if setup().is_none() {
         return;
     }
+    let prompts = pressure_prompts(&env.text);
     // Few blocks: rows shed their drafts, then preempt each other.
+    let mut jobs: Vec<Job> = prompts
+        .iter()
+        .map(|(&id, (p, s))| job(0, id, p, *s, 14, None))
+        .collect();
+    jobs.sort_by_key(|j| j.id);
     let mut r = Run::new(
         gpu_executor(3, 16, CudaGraphs::Off).unwrap(),
         32,
         true,
-        (0..6u64)
-            .map(|id| {
-                let start = usize::try_from(id * 37).unwrap();
-                job(
-                    0,
-                    id,
-                    &env.text[start..start + 40],
-                    SamplingParams::greedy(),
-                    14,
-                    None,
-                )
-            })
-            .collect(),
+        jobs,
     );
     let mut zero_checks = 0;
     while !r.done() {
         r.step();
         zero_checks += r.check_kv();
     }
-    let prompts: HashMap<u64, (Vec<u32>, SamplingParams)> = (0..6u64)
-        .map(|id| {
-            let start = usize::try_from(id * 37).unwrap();
-            (
-                id,
-                (
-                    env.text[start..start + 40].to_vec(),
-                    SamplingParams::greedy(),
-                ),
-            )
-        })
-        .collect();
     let (n, exact, worst) = check_outputs(&prompts, &r.outputs);
     r.eng.sweep(r.step + 1).unwrap();
     r.check_kv();
@@ -669,8 +734,10 @@ fn drafting_under_kv_pressure_preempts_and_resumes() {
 
 /// Uniform drafted decode steps bit-identical across replay, direct launch
 /// and the eager path: three copies of the same rows (each prefilled alone,
-/// so identical), one decoded per path, twice (the second step loading the
-/// state the first left); then an engine workload with graphs on and off.
+/// so identical), one decoded per path, twice at the full width (the second
+/// step loading the state the first left) and then at widths 1 and 0 (the
+/// serving core narrows a step's width; every width has its rungs); then an
+/// engine workload with graphs on and off.
 #[test]
 fn graphs_and_eager_agree_with_drafting() {
     let Some(env) = env() else { return };
@@ -681,13 +748,14 @@ fn graphs_and_eager_agree_with_drafting() {
     let mut ex = gpu_executor(depths, 64, CudaGraphs::On).unwrap();
     // Three rows per copy, at contexts across a block boundary and past the
     // drafter's window; slot = copy * 3 + row.
-    let contexts = [21u32, 32, 150];
+    let contexts = GRAPH_CONTEXTS;
     let groups = 3u32;
     let mut updates = Vec::new();
     let mut next = 1u32;
     for slot in 0..9u32 {
         let c = contexts[(slot % 3) as usize];
-        for index in 0..=(c + 2 * (depths + 1)) / BS {
+        // Room for four decode steps of at most `1 + depths` tokens.
+        for index in 0..=(c + 4 * (depths + 1)) / BS {
             for group in 0..groups {
                 updates.push(TableUpdate {
                     slot,
@@ -699,10 +767,7 @@ fn graphs_and_eager_agree_with_drafting() {
             next += 1;
         }
     }
-    let row_tokens = |slot: u32| -> Vec<u32> {
-        let c = contexts[(slot % 3) as usize] as usize;
-        env.text[(slot % 3) as usize * 7..][..c + 1].to_vec()
-    };
+    let row_tokens = |slot: u32| graph_row_tokens(&env.text, slot);
     for slot in 0..9u32 {
         let toks = row_tokens(slot);
         let c = u32::try_from(toks.len() - 1).unwrap();
@@ -726,6 +791,8 @@ fn graphs_and_eager_agree_with_drafting() {
         };
         ex.execute(&step).unwrap();
     }
+    // The prefill steps' (empty) draft records are not the compared steps'.
+    ex.take_drafts();
     // By row, so the three copies sample alike: rows 0 and 2 greedy, row 1
     // seeded.
     let sampling = |slot: u32| {
@@ -737,7 +804,9 @@ fn graphs_and_eager_agree_with_drafting() {
     };
     let mut next_tok: Vec<u32> = (0..9u32).map(|s| *row_tokens(s).last().unwrap()).collect();
     let mut ctx: Vec<u32> = (0..9u32).map(|s| contexts[(s % 3) as usize]).collect();
-    for round in 0..2 {
+    // Two rounds at the full width (the second loading the state the first
+    // left), then the narrower widths the serving core may give a step.
+    for (round, width) in [depths, depths, 1, 0].into_iter().enumerate() {
         let mut results = Vec::new();
         for (copy, path) in [DecodePath::Eager, DecodePath::Direct, DecodePath::Replay]
             .into_iter()
@@ -759,7 +828,7 @@ fn graphs_and_eager_agree_with_drafting() {
                         token_start: u32::try_from(i).unwrap(),
                         num_tokens: 1,
                         context_len: ctx[slot as usize],
-                        num_drafts: depths,
+                        num_drafts: width,
                         sample: true,
                         sampling: sampling(slot),
                     })

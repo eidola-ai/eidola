@@ -155,7 +155,17 @@ fn main() {
         .expect("executor with every rung captured");
     let (ladder, capture) = match (ex.decode_graphs(), ex.draft_graphs()) {
         (Some(g), _) => (g.ladder().to_vec(), g.capture_bytes().to_vec()),
-        (_, Some(g)) => (g.ladder(), g.capture_bytes().to_vec()),
+        (_, Some(g)) => {
+            // Every width's rungs are captured; this bench runs width `depths`.
+            let bytes = g
+                .rungs()
+                .into_iter()
+                .zip(g.capture_bytes())
+                .filter(|((w, _), _)| *w == depths)
+                .map(|(_, &b)| b)
+                .collect();
+            (g.ladder(depths), bytes)
+        }
         _ => unreachable!("graphs on"),
     };
     println!("loaded and captured in {:.1?}", t0.elapsed());

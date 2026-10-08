@@ -59,10 +59,12 @@
 //! and acceptance run inside the step, so a speculative decode step needs no host round
 //! trip. Steps with `num_drafts` uniform across rows and one host token per row (pure
 //! decode) are the ones expected to replay a captured graph; mixed prefill steps may
-//! run piecewise. The host gives every row either the full draft width `k` or none
-//! (none at position 0, and none for every row of a step that ran short of KV),
-//! trimming only near the model length, so non-uniform decode steps are rare and need
-//! no graph of their own. `maintenance` and `table_updates` are applied by small
+//! run piecewise. The host gives every drafting row of a step the same width: the full
+//! `k`, or the widest `w < k` that keeps the step within
+//! [`ModelSpec::draft_step_tokens`] when only narrowing does (none at position 0, and
+//! none for every row of a step that ran short of KV), trimming only near the model
+//! length, so non-uniform decode steps are rare and need no graph of their own; an
+//! executor that reports a step limit captures a graph per width it can be given. `maintenance` and `table_updates` are applied by small
 //! kernels or copies before the graph replays.
 //!
 //! # Determinism contract

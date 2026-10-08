@@ -1329,3 +1329,65 @@ fn optional_reservations_are_shed_before_length() {
         }
     }
 }
+
+/// The draft width narrows to keep a step within the executor's fast path: with k = 3
+/// and a 16-token step limit, a pure decode step of `r` drafting rows drafts 3 while `4r`
+/// fits, else the widest `w` with `r (1 + w) <= 16` (0 from 9 rows on), and keeps the full
+/// width once `r > 16`, where no width fits. Every regime occurs as requests of staggered
+/// lengths finish, and greedy outputs are the dense reference's throughout.
+#[test]
+fn draft_width_narrows_to_the_step_limit() {
+    const LIMIT: u32 = 16;
+    let mut spec = small_spec(256);
+    spec.draft_step_tokens = LIMIT;
+    let k = spec.max_draft_tokens;
+    let mut h = Harness::new(spec, sched(true), MockConfig::default());
+    let mut rng = TestRng(77);
+    let mut cases = Vec::new();
+    for id in 0..20u64 {
+        let prompt = rng.var_tokens(1, 4, 32);
+        let p = params(id);
+        let max = 2 + 3 * id as u32;
+        h.submit(request(id, prompt.clone(), p, max, CacheScope::Private));
+        cases.push((id, prompt, p, max));
+    }
+    h.run();
+    for (id, prompt, p, max) in &cases {
+        check_output(&h, *id, prompt, p, *max, true);
+    }
+    let mut seen = BTreeSet::new();
+    for rows in h.eng.executor().rows_used() {
+        let host: u32 = rows.iter().map(|e| e.num_tokens).sum();
+        // Rows the scheduler drafts for: decode rows past position 0 (no KV pressure,
+        // nowhere near the model length).
+        let eligible = rows
+            .iter()
+            .filter(|e| e.num_tokens == 1 && e.sample && e.context_len > 0)
+            .count() as u32;
+        if eligible == 0 {
+            continue;
+        }
+        let widths: BTreeSet<u32> = rows
+            .iter()
+            .filter(|e| e.num_tokens == 1 && e.sample && e.context_len > 0)
+            .map(|e| e.num_drafts)
+            .collect();
+        assert_eq!(widths.len(), 1, "one width a step: {rows:?}");
+        let w = *widths.first().unwrap();
+        let want = if host + eligible * k <= LIMIT || host > LIMIT {
+            k
+        } else {
+            ((LIMIT - host) / eligible).min(k)
+        };
+        assert_eq!(w, want, "{eligible} drafting rows, {host} host tokens");
+        let query = host + rows.iter().map(|e| e.num_drafts).sum::<u32>();
+        assert!(query <= LIMIT || w == k, "{query} tokens at width {w}");
+        seen.insert((w, host > LIMIT));
+    }
+    for regime in [(k, false), (2, false), (1, false), (0, false), (k, true)] {
+        assert!(
+            seen.contains(&regime),
+            "regime {regime:?} never ran: {seen:?}"
+        );
+    }
+}

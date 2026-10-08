@@ -1702,16 +1702,16 @@ pub(crate) unsafe fn run(
     Ok(())
 }
 
-/// A padding row of a graph step: a decode row at position `depths` (so
-/// every depth has its rows, as in a uniform real row), drafting the full
-/// width, every write and read in the pad blocks, every store into a
-/// write-only row, its samples greedy over logits row 0.
-pub(crate) fn pad_row(depths: u32) -> Row {
+/// A padding row of a graph step of draft width `width`: a decode row at
+/// position `depths` (so every depth has its rows, as in a uniform real
+/// row), drafting `width`, every write and read in the pad blocks, every
+/// store into a write-only row, its samples greedy over logits row 0.
+pub(crate) fn pad_row(depths: u32, width: u32) -> Row {
     Row {
         slot: None,
         c: depths,
         tokens: vec![crate::graph::PAD_TOKEN],
-        k: depths,
+        k: width,
         sample: true,
         sampling: SamplingParams::greedy(),
         load: Load::Zero,
@@ -1872,20 +1872,21 @@ pub(crate) fn check_plan(
     Ok(())
 }
 
-/// The rungs of drafted decode steps: like [`crate::graph::decode_ladder`]
-/// over rows that each cost `1 + depths` tokens (`min(max_seqs, max_tokens /
-/// (1 + depths))` per bucket), with the masked expert layout's limit
-/// (`128 / (1 + depths)` rows) a rung whenever the capacity exceeds it, so a
-/// padded step takes the layout its eager run would.
-pub fn draft_ladder(buckets: &[eidola_engine::spec::Bucket], depths: u32) -> Vec<u32> {
-    let rows = |b: &eidola_engine::spec::Bucket| b.max_seqs.min(b.max_tokens / (depths + 1));
+/// The rungs of drafted decode steps of draft width `width`: like
+/// [`crate::graph::decode_ladder`] over rows that each cost `1 + width`
+/// tokens (`min(max_seqs, max_tokens / (1 + width))` per bucket), with the
+/// masked expert layout's limit (`128 / (1 + width)` rows) a rung whenever
+/// the capacity exceeds it, so a padded step takes the layout its eager run
+/// would.
+pub fn draft_ladder(buckets: &[eidola_engine::spec::Bucket], width: u32) -> Vec<u32> {
+    let rows = |b: &eidola_engine::spec::Bucket| b.max_seqs.min(b.max_tokens / (width + 1));
     let cap = buckets.last().map_or(0, rows);
     let mut rungs: Vec<u32> = (0..32)
         .map(|i| 1u32 << i)
         .take_while(|&r| r < cap)
         .collect();
     rungs.extend(buckets.iter().map(rows).filter(|&r| r > 0));
-    let masked = crate::model::MASKED_TOKENS / (depths + 1);
+    let masked = crate::model::MASKED_TOKENS / (width + 1);
     if masked > 0 && masked < cap {
         rungs.push(masked);
     }
@@ -1894,15 +1895,26 @@ pub fn draft_ladder(buckets: &[eidola_engine::spec::Bucket], depths: u32) -> Vec
     rungs
 }
 
+/// The drafted ladders an executor of `depths` draft depths captures: one
+/// per width `0 ..= depths`, since the serving core narrows a step's width to
+/// keep it within the masked layout (`ModelSpec::draft_step_tokens`).
+pub fn draft_ladders(buckets: &[eidola_engine::spec::Bucket], depths: u32) -> Vec<(u32, Vec<u32>)> {
+    (0..=depths)
+        .map(|w| (w, draft_ladder(buckets, w)))
+        .collect()
+}
+
 struct RungGraph {
+    width: u32,
     rows: usize,
     layout: Layout,
     launches: Vec<Launch>,
     graph: cudarc::driver::CudaGraph,
 }
 
-/// The captured drafted-step graphs: one per rung of [`draft_ladder`], over
-/// one step table sized for the largest rung's layout.
+/// The captured drafted-step graphs: one per rung of each width's
+/// [`draft_ladder`], over one step table sized for the largest rung's
+/// layout.
 pub struct DraftGraphs {
     rungs: Vec<RungGraph>,
     table: cudarc::driver::CudaSlice<u32>,
@@ -1912,28 +1924,31 @@ pub struct DraftGraphs {
 impl std::fmt::Debug for DraftGraphs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DraftGraphs")
-            .field("ladder", &self.ladder())
+            .field("rungs", &self.rungs())
             .finish_non_exhaustive()
     }
 }
 
 impl DraftGraphs {
-    /// For each rung of `ladder`, in order: plan an all-padding step, run its
-    /// launches once directly (which exercises every launch on this device),
-    /// capture them, upload and replay the capture once, checking the status
-    /// word after each run.
+    /// For each width and each rung of its ladder, in order: plan an
+    /// all-padding step, run its launches once directly (which exercises
+    /// every launch on this device), capture them, upload and replay the
+    /// capture once, checking the status word after each run.
     pub(crate) fn capture(
         gpu: &crate::Gpu,
-        ladder: Vec<u32>,
+        ladders: Vec<(u32, Vec<u32>)>,
         ctx: &PlanCtx,
         t: &mut RunTarget<'_>,
     ) -> crate::Result<DraftGraphs> {
         use cudarc::driver::sys;
         let mut ctx = ctx.clone();
         ctx.graph = true;
-        let mut planned = Vec::with_capacity(ladder.len());
-        for &r in &ladder {
-            let rows: Vec<Row> = (0..r).map(|_| pad_row(ctx.depths)).collect();
+        let mut planned = Vec::new();
+        for (width, r) in ladders
+            .iter()
+            .flat_map(|(w, l)| l.iter().map(move |&r| (*w, r)))
+        {
+            let rows: Vec<Row> = (0..r).map(|_| pad_row(ctx.depths, width)).collect();
             let kv = StepKv {
                 mirror: t.kv.mirror(),
                 geometry: t.kv.geometry(),
@@ -1945,21 +1960,21 @@ impl DraftGraphs {
             let layout = Layout::new(&built, &ctx, true)?;
             let words = pack(&built, &layout, &ctx)?;
             let launches = launches(&built, &layout);
-            planned.push((r as usize, layout, launches, words));
+            planned.push((width, r as usize, layout, launches, words));
         }
-        let max_words = planned.iter().map(|p| p.1.words).max().unwrap_or(1);
+        let max_words = planned.iter().map(|p| p.2.words).max().unwrap_or(1);
         let s = gpu.stream().clone();
         let mut table = s.alloc_zeros::<u32>(max_words.max(1))?;
         let mut rungs = Vec::with_capacity(planned.len());
         let mut capture_bytes = Vec::with_capacity(planned.len());
-        for (rows, layout, launches, words) in planned {
+        for (width, rows, layout, launches, words) in planned {
             s.memcpy_htod(&words, &mut table.slice_mut(..words.len()))?;
             let base = crate::launch::dptr(&table, &s);
             let check = |t: &RunTarget<'_>| -> crate::Result<()> {
                 let status = s.clone_dtoh(&t.bufs.readback.slice(0..1))?[0];
                 if status != 0 {
                     return Err(crate::CudaError::new(format!(
-                        "drafted rung {rows}: status {status:#x} over padding"
+                        "drafted rung {rows} of width {width}: status {status:#x} over padding"
                     )));
                 }
                 Ok(())
@@ -1975,13 +1990,16 @@ impl DraftGraphs {
             let graph = s.end_capture(sys::CUgraphInstantiate_flags(0));
             recorded?;
             let graph = graph?.ok_or_else(|| {
-                crate::CudaError::new(format!("drafted rung {rows}: the capture is empty"))
+                crate::CudaError::new(format!(
+                    "drafted rung {rows} of width {width}: the capture is empty"
+                ))
             })?;
             graph.upload()?;
             graph.launch()?;
             check(t)?;
             capture_bytes.push(before - crate::graph::free_memory()?);
             rungs.push(RungGraph {
+                width,
                 rows,
                 layout,
                 launches,
@@ -1995,25 +2013,38 @@ impl DraftGraphs {
         })
     }
 
-    /// Row counts of the rungs, ascending.
-    pub fn ladder(&self) -> Vec<u32> {
+    /// Every rung as `(width, rows)`, in capture order (by width, then rows
+    /// ascending).
+    pub fn rungs(&self) -> Vec<(u32, u32)> {
         self.rungs
             .iter()
-            .map(|r| u32::try_from(r.rows).expect("rows fit u32"))
+            .map(|r| (r.width, u32::try_from(r.rows).expect("rows fit u32")))
             .collect()
     }
 
-    /// Device memory each capture took, as the driver's free memory moved.
+    /// Row counts of width `width`'s rungs, ascending.
+    pub fn ladder(&self, width: u32) -> Vec<u32> {
+        self.rungs()
+            .into_iter()
+            .filter(|&(w, _)| w == width)
+            .map(|(_, r)| r)
+            .collect()
+    }
+
+    /// Device memory each capture took, as the driver's free memory moved
+    /// (in the order of [`DraftGraphs::rungs`]).
     pub fn capture_bytes(&self) -> &[i64] {
         &self.capture_bytes
     }
 
-    /// The smallest rung holding `rows` rows.
-    pub(crate) fn rung_for(&self, rows: usize) -> Option<usize> {
+    /// The smallest rung of width `width` holding `rows` rows.
+    pub(crate) fn rung_for(&self, width: u32, rows: usize) -> Option<usize> {
         if rows == 0 {
             return None;
         }
-        self.rungs.iter().position(|r| r.rows >= rows)
+        self.rungs
+            .iter()
+            .position(|r| r.width == width && r.rows >= rows)
     }
 
     pub(crate) fn rows(&self, rung: usize) -> usize {
@@ -2693,7 +2724,7 @@ mod tests {
     }
 
     fn pad(depths: u32) -> Row {
-        pad_row(depths)
+        pad_row(depths, depths)
     }
 
     /// Mixed steps across depths and block sizes: decode rows at every
@@ -2834,12 +2865,15 @@ mod tests {
     #[test]
     fn padded_uniform_steps_have_their_rungs_shape() {
         for depths in 1..=3u32 {
-            for bs in [1u32, 3, 16] {
+            for (bs, width) in [1u32, 3, 16]
+                .into_iter()
+                .flat_map(|bs| (0..=depths).map(move |w| (bs, w)))
+            {
                 let kv = FakeKv { bs };
                 let cap = 12u32;
                 let c = ctx(depths, bs, cap, true);
                 for &rung in &[1u32, 5, 12] {
-                    let capture: Vec<Row> = (0..rung).map(|_| pad(depths)).collect();
+                    let capture: Vec<Row> = (0..rung).map(|_| pad_row(depths, width)).collect();
                     let cp = plan(&capture, &c, &kv);
                     let cb = build(&cp, &c).unwrap();
                     let layout = Layout::new(&cb, &c, true).unwrap();
@@ -2855,16 +2889,16 @@ mod tests {
                                 } else {
                                     Load::Tap { block: 500 + i }
                                 };
-                                decode(i, p, depths, load)
+                                decode(i, p, width, load)
                             })
                             .collect();
-                        rows.extend((real..rung).map(|_| pad(depths)));
+                        rows.extend((real..rung).map(|_| pad_row(depths, width)));
                         let p = plan(&rows, &c, &kv);
                         let b = build(&p, &c).unwrap();
                         assert_eq!(
                             launches(&b, &layout),
                             want,
-                            "D {depths} bs {bs} rung {rung} real {real}"
+                            "D {depths} width {width} bs {bs} rung {rung} real {real}"
                         );
                         pack(&b, &layout, &c).unwrap();
                         let (_, w) = emulate(&rows, &c, &kv);

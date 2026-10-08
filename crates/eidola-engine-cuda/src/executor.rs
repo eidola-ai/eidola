@@ -307,6 +307,10 @@ impl CudaExecutor {
             max_model_len: cfg.max_model_len,
             kv_groups,
             max_draft_tokens: cfg.draft_tokens,
+            // A target pass of at most this many tokens takes the masked
+            // expert layout; past it the contiguous layout costs several
+            // times as much (`AGENTS.md` → Drafting).
+            draft_step_tokens: crate::model::MASKED_TOKENS,
             num_state_slots: cfg.num_state_slots,
             buckets: cfg.buckets.clone(),
         };
@@ -933,7 +937,7 @@ impl CudaExecutor {
         let drafter = self.model.num_groups();
         let graphs = crate::draft::DraftGraphs::capture(
             &self.gpu,
-            crate::draft::draft_ladder(&self.spec.buckets, d.ctx.depths),
+            crate::draft::draft_ladders(&self.spec.buckets, d.ctx.depths),
             &d.ctx,
             &mut crate::draft::RunTarget {
                 model: &mut self.model,
@@ -1044,23 +1048,27 @@ impl CudaExecutor {
         // A uniform drafted decode step that fits a rung replays (or runs
         // directly) padded to it.
         let path = self.decode_path.get();
+        // Every row one host token, sampled, at one draft width (any of `0
+        // ..= depths`: the serving core narrows it), past the first `depths`
+        // positions so every depth has its rows.
+        let width = rows.first().map_or(0, |r| r.k);
         let uniform = !rows.is_empty()
             && rows
                 .iter()
-                .all(|r| r.tokens.len() == 1 && r.sample && r.k == depths && r.c >= depths);
+                .all(|r| r.tokens.len() == 1 && r.sample && r.k == width && r.c >= depths);
         let rung = match (path, d.graphs.as_ref()) {
             (DecodePath::Eager, _) => None,
             (_, None) => {
                 return Err(CudaError::new(format!("{path:?} decode needs graphs on")));
             }
-            (_, Some(g)) if uniform => g.rung_for(rows.len()),
+            (_, Some(g)) if uniform => g.rung_for(width, rows.len()),
             _ => None,
         };
         let real = rows.len();
         let mut ctx = d.ctx.clone();
         if let Some(r) = rung {
             let rung_rows = d.graphs.as_ref().expect("a rung").rows(r);
-            rows.extend((real..rung_rows).map(|_| crate::draft::pad_row(depths)));
+            rows.extend((real..rung_rows).map(|_| crate::draft::pad_row(depths, width)));
             ctx.graph = true;
         }
         let kvmap = crate::draft::StepKv {

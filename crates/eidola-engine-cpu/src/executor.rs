@@ -55,6 +55,9 @@ pub struct CpuExecutorConfig {
     /// rows go through every row-wise kernel and are discarded; with row-independent
     /// kernels they cannot change any real row.
     pub pad_batches: bool,
+    /// Reported as [`ModelSpec::draft_step_tokens`] (0: none), so the serving core's
+    /// draft-width narrowing can be exercised against the reference.
+    pub draft_step_tokens: u32,
     /// Testing aid: compute logits at every computed position and keep a [`RowRecord`] of
     /// every row (see [`CpuExecutor::take_records`]).
     pub record: bool,
@@ -87,6 +90,7 @@ impl CpuExecutorConfig {
             mtp_hidden: MtpHidden::Normed,
             sampleable_vocab_size,
             pad_batches: false,
+            draft_step_tokens: 0,
             record: false,
         }
     }
@@ -350,6 +354,7 @@ impl CpuExecutor {
             max_model_len: cfg.max_model_len,
             kv_groups,
             max_draft_tokens: depths as u32,
+            draft_step_tokens: cfg.draft_step_tokens,
             num_state_slots: cfg.num_state_slots,
             buckets: cfg.buckets.clone(),
         };

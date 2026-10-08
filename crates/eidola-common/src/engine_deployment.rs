@@ -197,7 +197,7 @@ pub const SUPPORTED_GPU_MEMORY_BYTES: u64 = 287_428_640_768;
 
 /// Device memory the CUDA executor holds whatever its sizing: the CUDA
 /// context, the loaded kernel modules, the decode graphs' captures (a few
-/// MiB a rung), and the slack of the weights' device layouts over their file
+/// MiB a rung; with drafting, a ladder for each draft width), and the slack of the weights' device layouts over their file
 /// bytes (each fused QKV chunk padded to whole 128-row tiles, norm and bias
 /// vectors widened to f32): 4 GiB.
 pub const DEVICE_FIXED_RESERVE_BYTES: u64 = 4 << 30;

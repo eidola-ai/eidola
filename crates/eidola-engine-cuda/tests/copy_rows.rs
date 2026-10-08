@@ -18,13 +18,13 @@ use eidola_engine_cuda::launch::dptr;
 /// One item: source buffer and row, destination buffer and row.
 type Item = (usize, usize, usize, usize);
 
-/// Buffers of `rows[b]` rows each; items copy row to row among them.
-fn case(width: usize, rows: [usize; 4], items: usize, seed: u64) {
-    let Some(su) = setup() else { return };
-    let gpu = &su.gpu;
-    let s = gpu.stream();
+/// A case's host side: the buffers' contents, the item list (`items` valid
+/// items, then two out of range) and the buffers the valid items leave.
+/// Needs no device, so the run without one builds every case
+/// (`cases_are_built_without_a_device`).
+fn plan(width: usize, rows: [usize; 4], items: usize, seed: u64) -> Plan {
     let mut rng = Lcg(seed);
-    let mut host: Vec<Vec<u32>> = rows
+    let host: Vec<Vec<u32>> = rows
         .iter()
         .map(|&r| {
             (0..r * width)
@@ -36,7 +36,10 @@ fn case(width: usize, rows: [usize; 4], items: usize, seed: u64) {
     let mut dsts = std::collections::HashSet::new();
     let mut srcs = Vec::new();
     let mut list = Vec::new();
+    let mut draws = 0u32;
     while list.len() < items {
+        draws += 1;
+        assert!(draws < 1_000_000, "no item list of {items} found");
         let below = |rng: &mut Lcg, n: usize| usize::try_from(rng.below(n as u64)).unwrap();
         let (sb, db) = (below(&mut rng, 4), below(&mut rng, 4));
         let (sr, dr) = (below(&mut rng, rows[sb]), below(&mut rng, rows[db]));
@@ -49,6 +52,31 @@ fn case(width: usize, rows: [usize; 4], items: usize, seed: u64) {
     // One item past its buffer's rows and one naming an unused slot: refused.
     list.push((0, rows[0], 1, 0));
     list.push((COPY_BUFFERS, 0, 2, 0));
+    // The reference: every in-range item, in any order (none overlaps).
+    let mut want = host.clone();
+    for &(sb, sr, db, dr) in &list[..items] {
+        let row = host[sb][sr * width..(sr + 1) * width].to_vec();
+        want[db][dr * width..(dr + 1) * width].copy_from_slice(&row);
+    }
+    Plan { host, list, want }
+}
+
+struct Plan {
+    host: Vec<Vec<u32>>,
+    list: Vec<Item>,
+    want: Vec<Vec<u32>>,
+}
+
+/// Buffers of `rows[b]` rows each; items copy row to row among them.
+fn case(width: usize, rows: [usize; 4], items: usize, seed: u64) {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    let Plan {
+        mut host,
+        list,
+        want,
+    } = plan(width, rows, items, seed);
     let col = |f: &dyn Fn(&Item) -> usize| -> Vec<u32> {
         list.iter().map(|i| u32::try_from(f(i)).unwrap()).collect()
     };
@@ -56,12 +84,6 @@ fn case(width: usize, rows: [usize; 4], items: usize, seed: u64) {
         .iter()
         .map(|v| s.clone_htod(v).unwrap())
         .collect();
-    // The reference: every in-range item, in any order (none overlaps).
-    let mut want = host.clone();
-    for &(sb, sr, db, dr) in &list[..items] {
-        let row = host[sb][sr * width..(sr + 1) * width].to_vec();
-        want[db][dr * width..(dr + 1) * width].copy_from_slice(&row);
-    }
     for &arch in &su.archs {
         let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
         let bufs: Vec<_> = host.iter().map(|b| s.clone_htod(b).unwrap()).collect();
@@ -99,20 +121,41 @@ fn case(width: usize, rows: [usize; 4], items: usize, seed: u64) {
     host.clear();
 }
 
+/// Every case: width, rows per buffer, valid items, seed.
+const CASES: [(usize, [usize; 4], usize, u64); 3] = [
+    (1, [64, 9, 300, 17], 120, 1),
+    (4096, [40, 12, 33, 8], 50, 2),
+    // More than one block of threads per row, the last partial.
+    (COPY_THREADS as usize * 3 + 5, [7, 7, 7, 7], 12, 3),
+];
+
 #[test]
 fn token_rows() {
-    case(1, [64, 9, 300, 17], 120, 1);
+    let (w, r, i, s) = CASES[0];
+    case(w, r, i, s);
 }
 
 #[test]
 fn hidden_rows() {
-    case(4096, [40, 12, 33, 8], 50, 2);
+    let (w, r, i, s) = CASES[1];
+    case(w, r, i, s);
 }
 
 #[test]
 fn uneven_wide_rows() {
-    // More than one block of threads per row, the last partial.
-    case(COPY_THREADS as usize * 3 + 5, [7, 7, 7, 7], 12, 3);
+    let (w, r, i, s) = CASES[2];
+    case(w, r, i, s);
+}
+
+/// The cases' host side runs without a device, so a setup that cannot be
+/// built (an item list that cannot be drawn) fails here rather than on the
+/// GPU host.
+#[test]
+fn cases_are_built_without_a_device() {
+    for (w, r, i, s) in CASES {
+        let p = plan(w, r, i, s);
+        assert_eq!(p.list.len(), i + 2);
+    }
 }
 
 /// One block row per item; the row's words over blocks of `COPY_THREADS`.
