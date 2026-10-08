@@ -3,6 +3,7 @@
 //! only Eidola's gateway calls.
 //!
 //! * [`config`] — the node's configuration, from the environment; nothing defaulted.
+//! * `cuda` (the `cuda` feature) — the CUDA executor's refusals, KV sizing and device.
 //! * [`auth`] — the gateway token (measured Argon2id hash, constant-time per request).
 //! * [`model`] — the weights hash, checked before loading, and the loaded model.
 //! * [`storage`] — the `verified-readonly` storage check (mount and superblock read-only).
@@ -17,6 +18,8 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod error;
 pub mod http;
 pub mod model;
@@ -34,7 +37,7 @@ use eidola_engine::spec::Bucket;
 use eidola_engine_cpu::{CpuExecutor, CpuExecutorConfig, MtpHidden};
 use tokio::sync::oneshot;
 
-use crate::config::{Config, ExecutorKind};
+use crate::config::{Config, ExecutorConfig};
 use crate::http::AppState;
 use crate::model::LoadedModel;
 use crate::worker::{Admission, EngineHandle};
@@ -150,12 +153,16 @@ pub async fn os_shutdown_signal() {
     tracing::info!("shutting down");
 }
 
-/// Verifies and loads the configured weights, then starts the node.
+/// Verifies and loads the configured weights, then starts the node. In order: the
+/// weights storage, the weights hash, the model's files (and, for the CPU executor, the
+/// reference model), then the executor ([`start`]); a refusal at any step ends the boot
+/// with nothing served.
 pub fn boot(config: Config) -> Result<Node, BootError> {
     let model = LoadedModel::load(
         &config.weights_dir,
         &config.expected_weights_sha256,
         config.weights_storage,
+        config.executor.kind(),
     )
     .map_err(|e| BootError(e.to_string()))?;
     start(config, Arc::new(model))
@@ -175,21 +182,12 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         ));
     }
     let sizing = config.sizing;
-    let weights = &model.model().weights;
-    let max_positions = weights.config.max_position_embeddings as u32;
+    let max_positions = u32::try_from(model.config().max_position_embeddings).unwrap_or(u32::MAX);
     if sizing.max_model_len > max_positions {
         return Err(BootError(format!(
             "{} ({}) exceeds the model's max_position_embeddings ({max_positions})",
             config::env::MAX_MODEL_LEN,
             sizing.max_model_len
-        )));
-    }
-    let mtp_layers = weights.mtp.len() as u32;
-    if sizing.draft_tokens > mtp_layers {
-        return Err(BootError(format!(
-            "{} ({}) exceeds the model's {mtp_layers} MTP layers",
-            config::env::DRAFT_TOKENS,
-            sizing.draft_tokens
         )));
     }
     let sampleable_vocab_size = model.tokenizer().vocab_size() as u32;
@@ -208,12 +206,23 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
     };
 
     let (stopped_tx, stopped_rx) = oneshot::channel();
-    let engine = match config.executor {
-        ExecutorKind::Cpu => {
+    let (engine, device) = match &config.executor {
+        ExecutorConfig::Cpu { kv_blocks } => {
+            let reference = model.reference().cloned().ok_or_else(|| {
+                BootError("the loaded model has no reference weights for the cpu executor".into())
+            })?;
+            let mtp_layers = reference.weights.mtp.len() as u32;
+            if sizing.draft_tokens > mtp_layers {
+                return Err(BootError(format!(
+                    "{} ({}) exceeds the model's {mtp_layers} MTP layers",
+                    config::env::DRAFT_TOKENS,
+                    sizing.draft_tokens
+                )));
+            }
             // One captured shape: the CPU executor runs any batch within it unpadded.
             let exec_config = CpuExecutorConfig {
                 block_size: sizing.kv_block_size,
-                num_blocks: sizing.kv_blocks,
+                num_blocks: *kv_blocks,
                 num_state_slots: sizing.max_seqs,
                 max_model_len: sizing.max_model_len,
                 buckets: vec![Bucket {
@@ -226,21 +235,48 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 pad_batches: false,
                 record: false,
             };
-            let reference = model.model().clone();
-            worker::spawn(
+            let engine = worker::spawn(
                 move || Ok(CpuExecutor::new(reference, exec_config)),
                 scheduler,
                 SWEEP_INTERVAL,
                 stopped_tx,
-            )
+            );
+            (engine, None)
         }
+        // Never a fallback: a refusal here ends the boot.
         #[cfg(feature = "cuda")]
-        ExecutorKind::Cuda => {
-            drop(stopped_tx);
-            Err("the cuda executor is not implemented in this build".to_string())
+        ExecutorConfig::Cuda {
+            kernels_dir,
+            kv_device_bytes,
+        } => {
+            let prepared = cuda::prepare(
+                &model,
+                &sizing,
+                &config.cache,
+                kernels_dir,
+                *kv_device_bytes,
+            )?;
+            let report = prepared.report();
+            let blocks = prepared.config().num_blocks;
+            tracing::info!(
+                device = %report.name,
+                compute_capability = %report.compute_capability,
+                image = report.image.unwrap_or("none"),
+                global_kv_blocks = blocks.global,
+                sliding_kv_blocks = blocks.sliding,
+                "loading the model onto the device"
+            );
+            let engine = worker::spawn(
+                move || prepared.build(),
+                scheduler,
+                SWEEP_INTERVAL,
+                stopped_tx,
+            );
+            (engine, Some(report))
         }
-    }
-    .map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
+    };
+    let engine =
+        engine.map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
 
     let weights_hash = model.weights_hash().to_string();
     let admission = Admission::new(sizing.max_requests);
@@ -248,7 +284,8 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
     let reading = Admission::new(sizing.max_requests);
     let state = Arc::new(AppState {
         model_id: config.model_id,
-        executor: config.executor.as_str(),
+        executor: config.executor.kind().as_str(),
+        device,
         max_model_len: sizing.max_model_len,
         model,
         token: config.gateway_token,

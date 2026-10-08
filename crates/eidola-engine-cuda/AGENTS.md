@@ -79,11 +79,14 @@ A dense-only subset of layers needs neither of the last two. `support::tests` re
 
 **Construction order is structural.** `CudaExecutor::new` checks, in order:
 
-1. the configuration, the sampleable vocabulary and the device;
-2. the KV geometry (`GroupGeometry::validate`: every product in checked `usize`, a block within the 32-bit page stride, block ids within the `i32` tables);
-3. it loads and verifies every kernel image.
+1. the configuration, the sampleable vocabulary and the context;
+2. the KV geometry (`GroupGeometry::validate`: every product in checked `usize`, a block within the 32-bit page stride, block ids within the `i32` tables) and the resulting `ModelSpec`;
+3. the device;
+4. it loads and verifies every kernel image.
 
-Only then does it move weights. `ModelWeights::load` takes the loaded `Kernels`, so no weight can reach the device first, and a wrong device, image or kernel directory fails in about a second instead of after the checkpoint has filled the GPU (`tests/construction.rs`). Scratch sizes are computed with checked arithmetic, all of them before any allocation.
+Steps 1 and 2 need no device: `CudaExecutor::preflight` runs exactly them (the same code `new` runs) from the checkpoint's `config.json` and returns the `ModelSpec`, so a host can refuse a configuration on a machine without a GPU and size its KV pools from the spec's groups (the inference node does both).
+
+Only then does it move weights. `ModelWeights::load` takes the loaded `Kernels`, so no weight can reach the device first, and a wrong device, image or kernel directory fails in about a second instead of after the checkpoint has filled the GPU (`tests/construction.rs`, whose preflight test runs without a device). Scratch sizes are computed with checked arithmetic, all of them before any allocation.
 
 ## The executor
 

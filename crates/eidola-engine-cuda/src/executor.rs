@@ -116,25 +116,38 @@ impl std::fmt::Debug for CudaExecutor {
     }
 }
 
+/// What [`CudaExecutor::new`] builds from, once every host-side check passed.
+struct Plan {
+    config: eidola_engine_model::ModelConfig,
+    layer_kv: Vec<crate::model::LayerKv>,
+    geometry: Vec<crate::kv::GroupGeometry>,
+    spec: ModelSpec,
+}
+
 impl CudaExecutor {
-    /// Load the model (optionally only `keep_layers` of the checkpoint) and
-    /// allocate every pool and buffer.
-    pub fn new(
-        gpu: Gpu,
-        kernels_dir: &KernelDir,
-        store: Arc<WeightSet>,
+    /// Every check [`CudaExecutor::new`] makes that needs no device, in the
+    /// same order: the configuration (optionally only `keep_layers` of the
+    /// checkpoint), the sampleable vocabulary, the context, the KV geometry
+    /// and the resulting [`ModelSpec`], which it returns. Reads only the
+    /// checkpoint's `config.json`; nothing is loaded or allocated, so a host
+    /// can refuse a configuration on a machine without a device.
+    pub fn preflight(
+        store: &WeightSet,
         keep_layers: Option<&[usize]>,
-        cfg: CudaExecutorConfig,
-    ) -> Result<CudaExecutor> {
-        // Everything that can be refused is checked before any device memory
-        // is touched: the configuration, the sampleable vocabulary, the KV
-        // geometry; then the kernels are loaded and verified; only then do
-        // the weights move.
-        let config = read_config(&store, keep_layers)?;
+        cfg: &CudaExecutorConfig,
+    ) -> Result<ModelSpec> {
+        Ok(Self::plan(store, keep_layers, cfg)?.spec)
+    }
+
+    fn plan(
+        store: &WeightSet,
+        keep_layers: Option<&[usize]>,
+        cfg: &CudaExecutorConfig,
+    ) -> Result<Plan> {
+        let config = read_config(store, keep_layers)?;
         check_supported(&config)?;
         check_sampleable(cfg.sampleable_vocab_size as usize, config.vocab_size)?;
         check_context(cfg.max_model_len, &config)?;
-        let image = check_device(gpu.info(), &config, cfg.image)?;
         let (keys, layer_kv) = group_layers(&config);
         let num_blocks = cfg.num_blocks.resolve(&keys)?;
         let geometry = group_geometry(&keys, &layer_kv, cfg.block_size, &num_blocks)?;
@@ -177,6 +190,34 @@ impl CudaExecutor {
             buckets: cfg.buckets.clone(),
         };
         spec.validate().map_err(CudaError::new)?;
+        Ok(Plan {
+            config,
+            layer_kv,
+            geometry,
+            spec,
+        })
+    }
+
+    /// Load the model (optionally only `keep_layers` of the checkpoint) and
+    /// allocate every pool and buffer.
+    pub fn new(
+        gpu: Gpu,
+        kernels_dir: &KernelDir,
+        store: Arc<WeightSet>,
+        keep_layers: Option<&[usize]>,
+        cfg: CudaExecutorConfig,
+    ) -> Result<CudaExecutor> {
+        // Everything that can be refused is checked before any device memory
+        // is touched: the configuration, the sampleable vocabulary, the
+        // context and the KV geometry (`preflight`), then the device; then
+        // the kernels are loaded and verified; only then do the weights move.
+        let Plan {
+            config,
+            layer_kv,
+            geometry,
+            spec,
+        } = Self::plan(&store, keep_layers, &cfg)?;
+        let image = check_device(gpu.info(), &config, cfg.image)?;
         let kernels = Kernels::load(&gpu, kernels_dir, Some(image))?;
         let weights = ModelWeights::load(&gpu, &kernels, store, config)?;
         let last = *spec.buckets.last().expect("validated: a bucket");
