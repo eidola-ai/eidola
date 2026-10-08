@@ -45,6 +45,13 @@ constexpr uint64_t kStreamSample = 0;
 
 // Status bits.
 constexpr uint32_t kStatusNonFinite = 1;
+// A token id at or past the sampleable vocabulary: one this kernel would have
+// produced (never, by construction: every argmax and draw is below `n`), or a
+// draft chain acceptance was handed. Drafts produced on the device reach the
+// forward's embedding and acceptance's distributions only through these two
+// kernels, so the bound is checked where the ids are made and where they are
+// read.
+constexpr uint32_t kStatusBadToken = 2;
 
 __device__ __forceinline__ uint64_t mix64(uint64_t z) {
   z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -303,6 +310,14 @@ __device__ uint32_t argmax_f64(const double* p, uint32_t n, Shared& sh) {
   return static_cast<uint32_t>(block_min_u64(lo, sh));
 }
 
+// `token` if it lies in the sampleable vocabulary; else 0, with
+// kStatusBadToken raised.
+__device__ __forceinline__ uint32_t bounded(uint32_t token, uint32_t n, uint32_t* status) {
+  if (token < n) return token;
+  atomicOr(status, kStatusBadToken);
+  return 0;
+}
+
 }  // namespace
 
 // Per-row sampling parameters (32 bytes), the device copy of SamplingParams
@@ -337,7 +352,7 @@ extern "C" __global__ void __launch_bounds__(kThreads)
   if (row.temperature <= 0.0f) {
     for (uint32_t i = threadIdx.x; i < n; i += kThreads) p[i] = i == top ? 1.0 : 0.0;
     if (threadIdx.x == 0) {
-      if (draw_stream != 0xffffffffu) tokens[blockIdx.x] = top;
+      if (draw_stream != 0xffffffffu) tokens[blockIdx.x] = bounded(top, n, status);
       if (non_finite) atomicOr(status, kStatusNonFinite);
     }
     return;
@@ -413,7 +428,7 @@ extern "C" __global__ void __launch_bounds__(kThreads)
   if (draw_stream != 0xffffffffu) {
     const double u = uniform(row.seed, row.position, draw_stream);
     const uint32_t token = draw(p, n, u, sh);
-    if (threadIdx.x == 0) tokens[blockIdx.x] = token;
+    if (threadIdx.x == 0) tokens[blockIdx.x] = bounded(token, n, status);
   }
 }
 
@@ -421,18 +436,23 @@ EIDOLA_KERNEL_META(eidola_sample, kThreads, 1, 1, 0, 1, 1, 1, 0);
 
 // Chain speculative acceptance (sampling::chain_accept) for one sequence per
 // block. Row r has `num_drafts[r] = k` drafts; its target distributions are
-// `target[target_row[r] + 0 ..= k]` and its draft distributions
-// `draft[draft_row[r] + 0 .. k]` (each a [n] f64 row from eidola_sample).
-// Writes 1..=k+1 tokens to out[r * stride ..] and their count to counts[r].
-// `scratch` holds one [n] row per block for the residual.
+// `target[target_row[r] + 0 ..= k]` and draft i's distribution and id are row
+// `draft_row[r] + i * draft_step` of `draft` (each a [n] f64 row from
+// eidola_sample) and of `drafts`: contiguous per sequence with a step of 1,
+// or one depth's drafts of every sequence together (the drafter's layout)
+// with a step of the sequence count. Writes 1..=k+1 tokens to
+// out[r * stride ..] and their count to counts[r]. A draft id at or past `n`
+// raises kStatusBadToken in `status` and ends the row with no tokens, before
+// anything is read through it. `scratch` holds one [n] row per block for the
+// residual.
 extern "C" __global__ void __launch_bounds__(kThreads)
     eidola_chain_accept(const double* __restrict__ target, const double* __restrict__ draft,
                         uint32_t n, const EidolaSampleRow* __restrict__ rows,
                         const uint32_t* __restrict__ target_row,
-                        const uint32_t* __restrict__ draft_row,
+                        const uint32_t* __restrict__ draft_row, uint32_t draft_step,
                         const uint32_t* __restrict__ num_drafts, const uint32_t* __restrict__ drafts,
                         uint32_t stride, double* __restrict__ scratch, uint32_t* __restrict__ out,
-                        uint32_t* __restrict__ counts) {
+                        uint32_t* __restrict__ counts, uint32_t* __restrict__ status) {
   __shared__ Shared sh;
   const uint32_t r = blockIdx.x;
   const EidolaSampleRow row = rows[r];
@@ -443,9 +463,17 @@ extern "C" __global__ void __launch_bounds__(kThreads)
   double* res = scratch + static_cast<uint64_t>(r) * n;
   uint32_t produced = 0;
   for (uint32_t i = 0; i < k; ++i) {
+    const uint64_t dr = static_cast<uint64_t>(draft_row[r]) + static_cast<uint64_t>(i) * draft_step;
+    const uint32_t d = drafts[dr];
+    if (d >= n) {
+      if (threadIdx.x == 0) {
+        atomicOr(status, kStatusBadToken);
+        counts[r] = 0;
+      }
+      return;
+    }
     const double* p = target + static_cast<uint64_t>(target_row[r] + i) * n;
-    const double* q = draft + static_cast<uint64_t>(draft_row[r] + i) * n;
-    const uint32_t d = drafts[r * stride + i];
+    const double* q = draft + dr * n;
     const uint64_t pos = first + i;
     const bool accepted =
         greedy ? p[d] > 0.0

@@ -5,7 +5,9 @@ mod common;
 
 use common::{Lcg, setup};
 use eidola_engine::sampling::{self, Logits, SamplingParams, Stream};
-use eidola_engine_cuda::sampler::{AcceptInputs, AcceptRow, STATUS_NON_FINITE, SampleRow, Sampler};
+use eidola_engine_cuda::sampler::{
+    AcceptInputs, AcceptLaunch, AcceptRow, STATUS_BAD_TOKEN, STATUS_NON_FINITE, SampleRow, Sampler,
+};
 
 /// MiMo's padded head and tokenizer.
 const STRIDE: usize = 152_576;
@@ -393,8 +395,10 @@ fn chain_accept_matches_reference() {
                 &mut scratch,
                 &mut out,
                 &mut counts,
+                &mut status,
             )
             .unwrap();
+        assert_eq!(s.clone_dtoh(&status).unwrap(), vec![0], "{arch:?}");
         let out = s.clone_dtoh(&out).unwrap();
         let counts = s.clone_dtoh(&counts).unwrap();
         let mut accepted = 0;
@@ -480,6 +484,7 @@ fn oversized_vocabularies_are_refused() {
     let mut scratch = s.alloc_zeros::<f64>(n as usize).unwrap();
     let mut out = s.alloc_zeros::<u32>(2).unwrap();
     let mut counts = s.alloc_zeros::<u32>(1).unwrap();
+    let mut accept_status = s.alloc_zeros::<u32>(1).unwrap();
     let e = sampler
         .chain_accept(
             gpu,
@@ -492,6 +497,7 @@ fn oversized_vocabularies_are_refused() {
             &mut scratch,
             &mut out,
             &mut counts,
+            &mut accept_status,
         )
         .unwrap_err();
     assert!(e.to_string().contains("vocabulary"), "{e}");
@@ -540,6 +546,7 @@ fn accept_plans_are_bounded() {
     let mut scratch = s.alloc_zeros::<f64>(2 * n as usize).unwrap();
     let mut out = s.alloc_zeros::<u32>(2 * stride as usize).unwrap();
     let mut counts = s.alloc_zeros::<u32>(2).unwrap();
+    let mut status = s.alloc_zeros::<u32>(1).unwrap();
     let mut run = |plan: &[AcceptRow]| {
         sampler.chain_accept(
             gpu,
@@ -552,6 +559,7 @@ fn accept_plans_are_bounded() {
             &mut scratch,
             &mut out,
             &mut counts,
+            &mut status,
         )?;
         Ok::<_, eidola_engine_cuda::CudaError>((
             s.clone_dtoh(&out).unwrap(),
@@ -615,4 +623,82 @@ fn logit_rows_are_bounded() {
     run(1).unwrap();
     let e = run(2).unwrap_err();
     assert!(e.to_string().contains("logit row 2 of 2"), "{e}");
+}
+
+/// Draft ids the drafted step makes on the device never reach the host, so
+/// the acceptance kernel bounds them itself: a draft at or past the
+/// vocabulary raises `STATUS_BAD_TOKEN` and ends its row with no tokens,
+/// while the other rows (one with the drafter's layout, its drafts one depth
+/// apart) are accepted as the host plan would accept them.
+#[test]
+fn device_drafts_are_bounded_by_the_kernel() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    let (n, stride) = (64u32, 3u32);
+    // Three sequences of two drafts; target rows put all mass on token 7.
+    let mut target = vec![0f64; 9 * n as usize];
+    for r in 0..9 {
+        target[r * n as usize + 7] = 1.0;
+    }
+    let target = s.clone_htod(&target).unwrap();
+    // Draft rows depth-major: row `depth * 3 + sequence`.
+    let draft = s
+        .clone_htod(&vec![1.0 / f64::from(n); 6 * n as usize])
+        .unwrap();
+    // Sequence 1's second draft is out of range.
+    let ids: Vec<u32> = vec![7, 7, 7, 7, n + 5, 7];
+    let ids = s.clone_htod(&ids).unwrap();
+    let rows = s
+        .clone_htod(&[SampleRow::new(&SamplingParams::greedy(), 10, 0); 3])
+        .unwrap();
+    let target_row = s.clone_htod(&[0u32, 3, 6]).unwrap();
+    let draft_row = s.clone_htod(&[0u32, 1, 2]).unwrap();
+    let num_drafts = s.clone_htod(&[2u32, 2, 2]).unwrap();
+    for &arch in &su.archs {
+        let sampler = Sampler::from_module(su.module("sampling", arch)).unwrap();
+        let scratch = s.alloc_zeros::<f64>(3 * n as usize).unwrap();
+        let out = s.alloc_zeros::<u32>(3 * stride as usize).unwrap();
+        let counts = s.clone_htod(&[9u32; 3]).unwrap();
+        let status = s.alloc_zeros::<u32>(1).unwrap();
+        let p = |b: &cudarc::driver::CudaSlice<u32>| eidola_engine_cuda::launch::dptr(b, s);
+        let f = |b: &cudarc::driver::CudaSlice<f64>| eidola_engine_cuda::launch::dptr(b, s);
+        // SAFETY: every row's target, draft and id rows lie inside the
+        // buffers above; out, counts, scratch and status are sized for three
+        // rows.
+        unsafe {
+            sampler
+                .launch_accept(
+                    gpu,
+                    AcceptLaunch {
+                        target: f(&target),
+                        draft: f(&draft),
+                        n,
+                        rows: eidola_engine_cuda::launch::dptr(&rows, s),
+                        target_row: p(&target_row),
+                        draft_row: p(&draft_row),
+                        draft_step: 3,
+                        num_drafts: p(&num_drafts),
+                        drafts: p(&ids),
+                        stride,
+                        scratch: f(&scratch),
+                        out: p(&out),
+                        counts: p(&counts),
+                        status: p(&status),
+                        num_rows: 3,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            s.clone_dtoh(&status).unwrap(),
+            vec![STATUS_BAD_TOKEN],
+            "{arch:?}"
+        );
+        let counts = s.clone_dtoh(&counts).unwrap();
+        let out = s.clone_dtoh(&out).unwrap();
+        assert_eq!(counts, vec![3, 0, 3], "{arch:?}");
+        assert_eq!(&out[..3], &[7, 7, 7], "{arch:?}");
+        assert_eq!(&out[6..9], &[7, 7, 7], "{arch:?}");
+    }
 }
