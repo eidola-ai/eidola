@@ -19,7 +19,7 @@ use crate::module::KernelDir;
 use cudarc::driver::CudaSlice;
 use eidola_engine_model::ModelConfig;
 use eidola_engine_model::attention::rope_cos_sin;
-use eidola_engine_model::config::AttentionSpec;
+use eidola_engine_model::config::{AttentionSpec, FfnKind};
 use eidola_engine_model::safetensors::WeightSet;
 
 use crate::attention::{Attention, AttnLayer, AttnPlan};
@@ -159,18 +159,41 @@ pub struct GpuModel {
     pub captured: Vec<Vec<f32>>,
 }
 
-impl GpuModel {
-    pub fn new(
-        gpu: &Gpu,
-        weights: ModelWeights,
-        kernels: Kernels,
-        layer_kv: Vec<LayerKv>,
+/// Element counts of every scratch buffer, from the retained layers and the
+/// step capacity; checked arithmetic throughout.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ScratchSizes {
+    toks: usize,
+    per_group: usize,
+    tph: usize,
+    tpk: usize,
+    xsf: usize,
+    qkv: usize,
+    q: usize,
+    attn: usize,
+    gu: usize,
+    topk: usize,
+    eah: usize,
+    esf: usize,
+    egu: usize,
+    eact: usize,
+    eact_sf: usize,
+    sel: usize,
+    logits: usize,
+    erows: usize,
+    experts: usize,
+    rows: usize,
+}
+
+impl ScratchSizes {
+    pub(crate) fn new(
+        c: &ModelConfig,
+        groups: usize,
+        qkv_cols: usize,
         max_tokens: usize,
         max_logit_rows: usize,
         max_len: usize,
-    ) -> Result<GpuModel> {
-        let c = &weights.config;
-        let s = gpu.stream();
+    ) -> Result<ScratchSizes> {
         let (h, v) = (c.hidden_size, c.vocab_size);
         // Every buffer size is computed with checked arithmetic, and the whole
         // set before anything is allocated.
@@ -185,25 +208,25 @@ impl GpuModel {
             x.max(1).div_ceil(m).checked_mul(m).ok_or_else(overflow)
         };
         let tp = up(max_tokens, 4)?;
-        let groups = layer_kv.iter().map(|l| l.group + 1).max().unwrap_or(0);
-        let qkv_cols = weights
-            .layers
-            .iter()
-            .map(|l| l.attention.qkv.linear.n as usize)
-            .max()
-            .unwrap_or(0);
         let nq = c
             .layers
             .iter()
             .map(|l| l.attention.num_q_heads)
             .max()
             .unwrap_or(0);
-        let dense_i = c.dense_intermediate_size;
+        // Only the retained layers' FFNs size their buffers: a dense-only
+        // selection needs no expert scratch, an expert-only one no dense.
+        let has = |k: FfnKind| c.layers.iter().any(|l| l.ffn == k);
+        let dense_i = if has(FfnKind::Dense) {
+            c.dense_intermediate_size
+        } else {
+            0
+        };
         let kmax = h.max(dense_i).max(prod(&[nq, 128])?);
-        let (top_k, experts, inter) = c
-            .moe
-            .as_ref()
-            .map_or((0, 0, 0), |m| (m.top_k, m.num_experts, m.intermediate_size));
+        let (top_k, experts, inter) = match &c.moe {
+            Some(m) if has(FfnKind::Moe) => (m.top_k, m.num_experts, m.intermediate_size),
+            _ => (0, 0, 0),
+        };
         let erows = if experts > 0 {
             let n = prod(&[max_tokens, top_k])?;
             let padded = prod(&[n.min(experts), BLOCK_M as usize - 1])?
@@ -255,6 +278,79 @@ impl GpuModel {
             logits,
             _rope_len,
         ] = sz;
+        Ok(ScratchSizes {
+            toks,
+            per_group,
+            tph,
+            tpk,
+            xsf,
+            qkv,
+            q,
+            attn,
+            gu,
+            topk,
+            eah,
+            esf,
+            egu,
+            eact,
+            eact_sf,
+            sel,
+            logits,
+            erows,
+            experts,
+            rows,
+        })
+    }
+
+    /// Bytes across the expert buffers (`ea`, `esf`, `egu`, `eact`,
+    /// `eact_sf`, `edown`).
+    #[cfg(test)]
+    fn expert_bytes(&self) -> usize {
+        self.eah + self.esf * 4 + self.egu * 2 + self.eact + self.eact_sf * 4 + self.eah * 2
+    }
+}
+
+impl GpuModel {
+    pub fn new(
+        gpu: &Gpu,
+        weights: ModelWeights,
+        kernels: Kernels,
+        layer_kv: Vec<LayerKv>,
+        max_tokens: usize,
+        max_logit_rows: usize,
+        max_len: usize,
+    ) -> Result<GpuModel> {
+        let c = &weights.config;
+        let s = gpu.stream();
+        let groups = layer_kv.iter().map(|l| l.group + 1).max().unwrap_or(0);
+        let qkv_cols = weights
+            .layers
+            .iter()
+            .map(|l| l.attention.qkv.linear.n as usize)
+            .max()
+            .unwrap_or(0);
+        let ScratchSizes {
+            toks,
+            per_group,
+            tph,
+            tpk,
+            xsf,
+            qkv,
+            q,
+            attn,
+            gu,
+            topk,
+            eah,
+            esf,
+            egu,
+            eact,
+            eact_sf,
+            sel,
+            logits,
+            erows,
+            experts,
+            rows,
+        } = ScratchSizes::new(c, groups, qkv_cols, max_tokens, max_logit_rows, max_len)?;
         let scratch = Scratch {
             max_tokens,
             tokens: s.alloc_zeros(toks)?,
@@ -706,33 +802,44 @@ pub fn rope_table(spec: &AttentionSpec, max_len: usize) -> Vec<f32> {
     t
 }
 
-/// Group target layers by (attention kind, KV shape) in first-layer order,
-/// as the CPU reference executor does.
+/// Group target layers by (attention kind, KV shape), in the canonical
+/// order: global groups before sliding ones, each kind in first-layer order.
+/// The order is the configuration's, not the layer selection's.
 pub fn group_layers(config: &ModelConfig) -> (Vec<AttentionSpec>, Vec<LayerKv>) {
+    let same = |k: &AttentionSpec, a: &AttentionSpec| {
+        k.kind == a.kind
+            && k.num_kv_heads == a.num_kv_heads
+            && k.head_dim_qk == a.head_dim_qk
+            && k.head_dim_v == a.head_dim_v
+    };
     let mut keys: Vec<AttentionSpec> = Vec::new();
-    let mut counts: Vec<u32> = Vec::new();
-    let mut out = Vec::new();
     for l in &config.layers {
-        let a = &l.attention;
-        let g = match keys.iter().position(|k| {
-            k.kind == a.kind
-                && k.num_kv_heads == a.num_kv_heads
-                && k.head_dim_qk == a.head_dim_qk
-                && k.head_dim_v == a.head_dim_v
-        }) {
-            Some(g) => g,
-            None => {
-                keys.push(a.clone());
-                counts.push(0);
-                keys.len() - 1
-            }
-        };
-        out.push(LayerKv {
-            group: g,
-            layer_in_group: counts[g],
-        });
-        counts[g] += 1;
+        if !keys.iter().any(|k| same(k, &l.attention)) {
+            keys.push(l.attention.clone());
+        }
     }
+    keys.sort_by_key(|k| {
+        matches!(
+            k.kind,
+            eidola_engine_model::config::AttentionKind::Sliding { .. }
+        )
+    });
+    let mut counts = vec![0u32; keys.len()];
+    let out = config
+        .layers
+        .iter()
+        .map(|l| {
+            let g = keys
+                .iter()
+                .position(|k| same(k, &l.attention))
+                .expect("every layer's key was collected");
+            counts[g] += 1;
+            LayerKv {
+                group: g,
+                layer_in_group: counts[g] - 1,
+            }
+        })
+        .collect();
     (keys, out)
 }
 
@@ -762,9 +869,76 @@ pub fn read_config(store: &WeightSet, keep_layers: Option<&[usize]>) -> Result<M
         .model_config()
         .map_err(|e| CudaError::new(e.to_string()))?;
     if let Some(keep) = keep_layers {
+        crate::support::check_layers(keep, config.source_num_layers)?;
         config = config
             .truncated(keep)
             .map_err(|e| CudaError::new(e.to_string()))?;
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eidola_engine_model::config::AttentionKind;
+
+    fn flash(keep: &[usize]) -> ModelConfig {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../eidola-engine-model/tests/data/flash-mopd.config.json"
+        );
+        ModelConfig::from_file(std::path::Path::new(path))
+            .unwrap()
+            .truncated(keep)
+            .unwrap()
+    }
+
+    /// KV groups come in the canonical order (global, then sliding) whatever
+    /// kind the first retained layer is.
+    #[test]
+    fn groups_are_in_canonical_order() {
+        // Flash: layer 0 global, 1..=4 sliding, 5 global.
+        for keep in [&[0, 1, 2, 5][..], &[1, 5], &[1, 2, 5]] {
+            let (keys, kv) = group_layers(&flash(keep));
+            assert_eq!(keys.len(), 2, "{keep:?}");
+            assert_eq!(keys[0].kind, AttentionKind::Global, "{keep:?}");
+            assert!(
+                matches!(keys[1].kind, AttentionKind::Sliding { .. }),
+                "{keep:?}"
+            );
+            for (l, kv) in flash(keep).layers.iter().zip(&kv) {
+                assert_eq!(keys[kv.group].kind, l.attention.kind, "{keep:?}");
+            }
+        }
+        let (_, kv) = group_layers(&flash(&[1, 5]));
+        assert_eq!((kv[0].group, kv[1].group), (1, 0));
+        let (keys, _) = group_layers(&flash(&[1, 2]));
+        assert!(matches!(
+            keys[..],
+            [AttentionSpec {
+                kind: AttentionKind::Sliding { .. },
+                ..
+            }]
+        ));
+    }
+
+    /// Scratch is sized by the retained layers' FFNs: a dense-only selection
+    /// allocates no expert buffers, an expert-only one no dense ones.
+    #[test]
+    fn scratch_follows_the_retained_layers() {
+        let size = |keep: &[usize]| {
+            let (keys, kv) = group_layers(&flash(keep));
+            let groups = kv.iter().map(|l| l.group + 1).max().unwrap();
+            assert_eq!(groups, keys.len());
+            ScratchSizes::new(&flash(keep), groups, 12_800, 8192, 64, 4096).unwrap()
+        };
+        let (dense, moe, both) = (size(&[0]), size(&[1, 2]), size(&[0, 1]));
+        assert_eq!(dense.experts, 0);
+        assert!(dense.expert_bytes() < 1 << 16, "{dense:?}");
+        assert!(moe.expert_bytes() > 1 << 30, "{moe:?}");
+        assert_eq!(moe.expert_bytes(), both.expert_bytes());
+        assert_eq!(moe.gu, 1, "no dense layer, no SwiGLU buffer");
+        assert_eq!(dense.gu, both.gu);
+        assert!(dense.gu > 1);
+    }
 }

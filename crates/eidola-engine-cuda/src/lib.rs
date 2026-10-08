@@ -26,7 +26,7 @@ pub mod weights;
 use std::fmt;
 
 pub use device::{DeviceInfo, Gpu, ImageArch};
-pub use executor::{CudaExecutor, CudaExecutorConfig};
+pub use executor::{CudaExecutor, CudaExecutorConfig, KvBlocks};
 pub use module::{ImageSource, Kernel, KernelDir, KernelModule};
 pub use support::{Unsupported, check_device, check_supported};
 

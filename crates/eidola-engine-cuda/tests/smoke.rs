@@ -106,6 +106,39 @@ fn rmsnorm_matches_reference() {
     }
 }
 
+/// A resolved kernel keeps its image loaded: one resolved from a module
+/// that is then dropped (here, a temporary) still reads its attributes and
+/// launches, correctly, after other images have loaded in its place.
+#[test]
+fn kernels_outlive_their_module_handle() {
+    let Some((gpu, dir)) = setup() else { return };
+    let (rows, hidden) = (3usize, 4096usize);
+    let x: Vec<u16> = (0..rows * hidden)
+        .map(|i| bf16::from_f32((i % 7) as f32 - 3.0))
+        .collect();
+    let w: Vec<u16> = (0..hidden)
+        .map(|i| bf16::from_f32(0.5 + (i % 3) as f32))
+        .collect();
+    let stream = gpu.stream();
+    let (dx, dw) = (
+        stream.clone_htod(&x).unwrap(),
+        stream.clone_htod(&w).unwrap(),
+    );
+    let kernel = KernelModule::load(&gpu, &dir, "rmsnorm")
+        .unwrap()
+        .kernel("eidola_rmsnorm_bf16")
+        .unwrap();
+    let others: Vec<_> = ["engine_ops", "sampling", "rmsnorm"]
+        .into_iter()
+        .map(|name| KernelModule::load(&gpu, &dir, name).unwrap())
+        .collect();
+    drop(others);
+    kernel.static_smem_bytes().unwrap();
+    let mut dout = stream.alloc_zeros::<u16>(rows * hidden).unwrap();
+    ops::rmsnorm_bf16(&gpu, &kernel, &mut dout, &dx, &dw, hidden as u32, 1e-6).unwrap();
+    check_rmsnorm(&stream.clone_dtoh(&dout).unwrap(), &x, &w, rows, hidden);
+}
+
 fn check_rmsnorm(out: &[u16], x: &[u16], w: &[u16], rows: usize, hidden: usize) {
     let wf: Vec<f32> = w.iter().map(|&b| bf16::to_f32(b)).collect();
     let mut reference = vec![0f32; hidden];

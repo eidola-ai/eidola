@@ -13,7 +13,7 @@ use common::setup;
 use eidola_engine::executor::{Executor, Maintenance, SeqEntry, StepInput, TableUpdate};
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, KvBlocks};
 use eidola_engine_model::safetensors::WeightSet;
 
 const KEEP: [usize; 4] = [0, 1, 2, 5];
@@ -88,7 +88,10 @@ fn seam_contract_on_the_truncated_checkpoint() {
     let store = Arc::new(WeightSet::open_dir(&dir).unwrap());
     let cfg = CudaExecutorConfig {
         block_size: BS,
-        num_blocks: vec![32, 32],
+        num_blocks: KvBlocks {
+            global: 32,
+            sliding: 32,
+        },
         num_state_slots: 4,
         max_model_len: 1024,
         buckets: vec![Bucket {

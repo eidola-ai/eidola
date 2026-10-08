@@ -19,6 +19,7 @@ use eidola_engine::executor::{Executor, ExecutorError, StepInput, StepOutput};
 use eidola_engine::sampling::Stream;
 use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec};
 use eidola_engine_model::config::AttentionKind as ModelAttention;
+use eidola_engine_model::config::AttentionSpec;
 use eidola_engine_model::safetensors::WeightSet;
 
 use crate::attention::{AttnPlan, AttnRequest};
@@ -26,7 +27,7 @@ use crate::device::ImageArch;
 use crate::kv::KvStore;
 use crate::model::{ForwardInput, GpuModel, Kernels, group_geometry, group_layers, read_config};
 use crate::sampler::{STATUS_NON_FINITE, SampleRow};
-use crate::support::{check_context, check_device, check_sampleable, check_supported};
+use crate::support::{Unsupported, check_context, check_device, check_sampleable, check_supported};
 use crate::weights::ModelWeights;
 use crate::{CudaError, Gpu, Result};
 
@@ -35,9 +36,8 @@ use crate::{CudaError, Gpu, Result};
 pub struct CudaExecutorConfig {
     /// Positions per KV block (every group).
     pub block_size: u32,
-    /// Physical blocks per KV group (global first, then sliding, in the order
-    /// the model's layers first use them), each including the null block 0.
-    pub num_blocks: Vec<u32>,
+    /// Physical blocks per KV group, by kind.
+    pub num_blocks: KvBlocks,
     pub num_state_slots: u32,
     pub max_model_len: u32,
     /// Captured step shapes; the last bounds every step.
@@ -47,6 +47,46 @@ pub struct CudaExecutorConfig {
     /// Kernel image to run (the device's own when `None`; `Sm100f` runs the
     /// family image on any CC 10.x part).
     pub image: Option<ImageArch>,
+}
+
+/// Physical blocks per KV group, keyed by the group's kind, each including
+/// the null block 0. A group the retained layers use needs at least two; one
+/// they do not use must have none. (A drafter group joins these when drafting
+/// does.)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvBlocks {
+    pub global: u32,
+    pub sliding: u32,
+}
+
+impl KvBlocks {
+    /// The block count of each group `keys` names, in order; refuses a count
+    /// for a group no retained layer uses.
+    pub fn resolve(&self, keys: &[AttentionSpec]) -> std::result::Result<Vec<u32>, Unsupported> {
+        let used = |global: bool| {
+            keys.iter()
+                .any(|k| (k.kind == ModelAttention::Global) == global)
+        };
+        for (name, global, n) in [
+            ("global", true, self.global),
+            ("sliding", false, self.sliding),
+        ] {
+            if n != 0 && !used(global) {
+                return Err(Unsupported {
+                    field: format!("num_blocks.{name}"),
+                    found: n.to_string(),
+                    required: "0 (no retained layer uses this group)".into(),
+                });
+            }
+        }
+        Ok(keys
+            .iter()
+            .map(|k| match k.kind {
+                ModelAttention::Global => self.global,
+                ModelAttention::Sliding { .. } => self.sliding,
+            })
+            .collect())
+    }
 }
 
 pub struct CudaExecutor {
@@ -96,14 +136,8 @@ impl CudaExecutor {
         check_context(cfg.max_model_len, &config)?;
         let image = check_device(gpu.info(), &config, cfg.image)?;
         let (keys, layer_kv) = group_layers(&config);
-        if cfg.num_blocks.len() != keys.len() {
-            return Err(CudaError::new(format!(
-                "{} block counts for {} KV groups",
-                cfg.num_blocks.len(),
-                keys.len()
-            )));
-        }
-        let geometry = group_geometry(&keys, &layer_kv, cfg.block_size, &cfg.num_blocks);
+        let num_blocks = cfg.num_blocks.resolve(&keys)?;
+        let geometry = group_geometry(&keys, &layer_kv, cfg.block_size, &num_blocks);
         for g in &geometry {
             g.validate()?;
         }
@@ -436,5 +470,40 @@ impl Executor for CudaExecutor {
     fn execute(&mut self, step: &StepInput) -> std::result::Result<StepOutput, ExecutorError> {
         self.steps += 1;
         self.step(step).map_err(|e| ExecutorError(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(keep: &[usize]) -> Vec<AttentionSpec> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../eidola-engine-model/tests/data/flash-mopd.config.json"
+        );
+        let c = eidola_engine_model::ModelConfig::from_file(std::path::Path::new(path))
+            .unwrap()
+            .truncated(keep)
+            .unwrap();
+        group_layers(&c).0
+    }
+
+    /// Capacities follow their group's kind, not the layer selection's order,
+    /// and a capacity for a group no retained layer uses is refused.
+    #[test]
+    fn block_counts_are_keyed_by_kind() {
+        let b = KvBlocks {
+            global: 10,
+            sliding: 20,
+        };
+        assert_eq!(b.resolve(&keys(&[0, 1])).unwrap(), vec![10, 20]);
+        assert_eq!(b.resolve(&keys(&[1, 5])).unwrap(), vec![10, 20]);
+        let e = b.resolve(&keys(&[1, 2])).unwrap_err();
+        assert_eq!(e.field, "num_blocks.global");
+        let e = b.resolve(&keys(&[0])).unwrap_err();
+        assert_eq!(e.field, "num_blocks.sliding");
+        let sliding = KvBlocks { global: 0, ..b };
+        assert_eq!(sliding.resolve(&keys(&[1, 2])).unwrap(), vec![20]);
     }
 }

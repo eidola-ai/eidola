@@ -95,4 +95,12 @@ fn out_of_range_launches_are_refused() {
         unsafe { attn.run(gpu, &plan, &layer, 63, 0, 0) }.is_err(),
         "GQA groups"
     );
+    let other_pages = AttnLayer {
+        page_size: 32,
+        ..layer
+    };
+    assert!(
+        unsafe { attn.run(gpu, &plan, &other_pages, 64, 0, 0) }.is_err(),
+        "a plan for another page size"
+    );
 }

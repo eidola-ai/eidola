@@ -21,7 +21,7 @@ use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::secret::EngineSalt;
 use eidola_engine::spec::Bucket;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, KvBlocks};
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
 
@@ -124,7 +124,10 @@ impl Harness {
         let su = setup()?;
         let cfg = CudaExecutorConfig {
             block_size: 16,
-            num_blocks: vec![blocks, blocks],
+            num_blocks: KvBlocks {
+                global: blocks,
+                sliding: blocks,
+            },
             num_state_slots: 8,
             max_model_len: 1024,
             buckets: vec![

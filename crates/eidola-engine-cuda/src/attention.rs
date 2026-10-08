@@ -142,9 +142,103 @@ pub struct AttnRequest {
     pub kv_len: u32,
 }
 
+/// A step's work list as the host derives it, before upload. Every index
+/// is checked to fit the kernel's `i32` arrays, and every request's pages to
+/// cover exactly its KV: `(pages - 1) * page_size < kv_len <= pages *
+/// page_size`, so the last page holds 1..=page_size positions.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HostPlan {
+    pub tile: u32,
+    pub q_indptr: Vec<i32>,
+    pub indices: Vec<i32>,
+    pub indptr: Vec<i32>,
+    pub last_page_len: Vec<i32>,
+    pub request_indices: Vec<i32>,
+    pub qo_tile_indices: Vec<i32>,
+    pub kv_tile_indices: Vec<i32>,
+}
+
+impl HostPlan {
+    pub fn new(requests: &[AttnRequest], group_size: u32, page_size: u32) -> Result<HostPlan> {
+        let bad =
+            |r: &AttnRequest, why: &str| CudaError::new(format!("attention request {r:?}: {why}"));
+        let int = |x: u64| i32::try_from(x).ok();
+        if group_size == 0 || page_size == 0 {
+            return Err(CudaError::new(format!(
+                "attention plan: group size {group_size}, page size {page_size}"
+            )));
+        }
+        let packed = requests
+            .iter()
+            .map(|r| r.qo_len as u64 * group_size as u64)
+            .max()
+            .unwrap_or(1);
+        let tile = if packed <= 16 {
+            16
+        } else if packed <= 64 {
+            64
+        } else {
+            128
+        };
+        let mut p = HostPlan {
+            tile,
+            q_indptr: vec![0],
+            indices: vec![],
+            indptr: vec![0],
+            last_page_len: vec![],
+            request_indices: vec![],
+            qo_tile_indices: vec![],
+            kv_tile_indices: vec![],
+        };
+        for (i, r) in requests.iter().enumerate() {
+            let (kv, pages, ps) = (r.kv_len as u64, r.pages.len() as u64, page_size as u64);
+            let before = pages.checked_sub(1).and_then(|n| n.checked_mul(ps));
+            if before.is_none_or(|b| kv <= b || kv - b > ps) {
+                return Err(bad(
+                    r,
+                    "its pages must cover its KV, the last one partly or wholly",
+                ));
+            }
+            // Every query's own position is in its KV.
+            if r.qo_len == 0 || r.qo_len > r.kv_len {
+                return Err(bad(r, "1..=kv_len queries"));
+            }
+            if p.q_indptr.last().copied() != int(r.q_start as u64) {
+                return Err(CudaError::new(
+                    "attention requests must cover Q rows in order",
+                ));
+            }
+            let q_end =
+                int(r.q_start as u64 + r.qo_len as u64).ok_or_else(|| bad(r, "Q rows past i32"))?;
+            p.q_indptr.push(q_end);
+            for &page in &r.pages {
+                p.indices
+                    .push(int(page as u64).ok_or_else(|| bad(r, "a page past i32"))?);
+            }
+            p.indptr
+                .push(int(p.indices.len() as u64).ok_or_else(|| bad(r, "pages past i32"))?);
+            p.last_page_len.push(
+                int(kv - before.expect("checked above"))
+                    .ok_or_else(|| bad(r, "a page past i32"))?,
+            );
+            let tiles = (r.qo_len as u64 * group_size as u64).div_ceil(tile as u64);
+            for t in 0..tiles {
+                p.request_indices
+                    .push(int(i as u64).ok_or_else(|| bad(r, "requests past i32"))?);
+                p.qo_tile_indices
+                    .push(int(t).ok_or_else(|| bad(r, "query tiles past i32"))?);
+                p.kv_tile_indices.push(0);
+            }
+        }
+        Ok(p)
+    }
+}
+
 /// The per-step work list for one KV group (shared by all its layers).
 pub struct AttnPlan {
     tile: u32,
+    /// The page size `last_page_len` was computed for.
+    page_size: u32,
     work_items: u32,
     num_requests: u32,
     q_indptr: CudaSlice<i32>,
@@ -214,43 +308,16 @@ impl Attention {
         page_size: u32,
     ) -> Result<AttnPlan> {
         let s = gpu.stream();
-        let packed = requests
-            .iter()
-            .map(|r| r.qo_len as u64 * group_size as u64)
-            .max()
-            .unwrap_or(1);
-        let tile = if packed <= 16 {
-            16
-        } else if packed <= 64 {
-            64
-        } else {
-            128
-        };
-        let (mut q_indptr, mut indices, mut indptr, mut last) =
-            (vec![0i32], vec![], vec![0i32], vec![]);
-        let (mut req, mut qtile, mut kvtile) = (vec![], vec![], vec![]);
-        for (i, r) in requests.iter().enumerate() {
-            if r.kv_len == 0
-                || r.pages.is_empty()
-                || r.kv_len as u64 > r.pages.len() as u64 * page_size as u64
-            {
-                return Err(CudaError::new(format!("attention request {r:?}")));
-            }
-            if q_indptr.last().copied() != Some(r.q_start as i32) {
-                return Err(CudaError::new(
-                    "attention requests must cover Q rows in order",
-                ));
-            }
-            q_indptr.push((r.q_start + r.qo_len) as i32);
-            indices.extend(r.pages.iter().map(|&p| p as i32));
-            indptr.push(indices.len() as i32);
-            last.push((r.kv_len - (r.pages.len() as u32 - 1) * page_size) as i32);
-            for t in 0..(r.qo_len as u64 * group_size as u64).div_ceil(tile as u64) {
-                req.push(i as i32);
-                qtile.push(t as i32);
-                kvtile.push(0);
-            }
-        }
+        let HostPlan {
+            tile,
+            q_indptr,
+            indices,
+            indptr,
+            last_page_len: last,
+            request_indices: req,
+            qo_tile_indices: qtile,
+            kv_tile_indices: kvtile,
+        } = HostPlan::new(requests, group_size, page_size)?;
         let up = |v: &[i32]| -> Result<CudaSlice<i32>> {
             Ok(if v.is_empty() {
                 s.alloc_zeros::<i32>(1)?
@@ -260,6 +327,7 @@ impl Attention {
         };
         Ok(AttnPlan {
             tile,
+            page_size,
             work_items: req.len() as u32,
             num_requests: requests.len() as u32,
             q_indptr: up(&q_indptr)?,
@@ -300,6 +368,12 @@ impl Attention {
             return Err(CudaError::new(
                 "attention: query heads must be whole GQA groups; pages non-empty",
             ));
+        }
+        if layer.page_size != plan.page_size {
+            return Err(CudaError::new(format!(
+                "attention: a plan for {}-position pages run on {}",
+                plan.page_size, layer.page_size
+            )));
         }
         let s = gpu.stream();
         let kernel = match plan.tile {
@@ -351,5 +425,58 @@ impl Attention {
         // SAFETY: the single by-value argument is the kernel's PagedParams
         // (size checked at load); addresses are the caller's.
         unsafe { kernel.launch(s, [plan.work_items, 1, h], &mut args) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(q_start: u32, qo_len: u32, pages: usize, kv_len: u32) -> AttnRequest {
+        AttnRequest {
+            q_start,
+            qo_len,
+            pages: (1..=pages as u32).collect(),
+            kv_len,
+        }
+    }
+
+    /// A request's pages cover exactly its KV, the last one with 1..=page_size
+    /// positions; every index fits the kernel's `i32` arrays.
+    #[test]
+    fn plans_are_checked_on_the_host() {
+        let p = HostPlan::new(&[req(0, 1, 2, 17), req(1, 3, 2, 32)], 16, 16).unwrap();
+        assert_eq!(p.last_page_len, vec![1, 16]);
+        assert_eq!(p.q_indptr, vec![0, 1, 4]);
+        assert_eq!(p.indptr, vec![0, 2, 4]);
+        assert_eq!(p.tile, 64);
+        let refused = |rs: &[AttnRequest], group: u32, page: u32| {
+            HostPlan::new(rs, group, page).expect_err(&format!("{rs:?}"));
+        };
+        refused(&[req(0, 1, 2, 1)], 16, 16);
+        refused(&[req(0, 1, 2, 16)], 16, 16);
+        refused(&[req(0, 1, 2, 33)], 16, 16);
+        refused(&[req(0, 1, 0, 1)], 16, 16);
+        refused(&[req(0, 0, 1, 1)], 16, 16);
+        refused(&[req(0, 5, 1, 4)], 16, 16);
+        refused(&[req(1, 1, 1, 1)], 16, 16);
+        refused(&[req(0, 1, 1, 1), req(2, 1, 1, 1)], 16, 16);
+        refused(&[req(0, 1, 1, 1)], 0, 16);
+        refused(&[req(0, 1, 1, 1)], 16, 0);
+        refused(
+            &[AttnRequest {
+                pages: vec![1 << 31],
+                ..req(0, 1, 1, 1)
+            }],
+            16,
+            16,
+        );
+        refused(
+            &[req(0, 1, 1, 1), req(1, i32::MAX as u32, 1, u32::MAX)],
+            16,
+            u32::MAX,
+        );
+        // A page size past i32 leaves a last page whose length cannot be held.
+        refused(&[req(0, 1, 1, 1 << 31)], 16, u32::MAX);
     }
 }

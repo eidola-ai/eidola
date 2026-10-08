@@ -357,13 +357,7 @@ impl ModelWeights {
         config: ModelConfig,
     ) -> Result<ModelWeights> {
         check_supported(&config)?;
-        let chunks = match store.metadata("tp_size") {
-            Some(s) => s
-                .trim()
-                .parse()
-                .map_err(|_| CudaError::new(format!("tp_size {s:?}")))?,
-            None => config.num_key_value_heads,
-        };
+        let chunks = crate::support::qkv_chunks(store.metadata("tp_size"), &config)?;
         let l = Loader {
             gpu,
             store: &store,

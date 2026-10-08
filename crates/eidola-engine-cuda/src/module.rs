@@ -56,16 +56,35 @@ impl ImageSource {
 
 /// One loaded kernel image.
 pub struct KernelModule {
-    ctx: Arc<CudaContext>,
-    module: sys::CUmodule,
+    loaded: Arc<Loaded>,
     cubin: &'static Cubin,
     source: ImageSource,
 }
 
+/// A loaded image, unloaded when the last owner goes: the module and every
+/// [`Kernel`] resolved from it share it, so no function handle outlives its
+/// image.
+struct Loaded {
+    ctx: Arc<CudaContext>,
+    module: sys::CUmodule,
+}
+
 // SAFETY: a CUmodule handle is usable from any thread once its context is
-// current; every use below binds the context first.
-unsafe impl Send for KernelModule {}
-unsafe impl Sync for KernelModule {}
+// current; every use binds the context first.
+unsafe impl Send for Loaded {}
+unsafe impl Sync for Loaded {}
+
+impl Drop for Loaded {
+    fn drop(&mut self) {
+        if self.ctx.bind_to_thread().is_ok() {
+            // SAFETY: the module is ours, and with the last owner gone no
+            // function resolved from it remains.
+            unsafe {
+                let _ = sys::cuModuleUnload(self.module);
+            }
+        }
+    }
+}
 
 impl KernelModule {
     /// Load kernel `name` for this device's exact architecture from its
@@ -105,8 +124,10 @@ impl KernelModule {
             .result()
             .map_err(|e| CudaError::new(format!("loading {name} ({source:?}): {e:?}")))?;
         Ok(KernelModule {
-            ctx: gpu.context().clone(),
-            module,
+            loaded: Arc::new(Loaded {
+                ctx: gpu.context().clone(),
+                module,
+            }),
             cubin,
             source,
         })
@@ -129,11 +150,11 @@ impl KernelModule {
             .cubin
             .entry(symbol)
             .ok_or_else(|| CudaError::new(format!("no entry {symbol} in {}", self.cubin.name)))?;
-        self.ctx.bind_to_thread()?;
+        self.loaded.ctx.bind_to_thread()?;
         let c_symbol = CString::new(symbol).expect("symbols have no NUL");
         let mut func = std::ptr::null_mut();
         // SAFETY: valid module and NUL-terminated name.
-        unsafe { sys::cuModuleGetFunction(&mut func, self.module, c_symbol.as_ptr()) }
+        unsafe { sys::cuModuleGetFunction(&mut func, self.loaded.module, c_symbol.as_ptr()) }
             .result()
             .map_err(|e| CudaError::new(format!("resolving {symbol}: {e:?}")))?;
         let meta = self.read_meta(&entry.meta)?;
@@ -149,7 +170,7 @@ impl KernelModule {
             .result()?;
         }
         Ok(Kernel {
-            ctx: self.ctx.clone(),
+            loaded: self.loaded.clone(),
             func,
             meta,
             symbol: symbol.to_owned(),
@@ -158,14 +179,16 @@ impl KernelModule {
 
     /// The launch contract a record names, copied from the device global.
     pub fn read_meta(&self, record: &str) -> Result<KernelMeta> {
-        self.ctx.bind_to_thread()?;
+        self.loaded.ctx.bind_to_thread()?;
         let c_record = CString::new(record).expect("symbols have no NUL");
         let mut ptr = 0;
         let mut size = 0usize;
         // SAFETY: valid module and NUL-terminated name.
-        unsafe { sys::cuModuleGetGlobal_v2(&mut ptr, &mut size, self.module, c_record.as_ptr()) }
-            .result()
-            .map_err(|e| CudaError::new(format!("resolving {record}: {e:?}")))?;
+        unsafe {
+            sys::cuModuleGetGlobal_v2(&mut ptr, &mut size, self.loaded.module, c_record.as_ptr())
+        }
+        .result()
+        .map_err(|e| CudaError::new(format!("resolving {record}: {e:?}")))?;
         if size != KernelMeta::SIZE {
             return Err(CudaError::new(format!(
                 "{record} is {size} bytes, not {}",
@@ -180,20 +203,10 @@ impl KernelModule {
     }
 }
 
-impl Drop for KernelModule {
-    fn drop(&mut self) {
-        if self.ctx.bind_to_thread().is_ok() {
-            // SAFETY: the module is ours and no longer used.
-            unsafe {
-                let _ = sys::cuModuleUnload(self.module);
-            }
-        }
-    }
-}
-
 /// A resolved kernel entry and its launch contract.
 pub struct Kernel {
-    ctx: Arc<CudaContext>,
+    /// Keeps the image `func` lives in loaded.
+    loaded: Arc<Loaded>,
     func: sys::CUfunction,
     meta: KernelMeta,
     symbol: String,
@@ -219,7 +232,7 @@ impl Kernel {
     /// Static shared memory the image declares (beside the launch contract's
     /// dynamic amount).
     pub fn static_smem_bytes(&self) -> Result<u32> {
-        self.ctx.bind_to_thread()?;
+        self.loaded.ctx.bind_to_thread()?;
         let mut v = 0;
         // SAFETY: valid function handle; writes one int.
         unsafe {
@@ -249,7 +262,7 @@ impl Kernel {
     ) -> Result<()> {
         // The current context is per thread: whichever thread launches binds
         // the module's own.
-        self.ctx.bind_to_thread()?;
+        self.loaded.ctx.bind_to_thread()?;
         let m = &self.meta;
         let mut attrs = Vec::with_capacity(1);
         if m.cluster != [1, 1, 1] {

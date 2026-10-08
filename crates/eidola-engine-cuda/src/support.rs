@@ -70,6 +70,16 @@ pub const TOP_K: usize = 8;
 /// Most experts per token any launch wrapper accepts: the router's selection
 /// array.
 pub const MAX_TOP_K: usize = 8;
+/// Layers of the checkpoint: the range `keep_layers` selects from.
+pub const SOURCE_LAYERS: usize = 48;
+/// Rank-major chunks of the fused QKV (`tp_size`, or the top-level
+/// `num_key_value_heads` when the checkpoint does not record it): the
+/// loader's de-interleaving.
+pub const QKV_CHUNKS: usize = 4;
+/// FP8 scale tiles: the FP8 GEMMs' per-128 scale grids.
+pub const FP8_BLOCK: [usize; 2] = [128, 128];
+/// Elements per E8M0 scale of the MXFP4 experts: DeepGEMM's SFB words.
+pub const MXFP4_BLOCK: usize = 32;
 /// Largest sampleable vocabulary: `sampling.cu`'s 1,024 chunks of 1,024.
 pub const MAX_SAMPLEABLE: usize = 1 << 20;
 
@@ -106,6 +116,15 @@ pub fn check_supported(c: &ModelConfig) -> Result<(), Unsupported> {
         MAX_POSITIONS
     );
     exact!("rms_norm_eps", c.rms_norm_eps, 1e-6f32);
+    exact!("source_num_layers", c.source_num_layers, SOURCE_LAYERS);
+    // Read only as the fused-QKV chunk count's fallback (`qkv_chunks`), and
+    // so invisible to every per-layer check: pinned here.
+    exact!("num_key_value_heads", c.num_key_value_heads, QKV_CHUNKS);
+    let Some(q) = &c.quant else {
+        return bad("quant", "None", "FP8 blocks with MXFP4 experts");
+    };
+    exact!("quant.fp8_block", q.fp8_block, FP8_BLOCK);
+    exact!("quant.mxfp4_block", q.mxfp4_block, Some(MXFP4_BLOCK));
     exact!(
         "attention_value_scale",
         c.attention_value_scale,
@@ -226,6 +245,44 @@ pub fn check_device(
 }
 
 /// The sampleable vocabulary the sampler can serve with this head.
+/// Refuse a layer selection that is not a strictly ascending subset of the
+/// checkpoint's layers: the retained model keeps the checkpoint's order, and
+/// no layer twice.
+pub fn check_layers(keep: &[usize], source_layers: usize) -> Result<(), Unsupported> {
+    let ascending = keep.windows(2).all(|w| w[0] < w[1]);
+    if keep.is_empty() || !ascending || keep.last().is_some_and(|&l| l >= source_layers) {
+        return Err(Unsupported {
+            field: "keep_layers".into(),
+            found: format!("{keep:?}"),
+            required: format!("a strictly ascending, non-empty subset of 0..{source_layers}"),
+        });
+    }
+    Ok(())
+}
+
+/// The fused QKV's rank-major chunk count: the checkpoint's `tp_size`
+/// metadata, else the configuration's `num_key_value_heads`; either way
+/// Flash's [`QKV_CHUNKS`].
+pub fn qkv_chunks(tp_size: Option<&str>, c: &ModelConfig) -> Result<usize, Unsupported> {
+    let found = match tp_size {
+        Some(s) => s.trim().parse().ok(),
+        None => Some(c.num_key_value_heads),
+    };
+    match found {
+        Some(QKV_CHUNKS) => Ok(QKV_CHUNKS),
+        _ => Err(Unsupported {
+            field: if tp_size.is_some() {
+                "tp_size"
+            } else {
+                "num_key_value_heads"
+            }
+            .into(),
+            found: tp_size.map_or(c.num_key_value_heads.to_string(), |s| format!("{s:?}")),
+            required: QKV_CHUNKS.to_string(),
+        }),
+    }
+}
+
 /// Refuse a context longer than the checkpoint's declared window: positions
 /// past `max_position_embeddings` are outside what the model was trained for.
 pub fn check_context(max_model_len: u32, c: &ModelConfig) -> Result<(), Unsupported> {
@@ -339,6 +396,36 @@ mod tests {
         check_device(&d, &dense, None).unwrap();
     }
 
+    /// Only a strictly ascending subset of the checkpoint's layers is kept.
+    #[test]
+    fn layer_selections_are_checked() {
+        for keep in [&[0, 1, 2, 5][..], &[1, 5], &[47], &[0]] {
+            check_layers(keep, SOURCE_LAYERS).unwrap();
+        }
+        for keep in [&[][..], &[1, 0], &[0, 0], &[0, 5, 2], &[48], &[0, 48]] {
+            let e = check_layers(keep, SOURCE_LAYERS).expect_err("refused");
+            assert_eq!(e.field, "keep_layers", "{keep:?}");
+        }
+    }
+
+    /// The fused QKV is read as Flash's four chunks, whichever source names
+    /// the count.
+    #[test]
+    fn qkv_chunks_are_flash_s() {
+        let c = flash();
+        assert_eq!(qkv_chunks(None, &c).unwrap(), QKV_CHUNKS);
+        assert_eq!(qkv_chunks(Some(" 4 "), &c).unwrap(), QKV_CHUNKS);
+        for tp in ["2", "8", "four", ""] {
+            assert_eq!(qkv_chunks(Some(tp), &c).unwrap_err().field, "tp_size");
+        }
+        let mut c = flash().truncated(&[1, 2]).unwrap();
+        c.num_key_value_heads = 2;
+        assert_eq!(
+            qkv_chunks(None, &c).unwrap_err().field,
+            "num_key_value_heads"
+        );
+    }
+
     #[test]
     fn pro_is_refused() {
         refused(&load("pro-mopd.config.json"), "hidden_size");
@@ -404,6 +491,25 @@ mod tests {
         ] {
             let mut c = flash();
             set(c.moe.as_mut().unwrap());
+            refused(&c, name);
+        }
+        for (name, set) in [
+            ("source_num_layers", (|c| c.source_num_layers = 47) as C),
+            ("num_key_value_heads", |c| c.num_key_value_heads = 2),
+            ("quant", |c| c.quant = None),
+            ("quant.fp8_block", |c| {
+                c.quant.as_mut().unwrap().fp8_block = [64, 64]
+            }),
+            ("quant.mxfp4_block", |c| {
+                c.quant.as_mut().unwrap().mxfp4_block = Some(16)
+            }),
+        ] {
+            let mut c = flash();
+            set(&mut c);
+            refused(&c, name);
+            // Sliding-only subsets read none of these per layer: still refused.
+            let mut c = flash().truncated(&[1, 2]).unwrap();
+            set(&mut c);
             refused(&c, name);
         }
         for (s, v) in [(0, 152_576), (152_577, 152_576), ((1 << 20) + 1, 2 << 20)] {

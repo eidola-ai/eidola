@@ -19,7 +19,7 @@ use common::setup;
 use eidola_engine::executor::{Executor, Maintenance, SeqEntry, StepInput, TableUpdate};
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, Gpu, ImageArch};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, Gpu, ImageArch, KvBlocks};
 use eidola_engine_model::compare::compare_logits;
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
@@ -78,7 +78,10 @@ fn executor(
 ) -> CudaExecutor {
     let cfg = CudaExecutorConfig {
         block_size: BS,
-        num_blocks: vec![128, 128],
+        num_blocks: KvBlocks {
+            global: 128,
+            sliding: 128,
+        },
         num_state_slots: 4,
         max_model_len: 1024,
         buckets: vec![Bucket {

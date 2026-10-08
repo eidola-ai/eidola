@@ -8,7 +8,9 @@ mod common;
 use std::sync::Arc;
 
 use eidola_engine::spec::Bucket;
-use eidola_engine_cuda::{CudaError, CudaExecutor, CudaExecutorConfig, Gpu, ImageArch, KernelDir};
+use eidola_engine_cuda::{
+    CudaError, CudaExecutor, CudaExecutorConfig, Gpu, ImageArch, KernelDir, KvBlocks,
+};
 use eidola_engine_model::safetensors::WeightSet;
 
 fn tensorless_checkpoint() -> Arc<WeightSet> {
@@ -25,7 +27,10 @@ fn tensorless_checkpoint() -> Arc<WeightSet> {
 fn config() -> CudaExecutorConfig {
     CudaExecutorConfig {
         block_size: 16,
-        num_blocks: vec![8, 8],
+        num_blocks: KvBlocks {
+            global: 8,
+            sliding: 8,
+        },
         num_state_slots: 2,
         max_model_len: 256,
         buckets: vec![Bucket {
@@ -65,6 +70,21 @@ fn refusals_come_before_device_memory() {
         panic!("a configuration refusal, not {e}")
     };
     assert_eq!(u.field, "max_model_len");
+
+    // A layer selection out of the checkpoint's order.
+    let e =
+        CudaExecutor::new(open(), &kernels, store.clone(), Some(&[1, 0]), config()).unwrap_err();
+    let CudaError::Unsupported(u) = e else {
+        panic!("a configuration refusal, not {e}")
+    };
+    assert_eq!(u.field, "keep_layers");
+
+    // Blocks for a KV group no retained layer uses (layer 0 is global).
+    let e = CudaExecutor::new(open(), &kernels, store.clone(), Some(&[0]), config()).unwrap_err();
+    let CudaError::Unsupported(u) = e else {
+        panic!("a configuration refusal, not {e}")
+    };
+    assert_eq!(u.field, "num_blocks.sliding");
 
     // A kernel directory with no images: refused before any weight is read.
     let empty = std::env::temp_dir().join(format!("eidola-no-kernels-{}", std::process::id()));

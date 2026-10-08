@@ -35,7 +35,7 @@ use eidola_engine_chat::json::Json;
 use eidola_engine_chat::tool_call::parse_complete;
 use eidola_engine_chat::{ChatInput, ChatTemplate, MimoTokenizer, RenderOptions, ToolSchemas};
 use eidola_engine_cuda::KernelDir;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, Gpu};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, Gpu, KvBlocks};
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
 use serde_json::{Value, json};
@@ -73,7 +73,10 @@ fn executor(kernels: &str, model: &str, max_tokens: u32, max_seqs: u32) -> (Cuda
     let store = Arc::new(WeightSet::open_dir(Path::new(model)).unwrap());
     let cfg = CudaExecutorConfig {
         block_size: 16,
-        num_blocks: vec![16_384, 4_096],
+        num_blocks: KvBlocks {
+            global: 16_384,
+            sliding: 4_096,
+        },
         num_state_slots: max_seqs,
         max_model_len: 16_384,
         buckets: vec![
