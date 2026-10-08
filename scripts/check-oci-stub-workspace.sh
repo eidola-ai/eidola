@@ -29,10 +29,11 @@ command -v docker >/dev/null || { echo "error: docker is required" >&2; exit 1; 
 status=0
 found=0
 for containerfile in oci/*/Containerfile; do
-  # A workspace image is any Containerfile that runs cargo; identified
+  # A workspace image is any Containerfile that invokes cargo on any
+  # non-comment line (a `RUN` may continue across lines); identified
   # independently of the manifest-copy line this check protects, so dropping
   # that line is an error rather than a silent skip.
-  grep -Eq '^RUN .*cargo (fetch|build)' "$containerfile" || continue
+  grep -Ev '^[[:space:]]*#' "$containerfile" | grep -Eq '(^|[^[:alnum:]_-])cargo (fetch|build)' || continue
   found=$((found + 1))
   if ! grep -q '^COPY --parents crates/\*/Cargo.toml' "$containerfile"; then
     echo "error: $containerfile runs cargo but does not copy the workspace manifests the way this check expects" >&2
