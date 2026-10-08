@@ -54,6 +54,10 @@ use serde_json::{Value, json};
 
 const TOP: usize = 20;
 
+/// Tokens per executor step (the largest bucket's): longer prompts are
+/// prefilled in chunks of this many.
+const STEP_TOKENS: u32 = 2048;
+
 fn read_jsonl(path: &str) -> Vec<Value> {
     let f = std::io::BufReader::new(
         std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}")),
@@ -291,54 +295,82 @@ fn logprobs(
             result.push(json!({"id": r["id"], "top": tops}));
         }
     } else {
-        let (mut ex, n) = executor(kernels, model, 2048, 16);
+        let (mut ex, n) = executor(kernels, model, STEP_TOKENS, 16);
         ex.record_all_logits = true;
+        let max_len = ex.config().max_model_len;
         for r in &rows {
             let p = ids(&r["prompt_ids"]);
-            let len = p.len() as u32;
+            // Prefilled in chunks of the executor's step budget, as serving
+            // does; a prompt past the model length is refused by name.
+            let len = u32::try_from(p.len())
+                .ok()
+                .filter(|&l| l <= max_len)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "prompt {}: {} tokens, past the executor's {max_len}-token model length",
+                        r["id"],
+                        p.len()
+                    )
+                });
             let blocks = len.div_ceil(16);
-            let updates: Vec<TableUpdate> = (0..2)
-                .flat_map(|group| {
-                    (0..blocks).map(move |i| TableUpdate {
+            let mut tops = Vec::with_capacity(p.len());
+            let mut start = 0u32;
+            while start < len {
+                let chunk = (len - start).min(STEP_TOKENS);
+                // The first chunk maps and zeroes every block the prompt needs.
+                let (maintenance, table_updates) = if start == 0 {
+                    let mut m = vec![eidola_engine::executor::Maintenance::ResetSlot { slot: 0 }];
+                    for g in 0..2 {
+                        for b in 1..=blocks {
+                            m.push(eidola_engine::executor::Maintenance::Zero {
+                                group: g,
+                                block: b,
+                            });
+                        }
+                    }
+                    let u: Vec<TableUpdate> = (0..2)
+                        .flat_map(|group| {
+                            (0..blocks).map(move |i| TableUpdate {
+                                slot: 0,
+                                group,
+                                index: i,
+                                block: 1 + i,
+                            })
+                        })
+                        .collect();
+                    (m, u)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let step = StepInput {
+                    bucket: Bucket {
+                        max_seqs: 4,
+                        max_tokens: STEP_TOKENS,
+                    },
+                    maintenance,
+                    table_updates,
+                    seqs: vec![SeqEntry {
                         slot: 0,
-                        group,
-                        index: i,
-                        block: 1 + i,
-                    })
-                })
-                .collect();
-            let mut maintenance = vec![eidola_engine::executor::Maintenance::ResetSlot { slot: 0 }];
-            for g in 0..2 {
-                for b in 1..=blocks {
-                    maintenance
-                        .push(eidola_engine::executor::Maintenance::Zero { group: g, block: b });
-                }
+                        token_start: 0,
+                        num_tokens: chunk,
+                        context_len: start,
+                        num_drafts: 0,
+                        sample: true,
+                        sampling: SamplingParams::greedy(),
+                    }],
+                    token_ids: p[start as usize..(start + chunk) as usize].to_vec(),
+                    positions: (start..start + chunk).collect(),
+                    return_logits: false,
+                };
+                ex.execute(&step).unwrap();
+                let all = ex.take_all_logits().unwrap();
+                tops.extend(
+                    (0..chunk as usize)
+                        .map(|i| sink.row(&all[i * vocab..(i + 1) * vocab], n as usize)),
+                );
+                start += chunk;
             }
-            let step = StepInput {
-                bucket: Bucket {
-                    max_seqs: 4,
-                    max_tokens: 2048,
-                },
-                maintenance,
-                table_updates: updates,
-                seqs: vec![SeqEntry {
-                    slot: 0,
-                    token_start: 0,
-                    num_tokens: len,
-                    context_len: 0,
-                    num_drafts: 0,
-                    sample: true,
-                    sampling: SamplingParams::greedy(),
-                }],
-                token_ids: p.clone(),
-                positions: (0..len).collect(),
-                return_logits: false,
-            };
-            ex.execute(&step).unwrap();
-            let all = ex.take_all_logits().unwrap();
-            let tops: Vec<_> = (0..p.len())
-                .map(|i| sink.row(&all[i * vocab..(i + 1) * vocab], n as usize))
-                .collect();
+            assert_eq!(tops.len(), p.len());
             result.push(json!({"id": r["id"], "top": tops}));
         }
     }

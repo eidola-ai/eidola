@@ -14,6 +14,12 @@
 //! and checks the contract: a write into a block mapped by more than one table
 //! entry (a shared prefix-cache block) or a read through an unmapped entry is a
 //! host bug and panics, as in the CPU reference executor.
+//!
+//! A step's maintenance and table updates are validated whole before any of
+//! them takes effect: [`KvStore::stage`] checks them and computes the mirror
+//! they lead to without touching the device or the mirror, and
+//! [`KvStore::commit`] then queues the device work and installs that mirror.
+//! A malformed step panics or errs in `stage`, leaving everything as it was.
 
 use std::sync::Arc;
 
@@ -103,14 +109,215 @@ impl GroupGeometry {
     }
 }
 
+/// The host mirror of the block tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableMirror {
+    /// `[slot][group][index]`.
+    tables: Vec<Vec<Vec<u32>>>,
+    /// `[group][block]`: number of table entries mapping it.
+    mapped: Vec<Vec<u32>>,
+    /// Positions per block, per group.
+    block_size: Vec<u32>,
+}
+
+impl TableMirror {
+    /// Empty tables: `slots` rows of `max_blocks` null entries per group.
+    fn new(geometry: &[GroupGeometry], slots: usize, max_blocks: usize) -> TableMirror {
+        TableMirror {
+            tables: vec![vec![vec![NULL_BLOCK; max_blocks]; geometry.len()]; slots],
+            mapped: geometry
+                .iter()
+                .map(|g| vec![0; g.num_blocks as usize])
+                .collect(),
+            block_size: geometry.iter().map(|g| g.block_size).collect(),
+        }
+    }
+
+    fn set(&mut self, slot: usize, group: usize, index: usize, block: u32) {
+        let old = std::mem::replace(&mut self.tables[slot][group][index], block);
+        if old != NULL_BLOCK {
+            self.mapped[group][old as usize] -= 1;
+        }
+        if block != NULL_BLOCK {
+            self.mapped[group][block as usize] += 1;
+        }
+    }
+
+    /// One table row.
+    pub fn table(&self, slot: Slot, group: usize) -> &[u32] {
+        &self.tables[slot as usize][group]
+    }
+
+    /// The block holding `pos` for `slot` in `group`; panics if unmapped (a
+    /// read the host never provided for), or past the table.
+    pub fn block_of(&self, slot: Slot, group: usize, pos: u32) -> u32 {
+        let row = &self.tables[slot as usize][group];
+        let index = (pos / self.block_size[group]) as usize;
+        assert!(
+            index < row.len(),
+            "slot {slot} group {group} position {pos}: past the table"
+        );
+        let block = row[index];
+        assert!(
+            block != NULL_BLOCK,
+            "slot {slot} group {group} position {pos}: unmapped block"
+        );
+        block
+    }
+
+    /// The block a write at `pos` lands in, which must be mapped by exactly
+    /// one table entry: blocks shared through the prefix cache are immutable.
+    pub fn writable_block(&self, slot: Slot, group: usize, pos: u32) -> u32 {
+        let block = self.block_of(slot, group, pos);
+        assert!(
+            self.mapped[group][block as usize] == 1,
+            "slot {slot} group {group} position {pos}: write to shared block {block}"
+        );
+        block
+    }
+}
+
+/// Device work a staged step queues.
+#[derive(Clone, Copy, Debug)]
+enum DeviceOp {
+    Zero {
+        group: usize,
+        offset: usize,
+        bytes: usize,
+    },
+    Copy {
+        group: usize,
+        src: usize,
+        dst: usize,
+        bytes: usize,
+    },
+    ResetState {
+        slot: usize,
+    },
+}
+
+/// A step's maintenance and table updates, validated, with the mirror they
+/// lead to; nothing has happened yet ([`KvStore::commit`] applies it).
+#[derive(Debug)]
+pub struct Staged {
+    generation: u64,
+    mirror: TableMirror,
+    ops: Vec<DeviceOp>,
+    dirty: Vec<(usize, usize)>,
+}
+
+impl Staged {
+    /// The tables as they will be once committed.
+    pub fn mirror(&self) -> &TableMirror {
+        &self.mirror
+    }
+}
+
+fn stage(
+    geometry: &[GroupGeometry],
+    max_blocks: usize,
+    state_width: usize,
+    current: &TableMirror,
+    generation: u64,
+    maintenance: &[Maintenance],
+    updates: &[TableUpdate],
+) -> Staged {
+    let mut mirror = current.clone();
+    let mut ops = Vec::new();
+    let mut dirty: Vec<(usize, usize)> = Vec::new();
+    let slots = mirror.tables.len();
+    for m in maintenance {
+        match *m {
+            Maintenance::Zero { group, block } => {
+                let (g, offset, bytes) = block_range(geometry, group, block);
+                ops.push(DeviceOp::Zero {
+                    group: g,
+                    offset,
+                    bytes,
+                });
+            }
+            Maintenance::Copy { group, src, dst } => {
+                let (g, src, bytes) = block_range(geometry, group, src);
+                let (_, dst, _) = block_range(geometry, group, dst);
+                ops.push(DeviceOp::Copy {
+                    group: g,
+                    src,
+                    dst,
+                    bytes,
+                });
+            }
+            Maintenance::ResetSlot { slot } => {
+                let sl = slot as usize;
+                assert!(sl < slots, "reset of slot {slot} out of range");
+                for g in 0..geometry.len() {
+                    for idx in 0..max_blocks {
+                        mirror.set(sl, g, idx, NULL_BLOCK);
+                    }
+                    dirty.push((sl, g));
+                }
+                if state_width > 0 {
+                    ops.push(DeviceOp::ResetState { slot: sl });
+                }
+            }
+        }
+    }
+    for u in updates {
+        let (sl, g) = (u.slot as usize, u.group as usize);
+        assert!(sl < slots, "table update for slot {} out of range", u.slot);
+        assert!(
+            g < geometry.len(),
+            "table update for group {} out of range",
+            u.group
+        );
+        assert!(
+            u.block < geometry[g].num_blocks,
+            "table update to block {} outside group {}",
+            u.block,
+            u.group
+        );
+        assert!(
+            (u.index as usize) < max_blocks,
+            "table index {} past the longest sequence",
+            u.index
+        );
+        mirror.set(sl, g, u.index as usize, u.block);
+        dirty.push((sl, g));
+    }
+    dirty.sort_unstable();
+    dirty.dedup();
+    Staged {
+        generation,
+        mirror,
+        ops,
+        dirty,
+    }
+}
+
+/// `(group, byte offset, bytes)` of a block; panics on a group or block
+/// outside the pools.
+fn block_range(geometry: &[GroupGeometry], group: u32, block: u32) -> (usize, usize, usize) {
+    let g = group as usize;
+    assert!(
+        g < geometry.len(),
+        "maintenance on group {group} out of range"
+    );
+    let geom = &geometry[g];
+    assert!(
+        block < geom.num_blocks,
+        "maintenance on block {block} outside group {group}"
+    );
+    let bytes = geom.block_bytes();
+    (g, block as usize * bytes, bytes)
+}
+
 /// KV pools, block tables and per-slot state.
 pub struct KvStore {
     geometry: Vec<GroupGeometry>,
     pools: Vec<CudaSlice<u16>>,
-    /// Host mirror, `[slot][group][index]`.
-    tables: Vec<Vec<Vec<u32>>>,
-    /// `[group][block]`: number of table entries mapping it.
-    mapped: Vec<Vec<u32>>,
+    mirror: TableMirror,
+    /// Commits so far: a staged step applies only to the state it was
+    /// validated against.
+    generation: u64,
     /// Device tables, `[slot][group][index]`.
     tables_dev: CudaSlice<i32>,
     max_blocks: usize,
@@ -148,11 +355,8 @@ impl KvStore {
             pools.push(s.alloc_zeros::<u16>(g.block_elems() * g.num_blocks as usize)?);
         }
         Ok(KvStore {
-            tables: vec![vec![vec![NULL_BLOCK; mb]; groups]; slots],
-            mapped: geometry
-                .iter()
-                .map(|g| vec![0; g.num_blocks as usize])
-                .collect(),
+            mirror: TableMirror::new(&geometry, slots, mb),
+            generation: 0,
             tables_dev: s.alloc_zeros::<i32>(table_entries.max(1))?,
             state: s.alloc_zeros::<f32>(state_len.max(1))?,
             max_blocks: mb,
@@ -186,113 +390,105 @@ impl KvStore {
         &self.state
     }
 
-    /// The host mirror of one table row.
-    pub fn table(&self, slot: Slot, group: usize) -> &[u32] {
-        &self.tables[slot as usize][group]
+    /// The host mirror.
+    pub fn mirror(&self) -> &TableMirror {
+        &self.mirror
     }
 
-    /// Apply a step's maintenance, then its table updates, in order (the seam's
-    /// steps 1 and 2). Device work is queued on the stream ahead of the forward.
-    pub fn apply(
-        &mut self,
-        gpu: &Gpu,
-        maintenance: &[Maintenance],
-        updates: &[TableUpdate],
-    ) -> Result<()> {
+    /// The host mirror of one table row.
+    pub fn table(&self, slot: Slot, group: usize) -> &[u32] {
+        self.mirror.table(slot, group)
+    }
+
+    /// Validate a step's maintenance, then its table updates, in order (the
+    /// seam's steps 1 and 2), and compute the tables they lead to, without
+    /// touching the device or the mirror. A contract violation (a slot,
+    /// group, block or index out of range) panics here, before anything has
+    /// changed.
+    pub fn stage(&self, maintenance: &[Maintenance], updates: &[TableUpdate]) -> Staged {
+        stage(
+            &self.geometry,
+            self.max_blocks,
+            self.state_width,
+            &self.mirror,
+            self.generation,
+            maintenance,
+            updates,
+        )
+    }
+
+    /// Queue a staged step's device work on the stream (ahead of the
+    /// forward), upload the table rows it changed, and install its mirror.
+    pub fn commit(&mut self, gpu: &Gpu, staged: Staged) -> Result<()> {
+        assert_eq!(
+            staged.generation, self.generation,
+            "a staged step applies only to the state it was validated against"
+        );
         let s = gpu.stream();
         // The raw driver calls below need this thread's current context.
         gpu.context().bind_to_thread()?;
-        let mut dirty: Vec<(usize, usize)> = Vec::new();
-        for m in maintenance {
-            match *m {
-                Maintenance::Zero { group, block } => {
-                    let (g, off, bytes) = self.block_range(group, block);
-                    let base = dptr(&self.pools[g], s) + off as u64;
-                    // SAFETY: the range lies inside the pool.
+        for op in &staged.ops {
+            match *op {
+                DeviceOp::Zero {
+                    group,
+                    offset,
+                    bytes,
+                } => {
+                    let base = dptr(&self.pools[group], s) + offset as u64;
+                    // SAFETY: `stage` held the range inside the pool.
                     unsafe { sys::cuMemsetD8Async(base, 0, bytes, s.cu_stream()) }.result()?;
                 }
-                Maintenance::Copy { group, src, dst } => {
-                    let (g, src_off, bytes) = self.block_range(group, src);
-                    let (_, dst_off, _) = self.block_range(group, dst);
-                    let base = dptr(&self.pools[g], s);
-                    // SAFETY: both ranges lie inside the pool; distinct blocks
-                    // do not overlap.
+                DeviceOp::Copy {
+                    group,
+                    src,
+                    dst,
+                    bytes,
+                } => {
+                    let base = dptr(&self.pools[group], s);
+                    // SAFETY: `stage` held both ranges inside the pool;
+                    // distinct blocks do not overlap.
                     unsafe {
                         sys::cuMemcpyDtoDAsync_v2(
-                            base + dst_off as u64,
-                            base + src_off as u64,
+                            base + dst as u64,
+                            base + src as u64,
                             bytes,
                             s.cu_stream(),
                         )
                     }
                     .result()?;
                 }
-                Maintenance::ResetSlot { slot } => {
-                    let sl = slot as usize;
-                    assert!(sl < self.tables.len(), "reset of slot {slot} out of range");
-                    for g in 0..self.geometry.len() {
-                        for idx in 0..self.max_blocks {
-                            self.set(sl, g, idx, NULL_BLOCK);
-                        }
-                        dirty.push((sl, g));
-                    }
-                    if self.state_width > 0 {
-                        let w = self.state_width;
-                        let base = dptr(&self.state, s) + (sl * w * 4) as u64;
-                        // SAFETY: inside the state buffer.
-                        unsafe { sys::cuMemsetD8Async(base, 0, w * 4, s.cu_stream()) }.result()?;
-                    }
+                DeviceOp::ResetState { slot } => {
+                    let w = self.state_width;
+                    let base = dptr(&self.state, s) + (slot * w * 4) as u64;
+                    // SAFETY: `stage` held the slot inside the state buffer.
+                    unsafe { sys::cuMemsetD8Async(base, 0, w * 4, s.cu_stream()) }.result()?;
                 }
             }
         }
-        for u in updates {
-            let (sl, g) = (u.slot as usize, u.group as usize);
-            assert!(
-                sl < self.tables.len(),
-                "table update for slot {} out of range",
-                u.slot
-            );
-            assert!(
-                g < self.geometry.len(),
-                "table update for group {} out of range",
-                u.group
-            );
-            assert!(
-                u.block < self.geometry[g].num_blocks,
-                "table update to block {} outside group {}",
-                u.block,
-                u.group
-            );
-            assert!(
-                (u.index as usize) < self.max_blocks,
-                "table index {} past the longest sequence",
-                u.index
-            );
-            self.set(sl, g, u.index as usize, u.block);
-            dirty.push((sl, g));
-        }
-        dirty.sort_unstable();
-        dirty.dedup();
-        for (sl, g) in dirty {
+        self.mirror = staged.mirror;
+        self.generation += 1;
+        for &(sl, g) in &staged.dirty {
             self.upload_row(s, sl, g)?;
         }
         Ok(())
     }
 
-    fn set(&mut self, slot: usize, group: usize, index: usize, block: u32) {
-        let old = std::mem::replace(&mut self.tables[slot][group][index], block);
-        if old != NULL_BLOCK {
-            self.mapped[group][old as usize] -= 1;
-        }
-        if block != NULL_BLOCK {
-            self.mapped[group][block as usize] += 1;
-        }
+    /// Stage, then commit: maintenance and table updates, validated whole
+    /// before any takes effect.
+    pub fn apply(
+        &mut self,
+        gpu: &Gpu,
+        maintenance: &[Maintenance],
+        updates: &[TableUpdate],
+    ) -> Result<()> {
+        let staged = self.stage(maintenance, updates);
+        self.commit(gpu, staged)
     }
 
     fn upload_row(&mut self, s: &Arc<CudaStream>, slot: usize, group: usize) -> Result<()> {
         // Block ids are at most `num_blocks - 1`, which `validate` holds
         // within `i32` (the device tables' type).
-        let row: Vec<i32> = self.tables[slot][group]
+        let row: Vec<i32> = self.mirror.tables[slot][group]
             .iter()
             .map(|&b| i32::try_from(b).expect("validated: block ids fit i32"))
             .collect();
@@ -302,39 +498,15 @@ impl KvStore {
         Ok(())
     }
 
-    /// `(group, byte offset, bytes)` of a block; panics on an id outside the pool.
-    fn block_range(&self, group: u32, block: u32) -> (usize, usize, usize) {
-        let g = group as usize;
-        let geom = &self.geometry[g];
-        assert!(
-            block < geom.num_blocks,
-            "maintenance on block {block} outside group {group}"
-        );
-        let bytes = geom.block_bytes();
-        (g, block as usize * bytes, bytes)
-    }
-
-    /// The block holding `pos` for `slot` in `group`; panics if unmapped (a
-    /// read the host never provided for).
+    /// The block holding `pos` for `slot` in `group`; panics if unmapped.
     pub fn block_of(&self, slot: Slot, group: usize, pos: u32) -> u32 {
-        let bs = self.geometry[group].block_size;
-        let block = self.tables[slot as usize][group][(pos / bs) as usize];
-        assert!(
-            block != NULL_BLOCK,
-            "slot {slot} group {group} position {pos}: unmapped block"
-        );
-        block
+        self.mirror.block_of(slot, group, pos)
     }
 
-    /// The block a write at `pos` lands in, which must be mapped by exactly one
-    /// table entry: blocks shared through the prefix cache are immutable.
+    /// The block a write at `pos` lands in; panics unless exactly one table
+    /// entry maps it.
     pub fn writable_block(&self, slot: Slot, group: usize, pos: u32) -> u32 {
-        let block = self.block_of(slot, group, pos);
-        assert!(
-            self.mapped[group][block as usize] == 1,
-            "slot {slot} group {group} position {pos}: write to shared block {block}"
-        );
-        block
+        self.mirror.writable_block(slot, group, pos)
     }
 
     /// Copy one block of a group back to the host (tests and diagnostics).
@@ -393,6 +565,69 @@ mod tests {
             head_dim_v: 128,
             block_size,
             num_blocks,
+        }
+    }
+
+    /// Staging computes the tables a step leads to without touching the
+    /// current ones; a malformed step panics in staging, leaving them (and,
+    /// since nothing was queued, the device) as they were.
+    #[test]
+    fn staging_validates_before_anything_changes() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let geometry = vec![geom(16, 8), geom(16, 8)];
+        let current = TableMirror::new(&geometry, 2, 4);
+        let before = current.clone();
+        let update = |slot, group, index, block| TableUpdate {
+            slot,
+            group,
+            index,
+            block,
+        };
+        let ok = stage(
+            &geometry,
+            4,
+            0,
+            &current,
+            7,
+            &[Maintenance::Zero { group: 1, block: 3 }],
+            &[update(0, 0, 0, 5), update(1, 0, 0, 5), update(0, 1, 1, 2)],
+        );
+        assert_eq!(current, before, "staging changed the current tables");
+        assert_eq!(ok.generation, 7);
+        assert_eq!(ok.mirror.table(0, 0), &[5, 0, 0, 0]);
+        assert_eq!(ok.mirror.block_of(0, 1, 16), 2);
+        assert_eq!(ok.mirror.writable_block(0, 1, 17), 2);
+        assert_eq!(ok.dirty, vec![(0, 0), (0, 1), (1, 0)]);
+        assert_eq!(ok.ops.len(), 1);
+        // Block 5 is mapped twice: a write into it is refused on the staged
+        // tables.
+        let shared = catch_unwind(AssertUnwindSafe(|| ok.mirror.writable_block(0, 0, 3)));
+        assert!(shared.is_err());
+        // Each malformed piece, after valid ones, panics in staging.
+        let malformed: [(&[Maintenance], &[TableUpdate]); 6] = [
+            (&[Maintenance::Zero { group: 2, block: 1 }], &[]),
+            (
+                &[Maintenance::Copy {
+                    group: 0,
+                    src: 1,
+                    dst: 8,
+                }],
+                &[],
+            ),
+            (&[Maintenance::ResetSlot { slot: 2 }], &[]),
+            (&[], &[update(0, 0, 0, 1), update(0, 0, 4, 1)]),
+            (&[], &[update(0, 0, 0, 1), update(0, 0, 0, 8)]),
+            (
+                &[Maintenance::Zero { group: 0, block: 1 }],
+                &[update(2, 0, 0, 1)],
+            ),
+        ];
+        for (m, u) in malformed {
+            let r = catch_unwind(AssertUnwindSafe(|| {
+                stage(&geometry, 4, 0, &current, 7, m, u)
+            }));
+            assert!(r.is_err(), "{m:?} {u:?}");
+            assert_eq!(current, before);
         }
     }
 

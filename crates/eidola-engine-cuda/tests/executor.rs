@@ -2,7 +2,8 @@
 //! checkpoint (see `real_flash.rs` for the environment it needs): zero really
 //! zeroes, a copied block resumes bit for bit in a fresh slot, rows are
 //! independent of their batch (within the measured tolerance), the sampler
-//! never returns a padded id, and contract violations panic.
+//! never returns a padded id, contract violations panic, and a malformed
+//! step changes nothing.
 
 mod common;
 
@@ -13,6 +14,8 @@ use common::setup;
 use eidola_engine::executor::{Executor, Maintenance, SeqEntry, StepInput, TableUpdate};
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
+use eidola_engine_cuda::attention::AttnRequest;
+use eidola_engine_cuda::model::ForwardInput;
 use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, KvBlocks};
 use eidola_engine_model::safetensors::WeightSet;
 
@@ -229,6 +232,105 @@ fn seam_contract_on_the_truncated_checkpoint() {
         }),
         "write to a shared block"
     );
+    // A malformed step changes nothing: its maintenance and table updates
+    // are validated with its rows and applied only once all of it passes.
+    let tables_before: Vec<Vec<u32>> = (0..2).map(|g| ex.kv().table(3, g).to_vec()).collect();
+    let device_before: Vec<Vec<i32>> = (0..2)
+        .map(|g| ex.kv().read_table_row(ex.gpu(), 3, g).unwrap())
+        .collect();
+    let block_before = ex.kv().read_block(ex.gpu(), 0, 2).unwrap();
+    let malformed = || {
+        step(
+            vec![row(3, 0, 0, 4, true)],
+            vec![1, 2, 3, 4],
+            vec![Maintenance::Zero { group: 0, block: 2 }],
+            map(3, 0, &[10]),
+        )
+    };
+    let mut bad_positions = malformed();
+    bad_positions.positions[2] = 99;
+    assert!(
+        panics(|| {
+            let _ = ex.execute(&bad_positions);
+        }),
+        "positions disagree"
+    );
+    let mut bad_token = malformed();
+    bad_token.token_ids[1] = VOCAB as u32;
+    assert!(
+        ex.execute(&bad_token).is_err(),
+        "token outside the vocabulary"
+    );
+    for g in 0..2 {
+        assert_eq!(
+            ex.kv().table(3, g),
+            &tables_before[g][..],
+            "mirror untouched"
+        );
+        assert_eq!(
+            ex.kv().read_table_row(ex.gpu(), 3, g).unwrap(),
+            device_before[g],
+            "device table untouched"
+        );
+    }
+    assert_eq!(
+        ex.kv().read_block(ex.gpu(), 0, 2).unwrap(),
+        block_before,
+        "maintenance not applied"
+    );
+
+    // The model's own entry checks every index its kernels would follow.
+    let plans: Vec<_> = (0..2)
+        .map(|g| {
+            ex.model()
+                .kernels
+                .attention
+                .plan(
+                    ex.gpu(),
+                    &[AttnRequest {
+                        q_start: 0,
+                        qo_len: 1,
+                        pages: vec![11],
+                        kv_len: 1,
+                    }],
+                    [16, 8][g],
+                    BS,
+                )
+                .unwrap()
+        })
+        .collect();
+    let targets = vec![vec![(11u32, 0u32)]; 2];
+    let input = |tokens: &'static [u32], positions: &'static [u32], logit_rows: &'static [u32]| {
+        (tokens, positions, logit_rows)
+    };
+    let check = |(tokens, positions, logit_rows): (&[u32], &[u32], &[u32]),
+                 targets: &[Vec<(u32, u32)>]| {
+        ex.model().check_input(
+            ex.kv(),
+            &ForwardInput {
+                tokens,
+                positions,
+                kv_targets: targets,
+                plans: &plans,
+                logit_rows,
+            },
+        )
+    };
+    check(input(&[5], &[0], &[0]), &targets).unwrap();
+    for (bad, why) in [
+        (input(&[5], &[0], &[u32::MAX]), "logit row"),
+        (input(&[5], &[0], &[1]), "logit row"),
+        (input(&[5], &[1 << 20], &[0]), "position"),
+        (input(&[VOCAB as u32], &[0], &[0]), "vocabulary"),
+        (input(&[5, 6], &[0, 1], &[0]), "KV targets"),
+    ] {
+        let e = check(bad, &targets).unwrap_err();
+        assert!(e.to_string().contains(why), "{why}: {e}");
+    }
+    for bad in [(0, 0), (32, 0), (11, BS)] {
+        let e = check(input(&[5], &[0], &[0]), &[vec![bad], vec![(11, 0)]]).unwrap_err();
+        assert!(e.to_string().contains("KV target"), "{bad:?}: {e}");
+    }
     // Drafts are refused (this executor drafts none), at position 0 above all.
     let mut r = row(0, 0, 0, 1, true);
     r.num_drafts = 1;

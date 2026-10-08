@@ -22,7 +22,7 @@ use eidola_engine_model::config::AttentionKind as ModelAttention;
 use eidola_engine_model::config::AttentionSpec;
 use eidola_engine_model::safetensors::WeightSet;
 
-use crate::attention::{AttnPlan, AttnRequest};
+use crate::attention::{AttnPlan, AttnRequest, HostPlan};
 use crate::device::ImageArch;
 use crate::kv::KvStore;
 use crate::model::{ForwardInput, GpuModel, Kernels, group_geometry, group_layers, read_config};
@@ -266,9 +266,13 @@ impl CudaExecutor {
         {
             return Err(CudaError::new("batch exceeds its bucket"));
         }
-        // 1-2. Maintenance, then table updates.
-        self.kv
-            .apply(&self.gpu, &step.maintenance, &step.table_updates)?;
+        // The whole step is validated before any of it takes effect: the
+        // maintenance and table updates are staged (checked, and the tables
+        // they lead to computed, with nothing applied), the rows are checked
+        // against those staged tables, and the forward's input against the
+        // model; only then is the staged work committed.
+        let staged = self.kv.stage(&step.maintenance, &step.table_updates);
+        let tables = staged.mirror();
 
         // Validate rows; gather token-level inputs, KV targets and plans.
         let groups = self.spec.kv_groups.clone();
@@ -304,7 +308,7 @@ impl CudaExecutor {
             assert!(p < self.spec.max_model_len, "row past the model length");
             for (g, group) in groups.iter().enumerate() {
                 for pos in e.context_len..=p {
-                    let block = self.kv.writable_block(e.slot, g, pos);
+                    let block = tables.writable_block(e.slot, g, pos);
                     kv_targets[g].push((block, pos % bs));
                 }
                 // Visible KV of the row: from the first position its first
@@ -312,7 +316,7 @@ impl CudaExecutor {
                 let first = group.attention.first_visible(e.context_len);
                 let first_page = first / bs;
                 let pages: Vec<u32> = (first_page..=p / bs)
-                    .map(|i| self.kv.block_of(e.slot, g, i * bs))
+                    .map(|i| tables.block_of(e.slot, g, i * bs))
                     .collect();
                 requests[g].push(AttnRequest {
                     q_start,
@@ -353,26 +357,30 @@ impl CudaExecutor {
                 .map(|(l, _)| l.attention.num_q_heads)
                 .expect("a layer per group");
             let nq: u32 = narrow(nq, "query heads")?;
-            plans.push(self.model.kernels.attention.plan(
-                &self.gpu,
-                &requests[g],
-                nq / group.num_kv_heads,
-                bs,
-            )?);
+            let group_size = nq / group.num_kv_heads;
+            let host = HostPlan::new(&requests[g], group_size, bs)?;
+            // Fresh buffers for this step only: no executor state changes.
+            plans.push(
+                self.model
+                    .kernels
+                    .attention
+                    .upload(&self.gpu, host, group_size, bs)?,
+            );
         }
+        let input = ForwardInput {
+            tokens: &step.token_ids,
+            positions: &step.positions,
+            kv_targets: &kv_targets,
+            plans: &plans,
+            logit_rows: &logit_rows,
+        };
+        self.model.check_input(&self.kv, &input)?;
+
+        // 1-2. Maintenance, then table updates.
+        self.kv.commit(&self.gpu, staged)?;
 
         // 3. The forward.
-        self.model.forward(
-            &self.gpu,
-            &self.kv,
-            &ForwardInput {
-                tokens: &step.token_ids,
-                positions: &step.positions,
-                kv_targets: &kv_targets,
-                plans: &plans,
-                logit_rows: &logit_rows,
-            },
-        )?;
+        self.model.forward(&self.gpu, &self.kv, &input)?;
 
         // 4. Sampling over the sampleable vocabulary.
         let s = self.gpu.stream().clone();
@@ -403,15 +411,14 @@ impl CudaExecutor {
         };
         if !sample_rows.is_empty() {
             let n = sample_rows.len();
-            s.memcpy_htod(&sample_rows, &mut self.sample_rows.slice_mut(..n))?;
             s.memset_zeros(&mut self.status)?;
             self.model.kernels.sampler.sample(
                 &self.gpu,
                 self.model.logits(),
                 vocab as usize,
                 self.spec.sampleable_vocab_size,
-                &self.sample_rows,
-                narrow(n, "sample rows")?,
+                &sample_rows,
+                &mut self.sample_rows,
                 Some(Stream::Sample),
                 &mut self.probs,
                 &mut self.tokens,

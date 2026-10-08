@@ -87,9 +87,8 @@ fn sample_matches_reference_bit_for_bit() {
         }
     }
     let n = SAMPLEABLE as usize;
-    let drows = s
-        .clone_htod(&rows.iter().map(|r| r.0).collect::<Vec<_>>())
-        .unwrap();
+    let hrows: Vec<SampleRow> = rows.iter().map(|r| r.0).collect();
+    let mut drows = s.clone_htod(&hrows).unwrap();
     for &arch in &su.archs {
         let sampler = Sampler::from_module(su.module("sampling", arch)).unwrap();
         for stream in [Stream::Sample, Stream::Draft] {
@@ -103,8 +102,8 @@ fn sample_matches_reference_bit_for_bit() {
                     &dlogits,
                     STRIDE,
                     SAMPLEABLE,
-                    &drows,
-                    rows.len() as u32,
+                    &hrows,
+                    &mut drows,
                     Some(stream),
                     &mut probs,
                     &mut tokens,
@@ -159,7 +158,7 @@ fn draws_match_reference_over_many_positions() {
     let dlogits = s.clone_htod(&logits).unwrap();
     let params = SamplingParams::new(1.0, 0, 0.9, 0.0, 1234).unwrap();
     let rows: Vec<SampleRow> = (0..512).map(|i| SampleRow::new(&params, i, 0)).collect();
-    let drows = s.clone_htod(&rows).unwrap();
+    let mut drows = s.clone_htod(&rows).unwrap();
     let n = SAMPLEABLE as usize;
     let lrow = Logits::new(&logits[..STRIDE], SAMPLEABLE);
     let probs_ref = sampling::processed_probs(lrow, &params);
@@ -174,8 +173,8 @@ fn draws_match_reference_over_many_positions() {
                 &dlogits,
                 STRIDE,
                 SAMPLEABLE,
-                &drows,
-                rows.len() as u32,
+                &rows,
+                &mut drows,
                 Some(Stream::Sample),
                 &mut probs,
                 &mut tokens,
@@ -206,7 +205,8 @@ fn non_finite_logits_are_reported() {
         logits[100] = bad;
         let dlogits = s.clone_htod(&logits).unwrap();
         let params = SamplingParams::random(temperature, 1).unwrap();
-        let drows = s.clone_htod(&[SampleRow::new(&params, 3, 0)]).unwrap();
+        let hrow = [SampleRow::new(&params, 3, 0)];
+        let mut drows = s.clone_htod(&hrow).unwrap();
         for &arch in &su.archs {
             let sampler = Sampler::from_module(su.module("sampling", arch)).unwrap();
             let mut probs = s.alloc_zeros::<f64>(n).unwrap();
@@ -218,8 +218,8 @@ fn non_finite_logits_are_reported() {
                     &dlogits,
                     n,
                     n as u32,
-                    &drows,
-                    1,
+                    &hrow,
+                    &mut drows,
                     Some(Stream::Sample),
                     &mut probs,
                     &mut tokens,
@@ -317,8 +317,8 @@ fn chain_accept_matches_reference() {
     }
     let dt = s.clone_htod(&target_logits).unwrap();
     let dd = s.clone_htod(&draft_logits).unwrap();
-    let dtr = s.clone_htod(&t_rows).unwrap();
-    let ddr = s.clone_htod(&d_rows).unwrap();
+    let mut dtr = s.clone_htod(&t_rows).unwrap();
+    let mut ddr = s.clone_htod(&d_rows).unwrap();
     let rows: Vec<SampleRow> = seqs
         .iter()
         .map(|&(_, p, _, _, pos)| SampleRow::new(&p, pos, 0))
@@ -346,8 +346,8 @@ fn chain_accept_matches_reference() {
                 &dt,
                 n,
                 n as u32,
-                &dtr,
-                nt as u32,
+                &t_rows,
+                &mut dtr,
                 None,
                 &mut tp,
                 &mut tok,
@@ -360,8 +360,8 @@ fn chain_accept_matches_reference() {
                 &dd,
                 n,
                 n as u32,
-                &ddr,
-                nd as u32,
+                &d_rows,
+                &mut ddr,
                 None,
                 &mut dp,
                 &mut tok,
@@ -422,7 +422,7 @@ fn signed_zero_maxima_tie_to_the_lower_id() {
         SampleRow::new(&SamplingParams::greedy(), 1, 0),
         SampleRow::new(&SamplingParams::greedy(), 1, 1),
     ];
-    let drows = s.clone_htod(&rows).unwrap();
+    let mut drows = s.clone_htod(&rows).unwrap();
     for &arch in &su.archs {
         let sampler = Sampler::from_module(su.module("sampling", arch)).unwrap();
         let mut probs = s.alloc_zeros::<f64>(2 * n).unwrap();
@@ -434,8 +434,8 @@ fn signed_zero_maxima_tie_to_the_lower_id() {
                 &dlogits,
                 n,
                 n as u32,
-                &drows,
-                2,
+                &rows,
+                &mut drows,
                 Some(Stream::Sample),
                 &mut probs,
                 &mut tokens,
@@ -456,7 +456,8 @@ fn oversized_vocabularies_are_refused() {
     let sampler = Sampler::from_module(su.module("sampling", su.archs[0])).unwrap();
     let n = (1u32 << 20) + 1;
     let probs = s.alloc_zeros::<f64>(n as usize).unwrap();
-    let rows = s.clone_htod(&[SampleRow::default()]).unwrap();
+    let hrows = [SampleRow::default()];
+    let mut rows = s.clone_htod(&hrows).unwrap();
     let plan = [AcceptRow {
         target_row: 0,
         draft_row: 0,
@@ -491,8 +492,8 @@ fn oversized_vocabularies_are_refused() {
             &logits,
             n as usize,
             n,
-            &rows,
-            1,
+            &hrows,
+            &mut rows,
             None,
             &mut p,
             &mut tokens,
@@ -568,4 +569,37 @@ fn accept_plans_are_bounded() {
     }
     // A row with no drafts needs no draft rows at all.
     run(&[row(5, u32::MAX, &[])]).unwrap();
+}
+
+/// A row naming a logit row outside the logits is refused on the host,
+/// before anything is uploaded or launched.
+#[test]
+fn logit_rows_are_bounded() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    let sampler = Sampler::from_module(su.module("sampling", su.archs[0])).unwrap();
+    let n = 4096usize;
+    let logits = s.alloc_zeros::<f32>(2 * n).unwrap();
+    let mut rows_dev = s.alloc_zeros::<SampleRow>(1).unwrap();
+    let mut probs = s.alloc_zeros::<f64>(n).unwrap();
+    let mut tokens = s.alloc_zeros::<u32>(1).unwrap();
+    let mut status = s.alloc_zeros::<u32>(1).unwrap();
+    let mut run = |row: u32| {
+        sampler.sample(
+            gpu,
+            &logits,
+            n,
+            n as u32,
+            &[SampleRow::new(&SamplingParams::greedy(), 1, row)],
+            &mut rows_dev,
+            None,
+            &mut probs,
+            &mut tokens,
+            &mut status,
+        )
+    };
+    run(1).unwrap();
+    let e = run(2).unwrap_err();
+    assert!(e.to_string().contains("logit row 2 of 2"), "{e}");
 }

@@ -71,11 +71,13 @@ impl Sampler {
         })
     }
 
-    /// For each of `num_rows` rows: the processed distribution over the first
-    /// `n` logits of row `rows[r].logit_row` into `probs[r * n ..]`, and, with
+    /// For each row of `rows`: the processed distribution over the first `n`
+    /// logits of row `rows[r].logit_row` into `probs[r * n ..]`, and, with
     /// `draw`, a token drawn from it with that stream into `tokens[r]` (a
     /// greedy row takes the argmax and consumes no draw). Non-finite logits set
-    /// [`STATUS_NON_FINITE`] in `status`.
+    /// [`STATUS_NON_FINITE`] in `status`. The rows are host values, checked
+    /// (every `logit_row` inside `logits`) and then uploaded into `rows_dev`,
+    /// so the kernel reads only rows that passed.
     #[allow(clippy::too_many_arguments)]
     pub fn sample(
         &self,
@@ -83,27 +85,40 @@ impl Sampler {
         logits: &CudaSlice<f32>,
         logits_stride: usize,
         n: u32,
-        rows: &CudaSlice<SampleRow>,
-        num_rows: u32,
+        rows: &[SampleRow],
+        rows_dev: &mut CudaSlice<SampleRow>,
         draw: Option<Stream>,
         probs: &mut CudaSlice<f64>,
         tokens: &mut CudaSlice<u32>,
         status: &mut CudaSlice<u32>,
     ) -> Result<()> {
-        if num_rows == 0 {
+        if rows.is_empty() {
             return Ok(());
         }
-        let r = num_rows as usize;
-        if rows.len() < r || probs.len() < r * n as usize || tokens.len() < r || status.is_empty() {
+        let r = rows.len();
+        let num_rows: u32 = narrow(r, "sample rows")?;
+        if rows_dev.len() < r
+            || probs.len() < r * n as usize
+            || tokens.len() < r
+            || status.is_empty()
+        {
             return Err(CudaError::new("sample: buffer too small"));
         }
         if n == 0 || n as usize > logits_stride || n > 1 << 20 || logits.len() < logits_stride {
             return Err(CudaError::new(format!("sample: vocabulary {n}")));
         }
+        let logit_rows = logits.len() / logits_stride;
+        if let Some(row) = rows.iter().find(|row| row.logit_row as usize >= logit_rows) {
+            return Err(CudaError::new(format!(
+                "sample: logit row {} of {logit_rows}",
+                row.logit_row
+            )));
+        }
         let s = gpu.stream();
+        s.memcpy_htod(rows, &mut rows_dev.slice_mut(..r))?;
         let stream = draw.map_or(u32::MAX, |d| d as u32);
-        // SAFETY: arguments match `eidola_sample`; buffers checked above (the
-        // logits rows named by `rows` are the caller's contract).
+        // SAFETY: arguments match `eidola_sample`; buffers and every row's
+        // logit row checked above, and `rows_dev` holds exactly those rows.
         unsafe {
             launch!(
                 gpu,
@@ -112,7 +127,7 @@ impl Sampler {
                 dptr(logits, s),
                 logits_stride as u64,
                 n,
-                dptr(rows, s),
+                dptr(rows_dev, s),
                 stream,
                 dptr(probs, s),
                 dptr(tokens, s),

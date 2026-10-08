@@ -242,6 +242,12 @@ pub struct AttnPlan {
     tile: u32,
     /// The page size `last_page_len` was computed for.
     page_size: u32,
+    /// The GQA group size the query tiles were counted for.
+    group_size: u32,
+    /// Query rows the requests cover (`q_indptr`'s last entry).
+    q_rows: u32,
+    /// The largest page id listed, if any.
+    max_page: Option<u32>,
     work_items: u32,
     num_requests: u32,
     q_indptr: CudaSlice<i32>,
@@ -252,6 +258,26 @@ pub struct AttnPlan {
     qo_tile_indices: CudaSlice<i32>,
     kv_tile_indices: CudaSlice<i32>,
     kv_chunk_size: CudaSlice<u32>,
+}
+
+impl AttnPlan {
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
+    pub fn group_size(&self) -> u32 {
+        self.group_size
+    }
+
+    /// Query rows the plan's requests cover.
+    pub fn q_rows(&self) -> u32 {
+        self.q_rows
+    }
+
+    /// The largest page id it reads, if any.
+    pub fn max_page(&self) -> Option<u32> {
+        self.max_page
+    }
 }
 
 /// One layer's KV and attention settings.
@@ -301,13 +327,11 @@ impl Attention {
         })
     }
 
-    /// Plan one step's attention for a group: query tile chosen from the
-    /// longest packed query run (query rows × GQA group size), as FlashInfer
-    /// does, and one work item per (request, query tile).
-    pub fn plan(
+    /// Upload a host plan (see [`Attention::plan`]).
+    pub fn upload(
         &self,
         gpu: &Gpu,
-        requests: &[AttnRequest],
+        host: HostPlan,
         group_size: u32,
         page_size: u32,
     ) -> Result<AttnPlan> {
@@ -321,7 +345,7 @@ impl Attention {
             request_indices: req,
             qo_tile_indices: qtile,
             kv_tile_indices: kvtile,
-        } = HostPlan::new(requests, group_size, page_size)?;
+        } = host;
         let up = |v: &[i32]| -> Result<CudaSlice<i32>> {
             Ok(if v.is_empty() {
                 s.alloc_zeros::<i32>(1)?
@@ -329,11 +353,15 @@ impl Attention {
                 s.clone_htod(v)?
             })
         };
+        let unsigned = |x: i32| u32::try_from(x).map_err(|_| CudaError::new("negative plan index"));
         Ok(AttnPlan {
             tile,
             page_size,
+            group_size,
+            q_rows: unsigned(*q_indptr.last().expect("q_indptr starts at 0"))?,
+            max_page: indices.iter().copied().max().map(unsigned).transpose()?,
             work_items: narrow(req.len(), "attention work items")?,
-            num_requests: narrow(requests.len(), "attention requests")?,
+            num_requests: narrow(indptr.len() - 1, "attention requests")?,
             q_indptr: up(&q_indptr)?,
             indices: up(&indices)?,
             indptr: up(&indptr)?,
@@ -343,6 +371,20 @@ impl Attention {
             kv_tile_indices: up(&kvtile)?,
             kv_chunk_size: s.alloc_zeros::<u32>(1)?,
         })
+    }
+
+    /// Plan one step's attention for a group: query tile chosen from the
+    /// longest packed query run (query rows × GQA group size), as FlashInfer
+    /// does, and one work item per (request, query tile).
+    pub fn plan(
+        &self,
+        gpu: &Gpu,
+        requests: &[AttnRequest],
+        group_size: u32,
+        page_size: u32,
+    ) -> Result<AttnPlan> {
+        let host = HostPlan::new(requests, group_size, page_size)?;
+        self.upload(gpu, host, group_size, page_size)
     }
 
     /// Attention for one layer: `q` is `[rows, num_qo_heads, 192]`, `o` is
@@ -372,6 +414,13 @@ impl Attention {
             return Err(CudaError::new(
                 "attention: query heads must be whole GQA groups; pages non-empty",
             ));
+        }
+        if num_qo_heads / layer.num_kv_heads != plan.group_size {
+            return Err(CudaError::new(format!(
+                "attention: a plan for GQA groups of {} run on groups of {}",
+                plan.group_size,
+                num_qo_heads / layer.num_kv_heads
+            )));
         }
         if layer.page_size != plan.page_size {
             return Err(CudaError::new(format!(

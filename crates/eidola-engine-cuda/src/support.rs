@@ -117,6 +117,9 @@ pub fn check_supported(c: &ModelConfig) -> Result<(), Unsupported> {
     );
     exact!("rms_norm_eps", c.rms_norm_eps, 1e-6f32);
     exact!("source_num_layers", c.source_num_layers, SOURCE_LAYERS);
+    // Read by no implementation; pinned so a checkpoint declaring another
+    // value is refused rather than served as if it agreed.
+    exact!("attention_chunk_size", c.attention_chunk_size, Some(WINDOW));
     // Read only as the fused-QKV chunk count's fallback (`qkv_chunks`), and
     // so invisible to every per-layer check: pinned here.
     exact!("num_key_value_heads", c.num_key_value_heads, QKV_CHUNKS);
@@ -182,6 +185,13 @@ pub fn check_supported(c: &ModelConfig) -> Result<(), Unsupported> {
     exact!("moe.top_k", m.top_k, TOP_K);
     exact!("moe.norm_topk_prob", m.norm_topk_prob, true);
     exact!("moe.routed_scaling_factor", m.routed_scaling_factor, 1.0f32);
+    // The loader reads the router weight as BF16 and the router kernel
+    // scores it in f32: Flash's declaration, and no other.
+    exact!(
+        "moe.router_dtype",
+        m.router_dtype.as_deref(),
+        Some("bfloat16")
+    );
     Ok(())
 }
 
@@ -511,6 +521,10 @@ mod tests {
             ("moe.routed_scaling_factor", |m| {
                 m.routed_scaling_factor = 2.5
             }),
+            ("moe.router_dtype", |m| {
+                m.router_dtype = Some("float32".into())
+            }),
+            ("moe.router_dtype", |m| m.router_dtype = None),
         ] {
             let mut c = flash();
             set(c.moe.as_mut().unwrap());
@@ -519,6 +533,10 @@ mod tests {
         for (name, set) in [
             ("source_num_layers", (|c| c.source_num_layers = 47) as C),
             ("num_key_value_heads", |c| c.num_key_value_heads = 2),
+            ("attention_chunk_size", |c| {
+                c.attention_chunk_size = Some(256)
+            }),
+            ("attention_chunk_size", |c| c.attention_chunk_size = None),
             ("quant", |c| c.quant = None),
             ("quant.fp8_block", |c| {
                 c.quant.as_mut().unwrap().fp8_block = [64, 64]

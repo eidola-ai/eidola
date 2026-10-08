@@ -17,6 +17,7 @@
 
 use crate::module::KernelDir;
 use cudarc::driver::CudaSlice;
+use eidola_engine::spec::NULL_BLOCK;
 use eidola_engine_model::ModelConfig;
 use eidola_engine_model::attention::rope_cos_sin;
 use eidola_engine_model::config::{AttentionSpec, FfnKind};
@@ -156,6 +157,8 @@ pub struct GpuModel {
     /// Per distinct RoPE θ: `[max_len][32 cos | 32 sin]`.
     rope: Vec<(f32, CudaSlice<f32>)>,
     max_logit_rows: usize,
+    /// Positions the RoPE tables cover.
+    max_len: usize,
     /// When set, a host copy of `h` after every layer (the last forward's).
     pub capture_layers: bool,
     pub captured: Vec<Vec<f32>>,
@@ -399,6 +402,7 @@ impl GpuModel {
             scratch,
             rope,
             max_logit_rows,
+            max_len,
             capture_layers: false,
             captured: Vec::new(),
         })
@@ -416,18 +420,93 @@ impl GpuModel {
         &self.scratch.logits
     }
 
+    /// Check every host value of `input` that a kernel would use as an index
+    /// or count, against the scratch, the vocabulary, the RoPE tables and
+    /// `kv`'s pools, without touching the device. [`GpuModel::forward`] runs
+    /// it first; the executor runs it before a step changes any state.
+    pub fn check_input(&self, kv: &KvStore, input: &ForwardInput<'_>) -> Result<()> {
+        let bad = |what: String| Err(CudaError::new(format!("forward input: {what}")));
+        let t = input.tokens.len();
+        if t > self.scratch.max_tokens || input.logit_rows.len() > self.max_logit_rows {
+            return bad(format!(
+                "{t} tokens / {} logit rows exceed the scratch",
+                input.logit_rows.len()
+            ));
+        }
+        if input.positions.len() != t {
+            return bad(format!(
+                "{} positions for {t} tokens",
+                input.positions.len()
+            ));
+        }
+        let vocab = self.weights.config.vocab_size;
+        if let Some(&tok) = input.tokens.iter().find(|&&x| x as usize >= vocab) {
+            return bad(format!("token {tok} outside the vocabulary of {vocab}"));
+        }
+        if let Some(&p) = input
+            .positions
+            .iter()
+            .find(|&&p| p as usize >= self.max_len)
+        {
+            return bad(format!(
+                "position {p} past the RoPE tables' {}",
+                self.max_len
+            ));
+        }
+        if let Some(&r) = input.logit_rows.iter().find(|&&r| r as usize >= t) {
+            return bad(format!("logit row {r} of {t} tokens"));
+        }
+        let geometry = kv.geometry();
+        let groups = self.layer_kv.iter().map(|l| l.group + 1).max().unwrap_or(0);
+        if geometry.len() != groups
+            || input.kv_targets.len() != groups
+            || input.plans.len() != groups
+        {
+            return bad(format!(
+                "{} KV pools, {} target lists, {} plans for {groups} groups",
+                geometry.len(),
+                input.kv_targets.len(),
+                input.plans.len()
+            ));
+        }
+        for (g, (geom, targets)) in geometry.iter().zip(input.kv_targets).enumerate() {
+            if targets.len() != t {
+                return bad(format!(
+                    "group {g}: {} KV targets for {t} tokens",
+                    targets.len()
+                ));
+            }
+            // Block 0 is the null block: never written.
+            if let Some(&(b, o)) = targets
+                .iter()
+                .find(|&&(b, o)| b == NULL_BLOCK || b >= geom.num_blocks || o >= geom.block_size)
+            {
+                return bad(format!("group {g}: KV target block {b} offset {o}"));
+            }
+            let plan = &input.plans[g];
+            if plan.page_size() != geom.block_size
+                || plan.q_rows() as usize != t
+                || plan.max_page().is_some_and(|p| p >= geom.num_blocks)
+            {
+                return bad(format!(
+                    "group {g}: a plan for pages of {} over {} rows reading block {:?}",
+                    plan.page_size(),
+                    plan.q_rows(),
+                    plan.max_page()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Run the target over `input`, writing KV through `kv` and leaving the
-    /// logits of `input.logit_rows` in [`GpuModel::logits`].
+    /// logits of `input.logit_rows` in [`GpuModel::logits`]. The input is
+    /// checked whole ([`GpuModel::check_input`]) before anything is launched.
     pub fn forward(&mut self, gpu: &Gpu, kv: &KvStore, input: &ForwardInput<'_>) -> Result<()> {
+        self.check_input(kv, input)?;
         let t = input.tokens.len();
         if t == 0 {
             return Ok(());
-        }
-        if t > self.scratch.max_tokens || input.logit_rows.len() > self.max_logit_rows {
-            return Err(CudaError::new(format!(
-                "forward of {t} tokens / {} logit rows exceeds the scratch",
-                input.logit_rows.len()
-            )));
         }
         let s = gpu.stream().clone();
         let c = self.weights.config.clone();

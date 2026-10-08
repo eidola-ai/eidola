@@ -68,6 +68,8 @@ fn flash_layer_table() {
     assert_eq!(q.fp8_block, [128, 128]);
     assert_eq!(q.mxfp4_block, Some(32));
     assert_eq!(q.activation_scheme.as_deref(), Some("dynamic"));
+    assert_eq!(moe.router_dtype.as_deref(), Some("bfloat16"));
+    assert_eq!(c.attention_chunk_size, Some(128));
 }
 
 #[test]
