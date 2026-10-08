@@ -68,9 +68,9 @@ COPY releases/trust/sigstore-trusted-root.json ./releases/trust/sigstore-trusted
 # Engine trust inputs: `build.rs` embeds the engine deployments this gateway
 # accepts (`engine-enclaves.json`) after checking every pin against the
 # committed deployment configs under `deploy/engine/`. Neither depends on the
-# gateway's own digest, so they add no cycle either. The `deploy/engine*`
-# glob matches nothing while no engine deployment is committed, which COPY
-# accepts because the other source matches.
+# gateway's own digest, so they add no cycle either. A glob rather than
+# `deploy/engine/` so a tree without that directory still builds; the
+# build script then sees no deployments.
 COPY --parents releases/trust/engine-enclaves.json deploy/engine* ./
 
 # Ensure Cargo detects source changes over the fetch-stage stubs.
