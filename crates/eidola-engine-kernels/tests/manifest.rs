@@ -161,7 +161,7 @@ fn sass_uses_the_intended_tensor_core_path() {
             0,
             "{arch}"
         );
-        for own in ["rmsnorm", "sampling", "engine_ops"] {
+        for own in ["rmsnorm", "sampling", "engine_ops", "engine_ops_reference"] {
             let cubin = manifest.cubin(own, arch).expect("cubin");
             assert!(cubin.mma_sass.is_empty(), "{own} {arch}");
         }
