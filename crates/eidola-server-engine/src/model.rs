@@ -31,7 +31,11 @@
 //! Every byte the node uses is the byte it hashed: the shards are memory-mapped once and
 //! both hashed and loaded from that mapping, and the semantic and chat files are read once
 //! and parsed from the bytes that were hashed. The hash is checked **before** any weight
-//! is dequantised.
+//! is dequantised or copied to a device.
+//!
+//! What is loaded depends on the executor: the CPU executor runs the f32 reference model,
+//! dequantised here; the CUDA executor copies the checkpoint to the device as stored, from
+//! the same verified mapping ([`LoadedModel::store`]), so no reference model is built.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -42,10 +46,10 @@ use eidola_engine_chat::template::CHAT_TEMPLATE_FILE;
 use eidola_engine_chat::tokenizer::{GENERATION_CONFIG_FILE, TOKENIZER_FILE};
 use eidola_engine_chat::{ChatTemplate, MimoTokenizer};
 use eidola_engine_model::safetensors::{SEMANTIC_FILES, WeightSet};
-use eidola_engine_model::{LoadOptions, ModelWeights, ReferenceModel};
+use eidola_engine_model::{LoadOptions, ModelConfig, ModelWeights, ReferenceModel};
 use sha2::{Digest, Sha256};
 
-use crate::config::WeightsStorage;
+use crate::config::{ExecutorKind, WeightsStorage};
 
 /// The chat artifacts the weights hash covers besides the model crate's files.
 pub const CHAT_FILES: [&str; 3] = [TOKENIZER_FILE, CHAT_TEMPLATE_FILE, GENERATION_CONFIG_FILE];
@@ -145,7 +149,11 @@ impl GenerationDefaults {
 pub struct LoadedModel {
     weights_hash: String,
     storage: WeightsStorage,
-    model: Arc<ReferenceModel>,
+    config: ModelConfig,
+    /// The verified shards, memory-mapped.
+    store: Arc<WeightSet>,
+    /// The f32 reference model, loaded for the CPU executor only.
+    reference: Option<Arc<ReferenceModel>>,
     tokenizer: MimoTokenizer,
     template: ChatTemplate,
     defaults: GenerationDefaults,
@@ -161,9 +169,15 @@ impl std::fmt::Debug for LoadedModel {
 
 impl LoadedModel {
     /// Opens `dir`, checks its storage against `storage`, computes its weights hash,
-    /// refuses unless it equals `expected` (lowercase hex), and only then loads the
-    /// weights and chat artifacts.
-    pub fn load(dir: &Path, expected: &str, storage: WeightsStorage) -> Result<Self, ModelError> {
+    /// refuses unless it equals `expected` (lowercase hex), and only then parses the
+    /// configuration and chat artifacts and, for the CPU executor, loads the reference
+    /// model (the CUDA executor loads the shards itself, from [`LoadedModel::store`]).
+    pub fn load(
+        dir: &Path,
+        expected: &str,
+        storage: WeightsStorage,
+        executor: ExecutorKind,
+    ) -> Result<Self, ModelError> {
         // Storage first, before any weights file is opened, mapped or parsed: the
         // directory, then (from its listing, which reads only names) every file the node
         // will read.
@@ -221,9 +235,17 @@ impl LoadedModel {
         let config = store
             .model_config()
             .map_err(|e| ModelError(format!("config.json: {e}")))?;
-        let weights = ModelWeights::load(Arc::new(store), config, &LoadOptions::default())
-            .map_err(|e| ModelError(format!("cannot load the weights: {e}")))?;
-        let model = Arc::new(ReferenceModel::new(weights));
+        let store = Arc::new(store);
+        let reference = match executor {
+            ExecutorKind::Cpu => {
+                let weights =
+                    ModelWeights::load(store.clone(), config.clone(), &LoadOptions::default())
+                        .map_err(|e| ModelError(format!("cannot load the weights: {e}")))?;
+                Some(Arc::new(ReferenceModel::new(weights)))
+            }
+            #[cfg(feature = "cuda")]
+            ExecutorKind::Cuda => None,
+        };
 
         let tokenizer =
             MimoTokenizer::from_bytes(&chat[TOKENIZER_FILE], &chat[GENERATION_CONFIG_FILE])
@@ -235,16 +257,18 @@ impl LoadedModel {
         let defaults = GenerationDefaults::parse(&chat[GENERATION_CONFIG_FILE])?;
 
         let vocab = tokenizer.vocab_size();
-        if vocab > model.weights.config.vocab_size {
+        if vocab > config.vocab_size {
             return Err(ModelError(format!(
                 "the tokenizer defines {vocab} ids but the model's head has only {} rows",
-                model.weights.config.vocab_size
+                config.vocab_size
             )));
         }
         Ok(LoadedModel {
             weights_hash: actual,
             storage,
-            model,
+            config,
+            store,
+            reference,
             tokenizer,
             template,
             defaults,
@@ -261,9 +285,19 @@ impl LoadedModel {
         self.storage
     }
 
-    /// The reference model (weights and numerics).
-    pub fn model(&self) -> &Arc<ReferenceModel> {
-        &self.model
+    /// The model's configuration (`config.json`, verified).
+    pub fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+
+    /// The verified shards, memory-mapped: the bytes the weights hash covers.
+    pub fn store(&self) -> &Arc<WeightSet> {
+        &self.store
+    }
+
+    /// The f32 reference model (weights and numerics), when loaded for the CPU executor.
+    pub fn reference(&self) -> Option<&Arc<ReferenceModel>> {
+        self.reference.as_ref()
     }
 
     pub fn tokenizer(&self) -> &MimoTokenizer {

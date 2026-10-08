@@ -1,6 +1,7 @@
 //! The executor refuses what it cannot run before touching device memory:
-//! the configuration and the device, then the KV geometry, then the kernel images, and only
-//! then the weights. The checkpoint here is a configuration with no tensors,
+//! the configuration and the KV geometry (also checkable without a device,
+//! `CudaExecutor::preflight`), then the device, then the kernel images, and
+//! only then the weights. The checkpoint here is a configuration with no tensors,
 //! so reaching the weights at all shows up as a missing-tensor error.
 
 mod common;
@@ -9,12 +10,15 @@ use std::sync::Arc;
 
 use eidola_engine::spec::Bucket;
 use eidola_engine_cuda::{
-    CudaError, CudaExecutor, CudaExecutorConfig, Gpu, ImageArch, KernelDir, KvBlocks,
+    CudaError, CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, ImageArch, KernelDir, KvBlocks,
 };
 use eidola_engine_model::safetensors::WeightSet;
 
+/// A fresh directory per call, so tests running in parallel never share one.
 fn tensorless_checkpoint() -> Arc<WeightSet> {
-    let dir = std::env::temp_dir().join(format!("eidola-config-only-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("eidola-config-only-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -39,7 +43,42 @@ fn config() -> CudaExecutorConfig {
         }],
         sampleable_vocab_size: 151_675,
         image: None,
+        graphs: CudaGraphs::Off,
     }
+}
+
+/// The host-side refusals need no device: `preflight` makes them from the
+/// checkpoint's configuration alone, and returns the spec `new` would report.
+#[test]
+fn preflight_refuses_without_a_device() {
+    let store = tensorless_checkpoint();
+    let spec = CudaExecutor::preflight(&store, None, &config()).unwrap();
+    assert_eq!(spec.kv_groups.len(), 2);
+    assert_eq!(spec.max_draft_tokens, 0);
+
+    let mut cfg = config();
+    cfg.block_size = 16_777_217;
+    let e = CudaExecutor::preflight(&store, None, &cfg).unwrap_err();
+    assert!(e.to_string().contains("KV geometry"), "{e}");
+
+    let mut cfg = config();
+    cfg.sampleable_vocab_size = 200_000;
+    let e = CudaExecutor::preflight(&store, None, &cfg).unwrap_err();
+    assert!(matches!(e, CudaError::Unsupported(_)), "{e}");
+
+    let mut cfg = config();
+    cfg.max_model_len = (1 << 20) + 1;
+    let e = CudaExecutor::preflight(&store, None, &cfg).unwrap_err();
+    let CudaError::Unsupported(u) = e else {
+        panic!("a configuration refusal, not {e}")
+    };
+    assert_eq!(u.field, "max_model_len");
+
+    let e = CudaExecutor::preflight(&store, Some(&[0]), &config()).unwrap_err();
+    let CudaError::Unsupported(u) = e else {
+        panic!("a configuration refusal, not {e}")
+    };
+    assert_eq!(u.field, "num_blocks.sliding");
 }
 
 #[test]

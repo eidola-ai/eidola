@@ -617,7 +617,9 @@ fn every_variable_the_node_requires_is_checked() {
         env::EXECUTOR,
         env::BIND_ADDR,
         env::KV_BLOCK_SIZE,
-        env::KV_BLOCKS,
+        env::KV_DEVICE_BYTES,
+        env::KERNELS_DIR,
+        env::CUDA_GRAPHS,
         env::MAX_MODEL_LEN,
         env::MAX_SEQS,
         env::MAX_BATCHED_TOKENS,
@@ -649,7 +651,10 @@ fn every_variable_the_node_requires_is_checked() {
         (env::EXECUTOR, "gpu"),
         (env::BIND_ADDR, "localhost"),
         (env::KV_BLOCK_SIZE, "0"),
-        (env::KV_BLOCKS, "1"),
+        (env::KV_DEVICE_BYTES, "0"),
+        (env::KERNELS_DIR, "kernels"),
+        (env::CUDA_GRAPHS, "yes"),
+        (env::DRAFT_TOKENS, "1"),
         (env::MAX_MODEL_LEN, "-1"),
         (env::MAX_SEQS, "0"),
         (env::MAX_BATCHED_TOKENS, "many"),
@@ -671,6 +676,17 @@ fn every_variable_the_node_requires_is_checked() {
             &format!("the node would refuse this env: configuration refused: {name}"),
         );
     }
+
+    // The cpu executor's block count is refused with cuda, not ignored.
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"\n",
+        "      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"\n      - EIDOLA_ENGINE_KV_BLOCKS: \"256\"\n",
+    );
+    refused(
+        &tree,
+        "configuration refused: EIDOLA_ENGINE_KV_BLOCKS applies only to the cpu executor",
+    );
 }
 
 /// A TDX policy the attesting client would refuse when it compiles its pins
@@ -762,6 +778,15 @@ fn a_cuda_deployment_attests_its_gpus() {
     tree.edit_config("    runtime: nvidia\n", "");
     tree.edit_config("    gpus: all\n", "");
     tree.edit_config("EXECUTOR: \"cuda\"", "EXECUTOR: \"cpu\"");
+    tree.edit_config(
+        "      - EIDOLA_ENGINE_KV_DEVICE_BYTES: \"68719476736\"\n",
+        "      - EIDOLA_ENGINE_KV_BLOCKS: \"4096\"\n",
+    );
+    tree.edit_config(
+        "      - EIDOLA_ENGINE_KERNELS_DIR: \"/opt/eidola/kernels\"\n",
+        "",
+    );
+    tree.edit_config("      - EIDOLA_ENGINE_CUDA_GRAPHS: \"on\"\n", "");
     set_expected_gpus(&mut tree, None);
     refused(&tree, "a pinned deployment runs the cuda executor");
 }
@@ -777,9 +802,13 @@ fn allocations_are_capped_and_fit_the_deployment() {
         ("EIDOLA_ENGINE_MAX_PREFILL_CHUNK", "\"4096\"", "\"65537\""),
         ("EIDOLA_ENGINE_MAX_MODEL_LEN", "\"131072\"", "\"1048577\""),
         ("EIDOLA_ENGINE_MAX_REQUESTS", "\"8\"", "\"4097\""),
-        ("EIDOLA_ENGINE_DRAFT_TOKENS", "\"2\"", "\"9\""),
+        ("EIDOLA_ENGINE_DRAFT_TOKENS", "\"0\"", "\"9\""),
         ("EIDOLA_ENGINE_KV_BLOCK_SIZE", "\"16\"", "\"1025\""),
-        ("EIDOLA_ENGINE_KV_BLOCKS", "\"65536\"", "\"2147483648\""),
+        (
+            "EIDOLA_ENGINE_KV_DEVICE_BYTES",
+            "\"68719476736\"",
+            "\"309237645313\"",
+        ),
     ] {
         let mut tree = Tree::fixture();
         tree.edit_config(&format!("{name}: {from}"), &format!("{name}: {to}"));
@@ -795,10 +824,32 @@ fn allocations_are_capped_and_fit_the_deployment() {
     let mut tree = Tree::fixture();
     tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"12\"");
     refused(&tree, "more than the VM's");
-    // Device: 2^30 blocks of 16 positions do not fit eight GPUs.
+    // Device: the KV budget holds one longest sequence and every seat's
+    // sliding windows, each pool with its pad block, at their smallest
+    // (12,228,280,320 bytes for this sizing with the prefix cache).
     let mut tree = Tree::fixture();
-    tree.edit_config("KV_BLOCKS: \"65536\"", "KV_BLOCKS: \"1073741824\"");
-    refused(&tree, "more than 8 GPUs hold");
+    tree.edit_config(
+        "KV_DEVICE_BYTES: \"68719476736\"",
+        "KV_DEVICE_BYTES: \"12228280320\"",
+    );
+    tree.check().expect("the smallest KV budget fits");
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "KV_DEVICE_BYTES: \"68719476736\"",
+        "KV_DEVICE_BYTES: \"12228280319\"",
+    );
+    refused(&tree, "less than the 12228280320 bytes the KV pools need");
+
+    // The kernels ship in the image, never in an attached mount.
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "\"/opt/eidola/kernels\"",
+        "\"/tinfoil/models/weights/kernels\"",
+    );
+    refused(
+        &tree,
+        "EIDOLA_ENGINE_KERNELS_DIR must be a clean absolute path inside the image",
+    );
 }
 
 /// The shim forwards to the port the node listens on, on every interface.
@@ -1126,22 +1177,6 @@ fn the_vm_is_a_launchable_shape() {
         tree.edit_config(from, to);
         refused(&tree, needle);
     }
-}
-
-/// A step that cannot hold one decode row is refused, as the node's
-/// scheduler would refuse it at boot.
-#[test]
-fn a_step_holds_a_decode_row() {
-    let mut tree = Tree::fixture();
-    tree.edit_config("MAX_BATCHED_TOKENS: \"8192\"", "MAX_BATCHED_TOKENS: \"2\"");
-    refused(
-        &tree,
-        "EIDOLA_ENGINE_MAX_BATCHED_TOKENS must exceed EIDOLA_ENGINE_DRAFT_TOKENS",
-    );
-    let mut tree = Tree::fixture();
-    tree.edit_config("MAX_BATCHED_TOKENS: \"8192\"", "MAX_BATCHED_TOKENS: \"3\"");
-    tree.check()
-        .expect("three slots hold a decode row with two drafts");
 }
 
 /// A weights pack states the layout it was built with, one of the known

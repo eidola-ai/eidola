@@ -23,7 +23,7 @@ use eidola_engine_model::attention::rope_cos_sin;
 use eidola_engine_model::config::{AttentionSpec, FfnKind};
 use eidola_engine_model::safetensors::WeightSet;
 
-use crate::attention::{Attention, AttnLayer, AttnPlan};
+use crate::attention::{Attention, AttnLayer, AttnPlan, PlanShape, PlanView};
 use crate::device::ImageArch;
 use crate::engine_ops::{EngineOps, QkvArgs};
 use crate::gemm::{Gemm, GemmArgs, GemmKind};
@@ -92,6 +92,33 @@ pub struct ForwardInput<'a> {
     pub logit_rows: &'a [u32],
 }
 
+/// [`ForwardInput`]'s host values with its plans as shapes: what
+/// [`GpuModel::check_parts`] checks.
+pub(crate) struct InputParts<'a> {
+    pub tokens: &'a [u32],
+    pub positions: &'a [u32],
+    pub kv_targets: &'a [Vec<(u32, u32)>],
+    pub plans: &'a [PlanShape],
+    pub logit_rows: &'a [u32],
+}
+
+/// Where a forward's launches read their per-step values: device
+/// addresses, and the counts that fix the launch shapes.
+pub(crate) struct Indirect {
+    /// Token rows every row-wise launch covers.
+    pub tokens: usize,
+    pub token_ids: u64,
+    pub positions: u64,
+    /// Per group: `tokens` block ids, then `tokens` offsets in the block.
+    pub kv_block: Vec<u64>,
+    pub kv_slot: Vec<u64>,
+    /// Per group: the attention work list.
+    pub plans: Vec<PlanView>,
+    /// `num_logit_rows` token rows whose logits the head computes.
+    pub logit_rows: u64,
+    pub num_logit_rows: usize,
+}
+
 /// Device scratch sized for at most `max_tokens` tokens and `max_logit_rows`
 /// logit rows per forward.
 struct Scratch {
@@ -115,7 +142,6 @@ struct Scratch {
     topk_w: CudaSlice<f32>,
     row_of: CudaSlice<i32>,
     grouped: CudaSlice<i32>,
-    row_src: CudaSlice<i32>,
     ea: CudaSlice<u8>,
     esf: CudaSlice<i32>,
     egu: CudaSlice<u16>,
@@ -378,7 +404,6 @@ impl GpuModel {
             topk_w: s.alloc_zeros(topk)?,
             row_of: s.alloc_zeros(topk)?,
             grouped: s.alloc_zeros(erows.max(experts))?,
-            row_src: s.alloc_zeros(erows)?,
             ea: s.alloc_zeros(eah)?,
             esf: s.alloc_zeros(esf)?,
             egu: s.alloc_zeros(egu)?,
@@ -431,6 +456,11 @@ impl GpuModel {
         self.scratch.max_tokens
     }
 
+    /// KV groups the retained layers use.
+    pub fn num_groups(&self) -> usize {
+        self.layer_kv.iter().map(|l| l.group + 1).max().unwrap_or(0)
+    }
+
     pub fn logits(&self) -> &CudaSlice<f32> {
         &self.scratch.logits
     }
@@ -440,6 +470,22 @@ impl GpuModel {
     /// `kv`'s pools, without touching the device. [`GpuModel::forward`] runs
     /// it first; the executor runs it before a step changes any state.
     pub fn check_input(&self, kv: &KvStore, input: &ForwardInput<'_>) -> Result<()> {
+        let shapes: Vec<PlanShape> = input.plans.iter().map(AttnPlan::shape).collect();
+        self.check_parts(
+            kv,
+            &InputParts {
+                tokens: input.tokens,
+                positions: input.positions,
+                kv_targets: input.kv_targets,
+                plans: &shapes,
+                logit_rows: input.logit_rows,
+            },
+        )
+    }
+
+    /// [`GpuModel::check_input`] over host plans' shapes: what the executor
+    /// checks before a step changes any state, whichever path then runs it.
+    pub(crate) fn check_parts(&self, kv: &KvStore, input: &InputParts<'_>) -> Result<()> {
         let bad = |what: String| Err(CudaError::new(format!("forward input: {what}")));
         let t = input.tokens.len();
         if t > self.scratch.max_tokens || input.logit_rows.len() > self.max_logit_rows {
@@ -472,7 +518,7 @@ impl GpuModel {
             return bad(format!("logit row {r} of {t} tokens"));
         }
         let geometry = kv.geometry();
-        let groups = self.layer_kv.iter().map(|l| l.group + 1).max().unwrap_or(0);
+        let groups = self.num_groups();
         if geometry.len() != groups
             || input.kv_targets.len() != groups
             || input.plans.len() != groups
@@ -515,15 +561,13 @@ impl GpuModel {
                 return bad(format!("group {g}: KV target block {b} offset {o}"));
             }
             let plan = &input.plans[g];
-            if plan.page_size() != geom.block_size
-                || plan.q_rows() as usize != t
-                || plan.max_page().is_some_and(|p| p >= geom.num_blocks)
+            if plan.page_size != geom.block_size
+                || plan.q_rows as usize != t
+                || plan.max_page.is_some_and(|p| p >= geom.num_blocks)
             {
                 return bad(format!(
                     "group {g}: a plan for pages of {} over {} rows reading block {:?}",
-                    plan.page_size(),
-                    plan.q_rows(),
-                    plan.max_page()
+                    plan.page_size, plan.q_rows, plan.max_page
                 ));
             }
         }
@@ -540,6 +584,103 @@ impl GpuModel {
             return Ok(());
         }
         let s = gpu.stream().clone();
+        let sc = &mut self.scratch;
+        let mt = sc.max_tokens;
+
+        // Inputs.
+        s.memcpy_htod(input.tokens, &mut sc.tokens.slice_mut(..t))?;
+        s.memcpy_htod(input.positions, &mut sc.positions.slice_mut(..t))?;
+        for (g, targets) in input.kv_targets.iter().enumerate() {
+            let blocks: Vec<u32> = targets.iter().map(|x| x.0).collect();
+            let slots: Vec<u32> = targets.iter().map(|x| x.1).collect();
+            s.memcpy_htod(&blocks, &mut sc.kv_block.slice_mut(g * mt..g * mt + t))?;
+            s.memcpy_htod(&slots, &mut sc.kv_slot.slice_mut(g * mt..g * mt + t))?;
+        }
+        let n = input.logit_rows.len();
+        if n > 0 {
+            s.memcpy_htod(input.logit_rows, &mut sc.logit_rows.slice_mut(..n))?;
+        }
+        // Padding rows of every M-padded activation stay zero.
+        s.memset_zeros(&mut sc.x)?;
+        s.memset_zeros(&mut sc.h)?;
+
+        let groups = input.kv_targets.len();
+        let src = Indirect {
+            tokens: t,
+            token_ids: dptr(&sc.tokens, &s),
+            positions: dptr(&sc.positions, &s),
+            kv_block: (0..groups)
+                .map(|g| dptr_at(&sc.kv_block, &s, g * mt))
+                .collect(),
+            kv_slot: (0..groups)
+                .map(|g| dptr_at(&sc.kv_slot, &s, g * mt))
+                .collect(),
+            plans: input.plans.iter().map(|p| p.view(gpu)).collect(),
+            logit_rows: dptr(&sc.logit_rows, &s),
+            num_logit_rows: n,
+        };
+        let capture = self.capture_layers;
+        // SAFETY: every address is this model's scratch, just filled with
+        // the checked input, or a plan `check_input` accepted.
+        unsafe { self.launch(gpu, kv, &src, capture) }
+    }
+
+    /// Zero the first `rows` rows (padded to whole groups of four) of the
+    /// M-padded activations the next forward reads past its tokens: what
+    /// [`GpuModel::forward`] does to the whole buffers, over only the rows a
+    /// forward of `rows` tokens reaches.
+    pub(crate) fn zero_padding_rows(&mut self, gpu: &Gpu, rows: usize) -> Result<()> {
+        let s = gpu.stream();
+        let n = round_up(rows, 4)
+            .checked_mul(self.weights.config.hidden_size)
+            .filter(|&n| n <= self.scratch.x.len() && n <= self.scratch.h.len())
+            .ok_or_else(|| CudaError::new(format!("{rows} rows exceed the scratch")))?;
+        s.memset_zeros(&mut self.scratch.x.slice_mut(..n))?;
+        s.memset_zeros(&mut self.scratch.h.slice_mut(..n))?;
+        Ok(())
+    }
+
+    /// The forward's launches, from the embedding to the head, reading every
+    /// per-step value through `src`'s device addresses: nothing here copies
+    /// from the host (unless `capture` asks for the per-layer copies),
+    /// allocates, or reads back, so with fixed addresses and counts the
+    /// sequence can be recorded once and replayed.
+    ///
+    /// # Safety
+    ///
+    /// When the launches run, `src`'s addresses must hold `src.tokens` token
+    /// ids inside the vocabulary, as many positions inside the RoPE tables,
+    /// per group as many KV targets inside the group's pool (pad block
+    /// included), each group's work list over the same rows with pages
+    /// inside the pool, and `src.num_logit_rows` logit rows below
+    /// `src.tokens`; `src.tokens` and `src.num_logit_rows` within the
+    /// scratch.
+    pub(crate) unsafe fn launch(
+        &mut self,
+        gpu: &Gpu,
+        kv: &KvStore,
+        src: &Indirect,
+        capture: bool,
+    ) -> Result<()> {
+        let t = src.tokens;
+        if t == 0 {
+            return Ok(());
+        }
+        if t > self.scratch.max_tokens
+            || src.num_logit_rows > self.max_logit_rows
+            || src.kv_block.len() != self.num_groups()
+            || src.kv_slot.len() != self.num_groups()
+            || src.plans.len() != self.num_groups()
+        {
+            return Err(CudaError::new(format!(
+                "forward launch: {t} tokens, {} logit rows, {} / {} / {} group inputs",
+                src.num_logit_rows,
+                src.kv_block.len(),
+                src.kv_slot.len(),
+                src.plans.len()
+            )));
+        }
+        let s = gpu.stream().clone();
         let c = self.weights.config.clone();
         let h = c.hidden_size;
         let tp = round_up(t, 4);
@@ -554,32 +695,18 @@ impl GpuModel {
         let k = &self.kernels;
         let ops = &k.ops;
 
-        // Inputs.
-        s.memcpy_htod(input.tokens, &mut sc.tokens.slice_mut(..t))?;
-        s.memcpy_htod(input.positions, &mut sc.positions.slice_mut(..t))?;
-        for (g, targets) in input.kv_targets.iter().enumerate() {
-            let blocks: Vec<u32> = targets.iter().map(|x| x.0).collect();
-            let slots: Vec<u32> = targets.iter().map(|x| x.1).collect();
-            let mt = sc.max_tokens;
-            s.memcpy_htod(&blocks, &mut sc.kv_block.slice_mut(g * mt..g * mt + t))?;
-            s.memcpy_htod(&slots, &mut sc.kv_slot.slice_mut(g * mt..g * mt + t))?;
-        }
-        // Padding rows of every M-padded activation stay zero.
-        s.memset_zeros(&mut sc.x)?;
-        s.memset_zeros(&mut sc.h)?;
-
         let p = |b: &CudaSlice<f32>| dptr(b, &s);
         unsafe {
             ops.embed(
                 gpu,
                 p(&sc.h),
                 dptr(&self.weights.embed, &s),
-                dptr(&sc.tokens, &s),
+                src.token_ids,
                 h32,
                 t32,
             )?;
         }
-        if self.capture_layers {
+        if capture {
             self.captured.clear();
         }
         for (li, lw) in self.weights.layers.iter().enumerate() {
@@ -623,16 +750,15 @@ impl GpuModel {
                     .find(|(th, _)| *th == spec.rope_theta)
                     .expect("table per theta")
                     .1;
-                let mt = sc.max_tokens;
                 ops.qkv_rope_kv(
                     gpu,
                     QkvArgs {
                         qkv: dptr(&sc.qkv, &s),
                         q_out: dptr(&sc.q, &s),
                         pool: dptr(kv.pool(lkv.group), &s),
-                        positions: dptr(&sc.positions, &s),
-                        kv_block: dptr_at(&sc.kv_block, &s, lkv.group * mt),
-                        kv_slot: dptr_at(&sc.kv_slot, &s, lkv.group * mt),
+                        positions: src.positions,
+                        kv_block: src.kv_block[lkv.group],
+                        kv_slot: src.kv_slot[lkv.group],
                         rope: dptr(rope, &s),
                         block_elems: geom.block_elems() as u64,
                         k_off: geom.k_offset(lkv.layer_in_group) as u64,
@@ -645,9 +771,9 @@ impl GpuModel {
                     t32,
                 )?;
                 let pool = dptr(kv.pool(lkv.group), &s);
-                k.attention.run(
+                k.attention.run_view(
                     gpu,
-                    &input.plans[lkv.group],
+                    &src.plans[lkv.group],
                     &AttnLayer {
                         k_base: pool + 2 * geom.k_offset(lkv.layer_in_group) as u64,
                         v_base: pool + 2 * geom.v_offset(lkv.layer_in_group) as u64,
@@ -773,7 +899,6 @@ impl GpuModel {
                             gpu,
                             dptr(&sc.grouped, &s),
                             dptr(&sc.row_of, &s),
-                            dptr(&sc.row_src, &s),
                             dptr(&sc.topk_ids, &s),
                             t32,
                             m.top_k,
@@ -785,7 +910,9 @@ impl GpuModel {
                             dptr(&sc.ea, &s),
                             dptr(&sc.esf, &s),
                             p(&sc.x),
-                            dptr(&sc.row_src, &s),
+                            dptr(&sc.row_of, &s),
+                            t32,
+                            m.top_k,
                             rows32,
                             h32,
                             rows4,
@@ -811,6 +938,9 @@ impl GpuModel {
                             dptr(&sc.eact, &s),
                             dptr(&sc.eact_sf, &s),
                             dptr(&sc.egu, &s),
+                            dptr(&sc.row_of, &s),
+                            t32,
+                            m.top_k,
                             rows32,
                             m.inter,
                             rows4,
@@ -844,15 +974,14 @@ impl GpuModel {
                     }
                 }
             }
-            if self.capture_layers {
+            if capture {
                 self.captured.push(s.clone_dtoh(&sc.h.slice(..t * h))?);
             }
         }
         // Head: final norm of the wanted rows, BF16, lm_head (f32 logits).
-        let n = input.logit_rows.len();
+        let n = src.num_logit_rows;
         let n32: u32 = narrow(n, "logit rows")?;
         if n > 0 {
-            s.memcpy_htod(input.logit_rows, &mut sc.logit_rows.slice_mut(..n))?;
             unsafe {
                 ops.rmsnorm(
                     gpu,
@@ -865,14 +994,7 @@ impl GpuModel {
                     eps,
                     t32,
                 )?;
-                ops.gather_rows_bf16(
-                    gpu,
-                    dptr(&sc.sel, &s),
-                    p(&sc.x),
-                    dptr(&sc.logit_rows, &s),
-                    n32,
-                    h32,
-                )?;
+                ops.gather_rows_bf16(gpu, dptr(&sc.sel, &s), p(&sc.x), src.logit_rows, n32, h32)?;
                 k.bf16_gemm.launch(
                     gpu,
                     &GemmArgs {

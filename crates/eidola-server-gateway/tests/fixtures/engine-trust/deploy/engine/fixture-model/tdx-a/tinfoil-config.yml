@@ -1,5 +1,7 @@
 # A synthetic engine deployment, used by the gateway's engine-trust tests.
-# Laid out as a real one is: deploy/engine/<model>/<variant>/.
+# Laid out as a real one is: deploy/engine/<model>/<variant>/. Decode graphs
+# are on, the production setting, so the KV budget here is checked with the
+# pad block each pool keeps for graph replay.
 cvm-version: 0.15.0@sha256:1111111111111111111111111111111111111111111111111111111111111111
 cpus: 16
 memory: 65536
@@ -28,12 +30,14 @@ containers:
       - EIDOLA_ENGINE_EXECUTOR: "cuda"
       - EIDOLA_ENGINE_BIND_ADDR: "0.0.0.0:8080"
       - EIDOLA_ENGINE_KV_BLOCK_SIZE: "16"
-      - EIDOLA_ENGINE_KV_BLOCKS: "65536"
+      - EIDOLA_ENGINE_KV_DEVICE_BYTES: "68719476736"
+      - EIDOLA_ENGINE_KERNELS_DIR: "/opt/eidola/kernels"
+      - EIDOLA_ENGINE_CUDA_GRAPHS: "on"
       - EIDOLA_ENGINE_MAX_MODEL_LEN: "131072"
       - EIDOLA_ENGINE_MAX_SEQS: "64"
       - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "8192"
       - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "4096"
-      - EIDOLA_ENGINE_DRAFT_TOKENS: "2"
+      - EIDOLA_ENGINE_DRAFT_TOKENS: "0"
       - EIDOLA_ENGINE_MAX_REQUESTS: "8"
       - EIDOLA_ENGINE_PREFIX_CACHE: "true"
       - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"

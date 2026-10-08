@@ -3118,6 +3118,7 @@ dependencies = [
  "eidola-engine",
  "eidola-engine-chat",
  "eidola-engine-cpu",
+ "eidola-engine-cuda",
  "eidola-engine-model",
  "flate2",
  "futures-util",

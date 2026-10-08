@@ -172,16 +172,28 @@ pub struct AttnRequest {
 pub struct HostPlan {
     /// The GQA group size and page size it was checked for: upload takes
     /// them from here, never from elsewhere.
-    group_size: u32,
-    page_size: u32,
-    tile: u32,
-    q_indptr: Vec<i32>,
-    indices: Vec<i32>,
-    indptr: Vec<i32>,
-    last_page_len: Vec<i32>,
-    request_indices: Vec<i32>,
-    qo_tile_indices: Vec<i32>,
-    kv_tile_indices: Vec<i32>,
+    pub(crate) group_size: u32,
+    pub(crate) page_size: u32,
+    pub(crate) tile: u32,
+    pub(crate) q_indptr: Vec<i32>,
+    pub(crate) indices: Vec<i32>,
+    pub(crate) indptr: Vec<i32>,
+    pub(crate) last_page_len: Vec<i32>,
+    pub(crate) request_indices: Vec<i32>,
+    pub(crate) qo_tile_indices: Vec<i32>,
+    pub(crate) kv_tile_indices: Vec<i32>,
+}
+
+/// What a forward checks of a plan before launching over it: the geometry it
+/// was made for and the rows and pages it reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanShape {
+    pub page_size: u32,
+    pub group_size: u32,
+    /// Query rows the requests cover.
+    pub q_rows: u32,
+    /// The largest page id listed, if any.
+    pub max_page: Option<u32>,
 }
 
 impl HostPlan {
@@ -262,6 +274,33 @@ impl HostPlan {
     }
 }
 
+impl HostPlan {
+    /// The query tile every work item uses (16, 64 or 128).
+    pub fn tile(&self) -> u32 {
+        self.tile
+    }
+
+    /// Work items (CTAs per KV head): one per (request, query tile).
+    pub fn work_items(&self) -> usize {
+        self.request_indices.len()
+    }
+
+    /// Requests in the plan.
+    pub fn num_requests(&self) -> usize {
+        self.indptr.len() - 1
+    }
+
+    pub fn shape(&self) -> PlanShape {
+        let unsigned = |x: i32| u32::try_from(x).expect("checked by HostPlan::new: indices fit");
+        PlanShape {
+            page_size: self.page_size,
+            group_size: self.group_size,
+            q_rows: unsigned(*self.q_indptr.last().expect("q_indptr starts at 0")),
+            max_page: self.indices.iter().copied().max().map(unsigned),
+        }
+    }
+}
+
 /// The per-step work list for one KV group (shared by all its layers).
 pub struct AttnPlan {
     tile: u32,
@@ -303,6 +342,59 @@ impl AttnPlan {
     pub fn max_page(&self) -> Option<u32> {
         self.max_page
     }
+
+    pub fn shape(&self) -> PlanShape {
+        PlanShape {
+            page_size: self.page_size,
+            group_size: self.group_size,
+            q_rows: self.q_rows,
+            max_page: self.max_page,
+        }
+    }
+
+    /// The plan as the launch reads it: its shape and the device addresses
+    /// of its arrays.
+    pub fn view(&self, gpu: &Gpu) -> PlanView {
+        let s = gpu.stream();
+        PlanView {
+            tile: self.tile,
+            page_size: self.page_size,
+            group_size: self.group_size,
+            work_items: self.work_items,
+            num_requests: self.num_requests,
+            q_indptr: dptr(&self.q_indptr, s),
+            indices: dptr(&self.indices, s),
+            indptr: dptr(&self.indptr, s),
+            last_page_len: dptr(&self.last_page_len, s),
+            request_indices: dptr(&self.request_indices, s),
+            qo_tile_indices: dptr(&self.qo_tile_indices, s),
+            kv_tile_indices: dptr(&self.kv_tile_indices, s),
+            kv_chunk_size: dptr(&self.kv_chunk_size, s),
+        }
+    }
+}
+
+/// A work list as one launch reads it: the launch shape (query tile, work
+/// items, requests) and the device addresses of the arrays the kernel reads
+/// indirectly. Everything a step varies inside a fixed shape lives behind
+/// these addresses, so a launch over a view can be recorded once and
+/// replayed with new array contents. Made by [`AttnPlan::view`] (fresh
+/// buffers per step) or by the decode graphs over their step table.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanView {
+    pub(crate) tile: u32,
+    pub(crate) page_size: u32,
+    pub(crate) group_size: u32,
+    pub(crate) work_items: u32,
+    pub(crate) num_requests: u32,
+    pub(crate) q_indptr: u64,
+    pub(crate) indices: u64,
+    pub(crate) indptr: u64,
+    pub(crate) last_page_len: u64,
+    pub(crate) request_indices: u64,
+    pub(crate) qo_tile_indices: u64,
+    pub(crate) kv_tile_indices: u64,
+    pub(crate) kv_chunk_size: u64,
 }
 
 /// One layer's KV and attention settings.
@@ -425,6 +517,25 @@ impl Attention {
         q: u64,
         o: u64,
     ) -> Result<()> {
+        // SAFETY: the caller's contract, over the plan's own buffers.
+        unsafe { self.run_view(gpu, &plan.view(gpu), layer, num_qo_heads, q, o) }
+    }
+
+    /// [`Attention::run`] over a [`PlanView`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Attention::run`], and the view's addresses must hold a work list
+    /// [`HostPlan::new`] accepted for the view's shape when the launch runs.
+    pub(crate) unsafe fn run_view(
+        &self,
+        gpu: &Gpu,
+        plan: &PlanView,
+        layer: &AttnLayer,
+        num_qo_heads: u32,
+        q: u64,
+        o: u64,
+    ) -> Result<()> {
         if plan.work_items == 0 {
             return Ok(());
         }
@@ -472,12 +583,12 @@ impl Attention {
                 v_stride_h: HEAD_DIM_VO,
                 k_data: layer.k_base,
                 v_data: layer.v_base,
-                indices: dptr(&plan.indices, s),
-                indptr: dptr(&plan.indptr, s),
-                last_page_len: dptr(&plan.last_page_len, s),
+                indices: plan.indices,
+                indptr: plan.indptr,
+                last_page_len: plan.last_page_len,
                 rope_pos_offset: 0,
             },
-            q_indptr: dptr(&plan.q_indptr, s),
+            q_indptr: plan.q_indptr,
             o,
             lse: 0,
             group_size: UintFastdiv::new(num_qo_heads / h),
@@ -487,11 +598,11 @@ impl Attention {
             q_stride_n: narrow(num_qo_heads as u64 * HEAD_DIM_QK as u64, "query row stride")?,
             q_stride_h: narrow(HEAD_DIM_QK, "query head stride")?,
             window_left: layer.window_left,
-            request_indices: dptr(&plan.request_indices, s),
-            qo_tile_indices: dptr(&plan.qo_tile_indices, s),
-            kv_tile_indices: dptr(&plan.kv_tile_indices, s),
-            o_indptr: dptr(&plan.q_indptr, s),
-            kv_chunk_size_ptr: dptr(&plan.kv_chunk_size, s),
+            request_indices: plan.request_indices,
+            qo_tile_indices: plan.qo_tile_indices,
+            kv_tile_indices: plan.kv_tile_indices,
+            o_indptr: plan.q_indptr,
+            kv_chunk_size_ptr: plan.kv_chunk_size,
             padded_batch_size: plan.work_items,
             partition_kv: false,
             ..PagedParams::default()

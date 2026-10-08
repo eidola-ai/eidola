@@ -19,7 +19,7 @@ use common::setup;
 use eidola_engine::executor::{Executor, Maintenance, SeqEntry, StepInput, TableUpdate};
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, Gpu, ImageArch, KvBlocks};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, ImageArch, KvBlocks};
 use eidola_engine_model::compare::compare_logits;
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
@@ -90,6 +90,7 @@ fn executor(
         }],
         sampleable_vocab_size: SAMPLEABLE,
         image: Some(arch),
+        graphs: CudaGraphs::Off,
     };
     CudaExecutor::new(gpu, dir, store, layers().as_deref(), cfg).unwrap()
 }

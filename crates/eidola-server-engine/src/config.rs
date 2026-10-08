@@ -2,14 +2,16 @@
 //!
 //! Every value here would sit in the node's measured configuration, so none has a
 //! default: a missing or malformed variable refuses the boot rather than letting code
-//! choose a value the measurement does not show. The one secret (the gateway token) is
+//! choose a value the measurement does not show. What the node derives (the CUDA
+//! executor's per-group KV block counts) it derives from measured values alone, by a
+//! fixed rule, never from the device it finds. The one secret (the gateway token) is
 //! delivered as an environment variable alongside its Argon2id hash, which is the
 //! measured half (see [`crate::auth`]).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use eidola_common::engine_deployment::Executor;
+use eidola_common::engine_deployment::ExecutorSettings;
 
 use crate::auth::GatewayToken;
 
@@ -23,10 +25,41 @@ pub use eidola_common::engine_deployment::{CacheConfig, Sizing, WeightsStorage, 
 pub enum ExecutorKind {
     /// The f32 reference executor (`eidola-engine-cpu`).
     Cpu,
-    /// The CUDA executor. Parses only in a build with the `cuda` feature; the executor
-    /// itself lands separately, and until then boot refuses it.
+    /// The CUDA executor (`eidola-engine-cuda`). Parses only in a build with the `cuda`
+    /// feature.
     #[cfg(feature = "cuda")]
     Cuda,
+}
+
+/// The executor and the settings only it takes. A setting of the other executor is
+/// refused rather than ignored, so the measured configuration never shows a value that
+/// does nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorConfig {
+    Cpu {
+        /// Physical blocks per KV group, including the null block.
+        kv_blocks: u32,
+    },
+    #[cfg(feature = "cuda")]
+    Cuda {
+        /// The kernel build output (images checked against the compiled-in manifest).
+        kernels_dir: PathBuf,
+        /// Device memory for the KV pools; the node derives the per-group block counts
+        /// from it (`crate::cuda::derive_kv_blocks`).
+        kv_device_bytes: u64,
+        /// Whether decode steps replay captured graphs.
+        graphs: eidola_engine_cuda::CudaGraphs,
+    },
+}
+
+impl ExecutorConfig {
+    pub fn kind(&self) -> ExecutorKind {
+        match self {
+            ExecutorConfig::Cpu { .. } => ExecutorKind::Cpu,
+            #[cfg(feature = "cuda")]
+            ExecutorConfig::Cuda { .. } => ExecutorKind::Cuda,
+        }
+    }
 }
 
 impl ExecutorKind {
@@ -36,18 +69,6 @@ impl ExecutorKind {
             ExecutorKind::Cpu => "cpu",
             #[cfg(feature = "cuda")]
             ExecutorKind::Cuda => "cuda",
-        }
-    }
-
-    fn from_measured(executor: Executor) -> Result<Self, String> {
-        match executor {
-            Executor::Cpu => Ok(ExecutorKind::Cpu),
-            #[cfg(feature = "cuda")]
-            Executor::Cuda => Ok(ExecutorKind::Cuda),
-            #[cfg(not(feature = "cuda"))]
-            Executor::Cuda => {
-                Err("this build has no cuda executor (built without the `cuda` feature)".into())
-            }
         }
     }
 }
@@ -61,7 +82,7 @@ pub struct Config {
     pub expected_weights_sha256: String,
     pub weights_storage: WeightsStorage,
     pub gateway_token: GatewayToken,
-    pub executor: ExecutorKind,
+    pub executor: ExecutorConfig,
     pub bind_addr: SocketAddr,
     pub sizing: Sizing,
     pub cache: CacheConfig,
@@ -89,6 +110,12 @@ impl Config {
     /// Reads configuration through `lookup` (the environment, or a map in tests). An
     /// empty value counts as missing.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        // A build without the CUDA executor says so, rather than naming whichever cuda
+        // setting it would otherwise find missing.
+        #[cfg(not(feature = "cuda"))]
+        if lookup(env::EXECUTOR).as_deref() == Some("cuda") {
+            return Err(no_cuda_executor());
+        }
         let measured = eidola_common::engine_deployment::parse_measured(&lookup)
             .map_err(|e| ConfigError(e.0))?;
         let token = lookup(env::GATEWAY_TOKEN)
@@ -96,8 +123,28 @@ impl Config {
             .ok_or_else(|| ConfigError(format!("{} is not set", env::GATEWAY_TOKEN)))?;
         let gateway_token =
             GatewayToken::verify(token, &measured.gateway_token_hash).map_err(ConfigError)?;
-        let executor = ExecutorKind::from_measured(measured.executor)
-            .map_err(|e| ConfigError(format!("{}: {e}", env::EXECUTOR)))?;
+        let executor = match measured.executor {
+            ExecutorSettings::Cpu { kv_blocks } => ExecutorConfig::Cpu { kv_blocks },
+            #[cfg(feature = "cuda")]
+            ExecutorSettings::Cuda {
+                kernels_dir,
+                kv_device_bytes,
+                graphs,
+            } => ExecutorConfig::Cuda {
+                kernels_dir: PathBuf::from(kernels_dir),
+                kv_device_bytes,
+                graphs: match graphs {
+                    eidola_common::engine_deployment::CudaGraphs::On => {
+                        eidola_engine_cuda::CudaGraphs::On
+                    }
+                    eidola_common::engine_deployment::CudaGraphs::Off => {
+                        eidola_engine_cuda::CudaGraphs::Off
+                    }
+                },
+            },
+            #[cfg(not(feature = "cuda"))]
+            ExecutorSettings::Cuda { .. } => return Err(no_cuda_executor()),
+        };
 
         Ok(Config {
             model_id: measured.model_id,
@@ -113,9 +160,11 @@ impl Config {
     }
 }
 
-/// Whether `s` is 64 lowercase hex digits.
-pub fn is_sha256_hex(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+/// The refusal of a build without the CUDA executor.
+#[cfg(not(feature = "cuda"))]
+fn no_cuda_executor() -> ConfigError {
+    ConfigError(format!(
+        "{}: this build has no cuda executor (built without the `cuda` feature)",
+        env::EXECUTOR
+    ))
 }

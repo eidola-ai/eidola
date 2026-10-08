@@ -41,8 +41,18 @@ pub mod env {
     pub const BIND_ADDR: &str = "EIDOLA_ENGINE_BIND_ADDR";
     /// Positions per KV block.
     pub const KV_BLOCK_SIZE: &str = "EIDOLA_ENGINE_KV_BLOCK_SIZE";
-    /// Physical KV blocks per group, including the reserved null block.
+    /// Physical KV blocks per group, including the reserved null block
+    /// (`cpu` only).
     pub const KV_BLOCKS: &str = "EIDOLA_ENGINE_KV_BLOCKS";
+    /// Device memory for the KV pools, in bytes; the node derives the
+    /// per-group block counts from it (`cuda` only).
+    pub const KV_DEVICE_BYTES: &str = "EIDOLA_ENGINE_KV_DEVICE_BYTES";
+    /// The kernel build output the CUDA executor loads its images from, each
+    /// checked against the compiled-in kernel manifest (`cuda` only).
+    pub const KERNELS_DIR: &str = "EIDOLA_ENGINE_KERNELS_DIR";
+    /// Whether the CUDA executor replays captured graphs for decode steps:
+    /// `on` or `off` (`cuda` only).
+    pub const CUDA_GRAPHS: &str = "EIDOLA_ENGINE_CUDA_GRAPHS";
     /// Longest sequence (prompt plus completion), in tokens.
     pub const MAX_MODEL_LEN: &str = "EIDOLA_ENGINE_MAX_MODEL_LEN";
     /// Sequences per step (and per-sequence state slots).
@@ -77,6 +87,9 @@ pub mod env {
         BIND_ADDR,
         KV_BLOCK_SIZE,
         KV_BLOCKS,
+        KV_DEVICE_BYTES,
+        KERNELS_DIR,
+        CUDA_GRAPHS,
         MAX_MODEL_LEN,
         MAX_SEQS,
         MAX_BATCHED_TOKENS,
@@ -111,7 +124,11 @@ pub mod caps {
     /// prefix cache's unit of reuse; beyond 1,024 positions paging stops
     /// paying, and the page stride (32-bit) stays far from overflow.
     pub const KV_BLOCK_SIZE: u32 = 1024;
-    /// Blocks per KV group: the device block tables are `i32`
+    /// Device memory for the CUDA executor's KV pools: one GPU's, at most
+    /// ([`super::MAX_GPU_MEMORY_BYTES`]); the node also refuses a value not
+    /// less than its device's memory.
+    pub const KV_DEVICE_BYTES: u64 = super::MAX_GPU_MEMORY_BYTES;
+    /// Blocks per KV group (the `cpu` executor's): the device block tables are `i32`
     /// (`kv::GroupGeometry::validate`). The device bytes they cost are held
     /// to the attached GPUs separately ([`super::check_resources`]).
     pub const KV_BLOCKS: u32 = i32::MAX as u32;
@@ -138,6 +155,21 @@ pub mod caps {
 /// (`eidola-engine-cuda` `support`): 9 global layers of 4 KV heads and 39
 /// sliding layers of 8, each head 192 K + 128 V dims, in bf16.
 pub const KV_BYTES_PER_POSITION: u64 = (9 * 4 + 39 * 8) * (192 + 128) * 2;
+
+/// KV-cache bytes per position of MiMo-V2.6-Flash's global layers: 9 layers
+/// of 4 KV heads, 192 K + 128 V dims, bf16.
+pub const GLOBAL_KV_BYTES_PER_POSITION: u64 = 9 * 4 * (192 + 128) * 2;
+
+/// KV-cache bytes per position of MiMo-V2.6-Flash's sliding layers: 39
+/// layers of 8 KV heads, 192 K + 128 V dims, bf16.
+pub const SLIDING_KV_BYTES_PER_POSITION: u64 = 39 * 8 * (192 + 128) * 2;
+
+/// Positions a sliding layer sees (`eidola-engine-cuda` `support::WINDOW`).
+pub const SLIDING_WINDOW: u64 = 128;
+
+/// Retention points a keyed sequence may hold per sliding group with the
+/// prefix cache enabled (the node's `cuda::RETENTION_POINTS`).
+pub const RETENTION_POINTS: u64 = 3;
 
 /// Largest memory of one confidential GPU the platform offers, in bytes: the
 /// largest NVIDIA-CC part's HBM, rounded up (288 GiB).
@@ -190,27 +222,89 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
     read_pool + admission_pool + tables + PROCESS_HEADROOM_BYTES
 }
 
+/// The fewest bytes of device memory the CUDA executor's KV pools need: the
+/// node's own derivation (`cuda::derive_kv_blocks` in `eidola-server-engine`)
+/// at its smallest. With `B` = `KV_BLOCK_SIZE`,
+/// `R` = ⌈([`SLIDING_WINDOW`] − 1) / `B`⌉ + 1, and `P` =
+/// [`RETENTION_POINTS`] with the prefix cache (else 0):
+///
+/// - the **sliding** pool: 1 + `MAX_SEQS` × ((1 + `P`) × `R` + 1) +
+///   ⌈`MAX_BATCHED_TOKENS` / `B`⌉ blocks;
+/// - the **global** pool: one `MAX_MODEL_LEN` sequence and the null block,
+///   ⌈`MAX_MODEL_LEN` / `B`⌉ + 1 blocks;
+///
+/// each pool one pad block more (where a replayed decode graph's padding rows
+/// write), each block `B` positions of [`SLIDING_KV_BYTES_PER_POSITION`] or
+/// [`GLOBAL_KV_BYTES_PER_POSITION`]. Saturates rather than wraps.
+pub fn cuda_kv_min_bytes(sizing: &Sizing, cache: &CacheConfig) -> u64 {
+    let b = u64::from(sizing.kv_block_size.max(1));
+    let points = if cache.enabled { RETENTION_POINTS } else { 0 };
+    let window_blocks = (SLIDING_WINDOW - 1).div_ceil(b) + 1;
+    let sliding_blocks = u64::from(sizing.max_seqs)
+        .saturating_mul((1 + points).saturating_mul(window_blocks).saturating_add(1))
+        .saturating_add(1 + u64::from(sizing.max_batched_tokens).div_ceil(b));
+    let global_blocks = u64::from(sizing.max_model_len).div_ceil(b) + 1;
+    let pool = |blocks: u64, per_position: u64| {
+        blocks
+            .saturating_add(1)
+            .saturating_mul(b)
+            .saturating_mul(per_position)
+    };
+    pool(sliding_blocks, SLIDING_KV_BYTES_PER_POSITION)
+        .saturating_add(pool(global_blocks, GLOBAL_KV_BYTES_PER_POSITION))
+}
+
 /// Whether the deployment's VM and GPUs hold what its configuration
-/// allocates, as far as configuration alone fixes it: host memory (`memory`,
-/// MiB) holds [`host_memory_bytes`], and GPU memory (`gpus` ×
-/// [`MAX_GPU_MEMORY_BYTES`]) holds the KV cache (`KV_BLOCKS` ×
-/// `KV_BLOCK_SIZE` × [`KV_BYTES_PER_POSITION`]). The weights' own footprint is
-/// the model's and is not estimated here.
-pub fn check_resources(sizing: &Sizing, memory_mib: u64, gpus: u64) -> Result<(), String> {
-    let host = host_memory_bytes(sizing);
-    let host_limit = memory_mib << 20;
+/// allocates, as far as configuration alone fixes it. Host memory (`memory`,
+/// MiB) holds [`host_memory_bytes`], plus, for the `cpu` executor, its KV
+/// cache (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`KV_BYTES_PER_POSITION`]). For the
+/// `cuda` executor, which runs on one GPU, `KV_DEVICE_BYTES` holds at least
+/// [`cuda_kv_min_bytes`] and at most one GPU's [`MAX_GPU_MEMORY_BYTES`], and
+/// the VM has a GPU. The weights' own footprint is the model's and is not
+/// estimated here.
+pub fn check_resources(
+    sizing: &Sizing,
+    cache: &CacheConfig,
+    executor: &ExecutorSettings,
+    memory_mib: u64,
+    gpus: u64,
+) -> Result<(), String> {
+    let host_kv = match executor {
+        ExecutorSettings::Cpu { kv_blocks } => u64::from(*kv_blocks)
+            .saturating_mul(u64::from(sizing.kv_block_size))
+            .saturating_mul(KV_BYTES_PER_POSITION),
+        ExecutorSettings::Cuda { .. } => 0,
+    };
+    let host = host_memory_bytes(sizing).saturating_add(host_kv);
+    let host_limit = memory_mib.saturating_mul(1 << 20);
     if host > host_limit {
         return Err(format!(
-            "the node's request pools, block tables and headroom need {host} bytes, more than \
-             the VM's {host_limit} (memory)"
+            "the node's request pools, block tables, host KV and headroom need {host} bytes, \
+             more than the VM's {host_limit} (memory)"
         ));
     }
-    let kv = u64::from(sizing.kv_blocks) * u64::from(sizing.kv_block_size) * KV_BYTES_PER_POSITION;
-    let device_limit = gpus * MAX_GPU_MEMORY_BYTES;
-    if kv > device_limit {
-        return Err(format!(
-            "the KV cache needs {kv} bytes, more than {gpus} GPUs hold ({device_limit})"
-        ));
+    if let ExecutorSettings::Cuda {
+        kv_device_bytes, ..
+    } = executor
+    {
+        if gpus == 0 {
+            return Err("the cuda executor needs a GPU, and the VM has none".into());
+        }
+        let needed = cuda_kv_min_bytes(sizing, cache);
+        if *kv_device_bytes < needed {
+            return Err(format!(
+                "{} ({kv_device_bytes}) is less than the {needed} bytes the KV pools need at \
+                 their smallest (one {} sequence, every seat's sliding window, pad blocks)",
+                env::KV_DEVICE_BYTES,
+                env::MAX_MODEL_LEN
+            ));
+        }
+        if *kv_device_bytes > MAX_GPU_MEMORY_BYTES {
+            return Err(format!(
+                "{} ({kv_device_bytes}) is more than one GPU holds ({MAX_GPU_MEMORY_BYTES})",
+                env::KV_DEVICE_BYTES
+            ));
+        }
     }
     Ok(())
 }
@@ -279,7 +373,6 @@ impl WeightsStorage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sizing {
     pub kv_block_size: u32,
-    pub kv_blocks: u32,
     pub max_model_len: u32,
     pub max_seqs: u32,
     pub max_batched_tokens: u32,
@@ -296,6 +389,54 @@ pub struct CacheConfig {
     pub max_age_secs: u64,
 }
 
+/// Whether the CUDA executor replays captured graphs for decode steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CudaGraphs {
+    /// Every step runs eagerly.
+    Off,
+    /// Pure-decode steps replay graphs captured at boot.
+    On,
+}
+
+/// The executor and the settings only it takes. A setting of the other
+/// executor is refused rather than ignored, so the measured configuration
+/// never shows a value that does nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorSettings {
+    Cpu {
+        /// Physical blocks per KV group, including the null block.
+        kv_blocks: u32,
+    },
+    Cuda {
+        /// The kernel build output: an absolute, clean path.
+        kernels_dir: String,
+        /// Device memory for the KV pools, in bytes.
+        kv_device_bytes: u64,
+        graphs: CudaGraphs,
+    },
+}
+
+impl ExecutorSettings {
+    /// Which executor these settings are for.
+    pub fn kind(&self) -> Executor {
+        match self {
+            ExecutorSettings::Cpu { .. } => Executor::Cpu,
+            ExecutorSettings::Cuda { .. } => Executor::Cuda,
+        }
+    }
+}
+
+/// Whether `path` is absolute and clean: no empty, `.` or `..` component,
+/// and not `/` itself.
+pub fn is_clean_absolute_path(path: &str) -> bool {
+    path.strip_prefix('/').is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .split('/')
+                .all(|c| !c.is_empty() && c != "." && c != "..")
+    })
+}
+
 /// A node's measured configuration: every variable of its environment except
 /// the secret gateway token, parsed and validated.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,7 +448,7 @@ pub struct MeasuredConfig {
     pub weights_storage: WeightsStorage,
     /// A validated Argon2id PHC string.
     pub gateway_token_hash: String,
-    pub executor: Executor,
+    pub executor: ExecutorSettings,
     pub bind_addr: core::net::SocketAddr,
     pub sizing: Sizing,
     pub cache: CacheConfig,
@@ -393,7 +534,7 @@ pub fn parse_measured(
     let gateway_token_hash = get(env::GATEWAY_TOKEN_HASH)?;
     parse_gateway_token_hash(&gateway_token_hash)
         .map_err(|e| ConfigError(format!("{}: {e}", env::GATEWAY_TOKEN_HASH)))?;
-    let executor = match get(env::EXECUTOR)?.as_str() {
+    let kind = match get(env::EXECUTOR)?.as_str() {
         "cpu" => Executor::Cpu,
         "cuda" => Executor::Cuda,
         _ => {
@@ -403,13 +544,85 @@ pub fn parse_measured(
             )));
         }
     };
+    // Each executor's own settings are required with it and refused without
+    // it.
+    let refuse_unless = |name: &str, executor: &str| -> Result<(), ConfigError> {
+        match lookup(name) {
+            Some(v) if !v.is_empty() => Err(ConfigError(format!(
+                "{name} applies only to the {executor} executor"
+            ))),
+            _ => Ok(()),
+        }
+    };
+    let executor = match kind {
+        Executor::Cpu => {
+            refuse_unless(env::KV_DEVICE_BYTES, "cuda")?;
+            refuse_unless(env::KERNELS_DIR, "cuda")?;
+            refuse_unless(env::CUDA_GRAPHS, "cuda")?;
+            let kv_blocks = positive(env::KV_BLOCKS)?;
+            if kv_blocks < 2 {
+                return Err(ConfigError(format!(
+                    "{} must be at least 2 (block 0 is reserved)",
+                    env::KV_BLOCKS
+                )));
+            }
+            if kv_blocks > caps::KV_BLOCKS {
+                return Err(ConfigError(format!(
+                    "{} must be at most {}",
+                    env::KV_BLOCKS,
+                    caps::KV_BLOCKS
+                )));
+            }
+            ExecutorSettings::Cpu { kv_blocks }
+        }
+        Executor::Cuda => {
+            refuse_unless(env::KV_BLOCKS, "cpu")?;
+            let kv_device_bytes = match get(env::KV_DEVICE_BYTES)?.parse::<u64>() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    return Err(ConfigError(format!(
+                        "{} must be a positive number of bytes",
+                        env::KV_DEVICE_BYTES
+                    )));
+                }
+            };
+            if kv_device_bytes > caps::KV_DEVICE_BYTES {
+                return Err(ConfigError(format!(
+                    "{} must be at most {}",
+                    env::KV_DEVICE_BYTES,
+                    caps::KV_DEVICE_BYTES
+                )));
+            }
+            let kernels_dir = get(env::KERNELS_DIR)?;
+            if !is_clean_absolute_path(&kernels_dir) {
+                return Err(ConfigError(format!(
+                    "{} must be an absolute path with no empty, `.` or `..` component",
+                    env::KERNELS_DIR
+                )));
+            }
+            let graphs = match get(env::CUDA_GRAPHS)?.as_str() {
+                "on" => CudaGraphs::On,
+                "off" => CudaGraphs::Off,
+                _ => {
+                    return Err(ConfigError(format!(
+                        "{}: expected `on` or `off`",
+                        env::CUDA_GRAPHS
+                    )));
+                }
+            };
+            ExecutorSettings::Cuda {
+                kernels_dir,
+                kv_device_bytes,
+                graphs,
+            }
+        }
+    };
     let bind_addr = get(env::BIND_ADDR)?
         .parse::<core::net::SocketAddr>()
         .map_err(|_| ConfigError(format!("{} must be host:port", env::BIND_ADDR)))?;
 
     let sizing = Sizing {
         kv_block_size: positive(env::KV_BLOCK_SIZE)?,
-        kv_blocks: positive(env::KV_BLOCKS)?,
         max_model_len: positive(env::MAX_MODEL_LEN)?,
         max_seqs: positive(env::MAX_SEQS)?,
         max_batched_tokens: positive(env::MAX_BATCHED_TOKENS)?,
@@ -433,7 +646,6 @@ pub fn parse_measured(
             sizing.kv_block_size,
             caps::KV_BLOCK_SIZE,
         ),
-        (env::KV_BLOCKS, sizing.kv_blocks, caps::KV_BLOCKS),
         (
             env::MAX_MODEL_LEN,
             sizing.max_model_len,
@@ -465,10 +677,12 @@ pub fn parse_measured(
             env::DRAFT_TOKENS
         )));
     }
-    if sizing.kv_blocks < 2 {
+    // The CUDA executor does not draft yet: a draft width with it is refused
+    // rather than ignored.
+    if kind == Executor::Cuda && sizing.draft_tokens != 0 {
         return Err(ConfigError(format!(
-            "{} must be at least 2 (block 0 is reserved)",
-            env::KV_BLOCKS
+            "{} must be 0 with the cuda executor (it does not draft)",
+            env::DRAFT_TOKENS
         )));
     }
 
@@ -573,6 +787,26 @@ pub fn check_secrets<'a>(secrets: impl IntoIterator<Item = &'a str>) -> Result<(
 /// `/tinfoil/models/<name>`, in the granted containers only (cvmimage
 /// `docs/runtime-policy.md`; `ContainerModelsDir` in its boot paths).
 pub const MODEL_MOUNT_ROOT: &str = "/tinfoil/models";
+
+/// Where Tinfoil mounts what the deployment attaches (model packs and the
+/// like) inside the container.
+pub const TINFOIL_MOUNT_ROOT: &str = "/tinfoil";
+
+/// Whether `kernels_dir` (`EIDOLA_ENGINE_KERNELS_DIR`) names a directory of
+/// the measured image: the kernels the CUDA executor loads ship in the image
+/// the deployment pins, never in an attached mount.
+pub fn check_kernels_dir(kernels_dir: &str) -> Result<(), String> {
+    let under_mount = kernels_dir
+        .strip_prefix(TINFOIL_MOUNT_ROOT)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+    if under_mount || !is_clean_absolute_path(kernels_dir) {
+        return Err(format!(
+            "{} must be a clean absolute path inside the image, not under {TINFOIL_MOUNT_ROOT}",
+            env::KERNELS_DIR
+        ));
+    }
+    Ok(())
+}
 
 /// Whether `mpk` is a modelwrap artifact reference, `rootHash_hashOffset_uuid`
 /// (tinfoilsh/modelwrap `modelwrap.go` `ParseRef` at e61ae511): a 64-hex
@@ -994,51 +1228,119 @@ mod tests {
         }
     }
 
+    fn cuda(kv_device_bytes: u64) -> ExecutorSettings {
+        ExecutorSettings::Cuda {
+            kernels_dir: "/opt/eidola/kernels".into(),
+            kv_device_bytes,
+            graphs: CudaGraphs::On,
+        }
+    }
+
     #[test]
     fn resources_fit_the_vm_and_gpus() {
         let sizing = Sizing {
             kv_block_size: 16,
-            kv_blocks: 65_536,
             max_model_len: 131_072,
             max_seqs: 64,
             max_batched_tokens: 8192,
             max_prefill_chunk: 4096,
-            draft_tokens: 2,
+            draft_tokens: 0,
             max_requests: 8,
         };
-        assert!(check_resources(&sizing, 65_536, 8).is_ok());
+        let cache = CacheConfig {
+            enabled: true,
+            idle_ttl_secs: 900,
+            max_age_secs: 3600,
+        };
+        let kv = cuda(64 << 30);
+        assert!(check_resources(&sizing, &cache, &kv, 65_536, 8).is_ok());
         // Each slot can hold 32 MiB × (129 read + 42 admitted) ≈ 5.3 GiB at
         // worst; eight of them and the headroom exceed 32 GiB.
-        assert!(check_resources(&sizing, 32_768, 8).is_err());
+        assert!(check_resources(&sizing, &cache, &kv, 32_768, 8).is_err());
         // Near the limit: eleven slots (60,192 MiB of pools, plus headroom
         // and tables) fit 64 GiB; twelve (65,664 MiB of pools alone) do not.
         let near = |n| Sizing {
             max_requests: n,
             ..sizing
         };
-        assert!(check_resources(&near(11), 65_536, 8).is_ok());
-        assert!(check_resources(&near(12), 65_536, 8).is_err());
-        assert!(
-            check_resources(
-                &Sizing {
-                    kv_blocks: 1 << 30,
-                    ..sizing
-                },
-                65_536,
-                8
-            )
-            .is_err()
-        );
-        assert!(check_resources(&sizing, 65_536, 0).is_err());
+        assert!(check_resources(&near(11), &cache, &kv, 65_536, 8).is_ok());
+        assert!(check_resources(&near(12), &cache, &kv, 65_536, 8).is_err());
+        // The cuda executor needs a GPU.
+        assert!(check_resources(&sizing, &cache, &kv, 65_536, 0).is_err());
         // Block size 1 at the longest model length: 2^20 entries per slot.
         let tables = Sizing {
             kv_block_size: 1,
             max_model_len: caps::MAX_MODEL_LEN,
             max_seqs: caps::MAX_SEQS,
-            kv_blocks: 2,
             ..sizing
         };
-        assert!(check_resources(&tables, 16_384, 8).is_err());
+        assert!(check_resources(&tables, &cache, &cuda(caps::KV_DEVICE_BYTES), 16_384, 8).is_err());
+        // The cpu executor's KV is host memory: 2^20 blocks of 16 positions
+        // are 3.4 TiB.
+        let cpu = |kv_blocks| ExecutorSettings::Cpu { kv_blocks };
+        assert!(check_resources(&sizing, &cache, &cpu(1024), 65_536, 0).is_ok());
+        assert!(check_resources(&sizing, &cache, &cpu(1 << 20), 65_536, 0).is_err());
+    }
+
+    #[test]
+    fn kv_device_bytes_hold_the_pools_at_their_smallest() {
+        let sizing = Sizing {
+            kv_block_size: 16,
+            max_model_len: 131_072,
+            max_seqs: 64,
+            max_batched_tokens: 8192,
+            max_prefill_chunk: 4096,
+            draft_tokens: 0,
+            max_requests: 8,
+        };
+        let cache = |enabled| CacheConfig {
+            enabled,
+            idle_ttl_secs: 900,
+            max_age_secs: 3600,
+        };
+        // Sliding: R = ⌈127/16⌉ + 1 = 9; 1 + 64 × (4 × 9 + 1) + 512 = 2,881
+        // blocks, one pad more, × 16 × 199,680. Global: 8,192 + 1 blocks,
+        // one pad more, × 16 × 23,040.
+        assert_eq!(cuda_kv_min_bytes(&sizing, &cache(true)), 12_228_280_320);
+        // Without the cache, no retained windows: 1 + 64 × 10 + 512 = 1,153.
+        assert_eq!(cuda_kv_min_bytes(&sizing, &cache(false)), 6_707_527_680);
+        let min = cuda_kv_min_bytes(&sizing, &cache(true));
+        let fits = |bytes| check_resources(&sizing, &cache(true), &cuda(bytes), 65_536, 1);
+        assert!(fits(min).is_ok());
+        assert!(fits(min - 1).is_err());
+        assert!(fits(MAX_GPU_MEMORY_BYTES).is_ok());
+        assert!(fits(MAX_GPU_MEMORY_BYTES + 1).is_err());
+        // Eight GPUs do not widen one node's device: it runs on one.
+        assert!(
+            check_resources(
+                &sizing,
+                &cache(true),
+                &cuda(MAX_GPU_MEMORY_BYTES + 1),
+                65_536,
+                8
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kernels_come_from_the_image() {
+        assert!(check_kernels_dir("/opt/eidola/kernels").is_ok());
+        assert!(check_kernels_dir("/tinfoilx/kernels").is_ok());
+        for bad in [
+            "/tinfoil",
+            "/tinfoil/models/weights/kernels",
+            "/tinfoil/kernels",
+            "/",
+            "",
+            "kernels",
+            "/opt/../tinfoil/kernels",
+            "/opt//kernels",
+            "/opt/./kernels",
+            "/opt/kernels/",
+        ] {
+            assert!(check_kernels_dir(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -1302,6 +1604,174 @@ mod tests {
         ] {
             assert_eq!(parse_cvm_version(&bad), Err(error), "{bad:?}");
         }
+    }
+
+    #[cfg(feature = "argon2")]
+    fn cuda_env() -> std::collections::BTreeMap<&'static str, String> {
+        [
+            (env::MODEL_ID, "m"),
+            (env::WEIGHTS_DIR, "/tinfoil/models/weights"),
+            (env::WEIGHTS_SHA256, &"ab".repeat(32)),
+            (env::WEIGHTS_STORAGE, "verified-readonly"),
+            (
+                env::GATEWAY_TOKEN_HASH,
+                "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$unNYT/KTNSNW0JCH9+9OQ2zBApPLxGNZiw746903Q8E",
+            ),
+            (env::EXECUTOR, "cuda"),
+            (env::BIND_ADDR, "0.0.0.0:8080"),
+            (env::KV_BLOCK_SIZE, "16"),
+            (env::KV_DEVICE_BYTES, "68719476736"),
+            (env::KERNELS_DIR, "/opt/eidola/kernels"),
+            (env::CUDA_GRAPHS, "on"),
+            (env::MAX_MODEL_LEN, "131072"),
+            (env::MAX_SEQS, "64"),
+            (env::MAX_BATCHED_TOKENS, "8192"),
+            (env::MAX_PREFILL_CHUNK, "4096"),
+            (env::DRAFT_TOKENS, "0"),
+            (env::MAX_REQUESTS, "8"),
+            (env::PREFIX_CACHE, "true"),
+            (env::CACHE_IDLE_TTL_SECS, "900"),
+            (env::CACHE_MAX_AGE_SECS, "3600"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k, v.to_string()))
+        .collect()
+    }
+
+    #[cfg(feature = "argon2")]
+    fn parse_map(
+        map: &std::collections::BTreeMap<&'static str, String>,
+    ) -> Result<MeasuredConfig, String> {
+        parse_measured(&|name| map.get(name).cloned()).map_err(|e| e.0)
+    }
+
+    #[cfg(feature = "argon2")]
+    #[test]
+    fn each_executor_takes_its_own_settings_and_refuses_the_others() {
+        let cuda = cuda_env();
+        assert_eq!(
+            parse_map(&cuda).unwrap().executor,
+            ExecutorSettings::Cuda {
+                kernels_dir: "/opt/eidola/kernels".into(),
+                kv_device_bytes: 64 << 30,
+                graphs: CudaGraphs::On,
+            }
+        );
+        // Every cuda setting is required with cuda.
+        for name in [env::KV_DEVICE_BYTES, env::KERNELS_DIR, env::CUDA_GRAPHS] {
+            let mut map = cuda.clone();
+            map.remove(name);
+            assert!(parse_map(&map).unwrap_err().contains(name), "{name}");
+        }
+        // The cpu executor's block count is refused with cuda, not ignored.
+        let mut map = cuda.clone();
+        map.insert(env::KV_BLOCKS, "256".into());
+        let err = parse_map(&map).unwrap_err();
+        assert!(err.contains(env::KV_BLOCKS) && err.contains("cpu"), "{err}");
+        // So is a draft width: the cuda executor does not draft.
+        let mut map = cuda.clone();
+        map.insert(env::DRAFT_TOKENS, "1".into());
+        let err = parse_map(&map).unwrap_err();
+        assert!(err.contains(env::DRAFT_TOKENS), "{err}");
+
+        // The cpu executor: its block count required, every cuda setting refused.
+        let mut cpu = cuda.clone();
+        cpu.insert(env::EXECUTOR, "cpu".into());
+        for name in [env::KV_DEVICE_BYTES, env::KERNELS_DIR, env::CUDA_GRAPHS] {
+            cpu.remove(name);
+        }
+        cpu.insert(env::KV_BLOCKS, "256".into());
+        cpu.insert(env::DRAFT_TOKENS, "2".into());
+        assert_eq!(
+            parse_map(&cpu).unwrap().executor,
+            ExecutorSettings::Cpu { kv_blocks: 256 }
+        );
+        for name in [env::KV_DEVICE_BYTES, env::KERNELS_DIR, env::CUDA_GRAPHS] {
+            let mut map = cpu.clone();
+            map.insert(name, cuda[name].clone());
+            let err = parse_map(&map).unwrap_err();
+            assert!(err.contains(name) && err.contains("cuda"), "{err}");
+        }
+        let mut map = cpu.clone();
+        map.remove(env::KV_BLOCKS);
+        assert!(parse_map(&map).unwrap_err().contains(env::KV_BLOCKS));
+        for bad in ["1", "0", &(u64::from(caps::KV_BLOCKS) + 1).to_string()] {
+            let mut map = cpu.clone();
+            map.insert(env::KV_BLOCKS, bad.into());
+            assert!(
+                parse_map(&map).unwrap_err().contains(env::KV_BLOCKS),
+                "{bad}"
+            );
+        }
+    }
+
+    /// A step that cannot hold one decode row is refused, as the node's
+    /// scheduler would refuse it at boot (drafting is the cpu executor's).
+    #[cfg(feature = "argon2")]
+    #[test]
+    fn a_step_holds_a_decode_row() {
+        let mut cpu = cuda_env();
+        cpu.insert(env::EXECUTOR, "cpu".into());
+        for name in [env::KV_DEVICE_BYTES, env::KERNELS_DIR, env::CUDA_GRAPHS] {
+            cpu.remove(name);
+        }
+        cpu.insert(env::KV_BLOCKS, "256".into());
+        cpu.insert(env::DRAFT_TOKENS, "2".into());
+        cpu.insert(env::MAX_BATCHED_TOKENS, "2".into());
+        cpu.insert(env::MAX_PREFILL_CHUNK, "2".into());
+        let err = parse_map(&cpu).unwrap_err();
+        assert!(
+            err.contains("EIDOLA_ENGINE_MAX_BATCHED_TOKENS must exceed EIDOLA_ENGINE_DRAFT_TOKENS"),
+            "{err}"
+        );
+        cpu.insert(env::MAX_BATCHED_TOKENS, "3".into());
+        parse_map(&cpu).expect("three slots hold a decode row with two drafts");
+    }
+
+    #[cfg(feature = "argon2")]
+    #[test]
+    fn the_cuda_settings_are_exact() {
+        let cuda = cuda_env();
+        let refused = |name: &'static str, value: &str| {
+            let mut map = cuda.clone();
+            map.insert(name, value.into());
+            parse_map(&map).unwrap_err().contains(name)
+        };
+        for bad in [
+            "0",
+            "-1",
+            "8GiB",
+            " 1024",
+            "18446744073709551616",
+            &(caps::KV_DEVICE_BYTES + 1).to_string(),
+        ] {
+            assert!(refused(env::KV_DEVICE_BYTES, bad), "{bad:?}");
+        }
+        for bad in [
+            "kernels",
+            "/",
+            "/opt/../kernels",
+            "/opt/./kernels",
+            "/opt//kernels",
+            "/opt/kernels/",
+        ] {
+            assert!(refused(env::KERNELS_DIR, bad), "{bad:?}");
+        }
+        for bad in ["ON", "true", "1", "auto", "on "] {
+            assert!(refused(env::CUDA_GRAPHS, bad), "{bad:?}");
+        }
+        let mut off = cuda.clone();
+        off.insert(env::CUDA_GRAPHS, "off".into());
+        assert!(matches!(
+            parse_map(&off).unwrap().executor,
+            ExecutorSettings::Cuda {
+                graphs: CudaGraphs::Off,
+                ..
+            }
+        ));
+        let mut most = cuda.clone();
+        most.insert(env::KV_DEVICE_BYTES, caps::KV_DEVICE_BYTES.to_string());
+        assert!(parse_map(&most).is_ok());
     }
 
     #[cfg(feature = "argon2")]

@@ -46,6 +46,21 @@ impl SampleRow {
     }
 }
 
+/// One `eidola_sample` launch over device addresses (see
+/// [`Sampler::launch_sample`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SampleLaunch {
+    pub logits: u64,
+    pub logits_stride: u64,
+    pub n: u32,
+    pub rows: u64,
+    pub num_rows: u32,
+    pub draw: Option<Stream>,
+    pub probs: u64,
+    pub tokens: u64,
+    pub status: u64,
+}
+
 /// The status bit a row with NaN, `+inf` or (when not greedy) only `-inf`
 /// logits sets.
 pub const STATUS_NON_FINITE: u32 = 1;
@@ -116,22 +131,58 @@ impl Sampler {
         }
         let s = gpu.stream();
         s.memcpy_htod(rows, &mut rows_dev.slice_mut(..r))?;
-        let stream = draw.map_or(u32::MAX, |d| d as u32);
-        // SAFETY: arguments match `eidola_sample`; buffers and every row's
-        // logit row checked above, and `rows_dev` holds exactly those rows.
+        // SAFETY: buffers and every row's logit row checked above, and
+        // `rows_dev` holds exactly those rows.
+        unsafe {
+            self.launch_sample(
+                gpu,
+                SampleLaunch {
+                    logits: dptr(logits, s),
+                    logits_stride: logits_stride as u64,
+                    n,
+                    rows: dptr(rows_dev, s),
+                    num_rows,
+                    draw,
+                    probs: dptr(probs, s),
+                    tokens: dptr(tokens, s),
+                    status: dptr(status, s),
+                },
+            )
+        }
+    }
+
+    /// The `eidola_sample` launch alone, over rows already on the device.
+    ///
+    /// # Safety
+    ///
+    /// `a.rows` must hold `a.num_rows` rows whose logit rows lie inside
+    /// `a.logits` (rows of `a.logits_stride` floats, `a.n` of them read), and
+    /// `a.probs`, `a.tokens` and `a.status` must hold `num_rows * n`,
+    /// `num_rows` and one value, when the launch runs. `n` must be in
+    /// `1..=2^20` and at most the stride.
+    pub(crate) unsafe fn launch_sample(&self, gpu: &Gpu, a: SampleLaunch) -> Result<()> {
+        if a.num_rows == 0 {
+            return Ok(());
+        }
+        if a.n == 0 || u64::from(a.n) > a.logits_stride || a.n > 1 << 20 {
+            return Err(CudaError::new(format!("sample: vocabulary {}", a.n)));
+        }
+        let stream = a.draw.map_or(u32::MAX, |d| d as u32);
+        // SAFETY: arguments match `eidola_sample`; the caller's contract
+        // covers every address.
         unsafe {
             launch!(
                 gpu,
                 self.sample,
-                [num_rows, 1, 1],
-                dptr(logits, s),
-                logits_stride as u64,
-                n,
-                dptr(rows_dev, s),
+                [a.num_rows, 1, 1],
+                a.logits,
+                a.logits_stride,
+                a.n,
+                a.rows,
                 stream,
-                dptr(probs, s),
-                dptr(tokens, s),
-                dptr(status, s),
+                a.probs,
+                a.tokens,
+                a.status,
             )
         }
     }

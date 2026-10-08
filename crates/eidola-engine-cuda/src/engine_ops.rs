@@ -224,12 +224,18 @@ impl EngineOps {
         }
     }
 
+    /// SwiGLU + UE8M0 quantization of the expert layout's routed rows: the
+    /// `tokens * top_k` rows `row_of` names, in a layout of `rows` rows.
+    /// Padding rows are left as they are.
     pub unsafe fn swiglu_quant_ue8m0(
         &self,
         gpu: &Gpu,
         q: u64,
         sf: u64,
         gu: u64,
+        row_of: u64,
+        tokens: u32,
+        top_k: u32,
         rows: u32,
         inter: u32,
         rows4: u32,
@@ -239,17 +245,19 @@ impl EngineOps {
             inter > 0 && inter.is_multiple_of(512) && sfa_layout_ok(rows, rows4, cap),
             "swiglu (UE8M0): intermediate must be whole 512-wide words and the scale layout cover the rows",
         )?;
-        if rows == 0 {
+        let grid = pair_grid(tokens, top_k, inter, rows)?;
+        if grid[0] == 0 {
             return Ok(());
         }
         unsafe {
             launch!(
                 gpu,
                 self.swiglu_ue8m0,
-                [rows, inter / 512, 1],
+                grid,
                 q,
                 sf,
                 gu,
+                row_of,
                 inter,
                 rows4,
                 cap
@@ -272,22 +280,23 @@ impl EngineOps {
         scaling: f32,
     ) -> Result<()> {
         require(
-            hidden > 0
+            (1..=ROUTER_MAX_HIDDEN).contains(&hidden)
                 && (1..=crate::support::EXPERTS).contains(&(experts as usize))
                 && (2..=crate::support::MAX_TOP_K).contains(&(top_k as usize))
                 && top_k <= experts,
             // The kernel always renormalizes the selection; the reference does
             // not for a single expert, so one expert per token is not served.
-            "router: at most 256 experts and 2..=8 per token",
+            "router: hidden at most 4096, at most 256 experts and 2..=8 per token",
         )?;
-        if tokens == 0 {
+        let grid = router_grid(tokens)?;
+        if grid[0] == 0 {
             return Ok(());
         }
         unsafe {
             launch!(
                 gpu,
                 self.router,
-                [tokens, 1, 1],
+                grid,
                 ids,
                 weights,
                 x,
@@ -306,7 +315,6 @@ impl EngineOps {
         gpu: &Gpu,
         grouped_layout: u64,
         row_of: u64,
-        row_src: u64,
         topk_ids: u64,
         tokens: u32,
         top_k: u32,
@@ -329,7 +337,6 @@ impl EngineOps {
                 [1, 1, 1],
                 grouped_layout,
                 row_of,
-                row_src,
                 topk_ids,
                 tokens,
                 top_k,
@@ -339,13 +346,18 @@ impl EngineOps {
         }
     }
 
+    /// FP8 + UE8M0 quantization of each routed (token, slot) pair's token
+    /// row into the row `row_of` names, in a layout of `rows` rows. Padding
+    /// rows are left as they are.
     pub unsafe fn gather_quant_ue8m0(
         &self,
         gpu: &Gpu,
         a: u64,
         sf: u64,
         x: u64,
-        row_src: u64,
+        row_of: u64,
+        tokens: u32,
+        top_k: u32,
         rows: u32,
         k: u32,
         rows4: u32,
@@ -355,18 +367,20 @@ impl EngineOps {
             k > 0 && k.is_multiple_of(512) && sfa_layout_ok(rows, rows4, cap),
             "gather_quant: K must be whole 512-wide words and the scale layout cover the rows",
         )?;
-        if rows == 0 {
+        let grid = pair_grid(tokens, top_k, k, rows)?;
+        if grid[0] == 0 {
             return Ok(());
         }
         unsafe {
             launch!(
                 gpu,
                 self.gather_quant,
-                [rows, k / 512, 1],
+                grid,
                 a,
                 sf,
                 x,
-                row_src,
+                row_of,
+                top_k,
                 k,
                 rows4,
                 cap
@@ -424,6 +438,49 @@ impl EngineOps {
     }
 }
 
+/// The driver's grid limit in x.
+const MAX_GRID_X: u32 = (1 << 31) - 1;
+
+/// Blocks per token of `eidola_router_topk`: its cluster size (the kernel's
+/// launch contract records it, and the launch sets it from there).
+pub const ROUTER_CLUSTER: u32 = 8;
+/// Threads per block of `eidola_router_topk`: one warp per expert.
+pub const ROUTER_THREADS: u32 = 1024;
+/// The widest row the router stages in shared memory.
+pub const ROUTER_MAX_HIDDEN: u32 = 4096;
+
+/// The router's grid: one cluster of [`ROUTER_CLUSTER`] blocks per token.
+pub fn router_grid(tokens: u32) -> Result<[u32; 3]> {
+    let blocks = tokens
+        .checked_mul(ROUTER_CLUSTER)
+        .filter(|&b| b <= MAX_GRID_X)
+        .ok_or_else(|| crate::CudaError::new("router: too many tokens for one launch"))?;
+    Ok([blocks, 1, 1])
+}
+
+/// The grid of the pair-indexed expert kernels (gather, SwiGLU): one block
+/// per routed (token, slot) pair and 512-wide word of `width`. Every pair
+/// lands in its own row, so the layout's `rows` must hold them all.
+pub fn pair_grid(tokens: u32, top_k: u32, width: u32, rows: u32) -> Result<[u32; 3]> {
+    require(
+        (1..=crate::support::MAX_TOP_K).contains(&(top_k as usize)),
+        "expert rows: 1..=8 experts per token",
+    )?;
+    require(
+        width > 0 && width.is_multiple_of(512) && width / 512 <= 65_535,
+        "expert rows: width must be whole 512-wide words",
+    )?;
+    let pairs = tokens
+        .checked_mul(top_k)
+        .filter(|&p| p <= MAX_GRID_X)
+        .ok_or_else(|| crate::CudaError::new("expert rows: too many pairs for one launch"))?;
+    require(
+        pairs <= rows,
+        "expert rows: the layout holds fewer rows than pairs",
+    )?;
+    Ok([pairs, width / 512, 1])
+}
+
 fn require(ok: bool, what: &str) -> Result<()> {
     if ok {
         Ok(())
@@ -439,5 +496,72 @@ fn sfa_layout_ok(rows: u32, rows4: u32, cap: u32) -> bool {
         rows4 >= rows && rows4.is_multiple_of(4)
     } else {
         rows.is_multiple_of(cap) && cap.is_multiple_of(4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One cluster per token: the grid is the token count times the cluster,
+    /// a whole number of clusters, and a function of the token count alone
+    /// (a decode graph's rung).
+    #[test]
+    fn router_grid_is_one_cluster_per_token() {
+        for tokens in [0u32, 1, 2, 7, 64, 128, 513, 8192] {
+            let g = router_grid(tokens).unwrap();
+            assert_eq!(g, [tokens * ROUTER_CLUSTER, 1, 1], "{tokens}");
+            assert!(g[0].is_multiple_of(ROUTER_CLUSTER));
+            assert_eq!(g[0] / ROUTER_CLUSTER, tokens);
+        }
+        assert_eq!(
+            ROUTER_THREADS / 32 * ROUTER_CLUSTER,
+            256,
+            "one warp per expert"
+        );
+        assert!(router_grid(u32::MAX / ROUTER_CLUSTER + 1).is_err());
+        assert!(router_grid((1 << 31) / ROUTER_CLUSTER).is_err());
+        assert!(router_grid((1 << 31) / ROUTER_CLUSTER - 1).is_ok());
+    }
+
+    /// One block per routed pair and 512-wide word, whatever the layout's
+    /// row count: decode launches scale with the tokens, not the experts'
+    /// capacity.
+    #[test]
+    fn pair_grid_is_one_block_per_pair_and_word() {
+        let masked_rows = 256 * 128;
+        for tokens in [1u32, 2, 7, 64, 128] {
+            assert_eq!(
+                pair_grid(tokens, 8, 4096, masked_rows).unwrap(),
+                [tokens * 8, 8, 1],
+                "gather, {tokens} tokens"
+            );
+            assert_eq!(
+                pair_grid(tokens, 8, 2048, masked_rows).unwrap(),
+                [tokens * 8, 4, 1],
+                "swiglu, {tokens} tokens"
+            );
+        }
+        // Contiguous layouts hold every pair plus padding.
+        for tokens in [129u32, 513, 8192] {
+            let n = (tokens * 8) as usize;
+            let rows = u32::try_from((n + n.min(256) * 127).div_ceil(128) * 128).unwrap();
+            assert_eq!(
+                pair_grid(tokens, 8, 4096, rows).unwrap(),
+                [tokens * 8, 8, 1]
+            );
+        }
+        assert_eq!(pair_grid(0, 8, 4096, 0).unwrap(), [0, 8, 1]);
+        assert!(pair_grid(2, 8, 4096, 15).is_err(), "more pairs than rows");
+        assert!(pair_grid(2, 8, 4096, 16).is_ok());
+        assert!(pair_grid(1, 0, 4096, 8).is_err(), "top_k 0");
+        assert!(pair_grid(1, 9, 4096, 9).is_err(), "top_k 9");
+        assert!(pair_grid(1, 8, 1000, 8).is_err(), "not whole words");
+        assert!(pair_grid(1, 8, 0, 8).is_err(), "no words");
+        assert!(pair_grid(u32::MAX / 8 + 1, 8, 4096, u32::MAX).is_err());
+        assert!(
+            pair_grid(1 << 28, 8, 4096, u32::MAX).is_err(),
+            "past the grid"
+        );
     }
 }

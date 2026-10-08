@@ -19,9 +19,10 @@ use std::collections::BTreeMap;
 use serde_json::Value as Json;
 
 use super::{
-    Executor, MeasuredConfig, ModelPack, WeightsStorage, check_container_gpu_access,
-    check_env_names, check_gpu_attestation, check_resources, check_secrets, check_shim_paths,
-    check_vm_resources, check_weights_pack, env, parse_cvm_version, parse_measured,
+    ExecutorSettings, MeasuredConfig, ModelPack, WeightsStorage, check_container_gpu_access,
+    check_env_names, check_gpu_attestation, check_kernels_dir, check_resources, check_secrets,
+    check_shim_paths, check_vm_resources, check_weights_pack, env, parse_cvm_version,
+    parse_measured,
 };
 
 /// The image every engine deployment runs, pinned by digest.
@@ -74,12 +75,13 @@ pub fn check_deployment(
     // A pinned deployment runs the CUDA executor: the CPU executor is the
     // numerics reference and the development path, and nothing confidential
     // ships on it.
-    if measured.executor != Executor::Cuda {
+    let ExecutorSettings::Cuda { kernels_dir, .. } = &measured.executor else {
         return Err(format!(
             "{at}: a pinned deployment runs the cuda executor; cpu is the reference and \
              development path"
         ));
-    }
+    };
+    check_kernels_dir(kernels_dir).map_err(|e| format!("{at}: {e}"))?;
     if measured.model_id != model_id {
         return Err(format!(
             "{at}: EIDOLA_ENGINE_MODEL_ID is {:?}, but the deployment is for {model_id:?}",
@@ -136,18 +138,24 @@ pub fn check_deployment(
     .map_err(|e| format!("{at}: {e}"))?;
 
     // GPUs: attested exactly, and the container's access matching its executor.
-    check_gpu_attestation(measured.executor, c.gpus, side.expected_gpus)
+    check_gpu_attestation(measured.executor.kind(), c.gpus, side.expected_gpus)
         .map_err(|e| format!("{at}: {e}"))?;
     check_container_gpu_access(
-        measured.executor,
+        measured.executor.kind(),
         c.runtime.as_deref(),
         c.container_gpus.as_deref(),
     )
     .map_err(|e| format!("{at}: {e}"))?;
 
     // What the node allocates fits the VM and the GPUs it attaches.
-    check_resources(&measured.sizing, c.memory, c.gpus.unwrap_or(0))
-        .map_err(|e| format!("{at}: {e}"))?;
+    check_resources(
+        &measured.sizing,
+        &measured.cache,
+        &measured.executor,
+        c.memory,
+        c.gpus.unwrap_or(0),
+    )
+    .map_err(|e| format!("{at}: {e}"))?;
 
     Ok(Deployment {
         cvm_version: c.cvm_version,

@@ -7,6 +7,7 @@ The engine's GPU kernels, compiled ahead of time from open source on a GPU-less 
 | Path | What |
 |---|---|
 | `csrc/*.cu`, `csrc/eidola_kernel.cuh` | Our translation units: one per kernel family, each instantiating upstream templates (or our own code) and exposing entry points |
+| `csrc/engine_ops_common.cuh` | Helpers `engine_ops.cu` and `engine_ops_reference.cu` share (conversions, warp reductions, the UE8M0 recipe, the packed scale layout) |
 | `csrc/kernels.json` | The build matrix: kernels, target archs, flag profiles, and the `meta_aliases` binding mangled entries to their launch-contract records. The single place a kernel is added |
 | `nix/default.nix` | The derivation: pinned nixpkgs, CUDA 13.2, unfree allow-list, inputs → `$out/{cubin,fatbin,inspect,manifest.json}` |
 | `nix/sources.nix` | Upstream pins (commit + NAR hash) |
@@ -44,11 +45,30 @@ Never, in this crate or anything it feeds:
 | Paged attention, learned sinks, sliding window, head dims 192/128, BF16; query tiles 16/64/128 + split-KV merge | FlashInfer FA2 prefill template + `AttentionSink` | `eidola_fa2_sink_paged_bf16_q{16,64,128}`, mangled `PersistentVariableLengthMergeStatesKernel<…>` | `mma.sync` (`HMMA`), no tcgen05 |
 | Sampling (filters, inverse-CDF draw) and chain speculative acceptance | ours (`sampling.cu`) | `eidola_sample`, `eidola_chain_accept` | none |
 | The executor's glue: embedding, RMSNorm, FP8 activation quantization (f32-scale and UE8M0 recipes), fused-QKV RoPE + paged KV write, SwiGLU + quantization, router top-k, expert placement, gather, combine | ours (`engine_ops.cu`) | 13 `eidola_*` entries | none |
+| Reference forms of the router, the UE8M0 gather and the UE8M0 SwiGLU, for the GPU tests and the kernel bench only (the executor never loads them) | ours (`engine_ops_reference.cu`) | `eidola_reference_{router_topk,gather_quant_ue8m0,swiglu_quant_fp8_ue8m0}` | none |
 | RMSNorm, BF16 | ours | `eidola_rmsnorm_bf16` | none |
 
 **Sampling never comes from upstream.** The serving core (`eidola-engine/src/sampling.rs`) defines what a sample is: draws from a SplitMix-based counter RNG keyed by `(seed, position, stream)`, with separate streams for target samples, drafts, speculative acceptance and the residual, its own filtering, CDF walk and chain acceptance, and pinned `f64` arithmetic (its own `exp`, sums in a fixed chunked order). Recompute preemption and the CPU oracle depend on those exact draws. FlashInfer's sampling kernels draw from Philox with a caller-supplied seed and offset and cannot reproduce them. `sampling.cu` performs the core's operations in the core's grouping with explicit round-to-nearest intrinsics (nvcc never contracts those into FMAs; the `DFMA`s in its SASS belong to the correctly rounded division routine), so it returns the same probabilities and tokens bit for bit given equal logits; `eidola-engine-cuda`'s `tests/sampler.rs` checks every probability and token against the core on both device images.
 
 Every kernel is built for all three targets; each fatbin bundles the `sm_100a` and `sm_103a` cubins so the driver picks the exact match. Instantiation choices (tile shapes, stages, thread counts) mirror what the upstream host dispatchers pick for these shapes; each source file explains its own.
+
+### The expert path's kernels
+
+At one decode row these launch per MoE layer, so their geometry is chosen for small token counts first; every launch's shape is a function of the token count alone (a decode graph's rung). Flash: hidden 4096, 256 experts, top 8, expert intermediate 2048.
+
+| Entry | What | Geometry |
+|---|---|---|
+| `eidola_router_topk` | Logits `x · Wᵀ` (BF16 weights, f32), sigmoid scores, top-k of score + bias with ties to the lower id, ids ascending, renormalized weights | One cluster of 8 blocks per token (grid `8T`, cluster attribute from the launch contract), 1024 threads: one warp per expert, the token's row staged in shared memory (hidden ≤ 4096). Rank 0's first warp reads the 256 choices through distributed shared memory and selects with warp shuffles |
+| `eidola_moe_permute` | Expert-major placement: `row_of` per (token, slot) pair and the grouped layout | One block, a thread per expert |
+| `eidola_gather_quant_ue8m0` | Each pair's token row, FP8 with UE8M0 scales, into the row `row_of` names | Grid (pairs, K/512), 4 warps: one block per pair and 512-wide word |
+| `eidola_swiglu_quant_fp8_ue8m0` | SwiGLU of each routed row of the gate/up GEMM output, FP8 with UE8M0 scales | Grid (pairs, I/512), 4 warps |
+
+**The numerics are the reference forms'**, bit for bit; the geometry only moves where the arithmetic runs:
+
+- **Router.** A logit is lane `l`'s sequential fused multiply-add over `i = l, l + 32, …` in ascending order, then the xor butterfly over the warp, then `1 / (1 + expf(-x))`; the selection takes, per round, the untaken expert a scan in expert order keeping the first strictly greater choice would take. Under the order (choice greater, or equal and lower id) that is the maximum over non-NaN choices, unless the lowest untaken expert's choice is NaN, in which case that expert; the warp computes exactly that, and the order is total, so the shuffle tree cannot change the result. The weight sum runs over the selection in ascending id order, as before. The reference form ran 32 experts per warp on one block per token, its dot products bound by one load round trip per eight elements, and the selection on one thread.
+- **Gather and SwiGLU** compute each routed row exactly as the per-row reference does. They do not touch the layout's padding rows: the reference forms launched over every row of the layout (256 × 128 rows in the masked layout whatever the token count), zero-filling them in the gather. The grouped GEMMs compute each output row from its own A row and scales only, and the combine reads only the rows `row_of` names, so a padding row's contents reach nothing the executor uses.
+
+`eidola-engine-cuda`'s `tests/moe_ops.rs` checks the three against the reference image bit for bit from 1 to 8,192 tokens (ties, NaN and infinite choices, scale-range extremes), and its `moe_kernel_bench` example times both forms per token count.
 
 `tests/manifest.rs` holds the SASS facts above as assertions on the manifest, so a source or toolkit change that silently drops a GEMM off tcgen05 fails `cargo test`.
 

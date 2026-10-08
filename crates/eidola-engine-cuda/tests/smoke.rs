@@ -24,8 +24,8 @@ fn setup() -> Option<(Gpu, KernelDir)> {
 /// instances included) and its launch contract reads back, from the exact
 /// cubin, the family cubin and the fatbin. The contracts also pin the
 /// device-side requirements `check_device` holds: the largest launch's shared
-/// memory is exactly `REQUIRED_SMEM_PER_BLOCK`, and only DeepGEMM's
-/// instances (the MoE path) launch clusters.
+/// memory is exactly `REQUIRED_SMEM_PER_BLOCK`, and only the expert path
+/// launches clusters (DeepGEMM's instances and the router).
 #[test]
 fn every_entry_and_contract_resolves() {
     use eidola_engine_cuda::support::REQUIRED_SMEM_PER_BLOCK;
@@ -48,7 +48,13 @@ fn every_entry_and_contract_resolves() {
                     largest = (smem, entry.symbol.clone());
                 }
                 if meta.cluster != [1, 1, 1] {
-                    assert_eq!(fatbin.name, "deepgemm_fp8_fp4_grouped", "{}", entry.symbol);
+                    assert!(
+                        fatbin.name == "deepgemm_fp8_fp4_grouped"
+                            || (fatbin.name == "engine_ops"
+                                && entry.symbol == "eidola_router_topk"),
+                        "{}",
+                        entry.symbol
+                    );
                 }
             }
         }
