@@ -36,7 +36,10 @@ fn filled(su: &common::Setup, store: &mut KvStore, rng: &mut Lcg) -> Vec<Vec<Vec
         let mut blocks = Vec::new();
         for b in 0..store.geometry()[g].num_blocks {
             let data: Vec<u16> = (0..store.geometry()[g].block_elems())
-                .map(|_| (rng.next_u64() as u16) | 1)
+                .map(|_| {
+                    let r = rng.next_u64().to_le_bytes();
+                    u16::from_le_bytes([r[0], r[1]]) | 1
+                })
                 .collect();
             store.write_block(&su.gpu, g, b, &data).unwrap();
             blocks.push(data);
@@ -80,7 +83,10 @@ fn zero_and_copy_touch_exactly_their_blocks() {
     for (g, blocks) in want.iter().enumerate() {
         for (b, data) in blocks.iter().enumerate() {
             assert!(
-                store.read_block(&su.gpu, g, b as u32).unwrap() == *data,
+                store
+                    .read_block(&su.gpu, g, u32::try_from(b).unwrap())
+                    .unwrap()
+                    == *data,
                 "group {g} block {b}"
             );
         }
@@ -110,7 +116,7 @@ fn reset_slot_empties_tables_and_scrubs_only_that_slot() {
         for g in 0..2 {
             let row = store.read_table_row(&su.gpu, slot, g).unwrap();
             let mut want = vec![0i32; 8];
-            want[slot as usize] = 1 + slot as i32;
+            want[slot as usize] = 1 + i32::try_from(slot).unwrap();
             assert_eq!(row, want);
         }
     }

@@ -23,6 +23,7 @@ const KEEP: [usize; 4] = [0, 1, 2, 5];
 const BS: u32 = 16;
 const SAMPLEABLE: u32 = 151_675;
 const VOCAB: usize = 152_576;
+const VOCAB32: u32 = 152_576;
 
 fn row(slot: u32, start: u32, context: u32, n: u32, sample: bool) -> SeqEntry {
     SeqEntry {
@@ -70,7 +71,7 @@ fn map(slot: u32, first: u32, blocks: &[u32]) -> Vec<TableUpdate> {
                 .map(move |(i, &block)| TableUpdate {
                     slot,
                     group,
-                    index: first + i as u32,
+                    index: first + u32::try_from(i).unwrap(),
                     block,
                 })
         })
@@ -256,11 +257,19 @@ fn seam_contract_on_the_truncated_checkpoint() {
         "positions disagree"
     );
     let mut bad_token = malformed();
-    bad_token.token_ids[1] = VOCAB as u32;
+    bad_token.token_ids[1] = VOCAB32;
     assert!(
         ex.execute(&bad_token).is_err(),
         "token outside the vocabulary"
     );
+    // A bucket outside the configured ladder, even a larger one.
+    let mut bad_bucket = malformed();
+    bad_bucket.bucket = Bucket {
+        max_seqs: 8,
+        max_tokens: 256,
+    };
+    let e = ex.execute(&bad_bucket).unwrap_err();
+    assert!(e.to_string().contains("not one of the configured"), "{e}");
     for g in 0..2 {
         assert_eq!(
             ex.kv().table(3, g),
@@ -283,7 +292,7 @@ fn seam_contract_on_the_truncated_checkpoint() {
     let plans: Vec<_> = (0..2)
         .map(|g| {
             ex.model()
-                .kernels
+                .kernels()
                 .attention
                 .plan(
                     ex.gpu(),
@@ -321,7 +330,7 @@ fn seam_contract_on_the_truncated_checkpoint() {
         (input(&[5], &[0], &[u32::MAX]), "logit row"),
         (input(&[5], &[0], &[1]), "logit row"),
         (input(&[5], &[1 << 20], &[0]), "position"),
-        (input(&[VOCAB as u32], &[0], &[0]), "vocabulary"),
+        (input(&[VOCAB32], &[0], &[0]), "vocabulary"),
         (input(&[5, 6], &[0, 1], &[0]), "KV targets"),
     ] {
         let e = check(bad, &targets).unwrap_err();

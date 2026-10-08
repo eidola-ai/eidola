@@ -78,7 +78,11 @@ fn ids(v: &Value) -> Vec<u32> {
     v.as_array()
         .unwrap()
         .iter()
-        .map(|x| x.as_u64().unwrap() as u32)
+        .map(|x| {
+            x.as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .unwrap_or_else(|| panic!("token id {x} is not a u32"))
+        })
         .collect()
 }
 
@@ -109,13 +113,13 @@ fn executor(kernels: &str, model: &str, max_tokens: u32, max_seqs: u32) -> (Cuda
                 max_tokens,
             },
         ],
-        sampleable_vocab_size: tok.vocab_size() as u32,
+        sampleable_vocab_size: u32::try_from(tok.vocab_size()).unwrap(),
         image: None,
     };
     let t0 = Instant::now();
     let ex = CudaExecutor::new(gpu, &dir, store, None, cfg).unwrap();
     eprintln!("executor loaded in {:.1?}", t0.elapsed());
-    (ex, tok.vocab_size() as u32)
+    (ex, u32::try_from(tok.vocab_size()).unwrap())
 }
 
 fn render(model: &str, tasks: &str, out: &str) {
@@ -217,12 +221,17 @@ fn log_softmax(row: &[f32], n: usize) -> Vec<f32> {
             .map(|&v| (v as f64 - max).exp())
             .sum::<f64>()
             .ln();
+    // Log-probabilities are kept at f32, the precision the logits had.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f64 log-probabilities stored as f32"
+    )]
     row.iter().map(|&v| (v as f64 - lse) as f32).collect()
 }
 
 /// Top-`TOP` (id, log-probability) of one log-probability row.
 fn top(lp: &[f32]) -> Vec<(u32, f64)> {
-    let mut idx: Vec<u32> = (0..lp.len() as u32).collect();
+    let mut idx: Vec<u32> = (0..u32::try_from(lp.len()).unwrap()).collect();
     // One total order (log-probability descending, then id ascending) for
     // both the cut and the sort: which of several tied tokens make the list
     // never depends on the selection algorithm.
@@ -343,10 +352,7 @@ fn logprobs(
                     (Vec::new(), Vec::new())
                 };
                 let step = StepInput {
-                    bucket: Bucket {
-                        max_seqs: 4,
-                        max_tokens: STEP_TOKENS,
-                    },
+                    bucket: *ex.config().buckets.last().expect("a bucket"),
                     maintenance,
                     table_updates,
                     seqs: vec![SeqEntry {
@@ -439,7 +445,7 @@ impl FullRows {
             rows += r["top"].as_array().unwrap().len();
         }
         let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        let bytes = file.metadata().unwrap().len() as usize;
+        let bytes = usize::try_from(file.metadata().unwrap().len()).unwrap();
         assert!(
             rows > 0 && bytes.is_multiple_of(rows * 4),
             "{path}: {bytes} bytes is not {rows} whole rows"
@@ -576,7 +582,7 @@ fn compare(a: &str, b: &str, full: Option<(&str, &str)>, from: Option<&str>) {
         let rows = read_jsonl(p);
         by_id(&rows, "prompts")
             .into_iter()
-            .map(|(id, r)| (id, r["start"].as_u64().unwrap() as usize))
+            .map(|(id, r)| (id, usize::try_from(r["start"].as_u64().unwrap()).unwrap()))
             .collect()
     });
     let m = compare_rows(&a, &b, full, starts.as_ref());
@@ -783,7 +789,7 @@ mod tests {
     #[test]
     fn top_lists_break_ties_by_id() {
         let tied = vec![-3.0f32; 64];
-        let want: Vec<u32> = (0..TOP as u32).collect();
+        let want: Vec<u32> = (0..u32::try_from(TOP).unwrap()).collect();
         assert_eq!(top(&tied).iter().map(|t| t.0).collect::<Vec<_>>(), want);
         // Two maxima at high ids, then 40 tokens tied at the cut.
         let mut lp = vec![-9.0f32; 100];

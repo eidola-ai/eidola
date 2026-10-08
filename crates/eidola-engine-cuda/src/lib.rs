@@ -8,14 +8,8 @@
 //!
 //! No integer conversion here may lose a value silently: counts, strides,
 //! grid dimensions and offsets reach the kernels as 32-bit values through
-//! [`narrow`], which refuses one that does not fit, and the lints below hold
-//! every other conversion to that.
-
-#![deny(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
+//! [`narrow`], which refuses one that does not fit, and the crate's lints
+//! (`Cargo.toml`, every target) hold every other conversion to that.
 
 pub mod attention;
 pub mod bf16;

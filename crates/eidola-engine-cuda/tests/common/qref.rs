@@ -32,6 +32,8 @@ pub fn e4m3(x: f32) -> f32 {
     if a == 0.0 || a.is_nan() {
         return x;
     }
+    // A finite nonzero f32's binary exponent lies in [-149, 127].
+    #[expect(clippy::cast_possible_truncation, reason = "an f32 exponent fits i32")]
     let e = a.log2().floor() as i32;
     let step = if e < -6 {
         2f32.powi(-9)
@@ -70,6 +72,7 @@ fn fake_fp8_ue8m0(x: &Matrix) -> Matrix {
         for g in out.row_mut(r).chunks_mut(128) {
             let amax = g.iter().fold(0f32, |m, v| m.max(v.abs()));
             let e = (amax.max(1e-10) / 448.0).log2().ceil().clamp(-127.0, 127.0);
+            #[expect(clippy::cast_possible_truncation, reason = "clamped to [-127, 127]")]
             let s = 2f32.powi(e as i32);
             for v in g {
                 *v = e4m3(*v / s) * s;

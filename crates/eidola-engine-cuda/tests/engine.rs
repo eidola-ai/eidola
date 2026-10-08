@@ -55,7 +55,7 @@ fn env() -> Option<&'static Env> {
             .to_i64("tokens")
             .unwrap()
             .into_iter()
-            .map(|x| x as u32)
+            .map(|x| u32::try_from(x).unwrap())
             .collect();
         let store = Arc::new(WeightSet::open_dir(&PathBuf::from(dir)).unwrap());
         let config = store.model_config().unwrap().truncated(&KEEP).unwrap();
@@ -309,7 +309,7 @@ fn preemption_and_cancellation_under_pressure() {
     };
     let text = env().unwrap().text.clone();
     for id in 0..6u64 {
-        let start = (id * 37) as usize;
+        let start = usize::try_from(id * 37).unwrap();
         let params = if id % 2 == 0 {
             greedy()
         } else {
@@ -364,10 +364,10 @@ fn randomized_workload() {
     let mut id = 0u64;
     for round in 0..4 {
         for _ in 0..4 {
-            let start = rnd(200) as usize;
-            let len = 5 + rnd(60) as usize;
+            let start = usize::try_from(rnd(200)).unwrap();
+            let len = 5 + usize::try_from(rnd(60)).unwrap();
             let cache = if rnd(2) == 0 {
-                CacheScope::Keyed(salt(rnd(3) as u8))
+                CacheScope::Keyed(salt(u8::try_from(rnd(3)).unwrap()))
             } else {
                 CacheScope::Private
             };
@@ -380,7 +380,7 @@ fn randomized_workload() {
                 id,
                 text[start..start + len].to_vec(),
                 params,
-                1 + rnd(10) as u32,
+                1 + u32::try_from(rnd(10)).unwrap(),
                 cache,
             ));
             id += 1;

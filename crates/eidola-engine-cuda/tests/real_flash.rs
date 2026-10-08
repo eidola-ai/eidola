@@ -62,7 +62,7 @@ fn fixture() -> Option<Fixture> {
         .to_i64("tokens")
         .unwrap()
         .into_iter()
-        .map(|x| x as u32)
+        .map(|x| u32::try_from(x).unwrap())
         .collect();
     Some(Fixture {
         dir: dir.into(),
@@ -223,11 +223,11 @@ fn truncated_flash_matches_the_reference() {
         ex.record_all_logits = true;
 
         // Unchunked prefill in slot 0 (blocks 1..).
-        let nb = (n as u32).div_ceil(BS);
+        let nb = u32::try_from(n).unwrap().div_ceil(BS);
         let t0 = Instant::now();
         let out = ex
             .execute(&step(
-                vec![row(0, 0, 0, n as u32, true)],
+                vec![row(0, 0, 0, u32::try_from(n).unwrap(), true)],
                 tokens,
                 vec![],
                 tables(0, nb, 1),
@@ -264,10 +264,10 @@ fn truncated_flash_matches_the_reference() {
         let mut chunked = Vec::new();
         let mut c = 0u32;
         let mut updates = tables(1, nb, base);
-        for len in [37u32, 64, n as u32 - 101] {
+        for len in [37u32, 64, u32::try_from(n).unwrap() - 101] {
             let toks = &tokens[c as usize..(c + len) as usize];
             ex.execute(&step(
-                vec![row(1, 0, c, len, c + len == n as u32)],
+                vec![row(1, 0, c, len, c + len == u32::try_from(n).unwrap())],
                 toks,
                 vec![],
                 std::mem::take(&mut updates),
@@ -283,7 +283,7 @@ fn truncated_flash_matches_the_reference() {
 
         // Decode: prefill n - 8 tokens in slot 2, then 8 single-token steps.
         let base = base + nb;
-        let pre = n as u32 - 8;
+        let pre = u32::try_from(n).unwrap() - 8;
         ex.execute(&step(
             vec![row(2, 0, 0, pre, false)],
             &tokens[..pre as usize],
@@ -292,7 +292,7 @@ fn truncated_flash_matches_the_reference() {
         ))
         .unwrap();
         let mut decoded = Vec::new();
-        for p in pre..n as u32 {
+        for p in pre..u32::try_from(n).unwrap() {
             ex.execute(&step(
                 vec![row(2, 0, p, 1, true)],
                 &tokens[p as usize..p as usize + 1],

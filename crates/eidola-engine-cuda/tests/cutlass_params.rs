@@ -39,7 +39,7 @@ fn cases() -> Vec<Case> {
                 "bf16" => GemmKind::Bf16,
                 k => panic!("{k}"),
             };
-            let u = |k: &str| v[k].as_u64().unwrap() as u32;
+            let u = |k: &str| u32::try_from(v[k].as_u64().unwrap()).unwrap();
             let hex = v["params"].as_str().unwrap();
             Case {
                 kind,
@@ -52,10 +52,10 @@ fn cases() -> Vec<Case> {
                     d: D,
                     sfa: SFA,
                     sfb: SFB,
-                    alpha: v["alpha"].as_f64().unwrap() as f32,
+                    alpha: f32_exact(v["alpha"].as_f64().unwrap()),
                 },
                 can_implement: v["can_implement"].as_bool().unwrap(),
-                grid: [0, 1, 2].map(|i| v["grid"][i].as_u64().unwrap() as u32),
+                grid: [0, 1, 2].map(|i| u32::try_from(v["grid"][i].as_u64().unwrap()).unwrap()),
                 params: (0..hex.len() / 2)
                     .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
                     .collect(),
@@ -173,4 +173,15 @@ fn params_match_cutlass_with_driver_descriptors() {
             .unwrap();
         compare(&case, &ours);
     }
+}
+
+/// An f64 the JSON holds for an f32 field, which must round-trip exactly.
+fn f32_exact(x: f64) -> f32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "checked to round-trip below"
+    )]
+    let y = x as f32;
+    assert_eq!(f64::from(y), x, "{x} is not an f32");
+    y
 }

@@ -30,3 +30,10 @@ serde_json = "1"
 [[example]]
 name = "eval"
 test = true
+
+# No integer conversion may lose a value silently, in any target (library,
+# tests, examples): counts and ids are converted with `try_from`.
+[lints.clippy]
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"

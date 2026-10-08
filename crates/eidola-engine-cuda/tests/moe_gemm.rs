@@ -30,8 +30,12 @@ struct Expert {
 }
 
 fn expert(rng: &mut Lcg, n: usize, k: usize) -> Expert {
-    let packed: Vec<u8> = (0..n * k / 2).map(|_| rng.next_u64() as u8).collect();
-    let scales: Vec<u8> = (0..n * k / 32).map(|_| 118 + rng.below(6) as u8).collect();
+    let packed: Vec<u8> = (0..n * k / 2)
+        .map(|_| rng.next_u64().to_le_bytes()[0])
+        .collect();
+    let scales: Vec<u8> = (0..n * k / 32)
+        .map(|_| 118 + u8::try_from(rng.below(6)).unwrap())
+        .collect();
     let mut values = vec![0f32; n * k];
     for r in 0..n {
         for c in 0..k {
@@ -69,7 +73,7 @@ fn activations(rng: &mut Lcg, rows: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<f
     for r in 0..rows {
         for c in 0..k {
             let code = loop {
-                let b = rng.next_u64() as u8;
+                let b = rng.next_u64().to_le_bytes()[0];
                 if b & 0x7f != 0x7f {
                     break b;
                 }
@@ -77,7 +81,7 @@ fn activations(rng: &mut Lcg, rows: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<f
             codes[r * k + c] = code;
         }
         for q in 0..k / 128 {
-            scales[r * k / 128 + q] = 120 + rng.below(4) as u8;
+            scales[r * k / 128 + q] = 120 + u8::try_from(rng.below(4)).unwrap();
         }
         for c in 0..k {
             values[r * k + c] =
@@ -187,7 +191,7 @@ fn run(proj: MoeProj, layout: MoeLayout) {
                     a[off * k..(off + r) * k].copy_from_slice(codes);
                     scales[off * k / 128..(off + r) * k / 128].copy_from_slice(sc);
                     for row in 0..*r {
-                        gl[off + row] = *g as i32;
+                        gl[off + row] = i32::try_from(*g).unwrap();
                     }
                 }
                 let sfa = sfa_words(&scales, total, k);
@@ -207,7 +211,7 @@ fn run(proj: MoeProj, layout: MoeLayout) {
                     padded.resize(cap * k / 128, 127);
                     let words = sfa_words(&padded, cap, k);
                     sfa[g * (k / 512) * r4..(g + 1) * (k / 512) * r4].copy_from_slice(&words);
-                    masked[*g] = *r as i32;
+                    masked[*g] = i32::try_from(*r).unwrap();
                 }
                 (cap, a, sfa, masked, offsets)
             }
@@ -225,7 +229,7 @@ fn run(proj: MoeProj, layout: MoeLayout) {
         let args = MoeGemmArgs {
             layout,
             proj,
-            m: m as u32,
+            m: u32::try_from(m).unwrap(),
             grouped_layout: dptr(&dgl, s),
             a: dptr(&da, s),
             sfa: dptr(&dsfa, s),

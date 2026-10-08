@@ -261,6 +261,14 @@ impl CudaExecutor {
     }
 
     fn step(&mut self, step: &StepInput) -> Result<StepOutput> {
+        // Scratch is sized for the configured ladder: a step names one of its
+        // buckets, exactly, or is refused before anything is staged.
+        if !self.spec.buckets.contains(&step.bucket) {
+            return Err(CudaError::new(format!(
+                "bucket {:?} is not one of the configured {:?}",
+                step.bucket, self.spec.buckets
+            )));
+        }
         if step.seqs.len() > step.bucket.max_seqs as usize
             || step.query_tokens() > step.bucket.max_tokens
         {

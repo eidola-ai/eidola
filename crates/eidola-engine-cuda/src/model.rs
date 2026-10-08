@@ -150,9 +150,9 @@ fn contiguous_rows(tokens: usize, top_k: usize, experts: usize) -> usize {
 }
 
 pub struct GpuModel {
-    pub weights: ModelWeights,
-    pub kernels: Kernels,
-    pub layer_kv: Vec<LayerKv>,
+    pub(crate) weights: ModelWeights,
+    pub(crate) kernels: Kernels,
+    pub(crate) layer_kv: Vec<LayerKv>,
     scratch: Scratch,
     /// Per distinct RoPE θ: `[max_len][32 cos | 32 sin]`.
     rope: Vec<(f32, CudaSlice<f32>)>,
@@ -316,7 +316,9 @@ impl ScratchSizes {
 }
 
 impl GpuModel {
-    pub fn new(
+    /// The model over its weights, with `layer_kv` from [`group_layers`] of
+    /// the same configuration (the executor's construction).
+    pub(crate) fn new(
         gpu: &Gpu,
         weights: ModelWeights,
         kernels: Kernels,
@@ -408,6 +410,19 @@ impl GpuModel {
         })
     }
 
+    pub fn weights(&self) -> &ModelWeights {
+        &self.weights
+    }
+
+    pub fn kernels(&self) -> &Kernels {
+        &self.kernels
+    }
+
+    /// Where each layer's KV lives.
+    pub fn layer_kv(&self) -> &[LayerKv] {
+        &self.layer_kv
+    }
+
     pub fn config(&self) -> &ModelConfig {
         &self.weights.config
     }
@@ -468,6 +483,22 @@ impl GpuModel {
                 input.kv_targets.len(),
                 input.plans.len()
             ));
+        }
+        // The pools must be the ones these layers were grouped for: each
+        // layer's KV shape is its group's, and its index inside the group's
+        // block exists.
+        for (l, lkv) in self.weights.config.layers.iter().zip(&self.layer_kv) {
+            let (a, geom) = (&l.attention, &geometry[lkv.group]);
+            if geom.num_kv_heads as usize != a.num_kv_heads
+                || geom.head_dim_qk as usize != a.head_dim_qk
+                || geom.head_dim_v as usize != a.head_dim_v
+                || lkv.layer_in_group >= geom.num_layers
+            {
+                return bad(format!(
+                    "layer {} does not fit KV group {} ({geom:?})",
+                    l.index, lkv.group
+                ));
+            }
         }
         for (g, (geom, targets)) in geometry.iter().zip(input.kv_targets).enumerate() {
             if targets.len() != t {

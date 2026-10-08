@@ -102,8 +102,15 @@ fn rmsnorm_matches_reference() {
             KernelModule::load_from(&gpu, &dir, "rmsnorm", ImageSource::Cubin(arch)).unwrap();
         let norm = RmsNorm::from_module(&module).unwrap();
         let mut dout = stream.alloc_zeros::<u16>(rows * hidden).unwrap();
-        norm.launch(&gpu, &mut dout, &dx, &dw, hidden as u32, 1e-6)
-            .unwrap();
+        norm.launch(
+            &gpu,
+            &mut dout,
+            &dx,
+            &dw,
+            u32::try_from(hidden).unwrap(),
+            1e-6,
+        )
+        .unwrap();
         check_rmsnorm(&stream.clone_dtoh(&dout).unwrap(), &x, &w, rows, hidden);
     }
 }
@@ -134,8 +141,15 @@ fn kernels_outlive_their_module_handle() {
     drop(others);
     norm.kernel().static_smem_bytes().unwrap();
     let mut dout = stream.alloc_zeros::<u16>(rows * hidden).unwrap();
-    norm.launch(&gpu, &mut dout, &dx, &dw, hidden as u32, 1e-6)
-        .unwrap();
+    norm.launch(
+        &gpu,
+        &mut dout,
+        &dx,
+        &dw,
+        u32::try_from(hidden).unwrap(),
+        1e-6,
+    )
+    .unwrap();
     check_rmsnorm(&stream.clone_dtoh(&dout).unwrap(), &x, &w, rows, hidden);
 }
 
@@ -201,9 +215,9 @@ fn launches_from_another_thread() {
     .unwrap();
     let ptrs = [dptr(&dout, stream), dptr(&dx, stream), dptr(&dw, stream)];
     let gemm_args = GemmArgs {
-        m: rows as u32,
-        n: hidden as u32,
-        k: hidden as u32,
+        m: u32::try_from(rows).unwrap(),
+        n: u32::try_from(hidden).unwrap(),
+        k: u32::try_from(hidden).unwrap(),
         a: dptr(&dx, stream),
         b: dptr(&dw, stream),
         d: dptr(&dgemm, stream),
@@ -216,8 +230,13 @@ fn launches_from_another_thread() {
         s.spawn(|| {
             // Nothing on this thread has made a context current; each call
             // below is the first driver call of its kind here.
-            let (mut o, mut i, mut wt, mut h, mut eps) =
-                (ptrs[0], ptrs[1], ptrs[2], hidden as u32, 1e-6f32);
+            let (mut o, mut i, mut wt, mut h, mut eps) = (
+                ptrs[0],
+                ptrs[1],
+                ptrs[2],
+                u32::try_from(hidden).unwrap(),
+                1e-6f32,
+            );
             let mut args = [
                 &mut o as *mut _ as *mut std::ffi::c_void,
                 &mut i as *mut _ as *mut std::ffi::c_void,
@@ -226,8 +245,11 @@ fn launches_from_another_thread() {
                 &mut eps as *mut _ as *mut std::ffi::c_void,
             ];
             unsafe {
-                norm.kernel()
-                    .launch(gpu.stream(), [rows as u32, 1, 1], &mut args)
+                norm.kernel().launch(
+                    gpu.stream(),
+                    [u32::try_from(rows).unwrap(), 1, 1],
+                    &mut args,
+                )
             }
             .unwrap();
             unsafe { gemm.launch(&gpu, &gemm_args) }.unwrap();

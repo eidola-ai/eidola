@@ -82,8 +82,8 @@ fn sample_matches_reference_bit_for_bit() {
     let mut rows = Vec::new();
     for (pi, p) in params.iter().enumerate() {
         for lr in 0..num_logit_rows {
-            let pos = (pi * 31 + lr * 7) as u32 + 1;
-            rows.push((SampleRow::new(p, pos, lr as u32), *p));
+            let pos = u32::try_from(pi * 31 + lr * 7).unwrap() + 1;
+            rows.push((SampleRow::new(p, pos, u32::try_from(lr).unwrap()), *p));
         }
     }
     let n = SAMPLEABLE as usize;
@@ -217,7 +217,7 @@ fn non_finite_logits_are_reported() {
                     gpu,
                     &dlogits,
                     n,
-                    n as u32,
+                    u32::try_from(n).unwrap(),
                     &hrow,
                     &mut drows,
                     Some(Stream::Sample),
@@ -273,20 +273,20 @@ fn chain_accept_matches_reference() {
                 .collect();
             draft_logits.extend(noisy);
         }
-        seqs.push((k, p, tr, dr, (i * 13) as u32 + 1));
+        seqs.push((k, p, tr, dr, u32::try_from(i * 13).unwrap() + 1));
     }
     let nt = target_logits.len() / n;
     let nd = draft_logits.len() / n;
     let t_rows: Vec<SampleRow> = (0..nt)
         .map(|r| {
             let (_, p, ..) = seqs.iter().find(|q| r >= q.2 && r <= q.2 + q.0).unwrap();
-            SampleRow::new(p, 0, r as u32)
+            SampleRow::new(p, 0, u32::try_from(r).unwrap())
         })
         .collect();
     let d_rows: Vec<SampleRow> = (0..nd)
         .map(|r| {
             let (_, p, ..) = seqs.iter().find(|q| r >= q.3 && r < q.3 + q.0).unwrap();
-            SampleRow::new(p, 0, r as u32)
+            SampleRow::new(p, 0, u32::try_from(r).unwrap())
         })
         .collect();
     // Drafts: drawn on the host from the reference draft distributions.
@@ -296,19 +296,29 @@ fn chain_accept_matches_reference() {
     for (si, &(k, p, tr, dr, pos)) in seqs.iter().enumerate() {
         let qs: Vec<Vec<f64>> = (0..k)
             .map(|j| {
-                let l = Logits::new(&draft_logits[(dr + j) * n..(dr + j + 1) * n], n as u32);
+                let l = Logits::new(
+                    &draft_logits[(dr + j) * n..(dr + j + 1) * n],
+                    u32::try_from(n).unwrap(),
+                );
                 sampling::processed_probs(l, &p)
             })
             .collect();
         for (j, q) in qs.iter().enumerate() {
             drafts[si * stride as usize + j] = sampling::sample_from(
                 q,
-                sampling::uniform(p.seed(), (pos + j as u32) as u64, Stream::Draft),
+                sampling::uniform(
+                    p.seed(),
+                    (pos + u32::try_from(j).unwrap()) as u64,
+                    Stream::Draft,
+                ),
             );
         }
         let ps: Vec<Vec<f64>> = (0..=k)
             .map(|j| {
-                let l = Logits::new(&target_logits[(tr + j) * n..(tr + j + 1) * n], n as u32);
+                let l = Logits::new(
+                    &target_logits[(tr + j) * n..(tr + j + 1) * n],
+                    u32::try_from(n).unwrap(),
+                );
                 sampling::processed_probs(l, &p)
             })
             .collect();
@@ -328,8 +338,8 @@ fn chain_accept_matches_reference() {
         .iter()
         .enumerate()
         .map(|(si, &(k, _, tr, dr, _))| AcceptRow {
-            target_row: tr as u32,
-            draft_row: dr as u32,
+            target_row: u32::try_from(tr).unwrap(),
+            draft_row: u32::try_from(dr).unwrap(),
             drafts: &drafts[si * stride as usize..][..k],
         })
         .collect();
@@ -345,7 +355,7 @@ fn chain_accept_matches_reference() {
                 gpu,
                 &dt,
                 n,
-                n as u32,
+                u32::try_from(n).unwrap(),
                 &t_rows,
                 &mut dtr,
                 None,
@@ -359,7 +369,7 @@ fn chain_accept_matches_reference() {
                 gpu,
                 &dd,
                 n,
-                n as u32,
+                u32::try_from(n).unwrap(),
                 &d_rows,
                 &mut ddr,
                 None,
@@ -376,7 +386,7 @@ fn chain_accept_matches_reference() {
                 gpu,
                 &tp,
                 &dp,
-                n as u32,
+                u32::try_from(n).unwrap(),
                 &drows,
                 &plan,
                 &mut inputs,
@@ -415,7 +425,10 @@ fn signed_zero_maxima_tie_to_the_lower_id() {
     logits[n + 3000] = -0.0;
     for row in 0..2 {
         let r = &logits[row * n..(row + 1) * n];
-        assert_eq!(sampling::argmax(Logits::new(r, n as u32)), 5);
+        assert_eq!(
+            sampling::argmax(Logits::new(r, u32::try_from(n).unwrap())),
+            5
+        );
     }
     let dlogits = s.clone_htod(&logits).unwrap();
     let rows = [
@@ -433,7 +446,7 @@ fn signed_zero_maxima_tie_to_the_lower_id() {
                 gpu,
                 &dlogits,
                 n,
-                n as u32,
+                u32::try_from(n).unwrap(),
                 &rows,
                 &mut drows,
                 Some(Stream::Sample),
@@ -590,7 +603,7 @@ fn logit_rows_are_bounded() {
             gpu,
             &logits,
             n,
-            n as u32,
+            u32::try_from(n).unwrap(),
             &[SampleRow::new(&SamplingParams::greedy(), 1, row)],
             &mut rows_dev,
             None,

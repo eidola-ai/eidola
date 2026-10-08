@@ -148,17 +148,34 @@ pub struct AttnRequest {
 /// A step's work list as the host derives it, before upload. Every index
 /// is checked to fit the kernel's `i32` arrays, and every request's pages to
 /// cover exactly its KV: `(pages - 1) * page_size < kv_len <= pages *
-/// page_size`, so the last page holds 1..=page_size positions.
+/// page_size`, so the last page holds 1..=page_size positions. Its fields
+/// are private: [`HostPlan::new`], which checks every relation the kernel
+/// relies on, is the only way to make one, and [`Attention::upload`] takes
+/// only this type.
+///
+/// ```compile_fail
+/// // Not constructible outside the crate: every field is private.
+/// let _ = eidola_engine_cuda::attention::HostPlan {
+///     tile: 16,
+///     q_indptr: vec![0, 1],
+///     indices: vec![1],
+///     indptr: vec![0, 1],
+///     last_page_len: vec![1],
+///     request_indices: vec![100],
+///     qo_tile_indices: vec![0],
+///     kv_tile_indices: vec![0],
+/// };
+/// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct HostPlan {
-    pub tile: u32,
-    pub q_indptr: Vec<i32>,
-    pub indices: Vec<i32>,
-    pub indptr: Vec<i32>,
-    pub last_page_len: Vec<i32>,
-    pub request_indices: Vec<i32>,
-    pub qo_tile_indices: Vec<i32>,
-    pub kv_tile_indices: Vec<i32>,
+    tile: u32,
+    q_indptr: Vec<i32>,
+    indices: Vec<i32>,
+    indptr: Vec<i32>,
+    last_page_len: Vec<i32>,
+    request_indices: Vec<i32>,
+    qo_tile_indices: Vec<i32>,
+    kv_tile_indices: Vec<i32>,
 }
 
 impl HostPlan {

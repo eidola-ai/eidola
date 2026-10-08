@@ -45,7 +45,7 @@ fn run(window: Option<u32>, kv_heads: u32, rows: &[Row], seed: u64) {
     // Physical blocks handed out in a scrambled order.
     let mut free: Vec<u32> = (1..total_blocks).collect();
     for i in (1..free.len()).rev() {
-        free.swap(i, rng.below(i as u64 + 1) as usize);
+        free.swap(i, usize::try_from(rng.below(i as u64 + 1)).unwrap());
     }
     let (dqk, dv, h) = (
         HEAD_DIM_QK as usize,
@@ -103,7 +103,9 @@ fn run(window: Option<u32>, kv_heads: u32, rows: &[Row], seed: u64) {
         kv.push(row_kv);
     }
     for (b, data) in blocks.iter().enumerate().skip(1) {
-        store.write_block(gpu, 0, b as u32, data).unwrap();
+        store
+            .write_block(gpu, 0, u32::try_from(b).unwrap(), data)
+            .unwrap();
     }
     let sinks: Vec<f32> = match window {
         Some(_) => (0..NQ).map(|_| 0.5 + rng.f32().abs()).collect(),
@@ -165,10 +167,10 @@ fn run(window: Option<u32>, kv_heads: u32, rows: &[Row], seed: u64) {
     let layer_desc = AttnLayer {
         k_base: base + 2 * geom.k_offset(layer) as u64,
         v_base: base + 2 * geom.v_offset(layer) as u64,
-        block_elems: geom.block_elems() as u32,
+        block_elems: u32::try_from(geom.block_elems()).unwrap(),
         num_kv_heads: kv_heads,
         page_size: BS,
-        window_left: window.map_or(-1, |w| w as i32 - 1),
+        window_left: window.map_or(-1, |w| i32::try_from(w).unwrap() - 1),
         sink: dptr(&dsink, s),
     };
     for &arch in &su.archs {

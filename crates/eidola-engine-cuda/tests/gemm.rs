@@ -12,7 +12,7 @@ use eidola_engine_model::numeric::fp8_e4m3_to_f32;
 /// A finite e4m3 code (0x7f and 0xff are NaN).
 fn fp8(rng: &mut Lcg) -> u8 {
     loop {
-        let b = rng.next_u64() as u8;
+        let b = rng.next_u64().to_le_bytes()[0];
         if b & 0x7f != 0x7f {
             return b;
         }
