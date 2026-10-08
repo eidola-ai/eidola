@@ -248,6 +248,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         ExecutorConfig::Cuda {
             kernels_dir,
             kv_device_bytes,
+            graphs,
         } => {
             let prepared = cuda::prepare(
                 &model,
@@ -255,6 +256,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 &config.cache,
                 kernels_dir,
                 *kv_device_bytes,
+                *graphs,
             )?;
             let report = prepared.report();
             let blocks = prepared.config().num_blocks;
@@ -264,6 +266,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 image = report.image.unwrap_or("none"),
                 global_kv_blocks = blocks.global,
                 sliding_kv_blocks = blocks.sliding,
+                cuda_graphs = prepared.config().graphs.as_str(),
                 "loading the model onto the device"
             );
             let engine = worker::spawn(
