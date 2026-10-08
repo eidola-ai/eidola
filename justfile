@@ -34,7 +34,7 @@ db-reset:
 
 # --- Build (local toolchain, fast iteration) ---
 
-# Build a system: server, cli, gui, or www
+# Build a system: server, cli, gui, www, or engine-server
 build system:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -59,8 +59,11 @@ build system:
         # Build the website to target/www (drafts excluded, as deployed).
         cargo run -q -p eidola-www -- build
         ;;
+      engine-server)
+        cargo build -p eidola-server-engine
+        ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www)" >&2
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www, engine-server)" >&2
         exit 1
         ;;
     esac
@@ -81,7 +84,7 @@ engine-kernels *args:
 engine:
     nix build .#llama-server -o crates/eidola-gui/build/llama-server
 
-# Build and run a system: server, cli, gui, or www
+# Build and run a system: server, cli, gui, www, or engine-server
 run system *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -111,8 +114,36 @@ run system *args:
         # on change. Pass --addr <host:port> to override.
         cargo run -q -p eidola-www -- serve {{ args }}
         ;;
+      engine-server)
+        # An inference node on 127.0.0.1:8090 serving the synthetic dev model (random
+        # weights, gibberish output) through the CPU executor. Gateway token:
+        # `dev-gateway-token`; the weights hash is printed below and served by
+        # GET /v1/engine/info. See crates/eidola-server-engine/AGENTS.md.
+        dir=target/engine-dev-model
+        hash=$(cargo run -q -p eidola-server-engine --example dev_model -- "$dir")
+        echo "weights hash: $hash"
+        EIDOLA_ENGINE_MODEL_ID=mimo-dev \
+        EIDOLA_ENGINE_WEIGHTS_DIR="$dir" \
+        EIDOLA_ENGINE_WEIGHTS_SHA256="$hash" \
+        GATEWAY_TOKEN=dev-gateway-token \
+        GATEWAY_TOKEN_HASH="$(cargo run -q -p hash-secret -- dev-gateway-token)" \
+        EIDOLA_ENGINE_EXECUTOR=cpu \
+        EIDOLA_ENGINE_BIND_ADDR=127.0.0.1:8090 \
+        EIDOLA_ENGINE_KV_BLOCK_SIZE=16 \
+        EIDOLA_ENGINE_KV_BLOCKS=1024 \
+        EIDOLA_ENGINE_MAX_MODEL_LEN=4096 \
+        EIDOLA_ENGINE_MAX_SEQS=8 \
+        EIDOLA_ENGINE_MAX_BATCHED_TOKENS=512 \
+        EIDOLA_ENGINE_MAX_PREFILL_CHUNK=512 \
+        EIDOLA_ENGINE_DRAFT_TOKENS=2 \
+        EIDOLA_ENGINE_MAX_REQUESTS=32 \
+        EIDOLA_ENGINE_PREFIX_CACHE=true \
+        EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS=900 \
+        EIDOLA_ENGINE_CACHE_MAX_AGE_SECS=7200 \
+          cargo run -p eidola-server-engine -- {{ args }}
+        ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www)" >&2
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www, engine-server)" >&2
         exit 1
         ;;
     esac
