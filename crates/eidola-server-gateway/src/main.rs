@@ -604,17 +604,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Store the generated OpenAPI spec for the /openapi.json endpoint
     let api_json = api.to_json().expect("OpenAPI spec serialization failed");
-    let app = router
-        .route(
-            "/openapi.json",
-            axum::routing::get(move || {
-                let spec = api_json.clone();
-                async move { (StatusCode::OK, [("content-type", "application/json")], spec) }
-            }),
-        )
-        .layer(axum::middleware::from_fn(
-            eidola_server_gateway::middleware::observe,
-        ));
+    let router = router.route(
+        "/openapi.json",
+        axum::routing::get(move || {
+            let spec = api_json.clone();
+            async move { (StatusCode::OK, [("content-type", "application/json")], spec) }
+        }),
+    );
+    // Every response shaped, refusals and 404s included (`padding::shape`);
+    // observed outside that, so the metrics see what the client got.
+    let app = eidola_server_gateway::padding::shape(router).layer(axum::middleware::from_fn(
+        eidola_server_gateway::middleware::observe,
+    ));
 
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!("Listening on http://{}", config.bind_addr);

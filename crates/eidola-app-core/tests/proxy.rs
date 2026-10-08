@@ -778,6 +778,67 @@ fn a_streaming_refund_that_arrives_in_band_is_the_one_that_settles() {
     });
 }
 
+/// A stream the Eidola server padded (fixed-size frames of comment events,
+/// trailing whitespace, an event carried across frames) reaches the local tool
+/// with its padding, which every server-sent-events reader ignores and which
+/// hides nothing on this machine; it settles from its in-band refund; and the
+/// Record keeps its events without the padding, saying how much it left out.
+#[test]
+fn a_padded_stream_is_forwarded_whole_and_recorded_without_its_padding() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::StreamingPadded,
+            refund: RefundMode::Fail,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 200, "{body}");
+        for piece in ["Hello ", "from the ", "stream.", "data: [DONE]"] {
+            assert!(body.contains(piece), "{piece} is forwarded: {body}");
+        }
+        assert!(body.contains("\n:"), "the padding is forwarded too");
+        assert!(
+            !body.contains("\"refund\""),
+            "no credential travels downstream"
+        );
+
+        let wallet = runtime.block_on(core.wallet_lifecycle()).expect("wallet");
+        assert!(wallet.iter().any(|c| c.state == "spent"), "{wallet:?}");
+        assert!(!wallet.iter().any(|c| c.state == "spending"), "{wallet:?}");
+        assert_eq!(mock.refund_hits(), 0, "settled in-band");
+
+        let requests = runtime.block_on(core.list_requests(20, 0)).expect("record");
+        let row = requests
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is in the Record");
+        let detail = runtime
+            .block_on(core.request_detail(row.id.clone()))
+            .expect("detail")
+            .expect("the row");
+        let text = String::from_utf8(detail.response_body.expect("a recorded body")).unwrap();
+        assert!(!text.contains("\n:"), "no padding is kept: {text}");
+        for piece in ["Hello ", "from the ", "stream.", "data: [DONE]"] {
+            assert!(text.contains(piece), "{piece} is kept: {text}");
+        }
+        assert!(text.contains("bytes of stream padding"), "{text}");
+    });
+}
+
 #[test]
 fn a_stream_that_carries_no_refund_still_falls_back_to_recovery() {
     run(|| {

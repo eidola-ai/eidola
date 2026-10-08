@@ -105,10 +105,14 @@ The Eidola server is **not** the inference engine. Models run in a separate conf
 
 1. Verify the anonymous credential.
 2. Open an attested HTTPS connection to the inference upstream.
-3. Stream the request through, stream the response back.
+3. Stream the request through, stream the response back — re-framed, so that what a network observer sees of it does not follow the tokens (see [Response shape](#response-shape)).
 4. Record the per-request token counts for accounting.
 
 This means **two layers of confidential compute** protect the inference content: the Eidola server enclave (which sees the content only in transit, never logged) and the upstream provider's confidential-compute enclaves that perform the inference. The upstream is itself a *router* enclave that forwards to a separate per-model enclave; the Eidola server attests the router it connects to on every handshake, and how far that verification reaches (and where it stops) is detailed in [upstream.md](upstream.md) and [gaps.md § Inference upstream](gaps.md#inference-upstream). The client verifies the attestation of the Eidola server directly on every handshake.
+
+### Response shape
+
+Encrypted traffic still has a size and a timing, and a streamed answer relayed chunk by chunk would put one encrypted record on the wire per token: their sizes trace the tokens' lengths and their spacing traces the model's pace, which published attacks turn back into topics and text. So the server writes a streamed answer as frames of one fixed size (2 KiB) at a fixed interval (every 50 ms), from the moment the stream opens until it ends. Each frame carries whatever output is waiting and is filled out with padding that every server-sent-events reader ignores. Every other response the server sends (a blocking answer, an error, the refusal of a malformed request, a 404) is padded to the next power-of-two size, at least 4 KiB, and a refusal never quotes what the request contained. An observer on the network path learns how long a response ran (which tracks its length) and a padded response's size bucket, not the size or timing of any token. The padding stops at the Eidola server: its connection to the inference provider carries the stream as the provider sends it. The reasoning and its costs are in `crates/eidola-server-gateway/AGENTS.md`.
 
 ## Where to read the code
 

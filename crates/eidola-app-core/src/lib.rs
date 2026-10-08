@@ -8527,20 +8527,10 @@ impl Inner {
                     break;
                 }
             };
-            raw.push(&bytes);
-            if raw.received > peer_read::MAX_RESPONSE_BYTES {
-                read_error = Some(AppError::Network {
-                    message: format!(
-                        "the model's response stream passed the {}-byte ceiling this app reads \
-                         for one answer",
-                        peer_read::MAX_RESPONSE_BYTES
-                    ),
-                });
-                break;
-            }
             buf.extend_from_slice(&bytes);
 
             let mut oversized = false;
+            let mut past_ceiling = false;
             while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
                 // The frame ceiling is asked of a complete event **before** it
                 // is drained (`peer_read::event_past_ceiling`).
@@ -8549,9 +8539,31 @@ impl Inner {
                     break;
                 }
                 let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
-                // Drop the boundary itself — 2, 3 or 4 bytes, whichever pair of
-                // line terminators `find_event_boundary` matched.
-                buf.drain(..boundary_len);
+                // The boundary itself — 2, 3 or 4 bytes, whichever pair of
+                // line terminators `find_event_boundary` matched — goes to the
+                // Record with its event, and nowhere else.
+                let boundary = buf.drain(..boundary_len).collect::<Vec<u8>>();
+                raw.push_event(&event_bytes, &boundary);
+                // **The ceiling bounds what the answer is made of, not
+                // padding**, so it is asked of each event once it is
+                // classified, never of a transport chunk: the Eidola server
+                // streams fixed-size frames on a fixed tick, filled with
+                // comment events for as long as the answer runs, and a chunk
+                // counted whole would carry its padding into the sum. A
+                // padding event costs nothing to hold; what is not yet an
+                // event is the frame buffer, bounded on its own below. The
+                // event that crosses the ceiling is not used.
+                if raw.payload_received() > peer_read::MAX_RESPONSE_BYTES {
+                    read_error = Some(AppError::Network {
+                        message: format!(
+                            "the model's response stream passed the {}-byte ceiling this app \
+                             reads for one answer",
+                            peer_read::MAX_RESPONSE_BYTES
+                        ),
+                    });
+                    past_ceiling = true;
+                    break;
+                }
                 let event_str = match std::str::from_utf8(&event_bytes) {
                     Ok(s) => s,
                     Err(_) => continue,
@@ -8649,8 +8661,12 @@ impl Inner {
             // a backend that never terminates one grows it without end — the
             // other half of the frame ceiling, beside the complete event the
             // drain refused above. Either way the event is refused, not used.
+            if past_ceiling {
+                break;
+            }
             if oversized || peer_read::event_past_ceiling(None, buf.len()) {
                 read_error = Some(peer_read::oversized_event(&prep.backend_id));
+                raw.push_event(&buf, &[]);
                 buf.clear();
                 break;
             }
@@ -8659,6 +8675,11 @@ impl Inner {
                 break;
             }
         }
+        // Whatever arrived and was not drained as an event — a partial event,
+        // or what followed `[DONE]` in its read — is recorded as it came, and
+        // padding (the rest of the frame `[DONE]` arrived in, usually) as
+        // padding.
+        raw.push_event(&buf, &[]);
         let response_at = now_ms();
 
         // An unterminated final event is not an event the format delivers, so
@@ -9338,6 +9359,23 @@ fn sse_event_data(event: &str) -> Option<String> {
         }
     }
     data
+}
+
+/// Whether a server-sent event is **padding**: nothing but comment lines
+/// (`:` …) and empty lines, so it dispatches nothing and names nothing.
+///
+/// The Eidola server fills the fixed-size frames it streams with such events
+/// (and axum's keep-alive is one). They are already ignored by every reader
+/// here — no `data:` field, no payload — and this names them so the Record and
+/// the read ceiling can leave them out ([`recorded::RecordedBody::push_event`]).
+/// An event carrying any other field (`id:`, `event:`, `retry:`) is not padding.
+pub(crate) fn is_padding_event(event: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(event) else {
+        return false;
+    };
+    split_event_lines(text)
+        .iter()
+        .all(|(line, _)| line.is_empty() || line.starts_with(':'))
 }
 
 /// Whether a response's own headers say it is server-sent events.

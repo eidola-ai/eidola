@@ -147,6 +147,28 @@ pub enum ChatBehavior {
     /// and silently skips them — the deltas, the model rewrite, and the refund in
     /// the metadata event all go missing without anything failing.
     StreamingSplitDataFields,
+    /// [`ChatBehavior::StreamingWithMetadataRefund`] framed the way the Eidola
+    /// server frames every stream it answers: through its own
+    /// `eidola_server_gateway::padding::Framer`, as writes of exactly
+    /// `FRAME_BYTES`, each the events waiting plus padding (a comment event,
+    /// trailing whitespace on a JSON line, or blank lines after `[DONE]`), an
+    /// event larger than a frame carried across frames, and frames of nothing
+    /// but padding between the content deltas.
+    StreamingPadded,
+    /// [`ChatBehavior::StreamingPadded`] with **more padding than the read
+    /// ceiling** between its content deltas — what a slow answer looks like
+    /// when the frames keep coming at the frame rate. Ten megabytes of padding,
+    /// spelled here rather than imported: the mock must not learn this app's
+    /// ceilings.
+    StreamingPaddedPastReadCeiling,
+    /// A padded stream whose **answer is just under the read ceiling** —
+    /// eight megabytes less four kilobytes of events that carry data — and
+    /// whose last frames (several of nothing but padding, then the tail)
+    /// arrive coalesced into one transport chunk, as an intermediary that
+    /// buffers may deliver them. A reader that counts a transport chunk
+    /// before telling its padding from its data crosses the ceiling here;
+    /// one that counts only data does not.
+    StreamingPaddedNearReadCeiling,
     /// A plain success in **whichever transport asked** — SSE for a streaming
     /// request, JSON for a blocking one. One behaviour for a test that must
     /// exercise both twins against one upstream, which is otherwise impossible:
@@ -1448,6 +1470,23 @@ async fn handle_chat(
                 });
             write_sse_stream_with_metadata(stream, &[STREAM_CONTENT], refund).await
         }
+        ChatBehavior::StreamingPadded | ChatBehavior::StreamingPaddedPastReadCeiling => {
+            let refund = auth
+                .and_then(Issuer::spend_proof_from_auth)
+                .and_then(|sp| issuer.refund_for(&sp))
+                .map(|refund_b64| {
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                });
+            let idle_frames = if matches!(config.chat, ChatBehavior::StreamingPaddedPastReadCeiling)
+            {
+                // Ten megabytes of padding frames across the deltas below.
+                10 * 1024 * 1024 / eidola_server_gateway::padding::FRAME_BYTES / 3
+            } else {
+                2
+            };
+            write_padded_sse_stream(stream, &PADDED_CONTENT, refund, idle_frames).await
+        }
+        ChatBehavior::StreamingPaddedNearReadCeiling => write_padded_near_ceiling(stream).await,
         ChatBehavior::StreamingSplitDataFields => {
             let refund = auth
                 .and_then(Issuer::spend_proof_from_auth)
@@ -2249,6 +2288,159 @@ async fn write_sse_stream_with_metadata(
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// The content [`ChatBehavior::StreamingPadded`] streams, one delta each;
+/// joined, [`STREAM_CONTENT`].
+pub const PADDED_CONTENT: [&str; 3] = ["Hello ", "from the ", "stream."];
+
+/// The metadata stream framed by the Eidola server's own framer, with
+/// `idle_frames` frames of nothing but padding after each content delta. See
+/// [`ChatBehavior::StreamingPadded`].
+async fn write_padded_sse_stream(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+    refund: Option<serde_json::Value>,
+    idle_frames: usize,
+) -> std::io::Result<()> {
+    use eidola_server_gateway::padding::{FRAME_BYTES, Framer, StreamEvent};
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut framer = Framer::new(FRAME_BYTES);
+    // One write per frame, as the server's ticks write them.
+    async fn tick(stream: &mut TcpStream, framer: &mut Framer) -> std::io::Result<()> {
+        let frame = framer.frame();
+        let mut out = format!("{:x}\r\n", frame.len()).into_bytes();
+        out.extend_from_slice(&frame);
+        out.extend_from_slice(b"\r\n");
+        stream.write_all(&out).await?;
+        stream.flush().await
+    }
+
+    tick(stream, &mut framer).await?;
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "model": STREAM_WIRE_MODEL,
+            "choices": [{ "index": 0, "delta": { "content": chunk }, "finish_reason": null }]
+        });
+        framer.push(&StreamEvent::Json(content.to_string()));
+        tick(stream, &mut framer).await?;
+        for _ in 0..idle_frames {
+            tick(stream, &mut framer).await?;
+        }
+    }
+    let finish = serde_json::json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion.chunk",
+        "model": STREAM_WIRE_MODEL,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+    });
+    framer.push(&StreamEvent::Json(finish.to_string()));
+    let usage = serde_json::json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion.chunk",
+        "model": STREAM_WIRE_MODEL,
+        "choices": [],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16 }
+    });
+    framer.push(&StreamEvent::Json(usage.to_string()));
+    let mut metadata = serde_json::json!({
+        "object": "eidola.chat.completion.metadata",
+        "id": "chatcmpl-mock",
+        // Larger than a frame, as the server's privacy and verification
+        // metadata is, so the event crosses frames.
+        "privacy": { "note": "m".repeat(eidola_server_gateway::padding::FRAME_BYTES) },
+    });
+    if let Some(refund) = refund {
+        metadata["refund"] = refund;
+    }
+    framer.push(&StreamEvent::Json(metadata.to_string()));
+    framer.push(&StreamEvent::Done);
+    while framer.backlog() > 0 {
+        tick(stream, &mut framer).await?;
+    }
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// See [`ChatBehavior::StreamingPaddedNearReadCeiling`]. The sizes are the
+/// server's own encoding (`data: ` + JSON + a blank line), summed here.
+async fn write_padded_near_ceiling(stream: &mut TcpStream) -> std::io::Result<()> {
+    use eidola_server_gateway::padding::{FRAME_BYTES, Framer, StreamEvent};
+    // Spelled here rather than imported: the mock is the peer.
+    const TARGET: usize = 8 * 1024 * 1024 - 4096;
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+
+    let chunk = |content: &str| {
+        serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": null }]
+        })
+        .to_string()
+    };
+    let encoded = |json: &str| json.len() + "data: ".len() + 2;
+    let tail = vec![
+        serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] })
+            .to_string(),
+        serde_json::json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16 }
+        })
+        .to_string(),
+        serde_json::json!({ "object": "eidola.chat.completion.metadata", "id": "chatcmpl-mock" })
+            .to_string(),
+    ];
+    let tail_bytes: usize =
+        tail.iter().map(|j| encoded(j)).sum::<usize>() + "data: [DONE]\n\n".len();
+    let overhead = encoded(&chunk(""));
+    let piece = 64 * 1024;
+    let mut contents = Vec::new();
+    let mut total = tail_bytes;
+    while total + overhead + piece <= TARGET {
+        contents.push("y".repeat(piece));
+        total += overhead + piece;
+    }
+    contents.push("y".repeat(TARGET - total - overhead));
+
+    let mut framer = Framer::new(FRAME_BYTES);
+    let chunked = |frames: &[u8]| {
+        let mut out = format!("{:x}\r\n", frames.len()).into_bytes();
+        out.extend_from_slice(frames);
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+    for content in &contents {
+        framer.push(&StreamEvent::Json(chunk(content)));
+        while framer.backlog() > 0 {
+            stream.write_all(&chunked(&framer.frame())).await?;
+        }
+    }
+    // The last frames, coalesced: padding, then the tail.
+    let mut last = Vec::new();
+    for _ in 0..8 {
+        last.extend_from_slice(&framer.frame());
+    }
+    for json in tail {
+        framer.push(&StreamEvent::Json(json));
+    }
+    framer.push(&StreamEvent::Done);
+    while framer.backlog() > 0 {
+        last.extend_from_slice(&framer.frame());
+    }
+    stream.write_all(&chunked(&last)).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await
 }
 
 /// The metadata stream with each JSON payload split across one `data:` field

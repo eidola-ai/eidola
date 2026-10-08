@@ -78,13 +78,11 @@ pub struct ActSpend {
 /// Per RFC 9577 Section 2.2.2 and draft-schlesinger-privacypass-act-01 Section 9.1.
 pub struct TokenAuth(pub ActSpend);
 
-impl FromRequestParts<AppState> for TokenAuth {
+// It reads nothing from the state, so it extracts under any.
+impl<S: Send + Sync> FromRequestParts<S> for TokenAuth {
     type Rejection = ServerError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        _state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let header = parts
             .headers
             .get(AUTHORIZATION)
