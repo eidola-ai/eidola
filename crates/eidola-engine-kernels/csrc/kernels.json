@@ -37,7 +37,10 @@
   },
   "kernels": [
     { "name": "rmsnorm", "source": "rmsnorm.cu", "profile": "own" },
+    { "name": "sampling", "source": "sampling.cu", "profile": "own" },
+    { "name": "engine_ops", "source": "engine_ops.cu", "profile": "own" },
     { "name": "cutlass_fp8_blockwise_gemm", "source": "cutlass_fp8_blockwise_gemm.cu", "profile": "cutlass" },
+    { "name": "cutlass_bf16_gemm", "source": "cutlass_bf16_gemm.cu", "profile": "cutlass" },
     {
       "name": "deepgemm_fp8_fp4_grouped",
       "source": "deepgemm_fp8_fp4_grouped.cu",
