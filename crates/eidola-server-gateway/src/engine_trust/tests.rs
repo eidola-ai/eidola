@@ -385,6 +385,18 @@ fn the_gateway_token_is_a_secret_and_only_its_hash_is_measured() {
     let hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA";
     tree.edit_config(hash, "$argon2id$garbage");
     refused(&tree, "GATEWAY_TOKEN_HASH: not a valid Argon2 hash string");
+
+    // A well-formed string no token can verify against, as the node would
+    // find at boot: a memory cost below Argon2's minimum, no salt or output.
+    let mut tree = Tree::fixture();
+    tree.edit_config("m=19456,t=2,p=1", "m=1,t=2,p=1");
+    refused(&tree, "GATEWAY_TOKEN_HASH: has parameters");
+    let mut tree = Tree::fixture();
+    tree.edit_config(hash, "$argon2id$v=19$m=19456,t=2,p=1");
+    refused(
+        &tree,
+        "GATEWAY_TOKEN_HASH: must carry a salt and a hash output",
+    );
 }
 
 /// A retention bound the node refuses at boot is refused here even when the

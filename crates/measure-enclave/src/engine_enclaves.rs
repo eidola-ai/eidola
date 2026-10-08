@@ -205,7 +205,7 @@ containers:
       - EIDOLA_ENGINE_MODEL_ID: "fixture-model"
       - EIDOLA_ENGINE_WEIGHTS_SHA256: "{weights}"
       - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
-      - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
+      - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA"
       - EIDOLA_ENGINE_PREFIX_CACHE: "true"
       - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
       - EIDOLA_ENGINE_CACHE_MAX_AGE_SECS: "7200"

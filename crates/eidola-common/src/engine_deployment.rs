@@ -357,6 +357,12 @@ pub enum TokenHashError {
     NotAPhcString,
     /// A PHC string for an algorithm other than Argon2id.
     NotArgon2id,
+    /// No salt, or no hash output, so no token can ever verify against it.
+    Incomplete,
+    /// Parameters, version, salt or output length `argon2` refuses to hash
+    /// with (a memory cost below its minimum, a salt shorter than eight
+    /// bytes, …), so no token can ever verify against it.
+    Unusable,
 }
 
 #[cfg(feature = "argon2")]
@@ -365,18 +371,44 @@ impl core::fmt::Display for TokenHashError {
         f.write_str(match self {
             Self::NotAPhcString => "not a valid Argon2 hash string",
             Self::NotArgon2id => "must be an Argon2id hash",
+            Self::Incomplete => "must carry a salt and a hash output",
+            Self::Unusable => "has parameters, a salt or an output Argon2 cannot verify with",
         })
     }
 }
 
-/// Parse the gateway token's measured hash (`GATEWAY_TOKEN_HASH`): a PHC
-/// string for Argon2id. The node verifies its token against the result.
+/// Parse the gateway token's measured hash (`GATEWAY_TOKEN_HASH`): an
+/// Argon2id PHC string that a token can actually verify against.
+///
+/// Verification (`PasswordVerifier::verify_password`, which the node runs at
+/// boot) needs a salt and an output, and hashes the candidate with the
+/// hash's own algorithm, version and parameters; any of those `argon2`
+/// refuses makes every token fail. So this runs that same hashing step, with
+/// the same `Argon2::default()` the node verifies with, over an empty
+/// candidate, and keeps only hashes for which it succeeds: the set this
+/// accepts is the set some token verifies against. The comparison itself is
+/// the node's, against its secret.
 #[cfg(feature = "argon2")]
 pub fn parse_gateway_token_hash(hash: &str) -> Result<argon2::PasswordHash, TokenHashError> {
+    use argon2::CustomizedPasswordHasher as _;
+
     let parsed = argon2::PasswordHash::new(hash).map_err(|_| TokenHashError::NotAPhcString)?;
     if parsed.algorithm.as_str() != "argon2id" {
         return Err(TokenHashError::NotArgon2id);
     }
+    let (Some(salt), Some(_)) = (&parsed.salt, &parsed.hash) else {
+        return Err(TokenHashError::Incomplete);
+    };
+    let params = argon2::Params::try_from(&parsed).map_err(|_| TokenHashError::Unusable)?;
+    argon2::Argon2::default()
+        .hash_password_customized(
+            b"",
+            salt,
+            Some(parsed.algorithm.as_str()),
+            parsed.version,
+            params,
+        )
+        .map_err(|_| TokenHashError::Unusable)?;
     Ok(parsed)
 }
 
@@ -474,5 +506,60 @@ mod tests {
             parse_gateway_token_hash("").unwrap_err(),
             TokenHashError::NotAPhcString
         );
+    }
+
+    /// The hashes `parse_gateway_token_hash` refuses are exactly ones no token
+    /// verifies against: `verify_password` itself fails for each, even with
+    /// the token that would match a well-formed hash.
+    #[cfg(feature = "argon2")]
+    #[test]
+    fn the_token_hash_is_one_a_token_can_verify_against() {
+        use argon2::{PasswordHasher, PasswordVerifier};
+
+        let token = b"dev-gateway-token";
+        let good = argon2::Argon2::default()
+            .hash_password(token)
+            .unwrap()
+            .to_string();
+        let parsed = parse_gateway_token_hash(&good).unwrap();
+        argon2::Argon2::default()
+            .verify_password(token, &parsed)
+            .unwrap();
+
+        let (head, tail) = good.split_once("$m=").unwrap();
+        let (_, rest) = tail.split_once('$').unwrap();
+        let (salt, output) = rest.split_once('$').unwrap();
+        for (bad, error) in [
+            (
+                format!("{head}$m=1,t=2,p=1${rest}"),
+                TokenHashError::Unusable,
+            ),
+            (
+                format!("{head}$m=19456,t=0,p=1${rest}"),
+                TokenHashError::Unusable,
+            ),
+            (
+                format!("{head}$m=19456,t=2,p=1$c2FsdA${output}"),
+                TokenHashError::NotAPhcString,
+            ),
+            (
+                format!("{head}$m=19456,t=2,p=1"),
+                TokenHashError::Incomplete,
+            ),
+            (
+                format!("{head}$m=19456,t=2,p=1${salt}"),
+                TokenHashError::Incomplete,
+            ),
+        ] {
+            assert_eq!(parse_gateway_token_hash(&bad).unwrap_err(), error, "{bad}");
+            if let Ok(phc) = argon2::PasswordHash::new(&bad) {
+                assert!(
+                    argon2::Argon2::default()
+                        .verify_password(token, &phc)
+                        .is_err(),
+                    "{bad} verifies, so refusing it is wrong"
+                );
+            }
+        }
     }
 }
