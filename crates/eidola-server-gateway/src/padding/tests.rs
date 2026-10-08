@@ -5,7 +5,7 @@ use axum::Json;
 use futures_util::StreamExt;
 use proptest::prelude::*;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use super::*;
@@ -403,8 +403,7 @@ const TEST_CADENCE: Cadence = Cadence {
 /// size, and the stream ends with the frame that carries `[DONE]`.
 #[tokio::test(start_paused = true)]
 async fn frames_go_out_on_ticks_not_on_arrival() {
-    let (tx, rx) = mpsc::channel(32);
-    let mut stream = PaddedStream::new(rx, TEST_CADENCE);
+    let (tx, mut stream) = channel(TEST_CADENCE);
     let start = Instant::now();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(7)).await;
@@ -441,47 +440,109 @@ async fn frames_go_out_on_ticks_not_on_arrival() {
     );
 }
 
-/// A producer that outruns the frames is held at the backlog bound: the stream
-/// stops taking events, the channel fills, and the producer waits for frames.
+/// A producer that outruns the frames is held at the backlog bound, which is
+/// in bytes: events are admitted while the waiting bytes plus theirs fit, an
+/// event larger than the bound only when nothing else is waiting, and a
+/// stalled writer (nothing taking frames) stops the producer there.
 #[tokio::test(start_paused = true)]
-async fn a_producer_faster_than_the_frames_waits_at_the_backlog_bound() {
+async fn the_backlog_is_bounded_in_bytes_even_for_a_large_event() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let cadence = Cadence {
         max_backlog_bytes: 128,
         ..TEST_CADENCE
     };
-    let (tx, rx) = mpsc::channel(1);
-    let mut stream = PaddedStream::new(rx, cadence);
-    let start = Instant::now();
-    let producer = tokio::spawn(async move {
-        for i in 0..20 {
-            // 58 bytes encoded: twenty of them are many frames' worth.
-            let json = format!("{{\"i\":{i:02},\"pad\":\"{}\"}}", "p".repeat(33));
-            tx.send(StreamEvent::Json(json)).await.unwrap();
-        }
-        tx.send(StreamEvent::Done).await.unwrap();
-        start.elapsed()
-    });
-    let mut frames = 0;
+    let (tx, mut stream) = channel(cadence);
+    // 50 bytes encoded each, and one of 500.
+    let small = |i: usize| StreamEvent::Json(format!("{{\"i\":{i},\"p\":\"{}\"}}", "p".repeat(28)));
+    assert_eq!(encode(&small(0)).0.len(), 50);
+    let big = StreamEvent::Json(format!("{{\"big\":\"{}\"}}", "b".repeat(482)));
+    assert_eq!(encode(&big).0.len(), 500);
+    let sent = Arc::new(AtomicUsize::new(0));
+    let producer = {
+        let sent = sent.clone();
+        tokio::spawn(async move {
+            for event in [
+                small(0),
+                small(1),
+                small(2),
+                big,
+                small(3),
+                StreamEvent::Done,
+            ] {
+                tx.send(event).await.unwrap();
+                sent.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+
+    // A stalled writer: nothing takes frames, so two events (100 bytes) are
+    // in and the third would pass 128.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
+    assert_eq!(stream.backlog(), 100);
+
+    let mut seen_big_alone = false;
+    let mut frames = Vec::new();
     while let Some(Ok(frame)) = stream.next().await {
         assert_eq!(frame.len(), 64);
-        frames += 1;
+        frames.push(frame);
+        tokio::task::yield_now().await;
+        let state = stream.shared.lock();
+        let backlog = state.framer.backlog();
+        if backlog > 128 {
+            // Only the one event larger than the bound, alone.
+            assert_eq!(state.framer.events.len(), 1, "{backlog}");
+            assert!(backlog <= 500);
+            seen_big_alone = true;
+        }
     }
-    let producer_done = producer.await.unwrap();
-    assert!(frames >= (20 * 58 + 14usize).div_ceil(64), "{frames}");
-    assert!(
-        producer_done >= Duration::from_millis(500),
-        "the producer waited for frames: {producer_done:?}"
+    producer.await.unwrap();
+    assert!(seen_big_alone);
+    let mut want = vec![small(0), small(1), small(2)];
+    want.push(StreamEvent::Json(format!(
+        "{{\"big\":\"{}\"}}",
+        "b".repeat(482)
+    )));
+    want.push(small(3));
+    want.push(StreamEvent::Done);
+    assert_eq!(
+        spec_events(&concat(&frames))
+            .iter()
+            .map(|d| read(d))
+            .collect::<Vec<_>>(),
+        expected(&want)
     );
 }
 
-/// A client that goes away drops the stream, and with it the receiver: the
-/// producer's next send fails, which is how the handler sees the disconnect.
+/// A client that goes away drops the stream: the producer's next send fails,
+/// which is how the handler sees the disconnect, and so does a send already
+/// waiting for room.
 #[tokio::test]
 async fn a_dropped_stream_fails_the_producers_send() {
-    let (tx, rx) = mpsc::channel(4);
-    let stream = PaddedStream::new(rx, TEST_CADENCE);
+    let (tx, stream) = channel(TEST_CADENCE);
     drop(stream);
     assert!(tx.send(StreamEvent::Done).await.is_err());
+
+    let (tx, stream) = channel(Cadence {
+        max_backlog_bytes: 64,
+        ..TEST_CADENCE
+    });
+    tx.send(StreamEvent::Json(format!(
+        "{{\"a\":\"{}\"}}",
+        "x".repeat(40)
+    )))
+    .await
+    .unwrap();
+    let waiting = tokio::spawn(async move {
+        tx.send(StreamEvent::Json(format!(
+            "{{\"b\":\"{}\"}}",
+            "x".repeat(40)
+        )))
+        .await
+    });
+    tokio::task::yield_now().await;
+    drop(stream);
+    assert_eq!(waiting.await.unwrap(), Err(StreamClosed));
 }
 
 /// Over a real HTTP/1.1 connection, every frame is one chunk of the frame
@@ -495,15 +556,17 @@ async fn each_tick_is_one_http_chunk_of_the_frame_size() {
         tick: Duration::from_millis(10),
         max_backlog_bytes: 1 << 20,
     };
-    let (tx, rx) = mpsc::channel(32);
-    let slot = Arc::new(Mutex::new(Some(rx)));
-    let app = axum::Router::new().route(
+    let (tx, padded) = channel(cadence);
+    let slot = Arc::new(Mutex::new(Some(padded)));
+    // Through the layer every route has: it must pass a stream through as it
+    // comes, never buffer it.
+    let app = shape(axum::Router::new().route(
         "/",
         axum::routing::get(move || {
-            let rx = slot.lock().unwrap().take().expect("one request");
-            async move { padded_sse_response(rx, cadence) }
+            let padded = slot.lock().unwrap().take().expect("one request");
+            async move { padded_sse_response(padded) }
         }),
-    );
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -601,13 +664,18 @@ fn body_buckets_are_powers_of_two_from_the_floor() {
 }
 
 /// A JSON body (a completion, or an error carrying a refund) is padded to its
-/// bucket and parses to the same value; an event stream is left alone.
+/// bucket, parses to the same value and carries `no-transform`; an event
+/// stream is left alone; a content-encoded body is refused, padded.
 #[tokio::test]
 async fn a_json_body_is_padded_to_its_bucket_and_parses_the_same() {
     for len in [0usize, 10, 4000, 5000, 70_000] {
         let value =
             serde_json::json!({ "choices": [{ "message": { "content": "x".repeat(len) } }] });
-        let response = pad_json_response(Json(value.clone()).into_response()).await;
+        let response = pad_body(Json(value.clone()).into_response()).await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            HeaderValue::from_static("no-transform")
+        );
         let declared: usize = response.headers()[header::CONTENT_LENGTH]
             .to_str()
             .unwrap()
@@ -624,42 +692,183 @@ async fn a_json_body_is_padded_to_its_bucket_and_parses_the_same() {
         );
     }
 
-    let error = ServerError::BadRequest {
-        message: "unknown model".into(),
-    }
-    .into_response();
-    let status = error.status();
-    let padded = pad_json_response(error).await;
-    assert_eq!(padded.status(), status);
-    let bytes = axum::body::to_bytes(padded.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(bytes.len(), MIN_BODY_BUCKET);
+    let mut cached = Json(serde_json::json!({})).into_response();
+    cached
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let cached = pad_body(cached).await;
+    assert_eq!(
+        cached.headers()[header::CACHE_CONTROL],
+        HeaderValue::from_static("no-store, no-transform")
+    );
 
-    let (_tx, rx) = mpsc::channel(1);
-    let sse = padded_sse_response(rx, TEST_CADENCE);
-    let passed = pad_json_response(sse).await;
+    let (_tx, padded) = channel(TEST_CADENCE);
+    let passed = pad_body(padded_sse_response(padded)).await;
     assert!(passed.headers().get(header::CONTENT_LENGTH).is_none());
     assert_eq!(
         passed.headers()[header::CONTENT_TYPE],
         HeaderValue::from_static("text/event-stream")
     );
+
+    let mut encoded = Json(serde_json::json!({ "a": 1 })).into_response();
+    encoded
+        .headers_mut()
+        .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    let refused = pad_body(encoded).await;
+    assert_eq!(
+        refused.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(refused.headers().get(header::CONTENT_ENCODING).is_none());
+    let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.len(), MIN_BODY_BUCKET);
 }
 
-/// The chat handler writes a stream only through the framer, and pads every
-/// other answer: no axum `Sse` (whose events are relayed as they come), no
-/// keep-alive (a comment of its own size, on its own schedule), no event
-/// written past the framer. A source scan, because the handler needs a
-/// database to run and what is asserted is the absence of the other paths.
+/// What `shape` puts in front of the real extractors: a refusal of every kind
+/// is padded to a bucket, carries `no-transform`, and echoes nothing the
+/// client sent. Covers a missing credential, malformed JSON quoting a long
+/// scalar, an unknown field, an oversized body, a wrong method, an unknown
+/// path, and a handler that panics.
+#[tokio::test]
+async fn every_refusal_on_the_router_is_padded_and_echoes_nothing() {
+    use axum::http::{Method, Request as HttpRequest, StatusCode};
+    use tower::ServiceExt;
+
+    async fn chat(
+        _auth: crate::auth::TokenAuth,
+        crate::handlers::ChatRequest(_): crate::handlers::ChatRequest,
+    ) -> &'static str {
+        "ok"
+    }
+    async fn body_only(
+        crate::handlers::ChatRequest(_): crate::handlers::ChatRequest,
+    ) -> &'static str {
+        "ok"
+    }
+    async fn panics() -> &'static str {
+        panic!("a handler defect")
+    }
+    let app = shape(
+        axum::Router::new()
+            .route("/v1/chat/completions", axum::routing::post(chat))
+            .route("/body", axum::routing::post(body_only))
+            .route("/panics", axum::routing::get(panics)),
+    );
+
+    let secret = "s".repeat(9000);
+    let cases: Vec<(Method, &str, Option<&str>, String, StatusCode)> = vec![
+        (
+            Method::POST,
+            "/v1/chat/completions",
+            None,
+            "{}".into(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            Method::POST,
+            "/body",
+            Some("application/json"),
+            format!(r#"{{"model":"m","messages":[],"max_completion_tokens":"{secret}"}}"#),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            Method::POST,
+            "/body",
+            Some("application/json"),
+            format!(r#"{{"model":"m","messages":[],"{secret}":1}}"#),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            Method::POST,
+            "/body",
+            Some("application/json"),
+            format!(r#"{{"model":"{secret}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            "/body",
+            Some("application/json"),
+            format!(r#"{{"model":"{}"}}"#, "x".repeat(3 << 20)),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            Method::GET,
+            "/v1/chat/completions",
+            None,
+            String::new(),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            Method::GET,
+            "/nowhere-sssssssssssssssssssssss",
+            None,
+            String::new(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::GET,
+            "/panics",
+            None,
+            String::new(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ];
+    for (method, path, content_type, body, status) in cases {
+        let mut request = HttpRequest::builder().method(method.clone()).uri(path);
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(axum::body::Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{method} {path}");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            HeaderValue::from_static("no-transform"),
+            "{method} {path}"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), MIN_BODY_BUCKET, "{method} {path}");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("sssss"), "{method} {path} echoed: {text}");
+    }
+}
+
+/// The chat handler writes a stream only through the framer, and every route
+/// sits behind `shape`: no axum `Sse` (whose events are relayed as they
+/// come), no keep-alive (a comment of its own size, on its own schedule), no
+/// event written past the framer, and no compression layer anywhere. A
+/// source scan, because the handler needs a database to run and what is
+/// asserted is the absence of the other paths.
 #[test]
 fn the_chat_handler_answers_only_through_the_padding() {
     let source = include_str!("../handlers.rs");
     let source = &source[..source.find("#[cfg(test)]").unwrap()];
-    for absent in ["Sse::new", "KeepAlive", "Event::default", "sse::"] {
+    for absent in [
+        "Sse::new",
+        "KeepAlive",
+        "Event::default",
+        "sse::",
+        "mpsc::channel",
+    ] {
         assert!(!source.contains(absent), "{absent} in handlers.rs");
     }
-    assert!(source.contains("padding::padded_sse_response(rx, Cadence::CLIENT_FACING)"));
-    assert!(source.contains("padding::pad_json_response(response).await"));
+    assert!(source.contains("padding::channel(Cadence::CLIENT_FACING)"));
+    assert!(source.contains("padding::padded_sse_response(padded)"));
+
+    let main = include_str!("../main.rs");
+    assert!(main.contains("eidola_server_gateway::padding::shape(router)"));
+    let manifest = include_str!("../../Cargo.toml");
+    for absent in ["compression", "tower-http", "async-compression", "flate2"] {
+        assert!(!manifest.contains(absent), "{absent} in Cargo.toml");
+    }
 }
 
 /// A reader that falls behind (hyper polls the body only when the socket can
@@ -667,8 +876,7 @@ fn the_chat_handler_answers_only_through_the_padding() {
 /// missed ticks are not made up as frames written back to back.
 #[tokio::test(start_paused = true)]
 async fn a_late_reader_never_gets_frames_back_to_back() {
-    let (_tx, rx) = mpsc::channel(4);
-    let mut stream = PaddedStream::new(rx, TEST_CADENCE);
+    let (_tx, mut stream) = channel(TEST_CADENCE);
     let start = Instant::now();
     stream.next().await.unwrap().unwrap();
     tokio::time::sleep(Duration::from_millis(175)).await;

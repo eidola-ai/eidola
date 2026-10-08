@@ -144,3 +144,5 @@ tinfoil-shim-mock = { path = "../tinfoil-shim-mock" }
 # independence from token lengths over generated delta sequences.
 tokio = { version = "1", features = ["full", "test-util"] }
 proptest = "1.11"
+# `ServiceExt::oneshot`, to drive the shaped router's refusals in process.
+tower = { version = "0.5", features = ["util"] }

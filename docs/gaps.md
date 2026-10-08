@@ -112,7 +112,7 @@ Eidola does not defend against an adversary observing network metadata (connecti
 
 **What it would catch.** Connection patterns, packet sizes, timing — even with TLS confidentiality, these can reveal a great deal (which model you used, the rough shape of conversations, when you are active).
 
-**Mitigations today.** User-side: route Eidola through Tor. Eidola's protocol is plain HTTPS, so this works without modification. Server-side, for the response only: the Eidola server writes a streamed answer as fixed-size frames at a fixed interval and pads a blocking answer to a size bucket, so an observer sees how long a response ran rather than the size and timing of its tokens ([server.md § Response shape](server.md#response-shape)). Connection patterns, request sizes and the total duration of each response remain visible.
+**Mitigations today.** User-side: route Eidola through Tor. Eidola's protocol is plain HTTPS, so this works without modification. Server-side, for the response only: the Eidola server writes a streamed answer as fixed-size frames at a fixed interval and pads every other response (a blocking answer, an error, a refusal) to a size bucket, so an observer sees how long a response ran rather than the size and timing of its tokens ([server.md § Response shape](server.md#response-shape)). Connection patterns, request sizes and the total duration of each response remain visible.
 
 **Future.** We consider this in-scope as an Eidola problem to address, but do not yet have a committed plan. Explored directions include offering a Tor hidden service endpoint and partnering with independent organizations to provide oblivious HTTP (oHTTP) or MASQUE/CONNECT-style transports that decouple network identity from request content.
 

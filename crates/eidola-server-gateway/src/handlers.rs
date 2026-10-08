@@ -448,10 +448,7 @@ pub async fn chat_completions(
         ],
     );
 
-    // Every answer from here is sized to a bucket (a JSON body: a completion,
-    // or an error) or framed (an event stream): see `padding`.
-    let response = result.unwrap_or_else(IntoResponse::into_response);
-    Ok(padding::pad_json_response(response).await)
+    result
 }
 
 async fn chat_completions_phases(
@@ -803,8 +800,8 @@ async fn handle_streaming_request(
     };
 
     // Events for the client, framed by `padding` into fixed-size writes on a
-    // fixed tick (see `padded_sse_response`).
-    let (tx, rx) = mpsc::channel::<StreamEvent>(32);
+    // fixed tick, the waiting bytes bounded (see `padding::EventSender::send`).
+    let (tx, padded) = padding::channel(Cadence::CLIENT_FACING);
 
     // Clone/copy values for the spawned task.
     let issuer_key_hash = act.issuer_key_hash;
@@ -875,7 +872,7 @@ async fn handle_streaming_request(
 
         /// Send a metadata SSE event containing a refund, then [DONE].
         async fn send_metadata_event(
-            tx: &mpsc::Sender<StreamEvent>,
+            tx: &padding::EventSender,
             refund_info: Option<RefundInfo>,
             privacy: crate::response::PrivacyMetadata,
             verification: crate::response::VerificationMetadata,
@@ -994,11 +991,11 @@ async fn handle_streaming_request(
         send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;
     });
 
-    Ok(padding::padded_sse_response(rx, Cadence::CLIENT_FACING))
+    Ok(padding::padded_sse_response(padded))
 }
 
-/// `Json<T>` wrapper that logs the rejection reason at warn level on
-/// failure, before returning the same response axum would have returned.
+/// `Json<T>` wrapper that logs the rejection's class at warn level on
+/// failure and answers it with a fixed message for that class.
 ///
 /// Why we need this: `Json<T>` rejections fail the request before the
 /// handler runs (the extractor runs first), so handler-level logging
@@ -1013,9 +1010,12 @@ async fn handle_streaming_request(
 /// echo client-authored body values** — `deny_unknown_fields` quotes the
 /// unrecognized field name verbatim, and serde's data errors quote the
 /// offending scalar (`invalid type: string "<the whole string>",
-/// expected u32`). Only the rejection *class* reaches the log path; the
-/// full detail still goes to the client in the rejection response — its
-/// own data, over its own attested connection.
+/// expected u32`). So neither the log nor the client gets it: the log
+/// records the class, and the client gets a fixed message for the class
+/// (`refusal`), with the rejection's own status. Sent to the client, the
+/// detail would be its own data over its own attested connection, but the
+/// response's length would carry the echoed value to anyone watching the
+/// ciphertext, padding or not (a bucket is a function of length).
 ///
 /// Before any of that, the body's JSON shape is held to the limits an
 /// Eidola-hosted engine enforces (`eidola_common::engine_protocol::
@@ -1055,7 +1055,7 @@ async fn checked_body<T, S: Send + Sync>(
                 payload_type = std::any::type_name::<T>(),
                 "request body rejected: bytes error"
             );
-            rejection.into_response()
+            refusal(rejection.status(), "the request body could not be read")
         })?;
     // A malformed body goes on to axum's parse, which refuses it as it always has
     // (and, since the scan counts values as it goes, holds no more of them before
@@ -1098,20 +1098,38 @@ where
         Err(rejection) => {
             // Class only — the rejection's message can quote body
             // values (see the type-level privacy note).
-            let class = match &rejection {
-                JsonRejection::JsonDataError(_) => "data",
-                JsonRejection::JsonSyntaxError(_) => "syntax",
-                JsonRejection::MissingJsonContentType(_) => "missing content-type",
-                JsonRejection::BytesRejection(_) => "bytes",
-                _ => "other",
+            let (class, message) = match &rejection {
+                JsonRejection::JsonDataError(_) => (
+                    "data",
+                    "the request body does not match the expected schema",
+                ),
+                JsonRejection::JsonSyntaxError(_) => {
+                    ("syntax", "the request body is not valid JSON")
+                }
+                JsonRejection::MissingJsonContentType(_) => (
+                    "missing content-type",
+                    "expected a request with `Content-Type: application/json`",
+                ),
+                JsonRejection::BytesRejection(_) => ("bytes", "the request body could not be read"),
+                _ => ("other", "invalid request body"),
             };
             warn!(
                 payload_type = std::any::type_name::<T>(),
                 "request body rejected: {class} error"
             );
-            Err(rejection.into_response())
+            Err(refusal(rejection.status(), message))
         }
     }
+}
+
+/// A body refusal: `status`, and a fixed message that quotes nothing from the
+/// request.
+fn refusal(status: axum::http::StatusCode, message: &'static str) -> axum::response::Response {
+    (
+        status,
+        Json(ErrorResponse::new(message, "invalid_request_error")),
+    )
+        .into_response()
 }
 
 /// The chat request: [`LoggedJson`]'s checks and refusals, keeping the body's

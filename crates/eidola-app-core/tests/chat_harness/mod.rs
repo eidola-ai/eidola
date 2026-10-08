@@ -161,6 +161,14 @@ pub enum ChatBehavior {
     /// spelled here rather than imported: the mock must not learn this app's
     /// ceilings.
     StreamingPaddedPastReadCeiling,
+    /// A padded stream whose **answer is just under the read ceiling** —
+    /// eight megabytes less four kilobytes of events that carry data — and
+    /// whose last frames (several of nothing but padding, then the tail)
+    /// arrive coalesced into one transport chunk, as an intermediary that
+    /// buffers may deliver them. A reader that counts a transport chunk
+    /// before telling its padding from its data crosses the ceiling here;
+    /// one that counts only data does not.
+    StreamingPaddedNearReadCeiling,
     /// A plain success in **whichever transport asked** — SSE for a streaming
     /// request, JSON for a blocking one. One behaviour for a test that must
     /// exercise both twins against one upstream, which is otherwise impossible:
@@ -1478,6 +1486,7 @@ async fn handle_chat(
             };
             write_padded_sse_stream(stream, &PADDED_CONTENT, refund, idle_frames).await
         }
+        ChatBehavior::StreamingPaddedNearReadCeiling => write_padded_near_ceiling(stream).await,
         ChatBehavior::StreamingSplitDataFields => {
             let refund = auth
                 .and_then(Issuer::spend_proof_from_auth)
@@ -2360,6 +2369,78 @@ async fn write_padded_sse_stream(
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// See [`ChatBehavior::StreamingPaddedNearReadCeiling`]. The sizes are the
+/// server's own encoding (`data: ` + JSON + a blank line), summed here.
+async fn write_padded_near_ceiling(stream: &mut TcpStream) -> std::io::Result<()> {
+    use eidola_server_gateway::padding::{FRAME_BYTES, Framer, StreamEvent};
+    // Spelled here rather than imported: the mock is the peer.
+    const TARGET: usize = 8 * 1024 * 1024 - 4096;
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+
+    let chunk = |content: &str| {
+        serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": null }]
+        })
+        .to_string()
+    };
+    let encoded = |json: &str| json.len() + "data: ".len() + 2;
+    let tail = vec![
+        serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] })
+            .to_string(),
+        serde_json::json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16 }
+        })
+        .to_string(),
+        serde_json::json!({ "object": "eidola.chat.completion.metadata", "id": "chatcmpl-mock" })
+            .to_string(),
+    ];
+    let tail_bytes: usize =
+        tail.iter().map(|j| encoded(j)).sum::<usize>() + "data: [DONE]\n\n".len();
+    let overhead = encoded(&chunk(""));
+    let piece = 64 * 1024;
+    let mut contents = Vec::new();
+    let mut total = tail_bytes;
+    while total + overhead + piece <= TARGET {
+        contents.push("y".repeat(piece));
+        total += overhead + piece;
+    }
+    contents.push("y".repeat(TARGET - total - overhead));
+
+    let mut framer = Framer::new(FRAME_BYTES);
+    let chunked = |frames: &[u8]| {
+        let mut out = format!("{:x}\r\n", frames.len()).into_bytes();
+        out.extend_from_slice(frames);
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+    for content in &contents {
+        framer.push(&StreamEvent::Json(chunk(content)));
+        while framer.backlog() > 0 {
+            stream.write_all(&chunked(&framer.frame())).await?;
+        }
+    }
+    // The last frames, coalesced: padding, then the tail.
+    let mut last = Vec::new();
+    for _ in 0..8 {
+        last.extend_from_slice(&framer.frame());
+    }
+    for json in tail {
+        framer.push(&StreamEvent::Json(json));
+    }
+    framer.push(&StreamEvent::Done);
+    while framer.backlog() > 0 {
+        last.extend_from_slice(&framer.frame());
+    }
+    stream.write_all(&chunked(&last)).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await
 }
 
 /// The metadata stream with each JSON payload split across one `data:` field

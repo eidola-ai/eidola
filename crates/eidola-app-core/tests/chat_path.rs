@@ -7089,6 +7089,31 @@ fn a_long_padded_stream_is_not_cut_at_the_ceiling_or_lost_from_the_record() {
     });
 }
 
+/// **The ceiling is asked of events, not of transport chunks.** The answer here
+/// is just under the ceiling, and its last frames arrive coalesced into one
+/// chunk that is mostly padding: counted before its padding was told from its
+/// data, that chunk carried the sum past the ceiling and the turn failed with
+/// almost all of its answer read.
+#[test]
+fn an_answer_just_under_the_ceiling_is_not_pushed_over_it_by_padding() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingPaddedNearReadCeiling,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let res = stream_once(&core, "stream me").expect("the turn completes");
+        assert!(
+            res.content.len() > 8 * 1024 * 1024 - 64 * 1024,
+            "{} bytes",
+            res.content.len()
+        );
+        assert!(res.content.bytes().all(|b| b == b'y'));
+        let rows = completion_rows(&core);
+        assert_eq!(rows[0].error, None);
+    });
+}
+
 /// REGRESSION: **a stream that never opened still settles from the refund its
 /// error body carried.**
 ///

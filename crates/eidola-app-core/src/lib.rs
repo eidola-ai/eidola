@@ -8528,25 +8528,9 @@ impl Inner {
                 }
             };
             buf.extend_from_slice(&bytes);
-            // **The ceiling bounds what the answer is made of, not padding.**
-            // The Eidola server streams fixed-size frames on a fixed tick,
-            // filled with comment events for as long as the answer runs, so
-            // counting those would end a slow answer at the ceiling having
-            // read almost none of it. A padding event is dropped as soon as
-            // it is drained (`RecordedBody::push_event`) and costs nothing to
-            // hold; the frame buffer has its own ceiling below.
-            if raw.payload_received() + buf.len() > peer_read::MAX_RESPONSE_BYTES {
-                read_error = Some(AppError::Network {
-                    message: format!(
-                        "the model's response stream passed the {}-byte ceiling this app reads \
-                         for one answer",
-                        peer_read::MAX_RESPONSE_BYTES
-                    ),
-                });
-                break;
-            }
 
             let mut oversized = false;
+            let mut past_ceiling = false;
             while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
                 // The frame ceiling is asked of a complete event **before** it
                 // is drained (`peer_read::event_past_ceiling`).
@@ -8560,6 +8544,26 @@ impl Inner {
                 // Record with its event, and nowhere else.
                 let boundary = buf.drain(..boundary_len).collect::<Vec<u8>>();
                 raw.push_event(&event_bytes, &boundary);
+                // **The ceiling bounds what the answer is made of, not
+                // padding**, so it is asked of each event once it is
+                // classified, never of a transport chunk: the Eidola server
+                // streams fixed-size frames on a fixed tick, filled with
+                // comment events for as long as the answer runs, and a chunk
+                // counted whole would carry its padding into the sum. A
+                // padding event costs nothing to hold; what is not yet an
+                // event is the frame buffer, bounded on its own below. The
+                // event that crosses the ceiling is not used.
+                if raw.payload_received() > peer_read::MAX_RESPONSE_BYTES {
+                    read_error = Some(AppError::Network {
+                        message: format!(
+                            "the model's response stream passed the {}-byte ceiling this app \
+                             reads for one answer",
+                            peer_read::MAX_RESPONSE_BYTES
+                        ),
+                    });
+                    past_ceiling = true;
+                    break;
+                }
                 let event_str = match std::str::from_utf8(&event_bytes) {
                     Ok(s) => s,
                     Err(_) => continue,
@@ -8657,6 +8661,9 @@ impl Inner {
             // a backend that never terminates one grows it without end — the
             // other half of the frame ceiling, beside the complete event the
             // drain refused above. Either way the event is refused, not used.
+            if past_ceiling {
+                break;
+            }
             if oversized || peer_read::event_past_ceiling(None, buf.len()) {
                 read_error = Some(peer_read::oversized_event(&prep.backend_id));
                 raw.push_event(&buf, &[]);
