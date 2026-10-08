@@ -1100,8 +1100,12 @@ impl Inner {
             // upstream for its own refunds — asking or not asking changes
             // nothing there.)
             stream && request.include_usage,
-            // The proxy relays no prefix-cache key: `cache_key` is not one of
-            // the body fields it reads from a downstream caller.
+            // **No prefix-cache key, ever.** A proxied request has no lineage
+            // — no space, no participant — for an app-minted key to be scoped
+            // to, and `cache_key` is not a body field this proxy reads from a
+            // caller: a value a downstream tool picks and never rotates would
+            // link every request it rides on, which is `traceparent`'s reason
+            // for being stripped too.
             None,
         );
         if let Some(object) = body.as_object_mut() {

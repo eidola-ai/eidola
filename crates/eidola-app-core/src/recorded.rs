@@ -246,11 +246,38 @@ fn seal_recorded_body(mut kept: Vec<u8>, received: usize, side: RecordedSide) ->
 /// honest about it. See [`RecordedBody::seal_request`].
 ///
 /// **The request still travels whole**; what is bounded is what is kept.
+///
+/// **One member is withheld rather than kept: `cache_key`.** The prefix-cache
+/// key is secret ([`crate::prefix_cache`]) and the Record is a surface people
+/// read, so the row says a key was sent — its value replaced by
+/// [`WITHHELD_CACHE_KEY`] — and never which. A body without one is kept
+/// exactly as before.
 pub(crate) fn recorded_request(body: &Value) -> Vec<u8> {
     let mut kept = RecordedBody::default();
-    kept.push(body.to_string().as_bytes());
+    if let Some(sent_key_len) = body.get("cache_key").and_then(Value::as_str).map(str::len) {
+        let mut shown = body.clone();
+        crate::prefix_cache::scrub_body_key(&mut shown);
+        shown["cache_key"] = Value::String(WITHHELD_CACHE_KEY.to_string());
+        let shown = shown.to_string();
+        kept.push(shown.as_bytes());
+        // **The size the seal states is the size that was sent**, not the
+        // redacted copy's: the two serializations differ only in that one
+        // string, and neither a key (base64url) nor the placeholder needs
+        // escaping, so the difference is their lengths. The placeholder is a
+        // key's length besides, so the kept copy is the sent one's size and
+        // the seal's "was it all kept" comparison means what it says.
+        kept.received = shown.len() - WITHHELD_CACHE_KEY.len() + sent_key_len;
+    } else {
+        kept.push(body.to_string().as_bytes());
+    }
     kept.seal_request()
 }
+
+/// What the Record shows in place of a request's prefix-cache key — exactly
+/// as long as the key's text, so withholding it changes no size.
+pub(crate) const WITHHELD_CACHE_KEY: &str = "[withheld: this request's prefix-cache key]";
+const _: () =
+    assert!(WITHHELD_CACHE_KEY.len() == eidola_common::engine_protocol::CACHE_KEY_TEXT_LEN);
 
 /// What the Record keeps of a blocking answer, stating both the retention cap
 /// and the read ceiling where either applied.
@@ -277,6 +304,92 @@ pub(crate) fn recorded_cut_answer(partial: &BoundedBody) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Record says a key was sent and never which; a keyless body is kept
+    /// byte for byte.
+    #[test]
+    fn a_requests_cache_key_is_withheld_from_the_record() {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+        let keyed = eidola_common::chat_completion_request_body(
+            "m",
+            &messages,
+            16,
+            &[],
+            false,
+            false,
+            Some(key),
+        );
+        let kept = String::from_utf8(recorded_request(&keyed)).unwrap();
+        assert!(!kept.contains(key), "{kept}");
+        let parsed: Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(parsed["cache_key"], WITHHELD_CACHE_KEY);
+        assert_eq!(parsed["messages"], keyed["messages"]);
+        // The caller's body still carries the key it sends.
+        assert_eq!(keyed["cache_key"], key);
+
+        let keyless = eidola_common::chat_completion_request_body(
+            "m",
+            &messages,
+            16,
+            &[],
+            false,
+            false,
+            None,
+        );
+        assert_eq!(recorded_request(&keyless), keyless.to_string().into_bytes());
+    }
+
+    /// Past the retention cap, the seal states the size of the body that was
+    /// **sent**, key and all — not the size of the copy the Record withheld it
+    /// from.
+    #[test]
+    fn a_withheld_keys_request_past_the_cap_states_the_size_that_was_sent() {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let messages = [serde_json::json!({
+            "role": "user",
+            "content": "x".repeat(RECORD_BODY_MAX_BYTES + 4096),
+        })];
+        let keyed = eidola_common::chat_completion_request_body(
+            "m",
+            &messages,
+            16,
+            &[],
+            false,
+            false,
+            Some(key),
+        );
+        let sent = keyed.to_string().len();
+        let kept = String::from_utf8_lossy(&recorded_request(&keyed)).into_owned();
+        assert!(!kept.contains(key));
+        let tail = &kept[kept.len() - 300..];
+        assert!(
+            tail.contains(&format!(
+                "first {RECORD_BODY_MAX_BYTES} bytes of a {sent}-byte request"
+            )),
+            "{tail}"
+        );
+    }
+
+    /// Under the cap, withholding the key adds no truncation note: the kept
+    /// copy is whole.
+    #[test]
+    fn a_withheld_key_is_not_a_truncation() {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+        let keyed = eidola_common::chat_completion_request_body(
+            "m",
+            &messages,
+            16,
+            &[],
+            false,
+            false,
+            Some(key),
+        );
+        let kept = String::from_utf8(recorded_request(&keyed)).unwrap();
+        assert_eq!(kept.len(), keyed.to_string().len());
+        assert!(!kept.contains("[eidola:"), "{kept}");
+    }
 
     /// A request's note is a request's: it states the size this app built and
     /// claims nothing about sending, delivering or receiving.

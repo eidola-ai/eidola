@@ -8,6 +8,8 @@
 //!   base64url ([`CACHE_KEY_TEXT_LEN`] characters). [`is_cache_key_text`] is
 //!   the shape rule: the gateway refuses anything else before a request is
 //!   paid for, and the node's decoder accepts exactly what it accepts.
+//!   [`encode_cache_key`] is the one encoder, used by the client that mints
+//!   keys, so every key it sends has the spelling the rule accepts.
 //! - **The weights header** ([`WEIGHTS_HEADER`]) the gateway sends on every
 //!   chat request to a node, carrying the lowercase-hex weights hash it
 //!   expects that node to serve. The node refuses a request without it, or
@@ -330,6 +332,37 @@ pub fn is_cache_key_text(text: &str) -> bool {
     }
     let spare_bits = CACHE_KEY_TEXT_LEN * 6 - CACHE_KEY_BYTES * 8;
     last & ((1 << spare_bits) - 1) == 0
+}
+
+/// The one spelling of a prefix-cache key: [`CACHE_KEY_BYTES`] bytes as
+/// unpadded base64url, the text [`is_cache_key_text`] accepts.
+///
+/// Returned as ASCII bytes in a fixed array rather than a `String` so a
+/// caller holding secret key material decides where the text lives and when
+/// it is scrubbed; nothing here keeps a copy. The final character carries the
+/// key's last four bits and two zero bits, which is what makes the spelling
+/// canonical.
+pub fn encode_cache_key(key: &[u8; CACHE_KEY_BYTES]) -> [u8; CACHE_KEY_TEXT_LEN] {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = [0u8; CACHE_KEY_TEXT_LEN];
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    let mut written = 0;
+    for &byte in key {
+        acc = (acc << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 6 {
+            bits -= 6;
+            out[written] = ALPHABET[((acc >> bits) & 0x3f) as usize];
+            written += 1;
+        }
+    }
+    if bits > 0 {
+        out[written] = ALPHABET[((acc << (6 - bits)) & 0x3f) as usize];
+        written += 1;
+    }
+    debug_assert_eq!(written, CACHE_KEY_TEXT_LEN);
+    out
 }
 
 /// The six-bit value of one URL-safe base64 character, or `None` for any
@@ -737,5 +770,52 @@ mod tests {
         // Values 0, 4, 8, …, 60: the sixteen characters whose two low bits
         // are zero.
         assert_eq!(accepted.iter().collect::<String>(), "AEIMQUYcgkosw048");
+    }
+
+    fn encoded(key: &[u8; CACHE_KEY_BYTES]) -> String {
+        String::from_utf8(encode_cache_key(key).to_vec()).expect("ASCII")
+    }
+
+    #[test]
+    fn the_encoder_spells_known_keys_as_base64url_without_padding() {
+        // Vectors from an independent implementation (Python's
+        // `base64.urlsafe_b64encode`, padding stripped).
+        assert_eq!(encoded(&[0; CACHE_KEY_BYTES]), ZERO_KEY);
+        assert_eq!(
+            encoded(&[0xff; CACHE_KEY_BYTES]),
+            "__________________________________________8"
+        );
+        let mut ascending = [0u8; CACHE_KEY_BYTES];
+        for (i, b) in ascending.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        assert_eq!(
+            encoded(&ascending),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+        );
+    }
+
+    #[test]
+    fn every_encoded_key_is_one_the_shape_rule_accepts() {
+        // Each byte value in each position, so every final-character case and
+        // every alphabet entry is produced at least once.
+        for position in 0..CACHE_KEY_BYTES {
+            for value in 0..=255u8 {
+                let mut key = [0x5a; CACHE_KEY_BYTES];
+                key[position] = value;
+                let text = encoded(&key);
+                assert!(is_cache_key_text(&text), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_keys_have_distinct_spellings() {
+        let mut a = [0u8; CACHE_KEY_BYTES];
+        let mut b = [0u8; CACHE_KEY_BYTES];
+        a[31] = 0x01;
+        b[31] = 0x02;
+        assert_ne!(encoded(&a), encoded(&b));
+        assert_ne!(encoded(&a), ZERO_KEY);
     }
 }
