@@ -117,7 +117,7 @@ Prompts, outputs, cache keys and salts are content; so is anything derived from 
 
 ## Configuration
 
-All required; an empty value counts as missing. The cache switch, retention bounds and the token hash are parsed by `eidola_common::engine_deployment`, the same functions the gateway's build checks a pinned deployment's config with, so a pin can only name a config this node boots with.
+All required; an empty value counts as missing. Everything but the secret token is parsed by `eidola_common::engine_deployment::parse_measured` (the variable names live there too, re-exported as `config::env`); `Config::from_lookup` calls it and then verifies the token against the parsed hash. The gateway's build runs every pinned deployment's whole env through the same function, so a pin can only name a configuration this node boots with.
 
 | Variable | Meaning |
 |---|---|
