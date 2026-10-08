@@ -573,34 +573,39 @@ async fn without_a_key_the_least_loaded_engine_is_chosen() {
         .collect();
     router.apply_placement(&rows).await;
     router.probe_due().await;
+    // One request held open on one engine.
     for e in &engines {
         e.set_mode(Mode::Hold);
     }
+    let before = counts(&refs);
+    let mut held = router
+        .send_stream(&request(MODEL_A, None, true))
+        .await
+        .unwrap();
+    held.recv().await.unwrap().unwrap();
+    let busy = served_by(&refs, &before);
+    let idle = 1 - busy;
 
-    // Three rounds, so the outcome cannot be the rotation's alone.
-    for _ in 0..3 {
+    // While it is in flight, every request goes to the other engine, however
+    // the tie-breaking rotation turns.
+    engines[idle].set_mode(Mode::Serve);
+    for _ in 0..4 {
         let before = counts(&refs);
-        let mut first = router
-            .send_stream(&request(MODEL_A, None, true))
-            .await
-            .unwrap();
-        first.recv().await.unwrap().unwrap();
-        let busy = served_by(&refs, &before);
-
-        let before = counts(&refs);
-        let mut second = router
-            .send_stream(&request(MODEL_A, None, true))
-            .await
-            .unwrap();
-        second.recv().await.unwrap().unwrap();
-        assert_ne!(served_by(&refs, &before), busy);
-
-        for e in &engines {
-            e.state.release.notify_waiters();
-        }
-        while first.recv().await.is_some() {}
-        while second.recv().await.is_some() {}
+        router.send(&request(MODEL_A, None, false)).await.unwrap();
+        assert_eq!(served_by(&refs, &before), idle);
     }
+
+    // Released, the two are equal again and take turns.
+    engines[busy].state.release.notify_one();
+    while held.recv().await.is_some() {}
+    engines[busy].set_mode(Mode::Serve);
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..4 {
+        let before = counts(&refs);
+        router.send(&request(MODEL_A, None, false)).await.unwrap();
+        seen.insert(served_by(&refs, &before));
+    }
+    assert_eq!(seen.len(), 2);
 }
 
 /// Only enabled rows naming a pinned model and one of its pinned deployments,
@@ -973,7 +978,15 @@ async fn the_engines_usage_settles_the_charge() {
             events.first(),
             Some(Ok(BackendStreamEvent::Chunk(..)))
         ));
-        assert!(matches!(events.last(), Some(Err(_))), "{mode:?}");
+        // The node's error frame is the engine's own error; a stream that
+        // just stops is a broken connection.
+        match (mode, events.last()) {
+            (Mode::StreamError, Some(Err(ServerError::Backend { error_type, .. }))) => {
+                assert_eq!(error_type, "engine_unavailable")
+            }
+            (Mode::StreamTruncated, Some(Err(ServerError::Network(_)))) => {}
+            (mode, last) => panic!("{mode:?} ended with {:?}", last.map(|e| e.is_ok())),
+        }
         assert!(
             !events
                 .iter()
