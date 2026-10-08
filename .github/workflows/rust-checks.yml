@@ -269,6 +269,13 @@ jobs:
         if: steps.scope.outputs.rust == 'true'
         run: cargo test
 
+      - name: Check OCI stub-source resolution
+        # The image builds resolve the workspace from manifests plus stub
+        # sources before copying real code; a target whose path cargo infers
+        # from disk breaks that stage, which otherwise first runs on `main`.
+        if: steps.scope.outputs.rust == 'true'
+        run: scripts/check-oci-stub-workspace.sh
+
       # The committed Apple fixtures are the crate's golden, so an
       # Apple-only change (fixture tree, harness, instruments) must still run
       # the placement regressions. A full `cargo test` above already covers
