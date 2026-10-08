@@ -26,7 +26,7 @@ use crate::device::ImageArch;
 use crate::kv::KvStore;
 use crate::model::{ForwardInput, GpuModel, Kernels, group_geometry, group_layers, read_config};
 use crate::sampler::{STATUS_NON_FINITE, SampleRow};
-use crate::support::{check_device, check_sampleable, check_supported};
+use crate::support::{check_context, check_device, check_sampleable, check_supported};
 use crate::weights::ModelWeights;
 use crate::{CudaError, Gpu, Result};
 
@@ -93,6 +93,7 @@ impl CudaExecutor {
         let config = read_config(&store, keep_layers)?;
         check_supported(&config)?;
         check_sampleable(cfg.sampleable_vocab_size as usize, config.vocab_size)?;
+        check_context(cfg.max_model_len, &config)?;
         let image = check_device(gpu.info(), &config, cfg.image)?;
         let (keys, layer_kv) = group_layers(&config);
         if cfg.num_blocks.len() != keys.len() {

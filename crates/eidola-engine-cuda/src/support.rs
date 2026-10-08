@@ -100,6 +100,11 @@ pub fn check_supported(c: &ModelConfig) -> Result<(), Unsupported> {
         c.dense_intermediate_size,
         DENSE_INTER
     );
+    exact!(
+        "max_position_embeddings",
+        c.max_position_embeddings,
+        MAX_POSITIONS
+    );
     exact!("rms_norm_eps", c.rms_norm_eps, 1e-6f32);
     exact!(
         "attention_value_scale",
@@ -137,6 +142,9 @@ pub fn check_supported(c: &ModelConfig) -> Result<(), Unsupported> {
     exact!("moe.routed_scaling_factor", m.routed_scaling_factor, 1.0f32);
     Ok(())
 }
+
+/// The checkpoint's context window (`max_position_embeddings`).
+pub const MAX_POSITIONS: usize = 1 << 20;
 
 /// Shared memory per block the largest launch needs: the CUTLASS BF16 GEMM's
 /// dynamic plus static bytes. Every
@@ -218,6 +226,19 @@ pub fn check_device(
 }
 
 /// The sampleable vocabulary the sampler can serve with this head.
+/// Refuse a context longer than the checkpoint's declared window: positions
+/// past `max_position_embeddings` are outside what the model was trained for.
+pub fn check_context(max_model_len: u32, c: &ModelConfig) -> Result<(), Unsupported> {
+    if max_model_len as usize > c.max_position_embeddings {
+        return Err(Unsupported {
+            field: "max_model_len".into(),
+            found: max_model_len.to_string(),
+            required: format!("at most {}", c.max_position_embeddings),
+        });
+    }
+    Ok(())
+}
+
 pub fn check_sampleable(sampleable: usize, vocab: usize) -> Result<(), Unsupported> {
     if sampleable == 0 || sampleable > vocab || sampleable > MAX_SAMPLEABLE {
         return Err(Unsupported {
@@ -256,6 +277,15 @@ mod tests {
         check_supported(&flash()).unwrap();
         check_supported(&flash().truncated(&[0, 1, 2, 5]).unwrap()).unwrap();
         check_sampleable(151_675, 152_576).unwrap();
+        check_context(1 << 20, &flash()).unwrap();
+    }
+
+    /// A context past the checkpoint's window is refused; the window itself
+    /// is a pinned value (`every_field_is_checked`).
+    #[test]
+    fn contexts_are_bounded() {
+        let e = check_context((1 << 20) + 1, &flash()).expect_err("past the window");
+        assert_eq!(e.field, "max_model_len");
     }
 
     fn b300() -> crate::DeviceInfo {
@@ -323,6 +353,9 @@ mod tests {
             ("vocab_size", |c| c.vocab_size = 152_584),
             ("dense_intermediate_size", |c| {
                 c.dense_intermediate_size = 16_512
+            }),
+            ("max_position_embeddings", |c| {
+                c.max_position_embeddings = 262_144
             }),
             ("rms_norm_eps", |c| c.rms_norm_eps = 1e-5),
             ("attention_value_scale", |c| {

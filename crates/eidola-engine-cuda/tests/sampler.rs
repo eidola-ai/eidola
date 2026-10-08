@@ -5,7 +5,7 @@ mod common;
 
 use common::{Lcg, setup};
 use eidola_engine::sampling::{self, Logits, SamplingParams, Stream};
-use eidola_engine_cuda::sampler::{STATUS_NON_FINITE, SampleRow, Sampler};
+use eidola_engine_cuda::sampler::{AcceptInputs, AcceptRow, STATUS_NON_FINITE, SampleRow, Sampler};
 
 /// MiMo's padded head and tokenizer.
 const STRIDE: usize = 152_576;
@@ -324,16 +324,16 @@ fn chain_accept_matches_reference() {
         .map(|&(_, p, _, _, pos)| SampleRow::new(&p, pos, 0))
         .collect();
     let drows = s.clone_htod(&rows).unwrap();
-    let target_row = s
-        .clone_htod(&seqs.iter().map(|q| q.2 as u32).collect::<Vec<_>>())
-        .unwrap();
-    let draft_row = s
-        .clone_htod(&seqs.iter().map(|q| q.3 as u32).collect::<Vec<_>>())
-        .unwrap();
-    let num_drafts = s
-        .clone_htod(&seqs.iter().map(|q| q.0 as u32).collect::<Vec<_>>())
-        .unwrap();
-    let ddrafts = s.clone_htod(&drafts).unwrap();
+    let plan: Vec<AcceptRow> = seqs
+        .iter()
+        .enumerate()
+        .map(|(si, &(k, _, tr, dr, _))| AcceptRow {
+            target_row: tr as u32,
+            draft_row: dr as u32,
+            drafts: &drafts[si * stride as usize..][..k],
+        })
+        .collect();
+    let mut inputs = AcceptInputs::new(gpu, seqs.len(), stride).unwrap();
     for &arch in &su.archs {
         let sampler = Sampler::from_module(su.module("sampling", arch)).unwrap();
         let mut tp = s.alloc_zeros::<f64>(nt * n).unwrap();
@@ -378,12 +378,8 @@ fn chain_accept_matches_reference() {
                 &dp,
                 n as u32,
                 &drows,
-                &target_row,
-                &draft_row,
-                &num_drafts,
-                &ddrafts,
-                stride,
-                seqs.len() as u32,
+                &plan,
+                &mut inputs,
                 &mut scratch,
                 &mut out,
                 &mut counts,
@@ -461,7 +457,12 @@ fn oversized_vocabularies_are_refused() {
     let n = (1u32 << 20) + 1;
     let probs = s.alloc_zeros::<f64>(n as usize).unwrap();
     let rows = s.clone_htod(&[SampleRow::default()]).unwrap();
-    let idx = s.clone_htod(&[0u32]).unwrap();
+    let plan = [AcceptRow {
+        target_row: 0,
+        draft_row: 0,
+        drafts: &[],
+    }];
+    let mut inputs = AcceptInputs::new(gpu, 1, 2).unwrap();
     let mut scratch = s.alloc_zeros::<f64>(n as usize).unwrap();
     let mut out = s.alloc_zeros::<u32>(2).unwrap();
     let mut counts = s.alloc_zeros::<u32>(1).unwrap();
@@ -472,12 +473,8 @@ fn oversized_vocabularies_are_refused() {
             &probs,
             n,
             &rows,
-            &idx,
-            &idx,
-            &idx,
-            &idx,
-            1,
-            1,
+            &plan,
+            &mut inputs,
             &mut scratch,
             &mut out,
             &mut counts,
@@ -503,4 +500,72 @@ fn oversized_vocabularies_are_refused() {
         )
         .unwrap_err();
     assert!(e.to_string().contains("vocabulary"), "{e}");
+}
+
+/// Every index chain acceptance derives is bounded on the host before the
+/// launch: a row with as many drafts as its output has slots (no room for
+/// the bonus token), target or draft rows past the distributions (or past
+/// `u32`, which the kernel adds in), and a draft outside the vocabulary are
+/// each refused, and a plan at every limit runs.
+#[test]
+fn accept_plans_are_bounded() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    let sampler = Sampler::from_module(su.module("sampling", su.archs[0])).unwrap();
+    let (n, stride) = (64u32, 3u32);
+    // Two sequences' worth: 2 x 3 target rows, 2 x 2 draft rows.
+    let mut target = vec![0f64; 6 * n as usize];
+    for r in 0..6 {
+        target[r * n as usize + 7] = 1.0;
+    }
+    let target = s.clone_htod(&target).unwrap();
+    let draft = s.clone_htod(&vec![1.0 / n as f64; 4 * n as usize]).unwrap();
+    let rows = s.clone_htod(&[SampleRow::default(); 2]).unwrap();
+    let mut inputs = AcceptInputs::new(gpu, 2, stride).unwrap();
+    let mut scratch = s.alloc_zeros::<f64>(2 * n as usize).unwrap();
+    let mut out = s.alloc_zeros::<u32>(2 * stride as usize).unwrap();
+    let mut counts = s.alloc_zeros::<u32>(2).unwrap();
+    let mut run = |plan: &[AcceptRow]| {
+        sampler.chain_accept(
+            gpu,
+            &target,
+            &draft,
+            n,
+            &rows,
+            plan,
+            &mut inputs,
+            &mut scratch,
+            &mut out,
+            &mut counts,
+        )?;
+        Ok::<_, eidola_engine_cuda::CudaError>((
+            s.clone_dtoh(&out).unwrap(),
+            s.clone_dtoh(&counts).unwrap(),
+        ))
+    };
+    let row = |target_row, draft_row, drafts| AcceptRow {
+        target_row,
+        draft_row,
+        drafts,
+    };
+    // At every limit: two drafts in three slots, the last rows of both.
+    let (out, counts) = run(&[row(0, 0, &[7, 7]), row(3, 2, &[7, 7])]).unwrap();
+    assert_eq!((out, counts), (vec![7; 6], vec![3, 3]));
+    let outside = [7, n];
+    for (plan, why) in [
+        (vec![row(0, 0, &[7, 7]), row(2, 1, &[7, 7, 7])], "drafts"),
+        (vec![row(0, 0, &[7, 7]), row(4, 2, &[7, 7])], "target rows"),
+        (vec![row(0, 0, &[7]), row(6, 2, &[])], "target rows"),
+        (vec![row(0, 0, &[7, 7]), row(3, 3, &[7, 7])], "draft rows"),
+        (vec![row(u32::MAX, 0, &[7])], "target rows"),
+        (vec![row(0, u32::MAX, &[7])], "draft rows"),
+        (vec![row(0, 0, &outside)], "drafts token"),
+        (vec![row(0, 0, &[]); 3], "too small"),
+    ] {
+        let e = run(&plan).unwrap_err();
+        assert!(e.to_string().contains(why), "{why}: {e}");
+    }
+    // A row with no drafts needs no draft rows at all.
+    run(&[row(5, u32::MAX, &[])]).unwrap();
 }

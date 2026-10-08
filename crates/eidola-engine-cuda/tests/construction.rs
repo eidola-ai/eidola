@@ -57,6 +57,15 @@ fn refusals_come_before_device_memory() {
     let e = CudaExecutor::new(open(), &kernels, store.clone(), None, cfg).unwrap_err();
     assert!(matches!(e, CudaError::Unsupported(_)), "{e}");
 
+    // A context past the checkpoint's window.
+    let mut cfg = config();
+    cfg.max_model_len = (1 << 20) + 1;
+    let e = CudaExecutor::new(open(), &kernels, store.clone(), None, cfg).unwrap_err();
+    let CudaError::Unsupported(u) = e else {
+        panic!("a configuration refusal, not {e}")
+    };
+    assert_eq!(u.field, "max_model_len");
+
     // A kernel directory with no images: refused before any weight is read.
     let empty = std::env::temp_dir().join(format!("eidola-no-kernels-{}", std::process::id()));
     std::fs::create_dir_all(&empty).unwrap();

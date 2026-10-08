@@ -120,12 +120,17 @@ impl Sampler {
         }
     }
 
-    /// Chain speculative acceptance for `num_rows` sequences: row `r` has
-    /// `num_drafts[r]` drafts (`drafts[r * stride ..]`), target distributions
-    /// `target[(target_row[r] + i) * n ..]` for `i` in `0..=k`, draft
-    /// distributions `draft[(draft_row[r] + i) * n ..]` for `i` in `0..k`, and
-    /// `rows[r].position` set to its first drafted position. Writes the tokens
-    /// to `out[r * stride ..]` and their count to `counts[r]`.
+    /// Chain speculative acceptance, one sequence per entry of `plan`: row
+    /// `r` has `plan[r].drafts`, target distributions
+    /// `target[(plan[r].target_row + i) * n ..]` for `i` in `0..=k`, draft
+    /// distributions `draft[(plan[r].draft_row + i) * n ..]` for `i` in `0..k`,
+    /// and `rows[r].position` set to its first drafted position. Writes the
+    /// tokens to `out[r * stride ..]` and their count to `counts[r]`.
+    ///
+    /// Everything the kernel indexes by (draft counts, distribution rows,
+    /// draft token ids) is checked here, on the host, against the buffers
+    /// it will reach, and then uploaded into `inputs`: the device reads only
+    /// values that passed.
     #[allow(clippy::too_many_arguments)]
     pub fn chain_accept(
         &self,
@@ -134,64 +139,143 @@ impl Sampler {
         draft: &CudaSlice<f64>,
         n: u32,
         rows: &CudaSlice<SampleRow>,
-        target_row: &CudaSlice<u32>,
-        draft_row: &CudaSlice<u32>,
-        num_drafts: &CudaSlice<u32>,
-        drafts: &CudaSlice<u32>,
-        stride: u32,
-        num_rows: u32,
+        plan: &[AcceptRow<'_>],
+        inputs: &mut AcceptInputs,
         scratch: &mut CudaSlice<f64>,
         out: &mut CudaSlice<u32>,
         counts: &mut CudaSlice<u32>,
     ) -> Result<()> {
-        if num_rows == 0 {
+        if plan.is_empty() {
             return Ok(());
         }
-        let r = num_rows as usize;
+        let r = plan.len();
+        let stride = inputs.stride;
         // The kernel's chunked sums hold at most 1,024 chunks of 1,024.
         if n == 0 || n > 1 << 20 {
             return Err(CudaError::new(format!("chain_accept: vocabulary {n}")));
         }
-        if stride == 0
-            || drafts.len() < r * stride as usize
-            || target_row.len() < r
-            || draft_row.len() < r
-            || num_drafts.len() < r
-            || target.is_empty()
-            || !target.len().is_multiple_of(n as usize)
-            || !draft.len().is_multiple_of(n as usize)
-        {
-            return Err(CudaError::new(
-                "chain_accept: row arrays too small or not whole rows",
-            ));
+        if !target.len().is_multiple_of(n as usize) || !draft.len().is_multiple_of(n as usize) {
+            return Err(CudaError::new("chain_accept: distributions not whole rows"));
         }
-        if scratch.len() < r * n as usize
+        let (target_rows, draft_rows) = (target.len() / n as usize, draft.len() / n as usize);
+        if r > inputs.rows
+            || scratch.len() < r * n as usize
             || out.len() < r * stride as usize
             || counts.len() < r
             || rows.len() < r
         {
             return Err(CudaError::new("chain_accept: buffer too small"));
         }
+        let mut drafts = vec![0u32; r * stride as usize];
+        let (mut target_row, mut draft_row, mut num_drafts) = (
+            Vec::with_capacity(r),
+            Vec::with_capacity(r),
+            Vec::with_capacity(r),
+        );
+        for (i, row) in plan.iter().enumerate() {
+            let k = row.drafts.len();
+            // Up to k accepted drafts and one more token: k + 1 slots.
+            if k >= stride as usize {
+                return Err(CudaError::new(format!(
+                    "chain_accept: row {i} has {k} drafts, its output holds {stride} tokens"
+                )));
+            }
+            // The kernel adds in u32; the sums must fit, and stay in bounds.
+            let target_end = row.target_row.checked_add(k as u32 + 1);
+            if target_end.is_none_or(|e| e as usize > target_rows) {
+                return Err(CudaError::new(format!(
+                    "chain_accept: row {i}'s target rows {}+{} beyond {target_rows}",
+                    row.target_row,
+                    k + 1
+                )));
+            }
+            let draft_end = row.draft_row.checked_add(k as u32);
+            if k > 0 && draft_end.is_none_or(|e| e as usize > draft_rows) {
+                return Err(CudaError::new(format!(
+                    "chain_accept: row {i}'s draft rows {}+{k} beyond {draft_rows}",
+                    row.draft_row
+                )));
+            }
+            if let Some(&d) = row.drafts.iter().find(|&&d| d >= n) {
+                return Err(CudaError::new(format!(
+                    "chain_accept: row {i} drafts token {d} of {n}"
+                )));
+            }
+            drafts[i * stride as usize..][..k].copy_from_slice(row.drafts);
+            target_row.push(row.target_row);
+            draft_row.push(row.draft_row);
+            num_drafts.push(k as u32);
+        }
         let s = gpu.stream();
-        // SAFETY: arguments match `eidola_chain_accept`.
+        s.memcpy_htod(&target_row, &mut inputs.target_row.slice_mut(..r))?;
+        s.memcpy_htod(&draft_row, &mut inputs.draft_row.slice_mut(..r))?;
+        s.memcpy_htod(&num_drafts, &mut inputs.num_drafts.slice_mut(..r))?;
+        s.memcpy_htod(&drafts, &mut inputs.drafts.slice_mut(..r * stride as usize))?;
+        // SAFETY: arguments match `eidola_chain_accept`; every index the
+        // kernel derives was bounded above, and `inputs` holds exactly the
+        // checked values (uploaded on this stream, before the launch).
         unsafe {
             launch!(
                 gpu,
                 self.accept,
-                [num_rows, 1, 1],
+                [r as u32, 1, 1],
                 dptr(target, s),
                 dptr(draft, s),
                 n,
                 dptr(rows, s),
-                dptr(target_row, s),
-                dptr(draft_row, s),
-                dptr(num_drafts, s),
-                dptr(drafts, s),
+                dptr(&inputs.target_row, s),
+                dptr(&inputs.draft_row, s),
+                dptr(&inputs.num_drafts, s),
+                dptr(&inputs.drafts, s),
                 stride,
                 dptr(scratch, s),
                 dptr(out, s),
                 dptr(counts, s),
             )
         }
+    }
+}
+
+/// One sequence's chain acceptance, as the host scheduled it: its drafts and
+/// where its target and draft distributions start.
+#[derive(Clone, Copy, Debug)]
+pub struct AcceptRow<'a> {
+    pub target_row: u32,
+    pub draft_row: u32,
+    pub drafts: &'a [u32],
+}
+
+/// The device copies of a chain acceptance's per-row inputs, for up to
+/// `rows` sequences of at most `stride - 1` drafts. Only
+/// [`Sampler::chain_accept`] writes them, with values it has checked.
+pub struct AcceptInputs {
+    rows: usize,
+    stride: u32,
+    target_row: CudaSlice<u32>,
+    draft_row: CudaSlice<u32>,
+    num_drafts: CudaSlice<u32>,
+    drafts: CudaSlice<u32>,
+}
+
+impl AcceptInputs {
+    pub fn new(gpu: &Gpu, rows: usize, stride: u32) -> Result<AcceptInputs> {
+        let len = rows
+            .checked_mul(stride as usize)
+            .filter(|_| rows > 0 && stride > 0)
+            .ok_or_else(|| CudaError::new(format!("accept inputs: {rows} x {stride}")))?;
+        let s = gpu.stream();
+        Ok(AcceptInputs {
+            rows,
+            stride,
+            target_row: s.alloc_zeros(rows)?,
+            draft_row: s.alloc_zeros(rows)?,
+            num_drafts: s.alloc_zeros(rows)?,
+            drafts: s.alloc_zeros(len)?,
+        })
+    }
+
+    /// Tokens per output row: the most drafts a row may have, plus one.
+    pub fn stride(&self) -> u32 {
+        self.stride
     }
 }
