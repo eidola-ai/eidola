@@ -1275,8 +1275,8 @@ fn tight_sliding_spec() -> eidola_engine::spec::ModelSpec {
 }
 
 /// With caching off, no regeneration window is retained: nothing could ever hit it, and
-/// holding the prompt's window would stop the sliding groups recycling (a five-token
-/// prompt used to end with `Length` once decoding needed a fourth block).
+/// holding the prompt's window would stop the sliding groups recycling (retaining it
+/// makes a five-token prompt end with `Length` once decoding needs a fourth block).
 #[test]
 fn no_regeneration_retention_without_caching() {
     let mut cfg = sched(false);
@@ -1294,8 +1294,8 @@ fn no_regeneration_retention_without_caching() {
 /// reclaimable block. Under the tight sliding geometry, before concluding that the
 /// scheduler sheds drafts, then the prefill chunk (down to one block), then the
 /// sequence's own branch and regeneration retention (the windows it attached to cache
-/// entries, which only its own release would otherwise give back). Each case used to end
-/// with `Length` early (the 8-token prompt with no output at all).
+/// entries, which only its own release would otherwise give back). Skipping any of these
+/// steps ends the case with `Length` early (the 8-token prompt with no output at all).
 #[test]
 fn optional_reservations_are_shed_before_length() {
     let greedy = SamplingParams::greedy();
