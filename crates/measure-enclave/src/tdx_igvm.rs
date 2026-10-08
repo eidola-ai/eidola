@@ -178,6 +178,8 @@ struct ReleaseManifest {
 
 #[derive(Deserialize)]
 struct ReleaseIgvm {
+    /// Layout version of this `igvm` block. Only version 1 is understood.
+    format_version: u32,
     /// SHA-256 of the TDX IGVM image.
     tdx: String,
     tdx_launch: TdxLaunch,
@@ -206,8 +208,57 @@ pub struct TdxLaunchPin {
     pub mrconfigid: String,
 }
 
+/// The release a deployment config selects: its `cvm-version` field,
+/// optionally carrying an inline `@sha256:<hex>` pin of the release
+/// manifest (`cvm-version: 0.15.0@sha256:…`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConfigRelease {
+    /// The version, as the config states it (no leading `v`).
+    pub version: String,
+    /// The pinned release-manifest SHA-256, when the config carries one.
+    pub manifest_sha256: Option<String>,
+}
+
+/// Read the release a `tinfoil-config.yml` selects.
+pub fn config_release(config: &[u8]) -> Result<ConfigRelease> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_slice(config).context("parsing tinfoil-config.yml")?;
+    let raw = match value.get("cvm-version") {
+        Some(serde_yaml::Value::String(raw)) => raw.as_str(),
+        Some(other) => bail!("cvm-version must be a string, got {other:?}"),
+        None => bail!("tinfoil-config.yml has no cvm-version"),
+    };
+    let (version, manifest_sha256) = match raw.split_once('@') {
+        None => (raw, None),
+        Some((version, pin)) => {
+            let hex = pin
+                .strip_prefix("sha256:")
+                .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+                .with_context(|| {
+                    format!("malformed cvm-version pin {raw:?}: expected VERSION@sha256:<64 lowercase hex>")
+                })?;
+            (version, Some(hex.to_string()))
+        }
+    };
+    ensure!(
+        !version.is_empty() && !version.starts_with('v'),
+        "cvm-version {version:?} must be a bare version such as 0.15.0"
+    );
+    Ok(ConfigRelease {
+        version: version.to_string(),
+        manifest_sha256,
+    })
+}
+
 /// Compute a deployment's TDX launch identity and check it against the
 /// release that published the image.
+///
+/// Every input that names the same thing must agree: the config's
+/// `cvm-version` (and its inline manifest pin, when present) must name the
+/// release the manifest describes, the manifest must match the pinned hash,
+/// the image must be the one the manifest records, and the recomputed MRTD
+/// must equal the one the manifest states. A pin mixing one release's MRTD
+/// with a config that launches another could never attest.
 pub fn release_pin(
     manifest: &[u8],
     manifest_sha256: &str,
@@ -221,6 +272,26 @@ pub fn release_pin(
     );
     let manifest: ReleaseManifest =
         serde_json::from_slice(manifest).context("parsing release manifest")?;
+    ensure!(
+        manifest.igvm.format_version == 1,
+        "release manifest igvm.format_version {} is not supported",
+        manifest.igvm.format_version
+    );
+
+    let selected = config_release(config)?;
+    ensure!(
+        manifest.version == format!("v{}", selected.version),
+        "config selects cvm-version {}, but the release manifest is {}",
+        selected.version,
+        manifest.version
+    );
+    if let Some(pinned) = &selected.manifest_sha256 {
+        ensure!(
+            *pinned == actual,
+            "config pins release manifest {pinned}, but the manifest supplied is {actual}"
+        );
+    }
+
     let launch = &manifest.igvm.tdx_launch;
     let zero = "00".repeat(48);
     for (name, value) in [
@@ -411,13 +482,13 @@ mod tests {
         let good = manifest(&igvm, &mrtd, &zero);
         let good_sha = hex::encode(Sha256::digest(&good));
 
-        let pin = release_pin(&good, &good_sha, &igvm, b"config").unwrap();
+        let pin = release_pin(&good, &good_sha, &igvm, CONFIG).unwrap();
         assert_eq!(pin.mrtd, mrtd);
-        assert_eq!(pin.mrconfigid, hex::encode(mrconfigid(b"config")));
+        assert_eq!(pin.mrconfigid, hex::encode(mrconfigid(CONFIG)));
         assert_eq!(pin.cvm_version, "v0.0.0-test");
 
         let err = |manifest: &[u8], sha: &str, igvm: &[u8]| {
-            release_pin(manifest, sha, igvm, b"config")
+            release_pin(manifest, sha, igvm, CONFIG)
                 .unwrap_err()
                 .to_string()
         };
@@ -430,6 +501,69 @@ mod tests {
         let measured_boot = manifest(&igvm, &mrtd, &"22".repeat(48));
         let sha = hex::encode(Sha256::digest(&measured_boot));
         assert!(err(&measured_boot, &sha, &igvm).contains("rtmr0"));
+    }
+
+    const CONFIG: &[u8] = b"cvm-version: 0.0.0-test\ncpus: 2\n";
+
+    #[test]
+    fn config_release_reads_the_version_and_inline_pin() {
+        assert_eq!(
+            config_release(b"cvm-version: 0.15.0\n").unwrap(),
+            ConfigRelease {
+                version: "0.15.0".to_string(),
+                manifest_sha256: None
+            }
+        );
+        let pin = "ab".repeat(32);
+        assert_eq!(
+            config_release(format!("cvm-version: 0.15.0@sha256:{pin}\n").as_bytes())
+                .unwrap()
+                .manifest_sha256,
+            Some(pin)
+        );
+        for (config, needle) in [
+            ("cpus: 2\n", "no cvm-version"),
+            ("cvm-version: 15\n", "must be a string"),
+            ("cvm-version: v0.15.0\n", "bare version"),
+            ("cvm-version: 0.15.0@sha256:AB\n", "malformed"),
+            ("cvm-version: 0.15.0@sha512:00\n", "malformed"),
+        ] {
+            let err = config_release(config.as_bytes()).unwrap_err().to_string();
+            assert!(err.contains(needle), "{config}: {err}");
+        }
+    }
+
+    #[test]
+    fn release_pin_requires_the_config_to_select_the_manifests_release() {
+        let igvm = image(vec![page(0x2000, 1, IgvmPageDataFlags::new())]);
+        let mrtd = hex::encode(mrtd_from_igvm(&igvm).unwrap());
+        let good = manifest(&igvm, &mrtd, &"00".repeat(48));
+        let sha = hex::encode(Sha256::digest(&good));
+        let pin = |config: String| release_pin(&good, &sha, &igvm, config.as_bytes());
+
+        let err = pin("cvm-version: 0.0.1-test\n".into())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("config selects cvm-version 0.0.1-test"),
+            "{err}"
+        );
+
+        pin(format!("cvm-version: 0.0.0-test@sha256:{sha}\n")).expect("inline pin matches");
+        let other = "cd".repeat(32);
+        let err = pin(format!("cvm-version: 0.0.0-test@sha256:{other}\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config pins release manifest"), "{err}");
+
+        let mut future: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        future["igvm"]["format_version"] = 2.into();
+        let future = serde_json::to_vec(&future).unwrap();
+        let future_sha = hex::encode(Sha256::digest(&future));
+        let err = release_pin(&future, &future_sha, &igvm, CONFIG)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("format_version"), "{err}");
     }
 
     /// Known answer against a published release: set `TDX_IGVM` to the
