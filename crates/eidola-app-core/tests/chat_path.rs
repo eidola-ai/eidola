@@ -8738,3 +8738,175 @@ fn a_request_whose_delivery_is_unknown_counts_as_a_use_at_its_attempt() {
         );
     });
 }
+
+/// **A key is judged when it becomes observable, not when its request was
+/// built.** Connection setup — TCP, TLS, the peer's attestation — or a process
+/// suspended in between can take a request past the idle TTL after it was
+/// prepared; the key must still be retired, because the engine's cache is.
+#[test]
+fn a_key_is_judged_when_its_request_is_written_not_when_it_was_built() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        // Prepared comfortably inside the idle TTL…
+        core.test_advance_cache_clock(CACHE_IDLE_TTL_SECS * 1000 - 10_000);
+        // …but its connection takes twenty seconds to be ready to write.
+        core.test_delay_cache_clock_at_each_send(20_000);
+        turn(
+            &core,
+            "After a slow connection.",
+            Some(first.space_id.clone()),
+            None,
+        );
+        core.test_delay_cache_clock_at_each_send(0);
+        turn(&core, "Right after.", Some(first.space_id.clone()), None);
+
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        assert_ne!(sent[0], sent[1], "idle past the TTL when written: rotated");
+        assert_eq!(sent[1], sent[2], "and the fresh key carries on");
+    });
+}
+
+/// **A model change forgets the key at the write**, so a change made through a
+/// model that sends no key cannot leave the first model's key standing:
+/// A (keyed) → B (unkeyed) → A again starts a new key.
+#[test]
+fn a_model_change_through_an_unkeyed_model_still_retires_the_key() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            list_flat_model: true,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        let agent = agent_of(&core, &space);
+        let set_model = |model: &str| {
+            core.runtime()
+                .block_on(core.update_space_participant(
+                    agent.clone(),
+                    eidola_app_core::ParticipantUpdate {
+                        label: None,
+                        model_ref: Some(Some(model.to_string())),
+                        system_prompt: None,
+                        notify_policy: None,
+                    },
+                    eidola_app_core::ExpectedScope::Any,
+                ))
+                .expect("set the model")
+        };
+        set_model(FLAT_MODEL);
+        assert!(
+            lineages(&core).is_empty(),
+            "the model change forgot the key at the write"
+        );
+        set_model(MODEL);
+        let asked = core
+            .runtime()
+            .block_on(core.post_reply("Back on the first model.".into(), Some(space.clone()), None))
+            .expect("post");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.respond_stream_as(space.clone(), agent.clone(), asked.action_id, tx))
+            .expect("answer");
+
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        assert_eq!(sent.len(), 2);
+        assert_ne!(sent[0], sent[1], "A → B → A is a new key");
+    });
+}
+
+/// The same at the membership level: a shared agent's model override in one
+/// space forgets that lineage's key, and only that one.
+#[test]
+fn a_model_override_forgets_only_its_spaces_key() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            list_flat_model: true,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let first = turn(&core, "How do tides work?", None, None);
+        let home = first.space_id.clone();
+        let agent = agent_of(&core, &home);
+        core.runtime()
+            .block_on(core.promote_participant(agent.clone(), None, None))
+            .expect("share the agent");
+        let post = core
+            .runtime()
+            .block_on(core.post_reply("Elsewhere.".into(), None, None))
+            .expect("a new space");
+        core.runtime()
+            .block_on(core.add_global_participant(post.space_id.clone(), agent.clone(), None))
+            .expect("join");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.respond_stream_as(
+                post.space_id.clone(),
+                agent.clone(),
+                post.action_id,
+                tx,
+            ))
+            .expect("answer");
+        assert_eq!(lineages(&core).len(), 2);
+
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                post.space_id.clone(),
+                agent.clone(),
+                eidola_app_core::ParticipantOverride {
+                    label: None,
+                    model_ref: Some(Some(FLAT_MODEL.to_string())),
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+            ))
+            .expect("override the model here");
+        let left = lineages(&core);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].0, home, "the other space's key is untouched");
+    });
+}
+
+/// **The eidola configuration and the keys it invalidates change together or
+/// not at all.** A failure forgetting the keys rolls the configuration write
+/// back with it: the error is reported, nothing is announced, the client still
+/// talks to the endpoint it did, and the lineage keeps its key.
+#[test]
+fn a_configuration_write_and_its_key_cleanup_are_one_transaction() {
+    run(|| {
+        let (pinned, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let elsewhere = core.runtime().block_on(chat_harness::start(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            ..MockConfig::default()
+        }));
+        let first = turn(&core, "How do tides work?", None, None);
+
+        core.test_fail_cache_key_cleanup(true);
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.set_base_url(elsewhere.base_url.clone()))
+            .expect_err("the cleanup failed, so the write did too");
+        assert!(
+            !drain(&mut rx).contains(&Change::Backends),
+            "a write that did not commit announces nothing"
+        );
+        core.test_fail_cache_key_cleanup(false);
+
+        assert_eq!(lineages(&core).len(), 1, "the key is still there");
+        turn(&core, "Still here?", Some(first.space_id.clone()), None);
+        assert_eq!(elsewhere.chat_hits(), 0, "the endpoint did not change");
+        let sent: Vec<String> = keys(&pinned).into_iter().map(Option::unwrap).collect();
+        assert_eq!(sent[0], sent[1], "and the lineage kept its key");
+
+        core.runtime()
+            .block_on(core.set_base_url(elsewhere.base_url.clone()))
+            .expect("without the fault, the write lands");
+        assert!(lineages(&core).is_empty());
+    });
+}

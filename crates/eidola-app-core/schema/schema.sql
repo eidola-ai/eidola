@@ -947,10 +947,10 @@ CREATE INDEX idx_request_credential
 -- (`db::forget_unsendable_cache_keys`).
 --
 -- Both timestamps are this client's clock: `created_at` is the
--- key's birth, `last_used_at` the attempt time of the latest
--- request that may have left with it (`db::record_cache_key_use`).
--- `generation` counts the lineage's keys, so a use is recorded
--- against the key it was made with and never its successor.
+-- key's birth, `last_used_at` the latest instant a request's
+-- body was written with it (the claim, `db::claim_prefix_cache_key`).
+-- `generation` counts the lineage's keys, so a reuse stamps the
+-- key it judged and never a successor that replaced it.
 --
 -- No cascade. A row exists only after a turn ran in the space,
 -- and a turn needs a post there, so a space the pristine reaper
@@ -969,6 +969,37 @@ CREATE TABLE prefix_cache_key (
 
     PRIMARY KEY (space_id, participant_id)
 );
+
+-- **A model change forgets the lineage's key at the write.** A
+-- key belongs to the model it was minted for; checking only at
+-- the next keyed claim would miss a change made through a model
+-- that sends no key (A, then an unkeyed B, then A again would
+-- find A's key still standing). So the write that changes a
+-- participant's model, or its per-space override, deletes the
+-- affected keys in the same statement — a trigger, so no door
+-- can change a model and keep the key — each overwritten in
+-- place first, like every other forgotten key. A participant's
+-- own model change forgets its keys in every space, including
+-- spaces whose override shadows it: a spurious rotation costs a
+-- cache miss, a missed one a key past its model.
+CREATE TRIGGER prefix_cache_key_forget_on_model
+AFTER UPDATE OF model_ref ON participant
+WHEN OLD.model_ref IS NOT NEW.model_ref
+BEGIN
+    UPDATE prefix_cache_key SET key_bytes = zeroblob(32)
+     WHERE participant_id = NEW.id;
+    DELETE FROM prefix_cache_key WHERE participant_id = NEW.id;
+END;
+
+CREATE TRIGGER prefix_cache_key_forget_on_model_override
+AFTER UPDATE OF override_model_ref ON space_participant
+WHEN OLD.override_model_ref IS NOT NEW.override_model_ref
+BEGIN
+    UPDATE prefix_cache_key SET key_bytes = zeroblob(32)
+     WHERE space_id = NEW.space_id AND participant_id = NEW.participant_id;
+    DELETE FROM prefix_cache_key
+     WHERE space_id = NEW.space_id AND participant_id = NEW.participant_id;
+END;
 
 
 -- ############################################################

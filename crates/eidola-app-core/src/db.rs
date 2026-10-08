@@ -1331,14 +1331,23 @@ fn opt_str(v: Option<&str>) -> Value {
 // Layer 1 — Transport: prefix-cache keys
 // ---------------------------------------------------------------------------
 
-/// A key handed to one request, and what is needed to record that the request
-/// left with it ([`record_cache_key_use`]).
-pub(crate) struct ClaimedCacheKey {
-    pub key: crate::prefix_cache::CacheKey,
-    /// The key's place in its lineage's sequence of keys.
-    pub generation: i64,
-    /// When this request was attempted, by the rotation rule's clock.
-    pub attempt_at: i64,
+/// What a claim hands the request being written.
+pub(crate) enum ClaimOutcome {
+    /// The lineage's key — reused, or freshly minted and stored.
+    Claimed(crate::prefix_cache::CacheKey),
+    /// The lineage can no longer send ([`lineage_sendable_sql`]): nothing was
+    /// stored, and the request carries no key of the lineage's.
+    Unsendable,
+}
+
+#[cfg(test)]
+impl ClaimOutcome {
+    fn claimed(self) -> Option<crate::prefix_cache::CacheKey> {
+        match self {
+            ClaimOutcome::Claimed(key) => Some(key),
+            ClaimOutcome::Unsendable => None,
+        }
+    }
 }
 
 /// Hand one request its lineage's prefix-cache key: the stored key when the
@@ -1351,19 +1360,27 @@ pub(crate) struct ClaimedCacheKey {
 /// participant whose model changes, or a client pointed at another endpoint or
 /// trust bundle, starts a new key.
 ///
-/// **Claiming is not using.** A reused key's `last_used_at` is not advanced
-/// here: the request may yet fail before anything leaves this machine, and a
-/// use recorded for it would renew idleness nobody observed. The caller records
-/// the use once the attempt's fate is known ([`record_cache_key_use`]). A fresh
-/// key is born with `last_used_at = created_at`, the attempt time.
+/// **Called at the instant the key becomes observable** — when the transport
+/// first asks for the request body, after the connection, TLS and attestation
+/// are done (`keyed_body` in `lib.rs`) — so `now` is the moment the rotation
+/// rule must hold at, and the claim *is* the use: it stamps `last_used_at`. A
+/// request whose connection never opened never claims.
+///
+/// **A lineage closed in the meantime gets nothing.** The claim asks, inside
+/// its own transaction, whether the lineage can still send (the space open,
+/// the participant live and a live member — [`lineage_sendable_sql`], the
+/// predicate [`forget_unsendable_cache_keys`] deletes by). A turn prepared
+/// before an archival, a retirement or a departure landed would otherwise
+/// recreate the key that write just forgot; instead it is
+/// [`ClaimOutcome::Unsendable`] and nothing is stored.
 ///
 /// Decided at the write, in one `BEGIN IMMEDIATE`: two turns of one lineage
 /// racing each other (a regeneration beside a reply, a driven turn beside a
 /// human's) both read the row the other wrote, so they share a key or one of
 /// them mints the lineage's next key; no interleaving leaves them holding
-/// different keys each believes current. `Ok(None)` only when a fresh key was
-/// due and the OS could not supply randomness — the request then carries no
-/// key at all. Emits nothing: no surface reads a key.
+/// different keys each believes current. An error only when the store fails
+/// or a fresh key was due and the OS could not supply randomness. Emits
+/// nothing: no surface reads a key.
 pub(crate) async fn claim_prefix_cache_key(
     conn: &Connection,
     space_id: &str,
@@ -1371,7 +1388,7 @@ pub(crate) async fn claim_prefix_cache_key(
     model: &str,
     scope: &crate::prefix_cache::CacheScope,
     now: i64,
-) -> Result<Option<ClaimedCacheKey>, AppError> {
+) -> Result<ClaimOutcome, AppError> {
     begin_write(conn).await?;
     match claim_prefix_cache_key_body(conn, space_id, participant_id, model, scope, now).await {
         Ok((claimed, replaced)) => {
@@ -1396,7 +1413,7 @@ async fn claim_prefix_cache_key_body(
     model: &str,
     scope: &crate::prefix_cache::CacheScope,
     now: i64,
-) -> Result<(Option<ClaimedCacheKey>, bool), AppError> {
+) -> Result<(ClaimOutcome, bool), AppError> {
     use crate::prefix_cache::{CacheKey, Claim, StoredKeyAge, decide, mint};
     use eidola_common::engine_protocol::CACHE_KEY_BYTES;
     use zeroize::Zeroizing;
@@ -1405,6 +1422,21 @@ async fn claim_prefix_cache_key_body(
         Value::Text(space_id.to_string()),
         Value::Text(participant_id.to_string()),
     );
+    let mut sendable = conn
+        .query(
+            &format!("SELECT {}", lineage_sendable_sql("?1", "?2")),
+            lineage.clone(),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let open = match sendable.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<i64>(0).map_err(AppError::db)? != 0,
+        None => false,
+    };
+    drop(sendable);
+    if !open {
+        return Ok((ClaimOutcome::Unsendable, false));
+    }
     let mut rows = conn
         .query(
             &format!(
@@ -1433,18 +1465,27 @@ async fn claim_prefix_cache_key_body(
         && decide(Some(age), model, &scope.trust_domain, &scope.policy, now) == Claim::Reuse
         && let Ok(bytes) = <&[u8; CACHE_KEY_BYTES]>::try_from(&bytes[..])
     {
-        return Ok((
-            Some(ClaimedCacheKey {
-                key: CacheKey::from_bytes(bytes),
-                generation: *generation,
-                attempt_at: now,
-            }),
-            false,
-        ));
+        conn.execute(
+            &format!(
+                "UPDATE prefix_cache_key SET last_used_at = ?4 \
+                 WHERE {LINEAGE_IS} AND generation = ?3"
+            ),
+            (
+                lineage.0,
+                lineage.1,
+                Value::Integer(*generation),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+        return Ok((ClaimOutcome::Claimed(CacheKey::from_bytes(bytes)), false));
     }
 
     let Some(fresh) = mint() else {
-        return Ok((None, false));
+        return Err(AppError::Database {
+            message: "the operating system supplied no randomness for a prefix-cache key".into(),
+        });
     };
     // **The retiring key is overwritten in place before it is replaced.** The
     // upsert below rewrites the row's cell in place only when the new record
@@ -1484,50 +1525,9 @@ async fn claim_prefix_cache_key_body(
     .await
     .map_err(AppError::db)?;
     Ok((
-        Some(ClaimedCacheKey {
-            key: CacheKey::from_bytes(&fresh),
-            generation,
-            attempt_at: now,
-        }),
+        ClaimOutcome::Claimed(CacheKey::from_bytes(&fresh)),
         stored.is_some(),
     ))
-}
-
-/// Record that a request may have left this machine with a lineage's key
-/// `generation`, attempted at `attempt_at`: advance `last_used_at` to it.
-///
-/// Called by the turn once the attempt's fate is known, and **only when the
-/// request may have been delivered** — a response arrived, or the connection
-/// failed after the request could have been sent. An attempt that failed
-/// before anything left (no connection, a refused handshake, a request that
-/// could not be built) records nothing, so it cannot renew the lineage's idle
-/// clock. The time recorded is the attempt's, not the answer's: earlier than
-/// any engine could have seen the request, so the rotation rule's idle
-/// measure stays at least the engine's. Scoped to the generation the request
-/// carried, so a use of a key that has since been rotated away touches
-/// nothing; never moves `last_used_at` backwards.
-pub(crate) async fn record_cache_key_use(
-    conn: &Connection,
-    space_id: &str,
-    participant_id: &str,
-    generation: i64,
-    attempt_at: i64,
-) -> Result<(), AppError> {
-    conn.execute(
-        &format!(
-            "UPDATE prefix_cache_key SET last_used_at = ?4 \
-             WHERE {LINEAGE_IS} AND generation = ?3 AND last_used_at < ?4"
-        ),
-        (
-            Value::Text(space_id.to_string()),
-            Value::Text(participant_id.to_string()),
-            Value::Integer(generation),
-            Value::Integer(attempt_at),
-        ),
-    )
-    .await
-    .map_err(AppError::db)?;
-    Ok(())
 }
 
 /// Every lineage holding a key, **without the key**: `(space, participant,
@@ -1559,67 +1559,73 @@ pub(crate) async fn prefix_cache_lineages(
 }
 
 /// Forget every key minted under a trust domain other than `current`,
-/// overwritten before it goes — run when the eidola endpoint or trust bundle
-/// changes, so no key outlives the domain it was minted for even until its
-/// lineage's next claim would have rotated it. Returns how many were
-/// forgotten; the caller empties the log when any were
+/// overwritten before it goes — part of the write that changes the eidola
+/// endpoint or trust bundle, so no key outlives the domain it was minted for
+/// even until its lineage's next claim would have rotated it.
+///
+/// **Runs inside the caller's transaction** (`backends::update_backend` opens
+/// one around the configuration write and this), so the configuration and its
+/// keys change together or not at all. Returns how many were forgotten; the
+/// caller empties the log after committing when any were
 /// ([`truncate_log_after_forgetting_keys`]).
 pub(crate) async fn forget_cache_keys_outside(
     conn: &Connection,
     current: &str,
 ) -> Result<u64, AppError> {
-    begin_write(conn).await?;
-    let outcome = async {
-        scrub_cache_keys_where(
-            conn,
-            "trust_domain <> ?1",
-            (Value::Text(current.to_string()),),
-        )
-        .await?;
-        conn.execute(
-            "DELETE FROM prefix_cache_key WHERE trust_domain <> ?1",
-            (Value::Text(current.to_string()),),
-        )
-        .await
-        .map_err(AppError::db)
-    }
-    .await;
-    match outcome {
-        Ok(n) => {
-            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
-            if n > 0 {
-                truncate_log_after_forgetting_keys(conn).await;
-            }
-            Ok(n)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+    scrub_cache_keys_where(
+        conn,
+        "trust_domain <> ?1",
+        (Value::Text(current.to_string()),),
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM prefix_cache_key WHERE trust_domain <> ?1",
+        (Value::Text(current.to_string()),),
+    )
+    .await
+    .map_err(AppError::db)
 }
 
 /// One lineage's row, by `?1` (space) and `?2` (participant).
 const LINEAGE_IS: &str = "space_id = ?1 AND participant_id = ?2";
 
-/// **A lineage that can no longer send.** Its space is archived (archival,
-/// retirement's notebook and rooms, a departing owner's delegations — every
-/// door that closes a space writes `archived_at`), its participant is retired
-/// or removed, or the participant is no longer a live member of the space (an
-/// owned participant struck, a referenced one left). No turn can be prepared
-/// for such a lineage — `prepare_turn` refuses an archived space and resolves
-/// only live members — so its key would sit on disk unsent.
-const UNSENDABLE_LINEAGE: &str = "space_id IN (SELECT id FROM space WHERE archived_at IS NOT NULL) \
-     OR participant_id IN (SELECT id FROM participant WHERE removed_at IS NOT NULL) \
-     OR NOT ( \
-         EXISTS (SELECT 1 FROM participant p \
-                 WHERE p.id = prefix_cache_key.participant_id \
-                   AND p.owner_space_id = prefix_cache_key.space_id) \
-         OR EXISTS (SELECT 1 FROM space_participant sp \
-                    WHERE sp.space_id = prefix_cache_key.space_id \
-                      AND sp.participant_id = prefix_cache_key.participant_id \
-                      AND sp.left_at IS NULL) \
-     )";
+/// **Whether a lineage can still send**, as one SQL boolean over the space
+/// `space` and the participant `participant` (column references or
+/// parameters): the space is open, and the participant is live and a live
+/// member of it — owned by the space, or referenced into it and not left.
+///
+/// The one definition both ends of a key's life read. The claim asks it of the
+/// lineage it is about to key, so a turn prepared before a lineage closed
+/// cannot recreate its key ([`claim_prefix_cache_key`]); the forget deletes by
+/// its negation over every stored row, so every door that closes a space
+/// (archival, retirement's notebook and rooms, a departing owner's
+/// delegations — each writes `archived_at`), retires a participant or ends a
+/// membership leaves no key behind ([`forget_unsendable_cache_keys`]).
+/// `prepare_turn` refuses an archived space and resolves only live members, so
+/// a lineage this answers `false` for has no turn left to send.
+fn lineage_sendable_sql(space: &str, participant: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM space s WHERE s.id = {space} AND s.archived_at IS NULL) \
+          AND EXISTS (SELECT 1 FROM participant p \
+                      WHERE p.id = {participant} AND p.removed_at IS NULL \
+                        AND (p.owner_space_id = {space} \
+                             OR EXISTS (SELECT 1 FROM space_participant sp \
+                                        WHERE sp.space_id = {space} \
+                                          AND sp.participant_id = {participant} \
+                                          AND sp.left_at IS NULL))))"
+    )
+}
+
+/// The stored rows whose lineage can no longer send.
+fn unsendable_lineage_sql() -> String {
+    format!(
+        "NOT {}",
+        lineage_sendable_sql(
+            "prefix_cache_key.space_id",
+            "prefix_cache_key.participant_id"
+        )
+    )
+}
 
 /// Overwrite the stored key bytes of every row matching `predicate` with
 /// zeros, in place.
@@ -1653,7 +1659,7 @@ async fn scrub_cache_keys_where(
 /// rare writes that retire a key. If a reader holds the log it cannot complete
 /// now; the frames then go at the next checkpoint that empties the log, and the
 /// warning says so without naming any key.
-async fn truncate_log_after_forgetting_keys(conn: &Connection) {
+pub(crate) async fn truncate_log_after_forgetting_keys(conn: &Connection) {
     let outcome = async {
         let mut rows = conn
             .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
@@ -1679,7 +1685,7 @@ async fn truncate_log_after_forgetting_keys(conn: &Connection) {
 }
 
 /// Delete the key of every lineage that can no longer send
-/// ([`UNSENDABLE_LINEAGE`]), each overwritten before it goes.
+/// ([`lineage_sendable_sql`]), each overwritten before it goes.
 ///
 /// Stated as the invariant rather than per door, and run inside the
 /// transaction of every write that can end a lineage — archival, retirement,
@@ -1687,9 +1693,10 @@ async fn truncate_log_after_forgetting_keys(conn: &Connection) {
 /// one of those writes is covered without naming it here. Returns how many
 /// keys were forgotten.
 pub(crate) async fn forget_unsendable_cache_keys(conn: &Connection) -> Result<u64, AppError> {
-    scrub_cache_keys_where(conn, UNSENDABLE_LINEAGE, ()).await?;
+    let unsendable = unsendable_lineage_sql();
+    scrub_cache_keys_where(conn, &unsendable, ()).await?;
     conn.execute(
-        &format!("DELETE FROM prefix_cache_key WHERE {UNSENDABLE_LINEAGE}"),
+        &format!("DELETE FROM prefix_cache_key WHERE {unsendable}"),
         (),
     )
     .await
@@ -9634,11 +9641,13 @@ mod tests {
         )
         .await
         .unwrap()
+        .claimed()
         .expect("a key");
         let old = stored_key_bytes(&conn).await.remove(0);
         claim_prefix_cache_key(&conn, "s", &agent, "m", &scope, 10_001)
             .await
             .unwrap()
+            .claimed()
             .expect("a new key for the new model");
         let new = stored_key_bytes(&conn).await.remove(0);
         assert_ne!(old, new);
@@ -9688,8 +9697,77 @@ mod tests {
         claim_prefix_cache_key(&conn, "p", &agent, "m", &cache_scope("d"), 10)
             .await
             .unwrap()
+            .claimed()
             .expect("a key");
         assert!(discard_space_if_pristine(&conn, "p").await.unwrap());
+        assert!(stored_key_bytes(&conn).await.is_empty());
+    }
+
+    /// **A claim cannot recreate a key its lineage's closing just forgot.** A
+    /// turn prepared before the space was archived reaches its claim after the
+    /// archival committed — staged here as exactly that order — and gets
+    /// nothing stored; so does a participant that is not a live member.
+    #[tokio::test]
+    async fn a_claim_after_its_lineage_closed_stores_nothing() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "c",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        let agent = list_space_owned_participants(&conn, "c").await.unwrap()[0]
+            .id
+            .clone();
+        let scope = cache_scope("d");
+        assert!(
+            claim_prefix_cache_key(&conn, "c", &agent, "m", &scope, 10)
+                .await
+                .unwrap()
+                .claimed()
+                .is_some(),
+            "an open lineage is keyed (the premise)"
+        );
+
+        // The archival lands between the turn's preparation and its claim.
+        archive_space_tx(&conn, "c", 20).await.unwrap();
+        assert!(
+            stored_key_bytes(&conn).await.is_empty(),
+            "the archival forgot the key"
+        );
+        assert!(matches!(
+            claim_prefix_cache_key(&conn, "c", &agent, "m", &scope, 30)
+                .await
+                .unwrap(),
+            ClaimOutcome::Unsendable
+        ));
+        assert!(
+            stored_key_bytes(&conn).await.is_empty(),
+            "and the late claim recreated none"
+        );
+
+        // A live participant that is not a member of the space.
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "o",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            claim_prefix_cache_key(&conn, "o", &agent, "m", &scope, 40)
+                .await
+                .unwrap(),
+            ClaimOutcome::Unsendable
+        ));
         assert!(stored_key_bytes(&conn).await.is_empty());
     }
 
@@ -9723,7 +9801,9 @@ mod tests {
         claim_prefix_cache_key(&conn, "b", &agent_b, "m", &cache_scope("new"), 10)
             .await
             .unwrap();
+        begin_write(&conn).await.unwrap();
         assert_eq!(forget_cache_keys_outside(&conn, "new").await.unwrap(), 1);
+        conn.execute("COMMIT", ()).await.unwrap();
         let left = prefix_cache_lineages(&conn).await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].0, "b");

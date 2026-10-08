@@ -553,54 +553,83 @@ impl Inner {
         let overrides_json = update
             .model_overrides
             .map(|o| overrides_to_json(o.as_deref()));
-        let updated = db::update_backend_config(
-            &conn,
-            id,
-            update.display_name.as_deref(),
-            update
-                .base_url
-                .as_ref()
-                .map(|o| o.as_deref().map(|u| u.trim().trim_end_matches('/'))),
-            update.api_key.as_ref().map(|o| o.as_deref()),
-            update.models_dir.as_ref().map(|o| o.as_deref()),
-            overrides_json.as_ref().map(|o| o.as_deref()),
-            update
-                .engine_path
-                .as_ref()
-                .map(|o| o.as_deref().map(|p| p.trim()).filter(|p| !p.is_empty())),
-            update.auto_start,
-            update
-                .trusted_measurements
-                .as_ref()
-                .map(|o| o.as_deref().filter(|m| !m.is_empty())),
-            update.hardware_root_ca.as_ref().map(|o| o.as_deref()),
-            update
-                .hardware_intermediate_ca
-                .as_ref()
-                .map(|o| o.as_deref()),
-            now_ms(),
-        )
-        .await?;
+        // **One transaction: the configuration and the keys it invalidates.**
+        // A prefix-cache key never outlives the trust domain it was minted
+        // under — every key is bound to the digest of the eidola endpoint and
+        // trust bundle, and a mismatch rotates it at the next claim — and this
+        // is the belt to that brace: a write that changes the domain forgets
+        // every key from another one in the same transaction, read back from
+        // the row as written. So the configuration never commits without its
+        // cleanup, and a failure in either leaves both as they were and is
+        // reported with nothing to announce. A write that changed nothing
+        // keeps every key.
+        db::begin_write(&conn).await?;
+        let written = async {
+            let updated = db::update_backend_config(
+                &conn,
+                id,
+                update.display_name.as_deref(),
+                update
+                    .base_url
+                    .as_ref()
+                    .map(|o| o.as_deref().map(|u| u.trim().trim_end_matches('/'))),
+                update.api_key.as_ref().map(|o| o.as_deref()),
+                update.models_dir.as_ref().map(|o| o.as_deref()),
+                overrides_json.as_ref().map(|o| o.as_deref()),
+                update
+                    .engine_path
+                    .as_ref()
+                    .map(|o| o.as_deref().map(|p| p.trim()).filter(|p| !p.is_empty())),
+                update.auto_start,
+                update
+                    .trusted_measurements
+                    .as_ref()
+                    .map(|o| o.as_deref().filter(|m| !m.is_empty())),
+                update.hardware_root_ca.as_ref().map(|o| o.as_deref()),
+                update
+                    .hardware_intermediate_ca
+                    .as_ref()
+                    .map(|o| o.as_deref()),
+                now_ms(),
+            )
+            .await?;
+            if !updated || kind != BackendKind::Eidola {
+                return Ok((updated, 0));
+            }
+            #[cfg(feature = "test-support")]
+            if self
+                .fail_cache_key_cleanup
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(AppError::Database {
+                    message: "injected failure forgetting prefix-cache keys".into(),
+                });
+            }
+            let current = db::get_backend(&conn, id).await?;
+            let domain = crate::EidolaResolved::from_row(current.as_ref())?.cache_trust_domain();
+            Ok((true, db::forget_cache_keys_outside(&conn, &domain).await?))
+        }
+        .await;
+        let (updated, forgotten) = match written {
+            Ok(done) => {
+                conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+                done
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
         if !updated {
             return Err(AppError::NotConfigured {
                 message: format!("no backend named `{id}` is configured"),
             });
         }
+        if forgotten > 0 {
+            db::truncate_log_after_forgetting_keys(&conn).await;
+        }
         if repointed {
             self.retire_engines_for(id).await;
-        }
-        // **A prefix-cache key never outlives the trust domain it was minted
-        // under.** Every key is bound to the digest of the eidola endpoint and
-        // trust bundle and a mismatch rotates it at the next claim; this is
-        // the belt to that brace, so a key minted against a dev stack or an
-        // overridden bundle does not stay on disk once the client is pointed
-        // elsewhere. Read back from the row just written, still under the
-        // configuration lock, so the domain kept is the one now in force. A
-        // write that changed nothing keeps every key.
-        if kind == BackendKind::Eidola {
-            let current = db::get_backend(&conn, id).await?;
-            let domain = crate::EidolaResolved::from_row(current.as_ref())?.cache_trust_domain();
-            db::forget_cache_keys_outside(&conn, &domain).await?;
         }
         self.bus.emit(Change::Backends);
         Ok(())

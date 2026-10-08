@@ -156,12 +156,13 @@ pub(crate) enum Claim {
 /// - Idle for `idle_ttl_ms` or more since its last request.
 /// - `max_age_ms` or more since it was minted.
 ///
-/// Both stored times are attempt times, taken before the request could reach
-/// any engine, so both measures run at least as long as the engine's own: the
-/// key is retired no later than the cache could still answer for it. And a use
-/// is recorded only for an attempt that may have left this machine
-/// ([`crate::db::record_cache_key_use`]), so idleness is measured from the
-/// last request an observer could have seen, never renewed by one nobody did.
+/// `now` is the instant the request's body is first asked for, after its
+/// connection and attestation (`keyed_body` in `lib.rs`), and both stored times
+/// are such instants: no later than any engine could see the request, so both
+/// measures run at least as long as the engine's own and the key is retired no
+/// later than the cache could still answer for it; and no earlier than it could
+/// be observed, so idleness is measured from the last request anyone could have
+/// seen and never renewed by one whose connection never opened.
 pub(crate) fn decide(
     stored: Option<&StoredKeyAge>,
     model: &str,

@@ -2177,12 +2177,12 @@ struct Inner {
     /// build contains no path that widens what counts as our own catalog.
     #[cfg(feature = "test-support")]
     trust_declared_capabilities: std::sync::atomic::AtomicBool,
-    /// Milliseconds added to the clock the prefix-cache rotation rule reads
-    /// ([`Inner::cache_clock_ms`]), so a test can stand a lineage past its idle
-    /// TTL or maximum age — or set the clock back — without waiting. Only the
-    /// rotation rule reads it; every other timestamp is untouched.
+    /// The clock the prefix-cache rotation rule reads ([`CacheClock`]).
+    cache_clock: CacheClock,
+    /// Make the key cleanup inside an eidola configuration write fail, so a
+    /// test can hold the write and its cleanup to one transaction.
     #[cfg(feature = "test-support")]
-    cache_clock_offset_ms: std::sync::atomic::AtomicI64,
+    fail_cache_key_cleanup: std::sync::atomic::AtomicBool,
     /// The process-lifetime exclusive advisory lock on the local database
     /// (`<data_dir>/eidola.db.lock`). Taken in [`AppCore::build`] — a second
     /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
@@ -2761,61 +2761,6 @@ impl Inner {
             return true;
         }
         !eidola.base_url_is_override && !eidola.measurements_are_override
-    }
-
-    /// The clock the prefix-cache rotation rule reads: this client's own wall
-    /// clock (plus a test's offset). See [`prefix_cache::decide`] for what a
-    /// clock that moves backwards does.
-    fn cache_clock_ms(&self) -> i64 {
-        #[cfg(feature = "test-support")]
-        {
-            now_ms().saturating_add(
-                self.cache_clock_offset_ms
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            )
-        }
-        #[cfg(not(feature = "test-support"))]
-        {
-            now_ms()
-        }
-    }
-
-    /// The prefix-cache key this request of `prep`'s turn carries, if any.
-    ///
-    /// `None` unless the catalog declared the model's prefix cache
-    /// (`TurnPrep::cache_scope`), so every other request is untouched. Asked
-    /// **per request** rather than once per turn: a tool round can run past
-    /// the idle TTL. The claim leaves the attempt pending on `prep`, and
-    /// [`TurnPrep::send`] records the use only if the request may have left
-    /// ([`db::record_cache_key_use`]). A failure to read or write the key is
-    /// not the turn's failure — the request goes without one, which costs a
-    /// cache miss and links nothing — and the warning names neither the key
-    /// nor the lineage.
-    async fn claim_cache_key(&self, prep: &mut TurnPrep) -> Option<prefix_cache::CacheKey> {
-        let scope = prep.cache_scope.as_ref()?;
-        match db::claim_prefix_cache_key(
-            &prep.db_conn,
-            &prep.space_id,
-            &prep.model_participant_id,
-            &prep.model,
-            scope,
-            self.cache_clock_ms(),
-        )
-        .await
-        {
-            Ok(Some(claimed)) => {
-                prep.pending_cache_use = Some(PendingCacheUse {
-                    generation: claimed.generation,
-                    attempt_at: claimed.attempt_at,
-                });
-                Some(claimed.key)
-            }
-            Ok(None) => None,
-            Err(_) => {
-                eprintln!("warning: a turn's prefix-cache key could not be claimed; sending none");
-                None
-            }
-        }
     }
 }
 
@@ -4597,6 +4542,11 @@ impl Inner {
         )
         .await?;
         if changed {
+            if ov.model_ref.is_some() {
+                // The schema's trigger forgot this lineage's key in the
+                // write's own statement; empty the log of its history too.
+                db::truncate_log_after_forgetting_keys(&conn).await;
+            }
             self.bus.emit(Change::Participants);
             return Ok(());
         }
@@ -4798,6 +4748,11 @@ impl Inner {
         let persona = validate_persona(&update, expected)?;
         let conn = self.db_conn().await?;
         if persona.apply(&conn, participant_id, now_ms()).await? {
+            if update.model_ref.is_some() {
+                // The schema's trigger forgot the participant's keys in the
+                // write's own statement; empty the log of their history too.
+                db::truncate_log_after_forgetting_keys(&conn).await;
+            }
             self.bus.emit(Change::Participants);
             return Ok(());
         }
@@ -7268,7 +7223,7 @@ impl Inner {
             auto_tools,
             tool_policy,
             cache_scope,
-            pending_cache_use: None,
+            cache_clock: self.cache_clock.clone(),
             remote_pricing,
             budget,
             charge_credits,
@@ -7727,18 +7682,17 @@ impl Inner {
             self.bus.emit(Change::Space(space_for_emit.clone()));
         };
 
-        let cache_key = self.claim_cache_key(&mut *prep).await;
-        let request_body_json = prep.request_body(false, cache_key.as_ref());
-        drop(cache_key);
+        let request_body_json = prep.request_body(false);
         let request_at = now_ms();
 
         // Send the chat request. On failure, attempt refund recovery before
         // propagating the error so the credential isn't abandoned. Local
         // turns carry no Authorization header — there is nothing to spend.
-        let mut request = prep
-            .client
-            .post(format!("{}/v1/chat/completions", prep.base_url))
-            .json(&request_body_json);
+        let mut request = prep.with_body(
+            prep.client
+                .post(format!("{}/v1/chat/completions", prep.base_url)),
+            &request_body_json,
+        );
         if let Some(auth_value) = &prep.auth_value {
             request = request.header("Authorization", auth_value);
         }
@@ -8449,16 +8403,15 @@ impl Inner {
         // Sending it from the client is harmless (the server ignores
         // and overrides the value), but it's also unnecessary, so we
         // keep our outgoing request minimal.
-        let cache_key = self.claim_cache_key(&mut *prep).await;
-        let request_body_json = prep.request_body(true, cache_key.as_ref());
-        drop(cache_key);
+        let request_body_json = prep.request_body(true);
         let request_at = now_ms();
 
-        let mut request = prep
-            .client
-            .post(format!("{}/v1/chat/completions", prep.base_url))
-            .header("Accept", "text/event-stream")
-            .json(&request_body_json);
+        let mut request = prep.with_body(
+            prep.client
+                .post(format!("{}/v1/chat/completions", prep.base_url))
+                .header("Accept", "text/event-stream"),
+            &request_body_json,
+        );
         if let Some(auth_value) = &prep.auth_value {
             request = request.header("Authorization", auth_value);
         }
@@ -10044,8 +9997,32 @@ impl AppCore {
     #[cfg(feature = "test-support")]
     pub fn test_advance_cache_clock(&self, delta_ms: i64) {
         self.inner
-            .cache_clock_offset_ms
+            .cache_clock
+            .offset_ms
             .fetch_add(delta_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// **Test-only seam.** Make the prefix-cache key cleanup that rides an
+    /// eidola configuration write fail (`true`) or succeed again (`false`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_fail_cache_key_cleanup(&self, fail: bool) {
+        self.inner
+            .fail_cache_key_cleanup
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// **Test-only seam.** Advance the prefix-cache clock by `delta_ms` each
+    /// time a turn hands a request to the transport — after the request is
+    /// built, before the connection is set up — modelling a slow connection,
+    /// a slow attestation, or a process suspended in between. `0` stops it.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_delay_cache_clock_at_each_send(&self, delta_ms: i64) {
+        self.inner
+            .cache_clock
+            .delay_at_send_ms
+            .store(delta_ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn build(
@@ -10128,8 +10105,9 @@ impl AppCore {
                 http_override,
                 #[cfg(feature = "test-support")]
                 trust_declared_capabilities: std::sync::atomic::AtomicBool::new(false),
+                cache_clock: CacheClock::default(),
                 #[cfg(feature = "test-support")]
-                cache_clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
+                fail_cache_key_cleanup: std::sync::atomic::AtomicBool::new(false),
                 _db_lock: db_lock,
             }),
         })
@@ -12809,6 +12787,131 @@ impl ModelListEntry {
     }
 }
 
+/// The clock the prefix-cache rotation rule reads: this client's own wall
+/// clock. Under the test-support feature a test can offset it, or advance it
+/// at each send to stand a request's setup past a retention bound; see
+/// [`prefix_cache::decide`] for what a clock that moves backwards does.
+#[derive(Clone, Default)]
+struct CacheClock {
+    #[cfg(feature = "test-support")]
+    offset_ms: Arc<std::sync::atomic::AtomicI64>,
+    #[cfg(feature = "test-support")]
+    delay_at_send_ms: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl CacheClock {
+    fn now_ms(&self) -> i64 {
+        #[cfg(feature = "test-support")]
+        {
+            now_ms().saturating_add(self.offset_ms.load(std::sync::atomic::Ordering::Relaxed))
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            now_ms()
+        }
+    }
+
+    /// The test seam's simulated setup delay, applied as a request is handed
+    /// to the transport. Nothing in a release build.
+    fn at_send(&self) {
+        #[cfg(feature = "test-support")]
+        {
+            let delay = self
+                .delay_at_send_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            self.offset_ms
+                .fetch_add(delay, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// What a keyed request body carries in its `cache_key` member until the
+/// transport starts writing it: a well-formed key (32 zero bytes) of exactly a
+/// real key's length, so the body's length — and its `Content-Length` — is
+/// fixed before the key is chosen. Never sent: [`keyed_body`] replaces it.
+const CACHE_KEY_PLACEHOLDER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// A keyed request's body, as the transport will write it: the serialized body
+/// with the lineage's key **claimed at the moment the transport first asks for
+/// the body's bytes** — after the connection is open, TLS is up and the peer's
+/// attestation has passed, which is when anything in the body can first be
+/// observed.
+///
+/// That is the one invariant the rotation rule needs: **a key is judged at the
+/// instant it becomes observable.** Judged earlier — when the request was
+/// prepared or built — a slow connection, a slow attestation, or a process
+/// suspended in between could carry a key past its idle TTL or maximum age
+/// before anyone saw it. And the claim stamps the lineage's use only then, so
+/// a request whose connection never opened (DNS, refused, a failed handshake
+/// or attestation) never asks for its body, claims nothing, and leaves the
+/// lineage's idle clock where it was; one that asked may have been delivered,
+/// and is counted at that instant.
+///
+/// The body is one chunk of a length known up front ([`CACHE_KEY_PLACEHOLDER`]
+/// is a key's length), so it is sent with a `Content-Length` exactly as the
+/// unkeyed body is. If the lineage can no longer send
+/// ([`db::ClaimOutcome::Unsendable`]) or its key cannot be read or written,
+/// the body carries a fresh random key that is stored nowhere and used once —
+/// exactly as unlinkable as no key, and the same length. Only if the OS cannot
+/// supply randomness at all does the body fail, and the request with it.
+fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usize) {
+    let mut bytes = serde_json::to_vec(body).expect("a JSON value serializes");
+    // Object members serialize sorted, and `cache_key` sorts first among the
+    // body's members, so the first unescaped occurrence is the member itself
+    // (a message's text holding the same characters is escaped).
+    let needle = format!("\"cache_key\":\"{CACHE_KEY_PLACEHOLDER}\"");
+    let at = bytes
+        .windows(needle.len())
+        .position(|w| w == needle.as_bytes())
+        .expect("a keyed body carries the placeholder")
+        + "\"cache_key\":\"".len();
+    let len = bytes.len();
+    let conn = prep.db_conn.clone();
+    let space_id = prep.space_id.clone();
+    let participant_id = prep.model_participant_id.clone();
+    let model = prep.model.clone();
+    let scope = prep
+        .cache_scope
+        .clone()
+        .expect("only a keyed turn builds a keyed body");
+    let clock = prep.cache_clock.clone();
+    let chunk = async move {
+        let claimed = db::claim_prefix_cache_key(
+            &conn,
+            &space_id,
+            &participant_id,
+            &model,
+            &scope,
+            clock.now_ms(),
+        )
+        .await;
+        let key = match claimed {
+            Ok(db::ClaimOutcome::Claimed(key)) => key,
+            Ok(db::ClaimOutcome::Unsendable) => one_use_key()?,
+            Err(_) => {
+                eprintln!(
+                    "warning: a turn's prefix-cache key could not be claimed; sending a one-use key"
+                );
+                one_use_key()?
+            }
+        };
+        bytes[at..at + CACHE_KEY_PLACEHOLDER.len()].copy_from_slice(key.as_str().as_bytes());
+        Ok::<_, std::io::Error>(bytes::Bytes::from(bytes))
+    };
+    (
+        reqwest::Body::wrap_stream(futures_util::stream::once(chunk)),
+        len,
+    )
+}
+
+/// A key stored nowhere and sent once: what a keyed body carries when its
+/// lineage cannot (or can no longer) hold one.
+fn one_use_key() -> Result<prefix_cache::CacheKey, std::io::Error> {
+    prefix_cache::mint()
+        .map(|bytes| prefix_cache::CacheKey::from_bytes(&bytes))
+        .ok_or_else(|| std::io::Error::other("the operating system supplied no randomness"))
+}
+
 // ============================================================================
 // Refund processing helpers
 // ============================================================================
@@ -12825,59 +12928,6 @@ impl ModelListEntry {
 /// and streaming transports differ only in how they carry the request and
 /// read the response; everything durable before and after the wire lives
 /// here.
-/// Whether a request with a prefix-cache key **may have left this machine**,
-/// read off how its send ended — the line between a use the key's lineage must
-/// count and an attempt nobody saw.
-///
-/// - A response arrived: delivered.
-/// - The send failed before the request could be written — no connection
-///   (DNS, refused, a handshake or attestation that did not pass) or a request
-///   that could not be built: not sent, so not a use.
-/// - Any other failure (a connection that dropped after the request went, a
-///   timeout mid-exchange): delivery unknown, so counted as delivered at the
-///   attempt time — the reading that keeps both the engine-side bound and the
-///   linkability window honest.
-fn may_have_left(result: &Result<reqwest::Response, reqwest::Error>) -> bool {
-    match result {
-        Ok(_) => true,
-        Err(e) => !(e.is_connect() || e.is_builder()),
-    }
-}
-
-/// A claimed key's attempt, waiting for [`TurnPrep::send`] to learn whether
-/// the request left with it.
-struct PendingCacheUse {
-    generation: i64,
-    attempt_at: i64,
-}
-
-/// One request's body, as sent: scrubs its prefix-cache key when the request
-/// is done with it.
-///
-/// Every exit of a round reads the body (the Record keeps it), so it lives for
-/// the round; the copy of the key it holds goes when it does. The Record never
-/// keeps the key ([`recorded::recorded_request`] withholds it).
-struct WireBody(serde_json::Value);
-
-impl std::ops::Deref for WireBody {
-    type Target = serde_json::Value;
-    fn deref(&self) -> &serde_json::Value {
-        &self.0
-    }
-}
-
-impl serde::Serialize for WireBody {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(s)
-    }
-}
-
-impl Drop for WireBody {
-    fn drop(&mut self) {
-        prefix_cache::scrub_body_key(&mut self.0);
-    }
-}
-
 struct TurnPrep {
     db_conn: turso::Connection,
     provider_id: String,
@@ -12980,13 +13030,11 @@ struct TurnPrep {
     tool_policy: ToolPolicy,
     /// The model's engine prefix cache as the catalog declared it, or `None`
     /// for every model without one — every non-eidola backend included. Only
-    /// a `Some` here ever puts a `cache_key` on the wire
-    /// ([`Inner::claim_cache_key`]). Carries the trust domain the turn talks
+    /// a `Some` here ever puts a `cache_key` on the wire ([`keyed_body`]). Carries the trust domain the turn talks
     /// to, so a key never crosses from one endpoint or trust bundle to another.
     cache_scope: Option<prefix_cache::CacheScope>,
-    /// The current request's claimed key, until its send says whether it left
-    /// ([`Inner::claim_cache_key`], [`TurnPrep::send`]).
-    pending_cache_use: Option<PendingCacheUse>,
+    /// The clock the key is judged by, at the moment it is claimed.
+    cache_clock: CacheClock,
     /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
     /// for every non-spend backend. Kept so a later round can re-estimate.
     remote_pricing: Option<ChargePricing>,
@@ -13107,24 +13155,42 @@ impl TurnPrep {
     /// sends exactly the bytes it sent before tool support existed, so
     /// upstream prefix caches — and every pinned-bytes test — are undisturbed.
     ///
-    /// `cache_key` is the lineage's key for this request
-    /// ([`Inner::claim_cache_key`]); `None` — every model whose catalog row
-    /// declares no prefix cache — leaves the body exactly as it was before
+    /// A turn whose model declares a prefix cache carries
+    /// [`CACHE_KEY_PLACEHOLDER`] here; the key itself is chosen as the body is
+    /// written ([`keyed_body`]), so this value — which is what the Record keeps
+    /// — never holds one. Every other turn's body is exactly what it was before
     /// keys existed.
-    fn request_body(&self, stream: bool, cache_key: Option<&prefix_cache::CacheKey>) -> WireBody {
+    fn request_body(&self, stream: bool) -> serde_json::Value {
         // The Eidola server forces `include_usage` upstream regardless
         // (accurate refunds depend on it), so the remote request stays
         // minimal — but a local llama-server only reports usage when the
         // client asks.
-        WireBody(eidola_common::chat_completion_request_body(
+        eidola_common::chat_completion_request_body(
             &self.wire_model,
             &self.messages,
             self.max_completion_tokens,
             &self.tool_schemas,
             stream,
             stream && self.spend.is_none(),
-            cache_key.map(prefix_cache::CacheKey::as_str),
-        ))
+            self.cache_scope.as_ref().map(|_| CACHE_KEY_PLACEHOLDER),
+        )
+    }
+
+    /// Attach `body` to `request`: as JSON, exactly as before keys existed,
+    /// for every turn without a prefix cache; as a [`keyed_body`] otherwise.
+    fn with_body(
+        &self,
+        request: reqwest::RequestBuilder,
+        body: &serde_json::Value,
+    ) -> reqwest::RequestBuilder {
+        if self.cache_scope.is_none() {
+            return request.json(body);
+        }
+        let (stream, len) = keyed_body(self, body);
+        request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(stream)
     }
 
     /// Flush attestations captured since the last flush (a fresh handshake
@@ -13203,25 +13269,10 @@ impl TurnPrep {
         &mut self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        // Taken first, so a request that cannot even be built records no use.
-        let pending = self.pending_cache_use.take();
         let request = request.build()?;
         self.attach_plain_connection().await;
-        let result = self.client.execute(request).await;
-        if let Some(pending) = pending
-            && may_have_left(&result)
-            && let Err(e) = db::record_cache_key_use(
-                &self.db_conn,
-                &self.space_id,
-                &self.model_participant_id,
-                pending.generation,
-                pending.attempt_at,
-            )
-            .await
-        {
-            eprintln!("warning: a prefix-cache key's use was not recorded: {e}");
-        }
-        result
+        self.cache_clock.at_send();
+        self.client.execute(request).await
     }
 
     /// Settle this round's hold: **the refund the server handed us first, and
@@ -17139,56 +17190,6 @@ async fn insert_plain_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A refused connection sent nothing; a connection that took the request
-    /// and dropped may have delivered it. Real errors from a real client, so
-    /// the classification is held to how reqwest actually reports each.
-    #[test]
-    fn only_a_request_that_may_have_left_counts_as_a_keys_use() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-        runtime.block_on(async {
-            let client = reqwest::Client::builder().build().unwrap();
-
-            let refused_port = {
-                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                l.local_addr().unwrap().port()
-            };
-            let refused = client
-                .post(format!(
-                    "http://127.0.0.1:{refused_port}/v1/chat/completions"
-                ))
-                .body("{}")
-                .send()
-                .await;
-            assert!(
-                refused.as_ref().is_err_and(|e| e.is_connect()),
-                "{refused:?}"
-            );
-            assert!(!may_have_left(&refused));
-
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let dropper = std::thread::spawn(move || {
-                use std::io::Read;
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                // Dropped without answering.
-            });
-            let dropped = client
-                .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
-                .body("{}")
-                .send()
-                .await;
-            dropper.join().unwrap();
-            assert!(
-                dropped.as_ref().is_err_and(|e| !e.is_connect()),
-                "{dropped:?}"
-            );
-            assert!(may_have_left(&dropped));
-        });
-    }
 
     /// **An event ends at any two line terminators the format allows.**
     ///
