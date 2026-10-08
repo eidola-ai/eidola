@@ -12,10 +12,264 @@
 //!   for a config the node would refuse, or that it reads differently;
 //! - `measure-enclave`, which turns the config into that pin.
 //!
-//! The Argon2id rule needs the `argon2` crate and sits behind this crate's
+//! The Argon2id rule, and with it [`parse_measured`] (the whole measured
+//! environment), need the `argon2` crate and sit behind this crate's
 //! `argon2` feature: only the node and the gateway enable it, and both
 //! already depend on `argon2` themselves (see the crate docs' dependency
 //! rule).
+
+/// The node's environment variables. Every one is required (an empty value
+/// counts as missing) except where noted.
+pub mod env {
+    /// The one model id this node serves.
+    pub const MODEL_ID: &str = "EIDOLA_ENGINE_MODEL_ID";
+    /// Directory holding the model's weights and chat artifacts.
+    pub const WEIGHTS_DIR: &str = "EIDOLA_ENGINE_WEIGHTS_DIR";
+    /// The weights hash the directory must have (64 hex digits).
+    pub const WEIGHTS_SHA256: &str = "EIDOLA_ENGINE_WEIGHTS_SHA256";
+    /// `verified-readonly` (production: a read-only, kernel-verified mount) or
+    /// `dev-writable`.
+    pub const WEIGHTS_STORAGE: &str = "EIDOLA_ENGINE_WEIGHTS_STORAGE";
+    /// The gateway's bearer token. Secret, so not part of the measured
+    /// configuration [`super::parse_measured`] reads.
+    pub const GATEWAY_TOKEN: &str = "GATEWAY_TOKEN";
+    /// Argon2id hash of the gateway token (measured).
+    pub const GATEWAY_TOKEN_HASH: &str = "GATEWAY_TOKEN_HASH";
+    /// `cpu` or `cuda`.
+    pub const EXECUTOR: &str = "EIDOLA_ENGINE_EXECUTOR";
+    /// Listen address, `host:port`.
+    pub const BIND_ADDR: &str = "EIDOLA_ENGINE_BIND_ADDR";
+    /// Positions per KV block.
+    pub const KV_BLOCK_SIZE: &str = "EIDOLA_ENGINE_KV_BLOCK_SIZE";
+    /// Physical KV blocks per group, including the reserved null block.
+    pub const KV_BLOCKS: &str = "EIDOLA_ENGINE_KV_BLOCKS";
+    /// Longest sequence (prompt plus completion), in tokens.
+    pub const MAX_MODEL_LEN: &str = "EIDOLA_ENGINE_MAX_MODEL_LEN";
+    /// Sequences per step (and per-sequence state slots).
+    pub const MAX_SEQS: &str = "EIDOLA_ENGINE_MAX_SEQS";
+    /// Query tokens per step.
+    pub const MAX_BATCHED_TOKENS: &str = "EIDOLA_ENGINE_MAX_BATCHED_TOKENS";
+    /// Largest prefill chunk for one sequence in one step.
+    pub const MAX_PREFILL_CHUNK: &str = "EIDOLA_ENGINE_MAX_PREFILL_CHUNK";
+    /// Speculative draft width `k` (MTP depths); 0 disables speculation.
+    pub const DRAFT_TOKENS: &str = "EIDOLA_ENGINE_DRAFT_TOKENS";
+    /// Requests admitted to the engine at once (running plus queued).
+    pub const MAX_REQUESTS: &str = "EIDOLA_ENGINE_MAX_REQUESTS";
+    /// Whether finished keyed requests' KV is kept for reuse (`true` / `false`).
+    pub const PREFIX_CACHE: &str = "EIDOLA_ENGINE_PREFIX_CACHE";
+    /// Prefix-cache idle lifetime, seconds.
+    pub const CACHE_IDLE_TTL_SECS: &str = "EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS";
+    /// Prefix-cache maximum age, seconds.
+    pub const CACHE_MAX_AGE_SECS: &str = "EIDOLA_ENGINE_CACHE_MAX_AGE_SECS";
+}
+
+/// Which executor the configuration selects. Whether a given node build can
+/// run it is the node's concern (a `cuda` node build), not the grammar's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Executor {
+    /// The f32 reference executor.
+    Cpu,
+    /// The CUDA executor.
+    Cuda,
+}
+
+/// What backs the weights directory, as the measured configuration declares
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightsStorage {
+    /// Production: every weights file on read-only, kernel-verified storage
+    /// (checked by the node before any weights file is opened).
+    VerifiedReadonly,
+    /// Development: any filesystem, reported as such by the node.
+    DevWritable,
+}
+
+impl WeightsStorage {
+    /// The configuration spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WeightsStorage::VerifiedReadonly => "verified-readonly",
+            WeightsStorage::DevWritable => "dev-writable",
+        }
+    }
+}
+
+/// KV memory and scheduler sizing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sizing {
+    pub kv_block_size: u32,
+    pub kv_blocks: u32,
+    pub max_model_len: u32,
+    pub max_seqs: u32,
+    pub max_batched_tokens: u32,
+    pub max_prefill_chunk: u32,
+    pub draft_tokens: u32,
+    pub max_requests: u32,
+}
+
+/// Prefix-cache lifetime policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheConfig {
+    pub enabled: bool,
+    pub idle_ttl_secs: u64,
+    pub max_age_secs: u64,
+}
+
+/// A node's measured configuration: every variable of its environment except
+/// the secret gateway token, parsed and validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeasuredConfig {
+    pub model_id: String,
+    pub weights_dir: String,
+    /// Lowercase hex.
+    pub weights_sha256: String,
+    pub weights_storage: WeightsStorage,
+    /// A validated Argon2id PHC string.
+    pub gateway_token_hash: String,
+    pub executor: Executor,
+    pub bind_addr: core::net::SocketAddr,
+    pub sizing: Sizing,
+    pub cache: CacheConfig,
+}
+
+/// A refused configuration. Names the variable and the problem, never its
+/// value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError(pub String);
+
+impl core::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "configuration refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// Parse a node's measured configuration through `lookup` (its environment,
+/// or a deployment config's env list). **This is the node's boot grammar**:
+/// the node calls it and then verifies its secret token against the hash, so
+/// a configuration this accepts is one the node boots with, up to checks
+/// against its weights (model length, MTP depth, executor availability) that
+/// need the model itself. The gateway's build check runs every pinned
+/// deployment's whole env through it.
+#[cfg(feature = "argon2")]
+pub fn parse_measured(
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<MeasuredConfig, ConfigError> {
+    let get = |name: &str| -> Result<String, ConfigError> {
+        lookup(name)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| ConfigError(format!("{name} is not set")))
+    };
+    let positive = |name: &str| -> Result<u32, ConfigError> {
+        match get(name)?.parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(ConfigError(format!("{name} must be a positive integer"))),
+        }
+    };
+    let non_negative = |name: &str| -> Result<u32, ConfigError> {
+        get(name)?
+            .parse::<u32>()
+            .map_err(|_| ConfigError(format!("{name} must be a non-negative integer")))
+    };
+    let seconds = |name: &str| -> Result<u64, ConfigError> {
+        parse_cache_seconds(&get(name)?)
+            .ok_or_else(|| ConfigError(format!("{name} must be a positive number of seconds")))
+    };
+
+    let model_id = get(env::MODEL_ID)?;
+    if model_id
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(ConfigError(format!(
+            "{} must not contain whitespace or control characters",
+            env::MODEL_ID
+        )));
+    }
+    let weights_dir = get(env::WEIGHTS_DIR)?;
+    let weights_sha256 = get(env::WEIGHTS_SHA256)?.to_ascii_lowercase();
+    if !(weights_sha256.len() == 64
+        && weights_sha256
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    {
+        return Err(ConfigError(format!(
+            "{} must be 64 hexadecimal digits",
+            env::WEIGHTS_SHA256
+        )));
+    }
+    let weights_storage = match get(env::WEIGHTS_STORAGE)?.as_str() {
+        "verified-readonly" => WeightsStorage::VerifiedReadonly,
+        "dev-writable" => WeightsStorage::DevWritable,
+        _ => {
+            return Err(ConfigError(format!(
+                "{} must be `verified-readonly` or `dev-writable`",
+                env::WEIGHTS_STORAGE
+            )));
+        }
+    };
+    let gateway_token_hash = get(env::GATEWAY_TOKEN_HASH)?;
+    parse_gateway_token_hash(&gateway_token_hash)
+        .map_err(|e| ConfigError(format!("{}: {e}", env::GATEWAY_TOKEN_HASH)))?;
+    let executor = match get(env::EXECUTOR)?.as_str() {
+        "cpu" => Executor::Cpu,
+        "cuda" => Executor::Cuda,
+        _ => {
+            return Err(ConfigError(format!(
+                "{}: expected `cpu` or `cuda`",
+                env::EXECUTOR
+            )));
+        }
+    };
+    let bind_addr = get(env::BIND_ADDR)?
+        .parse::<core::net::SocketAddr>()
+        .map_err(|_| ConfigError(format!("{} must be host:port", env::BIND_ADDR)))?;
+
+    let sizing = Sizing {
+        kv_block_size: positive(env::KV_BLOCK_SIZE)?,
+        kv_blocks: positive(env::KV_BLOCKS)?,
+        max_model_len: positive(env::MAX_MODEL_LEN)?,
+        max_seqs: positive(env::MAX_SEQS)?,
+        max_batched_tokens: positive(env::MAX_BATCHED_TOKENS)?,
+        max_prefill_chunk: positive(env::MAX_PREFILL_CHUNK)?,
+        draft_tokens: non_negative(env::DRAFT_TOKENS)?,
+        max_requests: positive(env::MAX_REQUESTS)?,
+    };
+    if sizing.kv_blocks < 2 {
+        return Err(ConfigError(format!(
+            "{} must be at least 2 (block 0 is reserved)",
+            env::KV_BLOCKS
+        )));
+    }
+
+    let enabled = parse_prefix_cache(&get(env::PREFIX_CACHE)?)
+        .ok_or_else(|| ConfigError(format!("{} must be `true` or `false`", env::PREFIX_CACHE)))?;
+    let cache = CacheConfig {
+        enabled,
+        idle_ttl_secs: seconds(env::CACHE_IDLE_TTL_SECS)?,
+        max_age_secs: seconds(env::CACHE_MAX_AGE_SECS)?,
+    };
+    if cache.idle_ttl_secs > cache.max_age_secs {
+        return Err(ConfigError(format!(
+            "{} must not exceed {}",
+            env::CACHE_IDLE_TTL_SECS,
+            env::CACHE_MAX_AGE_SECS
+        )));
+    }
+
+    Ok(MeasuredConfig {
+        model_id,
+        weights_dir,
+        weights_sha256,
+        weights_storage,
+        gateway_token_hash,
+        executor,
+        bind_addr,
+        sizing,
+        cache,
+    })
+}
 
 /// Largest prefix-cache retention bound, in seconds: the engine core keeps
 /// retention in milliseconds as a `u64`.

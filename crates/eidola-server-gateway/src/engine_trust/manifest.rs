@@ -6,8 +6,10 @@
 //! build on any disagreement, and by the crate's tests, which run the same
 //! function over fixtures. It therefore uses nothing from the crate and only
 //! dependencies that are both build- and dev-dependencies (`serde_json`,
-//! `serde_yaml`, `sha2`, and `eidola-common` with its `argon2` feature, whose
-//! `engine_deployment` module holds the grammar the node boots with).
+//! `serde_yaml`, `sha2`, `eidola-common` with its `argon2` feature, whose
+//! `engine_deployment` module is the grammar the node boots with, and
+//! `tinfoil-verifier`, whose pin compiler is the one the attesting client
+//! runs).
 //!
 //! # What is checked
 //!
@@ -263,13 +265,30 @@ fn check_deployment(
             "{at}: weights.repo must be <owner>/<name> of [A-Za-z0-9._-]"
         ));
     }
-    config.require_env(&at_config, "EIDOLA_ENGINE_MODEL_ID", model_id)?;
-    config.require_env(&at_config, "EIDOLA_ENGINE_WEIGHTS_SHA256", &weights.sha256)?;
-    config.require_env(
-        &at_config,
-        "EIDOLA_ENGINE_WEIGHTS_STORAGE",
-        "verified-readonly",
-    )?;
+    // The whole measured environment, read by the node's own boot grammar:
+    // a pin is accepted only for a config the node boots with, read the same
+    // way. Its secret token is the one variable not measured.
+    let measured = engine_deployment::parse_measured(&|name| config.env.get(name).cloned())
+        .map_err(|e| format!("{at_config}: the node would refuse this env: {e}"))?;
+    if measured.model_id != model_id {
+        return Err(format!(
+            "{at_config}: EIDOLA_ENGINE_MODEL_ID is {:?}, but the pin is for {model_id:?}",
+            measured.model_id
+        ));
+    }
+    if measured.weights_sha256 != weights.sha256 {
+        return Err(format!(
+            "{at_config}: EIDOLA_ENGINE_WEIGHTS_SHA256 is {}, but the pin requires {}",
+            measured.weights_sha256, weights.sha256
+        ));
+    }
+    if measured.weights_storage != engine_deployment::WeightsStorage::VerifiedReadonly {
+        return Err(format!(
+            "{at_config}: EIDOLA_ENGINE_WEIGHTS_STORAGE is {:?}, but a pinned deployment \
+             must be \"verified-readonly\"",
+            measured.weights_storage.as_str()
+        ));
+    }
 
     // Prompt-cache retention.
     let cache_value = object(&deployment["prompt_cache"], &format!("{at}: prompt_cache"))?;
@@ -295,27 +314,10 @@ fn check_deployment(
             "{at}: prompt_cache.idle_ttl_secs exceeds max_age_secs, which the node refuses"
         ));
     }
-    // The config's values, read by the node's own grammar, so a pin is
-    // accepted only for a config the node boots with and reads the same way.
     let configured = CheckedCachePolicy {
-        enabled: config.env_value(
-            &at_config,
-            "EIDOLA_ENGINE_PREFIX_CACHE",
-            engine_deployment::parse_prefix_cache,
-            "true or false",
-        )?,
-        idle_ttl_secs: config.env_value(
-            &at_config,
-            "EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS",
-            engine_deployment::parse_cache_seconds,
-            "a positive number of seconds",
-        )?,
-        max_age_secs: config.env_value(
-            &at_config,
-            "EIDOLA_ENGINE_CACHE_MAX_AGE_SECS",
-            engine_deployment::parse_cache_seconds,
-            "a positive number of seconds",
-        )?,
+        enabled: measured.cache.enabled,
+        idle_ttl_secs: measured.cache.idle_ttl_secs,
+        max_age_secs: measured.cache.max_age_secs,
     };
     if configured != prompt_cache {
         return Err(format!(
@@ -334,12 +336,6 @@ fn check_deployment(
             "{at_config}: GATEWAY_TOKEN must not be a measured environment value"
         ));
     }
-    let token_hash = config.env.get("GATEWAY_TOKEN_HASH").ok_or_else(|| {
-        format!("{at_config}: the engine container's env does not set GATEWAY_TOKEN_HASH")
-    })?;
-    // The node verifies its token against the result of this same function.
-    engine_deployment::parse_gateway_token_hash(token_hash)
-        .map_err(|e| format!("{at_config}: GATEWAY_TOKEN_HASH: {e}"))?;
 
     // The pin, and the sidecar stating what source cannot derive.
     let sidecar_path = format!("{DEPLOY_ROOT}/{model_id}/{variant}/deployment.json");
@@ -430,6 +426,15 @@ fn check_deployment(
             ));
         }
     }
+
+    // The pin as the attesting client will read it: its own type, compiled by
+    // its own pin compiler (every field at its width, a TDX policy's safety
+    // bits and MR_SEAM allowlist), so a pin that builds is one it accepts.
+    let typed: tinfoil_verifier::AllowedMeasurement =
+        serde_json::from_value(deployment["pin"].clone())
+            .map_err(|e| format!("{at}: pin is not a tinfoil-verifier pin: {e}"))?;
+    tinfoil_verifier::validate_pins(std::slice::from_ref(&typed))
+        .map_err(|e| format!("{at}: the attesting client refuses this pin: {e}"))?;
 
     Ok((config_path.to_owned(), weights, prompt_cache))
 }
@@ -525,35 +530,6 @@ impl EngineConfig {
             secrets,
             env,
         })
-    }
-
-    /// `name`'s value read by `parse`, the node's grammar for it.
-    fn env_value<T>(
-        &self,
-        at: &str,
-        name: &str,
-        parse: fn(&str) -> Option<T>,
-        expected: &str,
-    ) -> Result<T, String> {
-        let value = self
-            .env
-            .get(name)
-            .ok_or_else(|| format!("{at}: the engine container's env does not set {name}"))?;
-        parse(value).ok_or_else(|| {
-            format!("{at}: {name} is {value:?}, which the node refuses: it must be {expected}")
-        })
-    }
-
-    fn require_env(&self, at: &str, name: &str, expected: &str) -> Result<(), String> {
-        match self.env.get(name) {
-            Some(value) if value == expected => Ok(()),
-            Some(value) => Err(format!(
-                "{at}: {name} is {value:?}, but the pin requires {expected:?}"
-            )),
-            None => Err(format!(
-                "{at}: the engine container's env does not set {name}"
-            )),
-        }
     }
 }
 

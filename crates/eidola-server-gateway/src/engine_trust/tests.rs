@@ -405,10 +405,7 @@ fn the_prompt_cache_policy_is_one_the_node_boots_with() {
         );
         tree.deployment()["prompt_cache"]["idle_ttl_secs"] = idle.into();
         tree.deployment()["prompt_cache"]["max_age_secs"] = max_age.into();
-        refused(
-            &tree,
-            "which the node refuses: it must be a positive number of seconds",
-        );
+        refused(&tree, "must be a positive number of seconds");
     }
 
     // The largest bound the node accepts is accepted.
@@ -570,4 +567,109 @@ fn every_deployment_of_a_model_agrees_and_none_is_pinned_twice() {
         &tree,
         "prompt_cache differs from the model's other deployments",
     );
+}
+
+/// Every variable the node requires, omitted or invalid, is refused: the
+/// check runs the whole measured env through the node's boot grammar
+/// (`eidola_common::engine_deployment::parse_measured`), not a chosen subset.
+#[test]
+fn every_variable_the_node_requires_is_checked() {
+    use eidola_common::engine_deployment::env;
+    let required = [
+        env::MODEL_ID,
+        env::WEIGHTS_DIR,
+        env::WEIGHTS_SHA256,
+        env::WEIGHTS_STORAGE,
+        env::GATEWAY_TOKEN_HASH,
+        env::EXECUTOR,
+        env::BIND_ADDR,
+        env::KV_BLOCK_SIZE,
+        env::KV_BLOCKS,
+        env::MAX_MODEL_LEN,
+        env::MAX_SEQS,
+        env::MAX_BATCHED_TOKENS,
+        env::MAX_PREFILL_CHUNK,
+        env::DRAFT_TOKENS,
+        env::MAX_REQUESTS,
+        env::PREFIX_CACHE,
+        env::CACHE_IDLE_TTL_SECS,
+        env::CACHE_MAX_AGE_SECS,
+    ];
+    let text = Tree::fixture().config_text();
+    for name in required {
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("- {name}:")))
+            .unwrap_or_else(|| panic!("the fixture sets {name}"))
+            .to_string();
+
+        let mut tree = Tree::fixture();
+        tree.edit_config(&format!("{line}\n"), "");
+        refused(&tree, &format!("{name} is not set"));
+
+        let mut tree = Tree::fixture();
+        tree.edit_config(&line, &format!("      - {name}: \"\""));
+        refused(&tree, &format!("{name} is not set"));
+    }
+
+    for (name, bad) in [
+        (env::EXECUTOR, "gpu"),
+        (env::BIND_ADDR, "localhost"),
+        (env::KV_BLOCK_SIZE, "0"),
+        (env::KV_BLOCKS, "1"),
+        (env::MAX_MODEL_LEN, "-1"),
+        (env::MAX_SEQS, "0"),
+        (env::MAX_BATCHED_TOKENS, "many"),
+        (env::MAX_PREFILL_CHUNK, "0"),
+        (env::DRAFT_TOKENS, "-1"),
+        (env::MAX_REQUESTS, "0"),
+        (env::MODEL_ID, "has space"),
+        (env::WEIGHTS_SHA256, "abc"),
+    ] {
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("- {name}:")))
+            .unwrap()
+            .to_string();
+        let mut tree = Tree::fixture();
+        tree.edit_config(&line, &format!("      - {name}: \"{bad}\""));
+        refused(
+            &tree,
+            &format!("the node would refuse this env: configuration refused: {name}"),
+        );
+    }
+}
+
+/// A TDX policy the attesting client would refuse when it compiles its pins
+/// fails the check, with the client's own reason: an empty object, wrong
+/// field widths, no MR_SEAM, and unsafe TD attributes.
+#[test]
+fn a_tdx_policy_the_attesting_client_refuses_is_refused() {
+    let cases: [(&str, fn(&mut serde_json::Value)); 5] = [
+        ("{}", |p| *p = serde_json::json!({})),
+        ("short xfam", |p| p["xfam"] = "e702".into()),
+        ("long mr_seam", |p| {
+            p["mr_seam"] = serde_json::json!(["55".repeat(49)])
+        }),
+        ("empty mr_seam", |p| p["mr_seam"] = serde_json::json!([])),
+        // DEBUG set (bit 0) alongside SEPT_VE_DISABLE.
+        ("debug attributes", |p| {
+            p["td_attributes"] = "0100001000000000".into()
+        }),
+    ];
+    for (name, edit) in cases {
+        let mut tree = Tree::fixture();
+        let mut policy = tree.deployment()["pin"]["platform"]["tdx"]["policy"].clone();
+        edit(&mut policy);
+        tree.deployment()["pin"]["platform"]["tdx"]["policy"] = policy.clone();
+        let mut sidecar = tree.sidecar();
+        sidecar["tdx_policy"] = policy;
+        tree.set_sidecar(sidecar);
+        let err = tree.check().expect_err(name);
+        assert!(
+            err.contains("pin is not a tinfoil-verifier pin")
+                || err.contains("the attesting client refuses this pin"),
+            "{name}: {err}"
+        );
+    }
 }

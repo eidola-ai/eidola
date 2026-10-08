@@ -125,6 +125,10 @@ sha2 = "0.11"
 # The node's own config grammar (`engine_deployment`), so a pin is accepted
 # only for a config the node boots with.
 eidola-common = { path = "../eidola-common", features = ["argon2"] }
+# The attesting client's own pin compiler (`validate_pins`), so a committed pin
+# the client would refuse fails the build rather than the first connection.
+# Costs a host build of the verifier's dependency tree for the build script.
+tinfoil-verifier = { path = "../tinfoil-verifier" }
 
 [dev-dependencies]
 # The same module, compiled into the crate's tests.
