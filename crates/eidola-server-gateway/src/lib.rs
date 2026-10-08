@@ -19,6 +19,7 @@ pub mod error;
 pub mod handlers;
 pub mod helpers;
 pub mod middleware;
+pub mod padding;
 pub mod response;
 pub mod stripe;
 pub mod telemetry;

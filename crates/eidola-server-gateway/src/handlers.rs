@@ -1,6 +1,5 @@
 //! Top-level HTTP handlers: health, models, chat completions.
 
-use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
 use anonymous_credit_tokens::{Scalar, SpendProof, credit_to_scalar, scalar_to_credit};
@@ -8,15 +7,12 @@ use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Request, State};
 use axum::response::IntoResponse;
-use axum::response::Sse;
-use axum::response::sse::{Event, KeepAlive};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use opentelemetry::KeyValue;
 use rand_core::OsRng;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, warn};
 
 use crate::AppState;
@@ -26,6 +22,7 @@ use crate::credentials;
 use crate::db;
 use crate::engine_trust::protocol::ValidatedRequest;
 use crate::error::ServerError;
+use crate::padding::{self, Cadence, StreamEvent};
 use crate::response::{
     EidolaResponse, EidolaStreamMetadata, RefundInfo, build_privacy_metadata,
     build_verification_metadata,
@@ -451,7 +448,10 @@ pub async fn chat_completions(
         ],
     );
 
-    result
+    // Every answer from here is sized to a bucket (a JSON body: a completion,
+    // or an error) or framed (an event stream): see `padding`.
+    let response = result.unwrap_or_else(IntoResponse::into_response);
+    Ok(padding::pad_json_response(response).await)
 }
 
 async fn chat_completions_phases(
@@ -802,7 +802,9 @@ async fn handle_streaming_request(
         }
     };
 
-    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
+    // Events for the client, framed by `padding` into fixed-size writes on a
+    // fixed tick (see `padded_sse_response`).
+    let (tx, rx) = mpsc::channel::<StreamEvent>(32);
 
     // Clone/copy values for the spawned task.
     let issuer_key_hash = act.issuer_key_hash;
@@ -873,7 +875,7 @@ async fn handle_streaming_request(
 
         /// Send a metadata SSE event containing a refund, then [DONE].
         async fn send_metadata_event(
-            tx: &mpsc::Sender<Result<Event, Infallible>>,
+            tx: &mpsc::Sender<StreamEvent>,
             refund_info: Option<RefundInfo>,
             privacy: crate::response::PrivacyMetadata,
             verification: crate::response::VerificationMetadata,
@@ -882,10 +884,8 @@ async fn handle_streaming_request(
             let stream_meta =
                 EidolaStreamMetadata::new(chat_id, privacy, verification, refund_info);
             let json_str = serde_json::to_string(&stream_meta).unwrap();
-            let event = Event::default().data(json_str);
-            let _ = tx.send(Ok(event)).await;
-            let done_event = Event::default().data("[DONE]");
-            let _ = tx.send(Ok(done_event)).await;
+            let _ = tx.send(StreamEvent::Json(json_str)).await;
+            let _ = tx.send(StreamEvent::Done).await;
         }
 
         let mut final_usage: Option<Usage> = None;
@@ -902,8 +902,7 @@ async fn handle_streaming_request(
                         final_usage.clone_from(&chunk.usage);
                     }
                     let json_str = serde_json::to_string(&chunk).unwrap();
-                    let event = Event::default().data(json_str);
-                    if tx.send(Ok(event)).await.is_err() {
+                    if tx.send(StreamEvent::Json(json_str)).await.is_err() {
                         // Client disconnected — we were likely billed for tokens
                         // already streamed but don't know how much. Refund 0
                         // (returns blind remaining value c - s). The client can't
@@ -995,10 +994,7 @@ async fn handle_streaming_request(
         send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;
     });
 
-    let stream = ReceiverStream::new(rx);
-    Ok(Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response())
+    Ok(padding::padded_sse_response(rx, Cadence::CLIENT_FACING))
 }
 
 /// `Json<T>` wrapper that logs the rejection reason at warn level on
@@ -1155,7 +1151,7 @@ impl<S: Send + Sync> FromRequest<S> for ChatRequest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The extractor's result over `body`: the value, or the refusal's status and text.
@@ -1282,7 +1278,7 @@ mod tests {
 
     /// A token-priced model with easy integer math at `PRICING_SCALE_FACTOR`:
     /// 1 credit per prompt token, 2 credits per completion token.
-    fn test_model() -> Model {
+    pub(crate) fn test_model() -> Model {
         Model {
             id: "test-model".to_string(),
             name: "Test Model".to_string(),
