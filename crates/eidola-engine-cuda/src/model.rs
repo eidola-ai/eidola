@@ -32,7 +32,7 @@ use crate::module::{ImageSource, KernelModule};
 use crate::moe_gemm::{BLOCK_M, MoeGemm, MoeGemmArgs, MoeLayout, MoeProj};
 use crate::sampler::Sampler;
 use crate::weights::{Ffn, ModelWeights};
-use crate::{CudaError, Gpu, Result};
+use crate::{CudaError, Gpu, Result, narrow};
 
 /// Every kernel the executor launches.
 pub struct Kernels {
@@ -132,6 +132,8 @@ const ROPE_TABLE_WIDTH: usize = 64;
 
 /// Masked layout (decode-sized batches): rows per expert.
 const MASKED_CAP: usize = 128;
+const MASKED_CAP32: u32 = 128;
+const _: () = assert!(MASKED_CAP32 as usize == MASKED_CAP);
 
 fn round_up(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
@@ -431,6 +433,12 @@ impl GpuModel {
         let c = self.weights.config.clone();
         let h = c.hidden_size;
         let tp = round_up(t, 4);
+        // Every count the kernels take, as the u32 they take it as.
+        let (h32, t32, tp32): (u32, u32, u32) = (
+            narrow(h, "hidden size")?,
+            narrow(t, "step tokens")?,
+            narrow(tp, "padded step tokens")?,
+        );
         let eps = c.rms_norm_eps;
         let sc = &mut self.scratch;
         let k = &self.kernels;
@@ -457,8 +465,8 @@ impl GpuModel {
                 p(&sc.h),
                 dptr(&self.weights.embed, &s),
                 dptr(&sc.tokens, &s),
-                h as u32,
-                t as u32,
+                h32,
+                t32,
             )?;
         }
         if self.capture_layers {
@@ -468,7 +476,7 @@ impl GpuModel {
             let spec = &c.layers[li].attention;
             let lkv = &self.layer_kv[li];
             let geom = &kv.geometry()[lkv.group];
-            let nq = spec.num_q_heads as u32;
+            let nq: u32 = narrow(spec.num_q_heads, "query heads")?;
             // 1. Norm, quantize, QKV.
             unsafe {
                 ops.rmsnorm(
@@ -476,26 +484,18 @@ impl GpuModel {
                     p(&sc.x),
                     0,
                     p(&sc.h),
-                    h as u32,
+                    h32,
                     dptr(&lw.input_norm, &s),
-                    h as u32,
+                    h32,
                     eps,
-                    t as u32,
+                    t32,
                 )?;
-                ops.quant_fp8(
-                    gpu,
-                    dptr(&sc.xq, &s),
-                    p(&sc.xsf),
-                    p(&sc.x),
-                    tp as u32,
-                    h as u32,
-                    tp as u32,
-                )?;
+                ops.quant_fp8(gpu, dptr(&sc.xq, &s), p(&sc.xsf), p(&sc.x), tp32, h32, tp32)?;
                 let qkv = &lw.attention.qkv;
                 k.fp8_gemm.launch(
                     gpu,
                     &GemmArgs {
-                        m: tp as u32,
+                        m: tp32,
                         n: qkv.linear.n,
                         k: qkv.linear.k,
                         a: dptr(&sc.xq, &s),
@@ -532,7 +532,7 @@ impl GpuModel {
                         q_heads_per_chunk: qkv.q_heads_per_chunk,
                         kv_heads_per_chunk: qkv.kv_heads_per_chunk,
                     },
-                    t as u32,
+                    t32,
                 )?;
                 let pool = dptr(kv.pool(lkv.group), &s);
                 k.attention.run(
@@ -541,10 +541,13 @@ impl GpuModel {
                     &AttnLayer {
                         k_base: pool + 2 * geom.k_offset(lkv.layer_in_group) as u64,
                         v_base: pool + 2 * geom.v_offset(lkv.layer_in_group) as u64,
-                        block_elems: geom.block_elems() as u32,
+                        block_elems: narrow(geom.block_elems(), "KV block elements")?,
                         num_kv_heads: geom.num_kv_heads,
                         page_size: geom.block_size,
-                        window_left: spec.window().map_or(-1, |w| w as i32 - 1),
+                        window_left: match spec.window() {
+                            Some(w) => narrow::<i32, _>(w, "window")? - 1,
+                            None => -1,
+                        },
                         sink: dptr(&lw.attention.sinks, &s),
                     },
                     nq,
@@ -555,8 +558,8 @@ impl GpuModel {
                 k.bf16_gemm.launch(
                     gpu,
                     &GemmArgs {
-                        m: t as u32,
-                        n: h as u32,
+                        m: t32,
+                        n: h32,
                         k: nq * 128,
                         a: dptr(&sc.attn, &s),
                         b: dptr(&lw.attention.o_proj, &s),
@@ -573,11 +576,11 @@ impl GpuModel {
                     p(&sc.x),
                     0,
                     p(&sc.h),
-                    h as u32,
+                    h32,
                     dptr(&lw.post_attention_norm, &s),
-                    h as u32,
+                    h32,
                     eps,
-                    t as u32,
+                    t32,
                 )?;
                 match &lw.ffn {
                     Ffn::Dense(d) => {
@@ -586,14 +589,14 @@ impl GpuModel {
                             dptr(&sc.xq, &s),
                             p(&sc.xsf),
                             p(&sc.x),
-                            tp as u32,
-                            h as u32,
-                            tp as u32,
+                            tp32,
+                            h32,
+                            tp32,
                         )?;
                         k.fp8_gemm.launch(
                             gpu,
                             &GemmArgs {
-                                m: tp as u32,
+                                m: tp32,
                                 n: d.gate_up.n,
                                 k: d.gate_up.k,
                                 a: dptr(&sc.xq, &s),
@@ -609,14 +612,14 @@ impl GpuModel {
                             dptr(&sc.xq, &s),
                             p(&sc.xsf),
                             dptr(&sc.gu, &s),
-                            tp as u32,
+                            tp32,
                             d.inter,
-                            tp as u32,
+                            tp32,
                         )?;
                         k.fp8_gemm.launch(
                             gpu,
                             &GemmArgs {
-                                m: tp as u32,
+                                m: tp32,
                                 n: d.down.n,
                                 k: d.down.k,
                                 a: dptr(&sc.xq, &s),
@@ -627,14 +630,7 @@ impl GpuModel {
                                 alpha: 1.0,
                             },
                         )?;
-                        ops.add_bf16(
-                            gpu,
-                            p(&sc.h),
-                            dptr(&sc.ffn_out, &s),
-                            h as u32,
-                            h as u32,
-                            t as u32,
-                        )?;
+                        ops.add_bf16(gpu, p(&sc.h), dptr(&sc.ffn_out, &s), h32, h32, t32)?;
                     }
                     Ffn::Moe(m) => {
                         ops.router_topk(
@@ -644,8 +640,8 @@ impl GpuModel {
                             p(&sc.x),
                             dptr(&m.router, &s),
                             dptr(&m.bias, &s),
-                            t as u32,
-                            h as u32,
+                            t32,
+                            h32,
                             m.experts,
                             m.top_k,
                             m.scaling,
@@ -655,23 +651,24 @@ impl GpuModel {
                             (
                                 MoeLayout::Masked,
                                 m.experts as usize * MASKED_CAP,
-                                MASKED_CAP as u32,
+                                MASKED_CAP32,
                             )
                         } else {
                             let r = contiguous_rows(t, m.top_k as usize, m.experts as usize);
                             (MoeLayout::Contiguous, r, 0)
                         };
-                        let rows4 = round_up(rows, 4) as u32;
+                        let rows4: u32 = narrow(round_up(rows, 4), "padded expert rows")?;
+                        let rows32: u32 = narrow(rows, "expert rows")?;
                         ops.moe_permute(
                             gpu,
                             dptr(&sc.grouped, &s),
                             dptr(&sc.row_of, &s),
                             dptr(&sc.row_src, &s),
                             dptr(&sc.topk_ids, &s),
-                            t as u32,
+                            t32,
                             m.top_k,
                             cap,
-                            rows as u32,
+                            rows32,
                         )?;
                         ops.gather_quant_ue8m0(
                             gpu,
@@ -679,16 +676,12 @@ impl GpuModel {
                             dptr(&sc.esf, &s),
                             p(&sc.x),
                             dptr(&sc.row_src, &s),
-                            rows as u32,
-                            h as u32,
+                            rows32,
+                            h32,
                             rows4,
                             cap,
                         )?;
-                        let gemm_m = if masked {
-                            MASKED_CAP as u32
-                        } else {
-                            rows as u32
-                        };
+                        let gemm_m = if masked { MASKED_CAP32 } else { rows32 };
                         k.moe.launch(
                             gpu,
                             &MoeGemmArgs {
@@ -708,7 +701,7 @@ impl GpuModel {
                             dptr(&sc.eact, &s),
                             dptr(&sc.eact_sf, &s),
                             dptr(&sc.egu, &s),
-                            rows as u32,
+                            rows32,
                             m.inter,
                             rows4,
                             cap,
@@ -733,8 +726,8 @@ impl GpuModel {
                             dptr(&sc.edown, &s),
                             dptr(&sc.row_of, &s),
                             p(&sc.topk_w),
-                            t as u32,
-                            h as u32,
+                            t32,
+                            h32,
                             m.top_k,
                         )?;
                         ops.add_f32(gpu, p(&sc.h), p(&sc.proj), (t * h) as u64)?;
@@ -747,6 +740,7 @@ impl GpuModel {
         }
         // Head: final norm of the wanted rows, BF16, lm_head (f32 logits).
         let n = input.logit_rows.len();
+        let n32: u32 = narrow(n, "logit rows")?;
         if n > 0 {
             s.memcpy_htod(input.logit_rows, &mut sc.logit_rows.slice_mut(..n))?;
             unsafe {
@@ -755,26 +749,26 @@ impl GpuModel {
                     p(&sc.x),
                     0,
                     p(&sc.h),
-                    h as u32,
+                    h32,
                     dptr(&self.weights.final_norm, &s),
-                    h as u32,
+                    h32,
                     eps,
-                    t as u32,
+                    t32,
                 )?;
                 ops.gather_rows_bf16(
                     gpu,
                     dptr(&sc.sel, &s),
                     p(&sc.x),
                     dptr(&sc.logit_rows, &s),
-                    n as u32,
-                    h as u32,
+                    n32,
+                    h32,
                 )?;
                 k.bf16_gemm.launch(
                     gpu,
                     &GemmArgs {
-                        m: n as u32,
-                        n: c.vocab_size as u32,
-                        k: h as u32,
+                        m: n32,
+                        n: narrow(c.vocab_size, "vocabulary")?,
+                        k: h32,
                         a: dptr(&sc.sel, &s),
                         b: dptr(&self.weights.lm_head, &s),
                         d: p(&sc.logits),
@@ -849,16 +843,21 @@ pub fn group_geometry(
     layer_kv: &[LayerKv],
     block_size: u32,
     num_blocks: &[u32],
-) -> Vec<GroupGeometry> {
+) -> Result<Vec<GroupGeometry>> {
     keys.iter()
         .enumerate()
-        .map(|(g, a)| GroupGeometry {
-            num_layers: layer_kv.iter().filter(|l| l.group == g).count() as u32,
-            num_kv_heads: a.num_kv_heads as u32,
-            head_dim_qk: a.head_dim_qk as u32,
-            head_dim_v: a.head_dim_v as u32,
-            block_size,
-            num_blocks: num_blocks[g],
+        .map(|(g, a)| {
+            Ok(GroupGeometry {
+                num_layers: narrow(
+                    layer_kv.iter().filter(|l| l.group == g).count(),
+                    "layers in a group",
+                )?,
+                num_kv_heads: narrow(a.num_kv_heads, "KV heads")?,
+                head_dim_qk: narrow(a.head_dim_qk, "QK head dim")?,
+                head_dim_v: narrow(a.head_dim_v, "V head dim")?,
+                block_size,
+                num_blocks: num_blocks[g],
+            })
         })
         .collect()
 }

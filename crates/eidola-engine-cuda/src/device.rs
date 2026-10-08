@@ -5,7 +5,7 @@ use std::sync::Arc;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
 
-use crate::{CudaError, Result};
+use crate::{CudaError, Result, narrow};
 
 /// The kernel image a device runs: the exact-match architecture-specific
 /// cubin where one is built, else the family cubin.
@@ -95,13 +95,18 @@ impl Gpu {
             ordinal,
             name: ctx.name()?,
             compute_capability: ctx.compute_capability()?,
-            sm_count: attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
-                as u32,
+            sm_count: narrow(
+                attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+                "SM count",
+            )?,
             driver_version,
             total_mem_bytes: ctx.total_mem()?,
-            max_smem_per_block_optin: attr(
-                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-            )? as u32,
+            max_smem_per_block_optin: narrow(
+                attr(
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                )?,
+                "opt-in shared memory",
+            )?,
             cluster_launch: attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH)? != 0,
         };
         let stream = ctx.new_stream()?;

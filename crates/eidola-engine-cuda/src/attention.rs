@@ -16,7 +16,7 @@ use cudarc::driver::CudaSlice;
 
 use crate::launch::dptr;
 use crate::module::{Kernel, KernelModule};
-use crate::{CudaError, Gpu, Result};
+use crate::{CudaError, Gpu, Result, narrow};
 
 pub const HEAD_DIM_QK: u32 = 192;
 pub const HEAD_DIM_VO: u32 = 128;
@@ -43,13 +43,16 @@ impl UintFastdiv {
             let k = 32 + shift;
             let mul = ((1u64 << k) + (1u64 << shift)) / divisor as u64;
             let low = (1u64 << k) / divisor as u64;
-            (mul as u32, (low == mul) as u32)
+            // `divisor` lies strictly between 2^shift and 2^(shift + 1), so
+            // `mul` < 2^32.
+            let mul32 = u32::try_from(mul).expect("fast_mod_div multiplier fits 32 bits");
+            (mul32, u32::from(low == mul))
         };
         UintFastdiv {
             divisor,
             multiplier,
             add,
-            shift: shift as i32,
+            shift: i32::try_from(shift).expect("a shift below 32"),
             d,
         }
     }
@@ -329,8 +332,8 @@ impl Attention {
         Ok(AttnPlan {
             tile,
             page_size,
-            work_items: req.len() as u32,
-            num_requests: requests.len() as u32,
+            work_items: narrow(req.len(), "attention work items")?,
+            num_requests: narrow(requests.len(), "attention requests")?,
             q_indptr: up(&q_indptr)?,
             indices: up(&indices)?,
             indptr: up(&indptr)?,
@@ -410,8 +413,8 @@ impl Attention {
             sink: layer.sink,
             sm_scale: 1.0 / (HEAD_DIM_QK as f64).sqrt(),
             num_qo_heads,
-            q_stride_n: (num_qo_heads * HEAD_DIM_QK) as i32,
-            q_stride_h: HEAD_DIM_QK as i32,
+            q_stride_n: narrow(num_qo_heads as u64 * HEAD_DIM_QK as u64, "query row stride")?,
+            q_stride_h: narrow(HEAD_DIM_QK, "query head stride")?,
             window_left: layer.window_left,
             request_indices: dptr(&plan.request_indices, s),
             qo_tile_indices: dptr(&plan.qo_tile_indices, s),
@@ -437,7 +440,7 @@ mod tests {
         AttnRequest {
             q_start,
             qo_len,
-            pages: (1..=pages as u32).collect(),
+            pages: (1..=u32::try_from(pages).unwrap()).collect(),
             kv_len,
         }
     }

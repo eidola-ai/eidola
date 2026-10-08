@@ -273,8 +273,8 @@ impl EngineOps {
     ) -> Result<()> {
         require(
             hidden > 0
-                && (1..=crate::support::EXPERTS as u32).contains(&experts)
-                && (2..=crate::support::MAX_TOP_K as u32).contains(&top_k)
+                && (1..=crate::support::EXPERTS).contains(&(experts as usize))
+                && (2..=crate::support::MAX_TOP_K).contains(&(top_k as usize))
                 && top_k <= experts,
             // The kernel always renormalizes the selection; the reference does
             // not for a single expert, so one expert per token is not served.
@@ -314,7 +314,7 @@ impl EngineOps {
         rows_bound: u32,
     ) -> Result<()> {
         require(
-            (1..=crate::support::MAX_TOP_K as u32).contains(&top_k)
+            (1..=crate::support::MAX_TOP_K).contains(&(top_k as usize))
                 && (if cap == 0 {
                     rows_bound > 0
                 } else {
@@ -386,7 +386,7 @@ impl EngineOps {
         top_k: u32,
     ) -> Result<()> {
         require(
-            hidden > 0 && (1..=crate::support::MAX_TOP_K as u32).contains(&top_k),
+            hidden > 0 && (1..=crate::support::MAX_TOP_K).contains(&(top_k as usize)),
             "combine: 1..=8 experts per token",
         )?;
         if tokens == 0 {

@@ -290,7 +290,12 @@ impl KvStore {
     }
 
     fn upload_row(&mut self, s: &Arc<CudaStream>, slot: usize, group: usize) -> Result<()> {
-        let row: Vec<i32> = self.tables[slot][group].iter().map(|&b| b as i32).collect();
+        // Block ids are at most `num_blocks - 1`, which `validate` holds
+        // within `i32` (the device tables' type).
+        let row: Vec<i32> = self.tables[slot][group]
+            .iter()
+            .map(|&b| i32::try_from(b).expect("validated: block ids fit i32"))
+            .collect();
         let off = (slot * self.geometry.len() + group) * self.max_blocks;
         let mut view = self.tables_dev.slice_mut(off..off + self.max_blocks);
         s.memcpy_htod(&row, &mut view)?;

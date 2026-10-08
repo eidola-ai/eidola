@@ -5,6 +5,17 @@
 //! comes from the ahead-of-time, hash-manifested build in
 //! `eidola-engine-kernels` and is loaded only after its bytes match the
 //! manifest ([`module`]).
+//!
+//! No integer conversion here may lose a value silently: counts, strides,
+//! grid dimensions and offsets reach the kernels as 32-bit values through
+//! [`narrow`], which refuses one that does not fit, and the lints below hold
+//! every other conversion to that.
+
+#![deny(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 
 pub mod attention;
 pub mod bf16;
@@ -69,3 +80,26 @@ impl From<Unsupported> for CudaError {
 }
 
 pub type Result<T> = std::result::Result<T, CudaError>;
+
+/// `x` as `T`, refused when it does not fit (`what` names it in the error).
+pub fn narrow<T, U>(x: U, what: &str) -> Result<T>
+where
+    T: TryFrom<U>,
+    U: Copy + fmt::Display,
+{
+    T::try_from(x)
+        .map_err(|_| CudaError::new(format!("{what} {x} does not fit the kernel's integer")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn narrowing_refuses_what_does_not_fit() {
+        assert_eq!(narrow::<u32, usize>(7, "rows").unwrap(), 7);
+        assert!(narrow::<u32, usize>(1 << 32, "rows").is_err());
+        assert!(narrow::<i32, u32>(1 << 31, "stride").is_err());
+        assert!(narrow::<u32, i32>(-1, "count").is_err());
+    }
+}

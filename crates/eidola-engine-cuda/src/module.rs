@@ -16,7 +16,7 @@ use cudarc::driver::{CudaContext, CudaStream};
 use eidola_engine_kernels::{ArtifactDir, Cubin, KernelMeta, Manifest};
 
 use crate::device::{Gpu, ImageArch};
-use crate::{CudaError, Result};
+use crate::{CudaError, Result, narrow};
 
 /// A kernel build output, read only through the compiled-in manifest
 /// ([`Manifest::embedded`]).
@@ -194,7 +194,7 @@ impl KernelModule {
                 sys::cuFuncSetAttribute(
                     func,
                     sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    meta.dynamic_smem_bytes as i32,
+                    narrow(meta.dynamic_smem_bytes, "dynamic shared memory")?,
                 )
             }
             .result()?;
@@ -273,7 +273,7 @@ impl Kernel {
             )
         }
         .result()?;
-        Ok(v as u32)
+        narrow(v, "static shared memory")
     }
 
     /// Launch with the block shape, dynamic shared memory and cluster shape
@@ -313,7 +313,7 @@ impl Kernel {
             sharedMemBytes: m.dynamic_smem_bytes,
             hStream: stream.cu_stream(),
             attrs: attrs.as_mut_ptr(),
-            numAttrs: attrs.len() as u32,
+            numAttrs: u32::try_from(attrs.len()).expect("at most two launch attributes"),
         };
         // SAFETY: forwarded to the caller.
         unsafe {

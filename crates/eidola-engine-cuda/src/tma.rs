@@ -92,7 +92,7 @@ impl TmaSpec {
             sys::cuTensorMapEncodeTiled(
                 &mut map,
                 dtype,
-                rank as u32,
+                u32::try_from(rank).expect("a rank of at most 5"),
                 self.addr as *mut std::ffi::c_void,
                 self.dims.as_ptr(),
                 self.strides.as_ptr(),

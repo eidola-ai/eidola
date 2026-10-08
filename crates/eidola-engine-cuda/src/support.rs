@@ -125,6 +125,29 @@ pub fn check_supported(c: &ModelConfig) -> Result<(), Unsupported> {
     };
     exact!("quant.fp8_block", q.fp8_block, FP8_BLOCK);
     exact!("quant.mxfp4_block", q.mxfp4_block, Some(MXFP4_BLOCK));
+    // Activations are quantized per row at run time (`amax / 448`); a
+    // static or absent scheme would mean another contract.
+    exact!(
+        "quant.activation_scheme",
+        q.activation_scheme.as_deref(),
+        Some("dynamic")
+    );
+    // BF16 exactly where the loader reads BF16: every `o_proj` (the
+    // checkpoint's layers and its MTP decoder) and nothing else.
+    let mut want: Vec<String> = (0..SOURCE_LAYERS)
+        .map(|i| format!("model.layers.{i}.self_attn.o_proj"))
+        .chain(std::iter::once("model.decoder.self_attn.o_proj".into()))
+        .collect();
+    let mut found = q.ignored_layers.clone();
+    want.sort();
+    found.sort();
+    if found != want {
+        return bad(
+            "quant.ignored_layers",
+            found.len(),
+            "every o_proj, and nothing else",
+        );
+    }
     exact!(
         "attention_value_scale",
         c.attention_value_scale,
@@ -502,6 +525,19 @@ mod tests {
             }),
             ("quant.mxfp4_block", |c| {
                 c.quant.as_mut().unwrap().mxfp4_block = Some(16)
+            }),
+            ("quant.activation_scheme", |c| {
+                c.quant.as_mut().unwrap().activation_scheme = Some("static".into())
+            }),
+            ("quant.activation_scheme", |c| {
+                c.quant.as_mut().unwrap().activation_scheme = None
+            }),
+            ("quant.ignored_layers", |c| {
+                c.quant.as_mut().unwrap().ignored_layers.pop();
+            }),
+            ("quant.ignored_layers", |c| {
+                let q = c.quant.as_mut().unwrap();
+                q.ignored_layers[0] = "model.layers.0.self_attn.qkv_proj".into();
             }),
         ] {
             let mut c = flash();

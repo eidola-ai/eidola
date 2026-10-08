@@ -67,6 +67,7 @@ fn flash_layer_table() {
     let q = c.quant.as_ref().unwrap();
     assert_eq!(q.fp8_block, [128, 128]);
     assert_eq!(q.mxfp4_block, Some(32));
+    assert_eq!(q.activation_scheme.as_deref(), Some("dynamic"));
 }
 
 #[test]
@@ -143,6 +144,11 @@ fn unsupported_features_are_rejected() {
 
     let mut v = data("flash-mopd.config.json");
     v["quantization_config"]["mxfp4_block_size"] = 16.into();
+    assert!(parse(&v).is_err());
+
+    // An unknown quantization key is refused rather than dropped.
+    let mut v = data("flash-mopd.config.json");
+    v["quantization_config"]["activation_block_size"] = 128.into();
     assert!(parse(&v).is_err());
 
     let mut v = data("flash-mopd.config.json");

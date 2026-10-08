@@ -27,7 +27,7 @@ use eidola_engine_model::safetensors::{Dtype, WeightSet};
 
 use crate::model::Kernels;
 use crate::support::check_supported;
-use crate::{CudaError, Gpu, Result};
+use crate::{CudaError, Gpu, Result, narrow};
 
 fn err(e: impl std::fmt::Display) -> CudaError {
     CudaError::new(e.to_string())
@@ -183,8 +183,8 @@ impl Loader<'_> {
         }
         let st = self.gpu.stream();
         Ok(Fp8Linear {
-            n: (n_each * prefixes.len()) as u32,
-            k: k as u32,
+            n: narrow(n_each * prefixes.len(), "GEMM rows")?,
+            k: narrow(k, "GEMM depth")?,
             w: st.clone_htod(&w)?,
             scale: st.clone_htod(&scale)?,
         })
@@ -226,15 +226,15 @@ impl Loader<'_> {
         let st = self.gpu.stream();
         Ok(QkvWeight {
             linear: Fp8Linear {
-                n: (chunks * stride) as u32,
-                k: h as u32,
+                n: narrow(chunks * stride, "QKV rows")?,
+                k: narrow(h, "hidden size")?,
                 w: st.clone_htod(&w)?,
                 scale: st.clone_htod(&scale)?,
             },
-            chunks: chunks as u32,
-            chunk_stride: stride as u32,
-            q_heads_per_chunk: (spec.num_q_heads / chunks) as u32,
-            kv_heads_per_chunk: (spec.num_kv_heads / chunks) as u32,
+            chunks: narrow(chunks, "QKV chunks")?,
+            chunk_stride: narrow(stride, "QKV chunk stride")?,
+            q_heads_per_chunk: narrow(spec.num_q_heads / chunks, "query heads per chunk")?,
+            kv_heads_per_chunk: narrow(spec.num_kv_heads / chunks, "KV heads per chunk")?,
         })
     }
 
@@ -334,9 +334,9 @@ impl Loader<'_> {
             gate_up_sf,
             down,
             down_sf,
-            experts: e as u32,
-            top_k: spec.top_k as u32,
-            inter: i as u32,
+            experts: narrow(e, "experts")?,
+            top_k: narrow(spec.top_k, "experts per token")?,
+            inter: narrow(i, "expert intermediate size")?,
             scaling: spec.routed_scaling_factor,
         })
     }
@@ -375,7 +375,7 @@ impl ModelWeights {
                     Ffn::Dense(DenseFfn {
                         gate_up: l.fp8_stacked(&[&gate, &up], i, h)?,
                         down: l.fp8_stacked(&[&format!("{p}.mlp.down_proj")], h, i)?,
-                        inter: i as u32,
+                        inter: narrow(i, "dense intermediate size")?,
                     })
                 }
                 FfnKind::Moe => Ffn::Moe(l.moe(&p)?),
@@ -393,7 +393,7 @@ impl ModelWeights {
             lm_head: l.bf16("lm_head.weight", &[v, h])?,
             final_norm: l.f32_vec("model.norm.weight", h)?,
             layers,
-            qkv_chunks: chunks as u32,
+            qkv_chunks: narrow(chunks, "QKV chunks")?,
             config,
         })
     }

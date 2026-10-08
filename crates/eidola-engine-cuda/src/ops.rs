@@ -6,7 +6,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::device::Gpu;
 use crate::module::{Kernel, KernelModule};
-use crate::{CudaError, Result};
+use crate::{CudaError, Result, narrow};
 
 /// The RMSNorm kernel (`eidola_rmsnorm_bf16` of the `rmsnorm` image), bound
 /// at construction: no other entry can be launched through it.
@@ -43,7 +43,7 @@ impl RmsNorm {
         if hidden == 0 || !x.len().is_multiple_of(hidden as usize) {
             return Err(CudaError::new("rmsnorm: input is not whole rows"));
         }
-        let rows = (x.len() / hidden as usize) as u32;
+        let rows: u32 = narrow(x.len() / hidden as usize, "rmsnorm rows")?;
         let n = x.len();
         if out.len() < n || weight.len() < hidden as usize {
             return Err(CudaError::new("rmsnorm: buffer too small"));

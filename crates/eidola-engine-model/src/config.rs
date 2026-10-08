@@ -82,7 +82,10 @@ fn yes() -> bool {
     true
 }
 
+/// Every key of `quantization_config` is read: an unknown one is refused, so
+/// no quantization setting is dropped unseen.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawQuantConfig {
     pub quant_method: String,
     pub fmt: Option<String>,
@@ -201,6 +204,10 @@ pub struct QuantSpec {
     pub mxfp4_block: Option<usize>,
     /// Modules stored unquantized (BF16) despite the FP8 method.
     pub ignored_layers: Vec<String>,
+    /// How activations are quantized for the FP8 GEMMs, as the checkpoint
+    /// declares it (`dynamic`: per-token scales computed at run time). The
+    /// reference forward runs activations unquantized and does not read it.
+    pub activation_scheme: Option<String>,
 }
 
 /// A validated MiMo-V2 text model.
@@ -623,5 +630,6 @@ fn quant_spec(q: &RawQuantConfig) -> Result<QuantSpec> {
         fp8_block,
         mxfp4_block,
         ignored_layers: q.ignored_layers.clone(),
+        activation_scheme: q.activation_scheme.clone(),
     })
 }

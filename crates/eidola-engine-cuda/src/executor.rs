@@ -29,7 +29,7 @@ use crate::model::{ForwardInput, GpuModel, Kernels, group_geometry, group_layers
 use crate::sampler::{STATUS_NON_FINITE, SampleRow};
 use crate::support::{Unsupported, check_context, check_device, check_sampleable, check_supported};
 use crate::weights::ModelWeights;
-use crate::{CudaError, Gpu, Result};
+use crate::{CudaError, Gpu, Result, narrow};
 
 /// Executor configuration: memory geometry and step limits.
 #[derive(Clone, Debug, PartialEq)]
@@ -137,21 +137,21 @@ impl CudaExecutor {
         let image = check_device(gpu.info(), &config, cfg.image)?;
         let (keys, layer_kv) = group_layers(&config);
         let num_blocks = cfg.num_blocks.resolve(&keys)?;
-        let geometry = group_geometry(&keys, &layer_kv, cfg.block_size, &num_blocks);
+        let geometry = group_geometry(&keys, &layer_kv, cfg.block_size, &num_blocks)?;
         for g in &geometry {
             g.validate()?;
         }
         let kv_groups = keys
             .iter()
             .enumerate()
-            .map(|(g, a)| {
+            .map(|(g, a)| -> Result<KvGroupSpec> {
                 let attention = match a.kind {
                     ModelAttention::Global => AttentionKind::Full,
                     ModelAttention::Sliding { window } => AttentionKind::Sliding {
-                        window: window as u32,
+                        window: narrow(window, "window")?,
                     },
                 };
-                KvGroupSpec {
+                Ok(KvGroupSpec {
                     name: match attention {
                         AttentionKind::Full => "global".into(),
                         AttentionKind::Sliding { window } => format!("sliding-{window}"),
@@ -163,11 +163,11 @@ impl CudaExecutor {
                     head_dim_qk: geometry[g].head_dim_qk,
                     head_dim_v: geometry[g].head_dim_v,
                     num_blocks: geometry[g].num_blocks,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let spec = ModelSpec {
-            vocab_size: config.vocab_size as u32,
+            vocab_size: narrow(config.vocab_size, "vocabulary")?,
             sampleable_vocab_size: cfg.sampleable_vocab_size,
             block_size: cfg.block_size,
             max_model_len: cfg.max_model_len,
@@ -261,7 +261,7 @@ impl CudaExecutor {
     }
 
     fn step(&mut self, step: &StepInput) -> Result<StepOutput> {
-        if step.seqs.len() as u32 > step.bucket.max_seqs
+        if step.seqs.len() > step.bucket.max_seqs as usize
             || step.query_tokens() > step.bucket.max_tokens
         {
             return Err(CudaError::new("batch exceeds its bucket"));
@@ -282,13 +282,13 @@ impl CudaExecutor {
             let start = e.token_start as usize;
             let end = start + e.num_tokens as usize;
             assert_eq!(
-                start as u32, q_start,
+                start, q_start as usize,
                 "rows' host tokens must be contiguous in row order"
             );
             for (i, &pos) in step.positions[start..end].iter().enumerate() {
                 assert_eq!(
                     pos,
-                    e.context_len + i as u32,
+                    e.context_len + u32::try_from(i).expect("i < num_tokens, a u32"),
                     "positions disagree with context_len"
                 );
             }
@@ -350,8 +350,9 @@ impl CudaExecutor {
                 .iter()
                 .zip(&self.model.layer_kv)
                 .find(|(_, l)| l.group == g)
-                .map(|(l, _)| l.attention.num_q_heads as u32)
+                .map(|(l, _)| l.attention.num_q_heads)
                 .expect("a layer per group");
+            let nq: u32 = narrow(nq, "query heads")?;
             plans.push(self.model.kernels.attention.plan(
                 &self.gpu,
                 &requests[g],
@@ -383,7 +384,7 @@ impl CudaExecutor {
                 let logit_row = if self.record_all_logits {
                     e.token_start + e.num_tokens - 1
                 } else {
-                    sample_rows.len() as u32
+                    narrow(sample_rows.len(), "sample row")?
                 };
                 sample_rows.push(SampleRow::new(&e.sampling, p + 1, logit_row));
                 which.push(i);
@@ -410,7 +411,7 @@ impl CudaExecutor {
                 vocab as usize,
                 self.spec.sampleable_vocab_size,
                 &self.sample_rows,
-                n as u32,
+                narrow(n, "sample rows")?,
                 Some(Stream::Sample),
                 &mut self.probs,
                 &mut self.tokens,

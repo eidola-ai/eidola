@@ -7,7 +7,7 @@ use eidola_engine::sampling::{SamplingParams, Stream};
 
 use crate::launch::dptr;
 use crate::module::{Kernel, KernelModule};
-use crate::{CudaError, Gpu, Result, launch};
+use crate::{CudaError, Gpu, Result, launch, narrow};
 
 /// One row's sampling parameters as the kernels read them (`EidolaSampleRow`).
 #[repr(C)]
@@ -181,8 +181,10 @@ impl Sampler {
                     "chain_accept: row {i} has {k} drafts, its output holds {stride} tokens"
                 )));
             }
-            // The kernel adds in u32; the sums must fit, and stay in bounds.
-            let target_end = row.target_row.checked_add(k as u32 + 1);
+            // k < stride, a u32. The kernel adds in u32; the sums must fit,
+            // and stay in bounds.
+            let k32 = u32::try_from(k).expect("k < stride");
+            let target_end = row.target_row.checked_add(k32 + 1);
             if target_end.is_none_or(|e| e as usize > target_rows) {
                 return Err(CudaError::new(format!(
                     "chain_accept: row {i}'s target rows {}+{} beyond {target_rows}",
@@ -190,7 +192,7 @@ impl Sampler {
                     k + 1
                 )));
             }
-            let draft_end = row.draft_row.checked_add(k as u32);
+            let draft_end = row.draft_row.checked_add(k32);
             if k > 0 && draft_end.is_none_or(|e| e as usize > draft_rows) {
                 return Err(CudaError::new(format!(
                     "chain_accept: row {i}'s draft rows {}+{k} beyond {draft_rows}",
@@ -205,7 +207,7 @@ impl Sampler {
             drafts[i * stride as usize..][..k].copy_from_slice(row.drafts);
             target_row.push(row.target_row);
             draft_row.push(row.draft_row);
-            num_drafts.push(k as u32);
+            num_drafts.push(k32);
         }
         let s = gpu.stream();
         s.memcpy_htod(&target_row, &mut inputs.target_row.slice_mut(..r))?;
@@ -219,7 +221,7 @@ impl Sampler {
             launch!(
                 gpu,
                 self.accept,
-                [r as u32, 1, 1],
+                [narrow(r, "acceptance rows")?, 1, 1],
                 dptr(target, s),
                 dptr(draft, s),
                 n,
