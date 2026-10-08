@@ -52,6 +52,16 @@ impl Tree {
         })
     }
 
+    /// Check the file as the given text, for shapes a `Value` cannot hold.
+    fn check_text(&self, json: &str) -> Result<Vec<CheckedModel>, String> {
+        manifest::check(json.as_bytes(), &mut |path| {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| format!("read {path}: no such file"))
+        })
+    }
+
     fn deployment(&mut self) -> &mut serde_json::Value {
         &mut self.json["models"][MODEL][0]
     }
@@ -241,18 +251,18 @@ fn the_file_shape_is_strict() {
 
     let mut tree = Tree::fixture();
     tree.json["extra"] = true.into();
-    refused(&tree, "unknown member \"extra\"");
+    refused(&tree, "unknown field `extra`");
 
     let mut tree = Tree::fixture();
     tree.deployment()["note"] = "hi".into();
-    refused(&tree, "unknown member \"note\"");
+    refused(&tree, "unknown field `note`");
 
     let mut tree = Tree::fixture();
     tree.deployment()
         .as_object_mut()
         .unwrap()
         .remove("prompt_cache");
-    refused(&tree, "missing member \"prompt_cache\"");
+    refused(&tree, "missing field `prompt_cache`");
 
     let mut tree = Tree::fixture();
     tree.json["models"][MODEL] = serde_json::json!([]);
@@ -516,7 +526,8 @@ fn a_pin_names_exactly_one_platform() {
     let mut tree = Tree::fixture();
     tree.deployment()["pin"]["platform"]["sev_snp"] =
         serde_json::json!({"measurement": "a".repeat(96)});
-    refused(&tree, "exactly one member, tdx or sev_snp");
+    // The typed parse (the runtime's) refuses a second platform member.
+    refused(&tree, "engine-enclaves.json: ");
 
     // SEV-SNP stays expressible, and then the sidecar states no TDX policy.
     let mut tree = Tree::fixture();
@@ -680,7 +691,7 @@ fn a_tdx_policy_the_attesting_client_refuses_is_refused() {
         tree.set_sidecar(sidecar);
         let err = tree.check().expect_err(name);
         assert!(
-            err.contains("pin is not a tinfoil-verifier pin")
+            err.starts_with("engine-enclaves.json: ")
                 || err.contains("the attesting client refuses this pin"),
             "{name}: {err}"
         );
@@ -801,5 +812,68 @@ fn every_image_is_the_digest_pinned_engine() {
             &image,
         );
         refused(&tree, "runs exactly one container");
+    }
+}
+
+/// A repeated member at any level is refused by the build check, as it is by
+/// the runtime's reading of the file: accepted at build means readable at
+/// runtime.
+#[test]
+fn a_repeated_member_anywhere_is_refused() {
+    let tree = Tree::fixture();
+    let text = serde_json::to_string(&tree.json).unwrap();
+    let pin = serde_json::to_string(&tree.json["models"][MODEL][0]["pin"]).unwrap();
+    let deployments = serde_json::to_string(&tree.json["models"][MODEL]).unwrap();
+    let weights = serde_json::to_string(&tree.json["models"][MODEL][0]["weights"]).unwrap();
+    let policy =
+        serde_json::to_string(&tree.json["models"][MODEL][0]["pin"]["platform"]["tdx"]["policy"])
+            .unwrap();
+    assert!(tree.check_text(&text).is_ok(), "the unedited text passes");
+
+    for (name, edited) in [
+        (
+            "pin",
+            text.replacen("\"pin\":", &format!("\"pin\":{pin},\"pin\":"), 1),
+        ),
+        (
+            "model id",
+            text.replacen(
+                &format!("\"{MODEL}\":"),
+                &format!("\"{MODEL}\":{deployments},\"{MODEL}\":"),
+                1,
+            ),
+        ),
+        (
+            "weights",
+            text.replacen(
+                "\"weights\":",
+                &format!("\"weights\":{weights},\"weights\":"),
+                1,
+            ),
+        ),
+        (
+            "policy",
+            text.replacen(
+                "\"policy\":",
+                &format!("\"policy\":{policy},\"policy\":"),
+                1,
+            ),
+        ),
+        (
+            "schema_version",
+            text.replacen(
+                "\"schema_version\":1",
+                "\"schema_version\":1,\"schema_version\":1",
+                1,
+            ),
+        ),
+    ] {
+        assert_ne!(edited, text, "{name}: the edit applied");
+        let err = tree.check_text(&edited).expect_err(name);
+        assert!(err.contains("duplicate"), "{name}: {err}");
+        assert!(
+            file::parse(edited.as_bytes()).is_err(),
+            "{name}: the runtime refuses it too"
+        );
     }
 }

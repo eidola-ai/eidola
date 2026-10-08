@@ -93,6 +93,10 @@ pub fn check(
     json: &[u8],
     read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
 ) -> Result<Vec<CheckedModel>, String> {
+    // The typed parse the running gateway reads its pins with, first: a file
+    // it cannot read (a repeated member at any level, say, which the value
+    // reading below would collapse) is refused here.
+    super::file::parse(json)?;
     let root: serde_json::Value =
         serde_json::from_slice(json).map_err(|e| format!("engine-enclaves.json: {e}"))?;
     let root = object(&root, "engine-enclaves.json")?;

@@ -16,6 +16,9 @@
 
 #[path = "src/engine_trust/manifest.rs"]
 mod engine_manifest;
+// `engine_manifest`'s `super::file`: the typed parse the runtime reads with.
+#[path = "src/engine_trust/file.rs"]
+mod file;
 
 use std::env;
 use std::fmt::Write;
@@ -60,6 +63,10 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("src/engine_trust/manifest.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/engine_trust/file.rs").display()
     );
     let engine_enclaves = engine_enclaves(&workspace_root);
     fs::write(out_dir.join("engine_enclaves.gen.rs"), engine_enclaves)

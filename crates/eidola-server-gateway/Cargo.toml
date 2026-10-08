@@ -117,6 +117,8 @@ tokio-stream = "0.1"
 
 [build-dependencies]
 serde_json = "1"
+# `src/engine_trust/file.rs`: the typed parse of engine-enclaves.json.
+serde = { version = "1", features = ["derive"] }
 # `src/engine_trust/manifest.rs`, compiled into the build script: reading the
 # engine deployment configs it re-derives `engine-enclaves.json` from, and
 # hashing them.

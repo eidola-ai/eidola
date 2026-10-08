@@ -29,9 +29,9 @@
 //! else: placement data (which node serves which model) can choose a node,
 //! never what it must be serving.
 
-use serde::Deserialize;
 use tinfoil_verifier::measurement::AllowedMeasurement;
 
+pub(crate) mod file;
 #[cfg(test)]
 pub(crate) mod manifest;
 pub mod protocol;
@@ -123,40 +123,15 @@ pub fn allowed_measurements(model_id: &str) -> Result<Vec<AllowedMeasurement>, S
 }
 
 fn allowed_measurements_in(json: &str, model_id: &str) -> Result<Vec<AllowedMeasurement>, String> {
-    let file: EngineEnclaves = serde_json::from_str(json)
-        .map_err(|e| format!("engine-enclaves.json does not parse as pins: {e}"))?;
+    // The parse the build check also runs first, so a file the build accepted
+    // reads here.
+    let file = file::parse(json.as_bytes())?;
     Ok(file
         .models
         .into_iter()
         .filter(|(id, _)| id == model_id)
         .flat_map(|(_, deployments)| deployments.into_iter().map(|d| d.pin))
         .collect())
-}
-
-/// `engine-enclaves.json`, read for its pins. Every other member was checked
-/// at build time; the strict shape here keeps the two readings from drifting.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EngineEnclaves {
-    #[allow(dead_code)]
-    schema_version: u64,
-    models: std::collections::BTreeMap<String, Vec<Deployment>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Deployment {
-    #[allow(dead_code)]
-    config: serde::de::IgnoredAny,
-    #[allow(dead_code)]
-    config_sha256: serde::de::IgnoredAny,
-    #[allow(dead_code)]
-    cvm_version: serde::de::IgnoredAny,
-    pin: AllowedMeasurement,
-    #[allow(dead_code)]
-    weights: serde::de::IgnoredAny,
-    #[allow(dead_code)]
-    prompt_cache: serde::de::IgnoredAny,
 }
 
 #[cfg(test)]
