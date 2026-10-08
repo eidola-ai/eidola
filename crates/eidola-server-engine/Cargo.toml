@@ -41,4 +41,6 @@ zeroize = "1"
 [dev-dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
 tempfile = "3"

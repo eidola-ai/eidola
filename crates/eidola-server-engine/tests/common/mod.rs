@@ -18,6 +18,14 @@ use serde_json::{Value, json};
 pub const MODEL_ID: &str = "mimo-test";
 pub const TOKEN: &str = "test-gateway-token";
 
+/// The test client. It speaks plain HTTP, but reqwest's features are unified across the
+/// workspace, where other crates select TLS without a built-in crypto provider, so the
+/// same RustCrypto provider they use is installed before a client is built.
+pub fn http_client() -> reqwest::Client {
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    reqwest::Client::new()
+}
+
 /// The dev model directory (built once, cached under the target directory).
 pub fn model_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -126,7 +134,7 @@ impl TestNode {
             base,
             engine: node.engine,
             admission: node.admission,
-            client: reqwest::Client::new(),
+            client: http_client(),
             server,
         }
     }
