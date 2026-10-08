@@ -45,6 +45,8 @@ The node trusts its measured configuration (the environment; see below) and the 
 | template accepts the messages; sampling parameters valid (`SamplingParams::new`) | 400 | `invalid_request_error` |
 | prompt + 1 fits `MAX_MODEL_LEN` and the KV pools | 400 | `context_length_exceeded` |
 
+Every `error.type` is an `eidola_common::engine_protocol::error_type` constant. A gateway sends a refused request to another node only when `engine_protocol::refused_before_admission` holds for its status and type: the first three rows, `model_not_found`, and `overloaded` (raised only when a read or admission slot is not free). `error::tests::only_pre_admission_refusals_say_so` holds every `ApiError` to that list, so a refusal raised after admission (`engine_unavailable`, once the engine has a request) must never reuse one of those types.
+
 The authentication check is about money, not privacy: it keeps anyone but the gateway (which bills) from spending the node's compute. No privacy property depends on who can call the node. Authentication precedes the weights check, so an unauthenticated caller learns nothing about the weights.
 
 The weights-hash check is redundant with the node's measurement (which covers the weights) but early, cheap and independent: a gateway sends the hash from its own compiled-in pin (`releases/trust/engine-enclaves.json`, via the gateway's `engine_trust::protocol`), never from placement data, so a misregistered node refuses traffic rather than serving the wrong weights. The header's name is `eidola_common::engine_protocol::WEIGHTS_HEADER`, which both sides read. `GET /v1/engine/info` reports the verified hash so a misregistration is visible before any traffic.
