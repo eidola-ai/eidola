@@ -41,14 +41,16 @@ jobs:
   rust-checks:
     name: Rust checks
     runs-on: ubuntu-24.04
-    # 60 rather than 30: dev builds compile dependencies at opt-level 2 (see
+    # 90 rather than 30: dev builds compile dependencies at opt-level 2 (see
     # the root Cargo.toml profile block), so a COLD-cache run — a dependency
     # or profile change, or a cache eviction — exceeds 30 minutes on this
-    # runner. Warm-cache runs are unaffected. The generous ceiling also
-    # protects the post-merge push run that SAVES the cache: rust-cache saves
-    # in a post step, which a timeout cancellation skips — a too-tight timeout
-    # there would leave every subsequent PR cold, timing out in a spiral.
-    timeout-minutes: 60
+    # runner, and with the inference engine crates in the workspace a cold
+    # run measured 58 minutes. Warm-cache runs are unaffected. The generous
+    # ceiling also protects the post-merge push run that SAVES the cache:
+    # rust-cache saves in a post step, which a timeout cancellation skips — a
+    # too-tight timeout there would leave every subsequent PR cold, timing out
+    # in a spiral.
+    timeout-minutes: 90
     permissions:
       contents: read
 
@@ -226,16 +228,18 @@ jobs:
         run: rustup show
 
       - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
-        # Save from pushes to both trunks: `next` (the active integration
+        # Save from pushes to the trunks: `next` (the active integration
         # branch — this is what warms feature PRs, which restore from their
-        # base) and `main` (the default branch — the universal restore fallback
-        # and the promotion PR's base). PRs never save (github.ref is a PR ref),
+        # base), `main` (the default branch — the universal restore fallback
+        # and the promotion PR's base), and `engine` (the inference engine's
+        # integration branch, whose PRs build dependencies `next`'s cache does
+        # not hold). PRs never save (github.ref is a PR ref),
         # so there's no per-PR thrash. This job only runs tests; no artifact
         # from here is published.
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true' || steps.scope.outputs.markdown == 'true'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/engine' }}
 
       - name: Check formatting
         if: steps.scope.outputs.rust == 'true'

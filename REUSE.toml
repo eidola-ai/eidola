@@ -26,6 +26,7 @@ path = [
     "crates/eidola-engine-chat/**",
     "crates/eidola-engine-kernels/**",
     "crates/eidola-engine-cpu/**",
+    "crates/eidola-engine-cuda/**",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
