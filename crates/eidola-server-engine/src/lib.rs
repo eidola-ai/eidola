@@ -206,8 +206,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
     };
 
     let (stopped_tx, stopped_rx) = oneshot::channel();
-    let mut device = None;
-    let engine = match &config.executor {
+    let (engine, device) = match &config.executor {
         ExecutorConfig::Cpu { kv_blocks } => {
             let reference = model.reference().cloned().ok_or_else(|| {
                 BootError("the loaded model has no reference weights for the cpu executor".into())
@@ -236,12 +235,13 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 pad_batches: false,
                 record: false,
             };
-            worker::spawn(
+            let engine = worker::spawn(
                 move || Ok(CpuExecutor::new(reference, exec_config)),
                 scheduler,
                 SWEEP_INTERVAL,
                 stopped_tx,
-            )
+            );
+            (engine, None)
         }
         // Never a fallback: a refusal here ends the boot.
         #[cfg(feature = "cuda")]
@@ -266,16 +266,17 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 sliding_kv_blocks = blocks.sliding,
                 "loading the model onto the device"
             );
-            device = Some(report);
-            worker::spawn(
+            let engine = worker::spawn(
                 move || prepared.build(),
                 scheduler,
                 SWEEP_INTERVAL,
                 stopped_tx,
-            )
+            );
+            (engine, Some(report))
         }
-    }
-    .map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
+    };
+    let engine =
+        engine.map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
 
     let weights_hash = model.weights_hash().to_string();
     let admission = Admission::new(sizing.max_requests);
