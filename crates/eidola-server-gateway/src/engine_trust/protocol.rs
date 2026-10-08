@@ -148,14 +148,24 @@ pub fn engine_request_body(request: &ValidatedRequest) -> Zeroizing<Vec<u8>> {
         body.push(b':');
         write(body);
     };
+    let parsed = &request.parsed;
     for (key, mut value) in members {
         match key.as_str() {
             "stream" | "stream_options" => {}
             "cache_key" => value.scrub(),
+            // The fields the strict type narrows (`f32` sampling values) are
+            // written from the typed request, exactly as the Tinfoil path
+            // serializes them, so both hosting paths receive the same scalar:
+            // `0.123456789` reaches either as the `f32` it parses to.
+            "temperature" => member(&mut body, &key, &|out| {
+                serde_json::to_writer(&mut *out, &parsed.temperature).expect("a scalar serializes")
+            }),
+            "top_p" => member(&mut body, &key, &|out| {
+                serde_json::to_writer(&mut *out, &parsed.top_p).expect("a scalar serializes")
+            }),
             _ => member(&mut body, &key, &|out| value.write(out)),
         }
     }
-    let parsed = &request.parsed;
     if parsed.stream {
         member(&mut body, "stream", &|out| out.extend_from_slice(b"true"));
         member(&mut body, "stream_options", &|out| {
@@ -510,6 +520,31 @@ mod tests {
     /// and tool call is exactly as long as the pricing contract measured it,
     /// and the forwarded body prices to the same prompt tokens as the request
     /// the gateway charged for.
+    #[test]
+    fn both_hosting_paths_receive_the_same_sampling_values() {
+        // Every field the strict type narrows: the two `f32` sampling values,
+        // spelled with more precision than an `f32` holds.
+        let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "temperature":0.123456789,"top_p":0.987654321012}"#;
+        let request =
+            ValidatedRequest::from_bytes(bytes::Bytes::from_static(raw.as_bytes())).unwrap();
+        let engine: serde_json::Value =
+            serde_json::from_slice(&engine_request_body(&request)).unwrap();
+        // What the Tinfoil path sends: the typed request, serialized to bytes
+        // (`.json(request)`), read back.
+        let tinfoil: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(request.request()).unwrap()).unwrap();
+        for field in ["temperature", "top_p"] {
+            assert_eq!(engine[field], tinfoil[field], "{field}");
+        }
+        let text = String::from_utf8(engine_request_body(&request).to_vec()).unwrap();
+        assert!(text.contains(&format!(
+            "\"temperature\":{}",
+            serde_json::to_string(&0.123456789_f32).unwrap()
+        )));
+        assert!(!text.contains("0.123456789,"), "{text}");
+    }
+
     #[test]
     fn the_engine_receives_exactly_what_was_priced() {
         let raw = r#"{"model":"m","messages":[
