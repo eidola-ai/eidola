@@ -816,7 +816,7 @@ mod tests {
 
         assert!(check_shim_paths(&["/*"]).is_ok());
         assert!(check_shim_paths(&["/v1/*", "/healthz"]).is_ok());
-        assert!(check_shim_paths(&NODE_ROUTES.to_vec()).is_ok());
+        assert!(check_shim_paths(NODE_ROUTES).is_ok());
         assert!(check_shim_paths(&[]).is_err());
         assert!(check_shim_paths(&["/v1/chat/completions"]).is_err());
         assert!(check_shim_paths(&["/*", "/admin"]).is_err());

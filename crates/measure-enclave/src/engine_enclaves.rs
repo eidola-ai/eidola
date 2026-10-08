@@ -217,7 +217,9 @@ fn check_secrets_shim_and_weights(
     rules::check_shim_paths(&paths.iter().map(String::as_str).collect::<Vec<_>>())
         .map_err(anyhow::Error::msg)?;
     let granted = strings(engine.get("models"), "the engine container's models")?;
-    let text = |v: &serde_yaml::Value, key: &str| v.get(key).and_then(serde_yaml::Value::as_str);
+    fn text<'v>(v: &'v serde_yaml::Value, key: &str) -> Option<&'v str> {
+        v.get(key).and_then(serde_yaml::Value::as_str)
+    }
     let packs: Vec<rules::ModelPack<'_>> = config
         .get("models")
         .and_then(serde_yaml::Value::as_sequence)

@@ -97,19 +97,21 @@ mod tests {
 
     #[test]
     fn verifies_and_accepts_only_the_token() {
-        let t = GatewayToken::verify("s3cret".into(), &hash("s3cret")).unwrap();
-        assert!(t.accepts(Some(b"Bearer s3cret")));
-        assert!(!t.accepts(Some(b"Bearer s3cret ")));
-        assert!(!t.accepts(Some(b"bearer s3cret")));
-        assert!(!t.accepts(Some(b"s3cret")));
+        let t = GatewayToken::verify("s3cret-gateway-token".into(), &hash("s3cret-gateway-token"))
+            .unwrap();
+        assert!(t.accepts(Some(b"Bearer s3cret-gateway-token")));
+        assert!(!t.accepts(Some(b"Bearer s3cret-gateway-token ")));
+        assert!(!t.accepts(Some(b"bearer s3cret-gateway-token")));
+        assert!(!t.accepts(Some(b"s3cret-gateway-token")));
         assert!(!t.accepts(None));
         assert_eq!(format!("{t:?}"), "GatewayToken(<redacted>)");
     }
 
     #[test]
     fn refuses_mismatch_and_malformed_hashes_without_echoing() {
-        let e = GatewayToken::verify("s3cret".into(), &hash("other")).unwrap_err();
+        let e = GatewayToken::verify("s3cret-gateway-token".into(), &hash("other-gateway-token"))
+            .unwrap_err();
         assert!(!e.contains("s3cret") && !e.contains("other"), "{e}");
-        assert!(GatewayToken::verify("s3cret".into(), "not-a-hash").is_err());
+        assert!(GatewayToken::verify("s3cret-gateway-token".into(), "not-a-hash").is_err());
     }
 }
