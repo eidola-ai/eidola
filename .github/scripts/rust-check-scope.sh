@@ -1,10 +1,12 @@
 #!/bin/sh
-# Classify changed paths for the independently gated Rust, Apple, and markdown checks.
+# Classify changed paths for the independently gated Rust, Apple, markdown and
+# OCI stub-resolution checks.
 set -eu
 
 rust=false
 apple=false
 markdown=false
+oci=false
 while IFS= read -r path; do
   [ -n "$path" ] || continue
   case "$path" in
@@ -14,13 +16,17 @@ while IFS= read -r path; do
     .github/workflows/rust-checks.yml|.github/scripts/rust-check-scope.sh|.github/scripts/test-rust-check-scope.sh)
       rust=true
       apple=true
-      markdown=true ;;
+      markdown=true
+      oci=true ;;
     # Glob rather than an enumeration so a script added under `scripts/` with
     # `apple` in its path is gated by existence, not by remembering to list
     # it. `macho_facts.py` is the one Apple instrument whose name does not
     # carry the word.
     scripts/*apple*|scripts/macho_facts.py)
       apple=true ;;
+    # The OCI images' manifest-only fetch stage, and its rehearsal.
+    scripts/check-oci-stub-workspace.sh|oci/*/Containerfile)
+      oci=true ;;
     *.md|.rumdl.toml) : ;;
     .github/*|docs/*|www/*|scripts/*|*.sh|justfile) : ;;
     compose*.yaml|compose*.yml|Containerfile*|*.hcl|.dockerignore) : ;;
@@ -33,4 +39,7 @@ while IFS= read -r path; do
   esac
 done
 
-printf 'rust=%s\napple=%s\nmarkdown=%s\n' "$rust" "$apple" "$markdown"
+# Any Rust-scope change can change what the stubbed workspace must resolve.
+[ "$rust" = true ] && oci=true
+
+printf 'rust=%s\napple=%s\nmarkdown=%s\noci=%s\n' "$rust" "$apple" "$markdown" "$oci"

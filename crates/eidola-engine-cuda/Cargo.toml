@@ -29,6 +29,7 @@ serde_json = "1"
 # The evaluator's scoring and comparison logic is unit-tested with the crate.
 [[example]]
 name = "eval"
+path = "examples/eval.rs"
 test = true
 
 # No integer conversion may lose a value silently, in any target (library,
