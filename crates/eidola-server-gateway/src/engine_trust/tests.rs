@@ -455,7 +455,7 @@ fn the_release_grammar_is_the_measurers() {
 fn the_config_runs_one_digest_pinned_engine_with_quoted_values() {
     let mut tree = Tree::fixture();
     tree.edit_config(&format!("@sha256:{}", "2".repeat(64)), ":latest");
-    refused(&tree, "must run exactly one container whose image is");
+    refused(&tree, "runs exactly one container");
 
     let mut tree = Tree::fixture();
     let engine = tree.config_text();
@@ -463,7 +463,7 @@ fn the_config_runs_one_digest_pinned_engine_with_quoted_values() {
     let end = engine.find("\nshim:").unwrap();
     let container = engine[start..end].to_string();
     tree.edit_config(&container, &format!("{container}{container}"));
-    refused(&tree, "must run exactly one container whose image is");
+    refused(&tree, "runs exactly one container");
 
     let mut tree = Tree::fixture();
     tree.edit_config("PREFIX_CACHE: \"true\"", "PREFIX_CACHE: true");
@@ -684,5 +684,116 @@ fn a_tdx_policy_the_attesting_client_refuses_is_refused() {
                 || err.contains("the attesting client refuses this pin"),
             "{name}: {err}"
         );
+    }
+}
+
+/// Sets `expected_gpus` in the pin and the sidecar alike, so only the GPU rule
+/// can object.
+fn set_expected_gpus(tree: &mut Tree, gpus: Option<u64>) {
+    let mut sidecar = tree.sidecar();
+    match gpus {
+        Some(n) => {
+            tree.deployment()["pin"]["expected_gpus"] = n.into();
+            sidecar["expected_gpus"] = n.into();
+        }
+        None => {
+            tree.deployment()["pin"]
+                .as_object_mut()
+                .unwrap()
+                .remove("expected_gpus");
+            sidecar.as_object_mut().unwrap().remove("expected_gpus");
+        }
+    }
+    tree.set_sidecar(sidecar);
+}
+
+/// A CUDA deployment must require GPU evidence on every handshake, as many
+/// items as the GPUs its config attaches; a CPU deployment need not.
+#[test]
+fn a_cuda_deployment_attests_its_gpus() {
+    for gpus in [None, Some(0)] {
+        let mut tree = Tree::fixture();
+        tree.edit_config("gpus: 8\n", "");
+        set_expected_gpus(&mut tree, gpus);
+        refused(&tree, "so pin.expected_gpus must be at least 1");
+    }
+
+    let mut tree = Tree::fixture();
+    set_expected_gpus(&mut tree, Some(4));
+    refused(
+        &tree,
+        "the config attaches 8 GPUs, so pin.expected_gpus must be 8",
+    );
+
+    // Without a stated count, any positive requirement stands.
+    let mut tree = Tree::fixture();
+    tree.edit_config("gpus: 8\n", "");
+    set_expected_gpus(&mut tree, Some(4));
+    tree.check()
+        .expect("a CUDA deployment requiring four GPUs' evidence");
+
+    // The CPU executor needs no GPU evidence.
+    let mut tree = Tree::fixture();
+    tree.edit_config("gpus: 8\n", "");
+    tree.edit_config("EXECUTOR: \"cuda\"", "EXECUTOR: \"cpu\"");
+    set_expected_gpus(&mut tree, None);
+    tree.check().expect("a CPU deployment without GPU evidence");
+}
+
+/// The shim forwards to the port the node listens on, on every interface.
+#[test]
+fn the_shim_reaches_the_node() {
+    let mut tree = Tree::fixture();
+    tree.edit_config("upstream-port: 8080", "upstream-port: 8081");
+    refused(
+        &tree,
+        "shim.upstream-port is 8081, but EIDOLA_ENGINE_BIND_ADDR listens on port 8080",
+    );
+
+    let mut tree = Tree::fixture();
+    tree.edit_config("\"0.0.0.0:8080\"", "\"127.0.0.1:8080\"");
+    refused(&tree, "must listen on every interface");
+
+    let mut tree = Tree::fixture();
+    tree.edit_config("  upstream-port: 8080\n", "");
+    refused(&tree, "shim.upstream-port must be a port number");
+
+    let mut tree = Tree::fixture();
+    tree.edit_config("\"0.0.0.0:8080\"", "\"[::]:8080\"");
+    tree.check()
+        .expect("the IPv6 unspecified address listens everywhere");
+}
+
+/// The engine is the only container, and its image is pinned by a full
+/// digest: a companion container, a tag, or a short digest would run code the
+/// measured config bytes do not fix.
+#[test]
+fn every_image_is_the_digest_pinned_engine() {
+    let digest = format!("@sha256:{}", "2".repeat(64));
+    let text = Tree::fixture().config_text();
+    let start = text.find("  - name:").unwrap();
+    let end = text.find("\nshim:").unwrap();
+    let engine = text[start..end].to_string();
+
+    for companion in [
+        "  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar:latest\"\n",
+        &format!("  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar{digest}\"\n"),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(&engine, &format!("{engine}{companion}"));
+        refused(&tree, "runs exactly one container");
+    }
+
+    for image in [
+        "ghcr.io/eidola-ai/eidola-server-engine:v1".to_string(),
+        "ghcr.io/eidola-ai/eidola-server-engine@sha256:2222".to_string(),
+        format!("ghcr.io/eidola-ai/eidola-server-engine{digest}:latest"),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(
+            &format!("ghcr.io/eidola-ai/eidola-server-engine{digest}"),
+            &image,
+        );
+        refused(&tree, "runs exactly one container");
     }
 }

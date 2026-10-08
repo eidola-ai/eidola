@@ -114,6 +114,24 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
             }
         }
     });
+    // GPU evidence attests the accelerators the prompt runs on: a CUDA
+    // deployment requires at least one GPU's, and a stated GPU count exactly
+    // that many (the gateway's build holds the same rule).
+    let expected_gpus = sidecar.get("expected_gpus").and_then(Value::as_u64);
+    ensure!(
+        var("EIDOLA_ENGINE_EXECUTOR")? != "cuda" || expected_gpus.unwrap_or(0) > 0,
+        "a cuda deployment must state expected_gpus of at least 1 in deployment.json"
+    );
+    if let Some(gpus) = config_yaml
+        .get("gpus")
+        .and_then(serde_yaml::Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        ensure!(
+            expected_gpus == Some(gpus),
+            "the config attaches {gpus} GPUs, so deployment.json's expected_gpus must be {gpus}"
+        );
+    }
     if let Some(gpus) = sidecar.get("expected_gpus") {
         pin["expected_gpus"] = gpus.clone();
     }
@@ -154,14 +172,21 @@ fn engine_env(config: &serde_yaml::Value) -> Result<BTreeMap<String, String>> {
         .get("containers")
         .and_then(serde_yaml::Value::as_sequence)
         .context("containers must be a list")?;
-    let mut engines = containers.iter().filter(|c| {
-        c.get("image")
-            .and_then(serde_yaml::Value::as_str)
-            .is_some_and(|i| i.starts_with("ghcr.io/eidola-ai/eidola-server-engine@sha256:"))
-    });
-    let (Some(engine), None) = (engines.next(), engines.next()) else {
-        bail!("the config must run exactly one eidola-server-engine container, pinned by digest");
+    // The gateway's build holds the same rule: exactly one container, the
+    // engine, pinned by a full digest (a tag escapes the measurement).
+    let [engine] = containers.as_slice() else {
+        bail!("an engine deployment runs exactly one container, the engine pinned by digest");
     };
+    let digest = engine
+        .get("image")
+        .and_then(serde_yaml::Value::as_str)
+        .and_then(|i| i.strip_prefix("ghcr.io/eidola-ai/eidola-server-engine@sha256:"));
+    ensure!(
+        digest.is_some_and(
+            |d| d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        ),
+        "the engine image must be pinned by a 64-hex-digit digest"
+    );
     let mut env = BTreeMap::new();
     for entry in engine
         .get("env")
@@ -205,6 +230,7 @@ containers:
       - EIDOLA_ENGINE_MODEL_ID: "fixture-model"
       - EIDOLA_ENGINE_WEIGHTS_SHA256: "{weights}"
       - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
+      - EIDOLA_ENGINE_EXECUTOR: "cuda"
       - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA"
       - EIDOLA_ENGINE_PREFIX_CACHE: "true"
       - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
@@ -321,5 +347,21 @@ containers:
         assert!(entry("fixture-model", &unpinned, SIDECAR).contains("pin its release manifest"));
         let other_release = good.replace(&release_sha, &"ab".repeat(32));
         assert!(entry("fixture-model", &other_release, SIDECAR).contains("not the pinned"));
+
+        // A CUDA deployment that asks for no GPU evidence, or a different
+        // count than it attaches.
+        let no_gpus = SIDECAR.replace("\"expected_gpus\": 8,", "");
+        assert!(entry("fixture-model", &good, &no_gpus).contains("at least 1"));
+        let zero_gpus = SIDECAR.replace("\"expected_gpus\": 8", "\"expected_gpus\": 0");
+        assert!(entry("fixture-model", &good, &zero_gpus).contains("at least 1"));
+        let attaches_four = good.replace("memory: 65536\n", "memory: 65536\ngpus: 4\n");
+        assert!(entry("fixture-model", &attaches_four, SIDECAR).contains("must be 4"));
+
+        // A companion container, or an engine named by a tag.
+        let companion =
+            format!("{good}  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar:latest\"\n");
+        assert!(entry("fixture-model", &companion, SIDECAR).contains("exactly one container"));
+        let tagged = good.replace(&format!("@sha256:{}", "2".repeat(64)), ":v1");
+        assert!(entry("fixture-model", &tagged, SIDECAR).contains("64-hex-digit digest"));
     }
 }

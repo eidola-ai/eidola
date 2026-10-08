@@ -3,6 +3,7 @@
 cvm-version: 0.15.0@sha256:1111111111111111111111111111111111111111111111111111111111111111
 cpus: 16
 memory: 65536
+gpus: 8
 
 containers:
   - name: "eidola-server-engine"

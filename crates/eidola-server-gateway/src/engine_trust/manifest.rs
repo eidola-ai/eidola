@@ -314,6 +314,24 @@ fn check_deployment(
             "{at}: prompt_cache.idle_ttl_secs exceeds max_age_secs, which the node refuses"
         ));
     }
+    // The shim forwards to the node's listener: the port must be the one the
+    // node binds, on every interface, as the gateway's own deployment does
+    // (`BIND_ADDR` 0.0.0.0:8080 behind `upstream-port: 8080`); the shim runs
+    // outside the workload container, so a loopback-only node is unreachable.
+    if u64::from(measured.bind_addr.port()) != config.shim_upstream_port {
+        return Err(format!(
+            "{at_config}: shim.upstream-port is {}, but EIDOLA_ENGINE_BIND_ADDR listens on port {}",
+            config.shim_upstream_port,
+            measured.bind_addr.port()
+        ));
+    }
+    if !measured.bind_addr.ip().is_unspecified() {
+        return Err(format!(
+            "{at_config}: EIDOLA_ENGINE_BIND_ADDR must listen on every interface \
+             (0.0.0.0 or [::]) for the shim to reach it"
+        ));
+    }
+
     let configured = CheckedCachePolicy {
         enabled: measured.cache.enabled,
         idle_ttl_secs: measured.cache.idle_ttl_secs,
@@ -361,6 +379,23 @@ fn check_deployment(
                 .ok_or_else(|| format!("{at}: pin.expected_gpus must be a u32"))?,
         ),
     };
+    // GPU evidence is what attests the accelerators the prompt is processed
+    // on: a CUDA deployment must require at least one GPU's evidence on every
+    // handshake, and a deployment that states its GPU count must require
+    // exactly that many.
+    if measured.executor == engine_deployment::Executor::Cuda && expected_gpus.unwrap_or(0) == 0 {
+        return Err(format!(
+            "{at}: the config runs the cuda executor, so pin.expected_gpus must be at least 1 \
+             (absent or 0 would leave its GPUs unattested)"
+        ));
+    }
+    if let Some(gpus) = config.gpus.filter(|n| *n > 0)
+        && expected_gpus != Some(gpus)
+    {
+        return Err(format!(
+            "{at}: the config attaches {gpus} GPUs, so pin.expected_gpus must be {gpus}"
+        ));
+    }
     if expected_gpus != sidecar.expected_gpus {
         return Err(format!(
             "{at}: pin.expected_gpus differs from {sidecar_path}"
@@ -445,6 +480,10 @@ struct EngineConfig {
     cvm_version: String,
     secrets: Vec<String>,
     env: BTreeMap<String, String>,
+    /// The port the attestation shim forwards to (`shim.upstream-port`).
+    shim_upstream_port: u64,
+    /// The GPUs the deployment attaches (`gpus`), when it states a count.
+    gpus: Option<u64>,
 }
 
 impl EngineConfig {
@@ -469,25 +508,28 @@ impl EngineConfig {
             .get("containers")
             .and_then(serde_yaml::Value::as_sequence)
             .ok_or_else(|| format!("{path}: containers must be a list"))?;
-        let mut engines = containers.iter().filter(|c| {
-            c.get("image")
-                .and_then(serde_yaml::Value::as_str)
-                .is_some_and(|image| image.starts_with(ENGINE_IMAGE_PREFIX))
-        });
-        let engine = match (engines.next(), engines.next()) {
-            (Some(engine), None) => engine,
+        // Exactly one container, the engine, pinned by full digest. MRCONFIGID
+        // covers this file's bytes, not what a tag resolves to, so any image
+        // named by a tag (or a companion container at all) would run code the
+        // measurement does not fix.
+        let engine = match containers.as_slice() {
+            [engine]
+                if engine
+                    .get("image")
+                    .and_then(serde_yaml::Value::as_str)
+                    .and_then(|image| image.strip_prefix(ENGINE_IMAGE_PREFIX))
+                    .is_some_and(|digest| is_lower_hex(digest, 32)) =>
+            {
+                engine
+            }
             _ => {
                 return Err(format!(
-                    "{path}: must run exactly one container whose image is {ENGINE_IMAGE_PREFIX}<digest>"
+                    "{path}: an engine deployment runs exactly one container, its image \
+                     {ENGINE_IMAGE_PREFIX}<64 lowercase hex>; every other container, and any \
+                     image named by a tag or a short digest, escapes the measurement"
                 ));
             }
         };
-        let image = engine["image"].as_str().expect("filtered on image");
-        if !is_lower_hex(&image[ENGINE_IMAGE_PREFIX.len()..], 32) {
-            return Err(format!(
-                "{path}: the engine image must be pinned by a 64-hex-digit digest"
-            ));
-        }
 
         let secrets = match engine.get("secrets") {
             None | Some(serde_yaml::Value::Null) => Vec::new(),
@@ -525,10 +567,25 @@ impl EngineConfig {
             }
         }
 
+        let shim_upstream_port = config
+            .get("shim")
+            .and_then(|shim| shim.get("upstream-port"))
+            .and_then(serde_yaml::Value::as_u64)
+            .ok_or_else(|| format!("{path}: shim.upstream-port must be a port number"))?;
+        let gpus = match config.get("gpus") {
+            None => None,
+            Some(gpus) => Some(
+                gpus.as_u64()
+                    .ok_or_else(|| format!("{path}: gpus must be a whole number"))?,
+            ),
+        };
+
         Ok(Self {
             cvm_version: cvm_version.to_owned(),
             secrets,
             env,
+            shim_upstream_port,
+            gpus,
         })
     }
 }
