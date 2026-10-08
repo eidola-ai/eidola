@@ -79,7 +79,7 @@ pub struct ChatCompletionRequest {
     // `skip_serializing`, so the OpenAPI schema (which drops a
     // `skip_serializing` field) still documents the field clients may send.
     #[serde(default, skip_serializing_if = "never_serialized")]
-    #[schema(value_type = Option<String>, min_length = 43, max_length = 43, pattern = "^[A-Za-z0-9_-]{43}$")]
+    #[schema(value_type = Option<String>, min_length = 43, max_length = 43, pattern = "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$")]
     pub cache_key: Option<CacheKey>,
 }
 
@@ -1305,6 +1305,45 @@ mod tests {
             r#"{"model":"m","messages":[],"cache_key":5}"#,
         );
         assert!(err.is_err());
+    }
+
+    /// The OpenAPI pattern published for `cache_key` admits exactly the
+    /// texts the decoder accepts: every byte in every position class (a
+    /// leading character, a middle one, the final one), after an otherwise
+    /// valid key, and keys of the wrong length.
+    #[test]
+    fn the_published_cache_key_pattern_is_the_decoders() {
+        let schema =
+            serde_json::to_value(<ChatCompletionRequest as utoipa::PartialSchema>::schema())
+                .unwrap();
+        let pattern = schema["properties"]["cache_key"]["pattern"]
+            .as_str()
+            .expect("cache_key publishes a pattern");
+        let pattern = regex::Regex::new(pattern).unwrap();
+
+        let mut texts = vec![
+            String::new(),
+            CACHE_KEY[..42].to_string(),
+            format!("{CACHE_KEY}A"),
+        ];
+        for b in 0u8..=255 {
+            let Some(c) = char::from_u32(b.into()) else {
+                continue;
+            };
+            texts.push(format!("{}{c}", &CACHE_KEY[..42]));
+            texts.push(format!("{c}{}", &CACHE_KEY[1..]));
+            texts.push(format!("{}{c}{}", &CACHE_KEY[..20], &CACHE_KEY[21..]));
+        }
+        let mut accepted = 0;
+        for text in texts {
+            let published = pattern.is_match(&text);
+            let decoded = serde_json::from_value::<CacheKey>(text.clone().into()).is_ok();
+            assert_eq!(published, decoded, "{text:?}");
+            accepted += usize::from(decoded);
+        }
+        // 16 canonical finals, plus 64 leading and 64 middle characters (one
+        // of each pair is the original key).
+        assert_eq!(accepted, 16 + 64 + 64);
     }
 
     #[test]

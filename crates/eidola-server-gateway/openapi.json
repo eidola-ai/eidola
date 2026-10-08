@@ -1032,7 +1032,7 @@
             "description": "The client's prefix-cache key: 32 bytes, base64url without padding\n(`eidola_common::engine_protocol`). An Eidola-hosted engine scopes\nprefix-cache reuse to requests carrying the same key; without one,\nnothing a request computes is reused by any other.\n\n**Secret, and never serialized.** It is held decoded in a\nscrubbed-on-drop buffer, prints redacted, and `Serialize` skips it, so\nre-serializing a request for the Tinfoil upstream (which has no use\nfor it) cannot carry it there. The one writer is\n`engine_trust::protocol::engine_request_body`.",
             "maxLength": 43,
             "minLength": 43,
-            "pattern": "^[A-Za-z0-9_-]{43}$"
+            "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
           },
           "max_completion_tokens": {
             "type": [
