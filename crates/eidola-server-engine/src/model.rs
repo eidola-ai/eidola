@@ -501,6 +501,20 @@ mod tests {
         );
     }
 
+    /// Where read-only mounts are available (`storage.rs`'s env-gated tests), the pinned
+    /// path gets the same verdicts as the configured one; skipped otherwise.
+    #[test]
+    fn a_pinned_directory_gets_the_storage_verdict_of_its_mount() {
+        if let Some(dir) = std::env::var_os("EIDOLA_TEST_READ_ONLY_DIR") {
+            let pinned = PinnedDir::open(Path::new(&dir)).unwrap();
+            crate::storage::require_immutable(pinned.path(), "dir").unwrap();
+        }
+        if let Some(dir) = std::env::var_os("EIDOLA_TEST_READ_ONLY_BIND_DIR") {
+            let pinned = PinnedDir::open(Path::new(&dir)).unwrap();
+            assert!(crate::storage::require_immutable(pinned.path(), "dir").is_err());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn verified_entries_must_be_regular_files() {
