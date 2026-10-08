@@ -51,7 +51,7 @@ fn every_entry_and_contract_resolves() {
                     assert!(
                         fatbin.name == "deepgemm_fp8_fp4_grouped"
                             || (fatbin.name == "engine_ops"
-                                && entry.symbol == "eidola_router_topk"),
+                                && entry.symbol.starts_with("eidola_router_topk")),
                         "{}",
                         entry.symbol
                     );
