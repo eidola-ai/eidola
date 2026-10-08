@@ -21,6 +21,14 @@ use crate::error::ApiError;
 /// Most stop sequences a request may carry (OpenAI's limit).
 pub const MAX_STOP_SEQUENCES: usize = 4;
 
+/// Longest stop sequence, in UTF-8 bytes. Stop sequences are delimiters (`"\n\n"`,
+/// `"Observation:"`, an end marker); Eidola's own chat path sends none, and its local
+/// proxy relays only what a local caller sets. The cap is far above any delimiter while
+/// bounding the matcher (`pipeline::StopMatcher`, a pattern copy plus a `usize` table per
+/// byte, plus the held-back text) to a few kilobytes per request, so a body cannot turn
+/// its 32 MiB into hundreds of MiB of matcher state.
+pub const MAX_STOP_BYTES: usize = 256;
+
 /// A chat completion request, as the gateway forwards it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +180,11 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
     }
     if stop.iter().any(String::is_empty) {
         return Err(ApiError::invalid("stop sequences must not be empty"));
+    }
+    if stop.iter().any(|s| s.len() > MAX_STOP_BYTES) {
+        return Err(ApiError::invalid(format!(
+            "each stop sequence may be at most {MAX_STOP_BYTES} bytes"
+        )));
     }
     let tools_given = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     let parse_tools = match &req.tool_choice {

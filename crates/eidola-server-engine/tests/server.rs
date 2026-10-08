@@ -16,6 +16,7 @@ use eidola_engine_chat::{
     ChatDelta, ChatInput, OutputConfig, OutputParser, PrefixedCallIds, RenderOptions, StopCause,
 };
 use eidola_engine_cpu::{CpuExecutor, CpuExecutorConfig, MtpHidden};
+use eidola_server_engine::api::MAX_STOP_BYTES;
 use eidola_server_engine::config::env;
 use eidola_server_engine::worker::Stats;
 use futures_util::StreamExt;
@@ -314,6 +315,12 @@ async fn strict_schema_refuses_what_it_does_not_name() {
         ),
         with("stop", json!(["a", "b", "c", "d", "e"])),
         with("stop", "".into()),
+        // One byte over the per-sequence cap, as one sequence or among four.
+        with("stop", "x".repeat(MAX_STOP_BYTES + 1).into()),
+        with(
+            "stop",
+            json!(["a", "b", "c", "é".repeat(MAX_STOP_BYTES / 2 + 1)]),
+        ),
         with("max_completion_tokens", 0.into()),
         with("top_p", 0.0.into()),
         with("temperature", (-1.0).into()),
@@ -345,6 +352,13 @@ async fn strict_schema_refuses_what_it_does_not_name() {
         "cache_key": "A".repeat(43),
     });
     let (status, v) = node.chat_json(&ok).await;
+    assert_eq!(status, 200, "{v}");
+
+    // Four sequences of exactly the cap are accepted.
+    let mut at_cap = request("hi", 2);
+    at_cap["stop"] =
+        json!(["\u{1}", "\u{2}", "\u{3}", "é"].map(|c: &str| c.repeat(MAX_STOP_BYTES / c.len())));
+    let (status, v) = node.chat_json(&at_cap).await;
     assert_eq!(status, 200, "{v}");
 }
 
@@ -527,7 +541,7 @@ async fn a_long_stop_sequence_does_not_hold_back_the_stream() {
     let node = TestNode::start(&[]).await;
     let mut body = request(LONG_TEXT, 24);
     let (_, plain) = node.chat_json(&body).await;
-    body["stop"] = json!(["\u{1}".repeat(20_000)]);
+    body["stop"] = json!(["\u{1}".repeat(eidola_server_engine::api::MAX_STOP_BYTES)]);
     body["stream"] = true.into();
     let (chunks, _) = parse_chunks(&node.chat_stream(&body).await);
     let deltas: Vec<&Value> = chunks
