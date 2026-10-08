@@ -1022,6 +1022,24 @@ fn a_stale_dev_model_is_rebuilt() {
     assert!(out.join("marker").exists());
 }
 
+/// Concurrent builders of one stale directory all return with the current model in
+/// place: none moves aside a model another has just published.
+#[test]
+fn concurrent_dev_model_builders_never_unpublish_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("model");
+    fixture::ensure_dev_model(&out).unwrap();
+    std::fs::write(out.join(fixture::FINGERPRINT_FILE), b"other inputs").unwrap();
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                fixture::ensure_dev_model(&out).unwrap();
+                assert_eq!(fixture::weights_hash_of(&out), weights_hash());
+            });
+        }
+    });
+}
+
 /// Production storage is checked, not assumed: a writable weights directory is refused
 /// before anything is hashed or loaded, and a model loaded under one storage mode cannot
 /// start a node configured for the other.

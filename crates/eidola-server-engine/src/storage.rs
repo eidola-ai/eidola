@@ -57,7 +57,9 @@ fn require_read_only_superblock(path: &Path, name: &str) -> Result<(), ModelErro
     let dev = std::fs::metadata(&canonical)
         .map_err(|e| ModelError(format!("cannot inspect {name}: {}", e.kind())))?
         .dev();
-    let text = std::fs::read_to_string("/proc/self/mountinfo")
+    // Bytes, not text: mount points are byte strings, and an unrelated mount whose path is
+    // not UTF-8 must not stop this check.
+    let text = std::fs::read("/proc/self/mountinfo")
         .map_err(|e| ModelError(format!("cannot read /proc/self/mountinfo: {}", e.kind())))?;
     let mounts =
         mountinfo::parse(&text).map_err(|e| ModelError(format!("/proc/self/mountinfo: {e}")))?;
@@ -86,21 +88,22 @@ pub mod mountinfo {
 
     /// Parses mountinfo text (proc(5): `id parent maj:min root mount-point options
     /// [optional fields…] - fstype source super-options`).
-    pub fn parse(text: &str) -> Result<Vec<Mount>, String> {
-        text.lines()
-            .filter(|l| !l.trim().is_empty())
+    pub fn parse(text: &[u8]) -> Result<Vec<Mount>, String> {
+        text.split(|b| *b == b'\n')
+            .filter(|l| !l.trim_ascii().is_empty())
             .enumerate()
             .map(|(i, line)| parse_line(line).ok_or_else(|| format!("line {} is malformed", i + 1)))
             .collect()
     }
 
-    fn parse_line(line: &str) -> Option<Mount> {
-        let fields: Vec<&str> = line.split(' ').collect();
-        let (major, minor) = fields.get(2)?.split_once(':')?;
+    fn parse_line(line: &[u8]) -> Option<Mount> {
+        use std::os::unix::ffi::OsStringExt;
+        let fields: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
+        let (major, minor) = std::str::from_utf8(fields.get(2)?).ok()?.split_once(':')?;
         let dev = (major.parse().ok()?, minor.parse().ok()?);
-        let mount_point = PathBuf::from(unescape(fields.get(4)?)?);
+        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(unescape(fields.get(4)?)?));
         let mount_ro = has_ro(fields.get(5)?);
-        let sep = fields.iter().skip(6).position(|f| *f == "-")? + 6;
+        let sep = fields.iter().skip(6).position(|f| *f == b"-")? + 6;
         let super_ro = has_ro(fields.get(sep + 3)?);
         Some(Mount {
             dev,
@@ -110,13 +113,12 @@ pub mod mountinfo {
         })
     }
 
-    fn has_ro(options: &str) -> bool {
-        options.split(',').any(|o| o == "ro")
+    fn has_ro(options: &[u8]) -> bool {
+        options.split(|b| *b == b',').any(|o| o == b"ro")
     }
 
     /// Decodes the kernel's `\ooo` octal escapes (space, tab, newline, backslash).
-    fn unescape(s: &str) -> Option<String> {
-        let b = s.as_bytes();
+    fn unescape(b: &[u8]) -> Option<Vec<u8>> {
         let mut out = Vec::with_capacity(b.len());
         let mut i = 0;
         while i < b.len() {
@@ -129,7 +131,7 @@ pub mod mountinfo {
                 i += 1;
             }
         }
-        String::from_utf8(out).ok()
+        Some(out)
     }
 
     /// The mount holding `canonical` (an absolute, canonical path) on device `dev`: the
@@ -193,7 +195,7 @@ mod tests {
 ";
 
     fn mounts() -> Vec<Mount> {
-        parse(SAMPLE).unwrap()
+        parse(SAMPLE.as_bytes()).unwrap()
     }
 
     fn verdict(path: &str, dev: (u32, u32)) -> Result<(), String> {
@@ -244,10 +246,23 @@ mod tests {
     }
 
     #[test]
+    fn a_non_utf8_mount_point_elsewhere_does_not_block_resolution() {
+        let mut text = SAMPLE.as_bytes().to_vec();
+        text.extend_from_slice(b"40 22 8:1 / /media/caf\xe9 rw - vfat /dev/sdb1 rw\n");
+        let m = parse(&text).unwrap();
+        check(resolve(&m, Path::new("/verity/model.safetensors"), (253, 3)).unwrap()).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            m.last().unwrap().mount_point.as_os_str().as_bytes(),
+            b"/media/caf\xe9"
+        );
+    }
+
+    #[test]
     fn malformed_lines_and_devices() {
-        assert!(parse("garbage").is_err());
+        assert!(parse(b"garbage").is_err());
         assert!(
-            parse("1 2 3:4 / /x rw - ext4 src").is_err(),
+            parse(b"1 2 3:4 / /x rw - ext4 src").is_err(),
             "no super options"
         );
         assert_eq!(linux_dev(0xfd03), (253, 3));

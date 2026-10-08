@@ -69,12 +69,22 @@ pub fn inputs_fingerprint() -> std::io::Result<String> {
 /// Makes sure `out` holds the derived model built from the current inputs. A directory
 /// whose recorded fingerprint differs (or is missing) is rebuilt: the new model is written
 /// into a sibling directory, fingerprint last, and swapped into place by renames, so `out`
-/// never holds a partial or mismatched model.
+/// never holds a partial or mismatched model. Rebuilds are serialized across processes by
+/// an exclusive lock on a sibling file, and the fingerprint is rechecked under it, so a
+/// builder never moves aside a current model another process has just published.
 pub fn ensure_dev_model(out: &Path) -> std::io::Result<()> {
     let fingerprint = inputs_fingerprint()?;
     let current = |dir: &Path| {
         std::fs::read_to_string(dir.join(FINGERPRINT_FILE)).is_ok_and(|f| f == fingerprint)
     };
+    if current(out) {
+        return Ok(());
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock = std::fs::File::create(out.with_extension("lock"))?;
+    lock.lock()?;
     if current(out) {
         return Ok(());
     }
@@ -91,11 +101,7 @@ pub fn ensure_dev_model(out: &Path) -> std::io::Result<()> {
             std::fs::remove_dir_all(&stale)?;
         }
     }
-    match std::fs::rename(&partial, out) {
-        // Another process put a current model in place first.
-        Err(_) if current(out) => std::fs::remove_dir_all(&partial),
-        r => r,
-    }
+    std::fs::rename(&partial, out)
 }
 
 /// Writes the derived model into `out`.
