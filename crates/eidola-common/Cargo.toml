@@ -25,7 +25,9 @@ argon2 = { version = "0.6", optional = true }
 # checked whole. Optional, enabled only by the gateway's build and tests and by
 # `measure-enclave`, each of which already reads YAML deployment configs.
 serde_yaml = { version = "0.9", optional = true }
+# The typed mirror of Tinfoil's config schema in the same module.
+serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
 argon2 = ["dep:argon2"]
-deployment = ["argon2", "dep:serde_yaml"]
+deployment = ["argon2", "dep:serde_yaml", "dep:serde"]

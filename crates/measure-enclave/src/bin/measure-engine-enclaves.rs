@@ -101,6 +101,12 @@ fn name(path: &Path) -> Result<String> {
         .file_name()
         .and_then(|n| n.to_str())
         .with_context(|| format!("{} has no UTF-8 name", path.display()))?;
-    ensure!(!name.starts_with('.'), "{} is hidden", path.display());
+    // The component grammar the gateway's build holds a pinned config's path
+    // to: a directory outside it is refused here, before anything is measured.
+    ensure!(
+        eidola_common::engine_deployment::is_safe_component(name),
+        "{} is not a deployment path component ([a-z0-9][a-z0-9._-]*)",
+        path.display()
+    );
     Ok(name.to_owned())
 }

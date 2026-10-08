@@ -17,12 +17,11 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value as Json;
-use serde_yaml::Value as Yaml;
 
 use super::{
-    MeasuredConfig, ModelPack, WeightsStorage, allowed_keys, check_container_gpu_access,
-    check_env_names, check_gpu_attestation, check_secrets, check_shim_paths, check_vm_resources,
-    check_weights_pack, env, first_disallowed_key, parse_cvm_version, parse_measured,
+    MeasuredConfig, ModelPack, WeightsStorage, check_container_gpu_access, check_env_names,
+    check_gpu_attestation, check_secrets, check_shim_paths, check_vm_resources, check_weights_pack,
+    env, parse_cvm_version, parse_measured,
 };
 
 /// The image every engine deployment runs, pinned by digest.
@@ -147,6 +146,115 @@ pub fn check_deployment(
     })
 }
 
+/// Largest config Tinfoil decodes (`tinfoil-config/decode.go`:
+/// `MaxConfigBytes = 1 << 20`, checked on the raw bytes before parsing).
+pub const MAX_CONFIG_BYTES: usize = 1 << 20;
+
+/// The engine container's name. Tinfoil's validator checks only that names
+/// are unique; an engine deployment has one container, and it is this one.
+pub const ENGINE_CONTAINER_NAME: &str = "eidola-server-engine";
+
+// The typed mirror of Tinfoil's config schema (`tinfoil-config/types.go`),
+// restricted to the fields an engine deployment needs. Every struct refuses
+// unknown fields, so a field Tinfoil supports but we do not allow — a
+// container's `entrypoint` or `command` (another executable from the pinned
+// image), `volumes`, `devices`, `cap_add`, `privileged` (wider reach),
+// `networks` or `cvm-network` (egress, inbound ports), the shim's
+// `dummy-attestation` (no hardware evidence), a pack's `exec`, `emwp` or
+// `key-secret` — fails the parse. Field types follow Tinfoil's: an `int`
+// there is an integer here (a quoted number is refused, as yaml.v3 refuses
+// it), a `string` a string. Widening the allow-list means adding the typed
+// field here and its validation below together.
+
+/// `Config` (types.go), top level.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TinfoilConfig {
+    /// The platform release, with its manifest pinned inline.
+    #[serde(rename = "cvm-version")]
+    cvm_version: String,
+    /// VM resources (`int` in types.go).
+    cpus: u64,
+    memory: u64,
+    /// GPUs attached to the VM (`int`; validation.go: 0 to 8).
+    #[serde(default)]
+    gpus: Option<u64>,
+    /// The read-only model packs that carry the weights to verified storage.
+    #[serde(default)]
+    models: Vec<TinfoilModel>,
+    containers: Vec<TinfoilContainer>,
+    shim: TinfoilShim,
+}
+
+/// `ModelSpec` (types.go): its name, source (`repo`), the pack pinned by root
+/// hash (`mpk`) and its layout (`schema`, required here).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TinfoilModel {
+    name: String,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    mpk: Option<String>,
+    #[serde(default)]
+    schema: Option<i64>,
+}
+
+/// `Container` (types.go): identity, the digest-pinned image, the measured
+/// env and the one secret, the weights pack grant, and GPU access.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TinfoilContainer {
+    name: String,
+    image: String,
+    /// One-key `NAME: "value"` mappings. Tinfoil also accepts a bare `NAME`
+    /// (inherit from the host) and non-string scalars; neither is measured
+    /// text, so neither is accepted here.
+    env: Vec<BTreeMap<String, QuotedString>>,
+    #[serde(default)]
+    secrets: Option<Vec<String>>,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    runtime: Option<String>,
+    #[serde(default)]
+    gpus: Option<GpuSelection>,
+}
+
+/// A YAML string scalar, and only that: `true`, `16` or `0.5` unquoted are
+/// other types, which a plain `String` would silently coerce. An env value is
+/// the text the node parses, so it is written as text.
+struct QuotedString(String);
+
+impl<'de> serde::Deserialize<'de> for QuotedString {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match <serde_yaml::Value as serde::Deserialize>::deserialize(d)? {
+            serde_yaml::Value::String(s) => Ok(Self(s)),
+            _ => Err(serde::de::Error::custom(
+                "each env entry must be one NAME: \"value\" pair with a quoted string value",
+            )),
+        }
+    }
+}
+
+/// A container's `gpus` (`interface{}` in types.go): a count or a selection.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum GpuSelection {
+    Count(u64),
+    Selection(String),
+}
+
+/// `ShimConfig` (shim.go), restricted to where it forwards and what it serves.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TinfoilShim {
+    #[serde(rename = "upstream-port")]
+    upstream_port: u64,
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
 struct Pack {
     name: String,
     repo: Option<String>,
@@ -169,183 +277,203 @@ struct EngineConfig {
     memory: u64,
 }
 
+/// An environment name as Tinfoil's validator reads one
+/// (validation.go `validEnvironmentName`): 1 to 256 bytes of `[A-Za-z_]`, and
+/// digits after the first.
+fn is_environment_name(name: &str) -> bool {
+    (1..=256).contains(&name.len())
+        && name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
+}
+
 impl EngineConfig {
     fn parse(bytes: &[u8], path: &str) -> Result<Self, String> {
-        let config: Yaml = serde_yaml::from_slice(bytes).map_err(|e| format!("{path}: {e}"))?;
-        // Only the keys an engine deployment needs, at every level that can
-        // change what runs.
-        allow_keys(&config, allowed_keys::CONFIG, path, "the config")?;
-        if let Some(shim) = config.get("shim") {
-            allow_keys(shim, allowed_keys::SHIM, path, "shim")?;
+        // decode.go: `len(data) > MaxConfigBytes` is refused before parsing.
+        if bytes.len() > MAX_CONFIG_BYTES {
+            return Err(format!(
+                "{path}: {} bytes exceeds Tinfoil's {MAX_CONFIG_BYTES}-byte config limit",
+                bytes.len()
+            ));
         }
+        refuse_anchors_and_aliases(bytes, path)?;
+        // One document, every struct strict (decode.go: `KnownFields(true)`,
+        // a trailing document refused), duplicate keys refused.
+        let config: TinfoilConfig =
+            serde_yaml::from_slice(bytes).map_err(|e| format!("{path}: {e}"))?;
 
-        let mut packs = Vec::new();
-        if let Some(models) = config.get("models") {
-            let models = models
-                .as_sequence()
-                .ok_or_else(|| format!("{path}: models must be a list"))?;
-            for (i, model) in models.iter().enumerate() {
-                let what = format!("models[{i}]");
-                allow_keys(model, allowed_keys::MODEL, path, &what)?;
-                let field = |key: &str| -> Result<Option<String>, String> {
-                    match model.get(key) {
-                        None => Ok(None),
-                        Some(v) => v
-                            .as_str()
-                            .map(|s| Some(s.to_owned()))
-                            .ok_or_else(|| format!("{path}: {what}.{key} must be a string")),
-                    }
-                };
-                // The layout the pack was built with: stated, and one we know.
-                match model.get("schema").and_then(Yaml::as_u64) {
-                    Some(n) if PACK_SCHEMAS.contains(&n) => {}
-                    _ => {
-                        return Err(format!(
-                            "{path}: {what}.schema must be one of {PACK_SCHEMAS:?}, the pack \
-                             layouts whose root hash it pins"
-                        ));
-                    }
-                }
-                packs.push(Pack {
-                    name: field("name")?.ok_or_else(|| format!("{path}: {what} has no name"))?,
-                    repo: field("repo")?,
-                    mpk: field("mpk")?,
-                });
-            }
-        }
-
-        let shim_paths = match config.get("shim").and_then(|shim| shim.get("paths")) {
-            None => Vec::new(),
-            Some(paths) => string_list(paths, path, "shim.paths")?,
-        };
-        let cvm_version = config
-            .get("cvm-version")
-            .and_then(Yaml::as_str)
-            .ok_or_else(|| format!("{path}: cvm-version must be a string"))?;
-        let release = parse_cvm_version(cvm_version).map_err(|e| format!("{path}: {e}"))?;
+        let release = parse_cvm_version(&config.cvm_version).map_err(|e| format!("{path}: {e}"))?;
         if release.manifest_sha256.is_none() {
             return Err(format!(
                 "{path}: cvm-version must pin its release manifest inline, \
                  as VERSION@sha256:<64 lowercase hex>"
             ));
         }
+        // validation.go `Validate`: `gpus must be between 0 and 8`.
+        if config.gpus.is_some_and(|n| n > 8) {
+            return Err(format!("{path}: gpus must be between 0 and 8"));
+        }
+        // shim.go `Validate`: `upstream port is not set` (zero); a port fits
+        // in sixteen bits.
+        if !(1..=u64::from(u16::MAX)).contains(&config.shim.upstream_port) {
+            return Err(format!("{path}: shim.upstream-port must be a port number"));
+        }
 
-        let containers = config
-            .get("containers")
-            .and_then(Yaml::as_sequence)
-            .ok_or_else(|| format!("{path}: containers must be a list"))?;
-        // Exactly one container, the engine, pinned by full digest: MRCONFIGID
-        // covers this file's bytes, not what a tag resolves to.
-        let engine = match containers.as_slice() {
-            [engine]
-                if engine
-                    .get("image")
-                    .and_then(Yaml::as_str)
-                    .and_then(|image| image.strip_prefix(ENGINE_IMAGE_PREFIX))
-                    .is_some_and(|digest| is_lower_hex(digest, 32)) =>
+        let mut packs = Vec::new();
+        for (i, model) in config.models.into_iter().enumerate() {
+            // validation.go `validateShape`: `schema must be a positive
+            // integer`; our rule is stricter: stated, and a layout we know.
+            if !model
+                .schema
+                .and_then(|n| u64::try_from(n).ok())
+                .is_some_and(|n| PACK_SCHEMAS.contains(&n))
             {
-                engine
+                return Err(format!(
+                    "{path}: models[{i}].schema must be one of {PACK_SCHEMAS:?}, the pack \
+                     layouts whose root hash it pins"
+                ));
+            }
+            packs.push(Pack {
+                name: model.name,
+                repo: model.repo,
+                mpk: model.mpk,
+            });
+        }
+
+        // Exactly one container, the engine, pinned by full digest: MRCONFIGID
+        // covers this file's bytes, not what a tag resolves to (validation.go
+        // `validateContainerImage` requires a digest; we require ours).
+        let mut containers = config.containers;
+        let engine = match containers.as_mut_slice() {
+            [engine]
+                if engine.name == ENGINE_CONTAINER_NAME
+                    && engine
+                        .image
+                        .strip_prefix(ENGINE_IMAGE_PREFIX)
+                        .is_some_and(|digest| is_lower_hex(digest, 32)) =>
+            {
+                containers.pop().expect("one container")
             }
             _ => {
                 return Err(format!(
-                    "{path}: an engine deployment runs exactly one container, its image \
-                     {ENGINE_IMAGE_PREFIX}<64 lowercase hex>; every other container, and any \
-                     image named by a tag or a short digest, escapes the measurement"
+                    "{path}: an engine deployment runs exactly one container, named \
+                     {ENGINE_CONTAINER_NAME:?}, its image {ENGINE_IMAGE_PREFIX}<64 lowercase \
+                     hex>; every other container, and any image named by a tag or a short \
+                     digest, escapes the measurement"
                 ));
             }
         };
-        allow_keys(
-            engine,
-            allowed_keys::CONTAINER,
-            path,
-            "the engine container",
-        )?;
 
-        let granted = match engine.get("models") {
-            None => Vec::new(),
-            Some(models) => string_list(models, path, "the engine container's models")?,
-        };
-        let runtime = match engine.get("runtime") {
-            None => None,
-            Some(runtime) => Some(
-                runtime
-                    .as_str()
-                    .ok_or_else(|| {
-                        format!("{path}: the engine container's runtime must be a string")
-                    })?
-                    .to_owned(),
-            ),
-        };
-        let container_gpus = match engine.get("gpus") {
-            None => None,
-            Some(Yaml::String(s)) => Some(s.clone()),
-            Some(Yaml::Number(n)) => Some(n.to_string()),
-            Some(_) => {
-                return Err(format!(
-                    "{path}: the engine container's gpus must be a count or a selection"
-                ));
-            }
-        };
-        let secrets = match engine.get("secrets") {
-            None | Some(Yaml::Null) => Vec::new(),
-            Some(list) => string_list(list, path, "the engine container's secrets")?,
-        };
-
+        // validation.go `validateContainer`: each env entry one key, each
+        // name a valid environment name.
         let mut env = BTreeMap::new();
-        let entries = engine
-            .get("env")
-            .and_then(Yaml::as_sequence)
-            .ok_or_else(|| format!("{path}: the engine container's env must be a list"))?;
-        for entry in entries {
-            let (key, value) = entry
-                .as_mapping()
-                .filter(|m| m.len() == 1)
-                .and_then(|m| m.iter().next())
-                .and_then(|(k, v)| Some((k.as_str()?, v.as_str()?)))
-                .ok_or_else(|| {
-                    format!(
-                        "{path}: each env entry must be one NAME: \"value\" pair \
-                         with a quoted string value"
-                    )
-                })?;
-            if env.insert(key.to_owned(), value.to_owned()).is_some() {
+        for entry in engine.env {
+            if entry.len() != 1 {
+                return Err(format!(
+                    "{path}: each env entry must be one NAME: \"value\" pair with a quoted \
+                     string value"
+                ));
+            }
+            let (key, value) = entry.into_iter().next().expect("one key");
+            if !is_environment_name(&key) {
+                return Err(format!(
+                    "{path}: env has an invalid environment name {key:?}"
+                ));
+            }
+            if env.contains_key(&key) {
                 return Err(format!("{path}: env sets {key} twice"));
             }
+            env.insert(key, value.0);
         }
-
-        let shim_upstream_port = config
-            .get("shim")
-            .and_then(|shim| shim.get("upstream-port"))
-            .and_then(Yaml::as_u64)
-            .ok_or_else(|| format!("{path}: shim.upstream-port must be a port number"))?;
-        let whole = |key: &str| -> Result<u64, String> {
-            config
-                .get(key)
-                .and_then(Yaml::as_u64)
-                .ok_or_else(|| format!("{path}: {key} must be a whole number"))
-        };
-        let cpus = whole("cpus")?;
-        let memory = whole("memory")?;
-        let gpus = match config.get("gpus") {
-            None => None,
-            Some(_) => Some(whole("gpus")?),
-        };
+        let secrets = engine.secrets.unwrap_or_default();
+        // validation.go `validateContainer`: secrets are environment names.
+        if let Some(bad) = secrets.iter().find(|s| !is_environment_name(s)) {
+            return Err(format!(
+                "{path}: secrets has an invalid environment name {bad:?}"
+            ));
+        }
+        // validation.go `validateModelAccess`: a grant is listed once.
+        for (i, name) in engine.models.iter().enumerate() {
+            if engine.models[..i].contains(name) {
+                return Err(format!(
+                    "{path}: the engine container's models grant {name:?} twice"
+                ));
+            }
+        }
+        // validation.go `validateContainerPolicy`: runtime is empty or nvidia.
+        if engine.runtime.as_deref().is_some_and(|r| r != "nvidia") {
+            return Err(format!(
+                "{path}: the engine container's runtime must be nvidia"
+            ));
+        }
+        let container_gpus = engine.gpus.map(|g| match g {
+            GpuSelection::Count(n) => n.to_string(),
+            GpuSelection::Selection(s) => s,
+        });
 
         Ok(Self {
-            cvm_version: cvm_version.to_owned(),
+            cvm_version: config.cvm_version,
             secrets,
             env,
-            shim_upstream_port,
-            shim_paths,
-            gpus,
-            runtime,
+            shim_upstream_port: config.shim.upstream_port,
+            shim_paths: config.shim.paths,
+            gpus: config.gpus,
+            runtime: engine.runtime,
             container_gpus,
             packs,
-            granted,
-            cpus,
-            memory,
+            granted: engine.models,
+            cpus: config.cpus,
+            memory: config.memory,
         })
     }
+}
+
+/// Refuse YAML anchors (`&name`) and aliases (`*name`). Tinfoil's shim decoder
+/// refuses aliases (shim.go `validateYAMLTree`); an engine config has no use
+/// for either anywhere, and an alias would let one value stand for another
+/// field's. A plain scalar cannot begin with `&` or `*` (they are YAML
+/// indicators), so outside quoted scalars and comments, either character where
+/// a node can start is one.
+fn refuse_anchors_and_aliases(bytes: &[u8], path: &str) -> Result<(), String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| format!("{path}: not UTF-8"))?;
+    for (n, line) in text.lines().enumerate() {
+        let mut quote: Option<char> = None;
+        let mut node_start = true;
+        let mut previous = ' ';
+        for c in line.chars() {
+            match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    }
+                }
+                None => {
+                    if c == '#' && previous.is_whitespace() {
+                        break;
+                    }
+                    if node_start && (c == '&' || c == '*') {
+                        return Err(format!(
+                            "{path}: line {}: YAML anchors and aliases are refused",
+                            n + 1
+                        ));
+                    }
+                    if c == '"' || c == '\'' {
+                        if node_start {
+                            quote = Some(c);
+                        }
+                        node_start = false;
+                    } else if c.is_whitespace() {
+                        node_start = matches!(previous, ':' | '-' | ',' | '[' | '{') || node_start;
+                    } else {
+                        node_start = matches!(c, '[' | '{' | ',');
+                    }
+                }
+            }
+            previous = c;
+        }
+    }
+    Ok(())
 }
 
 /// A deployment's `deployment.json`: what a pin carries that the config does
@@ -405,34 +533,6 @@ impl Sidecar {
             expected_gpus,
             tdx_policy,
         })
-    }
-}
-
-/// A YAML list of strings.
-fn string_list(value: &Yaml, path: &str, what: &str) -> Result<Vec<String>, String> {
-    value
-        .as_sequence()
-        .and_then(|l| l.iter().map(|s| s.as_str().map(str::to_owned)).collect())
-        .ok_or_else(|| format!("{path}: {what} must be a list of strings"))
-}
-
-/// Refuse any key of the mapping `value` that `allowed` does not list.
-fn allow_keys(value: &Yaml, allowed: &[&str], path: &str, what: &str) -> Result<(), String> {
-    let mapping = value
-        .as_mapping()
-        .ok_or_else(|| format!("{path}: {what} must be a mapping"))?;
-    let mut keys = Vec::with_capacity(mapping.len());
-    for key in mapping.keys() {
-        keys.push(
-            key.as_str()
-                .ok_or_else(|| format!("{path}: {what} has a non-string key"))?,
-        );
-    }
-    match first_disallowed_key(allowed, keys) {
-        None => Ok(()),
-        Some(key) => Err(format!(
-            "{path}: {what} may not set {key:?}; an engine deployment uses only {allowed:?} there"
-        )),
     }
 }
 

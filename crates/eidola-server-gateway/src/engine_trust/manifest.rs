@@ -37,7 +37,7 @@
 
 use std::collections::BTreeMap;
 
-use eidola_common::engine_deployment::deployment;
+use eidola_common::engine_deployment::{deployment, is_safe_component};
 use sha2::{Digest, Sha256};
 
 /// The schema version this gateway reads.
@@ -445,17 +445,6 @@ fn exact_keys(
 
 fn is_lower_hex(s: &str, bytes: usize) -> bool {
     s.len() == bytes * 2 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// A path component: `[a-z0-9][a-z0-9._-]*`.
-fn is_safe_component(s: &str) -> bool {
-    let mut bytes = s.bytes();
-    bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        && bytes.all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
-        })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

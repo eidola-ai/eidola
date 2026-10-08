@@ -785,7 +785,7 @@ fn the_shim_reaches_the_node() {
 
     let mut tree = Tree::fixture();
     tree.edit_config("  upstream-port: 8080\n", "");
-    refused(&tree, "shim.upstream-port must be a port number");
+    refused(&tree, "missing field `upstream-port`");
 
     let mut tree = Tree::fixture();
     tree.edit_config("\"0.0.0.0:8080\"", "\"[::]:8080\"");
@@ -805,8 +805,10 @@ fn every_image_is_the_digest_pinned_engine() {
     let engine = text[start..end].to_string();
 
     for companion in [
-        "  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar:latest\"\n",
-        &format!("  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar{digest}\"\n"),
+        "  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar:latest\"\n    env: []\n",
+        &format!(
+            "  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar{digest}\"\n    env: []\n"
+        ),
     ] {
         let mut tree = Tree::fixture();
         tree.edit_config(&engine, &format!("{engine}{companion}"));
@@ -909,7 +911,7 @@ fn the_config_uses_only_the_keys_an_engine_needs() {
     ] {
         let mut tree = Tree::fixture();
         tree.edit_config(&image, &format!("{image}{extra}"));
-        refused(&tree, &format!("the engine container may not set {key:?}"));
+        refused(&tree, &format!("unknown field `{key}`"));
     }
 
     for (extra, key) in [
@@ -919,7 +921,7 @@ fn the_config_uses_only_the_keys_an_engine_needs() {
     ] {
         let mut tree = Tree::fixture();
         tree.edit_config("gpus: 8\n", &format!("gpus: 8\n{extra}"));
-        refused(&tree, &format!("the config may not set {key:?}"));
+        refused(&tree, &format!("unknown field `{key}`"));
     }
 
     let mut tree = Tree::fixture();
@@ -927,14 +929,14 @@ fn the_config_uses_only_the_keys_an_engine_needs() {
         "  upstream-port: 8080\n",
         "  upstream-port: 8080\n  dummy-attestation: true\n",
     );
-    refused(&tree, "shim may not set \"dummy-attestation\"");
+    refused(&tree, "unknown field `dummy-attestation`");
 
     let mut tree = Tree::fixture();
     tree.edit_config(
         "  - name: \"weights\"\n",
         "  - name: \"weights\"\n    exec: true\n",
     );
-    refused(&tree, "models[0] may not set \"exec\"");
+    refused(&tree, "unknown field `exec`");
 }
 
 /// The CUDA engine sees every attested GPU through the NVIDIA runtime; the
@@ -1122,9 +1124,127 @@ fn the_weights_pack_states_a_known_layout() {
     ] {
         let mut tree = Tree::fixture();
         tree.edit_config("    schema: 2\n", to);
-        refused(&tree, "models[0].schema must be one of [1, 2]");
+        refused(&tree, "models[0].schema");
     }
     let mut tree = Tree::fixture();
     tree.edit_config("    schema: 2\n", "    schema: 1\n");
     tree.check().expect("schema 1 is known");
+}
+
+/// A deployment directory is named by the path-component grammar the
+/// measurer walks with: uppercase or a space is refused.
+#[test]
+fn a_deployment_path_uses_safe_components() {
+    for variant in ["TDX-A", "tdx a"] {
+        let mut tree = Tree::fixture();
+        tree.deployment()["config"] =
+            format!("deploy/engine/fixture-model/{variant}/tinfoil-config.yml").into();
+        refused(&tree, "config must be deploy/engine/fixture-model/");
+    }
+}
+
+/// The engine config is parsed into a typed, unknown-field-refusing mirror of
+/// Tinfoil's schema and validated with a port of its validator: one violating
+/// value per ported rule, each refused.
+#[test]
+fn the_config_holds_to_tinfoils_decoder_and_validator() {
+    let text = Tree::fixture().config_text();
+
+    // decode.go `MaxConfigBytes`: a config over 1 MiB, here by a comment.
+    let mut tree = Tree::fixture();
+    tree.set_config(format!("{text}#{}\n", "x".repeat(1 << 20)));
+    refused(&tree, "exceeds Tinfoil's 1048576-byte config limit");
+
+    // decode.go: one document (a trailing one is refused).
+    let mut tree = Tree::fixture();
+    tree.set_config(format!("{text}---\n{text}"));
+    refused(&tree, "more than one document");
+
+    let cases: &[(&str, &str, &str)] = &[
+        // The container's name: required, a string, and the engine's.
+        (
+            "  - name: \"eidola-server-engine\"\n",
+            "  - image_first: 1\n",
+            "unknown field",
+        ),
+        (
+            "  - name: \"eidola-server-engine\"\n",
+            "  - name: []\n",
+            "containers[0].name",
+        ),
+        (
+            "  - name: \"eidola-server-engine\"\n",
+            "  - name: \"\"\n",
+            "named \"eidola-server-engine\"",
+        ),
+        (
+            "  - name: \"eidola-server-engine\"\n",
+            "  - name: \"other\"\n",
+            "named \"eidola-server-engine\"",
+        ),
+        // validation.go `Validate`: gpus 0 to 8.
+        ("gpus: 8\n", "gpus: 9\n", "gpus must be between 0 and 8"),
+        // shim.go `Validate`: an upstream port is set; it is a port.
+        (
+            "upstream-port: 8080",
+            "upstream-port: 0",
+            "shim.upstream-port must be a port number",
+        ),
+        (
+            "upstream-port: 8080",
+            "upstream-port: 70000",
+            "shim.upstream-port must be a port number",
+        ),
+        // validation.go `validEnvironmentName`, on env and on secrets.
+        (
+            "      - EIDOLA_ENGINE_MODEL_ID",
+            "      - 1BAD: \"x\"\n      - EIDOLA_ENGINE_MODEL_ID",
+            "invalid environment name \"1BAD\"",
+        ),
+        (
+            "      - GATEWAY_TOKEN\n",
+            "      - GATEWAY_TOKEN\n      - bad-name\n",
+            "invalid environment name \"bad-name\"",
+        ),
+        // validation.go `validateModelAccess`: a grant listed once.
+        (
+            "models: [\"weights\"]",
+            "models: [\"weights\", \"weights\"]",
+            "grant \"weights\" twice",
+        ),
+        // validation.go `validateContainerPolicy`: runtime empty or nvidia.
+        (
+            "    runtime: nvidia\n",
+            "    runtime: runc\n",
+            "runtime must be nvidia",
+        ),
+        // validation.go `validateShape`: a pack schema is not negative.
+        ("    schema: 2\n", "    schema: -1\n", "models[0].schema"),
+        // types.go: `int` fields are integers, not quoted numbers.
+        ("cpus: 16", "cpus: \"16\"", "cpus"),
+        // An env entry that inherits from the host instead of stating a value.
+        (
+            "      - EIDOLA_ENGINE_MODEL_ID",
+            "      - INHERITED\n      - EIDOLA_ENGINE_MODEL_ID",
+            "env",
+        ),
+        // The YAML decoder: one value per key.
+        ("cpus: 16\n", "cpus: 16\ncpus: 32\n", "duplicate"),
+        // shim.go `validateYAMLTree`: no aliases (here, anywhere).
+        (
+            "cpus: 16\n",
+            "cpus: &n 16\n",
+            "anchors and aliases are refused",
+        ),
+        (
+            "memory: 65536\n",
+            "memory: *n\n",
+            "anchors and aliases are refused",
+        ),
+    ];
+    for (from, to, needle) in cases {
+        let mut tree = Tree::fixture();
+        tree.edit_config(from, to);
+        refused(&tree, needle);
+    }
 }

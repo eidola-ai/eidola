@@ -351,53 +351,18 @@ pub fn parse_measured(
     })
 }
 
-/// The keys an engine deployment's `tinfoil-config.yml` may use, section by
-/// section. Anything else is refused, because Tinfoil's schema
-/// (`tinfoil-config/types.go`) can change what runs or what it can reach in
-/// ways the engine's own measurement does not show: a container `entrypoint`
-/// or `command` runs another executable from the pinned image, `volumes`,
-/// `devices`, `cap_add` or `privileged` widen what it can touch, `networks`
-/// and `cvm-network` open egress or inbound ports, and the shim's
-/// `dummy-attestation` replaces the hardware evidence. Each allowed key is one
-/// the deployment needs:
-pub mod allowed_keys {
-    /// Top level: the platform release (`cvm-version`), the VM's resources
-    /// (`cpus`, `memory`, `gpus`, all measured), the read-only model packs
-    /// that carry the weights to verified storage (`models`), the one
-    /// container, and the attestation shim in front of it.
-    pub const CONFIG: &[&str] = &[
-        "cvm-version",
-        "cpus",
-        "memory",
-        "gpus",
-        "models",
-        "containers",
-        "shim",
-    ];
-    /// The shim: where it forwards (`upstream-port`, which must be the node's
-    /// port) and which paths it serves (`paths`).
-    pub const SHIM: &[&str] = &["upstream-port", "paths"];
-    /// The container: its identity (`name`), the digest-pinned image, its
-    /// measured environment (`env`) and secret (`secrets`, the gateway
-    /// token), its grant to the weights' model pack (`models`), and GPU access
-    /// for the `cuda` executor (`runtime: nvidia` with `gpus: all`).
-    pub const CONTAINER: &[&str] = &[
-        "name", "image", "env", "secrets", "models", "runtime", "gpus",
-    ];
-    /// A model pack: its name, source (`repo`), the pack pinned by its root
-    /// hash (`mpk`), and its layout version. Not `exec` (weights are never
-    /// programs), not the encrypted forms (`emwp`, `key-secret`), which public
-    /// weights do not need, and not `mwp`, a delivery the pinned `mpk` makes
-    /// unnecessary.
-    pub const MODEL: &[&str] = &["name", "repo", "mpk", "schema"];
-}
-
-/// The first of `keys` that `allowed` does not list.
-pub fn first_disallowed_key<'a>(
-    allowed: &[&str],
-    keys: impl IntoIterator<Item = &'a str>,
-) -> Option<&'a str> {
-    keys.into_iter().find(|key| !allowed.contains(key))
+/// A deployment path component (a model id, a variant):
+/// `[a-z0-9][a-z0-9._-]*`. `deploy/engine/<model>/<variant>/` directories
+/// are named this way; the gateway's build refuses a pin naming any other,
+/// and `measure-enclave` refuses to measure one.
+pub fn is_safe_component(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 /// Whether the engine container's GPU access matches its executor: the
@@ -820,23 +785,22 @@ mod tests {
     }
 
     #[test]
-    fn only_allowed_keys_pass() {
-        assert_eq!(
-            first_disallowed_key(allowed_keys::CONTAINER, ["name", "image"]),
-            None
-        );
-        assert_eq!(
-            first_disallowed_key(allowed_keys::CONTAINER, ["name", "entrypoint", "command"]),
-            Some("entrypoint")
-        );
-        assert_eq!(
-            first_disallowed_key(allowed_keys::SHIM, ["upstream-port", "dummy-attestation"]),
-            Some("dummy-attestation")
-        );
-        assert_eq!(
-            first_disallowed_key(allowed_keys::MODEL, ["name", "exec"]),
-            Some("exec")
-        );
+    fn path_components_are_safe() {
+        for good in ["mimo-v2", "tdx-8x.h200", "0a_b"] {
+            assert!(is_safe_component(good), "{good}");
+        }
+        for bad in [
+            "",
+            "Upper",
+            "has space",
+            ".hidden",
+            "-dash",
+            "a/b",
+            "..",
+            "é",
+        ] {
+            assert!(!is_safe_component(bad), "{bad:?}");
+        }
     }
 
     #[test]

@@ -321,8 +321,9 @@ containers:
         assert!(entry("fixture-model", &two, SIDECAR).contains("not an NVIDIA-CC shape"));
 
         // A companion container, or an engine named by a tag.
-        let companion =
-            format!("{good}  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar:latest\"\n");
+        let companion = format!(
+            "{good}  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar:latest\"\n    env: []\n"
+        );
         assert!(entry("fixture-model", &companion, SIDECAR).contains("exactly one container"));
         // A key an engine deployment does not need.
         let entrypoint = good.replace(
@@ -330,7 +331,7 @@ containers:
             "    runtime: nvidia\n    entrypoint: [\"/bin/sh\"]\n",
         );
         assert!(
-            entry("fixture-model", &entrypoint, SIDECAR).contains("may not set \"entrypoint\"")
+            entry("fixture-model", &entrypoint, SIDECAR).contains("unknown field `entrypoint`")
         );
         let no_runtime = good.replace("    runtime: nvidia\n", "");
         assert!(entry("fixture-model", &no_runtime, SIDECAR).contains("runtime: nvidia"));
