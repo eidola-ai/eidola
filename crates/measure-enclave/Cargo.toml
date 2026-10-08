@@ -11,12 +11,19 @@ license = "MIT OR Apache-2.0"
 name = "measure-enclave"
 path = "src/main.rs"
 
+[[bin]]
+name = "measure-tdx-igvm"
+path = "src/bin/measure-tdx-igvm.rs"
+
 [dependencies]
 # SEV-SNP measurement
 sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
 
 # TDX measurement
 tdx-measure = { git = "https://github.com/virtee/tdx-measure", tag = "v0.1.1" }
+# IGVM image parsing, for MRTD of IGVM-model releases
+igvm = "0.5"
+igvm_defs = "0.5"
 
 # Config parsing
 serde = { version = "1", features = ["derive"] }

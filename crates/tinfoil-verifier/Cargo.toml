@@ -11,6 +11,16 @@ license = "MIT OR Apache-2.0"
 # SEV-SNP attestation report parsing and certificate chain verification
 sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
 
+# Intel TDX quote verification (pure Rust, RustCrypto backend): PCK chain to
+# the pinned Intel SGX root with CRL checks, TCB Info / QE Identity
+# signatures, QE report and quote signatures, platform/QE/TDX-module TCB
+# matching. Only offline verification is used — collateral comes from the
+# attestation document. `std` is deliberately off: it turns on
+# `serde_json/preserve_order`, which would change `serde_json::Value` key
+# order for every crate linked into the same binary. Without `report` there
+# is no PCS fetcher and no `ring`.
+dcap-qvl = { version = "=0.6.6", default-features = false, features = ["rustcrypto", "default-x509"] }
+
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
 x509-cert = "0.2"
 der = { version = "0.7", features = ["alloc"] }
@@ -59,7 +69,8 @@ pem = "4"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` keeps Intel-signed JSON members as the exact bytes served.
+serde_json = { version = "1", features = ["raw_value"] }
 
 # Error handling
 thiserror = "2"

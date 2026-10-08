@@ -2666,8 +2666,15 @@ impl Inner {
             "hardware_intermediate_ca",
         )?;
 
+        // Release records pin their SEV-SNP launch digest only: the client
+        // path accepts no TDX evidence.
+        let allowed: Vec<tinfoil_verifier::AllowedMeasurement> = eidola
+            .measurements
+            .iter()
+            .map(tinfoil_verifier::AllowedMeasurement::from)
+            .collect();
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &eidola.measurements,
+            allowed_measurements: &allowed,
             inference_base_url: &eidola.base_url,
             trusted_ark_der: hardware_root_der.as_deref(),
             trusted_ask_der: hardware_intermediate_der.as_deref(),

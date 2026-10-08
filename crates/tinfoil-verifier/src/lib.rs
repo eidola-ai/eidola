@@ -1,8 +1,13 @@
 //! Tinfoil attestation verification with per-handshake attesting.
 //!
-//! Verifies that every new TLS connection to a Tinfoil inference enclave
-//! terminates inside genuine AMD SEV-SNP hardware running an allowed code
-//! measurement. Intel TDX presentations currently fail closed.
+//! Verifies that every new TLS connection to a Tinfoil enclave terminates
+//! inside genuine confidential-computing hardware running a pinned code
+//! measurement. The caller's pins are platform-tagged
+//! ([`AllowedMeasurement`]): AMD SEV-SNP evidence is checked only against
+//! SEV-SNP entries and Intel TDX evidence only against TDX entries, and
+//! evidence from a platform with no entry is refused before it is
+//! authenticated. A pin set built from release records
+//! ([`EnclaveMeasurement`]) is SEV-SNP-only.
 //!
 //! All verification happens in the data-plane connector layer (see
 //! [`attesting_client`]). On every new TCP+TLS handshake the connector
@@ -35,7 +40,10 @@
 //! committing exporter key material into `REPORT_DATA`.
 //!
 //! SEV-SNP verification is delegated to the [`sev`](https://crates.io/crates/sev)
-//! crate. TDX presentations currently fail closed before quote verification.
+//! crate and TDX quote verification to [`dcap-qvl`](https://crates.io/crates/dcap-qvl);
+//! TDX collateral is the document's captured Intel PCS responses, verified
+//! offline against the pinned Intel SGX root. TDX pins follow the IGVM launch
+//! model ([`TdxPin`]).
 //!
 //! # Prerequisites
 //!
@@ -62,14 +70,19 @@
 
 mod attesting_client;
 pub mod bundle;
+mod device;
 mod error;
 pub mod measurement;
 pub mod sevsnp;
 mod sevsnp_crl;
+pub mod tdx;
 
 pub use bundle::Platform;
 pub use error::Error;
-pub use measurement::{EnclaveMeasurement, MatchedMeasurement, TdxMeasurement};
+pub use measurement::{
+    AllowedMeasurement, EnclaveMeasurement, MatchedMeasurement, PckFlag, PlatformMeasurement,
+    TdxLaunchMeasurement, TdxMeasurement, TdxPin, TdxPolicy,
+};
 pub use sevsnp::{SevSnpObserver, SevSnpTcbObservation, SevSnpTcbPolicy, SevSnpTcbSvns};
 
 /// Details of a verified TEE attestation, emitted after each successful
@@ -86,7 +99,7 @@ pub struct VerifiedAttestation {
     pub attestation_doc: Vec<u8>,
     /// Platform-specific code measurement digest (hex-encoded).
     /// For SEV-SNP: the 48-byte launch digest.
-    /// For TDX: `{rtmr1}:{rtmr2}` (two 48-byte digests, colon-separated).
+    /// For TDX: `{mrtd}:{mrconfigid}` (two 48-byte values, colon-separated).
     pub pcr_digest: String,
     /// SHA-256 of the peer TLS certificate's SPKI (hex-encoded).
     pub peer_spki_hash: String,
@@ -99,10 +112,11 @@ pub type AttestationObserver = std::sync::Arc<dyn Fn(VerifiedAttestation) + Send
 
 /// Configuration for [`attesting_client`].
 pub struct AttestingClientConfig<'a> {
-    /// Allowed enclave releases. Each entry pairs a SEV-SNP measurement with a
-    /// TDX measurement; the verifier picks the matching field based on the
-    /// platform observed in the attestation document.
-    pub allowed_measurements: &'a [EnclaveMeasurement],
+    /// Allowed measurements, each tagged with its platform. Evidence is
+    /// checked only against entries of its own platform; a platform with no
+    /// entry is refused. Convert release records with
+    /// `AllowedMeasurement::from(&record)`, which pins SEV-SNP only.
+    pub allowed_measurements: &'a [AllowedMeasurement],
     /// Base URL of the inference endpoint (e.g. `https://inference.tinfoil.sh/v1`).
     /// The `/.well-known/tinfoil-attestation` endpoint is derived from the origin.
     pub inference_base_url: &'a str,
@@ -161,13 +175,18 @@ pub struct AttestingClientConfig<'a> {
 ///    endorsed-section hashes and domain-separated `REPORT_DATA`.
 /// 4. Verifies the echoed nonce and that the endorsed TLS SPKI fingerprint
 ///    matches `sha256(SPKI(peer_cert))`.
-/// 5. Enforces SEV-SNP report field hygiene (exact length, version ≥ 3,
+/// 5. Refuses evidence from a platform with no pinned entry.
+/// 6. SEV-SNP: enforces report field hygiene (exact length, version ≥ 3,
 ///    DEBUG/MIGRATE_MA policy bits off, VCEK-signed, no ID-block), then
 ///    verifies the document-carried AMD VCEK chain and report, plus the
 ///    complete carried CRL's ARK signature, identity, half-open validity
-///    interval, and ASK/VCEK revocation state; then enforces TCB floor,
-///    measurement, and exact `REPORT_DATA` binding.
-/// 6. Yields the connection to hyper for the real request.
+///    interval, and ASK/VCEK revocation state; then enforces TCB floor and
+///    measurement. TDX: verifies the quote to the pinned Intel root with the
+///    document's captured Intel PCS collateral, then the pinned MRTD,
+///    MRCONFIGID, zero RTMRs, and machine policy.
+/// 7. Requires the signed `REPORT_DATA` to equal the envelope's
+///    recomputation, and the matched entry's device-evidence requirement.
+/// 8. Yields the connection to hyper for the real request.
 ///
 /// Callers that want fail-fast-at-startup semantics should make one trivial
 /// request (e.g. `client.get(format!("{base}/v1/models")).send().await`)
@@ -176,35 +195,18 @@ pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwe
     let tls_roots = std::sync::Arc::new(config.tls_roots);
 
     let snp_policy = config.snp_min_tcb.unwrap_or_default();
+    let allowed_measurements = measurement::compile_pins(config.allowed_measurements)?;
 
     attesting_client::build_attesting_client(attesting_client::BuildParams {
         inference_base_url: config.inference_base_url.to_string(),
         trusted_ark_der: config.trusted_ark_der.map(|d| d.to_vec()),
         trusted_ask_der: config.trusted_ask_der.map(|d| d.to_vec()),
-        allowed_measurements: config.allowed_measurements.to_vec(),
+        allowed_measurements,
         snp_policy,
         snp_observer: config.snp_observer,
         attestation_observer: config.attestation_observer,
         tls_roots,
     })
-}
-
-/// Check a SEV-SNP measurement against the allowed list (case-insensitive).
-/// Returns the matched [`MatchedMeasurement::SevSnp`] on success.
-pub(crate) fn check_snp_measurement(
-    allowed: &[EnclaveMeasurement],
-    measurement_hex: &str,
-) -> Result<MatchedMeasurement, Error> {
-    let hit = allowed
-        .iter()
-        .find(|m| m.snp_measurement.eq_ignore_ascii_case(measurement_hex));
-    match hit {
-        Some(m) => Ok(MatchedMeasurement::SevSnp(m.snp_measurement.clone())),
-        None => Err(Error::MeasurementMismatch {
-            observed: MatchedMeasurement::SevSnp(measurement_hex.to_string()),
-            allowed_count: allowed.len(),
-        }),
-    }
 }
 
 /// Extract the bare host (no scheme, no port, no path) from an inference base URL.
