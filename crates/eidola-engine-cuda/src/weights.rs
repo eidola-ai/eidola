@@ -25,6 +25,7 @@ use eidola_engine_model::ModelConfig;
 use eidola_engine_model::config::{AttentionSpec, FfnKind};
 use eidola_engine_model::safetensors::{Dtype, WeightSet};
 
+use crate::model::Kernels;
 use crate::support::check_supported;
 use crate::{CudaError, Gpu, Result};
 
@@ -344,8 +345,17 @@ impl Loader<'_> {
 impl ModelWeights {
     /// Load `config`'s layers (a whole or truncated checkpoint) from `store`.
     /// Refuses (with [`CudaError::Unsupported`]) any configuration outside
-    /// [`check_supported`] before reading a tensor.
-    pub fn load(gpu: &Gpu, store: Arc<WeightSet>, config: ModelConfig) -> Result<ModelWeights> {
+    /// [`check_supported`] before reading a tensor. Taking the loaded kernels
+    /// makes the order structural: no weight reaches the device until every
+    /// kernel image has been read, verified against the manifest and loaded
+    /// (a wrong device, image or kernel directory fails in seconds, not after
+    /// the checkpoint has filled the GPU).
+    pub fn load(
+        gpu: &Gpu,
+        _loaded: &Kernels,
+        store: Arc<WeightSet>,
+        config: ModelConfig,
+    ) -> Result<ModelWeights> {
         check_supported(&config)?;
         let chunks = match store.metadata("tp_size") {
             Some(s) => s

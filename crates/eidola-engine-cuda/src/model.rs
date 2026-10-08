@@ -15,8 +15,6 @@
 //!
 //! The residual stream `h` stays f32 throughout.
 
-use std::sync::Arc;
-
 use crate::module::KernelDir;
 use cudarc::driver::CudaSlice;
 use eidola_engine_model::ModelConfig;
@@ -129,6 +127,9 @@ struct Scratch {
     pub logits: CudaSlice<f32>,
 }
 
+/// Floats per position in a RoPE table (32 cos, 32 sin).
+const ROPE_TABLE_WIDTH: usize = 64;
+
 /// Masked layout (decode-sized batches): rows per expert.
 const MASKED_CAP: usize = 128;
 
@@ -171,7 +172,19 @@ impl GpuModel {
         let c = &weights.config;
         let s = gpu.stream();
         let (h, v) = (c.hidden_size, c.vocab_size);
-        let tp = round_up(max_tokens.max(1), 4);
+        // Every buffer size is computed with checked arithmetic, and the whole
+        // set before anything is allocated.
+        let overflow = || CudaError::new("scratch sizes overflow for this step capacity");
+        let prod = |xs: &[usize]| -> Result<usize> {
+            xs.iter()
+                .try_fold(1usize, |acc, &x| acc.checked_mul(x))
+                .map(|n| n.max(1))
+                .ok_or_else(overflow)
+        };
+        let up = |x: usize, m: usize| -> Result<usize> {
+            x.max(1).div_ceil(m).checked_mul(m).ok_or_else(overflow)
+        };
+        let tp = up(max_tokens, 4)?;
         let groups = layer_kv.iter().map(|l| l.group + 1).max().unwrap_or(0);
         let qkv_cols = weights
             .layers
@@ -186,48 +199,92 @@ impl GpuModel {
             .max()
             .unwrap_or(0);
         let dense_i = c.dense_intermediate_size;
-        let kmax = h.max(dense_i).max(nq * 128);
+        let kmax = h.max(dense_i).max(prod(&[nq, 128])?);
         let (top_k, experts, inter) = c
             .moe
             .as_ref()
             .map_or((0, 0, 0), |m| (m.top_k, m.num_experts, m.intermediate_size));
         let erows = if experts > 0 {
-            contiguous_rows(max_tokens, top_k, experts).max(experts * MASKED_CAP)
+            let n = prod(&[max_tokens, top_k])?;
+            let padded = prod(&[n.min(experts), BLOCK_M as usize - 1])?
+                .checked_add(n)
+                .ok_or_else(overflow)?;
+            up(padded, BLOCK_M as usize)?.max(prod(&[experts, MASKED_CAP])?)
         } else {
             1
         };
-        let erows4 = round_up(erows, 4);
-        let a = |n: usize| n.max(1);
+        let erows4 = up(erows, 4)?;
+        let rows = max_logit_rows.max(1);
+        let sz = [
+            max_tokens.max(1),
+            prod(&[groups, max_tokens])?,
+            prod(&[tp, h])?,
+            prod(&[tp, kmax])?,
+            prod(&[kmax / 128, tp])?,
+            prod(&[tp, qkv_cols])?,
+            prod(&[max_tokens, nq, 192])?,
+            prod(&[max_tokens, nq, 128])?,
+            prod(&[tp, 2, dense_i])?,
+            prod(&[max_tokens, top_k])?,
+            prod(&[erows, h])?,
+            prod(&[h / 512, erows4])?,
+            prod(&[erows, 2, inter])?,
+            prod(&[erows, inter])?,
+            prod(&[inter / 512, erows4])?,
+            prod(&[rows, h])?,
+            prod(&[rows, v])?,
+            prod(&[max_len, ROPE_TABLE_WIDTH])?,
+        ];
+        let [
+            toks,
+            per_group,
+            tph,
+            tpk,
+            xsf,
+            qkv,
+            q,
+            attn,
+            gu,
+            topk,
+            eah,
+            esf,
+            egu,
+            eact,
+            eact_sf,
+            sel,
+            logits,
+            _rope_len,
+        ] = sz;
         let scratch = Scratch {
             max_tokens,
-            tokens: s.alloc_zeros(a(max_tokens))?,
-            positions: s.alloc_zeros(a(max_tokens))?,
-            kv_block: s.alloc_zeros(a(groups * max_tokens))?,
-            kv_slot: s.alloc_zeros(a(groups * max_tokens))?,
-            h: s.alloc_zeros(tp * h)?,
-            x: s.alloc_zeros(tp * h)?,
-            proj: s.alloc_zeros(tp * h)?,
-            xq: s.alloc_zeros(tp * kmax)?,
-            xsf: s.alloc_zeros(kmax / 128 * tp)?,
-            qkv: s.alloc_zeros(tp * qkv_cols)?,
-            q: s.alloc_zeros(a(max_tokens * nq * 192))?,
-            attn: s.alloc_zeros(a(max_tokens * nq * 128))?,
-            gu: s.alloc_zeros(tp * 2 * dense_i)?,
-            ffn_out: s.alloc_zeros(tp * h)?,
-            topk_ids: s.alloc_zeros(a(max_tokens * top_k))?,
-            topk_w: s.alloc_zeros(a(max_tokens * top_k))?,
-            row_of: s.alloc_zeros(a(max_tokens * top_k))?,
+            tokens: s.alloc_zeros(toks)?,
+            positions: s.alloc_zeros(toks)?,
+            kv_block: s.alloc_zeros(per_group)?,
+            kv_slot: s.alloc_zeros(per_group)?,
+            h: s.alloc_zeros(tph)?,
+            x: s.alloc_zeros(tph)?,
+            proj: s.alloc_zeros(tph)?,
+            xq: s.alloc_zeros(tpk)?,
+            xsf: s.alloc_zeros(xsf)?,
+            qkv: s.alloc_zeros(qkv)?,
+            q: s.alloc_zeros(q)?,
+            attn: s.alloc_zeros(attn)?,
+            gu: s.alloc_zeros(gu)?,
+            ffn_out: s.alloc_zeros(tph)?,
+            topk_ids: s.alloc_zeros(topk)?,
+            topk_w: s.alloc_zeros(topk)?,
+            row_of: s.alloc_zeros(topk)?,
             grouped: s.alloc_zeros(erows.max(experts))?,
             row_src: s.alloc_zeros(erows)?,
-            ea: s.alloc_zeros(erows * h)?,
-            esf: s.alloc_zeros(a(h / 512 * erows4))?,
-            egu: s.alloc_zeros(erows * 2 * inter.max(1))?,
-            eact: s.alloc_zeros(erows * inter.max(1))?,
-            eact_sf: s.alloc_zeros(a(inter / 512 * erows4))?,
-            edown: s.alloc_zeros(erows * h)?,
-            logit_rows: s.alloc_zeros(a(max_logit_rows))?,
-            sel: s.alloc_zeros(a(max_logit_rows) * h)?,
-            logits: s.alloc_zeros(a(max_logit_rows) * v)?,
+            ea: s.alloc_zeros(eah)?,
+            esf: s.alloc_zeros(esf)?,
+            egu: s.alloc_zeros(egu)?,
+            eact: s.alloc_zeros(eact)?,
+            eact_sf: s.alloc_zeros(eact_sf)?,
+            edown: s.alloc_zeros(eah)?,
+            logit_rows: s.alloc_zeros(rows)?,
+            sel: s.alloc_zeros(sel)?,
+            logits: s.alloc_zeros(logits)?,
         };
         let mut rope = Vec::new();
         for l in &c.layers {
@@ -699,12 +756,8 @@ pub fn group_geometry(
         .collect()
 }
 
-/// Load the model (whole or with `keep_layers` of the checkpoint) onto `gpu`.
-pub fn load_weights(
-    gpu: &Gpu,
-    store: Arc<WeightSet>,
-    keep_layers: Option<&[usize]>,
-) -> Result<ModelWeights> {
+/// The checkpoint's configuration, whole or with `keep_layers` of its layers.
+pub fn read_config(store: &WeightSet, keep_layers: Option<&[usize]>) -> Result<ModelConfig> {
     let mut config = store
         .model_config()
         .map_err(|e| CudaError::new(e.to_string()))?;
@@ -713,5 +766,5 @@ pub fn load_weights(
             .truncated(keep)
             .map_err(|e| CudaError::new(e.to_string()))?;
     }
-    ModelWeights::load(gpu, store, config)
+    Ok(config)
 }

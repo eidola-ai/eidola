@@ -273,9 +273,11 @@ impl EngineOps {
         require(
             hidden > 0
                 && (1..=crate::support::EXPERTS as u32).contains(&experts)
-                && (1..=crate::support::MAX_TOP_K as u32).contains(&top_k)
+                && (2..=crate::support::MAX_TOP_K as u32).contains(&top_k)
                 && top_k <= experts,
-            "router: at most 256 experts and 8 per token",
+            // The kernel always renormalizes the selection; the reference does
+            // not for a single expert, so one expert per token is not served.
+            "router: at most 256 experts and 2..=8 per token",
         )?;
         if tokens == 0 {
             return Ok(());

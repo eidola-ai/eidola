@@ -216,7 +216,7 @@ impl Attention {
         let s = gpu.stream();
         let packed = requests
             .iter()
-            .map(|r| r.qo_len * group_size)
+            .map(|r| r.qo_len as u64 * group_size as u64)
             .max()
             .unwrap_or(1);
         let tile = if packed <= 16 {
@@ -230,7 +230,10 @@ impl Attention {
             (vec![0i32], vec![], vec![0i32], vec![]);
         let (mut req, mut qtile, mut kvtile) = (vec![], vec![], vec![]);
         for (i, r) in requests.iter().enumerate() {
-            if r.kv_len == 0 || r.pages.is_empty() || r.kv_len > r.pages.len() as u32 * page_size {
+            if r.kv_len == 0
+                || r.pages.is_empty()
+                || r.kv_len as u64 > r.pages.len() as u64 * page_size as u64
+            {
                 return Err(CudaError::new(format!("attention request {r:?}")));
             }
             if q_indptr.last().copied() != Some(r.q_start as i32) {
@@ -242,7 +245,7 @@ impl Attention {
             indices.extend(r.pages.iter().map(|&p| p as i32));
             indptr.push(indices.len() as i32);
             last.push((r.kv_len - (r.pages.len() as u32 - 1) * page_size) as i32);
-            for t in 0..(r.qo_len * group_size).div_ceil(tile) {
+            for t in 0..(r.qo_len as u64 * group_size as u64).div_ceil(tile as u64) {
                 req.push(i as i32);
                 qtile.push(t as i32);
                 kvtile.push(0);

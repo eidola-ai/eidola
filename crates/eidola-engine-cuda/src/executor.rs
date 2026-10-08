@@ -24,8 +24,10 @@ use eidola_engine_model::safetensors::WeightSet;
 use crate::attention::{AttnPlan, AttnRequest};
 use crate::device::ImageArch;
 use crate::kv::KvStore;
-use crate::model::{ForwardInput, GpuModel, Kernels, group_geometry, group_layers, load_weights};
+use crate::model::{ForwardInput, GpuModel, Kernels, group_geometry, group_layers, read_config};
 use crate::sampler::{STATUS_NON_FINITE, SampleRow};
+use crate::support::{check_sampleable, check_supported};
+use crate::weights::ModelWeights;
 use crate::{CudaError, Gpu, Result};
 
 /// Executor configuration: memory geometry and step limits.
@@ -84,13 +86,13 @@ impl CudaExecutor {
         keep_layers: Option<&[usize]>,
         cfg: CudaExecutorConfig,
     ) -> Result<CudaExecutor> {
-        let weights = load_weights(&gpu, store, keep_layers)?;
-        crate::support::check_sampleable(
-            cfg.sampleable_vocab_size as usize,
-            weights.config.vocab_size,
-        )?;
-        let kernels = Kernels::load(&gpu, kernels_dir, cfg.image)?;
-        let config = weights.config.clone();
+        // Everything that can be refused is checked before any device memory
+        // is touched: the configuration, the sampleable vocabulary, the KV
+        // geometry; then the kernels are loaded and verified; only then do
+        // the weights move.
+        let config = read_config(&store, keep_layers)?;
+        check_supported(&config)?;
+        check_sampleable(cfg.sampleable_vocab_size as usize, config.vocab_size)?;
         let (keys, layer_kv) = group_layers(&config);
         if cfg.num_blocks.len() != keys.len() {
             return Err(CudaError::new(format!(
@@ -100,6 +102,9 @@ impl CudaExecutor {
             )));
         }
         let geometry = group_geometry(&keys, &layer_kv, cfg.block_size, &cfg.num_blocks);
+        for g in &geometry {
+            g.validate()?;
+        }
         let kv_groups = keys
             .iter()
             .enumerate()
@@ -136,6 +141,8 @@ impl CudaExecutor {
             buckets: cfg.buckets.clone(),
         };
         spec.validate().map_err(CudaError::new)?;
+        let kernels = Kernels::load(&gpu, kernels_dir, cfg.image)?;
+        let weights = ModelWeights::load(&gpu, &kernels, store, config)?;
         let last = *spec.buckets.last().expect("validated: a bucket");
         let max_tokens = last.max_tokens as usize;
         let max_rows = last.max_seqs as usize;
@@ -159,7 +166,12 @@ impl CudaExecutor {
         let v = cfg.sampleable_vocab_size as usize;
         Ok(CudaExecutor {
             sample_rows: s.alloc_zeros(max_rows.max(1))?,
-            probs: s.alloc_zeros(max_rows.max(1) * v)?,
+            probs: s.alloc_zeros(
+                max_rows
+                    .max(1)
+                    .checked_mul(v)
+                    .ok_or_else(|| CudaError::new("sampler scratch overflows"))?,
+            )?,
             tokens: s.alloc_zeros(max_rows.max(1))?,
             status: s.alloc_zeros(1)?,
             gpu,

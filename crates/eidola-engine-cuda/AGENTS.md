@@ -34,17 +34,32 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
 
 ## Supported configuration
 
-The kernels are built for one shape family, and the shapes are template arguments or compile-time constants in them. A different shape would read or write out of bounds rather than fail. `check_supported` runs before any tensor is read and refuses everything else with `CudaError::Unsupported`, naming the field. The requirements, with the kernel that bakes each one in:
+**The executor supports exactly the configuration space a real checkpoint exercises and the tests cover: no permitted-but-untested degrees of freedom.** That is MiMo-V2.6-Flash's configuration, field for field, for the whole model or any subset of its layers. `check_supported` runs before any device memory is touched and refuses everything else with `CudaError::Unsupported`, naming the field. Shapes are template arguments or compile-time constants in the kernels, so another shape would read or write out of bounds rather than fail. The scalars the kernels take at run time are held to the tested values too.
 
-- hidden size 4096 (DeepGEMM instances, UE8M0 words);
-- every layer: QK head dim 192, V head dim 128 (FA2, `eidola_qkv_rope_kv`), rotated dims 64 (`eidola_qkv_rope_kv`, the RoPE tables), and query heads in whole GQA groups;
-- dense intermediate size a multiple of 128 (FP8 GEMM tiles, f32-scale SwiGLU);
-- vocabulary a multiple of 8 (the BF16 `lm_head` GEMM);
-- 256 routed experts (DeepGEMM's group count, the router's and placement's shared arrays) of intermediate 2048 (DeepGEMM), `top_k` at most 8 (the router's selection array);
-- `norm_topk_prob = true`, because the router kernel always renormalizes;
-- a sampleable vocabulary of at most 2^20 (`sampling.cu`'s chunks).
+| Field | Required | Why |
+|---|---|---|
+| hidden size | 4096 | DeepGEMM instances, UE8M0 words |
+| vocabulary | 152,576 | the BF16 `lm_head` GEMM |
+| dense intermediate | 16,384 | the FP8 GEMMs, f32-scale SwiGLU |
+| every layer: QK / V head dims, rotated dims | 192 / 128 / 64 | FA2 instances, `eidola_qkv_rope_kv`, RoPE tables |
+| every layer: query heads | 64 | one attention plan per KV group serves all its layers |
+| global layers: KV heads, RoPE θ, sinks | 4, 1e7, none | as Flash |
+| sliding layers: KV heads, window, RoPE θ, sinks | 8, 128, 1e4, present | as Flash |
+| experts, expert intermediate | 256, 2048 | DeepGEMM's group count and instances; router and placement arrays |
+| experts per token | exactly 8 | the router kernel always renormalizes, which the reference skips for one expert |
+| `norm_topk_prob`, routing scale | true, 1.0 | the router kernel |
+| epsilon, value scale | 1e-6, 0.707 | the tested values |
+| sampleable vocabulary | at most 2^20, and no more than the head | `sampling.cu`'s chunks |
 
-Each field, changed alone, is refused (`support::tests`). Every f32 vector loaded (norms, sinks, router bias) must have exactly the model's width; the BF16 and FP8 tensors' shapes are checked likewise.
+Each field, changed alone, is refused (`support::tests`). Pro differs in its hidden size (6144), query heads (128), global KV heads (8), experts (384), value scale and epsilon; serving it is the multi-GPU executor's scope, not a widening of this one. Every f32 vector loaded (norms, sinks, router bias) must have exactly the model's width; the BF16 and FP8 tensors' shapes are checked likewise.
+
+**Construction order is structural.** `CudaExecutor::new` checks, in order:
+
+1. the configuration and the sampleable vocabulary;
+2. the KV geometry (`GroupGeometry::validate`: every product in checked `usize`, a block within the 32-bit page stride, block ids within the `i32` tables);
+3. it loads and verifies every kernel image.
+
+Only then does it move weights. `ModelWeights::load` takes the loaded `Kernels`, so no weight can reach the device first, and a wrong device, image or kernel directory fails in about a second instead of after the checkpoint has filled the GPU (`tests/construction.rs`). Scratch sizes are computed with checked arithmetic, all of them before any allocation.
 
 ## The executor
 
