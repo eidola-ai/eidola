@@ -83,7 +83,7 @@ sha2 = "0.11"
 eidola-app-core = { path = ".", features = ["test-support"] }
 # Strict chat-request acceptance bridge for the real HTTP harness captures.
 # Test-only: app-core's production dependency graph must not include server.
-eidola-server = { path = "../eidola-server", features = ["test-support"] }
+eidola-server-gateway = { path = "../eidola-server-gateway", features = ["test-support"] }
 libc = "0.2"
 tempfile = "3"
 # Building the containers the install fixtures download. Same crate and

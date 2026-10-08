@@ -1,4 +1,4 @@
-# eidola-server — Agent Development Guide
+# eidola-server-gateway — Agent Development Guide
 
 An OpenAI-compatible proxy that translates requests to upstream AI providers, with a billing system using anonymous credentials for privacy-preserving usage tracking.
 
@@ -6,6 +6,8 @@ An OpenAI-compatible proxy that translates requests to upstream AI providers, wi
 - **Database:** PostgreSQL 17+ (`schema/schema.sql`).
 - **Deployment:** Tinfoil Containers — all services run inside confidential enclaves. The Tinfoil shim terminates TLS and serves self-contained v3 attestation; the server runs plain HTTP behind it.
 - **API endpoints:** defined in `openapi.json`, generated from utoipa annotations — see Conventions in the top-level AGENTS.md (`just update-openapi`).
+- **Role:** the gateway — accounts, billing, anonymous credentials, routing. Inference itself is an upstream's job (today Tinfoil's; later Eidola's own engine nodes).
+- **Names that did not follow the crate:** the image is `ghcr.io/eidola-ai/eidola-server-gateway`, but its bake targets are still `server` / `ci-server` and its `artifact-manifest.json` key is still `eidola-server`. The key is what installed clients compare (`EXPECTED_ARTIFACTS` in `eidola-app-core/src/updates.rs`), and `scripts/artifact-manifest.sh` derives it from the bake target name, so changing either is a manifest artifact-set rotation — accept side one release, emit side the next (`releases/README.md`) — never a rename in place. An OCI digest does not depend on the repository name, so the row checks the same image whichever name it was pushed under; images of releases cut before the rename live at `ghcr.io/eidola-ai/eidola-server` and must stay there.
 
 ## Key design decisions
 
@@ -78,9 +80,18 @@ The server runs plain HTTP inside a Tinfoil Container; the shim terminates WebPK
 
 - `CREDENTIAL_MASTER_KEY` is injected as a Tinfoil secret (encrypted, enclave-only) in production.
 - With an external PostgreSQL (until Tinfoil supports persistent disks): connection metadata in `DATABASE_URL`, `DATABASE_PASSWORD` as a Tinfoil secret, `DATABASE_SSL_CERT` if the server cert doesn't chain to a WebPKI root.
-- The container has `/dev/sev-guest` (via the undocumented `devices` field in `tinfoil-config.yml`) so the shim can obtain a fresh SEV-SNP report for each v3 challenge; shim runtime material is mounted at `/tinfoil/`.
+- **The container gets no attestation device and no attestation socket.** The shim is a CVM-level service outside every workload container and obtains each v3 challenge's SEV-SNP report itself; nothing in this crate requests a report. Mapping `/dev/sev-guest` into the container (the old `devices` field, which the strict config validator for `cvm-version` ≥ 0.11 rejects) would only have let a compromised gateway process mint reports over data of its choosing. The supported in-container route (`attestation: true` plus `/tinfoil/attestation.sock`) is likewise for workloads that attest themselves, which this one does not — add it only alongside code that uses it.
 
-`tinfoil-config.yml` (workspace root) is the Tinfoil Container configuration: image digests from `artifact-manifest.json`, `_HASH` env vars for measured secrets (Argon2id hashes via `cargo run -p hash-secret`), CVM resources. Its SHA-256 is embedded in the kernel command line and bound into the enclave measurement — any change produces a different measurement.
+`tinfoil-config.yml` (workspace root) is the Tinfoil Container configuration: image digests from `artifact-manifest.json`, `_HASH` env vars for measured secrets (Argon2id hashes via `cargo run -p hash-secret`), CVM resources. Its SHA-256 is embedded in the kernel command line and bound into the enclave measurement — any change produces a different measurement. `memory` must be one of the sizes Tinfoil's validator accepts (8192, 16384, 32768, …); `scripts/artifact-manifest.sh stamp-config` refuses a config with no `ghcr.io/eidola-ai/eidola-server-gateway@sha256:` image line to stamp, so a renamed image cannot silently ship a stale digest.
+
+### Release checklist: bringing `tinfoil-config.yml` onto the current platform
+
+Each item moves the enclave measurement, so it lands with a release's manifest regeneration (`just update-manifest`, or the `artifact-manifest` job's suggested files), never in a feature change.
+
+1. **Reconcile the OVMF pin — this blocks the next tagged release as things stand.** `tinfoil-build.yml` pins `tinfoilsh/measure-image-action` v0.13.1, which measures SEV-SNP with EDK2 OVMF `v0.0.4` (`78c89017…`), while `OVMF_VERSION` / `OVMF_SHA256` in `scripts/artifact-manifest.sh` still pin `v0.0.3` (`3a38d062…`). The two measurers therefore disagree on the SNP launch digest and the tag workflow's "measurements match" cross-check will fail. Move the script pin to the firmware the pinned action uses (verify the asset with `gh attestation verify … -R tinfoilsh/edk2`), confirm with Tinfoil which firmware their hosts launch for the chosen `cvm-version`, and regenerate. Any future bump of the action pin (Dependabot proposes them) must be checked for the same drift.
+2. **Bump `cvm-version` from `0.7.3`.** Pick a current release line (≥ 0.11 brings the strict workload validator; ≥ 0.14.10 attested keys) and update `CVM_MANIFEST_VERSION` / `CVM_MANIFEST_SHA256` in the same change, verifying the manifest's Sigstore provenance. The strict validator then applies to this file at measurement time (the action runs `tinfoil-config` validation for ≥ 0.11): re-validate the whole file against it rather than assuming the current fields survive — `devices` is already gone, `memory: 8192` is a valid size, and every other key must be checked against the validator of the chosen version.
+3. **Publish the renamed image before tagging.** The first push of `ghcr.io/eidola-ai/eidola-server-gateway` creates a new GHCR package; make it public (Tinfoil pulls it by digest at deploy) and give the repository's Actions write access before the tag run needs it. Keep `ghcr.io/eidola-ai/eidola-server` — released configs reference it.
+4. **Observability.** The default `OTEL_SERVICE_NAME`, tracer, and meter name are now `eidola-server-gateway`; update dashboards and alerts keyed on `eidola-server` (or set `OTEL_SERVICE_NAME` to keep the old series continuous).
 
 ## Upstream measurement resolution (`src/upstream_trust/`)
 
@@ -97,9 +108,9 @@ The server runs plain HTTP inside a Tinfoil Container; the shim terminates WebPK
 
 `compose.yaml` — two supported workflows share one file:
 
-- **Full container stack** (`just dev` → `scripts/dev.sh --container`): postgres + server + shim + stripe-cli in containers, detached. Server image rebuilt each invocation.
+- **Full container stack** (`just dev` → `scripts/dev.sh --container`): postgres + gateway + shim + stripe-cli in containers, detached. Gateway image rebuilt each invocation.
 - **Host mode** (`just services` → `scripts/dev.sh --host`): postgres + shim + stripe-cli in containers, with `SHIM_UPSTREAM_URL=http://host.docker.internal:8080` so the shim forwards to a cargo-built server on the host. Writes `.env.local` (`STRIPE_WEBHOOK_SECRET` + `BIND_ADDR=0.0.0.0:8080`) for the host server to source.
 
 The shim service forwards `DEV_MEASUREMENT` as a bare pass-through (`- DEV_MEASUREMENT`, no `=`), so it reaches the container only when set in the environment running compose or in `.env` (which compose reads from the project directory automatically) — an unset var leaves the shim on its all-zeros default rather than an empty measurement, which would panic it. `scripts/local-client.sh` resolves the same variable the same way, environment before `.env`, so one value governs both what the shim advertises and what the client trusts on every documented path. Its `.env` reader covers compose's grammar except `${VAR}` interpolation (reimplementing that is reimplementing compose): such a value warns and then fails the script's own shape check, pointing at exporting the variable instead. The script's other settings (`EIDOLA_DEV_CERT_DIR` / `EIDOLA_DEV_BASE_URL`) are client-side only by design — they say where a stack already is, and have no compose counterpart to follow.
 
-Both build only the images they need, idempotently apply `schema.sql`, capture the Stripe webhook secret if `STRIPE_API_KEY` is set (else skip stripe-cli), and start detached. `just down` tears down both. Profiles: `server` gates the server container, `stripe` gates stripe-cli; postgres and shim have no profile. The shim has `extra_hosts: host.docker.internal:host-gateway` (Linux host-gateway) and intentionally no `depends_on: server` (host mode); `postgres`/`server`/`shim` declare `platform: linux/amd64` so compose doesn't warn on arm64 hosts.
+Both build only the images they need, idempotently apply `schema.sql`, capture the Stripe webhook secret if `STRIPE_API_KEY` is set (else skip stripe-cli), and start detached. `just down` tears down both. Profiles: `gateway` gates the gateway container, `stripe` gates stripe-cli; postgres and shim have no profile. The shim has `extra_hosts: host.docker.internal:host-gateway` (Linux host-gateway) and intentionally no `depends_on: gateway` (host mode); `postgres`/`gateway`/`shim` declare `platform: linux/amd64` so compose doesn't warn on arm64 hosts.

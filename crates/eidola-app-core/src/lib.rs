@@ -8380,7 +8380,7 @@ impl Inner {
         // round's refund in its body.** A non-2xx is an error document — the
         // server spends the credential before it dispatches, so a stream that
         // fails to open after the nullifier is recorded answers with a
-        // refund-bearing JSON error body (`eidola-server`'s
+        // refund-bearing JSON error body (`eidola-server-gateway`'s
         // `error_response_with_refund`). A **2xx that is not server-sent
         // events** is a backend that ignored `stream: true` and answered a
         // whole completion, refund and all, or an intermediary's page; parsed

@@ -20,7 +20,7 @@ fn main() {
     let workspace_root = manifest_dir
         .parent()
         .and_then(Path::parent)
-        .expect("workspace root above crates/eidola-server")
+        .expect("workspace root above crates/eidola-server-gateway")
         .to_path_buf();
 
     println!("cargo:rerun-if-changed=build.rs");

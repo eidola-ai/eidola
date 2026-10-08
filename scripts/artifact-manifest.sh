@@ -151,7 +151,11 @@ assert_manifest_complete() {
 }
 
 # CVM image artifacts for enclave measurement computation.
-# The OVMF firmware version is pinned to match tinfoilsh/measure-image-action.
+# The OVMF firmware version must equal the one the tinfoilsh/measure-image-action
+# release pinned in .github/workflows/tinfoil-build.yml measures with
+# (`defaultEDK2Version` in its orchestrator); otherwise the tag workflow's
+# cross-check fails. See crates/eidola-server-gateway/AGENTS.md → Release
+# checklist.
 CVM_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/eidola/cvm"
 OVMF_VERSION="v0.0.3"
 OVMF_URL="https://github.com/tinfoilsh/edk2/releases/download/${OVMF_VERSION}/OVMF.fd"
@@ -453,17 +457,22 @@ fetch_cvm_artifacts() {
 
 # ── Enclave measurement ──────────────────────────────────────────────────────
 
-# Update the eidola-server image digest in tinfoil-config.yml from build
-# metadata. (Only the server runs inside the enclave; the database is
-# hosted externally, so eidola-postgres's digest doesn't feed the
-# measurement.)
+# Update the gateway image digest in tinfoil-config.yml from build metadata.
+# (Only the gateway runs inside the enclave; the database is hosted
+# externally, so eidola-postgres's digest doesn't feed the measurement.)
+# The gateway is built by the `server` bake target — see
+# print_oci_partial_for_targets for why that name stays.
 stamp_config_digests() {
   local server_digest
 
   server_digest="$(metadata_digest "$METADATA_FILE" "$(target_key server)")"
 
+  if ! grep -q 'ghcr.io/eidola-ai/eidola-server-gateway@sha256:' "$CONFIG_FILE"; then
+    echo "error: $CONFIG_FILE has no ghcr.io/eidola-ai/eidola-server-gateway@sha256: image to stamp" >&2
+    exit 1
+  fi
   sed -i.bak \
-    -e "s|ghcr.io/eidola-ai/eidola-server@sha256:[a-f0-9]*|ghcr.io/eidola-ai/eidola-server@${server_digest}|" \
+    -e "s|ghcr.io/eidola-ai/eidola-server-gateway@sha256:[a-f0-9]*|ghcr.io/eidola-ai/eidola-server-gateway@${server_digest}|" \
     "$CONFIG_FILE"
   rm -f "${CONFIG_FILE}.bak"
 }
@@ -604,6 +613,14 @@ metadata_digest() {
 
 # Build a partial artifact-manifest from a list of target names.
 # Each target is read from $METADATA_FILE using its push-aware key.
+#
+# The manifest key is `eidola-<bake target>`, so a bake target's name is a
+# manifest key in disguise: renaming one is a manifest artifact-set rotation
+# (`releases/README.md`), not a build tweak. That is why the gateway image is
+# built by the `server` target and recorded as `eidola-server` although the
+# image it pushes is `eidola-server-gateway` — the OCI digest the row records
+# does not depend on the repository name, and installed clients expect the
+# key they were built against.
 print_oci_partial_for_targets() {
   local -a targets=("$@")
   local target digest jq_filter

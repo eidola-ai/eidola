@@ -7,7 +7,7 @@
 //! the embed-marker recognition rule shared between the markdown editor's
 //! embed plugin and app-core's upstream quote expansion ([`embed`]). It is
 //! intentionally lib-only, pure Rust, and float-free so `eidola-app-core`,
-//! `eidola-server`, and tests can depend on it and compute identical results
+//! `eidola-server-gateway`, and tests can depend on it and compute identical results
 //! on any platform.
 //!
 //! # The dependency rule
@@ -672,7 +672,7 @@ mod tests {
     ///
     /// Each consumer keeps one agreement test that feeds its *own* request
     /// representation through the same walk and asserts the same 230
-    /// (`eidola-server`'s `tool_round_fixture_charges_the_pinned_contract_value`
+    /// (`eidola-server-gateway`'s `tool_round_fixture_charges_the_pinned_contract_value`
     /// over a parsed `ChatCompletionRequest`, `eidola-app-core`'s
     /// `prompt_charge_matches_the_shared_contract_fixture` over the `Value`
     /// messages a turn actually sends). Those still have teeth after the

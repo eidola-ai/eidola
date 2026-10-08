@@ -2,7 +2,7 @@
 
 Every piece of the Eidola trust chain that is intentionally deferred is catalogued here. Each gap closes a specific class of attack that is already constrained by other parts of the chain — but they are real and worth understanding. Reading this page is the fastest way to see what Eidola does not yet defend against.
 
-The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs) and `rekor.rs`, and the install-side gap is described where the verifier hands off to [`crates/eidola-app-core/src/updater/install/`](../crates/eidola-app-core/src/updater/install/mod.rs). The same two cryptographic-verifier gaps apply to the server-side runtime upstream-measurement resolver ([`crates/eidola-server/src/upstream_trust/sigstore.rs`](../crates/eidola-server/src/upstream_trust/sigstore.rs)), which reuses the same Fulcio/Rekor primitives.
+The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs) and `rekor.rs`, and the install-side gap is described where the verifier hands off to [`crates/eidola-app-core/src/updater/install/`](../crates/eidola-app-core/src/updater/install/mod.rs). The same two cryptographic-verifier gaps apply to the server-side runtime upstream-measurement resolver ([`crates/eidola-server-gateway/src/upstream_trust/sigstore.rs`](../crates/eidola-server-gateway/src/upstream_trust/sigstore.rs)), which reuses the same Fulcio/Rekor primitives.
 
 ## Cryptographic verifier
 
