@@ -20,7 +20,7 @@
 
 use std::mem::MaybeUninit;
 
-use unsafe_libyaml as sys;
+use unsafe_libyaml as libyaml_unsafe;
 
 /// Owns an initialized libyaml parser and deletes it on drop.
 struct Parser(Box<MaybeUninit<sys::yaml_parser_t>>);
