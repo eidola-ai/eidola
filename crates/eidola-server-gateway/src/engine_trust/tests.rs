@@ -733,7 +733,8 @@ fn every_variable_the_node_requires_is_checked() {
         (env::KV_DEVICE_BYTES, "0"),
         (env::KERNELS_DIR, "kernels"),
         (env::CUDA_GRAPHS, "yes"),
-        (env::DRAFT_TOKENS, "1"),
+        // Past MiMo-V2.6-Flash's three MTP layers, the cuda executor's bound.
+        (env::DRAFT_TOKENS, "4"),
         (env::MAX_MODEL_LEN, "-1"),
         (env::MAX_SEQS, "0"),
         (env::MAX_BATCHED_TOKENS, "many"),
@@ -921,18 +922,18 @@ fn allocations_are_capped_and_fit_the_deployment() {
     refused(&tree, "less than the 12228280320 bytes the KV pools need");
 
     // The device holds the KV budget, the weights (the pack's data size,
-    // 17,419,419,648 bytes here) and the executor's reserve (16,789,798,912
+    // 17,419,419,648 bytes here) and the executor's reserve (16,831,741,952
     // bytes for this sizing) within the B300's 287,428,640,768.
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"253219422208\"",
+        "KV_DEVICE_BYTES: \"253177479168\"",
     );
     tree.check().expect("the budget fills the device exactly");
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"253219422209\"",
+        "KV_DEVICE_BYTES: \"253177479169\"",
     );
     refused(&tree, "more than the NVIDIA B300 SXM6 AC's 287428640768");
     // A Flash-sized pack leaves room for 64 GiB, and not for twice that.
@@ -950,6 +951,13 @@ fn allocations_are_capped_and_fit_the_deployment() {
         &tree,
         "of device memory, more than the NVIDIA B300 SXM6 AC's",
     );
+
+    // A cuda deployment drafting three tokens fits: its drafter pool and the
+    // larger reserve are held to the same rules.
+    let mut tree = Tree::fixture();
+    tree.edit_config("DRAFT_TOKENS: \"0\"", "DRAFT_TOKENS: \"3\"");
+    tree.check()
+        .expect("a cuda deployment may draft three tokens");
 
     // The kernels ship in the image, never in an attached mount.
     let mut tree = Tree::fixture();

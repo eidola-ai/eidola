@@ -11,9 +11,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, ModelSpec};
-use eidola_engine_cuda::kv::GroupGeometry;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, KernelDir, KvBlocks};
+use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec};
+use eidola_engine_cuda::kv::{GroupGeometry, KvLayout};
+use eidola_engine_cuda::{
+    CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, KernelDir, KvBlocks, MtpHidden,
+};
 use eidola_engine_model::safetensors::WeightSet;
 
 use crate::BootError;
@@ -33,14 +35,17 @@ const RETENTION_POINTS: u64 = 3;
 /// Derives the executor's per-group KV block counts from `kv_device_bytes`.
 ///
 /// `spec` is the executor's own [`ModelSpec`] (from [`CudaExecutor::preflight`]); only its
-/// group shapes are read. With `B` the block size and, for a sliding group of window `W`,
+/// group shapes are read, and `hidden` (the model's hidden size, the width of a drafter
+/// block's boundary tap). With `B` the block size and, for a sliding group of window `W`,
 /// `R = ceil((W - 1) / B) + 1` (the core's bound on one window's blocks):
 ///
 /// * each **sliding** group gets `1 + max_seqs × ((1 + P) × R + 1) + ceil(max_batched_tokens / B)`
 ///   blocks: the null block; per seated sequence its live window, the partly filled block
 ///   after it, and `P` retained windows (`P` = 3 with the prefix cache, else 0); and the
 ///   positions one step adds. So sliding blocks never run out while the global pool still
-///   has room, and the global pool is the one that bounds concurrency and context;
+///   has room, and the global pool is the one that bounds concurrency and context. The
+///   **drafter** group (MTP depths' KV, when drafting) is a sliding window too, and gets the
+///   same count by the same rule;
 /// * each **global** group gets what is left, `floor((kv_device_bytes − sliding bytes) /
 ///   global block bytes) − 1`, and must hold at least one `MAX_MODEL_LEN` sequence plus the
 ///   null block.
@@ -55,6 +60,7 @@ const RETENTION_POINTS: u64 = 3;
 /// holds every pinned deployment to; the two are kept equal by a test here.
 pub fn derive_kv_blocks(
     spec: &ModelSpec,
+    hidden: u32,
     kv_device_bytes: u64,
     sizing: &Sizing,
     cache: &CacheConfig,
@@ -69,6 +75,14 @@ pub fn derive_kv_blocks(
             head_dim_v: g.head_dim_v,
             block_size: sizing.kv_block_size,
             num_blocks: 2,
+            // A drafter block holds a tap of every depth's level beside its KV.
+            layout: match g.role {
+                KvRole::Target => KvLayout::Blocked,
+                KvRole::Drafter => KvLayout::Planar {
+                    taps: g.num_layers,
+                    hidden,
+                },
+            },
         };
         geometry
             .validate()
@@ -77,7 +91,7 @@ pub fn derive_kv_blocks(
     };
     let points = if cache.enabled { RETENTION_POINTS } else { 0 };
 
-    let (mut global, mut sliding) = (None, None);
+    let (mut global, mut sliding, mut drafter) = (None, None, None);
     let mut sliding_bytes = 0u64;
     for g in &spec.kv_groups {
         match g.attention {
@@ -98,9 +112,13 @@ pub fn derive_kv_blocks(
                     .checked_mul(block_bytes(g)?)
                     .and_then(|x| x.checked_add(sliding_bytes))
                     .ok_or_else(overflow)?;
-                if sliding.replace(blocks).is_some() {
+                let slot = match g.role {
+                    KvRole::Target => &mut sliding,
+                    KvRole::Drafter => &mut drafter,
+                };
+                if slot.replace(blocks).is_some() {
                     return Err(BootError(
-                        "the executor reports two sliding KV groups".into(),
+                        "the executor reports two sliding KV groups of one role".into(),
                     ));
                 }
             }
@@ -115,6 +133,7 @@ pub fn derive_kv_blocks(
     }
     let narrow = |n: u64| u32::try_from(n).map_err(|_| overflow());
     let sliding = sliding.map(narrow).transpose()?.unwrap_or(0);
+    let drafter = drafter.map(narrow).transpose()?.unwrap_or(0);
     let global = match global {
         None => 0,
         Some(bytes) => {
@@ -142,7 +161,11 @@ pub fn derive_kv_blocks(
             narrow(blocks.min(i32::MAX as u64))?
         }
     };
-    Ok(KvBlocks { global, sliding })
+    Ok(KvBlocks {
+        global,
+        sliding,
+        drafter,
+    })
 }
 
 /// Everything checked and the device open: what the engine thread builds the executor
@@ -180,9 +203,9 @@ impl Prepared {
     }
 }
 
-/// The refusals that need no device, in order (drafting, the executor's own preflight of
-/// the model and the step shape, the KV derivation and the derived geometry), then the
-/// device. Nothing is allocated on the device here.
+/// The refusals that need no device, in order (the executor's own preflight of the model,
+/// its MTP layers for the draft width, and the step shape; the KV derivation and the
+/// derived geometry), then the device. Nothing is allocated on the device here.
 pub fn prepare(
     model: &LoadedModel,
     sizing: &Sizing,
@@ -194,18 +217,14 @@ pub fn prepare(
     let refused = |e: eidola_engine_cuda::CudaError| {
         BootError(format!("the engine refused its configuration: {e}"))
     };
-    if sizing.draft_tokens != 0 {
-        return Err(BootError(format!(
-            "{} must be 0 with the cuda executor (it does not draft)",
-            env::DRAFT_TOKENS
-        )));
-    }
+    let drafting = sizing.draft_tokens > 0;
     // One step shape, as on the CPU executor: the scheduler's limits.
     let mut config = CudaExecutorConfig {
         block_size: sizing.kv_block_size,
         num_blocks: KvBlocks {
             global: 2,
             sliding: 2,
+            drafter: if drafting { 2 } else { 0 },
         },
         num_state_slots: sizing.max_seqs,
         max_model_len: sizing.max_model_len,
@@ -217,9 +236,13 @@ pub fn prepare(
             .map_err(|_| BootError("the tokenizer's vocabulary does not fit u32".into()))?,
         image: None,
         graphs,
+        draft_tokens: sizing.draft_tokens,
+        mtp_hidden: MtpHidden::Normed,
     };
     let spec = CudaExecutor::preflight(model.store(), None, &config).map_err(refused)?;
-    config.num_blocks = derive_kv_blocks(&spec, kv_device_bytes, sizing, cache)?;
+    let hidden = u32::try_from(model.config().hidden_size)
+        .map_err(|_| BootError("the model's hidden size does not fit u32".into()))?;
+    config.num_blocks = derive_kv_blocks(&spec, hidden, kv_device_bytes, sizing, cache)?;
     CudaExecutor::preflight(model.store(), None, &config).map_err(refused)?;
 
     let gpu = Gpu::open(DEVICE_ORDINAL).map_err(refused)?;
@@ -264,6 +287,20 @@ mod tests {
             head_dim_v: 128,
             num_blocks: 2,
         }
+    }
+
+    /// Flash's groups with `k` draft depths: a drafter group of `k` MTP layers × 8
+    /// heads after the target groups.
+    fn flash_drafting(k: u32) -> ModelSpec {
+        let mut spec = flash();
+        if k > 0 {
+            spec.kv_groups.push(KvGroupSpec {
+                role: KvRole::Drafter,
+                ..group(AttentionKind::Sliding { window: 128 }, k, 8)
+            });
+            spec.max_draft_tokens = k;
+        }
+        spec
     }
 
     /// Flash's two groups: 9 global layers × 4 KV heads, 39 sliding layers × 8 heads.
@@ -314,7 +351,7 @@ mod tests {
         // R = ceil(127 / 16) + 1 = 9; per sequence (1 + 3) × 9 + 1 = 37 with the cache.
         let sliding = 1 + 8 * 37 + 512 / 16;
         let budget = 40 << 30;
-        let blocks = derive_kv_blocks(&flash(), budget, &sizing(), &cache(true)).unwrap();
+        let blocks = derive_kv_blocks(&flash(), 4096, budget, &sizing(), &cache(true)).unwrap();
         assert_eq!(blocks.sliding, sliding as u32);
         // Each pool holds one pad block past its count.
         assert_eq!(
@@ -329,8 +366,24 @@ mod tests {
         );
 
         // No retention without the cache: (1 + 0) × 9 + 1 = 10 per sequence.
-        let blocks = derive_kv_blocks(&flash(), budget, &sizing(), &cache(false)).unwrap();
+        let blocks = derive_kv_blocks(&flash(), 4096, budget, &sizing(), &cache(false)).unwrap();
         assert_eq!(blocks.sliding, 1 + 8 * 10 + 32);
+        assert_eq!(blocks.drafter, 0);
+
+        // Drafting three tokens: the drafter group gets the sliding count, each block 16
+        // positions × 3 depths × 8 heads × (192 + 128) × 2 bytes and a tap of 3 × 4,096
+        // f32; the global pool what is left.
+        let drafter_bytes = 16 * 3 * 8 * 320 * 2 + 3 * 4096 * 4u64;
+        let blocks =
+            derive_kv_blocks(&flash_drafting(3), 4096, budget, &sizing(), &cache(true)).unwrap();
+        assert_eq!(
+            (blocks.sliding, blocks.drafter),
+            (sliding as u32, sliding as u32)
+        );
+        assert_eq!(
+            u64::from(blocks.global),
+            (budget - (sliding + 1) * (sliding_bytes + drafter_bytes)) / global_bytes - 1
+        );
     }
 
     #[test]
@@ -341,40 +394,42 @@ mod tests {
         // One 4096-token sequence needs 256 blocks plus the null block, and the pool
         // its pad block.
         let enough = sliding_bytes + 258 * global_bytes;
-        let blocks = derive_kv_blocks(&flash(), enough, &sizing(), &cache(true)).unwrap();
+        let blocks = derive_kv_blocks(&flash(), 4096, enough, &sizing(), &cache(true)).unwrap();
         assert_eq!(blocks.global, 257);
-        let e = derive_kv_blocks(&flash(), enough - 1, &sizing(), &cache(true)).unwrap_err();
+        let e = derive_kv_blocks(&flash(), 4096, enough - 1, &sizing(), &cache(true)).unwrap_err();
         assert!(e.0.contains(env::KV_DEVICE_BYTES), "{e}");
         assert!(e.0.contains(env::MAX_MODEL_LEN), "{e}");
         // Not even the sliding windows fit.
-        let e = derive_kv_blocks(&flash(), sliding_bytes - 1, &sizing(), &cache(true)).unwrap_err();
+        let e = derive_kv_blocks(&flash(), 4096, sliding_bytes - 1, &sizing(), &cache(true))
+            .unwrap_err();
         assert!(e.0.contains("sliding"), "{e}");
     }
 
     /// The gateway's build holds a pinned deployment's budget to
     /// `cuda_kv_min_bytes`; it is exactly the least this derivation accepts, across
-    /// block sizes, seats, step sizes and the cache switch.
+    /// block sizes, seats, step sizes, the cache switch and the draft width.
     #[test]
     fn the_shared_minimum_is_the_derivations() {
         use eidola_common::engine_deployment::cuda_kv_min_bytes;
         for block in [1, 16, 64, 1024] {
-            for (seats, step) in [(1, 1), (8, 512), (64, 8192)] {
-                for enabled in [false, true] {
+            for (seats, step) in [(1, 4), (8, 512), (64, 8192)] {
+                for (enabled, draft) in [(false, 0), (true, 0), (false, 1), (true, 3)] {
                     let sizing = Sizing {
                         kv_block_size: block,
                         max_seqs: seats,
                         max_batched_tokens: step,
                         max_prefill_chunk: step,
+                        draft_tokens: draft,
                         ..sizing()
                     };
-                    let mut spec = flash();
+                    let mut spec = flash_drafting(draft);
                     spec.block_size = block;
                     let min = cuda_kv_min_bytes(&sizing, &cache(enabled));
-                    let at = (block, seats, step, enabled);
-                    derive_kv_blocks(&spec, min, &sizing, &cache(enabled))
+                    let at = (block, seats, step, enabled, draft);
+                    derive_kv_blocks(&spec, 4096, min, &sizing, &cache(enabled))
                         .unwrap_or_else(|e| panic!("{at:?}: {e}"));
                     assert!(
-                        derive_kv_blocks(&spec, min - 1, &sizing, &cache(enabled)).is_err(),
+                        derive_kv_blocks(&spec, 4096, min - 1, &sizing, &cache(enabled)).is_err(),
                         "{at:?}"
                     );
                 }
@@ -384,7 +439,7 @@ mod tests {
 
     #[test]
     fn global_blocks_stop_at_the_tables_index_range() {
-        let blocks = derive_kv_blocks(&flash(), u64::MAX, &sizing(), &cache(true)).unwrap();
+        let blocks = derive_kv_blocks(&flash(), 4096, u64::MAX, &sizing(), &cache(true)).unwrap();
         assert_eq!(blocks.global, i32::MAX as u32);
     }
 }

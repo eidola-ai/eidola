@@ -25,14 +25,14 @@ use eidola_engine_model::safetensors::WeightSet;
 
 use crate::attention::{Attention, AttnLayer, AttnPlan, PlanShape, PlanView};
 use crate::device::ImageArch;
-use crate::engine_ops::{EngineOps, QkvArgs};
+use crate::engine_ops::{COPY_BUFFERS, CopyArgs, EngineOps, QkvArgs};
 use crate::gemm::{Gemm, GemmArgs, GemmKind};
 use crate::kv::{GroupGeometry, KvStore};
 use crate::launch::{dptr, dptr_at};
 use crate::module::{ImageSource, KernelModule};
 use crate::moe_gemm::{BLOCK_M, MoeGemm, MoeGemmArgs, MoeLayout, MoeProj};
 use crate::sampler::Sampler;
-use crate::weights::{Ffn, ModelWeights};
+use crate::weights::{AttentionWeights, DenseFfn, Ffn, ModelWeights, MoeFfn};
 use crate::{CudaError, Gpu, Result, narrow};
 
 /// Every kernel the executor launches.
@@ -117,6 +117,26 @@ pub(crate) struct Indirect {
     /// `num_logit_rows` token rows whose logits the head computes.
     pub logit_rows: u64,
     pub num_logit_rows: usize,
+    /// Run the final norm over every row even when no logits are wanted
+    /// (the drafter reads the normed rows of every token).
+    pub final_norm: bool,
+}
+
+/// Where an MTP forward reads its per-step values (see
+/// [`GpuModel::launch_mtp`]): the device addresses of `tokens` token ids,
+/// RoPE positions (each row's position less one), the drafter plane row each
+/// row's KV goes to, the drafter group's work list, and the logit rows.
+pub(crate) struct MtpIndirect {
+    pub tokens: usize,
+    pub token_ids: u64,
+    pub positions: u64,
+    pub kv_rows: u64,
+    pub plan: PlanView,
+    pub logit_rows: u64,
+    pub num_logit_rows: usize,
+    /// Where the copy that assembles `eh_proj`'s input raises
+    /// `STATUS_BAD_INDEX` (it cannot, by construction; the kernel checks).
+    pub status: u64,
 }
 
 /// Device scratch sized for at most `max_tokens` tokens and `max_logit_rows`
@@ -157,9 +177,11 @@ struct Scratch {
 /// Floats per position in a RoPE table (32 cos, 32 sin).
 const ROPE_TABLE_WIDTH: usize = 64;
 
-/// Masked layout (decode-sized batches): rows per expert.
+/// Masked layout (decode-sized batches): rows per expert, and the most
+/// tokens a forward runs it for.
 const MASKED_CAP: usize = 128;
 const MASKED_CAP32: u32 = 128;
+pub(crate) const MASKED_TOKENS: u32 = MASKED_CAP32;
 const _: () = assert!(MASKED_CAP32 as usize == MASKED_CAP);
 
 fn round_up(x: usize, m: usize) -> usize {
@@ -180,6 +202,11 @@ pub struct GpuModel {
     pub(crate) kernels: Kernels,
     pub(crate) layer_kv: Vec<LayerKv>,
     scratch: Scratch,
+    /// With MTP layers: the copy lists interleaving `enorm(e)` and
+    /// `hnorm(h)` rows into `eh_proj`'s input (`[src_buf | src_row | dst_buf
+    /// | dst_row]`, each `2 × max_tokens` words), and `max_tokens` zero block
+    /// ids (the drafter's KV writes address plane rows, never blocks).
+    mtp_lists: Option<(CudaSlice<u32>, CudaSlice<u32>)>,
     /// Per distinct RoPE θ: `[max_len][32 cos | 32 sin]`.
     rope: Vec<(f32, CudaSlice<f32>)>,
     max_logit_rows: usize,
@@ -217,6 +244,10 @@ pub(crate) struct ScratchSizes {
 }
 
 impl ScratchSizes {
+    /// `mtp_inter` is the MTP layers' dense intermediate size when they are
+    /// loaded (0 otherwise): their SwiGLU and the `eh_proj` input
+    /// (`[tokens, 2 × hidden]` BF16, assembled in the quantized activations'
+    /// buffer) size the dense buffers too.
     pub(crate) fn new(
         c: &ModelConfig,
         groups: usize,
@@ -224,6 +255,7 @@ impl ScratchSizes {
         max_tokens: usize,
         max_logit_rows: usize,
         max_len: usize,
+        mtp_inter: usize,
     ) -> Result<ScratchSizes> {
         let (h, v) = (c.hidden_size, c.vocab_size);
         // Every buffer size is computed with checked arithmetic, and the whole
@@ -252,8 +284,16 @@ impl ScratchSizes {
             c.dense_intermediate_size
         } else {
             0
-        };
+        }
+        .max(mtp_inter);
         let kmax = h.max(dense_i).max(prod(&[nq, 128])?);
+        // The MTP forward assembles `[enorm(e) ‖ hnorm(h)]` as BF16 rows of
+        // `2 × hidden` in the FP8 activations' buffer (`tp × kmax` bytes).
+        if mtp_inter > 0 && kmax < prod(&[4, h])? {
+            return Err(CudaError::new(
+                "scratch: the MTP input rows do not fit the activations' buffer",
+            ));
+        }
         let (top_k, experts, inter) = match &c.moe {
             Some(m) if has(FfnKind::Moe) => (m.top_k, m.num_experts, m.intermediate_size),
             _ => (0, 0, 0),
@@ -359,9 +399,12 @@ impl GpuModel {
         let qkv_cols = weights
             .layers
             .iter()
-            .map(|l| l.attention.qkv.linear.n as usize)
+            .map(|l| &l.attention)
+            .chain(weights.mtp.iter().map(|m| &m.attention))
+            .map(|a| a.qkv.linear.n as usize)
             .max()
             .unwrap_or(0);
+        let mtp_inter = weights.mtp.first().map_or(0, |m| m.ffn.inter as usize);
         let ScratchSizes {
             toks,
             per_group,
@@ -383,7 +426,15 @@ impl GpuModel {
             erows,
             experts,
             rows,
-        } = ScratchSizes::new(c, groups, qkv_cols, max_tokens, max_logit_rows, max_len)?;
+        } = ScratchSizes::new(
+            c,
+            groups,
+            qkv_cols,
+            max_tokens,
+            max_logit_rows,
+            max_len,
+            mtp_inter,
+        )?;
         let scratch = Scratch {
             max_tokens,
             tokens: s.alloc_zeros(toks)?,
@@ -415,18 +466,28 @@ impl GpuModel {
             logits: s.alloc_zeros(logits)?,
         };
         let mut rope = Vec::new();
-        for l in &c.layers {
-            let spec = &l.attention;
+        let mtp_spec = (!weights.mtp.is_empty()).then_some(&c.mtp.attention);
+        for spec in c.layers.iter().map(|l| &l.attention).chain(mtp_spec) {
             if rope.iter().any(|(t, _): &(f32, _)| *t == spec.rope_theta) {
                 continue;
             }
             rope.push((spec.rope_theta, s.clone_htod(&rope_table(spec, max_len))?));
         }
+        let mtp_lists = if weights.mtp.is_empty() {
+            None
+        } else {
+            let lists = mtp_concat_lists(max_tokens)?;
+            Some((
+                s.clone_htod(&lists)?,
+                s.alloc_zeros::<u32>(max_tokens.max(1))?,
+            ))
+        };
         Ok(GpuModel {
             weights,
             kernels,
             layer_kv,
             scratch,
+            mtp_lists,
             rope,
             max_logit_rows,
             max_len,
@@ -456,6 +517,16 @@ impl GpuModel {
         self.scratch.max_tokens
     }
 
+    /// Logit rows one forward may compute.
+    pub fn max_logit_rows(&self) -> usize {
+        self.max_logit_rows
+    }
+
+    /// Positions the RoPE tables cover.
+    pub fn max_positions(&self) -> usize {
+        self.max_len
+    }
+
     /// KV groups the retained layers use.
     pub fn num_groups(&self) -> usize {
         self.layer_kv.iter().map(|l| l.group + 1).max().unwrap_or(0)
@@ -463,6 +534,22 @@ impl GpuModel {
 
     pub fn logits(&self) -> &CudaSlice<f32> {
         &self.scratch.logits
+    }
+
+    /// The f32 rows of `hidden` a forward leaves its states in, and the MTP
+    /// forward reads its previous level from: `(normed, pre-norm, mtp input)`
+    /// as `(device address, rows)`. After a forward, row `i` of the first is
+    /// token `i`'s final-norm output and of the second its residual stream;
+    /// [`GpuModel::launch_mtp`] reads row `i` of the third as row `i`'s
+    /// previous chain level.
+    pub(crate) fn level_buffers(&self, s: &cudarc::driver::CudaStream) -> [(u64, usize); 3] {
+        let h = self.weights.config.hidden_size;
+        let sc = &self.scratch;
+        [
+            (dptr(&sc.x, s), sc.x.len() / h),
+            (dptr(&sc.h, s), sc.h.len() / h),
+            (dptr(&sc.proj, s), sc.proj.len() / h),
+        ]
     }
 
     /// Check every host value of `input` that a kernel would use as an index
@@ -517,15 +604,18 @@ impl GpuModel {
         if let Some(&r) = input.logit_rows.iter().find(|&&r| r as usize >= t) {
             return bad(format!("logit row {r} of {t} tokens"));
         }
-        let geometry = kv.geometry();
+        // The target layers' groups come first; a drafter group, when
+        // there is one, follows them.
         let groups = self.num_groups();
-        if geometry.len() != groups
+        let geometry = &kv.geometry()[..groups.min(kv.geometry().len())];
+        let drafter = usize::from(!self.weights.mtp.is_empty());
+        if kv.geometry().len() != groups + drafter
             || input.kv_targets.len() != groups
             || input.plans.len() != groups
         {
             return bad(format!(
                 "{} KV pools, {} target lists, {} plans for {groups} groups",
-                geometry.len(),
+                kv.geometry().len(),
                 input.kv_targets.len(),
                 input.plans.len()
             ));
@@ -618,6 +708,7 @@ impl GpuModel {
             plans: input.plans.iter().map(|p| p.view(gpu)).collect(),
             logit_rows: dptr(&sc.logit_rows, &s),
             num_logit_rows: n,
+            final_norm: false,
         };
         let capture = self.capture_layers;
         // SAFETY: every address is this model's scratch, just filled with
@@ -681,25 +772,12 @@ impl GpuModel {
             )));
         }
         let s = gpu.stream().clone();
-        let c = self.weights.config.clone();
-        let h = c.hidden_size;
-        let tp = round_up(t, 4);
-        // Every count the kernels take, as the u32 they take it as.
-        let (h32, t32, tp32): (u32, u32, u32) = (
-            narrow(h, "hidden size")?,
-            narrow(t, "step tokens")?,
-            narrow(tp, "padded step tokens")?,
-        );
-        let eps = c.rms_norm_eps;
-        let sc = &mut self.scratch;
-        let k = &self.kernels;
-        let ops = &k.ops;
-
-        let p = |b: &CudaSlice<f32>| dptr(b, &s);
+        let h = self.weights.config.hidden_size;
+        let (h32, t32): (u32, u32) = (narrow(h, "hidden size")?, narrow(t, "step tokens")?);
         unsafe {
-            ops.embed(
+            self.kernels.ops.embed(
                 gpu,
-                p(&sc.h),
+                dptr(&self.scratch.h, &s),
                 dptr(&self.weights.embed, &s),
                 src.token_ids,
                 h32,
@@ -709,301 +787,226 @@ impl GpuModel {
         if capture {
             self.captured.clear();
         }
-        for (li, lw) in self.weights.layers.iter().enumerate() {
-            let spec = &c.layers[li].attention;
-            let lkv = &self.layer_kv[li];
+        for li in 0..self.weights.layers.len() {
+            let spec = self.weights.config.layers[li].attention.clone();
+            let lkv = self.layer_kv[li].clone();
             let geom = &kv.geometry()[lkv.group];
-            let nq: u32 = narrow(spec.num_q_heads, "query heads")?;
-            // 1. Norm, quantize, QKV.
+            let pool = dptr(kv.pool(lkv.group), &s);
+            let lw = &self.weights.layers[li];
+            let parts = LayerParts {
+                spec: &spec,
+                input_norm: &lw.input_norm,
+                post_attention_norm: &lw.post_attention_norm,
+                attention: &lw.attention,
+                ffn: match &lw.ffn {
+                    Ffn::Dense(d) => FfnRef::Dense(d),
+                    Ffn::Moe(m) => FfnRef::Moe(m),
+                },
+            };
+            let at = LayerKvAt {
+                pool,
+                kv_block: src.kv_block[lkv.group],
+                kv_slot: src.kv_slot[lkv.group],
+                block_elems: geom.block_elems() as u64,
+                k_off: geom.k_offset(lkv.layer_in_group) as u64,
+                v_off: geom.v_offset(lkv.layer_in_group) as u64,
+                attn: AttnLayer {
+                    k_base: pool + 2 * geom.k_offset(lkv.layer_in_group) as u64,
+                    v_base: pool + 2 * geom.v_offset(lkv.layer_in_group) as u64,
+                    k_page_stride: narrow(geom.block_elems(), "KV block elements")?,
+                    v_page_stride: narrow(geom.block_elems(), "KV block elements")?,
+                    num_kv_heads: geom.num_kv_heads,
+                    page_size: geom.block_size,
+                    window_left: match spec.window() {
+                        Some(w) => narrow::<i32, _>(w, "window")? - 1,
+                        None => -1,
+                    },
+                    sink: dptr(&lw.attention.sinks, &s),
+                },
+                plan: &src.plans[lkv.group],
+            };
+            // SAFETY: the caller's contract covers `src`; the pools and
+            // weights are this model's and `kv`'s.
+            unsafe {
+                layer(
+                    gpu,
+                    &self.kernels,
+                    &mut self.scratch,
+                    &self.rope,
+                    &self.weights.config,
+                    t,
+                    src.positions,
+                    &parts,
+                    &at,
+                )?;
+            }
+            if capture {
+                self.captured
+                    .push(s.clone_dtoh(&self.scratch.h.slice(..t * h))?);
+            }
+        }
+        // Head: final norm of the wanted rows, BF16, lm_head (f32 logits).
+        let final_norm = &self.weights.final_norm;
+        // SAFETY: as above; the logit rows lie below `t` (the caller's
+        // contract).
+        unsafe {
+            head(
+                gpu,
+                &self.kernels,
+                &mut self.scratch,
+                &self.weights,
+                final_norm,
+                t,
+                src.logit_rows,
+                src.num_logit_rows,
+                src.final_norm,
+            )
+        }
+    }
+
+    /// MTP depth `depth`'s launches over `src.tokens` rows, from the input
+    /// projection to the head: row `i` reads its previous chain level from
+    /// row `i` of the MTP input buffer ([`GpuModel::level_buffers`]), which
+    /// the caller has filled, embeds its token, normalizes both (`hnorm`,
+    /// `enorm`), interleaves them into `[e ‖ h]` rows (one bounded row
+    /// copy), projects with `eh_proj`, and runs the layer: attention over the
+    /// drafter group's plane rows of this depth (KV written at `src.kv_rows`,
+    /// RoPE at `src.positions`), the dense SwiGLU, and the layer's own final
+    /// norm over every row; then logits for `src.num_logit_rows` rows.
+    /// Afterwards row `i` of the normed (pre-norm) level buffer is row `i`'s
+    /// normed (pre-norm) output. Like [`GpuModel::launch`] it copies nothing
+    /// from the host, allocates nothing and reads nothing back.
+    ///
+    /// # Safety
+    ///
+    /// When the launches run, `src`'s addresses must hold `src.tokens` token
+    /// ids inside the vocabulary, as many positions inside the RoPE tables
+    /// and plane rows inside the drafter pool (pad block included), a work
+    /// list over the same rows with one-position pages inside the drafter
+    /// pool, and `src.num_logit_rows` logit rows below `src.tokens`; the MTP
+    /// input buffer's first `src.tokens` rows must be written.
+    pub(crate) unsafe fn launch_mtp(
+        &mut self,
+        gpu: &Gpu,
+        kv: &KvStore,
+        depth: usize,
+        src: &MtpIndirect,
+    ) -> Result<()> {
+        let t = src.tokens;
+        if t == 0 {
+            return Ok(());
+        }
+        let drafter = kv.geometry().len().checked_sub(1);
+        let geom = match drafter.map(|g| &kv.geometry()[g]) {
+            Some(g) if matches!(g.layout, crate::kv::KvLayout::Planar { .. }) => g.clone(),
+            _ => return Err(CudaError::new("MTP launch: no drafter KV group")),
+        };
+        let group = drafter.expect("matched above");
+        if depth >= self.weights.mtp.len()
+            || depth >= geom.num_layers as usize
+            || t > self.scratch.max_tokens
+            || src.num_logit_rows > self.max_logit_rows
+        {
+            return Err(CudaError::new(format!(
+                "MTP launch: depth {depth}, {t} rows, {} logit rows",
+                src.num_logit_rows
+            )));
+        }
+        let s = gpu.stream().clone();
+        let (lists, zeros) = match self.mtp_lists.as_ref() {
+            Some((l, z)) => (dptr(l, &s), dptr(z, &s)),
+            None => return Err(CudaError::new("MTP launch: no MTP layers loaded")),
+        };
+        let c = self.weights.config.clone();
+        let h = c.hidden_size;
+        let (h32, t32): (u32, u32) = (narrow(h, "hidden size")?, narrow(t, "MTP rows")?);
+        let eps = c.rms_norm_eps;
+        // 1. hnorm(previous level) and enorm(embedding), as BF16 rows of
+        //    `hidden`, then interleaved into `[e ‖ h]` rows of `2 × hidden`.
+        {
+            let sc = &self.scratch;
+            let mw = &self.weights.mtp[depth];
+            let ops = &self.kernels.ops;
+            let p = |b: &CudaSlice<f32>| dptr(b, &s);
+            let m = sc.max_tokens as u64;
+            // Rows of `hidden / 2` words each buffer holds.
+            let rows = |bytes: usize| bytes as u64 / (2 * h as u64);
+            let mut args = CopyArgs {
+                src_buf: lists,
+                src_row: lists + 4 * 2 * m,
+                dst_buf: lists + 4 * 4 * m,
+                dst_row: lists + 4 * 6 * m,
+                status: src.status,
+                width: h32 / 2,
+                items: 2 * t32,
+                ..CopyArgs::default()
+            };
+            for (i, (base, n)) in [
+                (dptr(&sc.sel, &s), rows(sc.sel.len() * 2)),
+                (dptr(&sc.attn, &s), rows(sc.attn.len() * 2)),
+                (dptr(&sc.xq, &s), rows(sc.xq.len())),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                args.buf[i] = base;
+                args.rows[i] = n;
+            }
+            const _: () = assert!(COPY_BUFFERS >= 3);
+            // SAFETY: the MTP input rows were written by the caller; the
+            // embedding reads ids it bounded; the copy lists hold `2 ×
+            // max_tokens` items, of which `2t` run, each inside its buffer
+            // (and bounded again by the kernel).
             unsafe {
                 ops.rmsnorm(
                     gpu,
-                    p(&sc.x),
                     0,
-                    p(&sc.h),
+                    dptr(&sc.attn, &s),
+                    p(&sc.proj),
                     h32,
-                    dptr(&lw.input_norm, &s),
+                    p(&mw.hnorm),
                     h32,
                     eps,
                     t32,
                 )?;
-                ops.quant_fp8(gpu, dptr(&sc.xq, &s), p(&sc.xsf), p(&sc.x), tp32, h32, tp32)?;
-                let qkv = &lw.attention.qkv;
-                k.fp8_gemm.launch(
+                ops.embed(
                     gpu,
-                    &GemmArgs {
-                        m: tp32,
-                        n: qkv.linear.n,
-                        k: qkv.linear.k,
-                        a: dptr(&sc.xq, &s),
-                        b: dptr(&qkv.linear.w, &s),
-                        d: dptr(&sc.qkv, &s),
-                        sfa: p(&sc.xsf),
-                        sfb: dptr(&qkv.linear.scale, &s),
-                        alpha: 1.0,
-                    },
-                )?;
-                // 2. RoPE, KV write, attention.
-                let rope = &self
-                    .rope
-                    .iter()
-                    .find(|(th, _)| *th == spec.rope_theta)
-                    .expect("table per theta")
-                    .1;
-                ops.qkv_rope_kv(
-                    gpu,
-                    QkvArgs {
-                        qkv: dptr(&sc.qkv, &s),
-                        q_out: dptr(&sc.q, &s),
-                        pool: dptr(kv.pool(lkv.group), &s),
-                        positions: src.positions,
-                        kv_block: src.kv_block[lkv.group],
-                        kv_slot: src.kv_slot[lkv.group],
-                        rope: dptr(rope, &s),
-                        block_elems: geom.block_elems() as u64,
-                        k_off: geom.k_offset(lkv.layer_in_group) as u64,
-                        v_off: geom.v_offset(lkv.layer_in_group) as u64,
-                        chunk_stride: qkv.chunk_stride,
-                        chunks: qkv.chunks,
-                        q_heads_per_chunk: qkv.q_heads_per_chunk,
-                        kv_heads_per_chunk: qkv.kv_heads_per_chunk,
-                    },
+                    p(&sc.proj),
+                    dptr(&self.weights.embed, &s),
+                    src.token_ids,
+                    h32,
                     t32,
                 )?;
-                let pool = dptr(kv.pool(lkv.group), &s);
-                k.attention.run_view(
+                ops.rmsnorm(
                     gpu,
-                    &src.plans[lkv.group],
-                    &AttnLayer {
-                        k_base: pool + 2 * geom.k_offset(lkv.layer_in_group) as u64,
-                        v_base: pool + 2 * geom.v_offset(lkv.layer_in_group) as u64,
-                        block_elems: narrow(geom.block_elems(), "KV block elements")?,
-                        num_kv_heads: geom.num_kv_heads,
-                        page_size: geom.block_size,
-                        window_left: match spec.window() {
-                            Some(w) => narrow::<i32, _>(w, "window")? - 1,
-                            None => -1,
-                        },
-                        sink: dptr(&lw.attention.sinks, &s),
-                    },
-                    nq,
-                    dptr(&sc.q, &s),
-                    dptr(&sc.attn, &s),
+                    0,
+                    dptr(&sc.sel, &s),
+                    p(&sc.proj),
+                    h32,
+                    p(&mw.enorm),
+                    h32,
+                    eps,
+                    t32,
                 )?;
-                // 3. o_proj with the value scale, added into h.
-                k.bf16_gemm.launch(
+                ops.copy_rows(gpu, args)?;
+            }
+        }
+        // 2. eh_proj into the residual stream.
+        self.zero_padding_rows(gpu, t)?;
+        {
+            let sc = &self.scratch;
+            // SAFETY: `[e ‖ h]` rows of `2 × hidden` BF16 in the activations'
+            // buffer (sized for them, `ScratchSizes::new`), `t` rows out.
+            unsafe {
+                self.kernels.bf16_gemm.launch(
                     gpu,
                     &GemmArgs {
                         m: t32,
                         n: h32,
-                        k: nq * 128,
-                        a: dptr(&sc.attn, &s),
-                        b: dptr(&lw.attention.o_proj, &s),
-                        d: p(&sc.proj),
-                        sfa: 0,
-                        sfb: 0,
-                        alpha: c.attention_value_scale.unwrap_or(1.0),
-                    },
-                )?;
-                ops.add_f32(gpu, p(&sc.h), p(&sc.proj), (t * h) as u64)?;
-                // 4. FFN.
-                ops.rmsnorm(
-                    gpu,
-                    p(&sc.x),
-                    0,
-                    p(&sc.h),
-                    h32,
-                    dptr(&lw.post_attention_norm, &s),
-                    h32,
-                    eps,
-                    t32,
-                )?;
-                match &lw.ffn {
-                    Ffn::Dense(d) => {
-                        ops.quant_fp8(
-                            gpu,
-                            dptr(&sc.xq, &s),
-                            p(&sc.xsf),
-                            p(&sc.x),
-                            tp32,
-                            h32,
-                            tp32,
-                        )?;
-                        k.fp8_gemm.launch(
-                            gpu,
-                            &GemmArgs {
-                                m: tp32,
-                                n: d.gate_up.n,
-                                k: d.gate_up.k,
-                                a: dptr(&sc.xq, &s),
-                                b: dptr(&d.gate_up.w, &s),
-                                d: dptr(&sc.gu, &s),
-                                sfa: p(&sc.xsf),
-                                sfb: dptr(&d.gate_up.scale, &s),
-                                alpha: 1.0,
-                            },
-                        )?;
-                        ops.swiglu_quant_f32scale(
-                            gpu,
-                            dptr(&sc.xq, &s),
-                            p(&sc.xsf),
-                            dptr(&sc.gu, &s),
-                            tp32,
-                            d.inter,
-                            tp32,
-                        )?;
-                        k.fp8_gemm.launch(
-                            gpu,
-                            &GemmArgs {
-                                m: tp32,
-                                n: d.down.n,
-                                k: d.down.k,
-                                a: dptr(&sc.xq, &s),
-                                b: dptr(&d.down.w, &s),
-                                d: dptr(&sc.ffn_out, &s),
-                                sfa: p(&sc.xsf),
-                                sfb: dptr(&d.down.scale, &s),
-                                alpha: 1.0,
-                            },
-                        )?;
-                        ops.add_bf16(gpu, p(&sc.h), dptr(&sc.ffn_out, &s), h32, h32, t32)?;
-                    }
-                    Ffn::Moe(m) => {
-                        ops.router_topk(
-                            gpu,
-                            dptr(&sc.topk_ids, &s),
-                            p(&sc.topk_w),
-                            p(&sc.x),
-                            dptr(&m.router, &s),
-                            dptr(&m.bias, &s),
-                            t32,
-                            h32,
-                            m.experts,
-                            m.top_k,
-                            m.scaling,
-                        )?;
-                        let masked = t <= MASKED_CAP;
-                        let (layout, rows, cap) = if masked {
-                            (
-                                MoeLayout::Masked,
-                                m.experts as usize * MASKED_CAP,
-                                MASKED_CAP32,
-                            )
-                        } else {
-                            let r = contiguous_rows(t, m.top_k as usize, m.experts as usize);
-                            (MoeLayout::Contiguous, r, 0)
-                        };
-                        let rows4: u32 = narrow(round_up(rows, 4), "padded expert rows")?;
-                        let rows32: u32 = narrow(rows, "expert rows")?;
-                        ops.moe_permute(
-                            gpu,
-                            dptr(&sc.grouped, &s),
-                            dptr(&sc.row_of, &s),
-                            dptr(&sc.topk_ids, &s),
-                            t32,
-                            m.top_k,
-                            cap,
-                            rows32,
-                        )?;
-                        ops.gather_quant_ue8m0(
-                            gpu,
-                            dptr(&sc.ea, &s),
-                            dptr(&sc.esf, &s),
-                            p(&sc.x),
-                            dptr(&sc.row_of, &s),
-                            t32,
-                            m.top_k,
-                            rows32,
-                            h32,
-                            rows4,
-                            cap,
-                        )?;
-                        let gemm_m = if masked { MASKED_CAP32 } else { rows32 };
-                        k.moe.launch(
-                            gpu,
-                            &MoeGemmArgs {
-                                layout,
-                                proj: MoeProj::GateUp,
-                                m: gemm_m,
-                                grouped_layout: dptr(&sc.grouped, &s),
-                                a: dptr(&sc.ea, &s),
-                                sfa: dptr(&sc.esf, &s),
-                                b: dptr(&m.gate_up, &s),
-                                sfb: dptr(&m.gate_up_sf, &s),
-                                d: dptr(&sc.egu, &s),
-                            },
-                        )?;
-                        ops.swiglu_quant_ue8m0(
-                            gpu,
-                            dptr(&sc.eact, &s),
-                            dptr(&sc.eact_sf, &s),
-                            dptr(&sc.egu, &s),
-                            dptr(&sc.row_of, &s),
-                            t32,
-                            m.top_k,
-                            rows32,
-                            m.inter,
-                            rows4,
-                            cap,
-                        )?;
-                        k.moe.launch(
-                            gpu,
-                            &MoeGemmArgs {
-                                layout,
-                                proj: MoeProj::Down,
-                                m: gemm_m,
-                                grouped_layout: dptr(&sc.grouped, &s),
-                                a: dptr(&sc.eact, &s),
-                                sfa: dptr(&sc.eact_sf, &s),
-                                b: dptr(&m.down, &s),
-                                sfb: dptr(&m.down_sf, &s),
-                                d: dptr(&sc.edown, &s),
-                            },
-                        )?;
-                        ops.moe_combine(
-                            gpu,
-                            p(&sc.proj),
-                            dptr(&sc.edown, &s),
-                            dptr(&sc.row_of, &s),
-                            p(&sc.topk_w),
-                            t32,
-                            h32,
-                            m.top_k,
-                        )?;
-                        ops.add_f32(gpu, p(&sc.h), p(&sc.proj), (t * h) as u64)?;
-                    }
-                }
-            }
-            if capture {
-                self.captured.push(s.clone_dtoh(&sc.h.slice(..t * h))?);
-            }
-        }
-        // Head: final norm of the wanted rows, BF16, lm_head (f32 logits).
-        let n = src.num_logit_rows;
-        let n32: u32 = narrow(n, "logit rows")?;
-        if n > 0 {
-            unsafe {
-                ops.rmsnorm(
-                    gpu,
-                    p(&sc.x),
-                    0,
-                    p(&sc.h),
-                    h32,
-                    dptr(&self.weights.final_norm, &s),
-                    h32,
-                    eps,
-                    t32,
-                )?;
-                ops.gather_rows_bf16(gpu, dptr(&sc.sel, &s), p(&sc.x), src.logit_rows, n32, h32)?;
-                k.bf16_gemm.launch(
-                    gpu,
-                    &GemmArgs {
-                        m: n32,
-                        n: narrow(c.vocab_size, "vocabulary")?,
-                        k: h32,
-                        a: dptr(&sc.sel, &s),
-                        b: dptr(&self.weights.lm_head, &s),
-                        d: p(&sc.logits),
+                        k: 2 * h32,
+                        a: dptr(&sc.xq, &s),
+                        b: dptr(&self.weights.mtp[depth].eh_proj, &s),
+                        d: dptr(&sc.h, &s),
                         sfa: 0,
                         sfb: 0,
                         alpha: 1.0,
@@ -1011,8 +1014,452 @@ impl GpuModel {
                 )?;
             }
         }
-        Ok(())
+        let mw = &self.weights.mtp[depth];
+        // 3. The layer, over this depth's planes of the drafter group.
+        let spec = c.mtp.attention.clone();
+        let pool = dptr(kv.pool(group), &s);
+        let layer_in_group: u32 = narrow(depth, "MTP depth")?;
+        let parts = LayerParts {
+            spec: &spec,
+            input_norm: &mw.input_norm,
+            post_attention_norm: &mw.post_attention_norm,
+            attention: &mw.attention,
+            ffn: FfnRef::Dense(&mw.ffn),
+        };
+        let at = LayerKvAt {
+            pool,
+            kv_block: zeros,
+            kv_slot: src.kv_rows,
+            block_elems: 0,
+            k_off: geom.plane_k_offset(layer_in_group) as u64,
+            v_off: geom.plane_v_offset(layer_in_group) as u64,
+            attn: AttnLayer {
+                k_base: pool + 2 * geom.plane_k_offset(layer_in_group) as u64,
+                v_base: pool + 2 * geom.plane_v_offset(layer_in_group) as u64,
+                k_page_stride: narrow(geom.k_row_elems(), "K row elements")?,
+                v_page_stride: narrow(geom.v_row_elems(), "V row elements")?,
+                num_kv_heads: geom.num_kv_heads,
+                page_size: 1,
+                window_left: match spec.window() {
+                    Some(w) => narrow::<i32, _>(w, "window")? - 1,
+                    None => -1,
+                },
+                sink: dptr(&mw.attention.sinks, &s),
+            },
+            plan: &src.plan,
+        };
+        unsafe {
+            layer(
+                gpu,
+                &self.kernels,
+                &mut self.scratch,
+                &self.rope,
+                &c,
+                t,
+                src.positions,
+                &parts,
+                &at,
+            )?;
+            // 4. The layer's own final norm over every row, then the head.
+            head(
+                gpu,
+                &self.kernels,
+                &mut self.scratch,
+                &self.weights,
+                &self.weights.mtp[depth].final_norm,
+                t,
+                src.logit_rows,
+                src.num_logit_rows,
+                true,
+            )
+        }
     }
+}
+
+/// The copy lists [`GpuModel::launch_mtp`] interleaves its two halves with,
+/// for up to `max_tokens` rows: item `2i` copies row `i` of buffer 0 (the
+/// `enorm` half) to row `2i` of buffer 2, item `2i + 1` row `i` of buffer 1
+/// (the `hnorm` half) to row `2i + 1`; four arrays of `2 × max_tokens`
+/// words (source buffers, source rows, destination buffers, destination
+/// rows). A prefix of `2t` items serves `t` rows.
+pub(crate) fn mtp_concat_lists(max_tokens: usize) -> Result<Vec<u32>> {
+    let n = 2 * max_tokens;
+    let mut v = vec![0u32; 4 * n];
+    for i in 0..n {
+        let row: u32 = narrow(i / 2, "MTP row")?;
+        let item: u32 = narrow(i, "MTP row")?;
+        let half = u32::from(i % 2 == 1);
+        v[i] = half;
+        v[n + i] = row;
+        v[2 * n + i] = 2;
+        v[3 * n + i] = item;
+    }
+    Ok(v)
+}
+
+/// One layer's weights, as [`layer`] reads them.
+struct LayerParts<'a> {
+    spec: &'a AttentionSpec,
+    input_norm: &'a CudaSlice<f32>,
+    post_attention_norm: &'a CudaSlice<f32>,
+    attention: &'a AttentionWeights,
+    ffn: FfnRef<'a>,
+}
+
+enum FfnRef<'a> {
+    Dense(&'a DenseFfn),
+    Moe(&'a MoeFfn),
+}
+
+/// Where one layer's KV goes and how its attention reads it.
+struct LayerKvAt<'a> {
+    pool: u64,
+    kv_block: u64,
+    kv_slot: u64,
+    block_elems: u64,
+    k_off: u64,
+    v_off: u64,
+    attn: AttnLayer,
+    plan: &'a PlanView,
+}
+
+/// One layer's launches over `t` rows of the residual stream `sc.h`: norm,
+/// quantize, fused QKV, RoPE and KV write, attention, `o_proj` with the
+/// value scale, residual; norm, the FFN (dense SwiGLU or the routed
+/// experts), residual.
+///
+/// # Safety
+///
+/// As [`GpuModel::launch`] for the rows' positions, KV targets and plan.
+#[allow(clippy::too_many_arguments)]
+unsafe fn layer(
+    gpu: &Gpu,
+    k: &Kernels,
+    sc: &mut Scratch,
+    rope: &[(f32, CudaSlice<f32>)],
+    c: &ModelConfig,
+    t: usize,
+    positions: u64,
+    lw: &LayerParts<'_>,
+    at: &LayerKvAt<'_>,
+) -> Result<()> {
+    let s = gpu.stream().clone();
+    let h = c.hidden_size;
+    let tp = round_up(t, 4);
+    // Every count the kernels take, as the u32 they take it as.
+    let (h32, t32, tp32): (u32, u32, u32) = (
+        narrow(h, "hidden size")?,
+        narrow(t, "step tokens")?,
+        narrow(tp, "padded step tokens")?,
+    );
+    let eps = c.rms_norm_eps;
+    let ops = &k.ops;
+    let spec = lw.spec;
+    let nq: u32 = narrow(spec.num_q_heads, "query heads")?;
+    let p = |b: &CudaSlice<f32>| dptr(b, &s);
+    // 1. Norm, quantize, QKV.
+    unsafe {
+        ops.rmsnorm(
+            gpu,
+            p(&sc.x),
+            0,
+            p(&sc.h),
+            h32,
+            dptr(lw.input_norm, &s),
+            h32,
+            eps,
+            t32,
+        )?;
+        ops.quant_fp8(gpu, dptr(&sc.xq, &s), p(&sc.xsf), p(&sc.x), tp32, h32, tp32)?;
+        let qkv = &lw.attention.qkv;
+        k.fp8_gemm.launch(
+            gpu,
+            &GemmArgs {
+                m: tp32,
+                n: qkv.linear.n,
+                k: qkv.linear.k,
+                a: dptr(&sc.xq, &s),
+                b: dptr(&qkv.linear.w, &s),
+                d: dptr(&sc.qkv, &s),
+                sfa: p(&sc.xsf),
+                sfb: dptr(&qkv.linear.scale, &s),
+                alpha: 1.0,
+            },
+        )?;
+        // 2. RoPE, KV write, attention.
+        let table = &rope
+            .iter()
+            .find(|(th, _)| *th == spec.rope_theta)
+            .expect("table per theta")
+            .1;
+        ops.qkv_rope_kv(
+            gpu,
+            QkvArgs {
+                qkv: dptr(&sc.qkv, &s),
+                q_out: dptr(&sc.q, &s),
+                pool: at.pool,
+                positions,
+                kv_block: at.kv_block,
+                kv_slot: at.kv_slot,
+                rope: dptr(table, &s),
+                block_elems: at.block_elems,
+                k_off: at.k_off,
+                v_off: at.v_off,
+                chunk_stride: qkv.chunk_stride,
+                chunks: qkv.chunks,
+                q_heads_per_chunk: qkv.q_heads_per_chunk,
+                kv_heads_per_chunk: qkv.kv_heads_per_chunk,
+            },
+            t32,
+        )?;
+        k.attention.run_view(
+            gpu,
+            at.plan,
+            &at.attn,
+            nq,
+            dptr(&sc.q, &s),
+            dptr(&sc.attn, &s),
+        )?;
+        // 3. o_proj with the value scale, added into h.
+        k.bf16_gemm.launch(
+            gpu,
+            &GemmArgs {
+                m: t32,
+                n: h32,
+                k: nq * 128,
+                a: dptr(&sc.attn, &s),
+                b: dptr(&lw.attention.o_proj, &s),
+                d: p(&sc.proj),
+                sfa: 0,
+                sfb: 0,
+                alpha: c.attention_value_scale.unwrap_or(1.0),
+            },
+        )?;
+        ops.add_f32(gpu, p(&sc.h), p(&sc.proj), (t * h) as u64)?;
+        // 4. FFN.
+        ops.rmsnorm(
+            gpu,
+            p(&sc.x),
+            0,
+            p(&sc.h),
+            h32,
+            dptr(lw.post_attention_norm, &s),
+            h32,
+            eps,
+            t32,
+        )?;
+        match lw.ffn {
+            FfnRef::Dense(d) => {
+                ops.quant_fp8(gpu, dptr(&sc.xq, &s), p(&sc.xsf), p(&sc.x), tp32, h32, tp32)?;
+                k.fp8_gemm.launch(
+                    gpu,
+                    &GemmArgs {
+                        m: tp32,
+                        n: d.gate_up.n,
+                        k: d.gate_up.k,
+                        a: dptr(&sc.xq, &s),
+                        b: dptr(&d.gate_up.w, &s),
+                        d: dptr(&sc.gu, &s),
+                        sfa: p(&sc.xsf),
+                        sfb: dptr(&d.gate_up.scale, &s),
+                        alpha: 1.0,
+                    },
+                )?;
+                ops.swiglu_quant_f32scale(
+                    gpu,
+                    dptr(&sc.xq, &s),
+                    p(&sc.xsf),
+                    dptr(&sc.gu, &s),
+                    tp32,
+                    d.inter,
+                    tp32,
+                )?;
+                k.fp8_gemm.launch(
+                    gpu,
+                    &GemmArgs {
+                        m: tp32,
+                        n: d.down.n,
+                        k: d.down.k,
+                        a: dptr(&sc.xq, &s),
+                        b: dptr(&d.down.w, &s),
+                        d: dptr(&sc.ffn_out, &s),
+                        sfa: p(&sc.xsf),
+                        sfb: dptr(&d.down.scale, &s),
+                        alpha: 1.0,
+                    },
+                )?;
+                ops.add_bf16(gpu, p(&sc.h), dptr(&sc.ffn_out, &s), h32, h32, t32)?;
+            }
+            FfnRef::Moe(m) => {
+                ops.router_topk(
+                    gpu,
+                    dptr(&sc.topk_ids, &s),
+                    p(&sc.topk_w),
+                    p(&sc.x),
+                    dptr(&m.router, &s),
+                    dptr(&m.bias, &s),
+                    t32,
+                    h32,
+                    m.experts,
+                    m.top_k,
+                    m.scaling,
+                )?;
+                let masked = t <= MASKED_CAP;
+                let (layout, rows, cap) = if masked {
+                    (
+                        MoeLayout::Masked,
+                        m.experts as usize * MASKED_CAP,
+                        MASKED_CAP32,
+                    )
+                } else {
+                    let r = contiguous_rows(t, m.top_k as usize, m.experts as usize);
+                    (MoeLayout::Contiguous, r, 0)
+                };
+                let rows4: u32 = narrow(round_up(rows, 4), "padded expert rows")?;
+                let rows32: u32 = narrow(rows, "expert rows")?;
+                ops.moe_permute(
+                    gpu,
+                    dptr(&sc.grouped, &s),
+                    dptr(&sc.row_of, &s),
+                    dptr(&sc.topk_ids, &s),
+                    t32,
+                    m.top_k,
+                    cap,
+                    rows32,
+                )?;
+                ops.gather_quant_ue8m0(
+                    gpu,
+                    dptr(&sc.ea, &s),
+                    dptr(&sc.esf, &s),
+                    p(&sc.x),
+                    dptr(&sc.row_of, &s),
+                    t32,
+                    m.top_k,
+                    rows32,
+                    h32,
+                    rows4,
+                    cap,
+                )?;
+                let gemm_m = if masked { MASKED_CAP32 } else { rows32 };
+                k.moe.launch(
+                    gpu,
+                    &MoeGemmArgs {
+                        layout,
+                        proj: MoeProj::GateUp,
+                        m: gemm_m,
+                        grouped_layout: dptr(&sc.grouped, &s),
+                        a: dptr(&sc.ea, &s),
+                        sfa: dptr(&sc.esf, &s),
+                        b: dptr(&m.gate_up, &s),
+                        sfb: dptr(&m.gate_up_sf, &s),
+                        d: dptr(&sc.egu, &s),
+                    },
+                )?;
+                ops.swiglu_quant_ue8m0(
+                    gpu,
+                    dptr(&sc.eact, &s),
+                    dptr(&sc.eact_sf, &s),
+                    dptr(&sc.egu, &s),
+                    dptr(&sc.row_of, &s),
+                    t32,
+                    m.top_k,
+                    rows32,
+                    m.inter,
+                    rows4,
+                    cap,
+                )?;
+                k.moe.launch(
+                    gpu,
+                    &MoeGemmArgs {
+                        layout,
+                        proj: MoeProj::Down,
+                        m: gemm_m,
+                        grouped_layout: dptr(&sc.grouped, &s),
+                        a: dptr(&sc.eact, &s),
+                        sfa: dptr(&sc.eact_sf, &s),
+                        b: dptr(&m.down, &s),
+                        sfb: dptr(&m.down_sf, &s),
+                        d: dptr(&sc.edown, &s),
+                    },
+                )?;
+                ops.moe_combine(
+                    gpu,
+                    p(&sc.proj),
+                    dptr(&sc.edown, &s),
+                    dptr(&sc.row_of, &s),
+                    p(&sc.topk_w),
+                    t32,
+                    h32,
+                    m.top_k,
+                )?;
+                ops.add_f32(gpu, p(&sc.h), p(&sc.proj), (t * h) as u64)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The head over `t` rows of `sc.h`: `norm` into `sc.x` (every row, when
+/// logits are wanted or `norm_all`), then the `n` wanted rows to BF16 and
+/// the `lm_head` GEMM into f32 logits.
+///
+/// # Safety
+///
+/// `logit_rows` must hold `n` rows below `t` when the launches run.
+#[allow(clippy::too_many_arguments)]
+unsafe fn head(
+    gpu: &Gpu,
+    k: &Kernels,
+    sc: &mut Scratch,
+    weights: &ModelWeights,
+    norm: &CudaSlice<f32>,
+    t: usize,
+    logit_rows: u64,
+    n: usize,
+    norm_all: bool,
+) -> Result<()> {
+    let s = gpu.stream().clone();
+    let c = &weights.config;
+    let h = c.hidden_size;
+    let (h32, t32): (u32, u32) = (narrow(h, "hidden size")?, narrow(t, "step tokens")?);
+    let n32: u32 = narrow(n, "logit rows")?;
+    let ops = &k.ops;
+    let p = |b: &CudaSlice<f32>| dptr(b, &s);
+    if n > 0 || norm_all {
+        unsafe {
+            ops.rmsnorm(
+                gpu,
+                p(&sc.x),
+                0,
+                p(&sc.h),
+                h32,
+                dptr(norm, &s),
+                h32,
+                c.rms_norm_eps,
+                t32,
+            )?;
+        }
+    }
+    if n > 0 {
+        unsafe {
+            ops.gather_rows_bf16(gpu, dptr(&sc.sel, &s), p(&sc.x), logit_rows, n32, h32)?;
+            k.bf16_gemm.launch(
+                gpu,
+                &GemmArgs {
+                    m: n32,
+                    n: narrow(c.vocab_size, "vocabulary")?,
+                    k: h32,
+                    a: dptr(&sc.sel, &s),
+                    b: dptr(&weights.lm_head, &s),
+                    d: p(&sc.logits),
+                    sfa: 0,
+                    sfb: 0,
+                    alpha: 1.0,
+                },
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// `[max_len][32 cos | 32 sin]` for one layer's RoPE, computed with the
@@ -1089,6 +1536,7 @@ pub fn group_geometry(
                 head_dim_v: narrow(a.head_dim_v, "V head dim")?,
                 block_size,
                 num_blocks: num_blocks[g],
+                layout: crate::kv::KvLayout::Blocked,
             })
         })
         .collect()
@@ -1161,7 +1609,7 @@ mod tests {
             let (keys, kv) = group_layers(&flash(keep));
             let groups = kv.iter().map(|l| l.group + 1).max().unwrap();
             assert_eq!(groups, keys.len());
-            ScratchSizes::new(&flash(keep), groups, 12_800, 8192, 64, 4096).unwrap()
+            ScratchSizes::new(&flash(keep), groups, 12_800, 8192, 64, 4096, 0).unwrap()
         };
         let (dense, moe, both) = (size(&[0]), size(&[1, 2]), size(&[0, 1]));
         assert_eq!(dense.experts, 0);

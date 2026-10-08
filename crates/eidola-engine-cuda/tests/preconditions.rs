@@ -128,7 +128,8 @@ fn out_of_range_launches_are_refused() {
     let layer = AttnLayer {
         k_base: 0,
         v_base: 0,
-        block_elems: 1,
+        k_page_stride: 1,
+        v_page_stride: 1,
         num_kv_heads: 4,
         page_size: 16,
         window_left: -1,

@@ -3,18 +3,21 @@
 //! A step runs the seam's sequence exactly (`eidola-engine/src/executor.rs`):
 //! maintenance in order, table updates in order, the target forward over every
 //! host token (KV written through the tables), then sampling on the device with
-//! the core's sampling semantics over the sampleable vocabulary. Speculative
-//! decoding is not implemented yet: the executor reports no draft width, and a
-//! step asking for drafts is a host bug (as is one asking for drafts at
-//! position 0, which the seam forbids outright).
+//! the core's sampling semantics over the sampleable vocabulary. With a draft
+//! width ([`CudaExecutorConfig::draft_tokens`]) every step is a drafted step
+//! ([`crate::draft`]): MTP drafter rows for every row, and for the rows the
+//! host gave drafts, drafting, verification and chain acceptance inside the
+//! step. Drafts at position 0, more drafts than depths, and drafts on a row
+//! that is not one sampled host token are host bugs.
 //!
 //! Contract checks mirror the CPU reference executor's: a KV write into a block
 //! mapped by more than one table entry, or a read through an unmapped entry,
 //! panics before anything is launched.
 //!
-//! With [`CudaGraphs::On`], a pure-decode step that fits a rung of the decode
-//! ladder replays that rung's graph instead of launching eagerly (see
-//! [`crate::graph`]); every check above runs first, the same either way.
+//! With [`CudaGraphs::On`], a pure-decode step (or, drafting, a uniform drafted
+//! decode step) that fits a rung of its ladder replays that rung's graph
+//! instead of launching eagerly (see [`crate::graph`] and [`crate::draft`]);
+//! every check above runs first, the same either way.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -29,17 +32,20 @@ use eidola_engine_model::safetensors::WeightSet;
 
 use crate::attention::{AttnPlan, AttnRequest, HostPlan, PlanShape};
 use crate::device::ImageArch;
+use crate::draft::MtpHidden;
 use crate::graph::{
     CudaGraphs, DecodeGraphs, DecodePath, DecodeRows, GroupSlots, ProgramArgs, decode_ladder,
     decode_rows, max_decode_pages, pack, rung_for, split_readback,
 };
-use crate::kv::KvStore;
+use crate::kv::{GroupGeometry, KvLayout, KvStore};
 use crate::launch::dptr;
 use crate::model::{
     ForwardInput, GpuModel, InputParts, Kernels, group_geometry, group_layers, read_config,
 };
 use crate::sampler::{STATUS_NON_FINITE, SampleRow};
-use crate::support::{Unsupported, check_context, check_device, check_sampleable, check_supported};
+use crate::support::{
+    Unsupported, check_context, check_device, check_drafting, check_sampleable, check_supported,
+};
 use crate::weights::ModelWeights;
 use crate::{CudaError, Gpu, Result, narrow};
 
@@ -60,24 +66,43 @@ pub struct CudaExecutorConfig {
     /// family image on any CC 10.x part).
     pub image: Option<ImageArch>,
     /// Whether decode steps replay captured graphs (captured here, at
-    /// construction, one per rung of [`decode_ladder`]).
+    /// construction, one per rung of [`decode_ladder`], or of
+    /// [`crate::draft::draft_ladder`] when drafting).
     pub graphs: CudaGraphs,
+    /// Draft width `k`: MTP depths drafted per decode step, depth `d` served
+    /// by the checkpoint's MTP layer `d` (0 disables drafting; at most
+    /// [`crate::support::MTP_LAYERS`]).
+    pub draft_tokens: u32,
+    /// Which hidden state chains into the MTP depths.
+    pub mtp_hidden: MtpHidden,
 }
 
 /// Physical blocks per KV group, keyed by the group's kind, each including
 /// the null block 0. A group the retained layers use needs at least two; one
-/// they do not use must have none. (A drafter group joins these when drafting
-/// does.)
+/// they do not use must have none. The drafter group (the MTP depths' KV and
+/// boundary taps) exists exactly when drafting does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KvBlocks {
     pub global: u32,
     pub sliding: u32,
+    pub drafter: u32,
 }
 
 impl KvBlocks {
     /// The block count of each group `keys` names, in order; refuses a count
     /// for a group no retained layer uses.
-    pub fn resolve(&self, keys: &[AttentionSpec]) -> std::result::Result<Vec<u32>, Unsupported> {
+    pub fn resolve(
+        &self,
+        keys: &[AttentionSpec],
+        drafting: bool,
+    ) -> std::result::Result<Vec<u32>, Unsupported> {
+        if !drafting && self.drafter != 0 {
+            return Err(Unsupported {
+                field: "num_blocks.drafter".into(),
+                found: self.drafter.to_string(),
+                required: "0 (nothing is drafted)".into(),
+            });
+        }
         let used = |global: bool| {
             keys.iter()
                 .any(|k| (k.kind == ModelAttention::Global) == global)
@@ -110,6 +135,9 @@ pub struct CudaExecutor {
     cfg: CudaExecutorConfig,
     kv: KvStore,
     model: GpuModel,
+    /// Drafting: the planner's constants, the device buffers, and per slot
+    /// which positions its state holds.
+    draft: Option<Drafting>,
     // Sampling scratch.
     sample_rows: cudarc::driver::CudaSlice<SampleRow>,
     probs: cudarc::driver::CudaSlice<f64>,
@@ -118,8 +146,12 @@ pub struct CudaExecutor {
     steps: u64,
     /// Testing aid: compute logits at every host token of every step and keep
     /// the last step's (`[tokens, vocab]`, see [`CudaExecutor::take_all_logits`]).
-    /// Steps run eagerly while it is set.
+    /// Steps run eagerly while it is set (not with drafting).
     pub record_all_logits: bool,
+    /// Testing aid: keep every drafted step's drafts per row (see
+    /// [`CudaExecutor::take_drafts`]).
+    pub record_drafts: bool,
+    drafts: std::cell::RefCell<Vec<DraftRecord>>,
     all_logits: Option<Vec<f32>>,
     /// The captured decode graphs (graphs on).
     decode: Option<DecodeGraphs>,
@@ -147,6 +179,26 @@ impl std::fmt::Debug for CudaExecutor {
             .field("steps", &self.steps)
             .finish_non_exhaustive()
     }
+}
+
+/// A drafting executor's own state.
+struct Drafting {
+    ctx: crate::draft::PlanCtx,
+    bufs: crate::draft::DraftBuffers,
+    /// Per slot: `(base, at)` when its state holds the levels at `base ..`
+    /// (entry `j` at `base + j`) and the sequence continues from `at`.
+    slots: Vec<Option<(u32, u32)>>,
+    graphs: Option<crate::draft::DraftGraphs>,
+}
+
+/// One row's drafts in a drafted step (see [`CudaExecutor::record_drafts`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftRecord {
+    pub slot: u32,
+    /// The row's first host position.
+    pub context_len: u32,
+    /// The drafts for positions `p + 1 ..= p + k`.
+    pub drafts: Vec<u32>,
 }
 
 /// What [`CudaExecutor::new`] builds from, once every host-side check passed.
@@ -179,11 +231,30 @@ impl CudaExecutor {
     ) -> Result<Plan> {
         let config = read_config(store, keep_layers)?;
         check_supported(&config)?;
+        let depths = cfg.draft_tokens as usize;
+        check_drafting(&config, depths)?;
         check_sampleable(cfg.sampleable_vocab_size as usize, config.vocab_size)?;
         check_context(cfg.max_model_len, &config)?;
         let (keys, layer_kv) = group_layers(&config);
-        let num_blocks = cfg.num_blocks.resolve(&keys)?;
-        let geometry = group_geometry(&keys, &layer_kv, cfg.block_size, &num_blocks)?;
+        let num_blocks = cfg.num_blocks.resolve(&keys, depths > 0)?;
+        let mut geometry = group_geometry(&keys, &layer_kv, cfg.block_size, &num_blocks)?;
+        if depths > 0 {
+            // The drafter group: one plane pair per depth, and a tap of
+            // every depth's level per block.
+            let a = &config.mtp.attention;
+            geometry.push(GroupGeometry {
+                num_layers: cfg.draft_tokens,
+                num_kv_heads: narrow(a.num_kv_heads, "KV heads")?,
+                head_dim_qk: narrow(a.head_dim_qk, "QK head dim")?,
+                head_dim_v: narrow(a.head_dim_v, "V head dim")?,
+                block_size: cfg.block_size,
+                num_blocks: cfg.num_blocks.drafter,
+                layout: KvLayout::Planar {
+                    taps: cfg.draft_tokens,
+                    hidden: narrow(config.hidden_size, "hidden size")?,
+                },
+            });
+        }
         for g in &geometry {
             g.validate()?;
         }
@@ -212,13 +283,30 @@ impl CudaExecutor {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut kv_groups = kv_groups;
+        if let Some(g) = geometry.get(keys.len()) {
+            let window = match config.mtp.attention.kind {
+                ModelAttention::Sliding { window } => narrow(window, "window")?,
+                ModelAttention::Global => unreachable!("check_drafting: a sliding MTP layer"),
+            };
+            kv_groups.push(KvGroupSpec {
+                name: "mtp".into(),
+                role: KvRole::Drafter,
+                attention: AttentionKind::Sliding { window },
+                num_layers: g.num_layers,
+                num_kv_heads: g.num_kv_heads,
+                head_dim_qk: g.head_dim_qk,
+                head_dim_v: g.head_dim_v,
+                num_blocks: g.num_blocks,
+            });
+        }
         let spec = ModelSpec {
             vocab_size: narrow(config.vocab_size, "vocabulary")?,
             sampleable_vocab_size: cfg.sampleable_vocab_size,
             block_size: cfg.block_size,
             max_model_len: cfg.max_model_len,
             kv_groups,
-            max_draft_tokens: 0,
+            max_draft_tokens: cfg.draft_tokens,
             num_state_slots: cfg.num_state_slots,
             buckets: cfg.buckets.clone(),
         };
@@ -252,16 +340,24 @@ impl CudaExecutor {
         } = Self::plan(&store, keep_layers, &cfg)?;
         let image = check_device(gpu.info(), &config, cfg.image)?;
         let kernels = Kernels::load(&gpu, kernels_dir, Some(image))?;
-        let weights = ModelWeights::load(&gpu, &kernels, store, config)?;
+        let depths = cfg.draft_tokens;
+        let hidden = config.hidden_size;
+        let weights = ModelWeights::load(&gpu, &kernels, store, config, depths as usize)?;
         let last = *spec.buckets.last().expect("validated: a bucket");
         let max_tokens = last.max_tokens as usize;
         let max_rows = last.max_seqs as usize;
+        // Per slot, with drafting: every depth's level at each of the
+        // `depths + 1` positions a step can leave it at.
+        let state_width = (depths as usize + 1)
+            .checked_mul(depths as usize)
+            .and_then(|x| x.checked_mul(hidden))
+            .ok_or_else(|| CudaError::new("drafter state overflows"))?;
         let kv = KvStore::new(
             &gpu,
             geometry,
             cfg.num_state_slots,
             spec.max_blocks_per_seq(),
-            0,
+            state_width,
         )?;
         let model = GpuModel::new(
             &gpu,
@@ -278,39 +374,77 @@ impl CudaExecutor {
             CudaGraphs::On => DecodePath::Replay,
             CudaGraphs::Off => DecodePath::Eager,
         };
+        let draft = if depths > 0 {
+            let ctx = crate::draft::PlanCtx {
+                depths,
+                hidden: cfg.mtp_hidden,
+                block_size: cfg.block_size,
+                targets: Vec::new(),
+                drafter_window: 0,
+                drafter_group_size: 0,
+                cap_rows: last.max_seqs,
+                max_blocks: spec.max_blocks_per_seq(),
+                graph: false,
+            };
+            Some(Drafting {
+                bufs: crate::draft::DraftBuffers::new(
+                    &gpu,
+                    &ctx,
+                    hidden,
+                    cfg.sampleable_vocab_size,
+                )?,
+                ctx,
+                slots: vec![None; cfg.num_state_slots as usize],
+                graphs: None,
+            })
+        } else {
+            None
+        };
+        // The plain sampler's scratch (drafting steps use their own).
+        let sample_rows = if depths > 0 { 1 } else { max_rows.max(1) };
         let mut ex = CudaExecutor {
-            sample_rows: s.alloc_zeros(max_rows.max(1))?,
+            sample_rows: s.alloc_zeros(sample_rows)?,
             probs: s.alloc_zeros(
-                max_rows
-                    .max(1)
+                sample_rows
                     .checked_mul(v)
                     .ok_or_else(|| CudaError::new("sampler scratch overflows"))?,
             )?,
-            tokens: s.alloc_zeros(max_rows.max(1))?,
+            tokens: s.alloc_zeros(sample_rows)?,
             status: s.alloc_zeros(1)?,
             gpu,
             spec,
             cfg,
             kv,
             model,
+            draft,
             steps: 0,
             record_all_logits: false,
+            record_drafts: false,
+            drafts: std::cell::RefCell::new(Vec::new()),
             all_logits: None,
             decode: None,
             decode_path: Cell::new(decode_path),
             stats: DecodeStats::default(),
         };
+        if let Some(d) = ex.draft.as_mut() {
+            d.ctx = draft_ctx(&ex.spec, &ex.model, &ex.cfg)?;
+        }
         if ex.cfg.graphs == CudaGraphs::On {
-            ex.capture_decode_graphs()?;
+            if ex.draft.is_some() {
+                ex.capture_draft_graphs()?;
+            } else {
+                ex.capture_decode_graphs()?;
+            }
         }
         Ok(ex)
     }
 
-    /// Query heads per KV head, per group.
+    /// Query heads per KV head, per target group.
     fn group_sizes(&self) -> Result<Vec<u32>> {
         self.spec
             .kv_groups
             .iter()
+            .take(self.model.num_groups())
             .enumerate()
             .map(|(g, group)| {
                 let nq = self
@@ -433,6 +567,9 @@ impl CudaExecutor {
             || step.query_tokens() > step.bucket.max_tokens
         {
             return Err(CudaError::new("batch exceeds its bucket"));
+        }
+        if self.draft.is_some() {
+            return self.draft_step(step);
         }
         // The whole step is validated before any of it takes effect: the
         // maintenance and table updates are staged (checked, and the tables
@@ -736,6 +873,389 @@ impl CudaExecutor {
     }
 }
 
+/// The planner's constants for this executor.
+fn draft_ctx(
+    spec: &ModelSpec,
+    model: &GpuModel,
+    cfg: &CudaExecutorConfig,
+) -> Result<crate::draft::PlanCtx> {
+    let c = model.config();
+    let targets = model.num_groups();
+    let group_size = |kv_heads: u32| -> Result<u32> {
+        let nq: u32 = narrow(c.layers[0].attention.num_q_heads, "query heads")?;
+        Ok(nq / kv_heads)
+    };
+    let drafter = &spec.kv_groups[targets];
+    let AttentionKind::Sliding { window } = drafter.attention else {
+        return Err(CudaError::new("the drafter group is a sliding window"));
+    };
+    let last = *spec.buckets.last().expect("validated: a bucket");
+    Ok(crate::draft::PlanCtx {
+        depths: cfg.draft_tokens,
+        hidden: cfg.mtp_hidden,
+        block_size: spec.block_size,
+        targets: spec.kv_groups[..targets]
+            .iter()
+            .map(|g| {
+                Ok(crate::draft::TargetGroup {
+                    attention: g.attention,
+                    group_size: group_size(g.num_kv_heads)?,
+                })
+            })
+            .collect::<Result<_>>()?,
+        drafter_window: window,
+        drafter_group_size: narrow(c.mtp.attention.num_q_heads, "query heads")
+            .map(|nq: u32| nq / drafter.num_kv_heads)?,
+        cap_rows: last.max_seqs,
+        max_blocks: spec.max_blocks_per_seq(),
+        graph: false,
+    })
+}
+
+impl CudaExecutor {
+    /// The drafts of every drafted step since the last call, row by row in
+    /// step order, while [`CudaExecutor::record_drafts`] is set (rows without
+    /// drafts included, with none). Takes `&self` so a caller that only
+    /// borrows the executor (through the engine) can drain them.
+    pub fn take_drafts(&self) -> Vec<DraftRecord> {
+        std::mem::take(&mut *self.drafts.borrow_mut())
+    }
+
+    /// The captured drafted-step graphs, when drafting with graphs on.
+    pub fn draft_graphs(&self) -> Option<&crate::draft::DraftGraphs> {
+        self.draft.as_ref().and_then(|d| d.graphs.as_ref())
+    }
+
+    /// Capture one graph per rung of the drafted ladder.
+    fn capture_draft_graphs(&mut self) -> Result<()> {
+        let d = self.draft.as_mut().expect("drafting");
+        let drafter = self.model.num_groups();
+        let graphs = crate::draft::DraftGraphs::capture(
+            &self.gpu,
+            crate::draft::draft_ladder(&self.spec.buckets, d.ctx.depths),
+            &d.ctx,
+            &mut crate::draft::RunTarget {
+                model: &mut self.model,
+                kv: &self.kv,
+                bufs: &mut d.bufs,
+                vocab: self.spec.vocab_size,
+                sampleable: self.spec.sampleable_vocab_size,
+                drafter,
+            },
+        )?;
+        d.graphs = Some(graphs);
+        Ok(())
+    }
+
+    /// A step with drafting configured: every row's drafter rows, and
+    /// drafting, verification and acceptance for the rows the host gave
+    /// drafts (`crate::draft`). Checked whole (rows, tables, the plan and its
+    /// work lists) before anything takes effect.
+    fn draft_step(&mut self, step: &StepInput) -> Result<StepOutput> {
+        use crate::draft::{Load, Row, RowOut};
+        let staged = self.kv.stage(&step.maintenance, &step.table_updates);
+        let d = self.draft.as_ref().expect("drafting");
+        let depths = d.ctx.depths;
+        let bs = self.spec.block_size;
+        let drafter = self.model.num_groups();
+        // The slots' state as it will be after this step's resets.
+        let mut slots = d.slots.clone();
+        for m in &step.maintenance {
+            if let eidola_engine::executor::Maintenance::ResetSlot { slot } = *m {
+                slots[slot as usize] = None;
+            }
+        }
+        let mirror = staged.mirror();
+        let mut rows = Vec::with_capacity(step.seqs.len());
+        let mut q_start = 0u32;
+        for e in &step.seqs {
+            assert!(e.num_tokens >= 1, "a row needs at least one host token");
+            let start = e.token_start as usize;
+            let end = start + e.num_tokens as usize;
+            assert_eq!(
+                start, q_start as usize,
+                "rows' host tokens must be contiguous in row order"
+            );
+            for (i, &pos) in step.positions[start..end].iter().enumerate() {
+                assert_eq!(
+                    pos,
+                    e.context_len + u32::try_from(i).expect("i < num_tokens, a u32"),
+                    "positions disagree with context_len"
+                );
+            }
+            let p = e.context_len + e.num_tokens - 1;
+            let k = if e.sample { e.num_drafts } else { 0 };
+            assert!(
+                p > 0 || k == 0,
+                "slot {}: {k} drafts requested at position 0",
+                e.slot
+            );
+            assert!(
+                k <= depths,
+                "{k} drafts requested; the drafter has {depths} depths"
+            );
+            assert!(p + k < self.spec.max_model_len, "row past the model length");
+            let c = e.context_len;
+            let load = if c == 0 {
+                Load::None
+            } else {
+                match slots.get(e.slot as usize).copied().flatten() {
+                    Some((base, at)) if at == c - 1 => Load::State { entry: at - base },
+                    _ => {
+                        assert!(
+                            c.is_multiple_of(bs),
+                            "slot {}: no drafter state at position {} (not a block boundary \
+                             of a cached prefix, and not this slot's last position)",
+                            e.slot,
+                            c - 1
+                        );
+                        Load::Tap {
+                            block: mirror.block_of(e.slot, drafter, c - 1),
+                        }
+                    }
+                }
+            };
+            rows.push(Row {
+                slot: Some(e.slot),
+                c,
+                tokens: step.token_ids[start..end].to_vec(),
+                k,
+                sample: e.sample,
+                sampling: e.sampling,
+                load,
+            });
+            q_start += e.num_tokens;
+        }
+        assert_eq!(
+            q_start as usize,
+            step.token_ids.len(),
+            "token_ids holds every row's host tokens"
+        );
+        let vocab = self.spec.vocab_size;
+        if let Some(&t) = step.token_ids.iter().find(|&&t| t >= vocab) {
+            return Err(CudaError::new(format!("token {t} outside vocab {vocab}")));
+        }
+        if self.record_all_logits || self.model.capture_layers {
+            return Err(CudaError::new(
+                "per-token logits and per-layer copies are not recorded while drafting",
+            ));
+        }
+        // A uniform drafted decode step that fits a rung replays (or runs
+        // directly) padded to it.
+        let path = self.decode_path.get();
+        let uniform = !rows.is_empty()
+            && rows
+                .iter()
+                .all(|r| r.tokens.len() == 1 && r.sample && r.k == depths && r.c >= depths);
+        let rung = match (path, d.graphs.as_ref()) {
+            (DecodePath::Eager, _) => None,
+            (_, None) => {
+                return Err(CudaError::new(format!("{path:?} decode needs graphs on")));
+            }
+            (_, Some(g)) if uniform => g.rung_for(rows.len()),
+            _ => None,
+        };
+        let real = rows.len();
+        let mut ctx = d.ctx.clone();
+        if let Some(r) = rung {
+            let rung_rows = d.graphs.as_ref().expect("a rung").rows(r);
+            rows.extend((real..rung_rows).map(|_| crate::draft::pad_row(depths)));
+            ctx.graph = true;
+        }
+        let kvmap = crate::draft::StepKv {
+            mirror,
+            geometry: self.kv.geometry(),
+            drafter,
+        };
+        let plan = crate::draft::plan(&rows, &ctx, &kvmap);
+        let built = crate::draft::build(&plan, &ctx)?;
+        // Every forward input the plan holds is checked as the eager path
+        // checks its own (tokens, positions, KV targets and pages inside
+        // their pools, logit rows inside each forward).
+        crate::draft::check_plan(&plan, &self.model, &self.kv, drafter)?;
+        let layout;
+        let launches;
+        let mut fresh_table = None;
+        match rung {
+            Some(r) => {
+                let g = self
+                    .draft
+                    .as_ref()
+                    .expect("drafting")
+                    .graphs
+                    .as_ref()
+                    .expect("a rung");
+                layout = g.layout(r).clone();
+                launches = crate::draft::launches(&built, &layout);
+                if launches != g.launches(r) {
+                    return Err(CudaError::new(format!(
+                        "a uniform drafted step of {real} rows does not match rung {}'s capture",
+                        g.rows(r)
+                    )));
+                }
+            }
+            None => {
+                layout = crate::draft::Layout::new(&built, &ctx, false)?;
+                launches = crate::draft::launches(&built, &layout);
+            }
+        }
+        let words = crate::draft::pack(&built, &layout, &ctx)?;
+
+        // 1-2. Maintenance, then table updates.
+        self.kv.commit(&self.gpu, staged)?;
+        // 3-4. The step's launches, then its one read-back.
+        let s = self.gpu.stream().clone();
+        let d = self.draft.as_mut().expect("drafting");
+        let table = match rung {
+            Some(_) => {
+                let g = d.graphs.as_mut().expect("a rung");
+                g.upload(&self.gpu, &words)?;
+                g.table_ptr(&s)
+            }
+            None => {
+                let t = s.clone_htod(&words)?;
+                let ptr = crate::launch::dptr(&t, &s);
+                fresh_table = Some(t);
+                ptr
+            }
+        };
+        let table_words = match (&fresh_table, d.graphs.as_ref(), rung) {
+            (Some(t), _, _) => t.len(),
+            (None, Some(g), Some(_)) => g.table_words(),
+            _ => unreachable!("a table was chosen above"),
+        };
+        let mut target = crate::draft::RunTarget {
+            model: &mut self.model,
+            kv: &self.kv,
+            bufs: &mut d.bufs,
+            vocab,
+            sampleable: self.spec.sampleable_vocab_size,
+            drafter,
+        };
+        match (rung, path) {
+            (Some(r), DecodePath::Replay) => {
+                d.graphs.as_ref().expect("a rung").replay(r)?;
+                self.stats.replayed += 1;
+            }
+            _ => {
+                // SAFETY: the table holds the step packed for `layout`, from
+                // a plan over these buffers, pools and model.
+                unsafe {
+                    crate::draft::run(
+                        &self.gpu,
+                        &launches,
+                        &layout,
+                        &mut target.args(&ctx, table, table_words),
+                    )?;
+                }
+                if rung.is_some() {
+                    self.stats.direct += 1;
+                } else {
+                    self.stats.eager += 1;
+                }
+            }
+        }
+        let rb_words = s.clone_dtoh(&d.bufs.readback)?;
+        let rb = crate::draft::split(&rb_words, ctx.cap_rows, depths);
+        if rb.status & STATUS_NON_FINITE != 0 {
+            return Err(CudaError::new("non-finite logits"));
+        }
+        if rb.status & crate::sampler::STATUS_BAD_TOKEN != 0 {
+            return Err(CudaError::new("a draft outside the sampleable vocabulary"));
+        }
+        if rb.status & crate::engine_ops::STATUS_BAD_INDEX != 0 {
+            return Err(CudaError::new("a drafted step's copy index out of range"));
+        }
+        if self.record_drafts {
+            let lanes = match &fresh_table {
+                Some(t) => s.clone_dtoh(&t.slice(layout.lanes..layout.kv_chunk))?,
+                None => d
+                    .graphs
+                    .as_ref()
+                    .expect("a rung")
+                    .read_words(&self.gpu, layout.lanes..layout.kv_chunk)?,
+            };
+            self.drafts
+                .borrow_mut()
+                .extend(plan.out[..real].iter().zip(&rows).map(|(o, row)| {
+                    DraftRecord {
+                        slot: row.slot.expect("a real row"),
+                        context_len: row.c,
+                        drafts: match *o {
+                            RowOut::Drafted(rd) => (0..row.k)
+                                .map(|i| lanes[layout.lane(&ctx, i, rd) - layout.lanes])
+                                .collect(),
+                            _ => Vec::new(),
+                        },
+                    }
+                }));
+        }
+        let stride = depths + 1;
+        let mut out = StepOutput {
+            tokens: vec![0; real * stride as usize],
+            stride,
+            num_tokens: vec![0; real],
+            logits: step.return_logits.then(Vec::new),
+        };
+        let mut logit_rows: Vec<Vec<usize>> = Vec::with_capacity(real);
+        for (i, row) in rows[..real].iter().enumerate() {
+            let produced: Vec<u32> = match plan.out[i] {
+                RowOut::Drafted(rd) => {
+                    let n = rb.counts[rd as usize];
+                    if n == 0 || n > row.k + 1 {
+                        return Err(CudaError::new(format!(
+                            "row {i}: acceptance produced {n} tokens for {} drafts",
+                            row.k
+                        )));
+                    }
+                    let at = rd as usize * stride as usize;
+                    rb.out[at..at + n as usize].to_vec()
+                }
+                RowOut::Plain(j) => vec![rb.plain[j as usize]],
+                RowOut::None => Vec::new(),
+            };
+            let first = plan.logits[i];
+            logit_rows.push(
+                (0..produced.len())
+                    .map(|j| first.expect("a sampled row has logits") as usize + j)
+                    .collect(),
+            );
+            let n = u32::try_from(produced.len()).expect("at most k + 1 tokens");
+            out.tokens[i * stride as usize..][..produced.len()].copy_from_slice(&produced);
+            out.num_tokens[i] = n;
+            // The slot continues from its last valid position; its state
+            // holds the levels at p ..= p + k.
+            let p = row.p();
+            d.slots[row.slot.expect("a real row") as usize] = Some((p, p + n.max(1) - 1));
+        }
+        for m in &step.maintenance {
+            if let eidola_engine::executor::Maintenance::ResetSlot { slot } = *m
+                && !step.seqs.iter().any(|e| e.slot == slot)
+            {
+                d.slots[slot as usize] = None;
+            }
+        }
+        if let Some(l) = out.logits.as_mut() {
+            let v = vocab as usize;
+            let max = logit_rows.iter().flatten().max().map_or(0, |&m| m + 1);
+            let all = if max > 0 {
+                s.clone_dtoh(&self.model.logits().slice(..max * v))?
+            } else {
+                Vec::new()
+            };
+            for rows in &logit_rows {
+                l.push(
+                    rows.iter()
+                        .map(|&r| all[r * v..(r + 1) * v].to_vec())
+                        .collect(),
+                );
+            }
+        }
+        drop(fresh_table);
+        Ok(out)
+    }
+}
+
 impl Executor for CudaExecutor {
     fn spec(&self) -> &ModelSpec {
         &self.spec
@@ -770,14 +1290,20 @@ mod tests {
         let b = KvBlocks {
             global: 10,
             sliding: 20,
+            drafter: 0,
         };
-        assert_eq!(b.resolve(&keys(&[0, 1])).unwrap(), vec![10, 20]);
-        assert_eq!(b.resolve(&keys(&[1, 5])).unwrap(), vec![10, 20]);
-        let e = b.resolve(&keys(&[1, 2])).unwrap_err();
+        assert_eq!(b.resolve(&keys(&[0, 1]), false).unwrap(), vec![10, 20]);
+        assert_eq!(b.resolve(&keys(&[1, 5]), false).unwrap(), vec![10, 20]);
+        let e = b.resolve(&keys(&[1, 2]), false).unwrap_err();
         assert_eq!(e.field, "num_blocks.global");
-        let e = b.resolve(&keys(&[0])).unwrap_err();
+        let e = b.resolve(&keys(&[0]), false).unwrap_err();
         assert_eq!(e.field, "num_blocks.sliding");
         let sliding = KvBlocks { global: 0, ..b };
-        assert_eq!(sliding.resolve(&keys(&[1, 2])).unwrap(), vec![20]);
+        assert_eq!(sliding.resolve(&keys(&[1, 2]), false).unwrap(), vec![20]);
+        // The drafter group has blocks exactly when drafting.
+        let drafter = KvBlocks { drafter: 30, ..b };
+        assert_eq!(drafter.resolve(&keys(&[0, 1]), true).unwrap(), vec![10, 20]);
+        let e = drafter.resolve(&keys(&[0, 1]), false).unwrap_err();
+        assert_eq!(e.field, "num_blocks.drafter");
     }
 }

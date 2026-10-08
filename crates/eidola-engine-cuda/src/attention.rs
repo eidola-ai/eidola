@@ -400,12 +400,15 @@ pub struct PlanView {
 /// One layer's KV and attention settings.
 #[derive(Clone, Copy, Debug)]
 pub struct AttnLayer {
-    /// Device address of this layer's K inside block 0.
+    /// Device address of this layer's K inside page 0.
     pub k_base: u64,
-    /// Device address of this layer's V inside block 0.
+    /// Device address of this layer's V inside page 0.
     pub v_base: u64,
-    /// Elements per block (all layers): the page stride.
-    pub block_elems: u32,
+    /// Elements from one page's K to the next: a whole block (every layer)
+    /// for a blocked group, one position's K for a planar one.
+    pub k_page_stride: u32,
+    /// Elements from one page's V to the next.
+    pub v_page_stride: u32,
     pub num_kv_heads: u32,
     pub page_size: u32,
     /// Keys visible to a query besides itself (`window - 1`), or -1.
@@ -542,7 +545,8 @@ impl Attention {
         if layer.num_kv_heads == 0
             || !num_qo_heads.is_multiple_of(layer.num_kv_heads)
             || layer.page_size == 0
-            || layer.block_elems == 0
+            || layer.k_page_stride == 0
+            || layer.v_page_stride == 0
         {
             return Err(CudaError::new(
                 "attention: query heads must be whole GQA groups; pages non-empty",
@@ -575,10 +579,10 @@ impl Attention {
                 num_heads: h,
                 head_dim: HEAD_DIM_QK,
                 batch_size: plan.num_requests,
-                stride_page: layer.block_elems,
+                stride_page: layer.k_page_stride,
                 stride_n: h * HEAD_DIM_QK,
                 stride_h: HEAD_DIM_QK,
-                v_stride_page: layer.block_elems,
+                v_stride_page: layer.v_page_stride,
                 v_stride_n: h * HEAD_DIM_VO,
                 v_stride_h: HEAD_DIM_VO,
                 k_data: layer.k_base,

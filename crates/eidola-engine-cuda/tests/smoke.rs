@@ -183,7 +183,7 @@ fn check_rmsnorm(out: &[u16], x: &[u16], w: &[u16], rows: usize, hidden: usize) 
 fn launches_from_another_thread() {
     use eidola_engine::executor::Maintenance;
     use eidola_engine_cuda::gemm::{Gemm, GemmArgs, GemmKind};
-    use eidola_engine_cuda::kv::{GroupGeometry, KvStore};
+    use eidola_engine_cuda::kv::{GroupGeometry, KvLayout, KvStore};
     use eidola_engine_cuda::launch::dptr;
 
     let Some((gpu, dir)) = setup() else { return };
@@ -213,6 +213,7 @@ fn launches_from_another_thread() {
             head_dim_v: 128,
             block_size: 16,
             num_blocks: 2,
+            layout: KvLayout::Blocked,
         }],
         1,
         1,

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! eval render   <model_dir> <tasks.jsonl> <prompts.jsonl>
-//! eval generate <kernels_dir> <model_dir> <prompts.jsonl> <outputs.jsonl> <max_tokens>
+//! eval generate <kernels_dir> <model_dir> <prompts.jsonl> <outputs.jsonl> <max_tokens> [--draft-tokens K]
 //! eval logprobs <kernels_dir> <model_dir> <prompts.jsonl> <out.jsonl> [--reference] [--full <out.f32>]
 //! eval score    <model_dir> <tasks.jsonl> <outputs.jsonl>
 //! eval compare  <a.jsonl> <b.jsonl> [--full <a.f32> <b.f32>] [--from <prompts.jsonl>]
@@ -34,7 +34,11 @@
 //!
 //! The executor replays decode graphs when `EIDOLA_ENGINE_CUDA_GRAPHS` is `on`
 //! (`off`, eager, when unset), so `generate` runs with each setting give the
-//! outputs to compare.
+//! outputs to compare. `generate --draft-tokens K` drafts `K` tokens a step
+//! with the checkpoint's MTP layers (greedy speculation: the outputs are the
+//! undrafted run's but for near-ties) and prints the acceptance of each draft
+//! depth over the prompts: the share of drafted steps whose draft `i` was
+//! accepted among those whose drafts before it were.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -51,7 +55,7 @@ use eidola_engine_chat::json::Json;
 use eidola_engine_chat::tool_call::parse_complete;
 use eidola_engine_chat::{ChatInput, ChatTemplate, MimoTokenizer, RenderOptions, ToolSchemas};
 use eidola_engine_cuda::KernelDir;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, KvBlocks};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, KvBlocks, MtpHidden};
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
 use serde_json::{Value, json};
@@ -90,7 +94,13 @@ fn ids(v: &Value) -> Vec<u32> {
         .collect()
 }
 
-fn executor(kernels: &str, model: &str, max_tokens: u32, max_seqs: u32) -> (CudaExecutor, u32) {
+fn executor(
+    kernels: &str,
+    model: &str,
+    max_tokens: u32,
+    max_seqs: u32,
+    depths: u32,
+) -> (CudaExecutor, u32) {
     let tok = MimoTokenizer::from_model_dir(Path::new(model)).unwrap();
     let gpu = Gpu::open(0).unwrap();
     let dir = KernelDir::new(kernels);
@@ -100,6 +110,7 @@ fn executor(kernels: &str, model: &str, max_tokens: u32, max_seqs: u32) -> (Cuda
         num_blocks: KvBlocks {
             global: 16_384,
             sliding: 4_096,
+            drafter: if depths > 0 { 4_096 } else { 0 },
         },
         num_state_slots: max_seqs,
         max_model_len: 16_384,
@@ -122,6 +133,8 @@ fn executor(kernels: &str, model: &str, max_tokens: u32, max_seqs: u32) -> (Cuda
         graphs: std::env::var("EIDOLA_ENGINE_CUDA_GRAPHS").map_or(CudaGraphs::Off, |v| {
             CudaGraphs::parse(&v).unwrap_or_else(|e| panic!("EIDOLA_ENGINE_CUDA_GRAPHS: {e}"))
         }),
+        draft_tokens: depths,
+        mtp_hidden: MtpHidden::Normed,
     };
     let t0 = Instant::now();
     let ex = CudaExecutor::new(gpu, &dir, store, None, cfg).unwrap();
@@ -158,15 +171,15 @@ fn render(model: &str, tasks: &str, out: &str) {
     eprintln!("rendered {} prompts", rows.len());
 }
 
-fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32) {
+fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32, depths: u32) {
     let tok = MimoTokenizer::from_model_dir(Path::new(model)).unwrap();
-    let (ex, _) = executor(kernels, model, 2048, 64);
+    let (ex, _) = executor(kernels, model, 2048, 64, depths);
     let sched = SchedulerConfig {
         max_batched_tokens: 2048,
         max_seqs: 64,
         max_prefill_chunk: 2048,
         eos_token_ids: tok.eos_token_ids().to_vec(),
-        speculative: false,
+        speculative: depths > 0,
         cache: CachePolicy::default(),
         sweep_interval_ms: 1000,
     };
@@ -189,9 +202,14 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32) 
     let mut outputs: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut finish: HashMap<u64, String> = HashMap::new();
     let (t0, mut steps, mut produced) = (Instant::now(), 0u64, 0usize);
+    // Per decode step and request: the tokens it produced (1 + accepted drafts).
+    let mut per_step: Vec<usize> = Vec::new();
     while eng.unfinished() > 0 {
         for e in eng.step(steps).unwrap() {
             produced += e.tokens.len();
+            if !e.tokens.is_empty() {
+                per_step.push(e.tokens.len());
+            }
             outputs.entry(e.id).or_default().extend(&e.tokens);
             if let Some(f) = e.finish {
                 finish.insert(e.id, format!("{f:?}"));
@@ -212,10 +230,42 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32) 
         t0.elapsed(),
         eng.stats()
     );
+    if depths > 0 {
+        let s = eng.stats();
+        let rate = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
+        let depth: Vec<String> = acceptance_by_depth(&per_step, depths as usize)
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!("draft {}: {:.3}", i + 1, r))
+            .collect();
+        eprintln!(
+            "drafting {depths}: accepted {}/{} drafts ({:.3}), {:.3} tokens per step; {}",
+            s.accepted,
+            s.drafted,
+            rate(s.accepted, s.drafted),
+            produced as f64 / per_step.len().max(1) as f64,
+            depth.join(", ")
+        );
+    }
     let out_rows: Vec<Value> = (0..rows.len() as u64)
         .map(|i| json!({"id": index[&i], "output_ids": outputs.get(&i).cloned().unwrap_or_default(), "finish": finish[&i]}))
         .collect();
     write_jsonl(out, &out_rows);
+}
+
+/// Acceptance of each draft depth from the tokens each step produced per
+/// request: draft `i` was accepted in a step that produced more than `i`
+/// tokens, among the steps whose first `i - 1` drafts were accepted (that
+/// produced at least `i`). Prefill steps count once with one token, the
+/// first, and bias nothing past depth 1's denominator by more than one step
+/// per request.
+fn acceptance_by_depth(produced: &[usize], depths: usize) -> Vec<f64> {
+    (1..=depths)
+        .map(|i| {
+            let reached = produced.iter().filter(|&&n| n >= i).count().max(1);
+            produced.iter().filter(|&&n| n > i).count() as f64 / reached as f64
+        })
+        .collect()
 }
 
 /// Log-probabilities of one logit row over its first `n` ids.
@@ -311,7 +361,7 @@ fn logprobs(
             result.push(json!({"id": r["id"], "top": tops}));
         }
     } else {
-        let (mut ex, n) = executor(kernels, model, STEP_TOKENS, 16);
+        let (mut ex, n) = executor(kernels, model, STEP_TOKENS, 16, 0);
         ex.record_all_logits = true;
         let max_len = ex.config().max_model_len;
         for r in &rows {
@@ -795,7 +845,14 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     match a.get(1).map(String::as_str) {
         Some("render") => render(&a[2], &a[3], &a[4]),
-        Some("generate") => generate(&a[2], &a[3], &a[4], &a[5], a[6].parse().unwrap()),
+        Some("generate") => generate(
+            &a[2],
+            &a[3],
+            &a[4],
+            &a[5],
+            a[6].parse().unwrap(),
+            flag(&a[7..], "--draft-tokens", 1).map_or(0, |v| v[0].parse().unwrap()),
+        ),
         Some("logprobs") => logprobs(
             &a[2],
             &a[3],

@@ -147,6 +147,10 @@ pub mod caps {
     /// Speculative draft width: MiMo's MTP heads are a handful; the node also
     /// refuses more than the loaded model has.
     pub const DRAFT_TOKENS: u32 = 8;
+    /// Speculative draft width with the CUDA executor: MiMo-V2.6-Flash's MTP
+    /// layers (`num_nextn_predict_layers`), each serving one draft depth
+    /// (`eidola-engine-cuda` `support::MTP_LAYERS`).
+    pub const CUDA_DRAFT_TOKENS: u32 = 3;
     /// Admission slots: each may hold a request body of up to
     /// `engine_protocol::MAX_REQUEST_BODY_BYTES` and its parse, held to the
     /// VM's memory separately ([`super::check_resources`]).
@@ -168,6 +172,15 @@ pub const SLIDING_KV_BYTES_PER_POSITION: u64 = 39 * 8 * (192 + 128) * 2;
 
 /// Positions a sliding layer sees (`eidola-engine-cuda` `support::WINDOW`).
 pub const SLIDING_WINDOW: u64 = 128;
+
+/// Drafter KV bytes per position for each draft depth: one MTP layer of
+/// MiMo-V2.6-Flash, 8 KV heads of 192 K + 128 V dims, bf16 (`eidola-engine-cuda`
+/// `kv::GroupGeometry`, planar layout).
+pub const DRAFTER_KV_BYTES_PER_POSITION_PER_DEPTH: u64 = 8 * (192 + 128) * 2;
+
+/// Drafter boundary-tap bytes per block for each draft depth: one chain
+/// level of the hidden size (4,096) in f32.
+pub const DRAFTER_TAP_BYTES_PER_DEPTH: u64 = 4096 * 4;
 
 /// Retention points a keyed sequence may hold per sliding group with the
 /// prefix cache enabled (the node's `cuda::RETENTION_POINTS`).
@@ -202,10 +215,43 @@ pub const STEP_TOKEN_DEVICE_BYTES: u64 = 5 << 18;
 /// 65,536 rows of at most 24 KiB.
 pub const EXPERT_FLOOR_DEVICE_BYTES: u64 = 65_536 * (24 << 10);
 
-/// Device memory per seat (`MAX_SEQS`): the sampler's f32 distribution over
-/// the vocabulary (152,576 × 4 bytes) and its row buffers, rounded up to
-/// 640 KiB.
-pub const SEAT_DEVICE_BYTES: u64 = 640 << 10;
+/// Device memory per sampler row (`eidola-engine-cuda`'s sampler scratch):
+/// the f64 distribution over at most the head's 152,576 ids (1,220,608
+/// bytes) and the row's buffers, rounded up to 1.25 MiB.
+pub const SAMPLER_ROW_DEVICE_BYTES: u64 = 5 << 18;
+
+/// Sampler rows per seat (`MAX_SEQS`): one without drafting; with `k`
+/// drafts, a step keeps `k` draft distributions, `k + 1` target
+/// distributions and acceptance's residual per row (`draft::probs_rows`).
+pub fn sampler_rows(draft_tokens: u32) -> u64 {
+    if draft_tokens == 0 {
+        1
+    } else {
+        2 * u64::from(draft_tokens) + 2
+    }
+}
+
+/// Rows of the hidden size (4,096 f32, 16 KiB) a drafting executor keeps
+/// per seat for `k` drafts: the slot's drafter state (every depth's level
+/// at each of the `k + 1` positions a step can leave it at), and the step's
+/// level rows (`draft::Levels`: `k` loaded, `k (k + 1) / 2` from the draft
+/// phase, `2 (k + 1)` write-only).
+pub fn drafter_seat_rows(draft_tokens: u32) -> u64 {
+    let k = u64::from(draft_tokens);
+    if k == 0 {
+        return 0;
+    }
+    (k + 1) * k + k + k * (k + 1) / 2 + 2 * (k + 1)
+}
+
+/// Step-table bytes a drafting executor may hold per seat beside its global
+/// page lists, in a graph's table and an eager step's together: every other
+/// per-row array of a drafted step (copy lists, token ids, positions, KV
+/// targets, work lists, the drafter's one-position page lists, sampler and
+/// acceptance rows; about 1,300 words a table for three depths), bounded by
+/// 32 KiB. An eager step's arrays per token beyond those (about 30 words for
+/// three depths) are inside [`STEP_TOKEN_DEVICE_BYTES`]'s rounding.
+pub const DRAFT_TABLE_SEAT_BYTES: u64 = 32 << 10;
 
 /// RoPE table bytes per position (`MAX_MODEL_LEN`): 64 f32 for each distinct
 /// θ, at most three.
@@ -214,23 +260,41 @@ pub const ROPE_DEVICE_BYTES_PER_POSITION: u64 = 3 * 64 * 4;
 /// Device memory the CUDA executor takes beside its weights and KV pools,
 /// bounded from above: [`DEVICE_FIXED_RESERVE_BYTES`], plus
 /// [`STEP_TOKEN_DEVICE_BYTES`] per `MAX_BATCHED_TOKENS`,
-/// [`EXPERT_FLOOR_DEVICE_BYTES`], [`SEAT_DEVICE_BYTES`] per `MAX_SEQS`, the
-/// device block tables (`MAX_SEQS` × ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉
-/// `i32` entries per KV group, two groups) and the RoPE tables
-/// ([`ROPE_DEVICE_BYTES_PER_POSITION`] per `MAX_MODEL_LEN`). Saturates.
+/// [`EXPERT_FLOOR_DEVICE_BYTES`], per `MAX_SEQS` [`sampler_rows`] of
+/// [`SAMPLER_ROW_DEVICE_BYTES`], the device block tables (`MAX_SEQS` ×
+/// ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉ `i32` entries per KV group, two
+/// groups, three with drafting) and the RoPE tables
+/// ([`ROPE_DEVICE_BYTES_PER_POSITION`] per `MAX_MODEL_LEN`). With
+/// `DRAFT_TOKENS` `k` > 0, per `MAX_SEQS` also [`drafter_seat_rows`] rows of
+/// 16 KiB, [`DRAFT_TABLE_SEAT_BYTES`], and the global page lists of a
+/// drafted step's table twice over (a graph's and an eager step's, one
+/// `i32` per block of `MAX_MODEL_LEN`). The MTP layers' own scratch (their
+/// copy lists, 36 bytes a token) is inside [`STEP_TOKEN_DEVICE_BYTES`]'s
+/// rounding, and their weights inside the pack. Saturates.
 pub fn cuda_device_reserve_bytes(sizing: &Sizing) -> u64 {
     let blocks_per_seq =
         u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size.max(1)));
+    let seats = u64::from(sizing.max_seqs);
+    let drafting = sizing.draft_tokens > 0;
+    let groups = if drafting { 3 } else { 2 };
+    let per_seat = sampler_rows(sizing.draft_tokens)
+        .saturating_mul(SAMPLER_ROW_DEVICE_BYTES)
+        .saturating_add(drafter_seat_rows(sizing.draft_tokens).saturating_mul(16 << 10))
+        .saturating_add(if drafting {
+            DRAFT_TABLE_SEAT_BYTES.saturating_add(blocks_per_seq.saturating_mul(2 * 4))
+        } else {
+            0
+        });
     DEVICE_FIXED_RESERVE_BYTES
         .saturating_add(
             u64::from(sizing.max_batched_tokens).saturating_mul(STEP_TOKEN_DEVICE_BYTES),
         )
         .saturating_add(EXPERT_FLOOR_DEVICE_BYTES)
-        .saturating_add(u64::from(sizing.max_seqs).saturating_mul(SEAT_DEVICE_BYTES))
+        .saturating_add(seats.saturating_mul(per_seat))
         .saturating_add(
-            u64::from(sizing.max_seqs)
+            seats
                 .saturating_mul(blocks_per_seq)
-                .saturating_mul(2 * 4),
+                .saturating_mul(groups * 4),
         )
         .saturating_add(
             u64::from(sizing.max_model_len).saturating_mul(ROPE_DEVICE_BYTES_PER_POSITION),
@@ -331,10 +395,16 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
 ///   ⌈`MAX_BATCHED_TOKENS` / `B`⌉ blocks;
 /// - the **global** pool: one `MAX_MODEL_LEN` sequence and the null block,
 ///   ⌈`MAX_MODEL_LEN` / `B`⌉ + 1 blocks;
+/// - with `DRAFT_TOKENS` `k` > 0, the **drafter** pool (the MTP depths' KV,
+///   a sliding window of the same width): as many blocks as the sliding
+///   pool;
 ///
 /// each pool one pad block more (where a replayed decode graph's padding rows
-/// write), each block `B` positions of [`SLIDING_KV_BYTES_PER_POSITION`] or
-/// [`GLOBAL_KV_BYTES_PER_POSITION`]. Saturates rather than wraps.
+/// write), each block `B` positions of [`SLIDING_KV_BYTES_PER_POSITION`],
+/// [`GLOBAL_KV_BYTES_PER_POSITION`] or `k` ×
+/// [`DRAFTER_KV_BYTES_PER_POSITION_PER_DEPTH`], a drafter block also `k` ×
+/// [`DRAFTER_TAP_BYTES_PER_DEPTH`] of boundary tap. Saturates rather than
+/// wraps.
 pub fn cuda_kv_min_bytes(sizing: &Sizing, cache: &CacheConfig) -> u64 {
     let b = u64::from(sizing.kv_block_size.max(1));
     let points = if cache.enabled { RETENTION_POINTS } else { 0 };
@@ -349,8 +419,18 @@ pub fn cuda_kv_min_bytes(sizing: &Sizing, cache: &CacheConfig) -> u64 {
             .saturating_mul(b)
             .saturating_mul(per_position)
     };
+    let k = u64::from(sizing.draft_tokens);
+    let drafter = if k == 0 {
+        0
+    } else {
+        sliding_blocks.saturating_add(1).saturating_mul(
+            b.saturating_mul(k * DRAFTER_KV_BYTES_PER_POSITION_PER_DEPTH)
+                .saturating_add(k * DRAFTER_TAP_BYTES_PER_DEPTH),
+        )
+    };
     pool(sliding_blocks, SLIDING_KV_BYTES_PER_POSITION)
         .saturating_add(pool(global_blocks, GLOBAL_KV_BYTES_PER_POSITION))
+        .saturating_add(drafter)
 }
 
 /// Whether the deployment's VM and GPUs hold what its configuration
@@ -785,12 +865,13 @@ pub fn parse_measured(
             env::DRAFT_TOKENS
         )));
     }
-    // The CUDA executor does not draft yet: a draft width with it is refused
-    // rather than ignored.
-    if kind == Executor::Cuda && sizing.draft_tokens != 0 {
+    // The CUDA executor drafts with MiMo-V2.6-Flash's MTP layers, one per
+    // depth: no wider than the checkpoint it serves ships.
+    if kind == Executor::Cuda && sizing.draft_tokens > caps::CUDA_DRAFT_TOKENS {
         return Err(ConfigError(format!(
-            "{} must be 0 with the cuda executor (it does not draft)",
-            env::DRAFT_TOKENS
+            "{} must be at most {} with the cuda executor (the model's MTP layers)",
+            env::DRAFT_TOKENS,
+            caps::CUDA_DRAFT_TOKENS
         )));
     }
 
@@ -1435,6 +1516,18 @@ mod tests {
         assert_eq!(cuda_kv_min_bytes(&sizing, &cache(true)), 12_228_280_320);
         // Without the cache, no retained windows: 1 + 64 × 10 + 512 = 1,153.
         assert_eq!(cuda_kv_min_bytes(&sizing, &cache(false)), 6_707_527_680);
+        // Drafting k tokens adds a drafter pool of the sliding pool's
+        // blocks, each 16 positions × k × 5,120 bytes and a tap of k × 16 KiB.
+        for k in 1..=3u64 {
+            let drafting = Sizing {
+                draft_tokens: u32::try_from(k).unwrap(),
+                ..sizing
+            };
+            assert_eq!(
+                cuda_kv_min_bytes(&drafting, &cache(true)),
+                12_228_280_320 + 2_882 * (16 * k * 5_120 + k * 16_384)
+            );
+        }
         let min = cuda_kv_min_bytes(&sizing, &cache(true));
         let fits =
             |bytes| check_resources(&sizing, &cache(true), &cuda(bytes), FIXTURE_PACK, 65_536, 1);
@@ -1465,19 +1558,49 @@ mod tests {
             max_age_secs: 3600,
         };
         // 4 GiB fixed; 8,192 step tokens × 1.25 MiB; the 1.5 GiB expert
-        // floor; 64 seats × 640 KiB; 64 × 8,192 table entries × 2 groups × 4
-        // bytes; 131,072 positions × 768 bytes of RoPE tables.
+        // floor; 64 seats × one sampler row of 1.25 MiB; 64 × 8,192 table
+        // entries × 2 groups × 4 bytes; 131,072 positions × 768 bytes of RoPE
+        // tables.
         let reserve = cuda_device_reserve_bytes(&sizing);
         assert_eq!(
             reserve,
             (4 << 30)
                 + 8192 * (5 << 18)
                 + 65_536 * (24 << 10)
-                + 64 * (640 << 10)
+                + 64 * (5 << 18)
                 + 64 * 8192 * 8
                 + 131_072 * 768
         );
-        assert_eq!(reserve, 16_789_798_912);
+        assert_eq!(reserve, 16_831_741_952);
+        // A sampler row holds an f64 distribution over every id of the head.
+        const { assert!(SAMPLER_ROW_DEVICE_BYTES >= 152_576 * 8) };
+        // Drafting three tokens: per seat 8 sampler rows, 29 rows of 16 KiB
+        // (12 of drafter state, 3 + 6 + 8 level rows), 32 KiB of step tables
+        // and two global page lists of 8,192 entries; and a third group's
+        // block tables.
+        let drafting = Sizing {
+            draft_tokens: 3,
+            ..sizing
+        };
+        assert_eq!(sampler_rows(3), 8);
+        assert_eq!(drafter_seat_rows(3), 29);
+        assert_eq!(
+            cuda_device_reserve_bytes(&drafting),
+            (4 << 30)
+                + 8192 * (5 << 18)
+                + 65_536 * (24 << 10)
+                + 64 * (8 * (5 << 18) + 29 * (16 << 10) + (32 << 10) + 8192 * 8)
+                + 64 * 8192 * 12
+                + 131_072 * 768
+        );
+        for k in 1..=3 {
+            assert!(
+                cuda_device_reserve_bytes(&Sizing {
+                    draft_tokens: k,
+                    ..sizing
+                }) > reserve
+            );
+        }
         let fits = |kv: u64, weights: u64, gpus: u64| {
             check_resources(&sizing, &cache, &cuda(kv), weights, 65_536, gpus)
         };
@@ -1862,11 +1985,19 @@ mod tests {
         map.insert(env::KV_BLOCKS, "256".into());
         let err = parse_map(&map).unwrap_err();
         assert!(err.contains(env::KV_BLOCKS) && err.contains("cpu"), "{err}");
-        // So is a draft width: the cuda executor does not draft.
+        // The cuda executor drafts up to the model's three MTP layers.
+        for k in 1..=caps::CUDA_DRAFT_TOKENS {
+            let mut map = cuda.clone();
+            map.insert(env::DRAFT_TOKENS, k.to_string());
+            assert_eq!(parse_map(&map).unwrap().sizing.draft_tokens, k);
+        }
         let mut map = cuda.clone();
-        map.insert(env::DRAFT_TOKENS, "1".into());
+        map.insert(env::DRAFT_TOKENS, (caps::CUDA_DRAFT_TOKENS + 1).to_string());
         let err = parse_map(&map).unwrap_err();
-        assert!(err.contains(env::DRAFT_TOKENS), "{err}");
+        assert!(
+            err.contains(env::DRAFT_TOKENS) && err.contains("cuda") && err.contains("at most 3"),
+            "{err}"
+        );
 
         // The cpu executor: its block count required, every cuda setting refused.
         let mut cpu = cuda.clone();
@@ -1900,7 +2031,7 @@ mod tests {
     }
 
     /// A step that cannot hold one decode row is refused, as the node's
-    /// scheduler would refuse it at boot (drafting is the cpu executor's).
+    /// scheduler would refuse it at boot.
     #[cfg(feature = "argon2")]
     #[test]
     fn a_step_holds_a_decode_row() {

@@ -3,9 +3,11 @@
 //! Without a device: the configuration (the executor's settings required with it and the
 //! CPU's refused), the boot order (storage, weights hash and model files before anything
 //! of the executor's), the executor's own refusal of a model it does not support, the
-//! refusals before the device (drafting and an oversized block in the grammar, a KV
-//! budget that cannot hold one sequence in the node), and a device-less machine failing closed, in process and as the real
-//! binary, with nothing served and no CPU fallback.
+//! refusals before the device (a draft width past the model's MTP layers and an
+//! oversized block in the grammar, a KV budget that cannot hold one sequence in the
+//! node), drafting within the MTP layers reaching the device, and a device-less machine
+//! failing closed, in process and as the real binary, with nothing served and no CPU
+//! fallback.
 //!
 //! With a device (`EIDOLA_TEST_CUDA_WEIGHTS` and `EIDOLA_ENGINE_KERNELS_DIR`): the node
 //! booted on real MiMo-V2.6-Flash weights answers a chat request end to end, and its
@@ -168,18 +170,42 @@ fn an_unsupported_model_is_refused_by_the_executor_before_the_device() {
     assert!(err.contains("hidden_size"), "{err}");
 }
 
-/// Drafting, and a block size past its cap, are refused by the configuration grammar;
-/// a KV budget that cannot hold one sequence is the node's refusal, before the device.
+/// A draft width past the model's MTP layers, and a block size past its cap, are refused
+/// by the configuration grammar; a KV budget that cannot hold one sequence is the node's
+/// refusal, before the device. Drafting within the model's MTP layers passes every
+/// host-side check and reaches the device.
 #[test]
-fn drafting_and_a_small_kv_budget_are_refused_before_the_device() {
+fn wide_drafts_and_a_small_kv_budget_are_refused_before_the_device() {
     let (dir, hash) = flash_shaped_dir();
     let mut map = cuda_env(dir, hash);
-    map.insert(env::DRAFT_TOKENS, "2".into());
+    map.insert(env::DRAFT_TOKENS, "4".into());
     let err = config_from(&map).unwrap_err();
     assert!(
         err.contains(env::DRAFT_TOKENS) && err.contains("cuda"),
         "{err}"
     );
+    for k in ["1", "3"] {
+        let mut map = cuda_env(dir, hash);
+        map.insert(env::DRAFT_TOKENS, k.into());
+        let err = boot_err(&map);
+        assert!(!err.contains("unsupported"), "{k}: {err}");
+        if !Gpu::available() {
+            assert!(err.contains(NO_DEVICE), "{k}: {err}");
+        }
+    }
+    // Drafting also needs its drafter pool from the budget: the least budget without
+    // drafting is refused with three draft depths.
+    let mut map = cuda_env(dir, hash);
+    let sizing = config_from(&map).unwrap().sizing;
+    let without = eidola_common::engine_deployment::cuda_kv_min_bytes(
+        &sizing,
+        &config_from(&map).unwrap().cache,
+    );
+    map.insert(env::KV_DEVICE_BYTES, without.to_string());
+    assert!(boot_err(&map).contains(NO_DEVICE) || Gpu::available());
+    map.insert(env::DRAFT_TOKENS, "3".into());
+    let err = boot_err(&map);
+    assert!(err.contains(env::KV_DEVICE_BYTES), "{err}");
 
     let mut map = cuda_env(dir, hash);
     map.insert(env::KV_DEVICE_BYTES, (1u64 << 20).to_string());

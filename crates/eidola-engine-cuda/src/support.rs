@@ -339,6 +339,84 @@ pub fn qkv_chunks(tp_size: Option<&str>, c: &ModelConfig) -> Result<usize, Unsup
     }
 }
 
+/// MTP draft layers Flash ships (`num_nextn_predict_layers`): the most draft
+/// depths the executor serves.
+pub const MTP_LAYERS: usize = 3;
+
+/// Refuse drafting `depths` tokens per step unless the checkpoint ships that
+/// many MTP layers of Flash's shape: declared as Flash declares them (3), each
+/// a sliding-window layer of the sliding target layers' geometry (the drafter
+/// KV group, the FA2 instances and the RoPE table they share) with Flash's
+/// dense SwiGLU (the FP8 GEMMs' and the f32-scale SwiGLU's width). Nothing is
+/// checked without drafting: the MTP layers are then never read.
+pub fn check_drafting(c: &ModelConfig, depths: usize) -> Result<(), Unsupported> {
+    if depths == 0 {
+        return Ok(());
+    }
+    let bad = |field: &str, found: String, required: String| {
+        Err(Unsupported {
+            field: field.into(),
+            found,
+            required,
+        })
+    };
+    if c.mtp.declared_layers != Some(MTP_LAYERS) {
+        return bad(
+            "mtp.declared_layers",
+            format!("{:?}", c.mtp.declared_layers),
+            format!("Some({MTP_LAYERS})"),
+        );
+    }
+    if depths > MTP_LAYERS {
+        return bad(
+            "draft_tokens",
+            depths.to_string(),
+            format!("at most {MTP_LAYERS} (the checkpoint's MTP layers)"),
+        );
+    }
+    if c.mtp.intermediate_size != DENSE_INTER {
+        return bad(
+            "mtp.intermediate_size",
+            c.mtp.intermediate_size.to_string(),
+            DENSE_INTER.to_string(),
+        );
+    }
+    let a = &c.mtp.attention;
+    for (field, found, want) in [
+        ("head_dim_qk", a.head_dim_qk, HEAD_DIM_QK),
+        ("head_dim_v", a.head_dim_v, HEAD_DIM_V),
+        ("rope_dim", a.rope_dim, ROPE_DIM),
+        ("num_q_heads", a.num_q_heads, Q_HEADS),
+        ("num_kv_heads", a.num_kv_heads, SLIDING_KV_HEADS),
+    ] {
+        if found != want {
+            return bad(
+                &format!("mtp.attention.{field}"),
+                found.to_string(),
+                want.to_string(),
+            );
+        }
+    }
+    if a.kind != (AttentionKind::Sliding { window: WINDOW }) {
+        return bad(
+            "mtp.attention.kind",
+            format!("{:?}", a.kind),
+            format!("Sliding {{ window: {WINDOW} }}"),
+        );
+    }
+    if a.rope_theta != 1e4 {
+        return bad(
+            "mtp.attention.rope_theta",
+            a.rope_theta.to_string(),
+            "10000".into(),
+        );
+    }
+    if !a.has_sinks {
+        return bad("mtp.attention.has_sinks", "false".into(), "true".into());
+    }
+    Ok(())
+}
+
 /// Refuse a context longer than the checkpoint's declared window: positions
 /// past `max_position_embeddings` are outside what the model was trained for.
 pub fn check_context(max_model_len: u32, c: &ModelConfig) -> Result<(), Unsupported> {
@@ -481,6 +559,61 @@ mod tests {
             qkv_chunks(None, &c).unwrap_err().field,
             "num_key_value_heads"
         );
+    }
+
+    /// Flash drafts up to its three MTP layers; more depths, another
+    /// declaration, and each MTP field changed alone are refused with the
+    /// field named. Without drafting nothing about the MTP layers is read.
+    #[test]
+    fn drafting_is_checked() {
+        for d in 0..=MTP_LAYERS {
+            check_drafting(&flash(), d).unwrap();
+            check_drafting(&flash().truncated(&[1, 5]).unwrap(), d).unwrap();
+        }
+        let drafting_refused = |c: &ModelConfig, d: usize, field: &str| {
+            let e = check_drafting(c, d).expect_err(field);
+            assert_eq!(e.field, field, "{e}");
+            check_drafting(c, 0).unwrap();
+        };
+        drafting_refused(&flash(), 4, "draft_tokens");
+        type C = fn(&mut ModelConfig);
+        for (name, set) in [
+            (
+                "mtp.declared_layers",
+                (|c| c.mtp.declared_layers = None) as C,
+            ),
+            ("mtp.declared_layers", |c| c.mtp.declared_layers = Some(4)),
+            ("mtp.intermediate_size", |c| c.mtp.intermediate_size = 8192),
+            ("mtp.attention.head_dim_qk", |c| {
+                c.mtp.attention.head_dim_qk = 128
+            }),
+            ("mtp.attention.head_dim_v", |c| {
+                c.mtp.attention.head_dim_v = 192
+            }),
+            ("mtp.attention.rope_dim", |c| c.mtp.attention.rope_dim = 96),
+            ("mtp.attention.num_q_heads", |c| {
+                c.mtp.attention.num_q_heads = 128
+            }),
+            ("mtp.attention.num_kv_heads", |c| {
+                c.mtp.attention.num_kv_heads = 4
+            }),
+            ("mtp.attention.kind", |c| {
+                c.mtp.attention.kind = AttentionKind::Global
+            }),
+            ("mtp.attention.kind", |c| {
+                c.mtp.attention.kind = AttentionKind::Sliding { window: 256 }
+            }),
+            ("mtp.attention.rope_theta", |c| {
+                c.mtp.attention.rope_theta = 1e7
+            }),
+            ("mtp.attention.has_sinks", |c| {
+                c.mtp.attention.has_sinks = false
+            }),
+        ] {
+            let mut c = flash();
+            set(&mut c);
+            drafting_refused(&c, 1, name);
+        }
     }
 
     #[test]

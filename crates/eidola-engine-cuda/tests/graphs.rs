@@ -28,7 +28,9 @@ use eidola_engine::executor::{Executor, SeqEntry, StepInput, TableUpdate};
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, DecodePath, KvBlocks};
+use eidola_engine_cuda::{
+    CudaExecutor, CudaExecutorConfig, CudaGraphs, DecodePath, KvBlocks, MtpHidden,
+};
 use eidola_engine_model::safetensors::WeightSet;
 
 const KEEP: [usize; 4] = [0, 1, 2, 5];
@@ -89,6 +91,7 @@ fn executor(fx: &Fixture, blocks: u32, buckets: Vec<Bucket>) -> Option<CudaExecu
         num_blocks: KvBlocks {
             global: blocks,
             sliding: blocks,
+            drafter: 0,
         },
         num_state_slots: SLOTS,
         max_model_len: 1024,
@@ -96,6 +99,8 @@ fn executor(fx: &Fixture, blocks: u32, buckets: Vec<Bucket>) -> Option<CudaExecu
         sampleable_vocab_size: SAMPLEABLE,
         image: None,
         graphs: CudaGraphs::On,
+        draft_tokens: 0,
+        mtp_hidden: MtpHidden::Normed,
     };
     let t0 = std::time::Instant::now();
     let ex = CudaExecutor::new(su.gpu, &su.dir, fx.store.clone(), layers().as_deref(), cfg)

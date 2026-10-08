@@ -39,7 +39,7 @@ Block tables are per slot and change only through `TableUpdate` and `ResetSlot`.
 7. Drafter rows for accepted drafts that the chain did not already compute.
 8. Drafter state and boundary taps.
 
-The target runs in two passes (steps 2 and 5). Row independence makes that identical to one pass. A GPU executor runs one pass, ordering the drafter first for decode rows (their drafter inputs all come from earlier steps).
+The target runs in two passes (steps 2 and 5). Row independence makes that identical to one pass. The CUDA executor runs one pass, ordering the drafter first for decode rows (their drafter inputs all come from earlier steps), and so drafts only decode rows, which are the only rows the serving core gives drafts (`eidola-engine-cuda/AGENTS.md` → Drafting).
 
 `pad_batches` pads the target batch to the bucket's token count. A test shows the padding rows change nothing.
 

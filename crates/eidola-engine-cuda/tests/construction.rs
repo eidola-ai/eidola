@@ -11,6 +11,7 @@ use std::sync::Arc;
 use eidola_engine::spec::Bucket;
 use eidola_engine_cuda::{
     CudaError, CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, ImageArch, KernelDir, KvBlocks,
+    MtpHidden,
 };
 use eidola_engine_model::safetensors::WeightSet;
 
@@ -34,6 +35,7 @@ fn config() -> CudaExecutorConfig {
         num_blocks: KvBlocks {
             global: 8,
             sliding: 8,
+            drafter: 0,
         },
         num_state_slots: 2,
         max_model_len: 256,
@@ -44,6 +46,8 @@ fn config() -> CudaExecutorConfig {
         sampleable_vocab_size: 151_675,
         image: None,
         graphs: CudaGraphs::Off,
+        draft_tokens: 0,
+        mtp_hidden: MtpHidden::Normed,
     }
 }
 
@@ -79,6 +83,57 @@ fn preflight_refuses_without_a_device() {
         panic!("a configuration refusal, not {e}")
     };
     assert_eq!(u.field, "num_blocks.sliding");
+}
+
+/// With a draft width the spec gains the drafter group (a sliding window of
+/// the MTP depths, after the target groups) and reports the width; the
+/// width is bounded by the checkpoint's MTP layers, and the drafter group's
+/// blocks are given exactly when drafting.
+#[test]
+fn preflight_reports_and_bounds_drafting() {
+    use eidola_engine::spec::{AttentionKind, KvRole};
+    let store = tensorless_checkpoint();
+    for depths in 1..=3 {
+        let mut cfg = config();
+        cfg.draft_tokens = depths;
+        cfg.num_blocks.drafter = 8;
+        let spec = CudaExecutor::preflight(&store, None, &cfg).unwrap();
+        assert_eq!(spec.max_draft_tokens, depths);
+        assert_eq!(spec.kv_groups.len(), 3);
+        let g = &spec.kv_groups[2];
+        assert_eq!(g.role, KvRole::Drafter);
+        assert_eq!(g.attention, AttentionKind::Sliding { window: 128 });
+        assert_eq!(
+            (
+                g.num_layers,
+                g.num_kv_heads,
+                g.head_dim_qk,
+                g.head_dim_v,
+                g.num_blocks
+            ),
+            (depths, 8, 192, 128, 8)
+        );
+        assert!(spec.kv_groups[..2].iter().all(|g| g.role == KvRole::Target));
+    }
+    let mut cfg = config();
+    cfg.draft_tokens = 4;
+    cfg.num_blocks.drafter = 8;
+    let CudaError::Unsupported(u) = CudaExecutor::preflight(&store, None, &cfg).unwrap_err() else {
+        panic!("a configuration refusal")
+    };
+    assert_eq!(u.field, "draft_tokens");
+    // Drafting needs drafter blocks (the null block and one more).
+    let mut cfg = config();
+    cfg.draft_tokens = 2;
+    let e = CudaExecutor::preflight(&store, None, &cfg).unwrap_err();
+    assert!(e.to_string().contains("KV geometry"), "{e}");
+    // And blocks for a drafter group that does not exist are refused.
+    let mut cfg = config();
+    cfg.num_blocks.drafter = 8;
+    let CudaError::Unsupported(u) = CudaExecutor::preflight(&store, None, &cfg).unwrap_err() else {
+        panic!("a configuration refusal")
+    };
+    assert_eq!(u.field, "num_blocks.drafter");
 }
 
 #[test]
