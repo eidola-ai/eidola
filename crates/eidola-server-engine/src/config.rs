@@ -19,6 +19,9 @@ pub mod env {
     pub const WEIGHTS_DIR: &str = "EIDOLA_ENGINE_WEIGHTS_DIR";
     /// The weights hash the directory must have (64 hex digits).
     pub const WEIGHTS_SHA256: &str = "EIDOLA_ENGINE_WEIGHTS_SHA256";
+    /// `verified-readonly` (production: a read-only, kernel-verified mount) or
+    /// `dev-writable`.
+    pub const WEIGHTS_STORAGE: &str = "EIDOLA_ENGINE_WEIGHTS_STORAGE";
     /// The gateway's bearer token (secret).
     pub const GATEWAY_TOKEN: &str = "GATEWAY_TOKEN";
     /// Argon2id hash of the gateway token (measured).
@@ -86,6 +89,34 @@ impl ExecutorKind {
     }
 }
 
+/// What backs the weights directory, as the measured configuration declares it.
+///
+/// The weights hash is checked once, at boot; the shards stay memory-mapped and routed
+/// experts are read from them on later forwards. What binds those later reads to the
+/// verified bytes is the storage, not this process: in production the directory is a
+/// dm-verity volume, mounted read-only, whose every read the kernel checks against the
+/// root hash in the measured configuration. This setting makes that assumption explicit
+/// and checked rather than implicit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightsStorage {
+    /// Production. Boot refuses unless every weights file is on a filesystem mounted
+    /// read-only (`statvfs` `ST_RDONLY`).
+    VerifiedReadonly,
+    /// Development. Boots on any filesystem; reported by `/v1/engine/info` and `/healthz`
+    /// so it can never be mistaken for production. A gateway pins the production
+    /// configuration, so it never routes to a node configured this way.
+    DevWritable,
+}
+
+impl WeightsStorage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WeightsStorage::VerifiedReadonly => "verified-readonly",
+            WeightsStorage::DevWritable => "dev-writable",
+        }
+    }
+}
+
 /// KV memory and scheduler sizing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sizing {
@@ -114,6 +145,7 @@ pub struct Config {
     pub weights_dir: PathBuf,
     /// Lowercase hex.
     pub expected_weights_sha256: String,
+    pub weights_storage: WeightsStorage,
     pub gateway_token: GatewayToken,
     pub executor: ExecutorKind,
     pub bind_addr: SocketAddr,
@@ -187,6 +219,16 @@ impl Config {
                 env::WEIGHTS_SHA256
             )));
         }
+        let weights_storage = match get(env::WEIGHTS_STORAGE)?.as_str() {
+            "verified-readonly" => WeightsStorage::VerifiedReadonly,
+            "dev-writable" => WeightsStorage::DevWritable,
+            _ => {
+                return Err(ConfigError(format!(
+                    "{} must be `verified-readonly` or `dev-writable`",
+                    env::WEIGHTS_STORAGE
+                )));
+            }
+        };
         let token = get(env::GATEWAY_TOKEN)?;
         let token_hash = get(env::GATEWAY_TOKEN_HASH)?;
         let gateway_token = GatewayToken::verify(token, &token_hash).map_err(ConfigError)?;
@@ -242,6 +284,7 @@ impl Config {
             model_id,
             weights_dir,
             expected_weights_sha256,
+            weights_storage,
             gateway_token,
             executor,
             bind_addr,

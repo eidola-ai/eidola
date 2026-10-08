@@ -224,16 +224,28 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
     })
 }
 
+/// Decodes the key into a fixed stack buffer (no heap copy, no by-value array), hands it
+/// to [`CacheKey::from_buffer`], which scrubs it, and scrubs the text and the buffer's
+/// slack. Copies outside this crate's reach remain: the request body's bytes in the HTTP
+/// stack's shared read buffers, and serde_json's scratch buffer when the key's JSON string
+/// uses escapes.
 fn decode_cache_key(mut text: String) -> Result<CacheKey, ApiError> {
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(text.as_bytes());
+    // Room for any 43-character input; a longer one is refused before decoding.
+    let mut buf = [0u8; 48];
+    let decoded = if text.len() == 43 {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode_slice(text.as_bytes(), &mut buf)
+    } else {
+        Ok(0)
+    };
     text.zeroize();
-    let mut bytes = decoded.map_err(|_| ApiError::invalid(CACHE_KEY_SHAPE))?;
-    let result = <[u8; 32]>::try_from(bytes.as_slice())
-        .map(CacheKey::from_bytes)
-        .map_err(|_| ApiError::invalid(CACHE_KEY_SHAPE));
-    bytes.zeroize();
-    // `from_bytes` copied the array it was given; that copy is gone with this frame and
-    // the decoded buffer is scrubbed above.
+    let result = match decoded {
+        Ok(32) => {
+            let key: &mut [u8; 32] = (&mut buf[..32]).try_into().expect("32 bytes");
+            Ok(CacheKey::from_buffer(key))
+        }
+        _ => Err(ApiError::invalid(CACHE_KEY_SHAPE)),
+    };
+    buf.zeroize();
     result
 }
 

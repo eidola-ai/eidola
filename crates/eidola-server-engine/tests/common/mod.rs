@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use eidola_server_engine::config::{Config, env};
+use eidola_server_engine::config::{Config, WeightsStorage, env};
 use eidola_server_engine::model::LoadedModel;
 use eidola_server_engine::worker::{EngineHandle, Stats};
 use serde_json::{Value, json};
@@ -22,7 +22,7 @@ pub const TOKEN: &str = "test-gateway-token";
 pub fn model_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("engine-dev-model-v1");
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("engine-dev-model");
         fixture::ensure_dev_model(&dir).expect("build the dev model");
         dir
     })
@@ -50,7 +50,12 @@ pub fn token_hash() -> &'static str {
 pub fn loaded() -> Arc<LoadedModel> {
     static MODEL: OnceLock<Arc<LoadedModel>> = OnceLock::new();
     MODEL
-        .get_or_init(|| Arc::new(LoadedModel::load(model_dir(), weights_hash()).unwrap()))
+        .get_or_init(|| {
+            Arc::new(
+                LoadedModel::load(model_dir(), weights_hash(), WeightsStorage::DevWritable)
+                    .unwrap(),
+            )
+        })
         .clone()
 }
 
@@ -60,6 +65,7 @@ pub fn env_map() -> HashMap<&'static str, String> {
         (env::MODEL_ID, MODEL_ID.to_string()),
         (env::WEIGHTS_DIR, model_dir().display().to_string()),
         (env::WEIGHTS_SHA256, weights_hash().to_string()),
+        (env::WEIGHTS_STORAGE, "dev-writable".into()),
         (env::GATEWAY_TOKEN, TOKEN.to_string()),
         (env::GATEWAY_TOKEN_HASH, token_hash().to_string()),
         (env::EXECUTOR, "cpu".into()),

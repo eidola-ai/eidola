@@ -28,20 +28,72 @@ fn crates_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Makes sure `out` holds the derived model: written into a sibling directory and renamed
-/// into place, so an interrupted run never leaves a partial model at `out`.
+/// Bumped when the derivation changes in a way this file's own bytes would not show.
+const GENERATOR_VERSION: &str = "eidola-server-engine dev model v1";
+
+/// Recorded inside a built directory: the fingerprint of the inputs it was built from.
+/// (Not a file the node reads, so it is outside the weights hash.)
+pub const FINGERPRINT_FILE: &str = ".fixture-fingerprint";
+
+/// Every input file of the derivation.
+fn input_files() -> Vec<PathBuf> {
+    let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/tiny");
+    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures");
+    vec![
+        tiny.join("config.json"),
+        tiny.join("model.safetensors"),
+        chat.join("tokenizer.json.gz"),
+        chat.join("chat_template.jinja"),
+        chat.join("generation_config.json"),
+    ]
+}
+
+/// SHA-256 over the generator version, this file's source (the derivation itself), and
+/// every input file's name and bytes, each length-prefixed.
+pub fn inputs_fingerprint() -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut field = |bytes: &[u8]| {
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    field(GENERATOR_VERSION.as_bytes());
+    field(include_bytes!("fixture.rs"));
+    for path in input_files() {
+        field(path.file_name().unwrap().as_encoded_bytes());
+        field(&std::fs::read(&path)?);
+    }
+    Ok(hex::encode(h.finalize()))
+}
+
+/// Makes sure `out` holds the derived model built from the current inputs. A directory
+/// whose recorded fingerprint differs (or is missing) is rebuilt: the new model is written
+/// into a sibling directory, fingerprint last, and swapped into place by renames, so `out`
+/// never holds a partial or mismatched model.
 pub fn ensure_dev_model(out: &Path) -> std::io::Result<()> {
-    if out.exists() {
+    let fingerprint = inputs_fingerprint()?;
+    let current = |dir: &Path| {
+        std::fs::read_to_string(dir.join(FINGERPRINT_FILE)).is_ok_and(|f| f == fingerprint)
+    };
+    if current(out) {
         return Ok(());
     }
-    let partial = out.with_extension("partial");
+    let pid = std::process::id();
+    let partial = out.with_extension(format!("partial-{pid}"));
     if partial.exists() {
         std::fs::remove_dir_all(&partial)?;
     }
     write_dev_model(&partial)?;
+    std::fs::write(partial.join(FINGERPRINT_FILE), &fingerprint)?;
+    if out.exists() {
+        let stale = out.with_extension(format!("stale-{pid}"));
+        if std::fs::rename(out, &stale).is_ok() {
+            std::fs::remove_dir_all(&stale)?;
+        }
+    }
     match std::fs::rename(&partial, out) {
-        // Another process finished first: theirs is identical.
-        Err(_) if out.exists() => std::fs::remove_dir_all(&partial),
+        // Another process put a current model in place first.
+        Err(_) if current(out) => std::fs::remove_dir_all(&partial),
         r => r,
     }
 }

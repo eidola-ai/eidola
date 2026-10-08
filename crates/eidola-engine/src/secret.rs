@@ -10,7 +10,7 @@
 //! pointer, so the collections that hold salts never leave copies of the bytes behind. A
 //! clone is a separate allocation, zeroed on its own drop. Constructors write the bytes
 //! straight into that allocation; `from_bytes` copies its argument, whose own copy is the
-//! caller's to scrub. The HMAC's internal state during [`SaltDeriver::derive`] is transient
+//! caller's to scrub, and `CacheKey::from_buffer` scrubs the caller's buffer itself. The HMAC's internal state during [`SaltDeriver::derive`] is transient
 //! stack memory and is not scrubbed by this crate.
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -82,6 +82,16 @@ impl CacheKey {
     /// Wraps a client-supplied key.
     pub fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
         Self::copy_from(&bytes)
+    }
+
+    /// Wraps a client-supplied key held in the caller's buffer, and zeroes that buffer.
+    /// Unlike [`CacheKey::from_bytes`], no by-value copy of the key is left behind: the
+    /// bytes are copied straight from `bytes` into the zeroizing allocation, and `bytes`
+    /// is scrubbed before this returns.
+    pub fn from_buffer(bytes: &mut [u8; SECRET_LEN]) -> Self {
+        let key = Self::copy_from(bytes);
+        bytes.zeroize();
+        key
     }
 }
 
@@ -257,6 +267,14 @@ mod tests {
             grown.push(CacheKey::from_bytes([i; 32]));
         }
         assert_eq!(grown[0].expose().as_ptr(), key_addr);
+    }
+
+    #[test]
+    fn from_buffer_scrubs_the_callers_copy() {
+        let mut buf = [0x42u8; 32];
+        let key = CacheKey::from_buffer(&mut buf);
+        assert_eq!(buf, [0u8; 32]);
+        assert_eq!(key.expose(), &[0x42u8; 32]);
     }
 
     #[test]

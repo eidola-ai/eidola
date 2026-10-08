@@ -230,22 +230,76 @@ fn append(into: &mut ChatDelta, d: ChatDelta) {
 
 /// Stop-sequence matching over streamed text.
 ///
-/// Text that could still be the start of a stop sequence is held back (at most the
-/// longest sequence's length minus one byte, extended to a character boundary), so a
-/// sequence split across tokens is caught and nothing past a match is ever released.
-/// On a match, the text before it is released and the sequence and everything after it
-/// are dropped (OpenAI semantics: the stop sequence is not part of the output).
+/// Each stop sequence runs a KMP automaton over the text's bytes, whose state is the
+/// length of the longest suffix of the text so far that is a prefix of that sequence.
+/// Only that much is held back (the largest state over the sequences, which always starts
+/// on a character boundary because the sequences are UTF-8); everything before it is
+/// released at once, so text that cannot begin a stop sequence is never delayed, and the
+/// work is linear in the text (times the at most four sequences) however long a sequence
+/// is. The first occurrence to complete wins: the text before it is released, and the
+/// sequence and everything after it are dropped (OpenAI semantics: the stop sequence is
+/// not part of the output).
 #[derive(Debug, Default)]
 pub struct StopMatcher {
-    stops: Vec<String>,
+    stops: Vec<Kmp>,
+    /// Text not yet released: always a prefix of some sequence (the longest state).
     pending: String,
     matched: bool,
 }
 
+#[derive(Debug)]
+struct Kmp {
+    pattern: Vec<u8>,
+    /// `fail[i]`: length of the longest proper border of `pattern[..=i]`.
+    fail: Vec<usize>,
+    state: usize,
+}
+
+impl Kmp {
+    fn new(pattern: &str) -> Self {
+        let p = pattern.as_bytes().to_vec();
+        let mut fail = vec![0; p.len()];
+        let mut k = 0;
+        for i in 1..p.len() {
+            while k > 0 && p[i] != p[k] {
+                k = fail[k - 1];
+            }
+            if p[i] == p[k] {
+                k += 1;
+            }
+            fail[i] = k;
+        }
+        Kmp {
+            pattern: p,
+            fail,
+            state: 0,
+        }
+    }
+
+    /// Feeds one byte; true when the whole pattern has just matched.
+    fn step(&mut self, b: u8) -> bool {
+        if self.state == self.pattern.len() {
+            self.state = self.fail[self.state - 1];
+        }
+        while self.state > 0 && self.pattern[self.state] != b {
+            self.state = self.fail[self.state - 1];
+        }
+        if self.pattern[self.state] == b {
+            self.state += 1;
+        }
+        self.state == self.pattern.len()
+    }
+}
+
 impl StopMatcher {
+    /// `stops` must be non-empty strings (the request validation guarantees it).
     pub fn new(stops: Vec<String>) -> Self {
         StopMatcher {
-            stops,
+            stops: stops
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| Kmp::new(s))
+                .collect(),
             pending: String::new(),
             matched: false,
         }
@@ -260,23 +314,30 @@ impl StopMatcher {
         if self.stops.is_empty() {
             return (text.to_string(), false);
         }
+        for (i, &b) in text.as_bytes().iter().enumerate() {
+            let mut hit = None;
+            for stop in &mut self.stops {
+                if stop.step(b) {
+                    hit = hit.max(Some(stop.pattern.len()));
+                }
+            }
+            if let Some(len) = hit {
+                // The match ends after byte `i`; with several completing on the same
+                // byte, the longest started first.
+                let end = self.pending.len() + i + 1;
+                let start = end - len;
+                // `i + 1` ends a character: the match's last byte ends one, since the
+                // sequence is UTF-8. `start` begins one, likewise.
+                self.pending.push_str(&text[..i + 1]);
+                let mut out = std::mem::take(&mut self.pending);
+                out.truncate(start);
+                self.matched = true;
+                return (out, true);
+            }
+        }
         self.pending.push_str(text);
-        let first = self
-            .stops
-            .iter()
-            .filter_map(|s| self.pending.find(s.as_str()))
-            .min();
-        if let Some(at) = first {
-            let out = self.pending[..at].to_string();
-            self.pending.clear();
-            self.matched = true;
-            return (out, true);
-        }
-        let hold = self.stops.iter().map(String::len).max().unwrap_or(1) - 1;
-        let mut cut = self.pending.len().saturating_sub(hold);
-        while !self.pending.is_char_boundary(cut) {
-            cut -= 1;
-        }
+        let hold = self.stops.iter().map(|s| s.state).max().unwrap_or(0);
+        let cut = self.pending.len() - hold;
         let out = self.pending[..cut].to_string();
         self.pending.drain(..cut);
         (out, false)
@@ -315,6 +376,93 @@ mod tests {
         assert_eq!(run(&["END"], &["abc EN"]), ("abc EN".into(), false));
         assert_eq!(run(&["xy", "b"], &["abxy"]), ("a".into(), true));
         assert_eq!(run(&[], &["a", "b"]), ("ab".into(), false));
+    }
+
+    /// Naive reference: the earliest-ending occurrence (ties to the longest).
+    fn naive(stops: &[&str], text: &str) -> (String, bool) {
+        let mut best: Option<(usize, usize)> = None; // (end, start)
+        for s in stops {
+            if let Some(at) = text.find(s) {
+                let cand = (at + s.len(), at);
+                best = Some(match best {
+                    Some(b) if (b.0, b.1) <= (cand.0, cand.1) => b,
+                    _ => cand,
+                });
+            }
+        }
+        match best {
+            Some((_, start)) => (text[..start].to_string(), true),
+            None => (text.to_string(), false),
+        }
+    }
+
+    #[test]
+    fn matches_the_naive_rule_on_every_split() {
+        let mut rng = 0x1234_5678u64;
+        let mut next = || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as usize
+        };
+        let alphabet = ['a', 'b', 'é'];
+        for _ in 0..3000 {
+            let word = |n: usize, next: &mut dyn FnMut() -> usize| -> String {
+                (0..n).map(|_| alphabet[next() % 3]).collect()
+            };
+            let n_stops = 1 + next() % 3;
+            let stops: Vec<String> = (0..n_stops)
+                .map(|_| {
+                    let n = 1 + next() % 4;
+                    word(n, &mut next)
+                })
+                .collect();
+            let n_text = next() % 14;
+            let text = word(n_text, &mut next);
+            let refs: Vec<&str> = stops.iter().map(String::as_str).collect();
+            // Split at random character boundaries.
+            let bounds: Vec<usize> = text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([text.len()])
+                .collect();
+            let mut chunks = Vec::new();
+            let mut last = 0;
+            for &b in &bounds[1..] {
+                if next() % 2 == 0 || b == text.len() {
+                    chunks.push(&text[last..b]);
+                    last = b;
+                }
+            }
+            assert_eq!(
+                run(&refs, &chunks),
+                naive(&refs, &text),
+                "{stops:?} {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn releases_text_that_cannot_begin_a_stop() {
+        let big = "Z".repeat(10_000);
+        let mut m = StopMatcher::new(vec![big.clone()]);
+        assert_eq!(m.push("hello "), ("hello ".to_string(), false));
+        assert_eq!(
+            m.push("ZZ"),
+            (String::new(), false),
+            "a possible start is held"
+        );
+        assert_eq!(
+            m.push("y"),
+            ("ZZy".to_string(), false),
+            "and released when it cannot be"
+        );
+        // A long run of a stop's prefix is held only as long as it could still match.
+        let (r, hit) = m.push(&big[..9_999]);
+        assert!(r.is_empty() && !hit);
+        let (r, hit) = m.push("Z!");
+        assert!(hit);
+        assert!(r.is_empty());
     }
 
     #[test]

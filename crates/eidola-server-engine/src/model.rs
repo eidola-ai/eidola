@@ -37,9 +37,11 @@ use eidola_engine::sampling::SamplingParams;
 use eidola_engine_chat::template::CHAT_TEMPLATE_FILE;
 use eidola_engine_chat::tokenizer::{GENERATION_CONFIG_FILE, TOKENIZER_FILE};
 use eidola_engine_chat::{ChatTemplate, MimoTokenizer};
-use eidola_engine_model::safetensors::WeightSet;
+use eidola_engine_model::safetensors::{SEMANTIC_FILES, WeightSet};
 use eidola_engine_model::{LoadOptions, ModelWeights, ReferenceModel};
 use sha2::{Digest, Sha256};
+
+use crate::config::WeightsStorage;
 
 /// The chat artifacts the weights hash covers besides the model crate's files.
 pub const CHAT_FILES: [&str; 3] = [TOKENIZER_FILE, CHAT_TEMPLATE_FILE, GENERATION_CONFIG_FILE];
@@ -126,6 +128,7 @@ impl GenerationDefaults {
 /// `LoadedModel` means holding weights whose identity was verified.
 pub struct LoadedModel {
     weights_hash: String,
+    storage: WeightsStorage,
     model: Arc<ReferenceModel>,
     tokenizer: MimoTokenizer,
     template: ChatTemplate,
@@ -141,15 +144,31 @@ impl std::fmt::Debug for LoadedModel {
 }
 
 impl LoadedModel {
-    /// Opens `dir`, computes its weights hash, refuses unless it equals `expected`
-    /// (lowercase hex), and only then loads the weights and chat artifacts.
-    pub fn load(dir: &Path, expected: &str) -> Result<Self, ModelError> {
+    /// Opens `dir`, checks its storage against `storage`, computes its weights hash,
+    /// refuses unless it equals `expected` (lowercase hex), and only then loads the
+    /// weights and chat artifacts.
+    pub fn load(dir: &Path, expected: &str, storage: WeightsStorage) -> Result<Self, ModelError> {
         let store = WeightSet::open_dir(dir)
             .map_err(|e| ModelError(format!("cannot open the weights: {e}")))?;
         if store.file_names().is_empty() {
             return Err(ModelError(
                 "no *.safetensors files in the weights directory".into(),
             ));
+        }
+        if storage == WeightsStorage::VerifiedReadonly {
+            let mut paths = vec![dir.to_path_buf()];
+            for name in store.file_names() {
+                paths.extend(store.path_of(name).map(Path::to_path_buf));
+            }
+            for name in SEMANTIC_FILES.iter().chain(CHAT_FILES.iter()) {
+                let p = dir.join(name);
+                if p.exists() {
+                    paths.push(p);
+                }
+            }
+            for p in &paths {
+                require_read_only(p)?;
+            }
         }
         let mut manifest = store.sha256_manifest();
         if !manifest.contains_key("config.json") {
@@ -195,6 +214,7 @@ impl LoadedModel {
         }
         Ok(LoadedModel {
             weights_hash: actual,
+            storage,
             model,
             tokenizer,
             template,
@@ -205,6 +225,11 @@ impl LoadedModel {
     /// The verified weights hash (lowercase hex).
     pub fn weights_hash(&self) -> &str {
         &self.weights_hash
+    }
+
+    /// The storage the weights were checked against.
+    pub fn storage(&self) -> WeightsStorage {
+        self.storage
     }
 
     /// The reference model (weights and numerics).
@@ -222,6 +247,25 @@ impl LoadedModel {
 
     pub fn defaults(&self) -> GenerationDefaults {
         self.defaults
+    }
+}
+
+/// Refuses unless `path` lives on a filesystem mounted read-only (`statvfs` reports
+/// `ST_RDONLY`; it follows symlinks, so the file's real filesystem is checked).
+pub fn require_read_only(path: &Path) -> Result<(), ModelError> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "the weights directory".into());
+    let stat = rustix::fs::statvfs(path)
+        .map_err(|e| ModelError(format!("cannot inspect the filesystem of {name}: {e}")))?;
+    if stat.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY) {
+        Ok(())
+    } else {
+        Err(ModelError(format!(
+            "{name} is on a writable filesystem; verified-readonly weights must be on a \
+             read-only mount"
+        )))
     }
 }
 
@@ -259,5 +303,27 @@ mod tests {
         assert_eq!((d.temperature, d.top_p, d.top_k), (1.0, 1.0, 0));
         assert!(GenerationDefaults::parse(br#"{"top_p": 0}"#).is_err());
         assert!(GenerationDefaults::parse(br#"{"temperature": "hot"}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn a_writable_directory_is_refused() {
+        let dir = std::env::temp_dir();
+        let e = require_read_only(&dir).unwrap_err();
+        assert!(e.to_string().contains("writable"), "{e}");
+    }
+
+    /// Run where a read-only mount is available (CI or a container: mount one and set
+    /// `EIDOLA_TEST_READ_ONLY_DIR`); skipped otherwise.
+    #[test]
+    fn a_read_only_mount_is_accepted() {
+        let Some(dir) = std::env::var_os("EIDOLA_TEST_READ_ONLY_DIR") else {
+            return;
+        };
+        require_read_only(Path::new(&dir)).unwrap();
     }
 }

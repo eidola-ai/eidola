@@ -31,6 +31,7 @@ use tokio::sync::mpsc;
 
 use crate::api::{self, ValidRequest};
 use crate::auth::GatewayToken;
+use crate::config::WeightsStorage;
 use crate::error::ApiError;
 use crate::model::LoadedModel;
 use crate::pipeline::{self, Decoder, Prepared};
@@ -86,7 +87,12 @@ async fn require_gateway(
 
 async fn healthz(State(state): State<Arc<AppState>>) -> Response {
     if state.engine.is_healthy() {
-        (StatusCode::OK, "ok").into_response()
+        match state.model.storage() {
+            WeightsStorage::VerifiedReadonly => (StatusCode::OK, "ok").into_response(),
+            WeightsStorage::DevWritable => {
+                (StatusCode::OK, "ok; weights-storage=dev-writable").into_response()
+            }
+        }
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response()
     }
@@ -107,6 +113,7 @@ async fn engine_info(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(json!({
         "model": state.model_id,
         "weights_sha256": state.model.weights_hash(),
+        "weights_storage": state.model.storage().as_str(),
         "build": build_info(),
         "executor": state.executor,
     }))

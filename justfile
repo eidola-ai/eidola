@@ -125,6 +125,7 @@ run system *args:
         EIDOLA_ENGINE_MODEL_ID=mimo-dev \
         EIDOLA_ENGINE_WEIGHTS_DIR="$dir" \
         EIDOLA_ENGINE_WEIGHTS_SHA256="$hash" \
+        EIDOLA_ENGINE_WEIGHTS_STORAGE=dev-writable \
         GATEWAY_TOKEN=dev-gateway-token \
         GATEWAY_TOKEN_HASH="$(cargo run -q -p hash-secret -- dev-gateway-token)" \
         EIDOLA_ENGINE_EXECUTOR=cpu \

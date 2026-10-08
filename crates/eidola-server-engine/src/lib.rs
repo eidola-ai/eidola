@@ -72,39 +72,90 @@ impl std::fmt::Debug for Node {
     }
 }
 
-/// Serves `router` on `listener` until `shutdown` resolves (`Ok`) or the engine thread
-/// stops for any reason (`Err`): `engine_stopped` resolving, whether by its signal or by
-/// its sender going away, is fatal, and the caller exits non-zero.
+/// How long the runtime may take to wind down remaining tasks (open connections, a
+/// preparation still running on the blocking pool) once serving has ended.
+pub const TEARDOWN_LIMIT: Duration = Duration::from_secs(2);
+
+/// Serves `router` on `listener` until `shutdown` resolves (`Ok`, after draining open
+/// requests gracefully) or the engine thread stops for any reason (`Err`, at once):
+/// `engine_stopped` resolving, by its signal or by its sender going away, is fatal, and
+/// nothing waits for open connections, however stalled. Those connection tasks are left
+/// to the runtime's bounded teardown ([`run`]).
 pub async fn serve(
     listener: tokio::net::TcpListener,
     router: axum::Router,
     engine_stopped: oneshot::Receiver<()>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), BootError> {
-    let (failed_tx, mut failed_rx) = oneshot::channel::<()>();
-    let signal = async move {
-        tokio::select! {
-            _ = shutdown => {}
-            _ = engine_stopped => {
-                tracing::error!("the engine thread stopped");
-                let _ = failed_tx.send(());
-            }
+    let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
+    tokio::select! {
+        served = std::future::IntoFuture::into_future(server) => {
+            served.map_err(|e| BootError(format!("serving failed: {}", e.kind())))
         }
-    };
-    axum::serve(listener, router)
-        .with_graceful_shutdown(signal)
-        .await
-        .map_err(|e| BootError(format!("serving failed: {}", e.kind())))?;
-    if failed_rx.try_recv().is_ok() {
-        return Err(BootError("the engine stopped".into()));
+        _ = engine_stopped => {
+            tracing::error!("the engine thread stopped");
+            Err(BootError("the engine stopped".into()))
+        }
     }
-    Ok(())
+}
+
+/// Runs the node's HTTP side to completion on its own runtime: binds `bind`, reports the
+/// bound address to `on_listening`, serves (see [`serve`]), and then tears the runtime
+/// down within [`TEARDOWN_LIMIT`], so a fatal engine stop ends the process promptly even
+/// with requests stalled mid-upload. `main` maps `Err` to a non-zero exit.
+pub fn run(
+    bind: std::net::SocketAddr,
+    router: axum::Router,
+    engine_stopped: oneshot::Receiver<()>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    on_listening: impl FnOnce(std::net::SocketAddr),
+) -> Result<(), BootError> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BootError(format!("cannot start the runtime: {}", e.kind())))?;
+    let result = runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .map_err(|e| BootError(format!("cannot bind: {}", e.kind())))?;
+        on_listening(
+            listener
+                .local_addr()
+                .map_err(|e| BootError(format!("cannot bind: {}", e.kind())))?,
+        );
+        serve(listener, router, engine_stopped, shutdown).await
+    });
+    runtime.shutdown_timeout(TEARDOWN_LIMIT);
+    result
+}
+
+/// Resolves on SIGINT or SIGTERM: the graceful shutdown.
+pub async fn os_shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install the SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
+    tracing::info!("shutting down");
 }
 
 /// Verifies and loads the configured weights, then starts the node.
 pub fn boot(config: Config) -> Result<Node, BootError> {
-    let model = LoadedModel::load(&config.weights_dir, &config.expected_weights_sha256)
-        .map_err(|e| BootError(e.to_string()))?;
+    let model = LoadedModel::load(
+        &config.weights_dir,
+        &config.expected_weights_sha256,
+        config.weights_storage,
+    )
+    .map_err(|e| BootError(e.to_string()))?;
     start(config, Arc::new(model))
 }
 
@@ -114,6 +165,11 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
     if model.weights_hash() != config.expected_weights_sha256 {
         return Err(BootError(
             "the loaded model's weights hash is not the configured one".into(),
+        ));
+    }
+    if model.storage() != config.weights_storage {
+        return Err(BootError(
+            "the loaded model's weights storage is not the configured one".into(),
         ));
     }
     let sizing = config.sizing;

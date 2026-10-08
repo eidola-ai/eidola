@@ -33,34 +33,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let node = eidola_server_engine::boot(config)?;
     tracing::info!(weights_sha256 = %node.weights_hash, "weights verified; engine started");
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(bind).await?;
-        tracing::info!(%bind, "listening");
-        eidola_server_engine::serve(listener, node.router, node.engine_stopped, async {
-            shutdown_signal().await;
-            tracing::info!("shutting down");
-        })
-        .await?;
-        Ok(())
-    })
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install the SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = term.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = ctrl_c.await;
-    }
+    eidola_server_engine::run(
+        bind,
+        node.router,
+        node.engine_stopped,
+        eidola_server_engine::os_shutdown_signal(),
+        |addr| tracing::info!(%addr, "listening"),
+    )?;
+    Ok(())
 }

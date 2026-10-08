@@ -22,6 +22,7 @@ The node trusts its measured configuration (the environment; see below) and the 
 
 - any configuration variable missing, empty or malformed;
 - a gateway token that does not verify against `GATEWAY_TOKEN_HASH`, or a hash that is not Argon2id;
+- `EIDOLA_ENGINE_WEIGHTS_STORAGE=verified-readonly` with any weights file (the directory, shards, semantic and chat files) on a filesystem not mounted read-only (checked before hashing);
 - a weights directory whose weights hash differs from `EIDOLA_ENGINE_WEIGHTS_SHA256` (checked before dequantising anything);
 - an unpinned tokenizer or chat template (the chat crate's pins), a tokenizer larger than the model's head, or an unusable `generation_config.json`;
 - sizing the model or the engine core cannot honour: `MAX_MODEL_LEN` above `max_position_embeddings`, more draft tokens than MTP layers, or a scheduler configuration `Engine::new` refuses (for example a step budget below one speculative decode row);
@@ -61,7 +62,9 @@ LC_ALL=C ls *.safetensors config.json model.safetensors.index.json \
   | LC_ALL=C sort | xargs sha256sum | sha256sum      # macOS: shasum -a 256
 ```
 
-Every byte used is a byte hashed: shards are memory-mapped once and both hashed and loaded from that mapping; the other files are read once and parsed from the hashed bytes. `LoadedModel` can only be built by `LoadedModel::load`, which checks the hash first, and `start` re-checks a loaded model's hash against the configuration.
+Every byte used is a byte hashed: shards are memory-mapped once and both hashed and loaded from that mapping; the other files are read once and parsed from the hashed bytes. `LoadedModel` can only be built by `LoadedModel::load`, which checks the hash first, and `start` re-checks a loaded model's hash and storage mode against the configuration.
+
+**What binds the bytes after boot is the storage, not this process.** The hash is checked once; the shards stay memory-mapped (shared, file-backed), and routed experts are dequantised from them on later forwards, so a file modified in place after the check would change the model while `/v1/engine/info` still reports the verified hash. Copying hundreds of gigabytes into private memory is not an option, so the binding is the deployment's: in production the weights directory is a dm-verity volume, mounted read-only, whose every read the kernel checks against the root hash in the measured configuration, so no read can return bytes other than those the hash covered. The process does not assume that: `EIDOLA_ENGINE_WEIGHTS_STORAGE` is part of the measured configuration, `verified-readonly` refuses to boot unless every weights file's filesystem reports `ST_RDONLY` (`statvfs`; checked on Linux against a read-only bind mount and on macOS against a read-only disk image; on a developer Mac an ordinary directory is writable and refused), and `dev-writable` boots anywhere but says so in `/v1/engine/info` (`weights_storage`) and in `/healthz`'s body. A gateway pins the production configuration, so it never routes to a `dev-writable` node.
 
 ## Wire contract
 
@@ -73,11 +76,11 @@ Every byte used is a byte hashed: shards are memory-mapped once and both hashed 
 - **Messages and tools render from the body as sent.** The strict serde types only validate; the prompt is rendered from the same bytes parsed by the chat crate's order-preserving JSON parser, because `serde_json::Value` would sort keys and round big integers that the template prints.
 - **Sampling**: `temperature` and `top_p` from the request, else `generation_config.json`'s (as vLLM applies a model's generation config), else 1.0; `top_k` from the generation config; a fresh random seed per request.
 - **`max_completion_tokens`**: clamped to the room left in `MAX_MODEL_LEN`; absent means that room.
-- **Stop sequences** are matched here on the decoded text (special tokens skipped), before reasoning/tool parsing: text that could begin a sequence is held back; on a match the text before it is released, the sequence and everything after it dropped, `finish_reason` is `stop` (or `tool_calls` if calls were emitted), and the engine request is cancelled. `completion_tokens` counts through the token that completed the match.
+- **Stop sequences** are matched here on the decoded text (special tokens skipped), before reasoning/tool parsing, by one KMP automaton per sequence: only the longest suffix that is a prefix of some sequence is held back, so text that cannot begin one is released at once, and the work is linear in the text however long a sequence is. The first occurrence to complete wins; on a match the text before it is released, the sequence and everything after it dropped, `finish_reason` is `stop` (or `tool_calls` if calls were emitted), and the engine request is cancelled. `completion_tokens` counts through the token that completed the match.
 - **Responses** are OpenAI shapes: `message.reasoning_content` / `content` (null when empty) / `tool_calls`; streaming sends a role chunk at once, one chunk per non-empty delta (`reasoning_content`, `content`, `tool_calls` with `index`), a finish chunk with an empty delta, a usage chunk with `choices: []` when `stream_options.include_usage` (the gateway always sets it), then `[DONE]`. A mid-stream failure ends the stream with an `event: error` frame.
 - **Usage** includes `prompt_tokens_details.cached_tokens`, the prompt positions served from the prefix cache. It is for the client's information only: nothing here prices, and the gateway's charge never depends on it.
 
-`GET /v1/engine/info` (gateway token, no weights header) returns `model`, `weights_sha256`, `executor`, and `build` (`crate`, `version`, and `git_sha`: the `EIDOLA_GIT_SHA` value the build was given at compile time, `null` otherwise; nothing is read from the build environment implicitly). `GET /healthz` is unauthenticated and content-free: `200 ok` while the engine thread runs, `503` after it stopped.
+`GET /v1/engine/info` (gateway token, no weights header) returns `model`, `weights_sha256`, `weights_storage`, `executor`, and `build` (`crate`, `version`, and `git_sha`: the `EIDOLA_GIT_SHA` value the build was given at compile time, `null` otherwise; nothing is read from the build environment implicitly). `GET /healthz` is unauthenticated and content-free: `200 ok` while the engine thread runs (`ok; weights-storage=dev-writable` on a development node), `503` after it stopped.
 
 ## Concurrency
 
@@ -85,7 +88,7 @@ The executor seam is synchronous, so one dedicated thread owns the `Engine` and 
 
 - **Admission** is bounded by `EIDOLA_ENGINE_MAX_REQUESTS` (rendering, tokenizing, running or queued). A permit is taken before rendering or tokenizing and is **owned by the work it bounds** for that work's whole life: it moves into the blocking preparation task (which runs to completion even when a disconnect drops the handler), comes back with the prepared request, travels with the submission, and is released when the request leaves the engine. With none free the request is refused at once (`overloaded`); nothing queues unboundedly in front of the engine. Rendering and tokenization run on the blocking pool.
 - **Cancellation**: each request holds a guard that sends `Cancel` when dropped, so a client disconnect (the SSE stream or the handler future dropped) releases the sequence before the engine's next step, including a request still waiting for a seat. Independently, the engine thread cancels a request whose reader has gone away the next time it has output for it.
-- **Failure**: an `ExecutorError` is fatal (the host cannot know which writes landed). **Any** exit of the engine thread (that, a panic, every handle dropped) is fatal, structurally: the thread owns an `ExitSignal` whose drop (on return or unwind alike) turns health `503` and resolves `Node::engine_stopped`; `serve` treats that receiver resolving in any way, signal or dropped sender, as fatal and returns an error, and `main` exits non-zero. In-flight requests see their channel close and get an error.
+- **Failure**: an `ExecutorError` is fatal (the host cannot know which writes landed). **Any** exit of the engine thread (that, a panic, every handle dropped) is fatal, structurally: the thread owns an `ExitSignal` whose drop (on return or unwind alike) turns health `503` and resolves `Node::engine_stopped`; `serve` treats that receiver resolving in any way, signal or dropped sender, as fatal and returns an error at once, without draining (graceful draining is only for SIGINT/SIGTERM); `run` then tears the runtime down within `TEARDOWN_LIMIT`, so open connections (even one stalled mid-upload) cannot keep the process alive, and `main` exits non-zero. In-flight requests see their channel close and get an error.
 
 ## Content-free by construction
 
@@ -93,7 +96,7 @@ Prompts, outputs, cache keys and salts are content; so is anything derived from 
 
 - `ApiError`'s `Display` (the only rendering that reaches logs) is the error category alone; the detail goes only into the caller's response body (`error.rs`, tested).
 - Configuration and boot errors name variables, files and limits, never values; the gateway token is held only as its SHA-256 and prints as a redaction marker.
-- The engine core's secret types (`CacheKey`, `EngineSalt`) print redacted and are zeroed on drop; the decoded key's buffers here are scrubbed (`zeroize`).
+- The engine core's secret types (`CacheKey`, `EngineSalt`) print redacted and are zeroed on drop. The cache key is decoded into a fixed stack buffer handed to `CacheKey::from_buffer`, which copies it into the zeroizing allocation and scrubs the buffer; the key's JSON text (the serde `String` and the order-preserving parse's copy) is scrubbed too. Not reachable from here: the body's bytes in the HTTP stack's shared read buffers, and serde_json's scratch buffer when the key's JSON string uses escapes. The gateway token is scrubbed after boot verification, but stays in the process environment (removing a variable is `unsafe` in this edition).
 - `ValidRequest` prints a marker, not its fields.
 - Per-request logging is limited to refusal categories at `debug` and failures at `warn`, with no sizes.
 
@@ -112,6 +115,7 @@ All required; an empty value counts as missing.
 | `EIDOLA_ENGINE_MODEL_ID` | The one model id served. |
 | `EIDOLA_ENGINE_WEIGHTS_DIR` | Weights and chat artifacts. |
 | `EIDOLA_ENGINE_WEIGHTS_SHA256` | The expected weights hash (64 hex digits). |
+| `EIDOLA_ENGINE_WEIGHTS_STORAGE` | `verified-readonly` (production: read-only, kernel-verified mount; checked) or `dev-writable` (reported in info and health). |
 | `GATEWAY_TOKEN` / `GATEWAY_TOKEN_HASH` | The gateway's bearer (secret) and its Argon2id hash (measured; make one with `cargo run -p hash-secret`). |
 | `EIDOLA_ENGINE_EXECUTOR` | `cpu` (or `cuda` in a `cuda` build). |
 | `EIDOLA_ENGINE_BIND_ADDR` | `host:port`. |
@@ -136,11 +140,11 @@ curl -N 127.0.0.1:8090/v1/chat/completions -H 'Authorization: Bearer dev-gateway
   -d '{"model":"mimo-dev","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":16,"stream":true}'
 ```
 
-**The dev model** is the model crate's committed synthetic fixture with `embed_tokens` and `lm_head` widened from 256 rows to MiMo's padded 152,576 (the fixture's rows first, then deterministic random rows at the same scale), so the real pinned tokenizer and template can drive it; every other tensor is the fixture's. Its weights are random: the output is gibberish, and nothing about it is a quality signal.
+**The dev model** is the model crate's committed synthetic fixture with `embed_tokens` and `lm_head` widened from 256 rows to MiMo's padded 152,576 (the fixture's rows first, then deterministic random rows at the same scale), so the real pinned tokenizer and template can drive it; every other tensor is the fixture's. Its weights are random: the output is gibberish, and nothing about it is a quality signal. A built directory records a fingerprint of its inputs (`.fixture-fingerprint`: SHA-256 over a generator version, the generator's own source, and every input file); a directory whose fingerprint does not match is rebuilt beside it and swapped in by rename, so neither the tests nor `just run engine-server` can use a stale model.
 
 ## Tests
 
-`cargo test -p eidola-server-engine` (about 5 s after the first build; no network, no GPU). `tests/server.rs` runs the real node in process on a loopback port, over the dev model (built once into the target directory, loaded once per test binary) and the CPU executor:
+`cargo test -p eidola-server-engine` (about 5 s after the first build; no network, no GPU). `tests/server.rs` runs the real node in process on a loopback port, over the dev model (built into the target directory when its input fingerprint changes, loaded once per test binary) and the CPU executor:
 
 - gateway token required (chat and info), checked before the weights hash; health unauthenticated;
 - weights-hash mismatch and absence refused on the header alone (an unparseable body gives the same answer), with the engine's counters untouched;
@@ -154,6 +158,10 @@ curl -N 127.0.0.1:8090/v1/chat/completions -H 'Authorization: Bearer dev-gateway
 - an injected executor panic (`tests/engine_exit.rs`, over the core's mock executor) turning health unhealthy, closing the in-flight request's channel, releasing its permit, and ending `serve` with an error;
 - `cache_key`: the same key reports whole cached blocks with identical output; another key, and no key, report none;
 - tool definitions and tool-call history with string arguments rendering, and non-object history arguments refused;
+- a long stop sequence not delaying the stream; the stop matcher against a naive reference on thousands of random stop sets and splits;
+- `verified-readonly` refusing a writable directory (and a model loaded under the other mode); `a_read_only_mount_is_accepted` runs where `EIDOLA_TEST_READ_ONLY_DIR` names a read-only mount;
+- an engine panic ending a real child process non-zero within the teardown bound while a request is stalled mid-upload (`tests/engine_exit.rs`);
+- a stale dev model rebuilt, a current one reused;
 - prompts beyond the model length; a full `boot` from the directory; boot refusing a wrong expected hash (before loading) and a loaded model's hash mismatching the configuration; every configuration variable's absence and malformations; sizing the model or the core cannot honour.
 
-Each of these was checked to fail under a deliberate bug: no cancel on guard drop (the queued-disconnect test), no cancel on either path, a dropped first output token, a different prompt rendering, a salt not derived from the key, the weights check moved after body parsing, the permit kept by the handler instead of the preparation task, the exit signal skipped on panic, `serve` reacting only to a sent stop signal, tools rendered under `tool_choice: none`, content parts accepting unknown fields. Keep that true when changing the tests.
+Each of these was checked to fail under a deliberate bug: no cancel on guard drop (the queued-disconnect test), no cancel on either path, a dropped first output token, a different prompt rendering, a salt not derived from the key, the weights check moved after body parsing, the permit kept by the handler instead of the preparation task, the exit signal skipped on panic, `serve` reacting only to a sent stop signal, tools rendered under `tool_choice: none`, content parts accepting unknown fields, the read-only check skipped, graceful draining on an engine stop, the stop matcher holding everything, a cached dev model reused whatever its fingerprint, `from_buffer` not scrubbing. Keep that true when changing the tests.

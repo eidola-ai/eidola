@@ -186,7 +186,8 @@ async fn gateway_token_is_required() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 200);
-    assert_eq!(r.text().await.unwrap(), "ok");
+    // A dev-writable node says so, even in its health check.
+    assert_eq!(r.text().await.unwrap(), "ok; weights-storage=dev-writable");
     assert_eq!(node.stats().submitted, 0);
 }
 
@@ -204,6 +205,7 @@ async fn info_reports_the_node_identity() {
     let v: Value = r.json().await.unwrap();
     assert_eq!(v["model"], MODEL_ID);
     assert_eq!(v["weights_sha256"], weights_hash());
+    assert_eq!(v["weights_storage"], "dev-writable");
     assert_eq!(v["executor"], "cpu");
     assert_eq!(v["build"]["crate"], "eidola-server-engine");
     assert_eq!(v["build"]["version"], env!("CARGO_PKG_VERSION"));
@@ -518,6 +520,39 @@ async fn stop_sequences_truncate_the_output_and_end_the_request() {
     assert_eq!(s.cancelled, 2, "{s:?}");
 }
 
+/// A long stop sequence that the output never begins does not delay the stream: text is
+/// released as it is generated.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_stop_sequence_does_not_hold_back_the_stream() {
+    let node = TestNode::start(&[]).await;
+    let mut body = request(LONG_TEXT, 24);
+    let (_, plain) = node.chat_json(&body).await;
+    body["stop"] = json!(["\u{1}".repeat(20_000)]);
+    body["stream"] = true.into();
+    let (chunks, _) = parse_chunks(&node.chat_stream(&body).await);
+    let deltas: Vec<&Value> = chunks
+        .iter()
+        .filter_map(|c| c["choices"].get(0))
+        .filter(|ch| ch["finish_reason"].is_null() && ch["delta"].get("role").is_none())
+        .collect();
+    assert!(deltas.len() > 4, "text streamed in {} deltas", deltas.len());
+    let text: String = deltas
+        .iter()
+        .map(|d| {
+            d["delta"]["reasoning_content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+                + d["delta"]["content"].as_str().unwrap_or("")
+        })
+        .collect();
+    let m = &plain["choices"][0]["message"];
+    assert_eq!(
+        text,
+        text_of(m, "reasoning_content") + &text_of(m, "content")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn max_tokens_ends_with_length() {
     let node = TestNode::start(&[]).await;
@@ -792,6 +827,7 @@ fn configuration_refuses_anything_missing_or_malformed() {
         (env::CACHE_IDLE_TTL_SECS, "0"),
         (env::CACHE_MAX_AGE_SECS, "60"),
         (env::MODEL_ID, "has space"),
+        (env::WEIGHTS_STORAGE, "readonly"),
     ];
     for (key, value) in bad {
         let mut map = full.clone();
@@ -947,4 +983,40 @@ async fn multimodal_keys_in_text_parts_are_refused() {
         assert_eq!(status, 400, "{key} on an image part");
     }
     assert_eq!(node.stats(), Stats::default());
+}
+
+/// The cached dev model is rebuilt when its recorded input fingerprint does not match.
+#[test]
+fn a_stale_dev_model_is_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("model");
+    fixture::ensure_dev_model(&out).unwrap();
+    let hash = fixture::weights_hash_of(&out);
+    assert_eq!(hash, weights_hash());
+    // Tamper with the built model and mark it as built from other inputs.
+    std::fs::write(out.join("config.json"), b"{}").unwrap();
+    std::fs::write(out.join(fixture::FINGERPRINT_FILE), b"other inputs").unwrap();
+    fixture::ensure_dev_model(&out).unwrap();
+    assert_eq!(
+        fixture::weights_hash_of(&out),
+        hash,
+        "rebuilt from the current inputs"
+    );
+    // A current one is reused as is.
+    std::fs::write(out.join("marker"), b"").unwrap();
+    fixture::ensure_dev_model(&out).unwrap();
+    assert!(out.join("marker").exists());
+}
+
+/// Production storage is checked, not assumed: a writable weights directory is refused
+/// before anything is hashed or loaded, and a model loaded under one storage mode cannot
+/// start a node configured for the other.
+#[test]
+fn verified_readonly_refuses_a_writable_weights_directory() {
+    let mut map = env_map();
+    map.insert(env::WEIGHTS_STORAGE, "verified-readonly".into());
+    let err = eidola_server_engine::boot(config_from(&map).unwrap()).unwrap_err();
+    assert!(err.to_string().contains("read-only mount"), "{err}");
+    let err = eidola_server_engine::start(config_from(&map).unwrap(), loaded()).unwrap_err();
+    assert!(err.to_string().contains("storage"), "{err}");
 }
