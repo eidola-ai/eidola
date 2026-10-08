@@ -23,8 +23,9 @@
 //! > **A dependency is admissible here only if it is already in every
 //! > consumer's graph and is required for contract fidelity.** Today that
 //! > set is `serde_json`, plus `argon2` behind the optional `argon2` feature
-//! > and `serde_yaml` behind the optional `deployment` feature. Any addition
-//! > needs the same argument written down.
+//! > and `serde_yaml`, `serde` (derive) and `unsafe-libyaml` behind the
+//! > optional `deployment` feature. Any addition needs the same argument
+//! > written down.
 //!
 //! `argon2` qualifies because it is optional: it enters a graph only when a
 //! consumer enables the feature, and the two that do (the inference node and
@@ -34,7 +35,8 @@
 //! is optional on the same terms: `deployment` (which implies `argon2`) is
 //! enabled by the gateway's build and tests and by `measure-enclave`, the
 //! readers of engine deployment configs, so the one deployment check
-//! (`engine_deployment::deployment`) parses YAML once for both.
+//! (`engine_deployment::deployment`) parses YAML once for both; `unsafe-libyaml`
+//! is the parser `serde_yaml` is built on, read directly for its event stream.
 //!
 //! `serde_json` qualifies on both counts: every consumer (app-core, gateway,
 //! inference node, gui; cli via app-core) already carries it, so admitting it
