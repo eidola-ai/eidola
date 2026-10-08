@@ -52,9 +52,41 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
     /// The client's prefix-cache key: 32 bytes, base64url without padding. Content-class:
-    /// never logged, and turned into an engine salt as soon as it is decoded.
+    /// never logged, and turned into an engine salt as soon as it is decoded. Its text is
+    /// scrubbed whenever it is dropped, including when a later field fails to parse and
+    /// serde drops the partly built request.
     #[serde(default)]
-    pub cache_key: Option<String>,
+    pub cache_key: Option<CacheKeyText>,
+}
+
+/// The cache key's JSON text, zeroed when dropped. Deserialized straight from a string, so
+/// the text is never held by an unscrubbed owner.
+pub struct CacheKeyText(String);
+
+impl CacheKeyText {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for CacheKeyText {
+    fn drop(&mut self) {
+        self.0.zeroize();
+        #[cfg(test)]
+        tests::record_scrub(&self.0);
+    }
+}
+
+impl std::fmt::Debug for CacheKeyText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CacheKeyText(<redacted>)")
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheKeyText {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d).map(CacheKeyText)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,19 +270,20 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
 }
 
 /// Decodes the key into a fixed stack buffer (no heap copy, no by-value array), hands it
-/// to [`CacheKey::from_buffer`], which scrubs it, and scrubs the text and the buffer's
-/// slack. Copies outside this crate's reach remain: the request body's bytes in the HTTP
+/// to [`CacheKey::from_buffer`], which scrubs it, and scrubs the text (dropping it) and the
+/// buffer's slack. Copies outside this crate's reach remain: the request body's bytes in the HTTP
 /// stack's shared read buffers, and serde_json's scratch buffer when the key's JSON string
 /// uses escapes.
-fn decode_cache_key(mut text: String) -> Result<CacheKey, ApiError> {
+fn decode_cache_key(text: CacheKeyText) -> Result<CacheKey, ApiError> {
     // Room for any 43-character input; a longer one is refused before decoding.
     let mut buf = [0u8; 48];
-    let decoded = if text.len() == 43 {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode_slice(text.as_bytes(), &mut buf)
+    let decoded = if text.as_str().len() == 43 {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode_slice(text.as_str().as_bytes(), &mut buf)
     } else {
         Ok(0)
     };
-    text.zeroize();
+    drop(text);
     let result = match decoded {
         Ok(32) => {
             let key: &mut [u8; 32] = (&mut buf[..32]).try_into().expect("32 bytes");
@@ -263,3 +296,69 @@ fn decode_cache_key(mut text: String) -> Result<CacheKey, ApiError> {
 }
 
 const CACHE_KEY_SHAPE: &str = "cache_key must be 32 bytes, base64url without padding";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Per dropped `CacheKeyText` on this thread: its capacity, and whether every byte
+        /// of it read zero after the scrub.
+        static SCRUBS: RefCell<Vec<(usize, bool)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Called by `CacheKeyText::drop` after zeroing, before the buffer is freed.
+    pub(super) fn record_scrub(s: &String) {
+        let cap = s.capacity();
+        // SAFETY: the allocation is live (the `String` has not been dropped yet), `cap`
+        // bytes long, and every byte of it was just written by `zeroize`, which zeroes
+        // the whole capacity.
+        let bytes = unsafe { std::slice::from_raw_parts(s.as_ptr(), cap) };
+        let zero = bytes.iter().all(|b| *b == 0);
+        SCRUBS.with(|v| v.borrow_mut().push((cap, zero)));
+    }
+
+    fn take_scrubs() -> Vec<(usize, bool)> {
+        SCRUBS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+    }
+
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// A field after `cache_key` failing to parse drops the partly built request: the key
+    /// text is scrubbed then too, and the request is refused as invalid.
+    #[test]
+    fn a_failure_after_the_cache_key_scrubs_it() {
+        take_scrubs();
+        for body in [
+            format!(r#"{{"cache_key":"{KEY}","model":5}}"#),
+            format!(r#"{{"cache_key":"{KEY}","unknown":1}}"#),
+            format!(r#"{{"cache_key":"{KEY}","messages":[{{"role":"nobody"}}]}}"#),
+            format!(r#"{{"cache_key":"{KEY}","cache_key":"{KEY}"}}"#),
+            format!(r#"{{"cache_key":"{KEY}","#),
+        ] {
+            let e = parse_request(body.as_bytes(), "m").unwrap_err();
+            assert!(matches!(e, ApiError::InvalidRequest(_)), "{body}: {e}");
+            let scrubs = take_scrubs();
+            assert!(!scrubs.is_empty(), "{body}: the key text was not dropped");
+            assert!(
+                scrubs.iter().all(|&(cap, zero)| cap >= KEY.len() && zero),
+                "{body}: {scrubs:?}"
+            );
+        }
+    }
+
+    /// The accepted path scrubs it too.
+    #[test]
+    fn a_decoded_cache_key_is_scrubbed() {
+        take_scrubs();
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"cache_key":"{KEY}"}}"#
+        );
+        let req = parse_request(body.as_bytes(), "m").unwrap();
+        assert!(req.cache_key.is_some());
+        let scrubs = take_scrubs();
+        assert_eq!(scrubs.len(), 1, "{scrubs:?}");
+        assert!(scrubs[0].1);
+    }
+}

@@ -328,6 +328,12 @@ async fn strict_schema_refuses_what_it_does_not_name() {
         with("cache_key", "A".repeat(43).replace('A', "+").into()),
         with("cache_key", format!("{}=", "A".repeat(43)).into()),
         with("cache_key", 5.into()),
+        // A valid key, then a field that fails to parse.
+        {
+            let mut b = with("cache_key", "A".repeat(43).into());
+            b["seed"] = 7.into();
+            b
+        },
     ];
     for body in &cases {
         let (status, v) = node.chat_json(body).await;
