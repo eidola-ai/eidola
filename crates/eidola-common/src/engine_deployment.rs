@@ -1440,6 +1440,9 @@ mod tests {
         assert!(fits(room, FLASH_PACK, 1).is_ok());
         let err = fits(room + 1, FLASH_PACK, 1).unwrap_err();
         assert!(err.contains(SUPPORTED_GPU), "{err}");
+        // The device is what the driver reports, not the HBM it is sold
+        // with: a budget that would fill 288 GiB does not fit.
+        assert!(fits((288 << 30) - FLASH_PACK - reserve, FLASH_PACK, 1).is_err());
         // A budget that fits only without the weights.
         let without_weights = SUPPORTED_GPU_MEMORY_BYTES - reserve;
         assert!(fits(without_weights, 0, 1).is_ok());
