@@ -75,15 +75,15 @@ pub fn engine_request_headers(token: &EngineToken, model: &PinnedModel) -> Heade
     headers
 }
 
-/// A chat request as the client sent it: the strict parse, and the exact
-/// bytes it was parsed from.
+/// A chat request as the client sent it: the strict parse, and the bytes it
+/// was parsed from.
 ///
 /// The node renders its prompt from the body as sent, through an
-/// order-preserving parser: object key order and number spellings inside
-/// `messages` and `tools` reach the chat template (a tool schema's property
-/// order is part of the prompt). Re-serializing the parse would sort keys and
-/// respell numbers, so a request bound for a node keeps its bytes, and the
-/// only constructor parses exactly those bytes, so the two cannot disagree.
+/// order-preserving parser: object key order inside `messages` and `tools`
+/// reaches the chat template (a tool schema's property order is part of the
+/// prompt), and the gateway's parse (`serde_json`'s sorted maps) does not keep
+/// it. So a request bound for a node keeps its bytes, and the only
+/// constructor parses exactly those bytes, so the two cannot disagree.
 pub struct ValidatedRequest {
     raw: bytes::Bytes,
     parsed: ChatCompletionRequest,
@@ -102,9 +102,23 @@ impl ValidatedRequest {
     }
 }
 
-/// The body of a chat request to a node: every top-level member of the
-/// client's body exactly as sent (bytes, nested key order, number spellings),
-/// except the three the gateway decides —
+/// The body of a chat request to a node.
+///
+/// **What is forwarded is what was priced.** The pricing contract
+/// (`eidola_common::prompt_charge`, computed identically by the client and by
+/// the gateway over the parsed request) measures tool schemas and tool calls
+/// as their compact `serde_json` serialization. Forwarding the client's raw
+/// spellings would let `1.0000000000000000000001` or an escaped string reach
+/// the node at more bytes than were priced. So every scalar is re-spelled
+/// exactly as `serde_json` serializes the parsed value — the same text the
+/// contract measures, and the text Eidola's own client sends — while object
+/// key order, the one thing the parse loses that the prompt depends on, is
+/// kept from the client's bytes (a key repeated within an object keeps its
+/// first position and its last value, `serde_json`'s reading of it). The
+/// output is compact; the Tinfoil path forwards the same scalars and the same
+/// measures, with keys sorted.
+///
+/// Three top-level members are the gateway's to decide, and are written last:
 ///
 /// - `stream` / `stream_options`: for a streaming request, `"stream":true`
 ///   and `"stream_options":{"include_usage":true}` (usage is what the refund
@@ -116,69 +130,169 @@ impl ValidatedRequest {
 /// of `raw`. `raw` itself is an HTTP-stack buffer, out of reach like the
 /// node's own read buffers.
 pub fn engine_request_body(request: &ValidatedRequest) -> Zeroizing<Vec<u8>> {
-    let members: TopLevel =
-        serde_json::from_slice(&request.raw).expect("the bytes the request was parsed from");
+    let Canonical::Object(members) =
+        serde_json::from_slice(&request.raw).expect("the bytes the request was parsed from")
+    else {
+        unreachable!("a parsed request is a JSON object");
+    };
     let mut body = Zeroizing::new(Vec::with_capacity(request.raw.len() + 96));
     body.push(b'{');
     let mut first = true;
-    let mut member = |body: &mut Vec<u8>, key: &str, value: &[u8]| {
+    let mut member = |body: &mut Vec<u8>, key: &str, write: &dyn Fn(&mut Vec<u8>)| {
         if !first {
             body.push(b',');
         }
         first = false;
         serde_json::to_writer(&mut *body, key).expect("a string serializes");
         body.push(b':');
-        body.extend_from_slice(value);
+        write(body);
     };
-    for (key, value) in members.0 {
+    for (key, mut value) in members {
         match key.as_str() {
             "stream" | "stream_options" => {}
-            "cache_key" => {
-                let mut text: Box<str> = value.into();
-                text.zeroize();
-            }
-            _ => member(&mut body, &key, value.get().as_bytes()),
+            "cache_key" => value.scrub(),
+            _ => member(&mut body, &key, &|out| value.write(out)),
         }
     }
     let parsed = &request.parsed;
     if parsed.stream {
-        member(&mut body, "stream", b"true");
-        member(&mut body, "stream_options", br#"{"include_usage":true}"#);
+        member(&mut body, "stream", &|out| out.extend_from_slice(b"true"));
+        member(&mut body, "stream_options", &|out| {
+            out.extend_from_slice(br#"{"include_usage":true}"#)
+        });
     }
     if let Some(key) = &parsed.cache_key {
         let text =
             Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.as_bytes()));
-        let quoted = Zeroizing::new(format!("\"{}\"", text.as_str()));
-        member(&mut body, "cache_key", quoted.as_bytes());
+        member(&mut body, "cache_key", &|out| {
+            out.push(b'"');
+            out.extend_from_slice(text.as_bytes());
+            out.push(b'"');
+        });
     }
     body.push(b'}');
     body
 }
 
-/// A JSON object's top-level members in document order, each value kept as
-/// the exact text it was written as.
-struct TopLevel(Vec<(String, Box<serde_json::value::RawValue>)>);
+/// A JSON value with object members in document order and scalars as
+/// `serde_json` reads them.
+enum Canonical {
+    Scalar(serde_json::Value),
+    Array(Vec<Canonical>),
+    Object(Vec<(String, Canonical)>),
+}
 
-impl<'de> serde::Deserialize<'de> for TopLevel {
+impl Canonical {
+    /// The compact serialization: scalars exactly as `serde_json` writes them,
+    /// objects in member order.
+    fn write(&self, out: &mut Vec<u8>) {
+        match self {
+            Canonical::Scalar(value) => {
+                serde_json::to_writer(&mut *out, value).expect("a scalar serializes")
+            }
+            Canonical::Array(items) => {
+                out.push(b'[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    item.write(out);
+                }
+                out.push(b']');
+            }
+            Canonical::Object(members) => {
+                out.push(b'{');
+                for (i, (key, value)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    serde_json::to_writer(&mut *out, key).expect("a string serializes");
+                    out.push(b':');
+                    value.write(out);
+                }
+                out.push(b'}');
+            }
+        }
+    }
+
+    /// Zero every string this value holds.
+    fn scrub(&mut self) {
+        match self {
+            Canonical::Scalar(serde_json::Value::String(s)) => s.zeroize(),
+            Canonical::Scalar(_) => {}
+            Canonical::Array(items) => items.iter_mut().for_each(Canonical::scrub),
+            Canonical::Object(members) => members.iter_mut().for_each(|(k, v)| {
+                k.zeroize();
+                v.scrub();
+            }),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Canonical {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Members;
-        impl<'de> serde::de::Visitor<'de> for Members {
-            type Value = TopLevel;
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Canonical;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON object")
+                f.write_str("a JSON value")
+            }
+            // Each scalar becomes the `serde_json::Value` `serde_json`'s own
+            // visitor builds from the same call, so it serializes identically.
+            fn visit_bool<E>(self, v: bool) -> Result<Canonical, E> {
+                Ok(Canonical::Scalar(v.into()))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Canonical, E> {
+                Ok(Canonical::Scalar(v.into()))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Canonical, E> {
+                Ok(Canonical::Scalar(v.into()))
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<Canonical, E> {
+                Ok(Canonical::Scalar(
+                    serde_json::Number::from_f64(v).map_or(serde_json::Value::Null, Into::into),
+                ))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Canonical, E> {
+                Ok(Canonical::Scalar(v.into()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Canonical, E> {
+                Ok(Canonical::Scalar(v.into()))
+            }
+            fn visit_unit<E>(self) -> Result<Canonical, E> {
+                Ok(Canonical::Scalar(serde_json::Value::Null))
+            }
+            fn visit_none<E>(self) -> Result<Canonical, E> {
+                Ok(Canonical::Scalar(serde_json::Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Canonical, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Canonical::Array(items))
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
-            ) -> Result<TopLevel, A::Error> {
-                let mut members = Vec::new();
-                while let Some(member) = map.next_entry()? {
-                    members.push(member);
+            ) -> Result<Canonical, A::Error> {
+                let mut members: Vec<(String, Canonical)> = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, Canonical>()? {
+                    match members.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, previous)) => {
+                            previous.scrub();
+                            *previous = value;
+                        }
+                        None => members.push((key, value)),
+                    }
                 }
-                Ok(TopLevel(members))
+                Ok(Canonical::Object(members))
             }
         }
-        d.deserialize_map(Members)
+        d.deserialize_any(Visitor)
     }
 }
 
@@ -257,26 +371,87 @@ mod tests {
         );
     }
 
-    /// Everything but the members the gateway decides reaches the node byte
-    /// for byte: nested key order (a tool schema's property order is part of
-    /// the prompt) and number spellings (`1.0`, `1e2`) included.
+    /// The node receives the client's key order (a tool schema's property
+    /// order is part of the prompt) with every scalar spelled as the pricing
+    /// contract measured it: a long number spelling, an exponent, a trailing
+    /// zero, an escaped string and whitespace all arrive in `serde_json`'s
+    /// compact form.
     #[test]
-    fn the_body_keeps_the_clients_bytes() {
-        let tools = r#"[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"zeta":{"type":"number","default":1.0},"alpha":{"type":"integer","maximum":1e2}}}}}]"#;
-        let messages = r#"[{"role":"user","content":"hi","name":"z"}]"#;
-        let raw = format!(
-            r#"{{"stream_options":{{"include_usage":false}},"tools":{tools},"model":"fixture-model","messages":{messages},"temperature":0.50,"stream":true,"cache_key":"_-0123456789abcdefghijklmnopqrstuvwxyzABCDE"}}"#
-        );
-        let request = ValidatedRequest::from_bytes(bytes::Bytes::from(raw)).unwrap();
+    fn the_body_keeps_key_order_and_canonical_scalars() {
+        let raw = r#"{ "stream_options":{"include_usage":false},
+            "tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object",
+              "properties":{"zeta":{"type":"number","default":1.0000000000000000000001},
+                            "alpha":{"type":"integer","maximum":1e2,"description":"\u0041"}}}}}],
+            "model":"fixture-model","messages":[{"role":"user","content":"hi","name":"z"}],
+            "temperature":0.50,"stream":true,
+            "cache_key":"_-0123456789abcdefghijklmnopqrstuvwxyzABCDE"}"#;
+        let request =
+            ValidatedRequest::from_bytes(bytes::Bytes::from_static(raw.as_bytes())).unwrap();
         let body = engine_request_body(&request);
-        let text = std::str::from_utf8(&body).unwrap();
         assert_eq!(
-            text,
-            format!(
-                r#"{{"tools":{tools},"model":"fixture-model","messages":{messages},"temperature":0.50,"stream":true,"stream_options":{{"include_usage":true}},"cache_key":"_-0123456789abcdefghijklmnopqrstuvwxyzABCDE"}}"#
-            )
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"zeta":{"type":"number","default":1.0},"alpha":{"type":"integer","maximum":100.0,"description":"A"}}}}}],"model":"fixture-model","messages":[{"role":"user","content":"hi","name":"z"}],"temperature":0.5,"stream":true,"stream_options":{"include_usage":true},"cache_key":"_-0123456789abcdefghijklmnopqrstuvwxyzABCDE"}"#
         );
-        // And it is still a request the strict type accepts.
         serde_json::from_slice::<ChatCompletionRequest>(&body).unwrap();
+    }
+
+    /// The bytes forwarded are the bytes priced: each forwarded tool schema
+    /// and tool call is exactly as long as the pricing contract measured it,
+    /// and the forwarded body prices to the same prompt tokens as the request
+    /// the gateway charged for.
+    #[test]
+    fn the_engine_receives_exactly_what_was_priced() {
+        let raw = r#"{"model":"m","messages":[
+            {"role":"user","content":"\u0068i"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function",
+              "function":{"name":"f","arguments":"{}"},"x":1.0000000000000000000001,"x":2E+0}]},
+            {"role":"tool","tool_call_id":"c","content":"4"}],
+          "tools":[{"type":"function","function":{"name":"f","parameters":{
+            "properties":{"b":{"maximum":1.0000000000000000000001e0},"a":{"minimum":-0.0}}}}}]}"#;
+        let request =
+            ValidatedRequest::from_bytes(bytes::Bytes::from_static(raw.as_bytes())).unwrap();
+        let body = engine_request_body(&request);
+
+        // What the gateway priced, through its own pricing function.
+        let priced = crate::handlers::chargeable_prompt_tokens_for(request.request());
+        // What the node receives, priced by the same contract.
+        let forwarded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let received = eidola_common::prompt_charge(
+            forwarded["messages"].as_array().unwrap(),
+            forwarded["tools"].as_array().map(Vec::as_slice),
+        );
+        assert_eq!(received.chargeable_prompt_tokens(), priced);
+
+        // And byte for byte per measured entry: the text the node receives for
+        // each tool and tool call is as long as its measure.
+        #[derive(serde::Deserialize)]
+        struct Raw<'a> {
+            #[serde(borrow)]
+            tools: Vec<&'a serde_json::value::RawValue>,
+            #[serde(borrow)]
+            messages: Vec<Message<'a>>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Message<'a> {
+            #[serde(borrow, default)]
+            tool_calls: Option<Vec<&'a serde_json::value::RawValue>>,
+        }
+        let sent: Raw<'_> = serde_json::from_slice(&body).unwrap();
+        let measured = serde_json::to_value(request.request()).unwrap();
+        for (text, value) in sent.tools.iter().zip(measured["tools"].as_array().unwrap()) {
+            assert_eq!(
+                text.get().len() as u64,
+                eidola_common::json_text_bytes(value)
+            );
+        }
+        let calls = sent.messages[1].tool_calls.as_ref().unwrap();
+        let measured_calls = measured["messages"][1]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), measured_calls.len());
+        for (text, value) in calls.iter().zip(measured_calls) {
+            assert_eq!(
+                text.get().len() as u64,
+                eidola_common::json_text_bytes(value)
+            );
+        }
     }
 }

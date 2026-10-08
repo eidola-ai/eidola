@@ -84,7 +84,7 @@ pub async fn list_models(
 /// already fully re-serializes to forward upstream, on the far side of an
 /// LLM call. Reconstructing the walk over the typed struct to avoid it would
 /// reintroduce exactly the drift the consolidation removed.
-fn chargeable_prompt_tokens_for(request: &ChatCompletionRequest) -> u64 {
+pub(crate) fn chargeable_prompt_tokens_for(request: &ChatCompletionRequest) -> u64 {
     let Ok(value) = serde_json::to_value(request) else {
         // Unreachable in practice (the request was deserialized from JSON and
         // every field is serializable). Falling back to the message count
