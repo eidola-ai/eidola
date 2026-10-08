@@ -988,7 +988,8 @@ where
 mod tests {
     use super::*;
     use crate::types::{
-        Capability, Modality, ModelCapabilities, ModelPricing, OutputBudgetClass, ScaledPrice,
+        Capability, Modality, ModelCapabilities, ModelHosting, ModelPricing, OutputBudgetClass,
+        PinnedWeightsCapability, PromptCacheCapability, ScaledPrice,
     };
 
     /// A token-priced model with easy integer math at `PRICING_SCALE_FACTOR`:
@@ -1001,11 +1002,14 @@ mod tests {
             context_length: 8192,
             max_output_tokens: Some(4096),
             output_budget_class: OutputBudgetClass::Standard,
+            hosting: ModelHosting::Tinfoil,
             capabilities: ModelCapabilities {
                 tool_calling: Capability::new(true),
                 reasoning: Capability::new(false),
                 input_modalities: vec![Modality::Text],
                 output_modalities: vec![Modality::Text],
+                prompt_cache: PromptCacheCapability::unsupported(),
+                pinned_weights: PinnedWeightsCapability::unsupported(),
             },
             pricing: ModelPricing {
                 per_prompt_token: ScaledPrice {

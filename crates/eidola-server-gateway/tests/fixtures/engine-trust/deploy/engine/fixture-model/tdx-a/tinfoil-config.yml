@@ -1,0 +1,27 @@
+# A synthetic engine deployment, used by the gateway's engine-trust tests.
+# Laid out as a real one is: deploy/engine/<model>/<variant>/.
+cvm-version: 0.15.0@sha256:1111111111111111111111111111111111111111111111111111111111111111
+cpus: 16
+memory: 65536
+
+containers:
+  - name: "eidola-server-engine"
+    image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    secrets:
+      - GATEWAY_TOKEN
+    env:
+      - EIDOLA_ENGINE_MODEL_ID: "fixture-model"
+      - EIDOLA_ENGINE_WEIGHTS_DIR: "/weights"
+      - EIDOLA_ENGINE_WEIGHTS_SHA256: "3333333333333333333333333333333333333333333333333333333333333333"
+      - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
+      - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA"
+      - EIDOLA_ENGINE_EXECUTOR: "cuda"
+      - EIDOLA_ENGINE_BIND_ADDR: "0.0.0.0:8080"
+      - EIDOLA_ENGINE_PREFIX_CACHE: "true"
+      - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
+      - EIDOLA_ENGINE_CACHE_MAX_AGE_SECS: "7200"
+
+shim:
+  upstream-port: 8080
+  paths:
+    - /*

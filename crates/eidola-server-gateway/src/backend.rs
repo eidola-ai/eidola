@@ -11,10 +11,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use utoipa::ToSchema;
 
+use crate::engine_trust::{self, PinnedModel};
 use crate::error::ServerError;
 use crate::types::{
     Capability, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Modality,
-    Model, ModelCapabilities, ModelPricing, ModelsResponse, OutputBudgetClass, ScaledPrice,
+    Model, ModelCapabilities, ModelHosting, ModelPricing, ModelsResponse, OutputBudgetClass,
+    PinnedWeightsCapability, PromptCacheCapability, ScaledPrice,
 };
 
 // ---------------------------------------------------------------------------
@@ -159,6 +161,11 @@ struct CatalogEntry {
     id: &'static str,
     name: &'static str,
     description: &'static str,
+    /// Who runs the model. An `Eidola` row is served by the engine
+    /// deployments `releases/trust/engine-enclaves.json` pins for its id,
+    /// and its weights and prompt-cache capabilities come from that pin; the
+    /// binding is checked at compile time (`catalog_binding_problem`).
+    hosting: ModelHosting,
     context_length: u64,
     /// Whether the model accepts a `tools` request field.
     tool_calling: bool,
@@ -222,6 +229,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "glm-5-3",
         name: "GLM-5.3",
         description: "Flagship model for agentic coding and long-horizon tasks, with a 1M-token context window",
+        hosting: ModelHosting::Tinfoil,
         context_length: 1_048_576,
         tool_calling: true,
         reasoning: true,
@@ -237,6 +245,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "glm-5-3-flash",
         name: "GLM-5.3 Flash",
         description: "Fast multimodal mixture-of-experts model with a 1M-token context window, image input, reasoning, and tool calling",
+        hosting: ModelHosting::Tinfoil,
         context_length: 1_048_576,
         tool_calling: true,
         reasoning: true,
@@ -252,6 +261,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "deepseek-v4-flash",
         name: "DeepSeek V4 Flash",
         description: "Efficient mixture-of-experts model with a 1M-token context window, speculative decoding, and tool calling",
+        hosting: ModelHosting::Tinfoil,
         context_length: 1_048_576,
         tool_calling: true,
         reasoning: true,
@@ -267,6 +277,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "gemma4-31b",
         name: "Gemma 4 31B",
         description: "Lightweight and efficient language model from Google for versatile use cases",
+        hosting: ModelHosting::Tinfoil,
         context_length: 262_144,
         tool_calling: true,
         reasoning: true,
@@ -282,6 +293,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "kimi-k3",
         name: "Kimi K3",
         description: "Multimodal mixture-of-experts model with hybrid attention for long-context reasoning, coding, and agentic workflows",
+        hosting: ModelHosting::Tinfoil,
         context_length: 262_144,
         tool_calling: true,
         reasoning: true,
@@ -297,6 +309,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "gpt-oss-120b",
         name: "GPT-OSS 120B",
         description: "Open-weight model designed for powerful reasoning, agentic tasks, and versatile use cases",
+        hosting: ModelHosting::Tinfoil,
         context_length: 131_072,
         tool_calling: true,
         reasoning: true,
@@ -316,6 +329,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         // shapes a request from, and it is what this row transcribes; the name
         // of the model family is not a capability.
         description: "Safety reasoning model for content classification and trust & safety applications",
+        hosting: ModelHosting::Tinfoil,
         context_length: 131_072,
         tool_calling: true,
         reasoning: false,
@@ -335,6 +349,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "voxtral-small-24b",
         name: "Voxtral Small 24B",
         description: "Audio-capable model built on Mistral Small 3.1 for transcription, translation, and spoken queries",
+        hosting: ModelHosting::Tinfoil,
         context_length: 32_768,
         // The one row in this catalog that declares **no** tool calling, and
         // the reason a declaration is worth carrying at all: offering it tools
@@ -353,6 +368,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "llama3-3-70b",
         name: "Llama 3.3 70B",
         description: "High-performance multilingual language model optimized for speed",
+        hosting: ModelHosting::Tinfoil,
         context_length: 131_072,
         tool_calling: true,
         reasoning: false,
@@ -444,6 +460,90 @@ pub const NOT_SOLD_UPSTREAM_MODELS: &[UnsoldModel] = &[
         reason: "realtime sessions; this server exposes no realtime route",
     },
 ];
+
+/// Why the catalog and the compiled-in engine pins disagree, if they do.
+///
+/// Every `Eidola` row must have a pin and every pin an `Eidola` row: a row
+/// without a pin would publish a model no accepted deployment serves, and a
+/// pin without a row would accept deployments for a model nothing sells. A
+/// `const` so the production pair is checked by the compiler (the assertion
+/// below), and callable at runtime so tests can show it catching fixtures.
+const fn catalog_binding_problem(
+    catalog: &[CatalogEntry],
+    pins: &[PinnedModel],
+) -> Option<&'static str> {
+    let mut i = 0;
+    while i < catalog.len() {
+        let entry = &catalog[i];
+        let pinned = pinned_in(pins, entry.id);
+        match entry.hosting {
+            ModelHosting::Eidola if !pinned => {
+                return Some(
+                    "an Eidola-hosted catalog row has no pin in releases/trust/engine-enclaves.json",
+                );
+            }
+            ModelHosting::Tinfoil if pinned => {
+                return Some(
+                    "a Tinfoil-hosted catalog row shares its id with a pin in \
+                     releases/trust/engine-enclaves.json",
+                );
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j < pins.len() {
+        let mut sold = false;
+        let mut i = 0;
+        while i < catalog.len() {
+            if str_eq(catalog[i].id, pins[j].id()) {
+                sold = true;
+            }
+            i += 1;
+        }
+        if !sold {
+            return Some(
+                "a model pinned in releases/trust/engine-enclaves.json has no catalog row",
+            );
+        }
+        j += 1;
+    }
+    None
+}
+
+const fn pinned_in(pins: &[PinnedModel], id: &str) -> bool {
+    let mut j = 0;
+    while j < pins.len() {
+        if str_eq(pins[j].id(), id) {
+            return true;
+        }
+        j += 1;
+    }
+    false
+}
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The compile-time binding: this build's catalog and its engine pins agree,
+/// or the gateway does not build.
+const _: () =
+    if let Some(problem) = catalog_binding_problem(MODEL_CATALOG, engine_trust::PINNED_MODELS) {
+        panic!("{}", problem);
+    };
 
 /// The two lists above against the published list they were transcribed from.
 ///
@@ -540,7 +640,12 @@ impl TinfoilBackend {
     }
 
     fn build_model_list(markup: f64, overrides: &HashMap<String, PricingOverride>) -> Vec<Model> {
-        Self::build_list_from(MODEL_CATALOG, markup, overrides)
+        Self::build_list_from(
+            MODEL_CATALOG,
+            engine_trust::PINNED_MODELS,
+            markup,
+            overrides,
+        )
     }
 
     /// The catalog → wire projection, over an explicit catalog slice so the
@@ -549,8 +654,13 @@ impl TinfoilBackend {
     /// per request, and nothing says the next thing we sell will not be), so
     /// it is kept and tested rather than deleted along with the last row that
     /// happened to need it.
+    ///
+    /// `pins` supplies an `Eidola` row's weights and prompt-cache capability;
+    /// the pair is bound at compile time for the production catalog, and a
+    /// row without a pin here is a fixture bug.
     fn build_list_from(
         catalog: &[CatalogEntry],
+        pins: &[PinnedModel],
         markup: f64,
         overrides: &HashMap<String, PricingOverride>,
     ) -> Vec<Model> {
@@ -591,6 +701,19 @@ impl TinfoilBackend {
                     }
                 };
 
+                let (prompt_cache, pinned_weights) = match entry.hosting {
+                    ModelHosting::Tinfoil => (
+                        PromptCacheCapability::unsupported(),
+                        PinnedWeightsCapability::unsupported(),
+                    ),
+                    ModelHosting::Eidola => {
+                        let pin = pins.iter().find(|p| p.id() == entry.id).unwrap_or_else(|| {
+                            panic!("{} is Eidola-hosted but unpinned", entry.id)
+                        });
+                        engine_capabilities(pin)
+                    }
+                };
+
                 Model {
                     id: entry.id.to_string(),
                     name: entry.name.to_string(),
@@ -598,11 +721,14 @@ impl TinfoilBackend {
                     context_length: entry.context_length,
                     max_output_tokens: entry.max_output_tokens,
                     output_budget_class: entry.output_budget_class,
+                    hosting: entry.hosting,
                     capabilities: ModelCapabilities {
                         tool_calling: Capability::new(entry.tool_calling),
                         reasoning: Capability::new(entry.reasoning),
                         input_modalities: entry.input_modalities.to_vec(),
                         output_modalities: entry.output_modalities.to_vec(),
+                        prompt_cache,
+                        pinned_weights,
                     },
                     pricing,
                 }
@@ -614,6 +740,44 @@ impl TinfoilBackend {
     pub fn lookup_model(&self, model_id: &str) -> Option<Model> {
         self.models.iter().find(|m| m.id == model_id).cloned()
     }
+
+    /// Refuse a request for a model this backend does not serve.
+    ///
+    /// An Eidola-hosted model's requests belong to its pinned engine
+    /// deployments; sending one to Tinfoil would hand that upstream a prompt
+    /// the catalog told the client it would not see.
+    fn ensure_served_here(&self, model_id: &str) -> Result<(), ServerError> {
+        match self.models.iter().find(|m| m.id == model_id) {
+            Some(model) if model.hosting != ModelHosting::Tinfoil => Err(
+                ServerError::ServiceUnavailable("model is not served by this upstream".to_string()),
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// An Eidola-hosted row's capabilities that its pin fixes: prompt-cache
+/// retention as the deployments' measured configs set it, and the weights
+/// every deployment serves.
+fn engine_capabilities(pin: &PinnedModel) -> (PromptCacheCapability, PinnedWeightsCapability) {
+    let cache = pin.prompt_cache();
+    let prompt_cache = if cache.enabled {
+        PromptCacheCapability {
+            supported: true,
+            idle_ttl_secs: Some(cache.idle_ttl_secs),
+            max_age_secs: Some(cache.max_age_secs),
+        }
+    } else {
+        PromptCacheCapability::unsupported()
+    };
+    let weights = pin.weights();
+    let pinned_weights = PinnedWeightsCapability {
+        supported: true,
+        sha256: Some(weights.sha256.to_string()),
+        repo: Some(weights.repo.to_string()),
+        revision: Some(weights.revision.to_string()),
+    };
+    (prompt_cache, pinned_weights)
 }
 
 impl ChatBackend for TinfoilBackend {
@@ -625,6 +789,7 @@ impl ChatBackend for TinfoilBackend {
 
     #[tracing::instrument(skip_all, name = "upstream.chat", err)]
     async fn send(&self, request: &ChatCompletionRequest) -> Result<BackendResponse, ServerError> {
+        self.ensure_served_here(&request.model)?;
         let url = format!("{}/chat/completions", self.base_url);
 
         let response = self
@@ -688,6 +853,7 @@ impl ChatBackend for TinfoilBackend {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<mpsc::Receiver<Result<BackendStreamEvent, ServerError>>, ServerError> {
+        self.ensure_served_here(&request.model)?;
         let url = format!("{}/chat/completions", self.base_url);
 
         // Ensure stream=true in the forwarded request, and force
@@ -1102,6 +1268,7 @@ mod tests {
         id: "per-request-fixture",
         name: "Per-Request Fixture",
         description: "A synthetic row priced per request rather than per token",
+        hosting: ModelHosting::Tinfoil,
         context_length: 8_192,
         tool_calling: false,
         reasoning: false,
@@ -1117,7 +1284,7 @@ mod tests {
     #[test]
     fn test_per_request_model_pricing() {
         let overrides = HashMap::new();
-        let models = TinfoilBackend::build_list_from(PER_REQUEST_FIXTURE, 1.0, &overrides);
+        let models = TinfoilBackend::build_list_from(PER_REQUEST_FIXTURE, &[], 1.0, &overrides);
 
         let model = models
             .iter()
@@ -1146,7 +1313,7 @@ mod tests {
             },
         );
 
-        let models = TinfoilBackend::build_list_from(PER_REQUEST_FIXTURE, 1.0, &overrides);
+        let models = TinfoilBackend::build_list_from(PER_REQUEST_FIXTURE, &[], 1.0, &overrides);
         let model = models
             .iter()
             .find(|m| m.id == "per-request-fixture")
@@ -1186,6 +1353,264 @@ mod tests {
                 unsold.id
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Eidola-hosted rows: bound to the engine pins, never sent to Tinfoil
+    // -----------------------------------------------------------------
+
+    use crate::engine_trust::{PinnedWeights, PromptCachePolicy};
+
+    const ENGINE_PIN: PinnedModel = PinnedModel::fixture(
+        "engine-fixture",
+        PinnedWeights {
+            sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+            repo: "example/engine-fixture",
+            revision: "4444444444444444444444444444444444444444",
+        },
+        PromptCachePolicy {
+            enabled: true,
+            idle_ttl_secs: 900,
+            max_age_secs: 7200,
+        },
+    );
+
+    const fn row(id: &'static str, hosting: ModelHosting) -> CatalogEntry {
+        CatalogEntry {
+            id,
+            name: "Fixture",
+            description: "A synthetic row",
+            hosting,
+            context_length: 8_192,
+            tool_calling: true,
+            reasoning: true,
+            input_modalities: &[Modality::Text],
+            output_modalities: &[Modality::Text],
+            max_output_tokens: Some(4_096),
+            output_budget_class: OutputBudgetClass::Reasoning,
+            input_per_m: 1.0,
+            output_per_m: 2.0,
+            per_request_usd: 0.0,
+        }
+    }
+
+    /// The production pair is checked by the compiler; this is the same
+    /// function shown catching each way the pair can disagree.
+    #[test]
+    fn the_catalog_and_the_engine_pins_bind_both_ways() {
+        assert_eq!(
+            catalog_binding_problem(MODEL_CATALOG, engine_trust::PINNED_MODELS),
+            None
+        );
+
+        let bound = [
+            row("tinfoil-fixture", ModelHosting::Tinfoil),
+            row("engine-fixture", ModelHosting::Eidola),
+        ];
+        assert_eq!(catalog_binding_problem(&bound, &[ENGINE_PIN]), None);
+
+        let unpinned = [row("engine-fixture", ModelHosting::Eidola)];
+        assert!(
+            catalog_binding_problem(&unpinned, &[])
+                .is_some_and(|p| p.contains("Eidola-hosted catalog row has no pin"))
+        );
+
+        let unsold = [row("tinfoil-fixture", ModelHosting::Tinfoil)];
+        assert!(
+            catalog_binding_problem(&unsold, &[ENGINE_PIN])
+                .is_some_and(|p| p.contains("has no catalog row"))
+        );
+
+        let misattributed = [row("engine-fixture", ModelHosting::Tinfoil)];
+        assert!(
+            catalog_binding_problem(&misattributed, &[ENGINE_PIN])
+                .is_some_and(|p| p.contains("Tinfoil-hosted catalog row shares its id"))
+        );
+    }
+
+    /// An Eidola-hosted row publishes its pin's weights and prompt-cache
+    /// retention; a Tinfoil-hosted row publishes neither.
+    #[test]
+    fn an_eidola_row_publishes_what_its_pin_fixes() {
+        let catalog = [
+            row("tinfoil-fixture", ModelHosting::Tinfoil),
+            row("engine-fixture", ModelHosting::Eidola),
+        ];
+        let models = TinfoilBackend::build_list_from(&catalog, &[ENGINE_PIN], 1.5, &HashMap::new());
+
+        let tinfoil = &models[0];
+        assert_eq!(tinfoil.hosting, ModelHosting::Tinfoil);
+        assert_eq!(
+            tinfoil.capabilities.prompt_cache,
+            PromptCacheCapability::unsupported()
+        );
+        assert_eq!(
+            tinfoil.capabilities.pinned_weights,
+            PinnedWeightsCapability::unsupported()
+        );
+
+        let engine = &models[1];
+        assert_eq!(engine.hosting, ModelHosting::Eidola);
+        assert_eq!(
+            engine.capabilities.prompt_cache,
+            PromptCacheCapability {
+                supported: true,
+                idle_ttl_secs: Some(900),
+                max_age_secs: Some(7200),
+            }
+        );
+        assert_eq!(
+            engine.capabilities.pinned_weights,
+            PinnedWeightsCapability {
+                supported: true,
+                sha256: Some(ENGINE_PIN.weights().sha256.to_string()),
+                repo: Some("example/engine-fixture".to_string()),
+                revision: Some("4444444444444444444444444444444444444444".to_string()),
+            }
+        );
+        let wire = serde_json::to_value(engine).unwrap();
+        assert_eq!(wire["hosting"], "eidola");
+        assert_eq!(wire["capabilities"]["prompt_cache"]["idle_ttl_secs"], 900);
+        let wire = serde_json::to_value(tinfoil).unwrap();
+        assert_eq!(
+            wire["capabilities"]["prompt_cache"],
+            serde_json::json!({"supported": false})
+        );
+        assert_eq!(
+            wire["capabilities"]["pinned_weights"],
+            serde_json::json!({"supported": false})
+        );
+    }
+
+    /// A disabled cache publishes no retention bounds.
+    #[test]
+    fn a_disabled_prompt_cache_is_published_as_unsupported() {
+        let pin = PinnedModel::fixture(
+            "engine-fixture",
+            *ENGINE_PIN.weights(),
+            PromptCachePolicy {
+                enabled: false,
+                idle_ttl_secs: 900,
+                max_age_secs: 7200,
+            },
+        );
+        assert_eq!(
+            engine_capabilities(&pin).0,
+            PromptCacheCapability::unsupported()
+        );
+    }
+
+    /// Every shipped row is Tinfoil-hosted today, and publishes that.
+    #[test]
+    fn every_shipped_row_says_who_hosts_it() {
+        let models = TinfoilBackend::build_model_list(DEFAULT_PRICING_MARKUP, &HashMap::new());
+        for (entry, model) in MODEL_CATALOG.iter().zip(&models) {
+            assert_eq!(model.hosting, entry.hosting, "{}", entry.id);
+        }
+    }
+
+    /// A local stand-in for the Tinfoil upstream that records every request
+    /// body it receives and answers with a minimal completion (or stream).
+    async fn recording_upstream() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::routing::post;
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = bodies.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: String| {
+                let seen = seen.clone();
+                async move {
+                    let stream = body.contains("\"stream\":true");
+                    seen.lock().unwrap().push(body);
+                    if stream {
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(
+                                "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[]}\n\ndata: [DONE]\n\n",
+                            ))
+                            .unwrap()
+                    } else {
+                        axum::response::Response::builder()
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[]}"#,
+                            ))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/v1"), bodies)
+    }
+
+    fn backend_at(base_url: String, models: Vec<Model>) -> TinfoilBackend {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        TinfoilBackend {
+            client: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(reqwest::Client::new())),
+            api_key: String::new(),
+            base_url,
+            models,
+        }
+    }
+
+    const CACHE_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+    fn request_with_cache_key(model: &str) -> ChatCompletionRequest {
+        serde_json::from_str(&format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"cache_key":"{CACHE_KEY}"}}"#
+        ))
+        .unwrap()
+    }
+
+    /// The Tinfoil upstream never receives a client's cache key, on either
+    /// transport, even when the client sent one.
+    #[tokio::test]
+    async fn the_tinfoil_upstream_never_receives_the_cache_key() {
+        let (base_url, bodies) = recording_upstream().await;
+        let backend = backend_at(
+            base_url,
+            TinfoilBackend::build_model_list(DEFAULT_PRICING_MARKUP, &HashMap::new()),
+        );
+        let request = request_with_cache_key(MODEL_CATALOG[0].id);
+        assert!(request.cache_key.is_some());
+
+        backend.send(&request).await.unwrap();
+        let mut rx = backend.send_stream(&request).await.unwrap();
+        while rx.recv().await.is_some() {}
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "both transports reached the stand-in");
+        for body in bodies.iter() {
+            assert!(body.contains("\"messages\""), "{body}");
+            assert!(!body.contains("cache_key"), "{body}");
+            assert!(!body.contains(CACHE_KEY), "{body}");
+        }
+    }
+
+    /// A request for an Eidola-hosted model is refused before anything is
+    /// sent to Tinfoil, on either transport.
+    #[tokio::test]
+    async fn an_eidola_hosted_model_is_never_sent_to_tinfoil() {
+        let (base_url, bodies) = recording_upstream().await;
+        let catalog = [row("engine-fixture", ModelHosting::Eidola)];
+        let backend = backend_at(
+            base_url,
+            TinfoilBackend::build_list_from(&catalog, &[ENGINE_PIN], 1.5, &HashMap::new()),
+        );
+        let request = request_with_cache_key("engine-fixture");
+
+        assert!(matches!(
+            backend.send(&request).await,
+            Err(ServerError::ServiceUnavailable(_))
+        ));
+        assert!(matches!(
+            backend.send_stream(&request).await,
+            Err(ServerError::ServiceUnavailable(_))
+        ));
+        assert!(bodies.lock().unwrap().is_empty());
     }
 
     #[test]
