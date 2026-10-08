@@ -1,10 +1,11 @@
 //! Device smoke tests. They need a CC 10.x GPU and a kernel build output
 //! (`EIDOLA_ENGINE_KERNELS_DIR`); without either they print why and pass.
 
+use eidola_engine_cuda::KernelDir;
 use eidola_engine_cuda::{Gpu, ImageArch, ImageSource, KernelModule, bf16, ops};
-use eidola_engine_kernels::{ArtifactDir, Manifest};
+use eidola_engine_kernels::Manifest;
 
-fn setup() -> Option<(Gpu, ArtifactDir<'static>)> {
+fn setup() -> Option<(Gpu, KernelDir)> {
     let Some(dir) = std::env::var_os("EIDOLA_ENGINE_KERNELS_DIR") else {
         eprintln!("skipping: EIDOLA_ENGINE_KERNELS_DIR is not set");
         return None;
@@ -15,7 +16,7 @@ fn setup() -> Option<(Gpu, ArtifactDir<'static>)> {
     }
     let gpu = Gpu::open(0).expect("open device 0");
     gpu.image_arch()?;
-    Some((gpu, ArtifactDir::new(dir, Manifest::embedded())))
+    Some((gpu, KernelDir::new(dir)))
 }
 
 /// Every entry of every kernel resolves (mangled, internal-linkage template
@@ -103,4 +104,114 @@ fn check_rmsnorm(out: &[u16], x: &[u16], w: &[u16], rows: usize, hidden: usize) 
             assert!(diff <= 1, "row {r} col {i}: {got:#06x} vs {want}");
         }
     }
+}
+
+/// Kernels loaded on one thread launch from another: every launch path binds
+/// the module's context (current contexts are per thread), including the
+/// ones that make other driver calls first (descriptor encoding, memsets).
+#[test]
+fn launches_from_another_thread() {
+    use eidola_engine::executor::Maintenance;
+    use eidola_engine_cuda::gemm::{Gemm, GemmArgs, GemmKind};
+    use eidola_engine_cuda::kv::{GroupGeometry, KvStore};
+    use eidola_engine_cuda::launch::dptr;
+
+    let Some((gpu, dir)) = setup() else { return };
+    let module = KernelModule::load(&gpu, &dir, "rmsnorm").unwrap();
+    let kernel = module.kernel("eidola_rmsnorm_bf16").unwrap();
+    let (name, entry) = GemmKind::Bf16.kernel();
+    let gemm_module = KernelModule::load(&gpu, &dir, name).unwrap();
+    let gemm = Gemm::new(GemmKind::Bf16, gemm_module.kernel(entry).unwrap()).unwrap();
+    let (rows, hidden) = (4usize, 256usize);
+    let x: Vec<u16> = (0..rows * hidden)
+        .map(|i| bf16::from_f32((i % 7) as f32 - 3.0))
+        .collect();
+    let w = vec![bf16::from_f32(1.0); hidden * hidden];
+    let stream = gpu.stream();
+    let (dx, dw) = (
+        stream.clone_htod(&x).unwrap(),
+        stream.clone_htod(&w).unwrap(),
+    );
+    let dout = stream.alloc_zeros::<u16>(rows * hidden).unwrap();
+    let dgemm = stream.alloc_zeros::<f32>(rows * hidden).unwrap();
+    let mut kv = KvStore::new(
+        &gpu,
+        vec![GroupGeometry {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim_qk: 192,
+            head_dim_v: 128,
+            block_size: 16,
+            num_blocks: 2,
+        }],
+        1,
+        1,
+        0,
+    )
+    .unwrap();
+    let ptrs = [dptr(&dout, stream), dptr(&dx, stream), dptr(&dw, stream)];
+    let gemm_args = GemmArgs {
+        m: rows as u32,
+        n: hidden as u32,
+        k: hidden as u32,
+        a: dptr(&dx, stream),
+        b: dptr(&dw, stream),
+        d: dptr(&dgemm, stream),
+        sfa: 0,
+        sfb: 0,
+        alpha: 1.0,
+    };
+    gpu.synchronize().unwrap();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // Nothing on this thread has made a context current; each call
+            // below is the first driver call of its kind here.
+            let (mut o, mut i, mut wt, mut h, mut eps) =
+                (ptrs[0], ptrs[1], ptrs[2], hidden as u32, 1e-6f32);
+            let mut args = [
+                &mut o as *mut _ as *mut std::ffi::c_void,
+                &mut i as *mut _ as *mut std::ffi::c_void,
+                &mut wt as *mut _ as *mut std::ffi::c_void,
+                &mut h as *mut _ as *mut std::ffi::c_void,
+                &mut eps as *mut _ as *mut std::ffi::c_void,
+            ];
+            unsafe { kernel.launch(gpu.stream(), [rows as u32, 1, 1], &mut args) }.unwrap();
+            unsafe { gemm.launch(&gpu, &gemm_args) }.unwrap();
+            kv.apply(&gpu, &[Maintenance::Zero { group: 0, block: 1 }], &[])
+                .unwrap();
+        });
+    });
+    gpu.synchronize().unwrap();
+    assert!(
+        stream.clone_dtoh(&dout).unwrap().iter().any(|&v| v != 0),
+        "the norm ran"
+    );
+    assert!(
+        stream.clone_dtoh(&dgemm).unwrap().iter().any(|&v| v != 0.0),
+        "the GEMM ran"
+    );
+}
+
+/// Only the compiled-in manifest approves bytes: a cubin altered by one byte
+/// is refused before it reaches the driver.
+#[test]
+fn altered_images_are_refused() {
+    let Some((gpu, _)) = setup() else { return };
+    let src = std::path::PathBuf::from(std::env::var_os("EIDOLA_ENGINE_KERNELS_DIR").unwrap());
+    let arch = gpu.image_arch().unwrap();
+    let cubin = Manifest::embedded()
+        .cubin("rmsnorm", arch.as_str())
+        .unwrap();
+    let tmp = std::env::temp_dir().join(format!("eidola-altered-{}", std::process::id()));
+    let dst = tmp.join(&cubin.file);
+    std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    let mut bytes = std::fs::read(src.join(&cubin.file)).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    std::fs::write(&dst, &bytes).unwrap();
+    let e = KernelModule::load(&gpu, &KernelDir::new(&tmp), "rmsnorm")
+        .err()
+        .expect("refused");
+    std::fs::remove_dir_all(&tmp).unwrap();
+    assert!(e.to_string().contains("sha256"), "{e}");
 }

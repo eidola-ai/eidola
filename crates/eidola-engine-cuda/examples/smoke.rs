@@ -7,15 +7,16 @@
 //! cargo run --release -p eidola-engine-cuda --example smoke -- <kernel build output>
 //! ```
 
+use eidola_engine_cuda::KernelDir;
 use eidola_engine_cuda::{Gpu, ImageArch, ImageSource, KernelModule, bf16, ops};
-use eidola_engine_kernels::{ArtifactDir, Manifest};
+use eidola_engine_kernels::Manifest;
 
 fn main() {
     let dir = std::env::args()
         .nth(1)
         .expect("usage: smoke <kernel build output dir>");
     let manifest = Manifest::embedded();
-    let artifacts = ArtifactDir::new(&dir, manifest);
+    let artifacts = KernelDir::new(&dir);
     artifacts
         .verify_all()
         .expect("every image matches the manifest");

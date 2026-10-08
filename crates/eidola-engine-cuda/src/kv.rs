@@ -165,6 +165,8 @@ impl KvStore {
         updates: &[TableUpdate],
     ) -> Result<()> {
         let s = gpu.stream();
+        // The raw driver calls below need this thread's current context.
+        gpu.context().bind_to_thread()?;
         let mut dirty: Vec<(usize, usize)> = Vec::new();
         for m in maintenance {
             match *m {

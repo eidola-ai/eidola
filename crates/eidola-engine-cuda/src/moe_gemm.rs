@@ -238,6 +238,8 @@ impl MoeGemm {
             .expect("every instance loaded")
             .1;
         let grid = deepgemm_grid(gpu)?;
+        // Descriptor encoding needs this thread's current context.
+        gpu.context().bind_to_thread()?;
         let mut maps = [TensorMap([0; 128]); 5];
         for (map, spec) in maps.iter_mut().zip(args.tma_specs()) {
             map.0 = spec.encode()?;

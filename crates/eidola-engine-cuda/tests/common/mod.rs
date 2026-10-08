@@ -3,12 +3,12 @@
 
 pub mod qref;
 
+use eidola_engine_cuda::KernelDir;
 use eidola_engine_cuda::{Gpu, ImageArch, ImageSource, KernelModule};
-use eidola_engine_kernels::{ArtifactDir, Manifest};
 
 pub struct Setup {
     pub gpu: Gpu,
-    pub dir: ArtifactDir<'static>,
+    pub dir: KernelDir,
     /// Every image a correctness test runs against: the device's exact cubin
     /// and the family cubin (what a CC 10.0 part other than the B200 would
     /// run, and the only way this device exercises a second binary).
@@ -41,7 +41,7 @@ pub fn setup() -> Option<Setup> {
     }
     Some(Setup {
         gpu,
-        dir: ArtifactDir::new(dir, Manifest::embedded()),
+        dir: KernelDir::new(dir),
         archs,
     })
 }

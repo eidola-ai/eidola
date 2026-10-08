@@ -1,7 +1,7 @@
 //! Launch wrappers for the executor's own kernels (`engine_ops.cu`). Every
 //! operand is a device address; the callers own the buffers and their sizes.
 
-use eidola_engine_kernels::ArtifactDir;
+use crate::module::KernelDir;
 
 use crate::module::{Kernel, KernelModule};
 use crate::{Gpu, Result, launch};
@@ -46,7 +46,7 @@ pub struct EngineOps {
 }
 
 impl EngineOps {
-    pub fn load(gpu: &Gpu, dir: &ArtifactDir<'static>) -> Result<EngineOps> {
+    pub fn load(gpu: &Gpu, dir: &KernelDir) -> Result<EngineOps> {
         EngineOps::from_module(KernelModule::load(gpu, dir, "engine_ops")?)
     }
 
@@ -90,6 +90,7 @@ impl EngineOps {
         hidden: u32,
         rows: u32,
     ) -> Result<()> {
+        require(hidden > 0, "embed: hidden 0")?;
         if rows == 0 {
             return Ok(());
         }
@@ -110,6 +111,10 @@ impl EngineOps {
         eps: f32,
         rows: u32,
     ) -> Result<()> {
+        require(
+            hidden > 0 && x_stride >= hidden,
+            "rmsnorm: row stride below the width",
+        )?;
         if rows == 0 {
             return Ok(());
         }
@@ -139,6 +144,10 @@ impl EngineOps {
         k: u32,
         m_pad: u32,
     ) -> Result<()> {
+        require(
+            k > 0 && k.is_multiple_of(128) && m_pad >= rows,
+            "quant_fp8: K must be whole 128-wide groups and m_pad cover the rows",
+        )?;
         if rows == 0 {
             return Ok(());
         }
@@ -162,6 +171,7 @@ impl EngineOps {
         d_stride: u32,
         rows: u32,
     ) -> Result<()> {
+        require(d_stride >= hidden, "add_bf16: row stride below the width")?;
         if rows == 0 {
             return Ok(());
         }
@@ -169,6 +179,13 @@ impl EngineOps {
     }
 
     pub unsafe fn qkv_rope_kv(&self, gpu: &Gpu, args: QkvArgs, tokens: u32) -> Result<()> {
+        require(
+            args.chunks > 0
+                && args.chunk_stride
+                    >= (args.q_heads_per_chunk + args.kv_heads_per_chunk) * 192
+                        + args.kv_heads_per_chunk * 128,
+            "qkv_rope_kv: chunk stride below its heads",
+        )?;
         if tokens == 0 {
             return Ok(());
         }
@@ -185,6 +202,10 @@ impl EngineOps {
         inter: u32,
         m_pad: u32,
     ) -> Result<()> {
+        require(
+            inter > 0 && inter.is_multiple_of(128) && m_pad >= rows,
+            "swiglu (f32 scales): intermediate must be whole 128-wide groups and m_pad cover the rows",
+        )?;
         if rows == 0 {
             return Ok(());
         }
@@ -213,6 +234,10 @@ impl EngineOps {
         rows4: u32,
         cap: u32,
     ) -> Result<()> {
+        require(
+            inter > 0 && inter.is_multiple_of(512) && sfa_layout_ok(rows, rows4, cap),
+            "swiglu (UE8M0): intermediate must be whole 512-wide words and the scale layout cover the rows",
+        )?;
         if rows == 0 {
             return Ok(());
         }
@@ -245,6 +270,13 @@ impl EngineOps {
         top_k: u32,
         scaling: f32,
     ) -> Result<()> {
+        require(
+            hidden > 0
+                && (1..=crate::support::EXPERTS as u32).contains(&experts)
+                && (1..=crate::support::MAX_TOP_K as u32).contains(&top_k)
+                && top_k <= experts,
+            "router: at most 256 experts and 8 per token",
+        )?;
         if tokens == 0 {
             return Ok(());
         }
@@ -278,6 +310,15 @@ impl EngineOps {
         cap: u32,
         rows_bound: u32,
     ) -> Result<()> {
+        require(
+            (1..=crate::support::MAX_TOP_K as u32).contains(&top_k)
+                && (if cap == 0 {
+                    rows_bound > 0
+                } else {
+                    cap >= tokens
+                }),
+            "permute: at most 8 experts per token; a masked expert holds every token",
+        )?;
         unsafe {
             launch!(
                 gpu,
@@ -307,6 +348,10 @@ impl EngineOps {
         rows4: u32,
         cap: u32,
     ) -> Result<()> {
+        require(
+            k > 0 && k.is_multiple_of(512) && sfa_layout_ok(rows, rows4, cap),
+            "gather_quant: K must be whole 512-wide words and the scale layout cover the rows",
+        )?;
         if rows == 0 {
             return Ok(());
         }
@@ -337,6 +382,10 @@ impl EngineOps {
         hidden: u32,
         top_k: u32,
     ) -> Result<()> {
+        require(
+            hidden > 0 && (1..=crate::support::MAX_TOP_K as u32).contains(&top_k),
+            "combine: 1..=8 experts per token",
+        )?;
         if tokens == 0 {
             return Ok(());
         }
@@ -364,9 +413,28 @@ impl EngineOps {
         n: u32,
         hidden: u32,
     ) -> Result<()> {
+        require(hidden > 0, "gather_rows: hidden 0")?;
         if n == 0 {
             return Ok(());
         }
         unsafe { launch!(gpu, self.gather_bf16, [n, 1, 1], out, x, rows, hidden) }
+    }
+}
+
+fn require(ok: bool, what: &str) -> Result<()> {
+    if ok {
+        Ok(())
+    } else {
+        Err(crate::CudaError::new(what))
+    }
+}
+
+/// The packed UE8M0 scale layouts (`sfa_index` in `engine_ops.cu`): `[K/512][rows4]`
+/// for the contiguous layout, `[rows / cap][K/512][cap]` for the masked one.
+fn sfa_layout_ok(rows: u32, rows4: u32, cap: u32) -> bool {
+    if cap == 0 {
+        rows4 >= rows && rows4.is_multiple_of(4)
+    } else {
+        rows.is_multiple_of(cap) && cap.is_multiple_of(4)
     }
 }

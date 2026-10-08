@@ -25,6 +25,7 @@ use eidola_engine_model::ModelConfig;
 use eidola_engine_model::config::{AttentionSpec, FfnKind};
 use eidola_engine_model::safetensors::{Dtype, WeightSet};
 
+use crate::support::check_supported;
 use crate::{CudaError, Gpu, Result};
 
 fn err(e: impl std::fmt::Display) -> CudaError {
@@ -111,8 +112,16 @@ struct Loader<'a> {
 }
 
 impl Loader<'_> {
-    fn f32_vec(&self, name: &str) -> Result<CudaSlice<f32>> {
+    /// A 1-D tensor of exactly `len` elements, widened to f32 (the kernels
+    /// index it at the model's width, so a short one would read past it).
+    fn f32_vec(&self, name: &str, len: usize) -> Result<CudaSlice<f32>> {
         let t = self.store.get(name).map_err(err)?;
+        if t.shape != [len] {
+            return Err(CudaError::new(format!(
+                "{name}: shape {:?}, expected [{len}]",
+                t.shape
+            )));
+        }
         let v = t.to_f32(name).map_err(err)?;
         Ok(self.gpu.stream().clone_htod(&v)?)
     }
@@ -236,7 +245,10 @@ impl Loader<'_> {
     ) -> Result<AttentionWeights> {
         let h = self.config.hidden_size;
         let sinks = if spec.has_sinks {
-            self.f32_vec(&format!("{prefix}.self_attn.attention_sink_bias"))?
+            self.f32_vec(
+                &format!("{prefix}.self_attn.attention_sink_bias"),
+                spec.num_q_heads,
+            )?
         } else {
             self.gpu
                 .stream()
@@ -316,7 +328,7 @@ impl Loader<'_> {
         }
         Ok(MoeFfn {
             router: self.bf16(&format!("{prefix}.mlp.gate.weight"), &[e, h])?,
-            bias: self.f32_vec(&format!("{prefix}.mlp.gate.e_score_correction_bias"))?,
+            bias: self.f32_vec(&format!("{prefix}.mlp.gate.e_score_correction_bias"), e)?,
             gate_up,
             gate_up_sf,
             down,
@@ -331,7 +343,10 @@ impl Loader<'_> {
 
 impl ModelWeights {
     /// Load `config`'s layers (a whole or truncated checkpoint) from `store`.
+    /// Refuses (with [`CudaError::Unsupported`]) any configuration outside
+    /// [`check_supported`] before reading a tensor.
     pub fn load(gpu: &Gpu, store: Arc<WeightSet>, config: ModelConfig) -> Result<ModelWeights> {
+        check_supported(&config)?;
         let chunks = match store.metadata("tp_size") {
             Some(s) => s
                 .trim()
@@ -345,13 +360,6 @@ impl ModelWeights {
             config: &config,
         };
         let (h, v) = (config.hidden_size, config.vocab_size);
-        if let Some(m) = &config.moe
-            && (m.num_experts != 256 || m.intermediate_size != 2048 || h != 4096 || m.top_k > 8)
-        {
-            return Err(CudaError::new(
-                "the grouped-GEMM instances are built for 256 experts of 2048 at hidden 4096",
-            ));
-        }
         let mut layers = Vec::with_capacity(config.layers.len());
         for spec in &config.layers {
             let p = format!("model.layers.{}", spec.source_index);
@@ -369,8 +377,9 @@ impl ModelWeights {
                 FfnKind::Moe => Ffn::Moe(l.moe(&p)?),
             };
             layers.push(LayerWeights {
-                input_norm: l.f32_vec(&format!("{p}.input_layernorm.weight"))?,
-                post_attention_norm: l.f32_vec(&format!("{p}.post_attention_layernorm.weight"))?,
+                input_norm: l.f32_vec(&format!("{p}.input_layernorm.weight"), h)?,
+                post_attention_norm: l
+                    .f32_vec(&format!("{p}.post_attention_layernorm.weight"), h)?,
                 attention: l.attention(&p, &spec.attention, chunks)?,
                 ffn,
             });
@@ -378,10 +387,52 @@ impl ModelWeights {
         Ok(ModelWeights {
             embed: l.bf16("model.embed_tokens.weight", &[v, h])?,
             lm_head: l.bf16("lm_head.weight", &[v, h])?,
-            final_norm: l.f32_vec("model.norm.weight")?,
+            final_norm: l.f32_vec("model.norm.weight", h)?,
             layers,
             qkv_chunks: chunks as u32,
             config,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A vector shorter (or longer) than the model's width is refused before it
+    /// is copied anywhere: the kernels would index it at that width.
+    #[test]
+    fn short_vectors_are_refused() {
+        if !Gpu::available() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let gpu = Gpu::open(0).unwrap();
+        let dir = std::env::temp_dir().join(format!("eidola-short-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        let header =
+            r#"{"model.norm.weight":{"dtype":"BF16","shape":[100],"data_offsets":[0,200]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend(std::iter::repeat_n(0u8, 200));
+        std::fs::write(&path, bytes).unwrap();
+        let store = WeightSet::open_files(&[path]).unwrap();
+        let config_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../eidola-engine-model/tests/data/flash-mopd.config.json"
+        );
+        let config = ModelConfig::from_file(std::path::Path::new(config_path)).unwrap();
+        let l = Loader {
+            gpu: &gpu,
+            store: &store,
+            config: &config,
+        };
+        let Err(e) = l.f32_vec("model.norm.weight", 4096) else {
+            panic!("a short vector loaded");
+        };
+        assert!(e.to_string().contains("expected [4096]"), "{e}");
+        assert!(l.f32_vec("model.norm.weight", 100).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

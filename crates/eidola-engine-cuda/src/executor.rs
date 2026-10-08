@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
+use crate::module::KernelDir;
 use eidola_engine::executor::{Executor, ExecutorError, StepInput, StepOutput};
 use eidola_engine::sampling::Stream;
 use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec};
-use eidola_engine_kernels::ArtifactDir;
 use eidola_engine_model::config::AttentionKind as ModelAttention;
 use eidola_engine_model::safetensors::WeightSet;
 
@@ -79,12 +79,16 @@ impl CudaExecutor {
     /// allocate every pool and buffer.
     pub fn new(
         gpu: Gpu,
-        kernels_dir: &ArtifactDir<'static>,
+        kernels_dir: &KernelDir,
         store: Arc<WeightSet>,
         keep_layers: Option<&[usize]>,
         cfg: CudaExecutorConfig,
     ) -> Result<CudaExecutor> {
         let weights = load_weights(&gpu, store, keep_layers)?;
+        crate::support::check_sampleable(
+            cfg.sampleable_vocab_size as usize,
+            weights.config.vocab_size,
+        )?;
         let kernels = Kernels::load(&gpu, kernels_dir, cfg.image)?;
         let config = weights.config.clone();
         let (keys, layer_kv) = group_layers(&config);

@@ -1,9 +1,9 @@
 //! The device sampler (`sampling.cu`): the serving core's `sampling` semantics,
 //! bit for bit given equal logits.
 
+use crate::module::KernelDir;
 use cudarc::driver::{CudaSlice, DeviceRepr, ValidAsZeroBits};
 use eidola_engine::sampling::{SamplingParams, Stream};
-use eidola_engine_kernels::ArtifactDir;
 
 use crate::launch::dptr;
 use crate::module::{Kernel, KernelModule};
@@ -58,7 +58,7 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    pub fn load(gpu: &Gpu, dir: &ArtifactDir<'static>) -> Result<Sampler> {
+    pub fn load(gpu: &Gpu, dir: &KernelDir) -> Result<Sampler> {
         Sampler::from_module(KernelModule::load(gpu, dir, "sampling")?)
     }
 
@@ -96,7 +96,7 @@ impl Sampler {
         if rows.len() < r || probs.len() < r * n as usize || tokens.len() < r || status.is_empty() {
             return Err(CudaError::new("sample: buffer too small"));
         }
-        if n == 0 || n as usize > logits_stride || n > 1 << 20 {
+        if n == 0 || n as usize > logits_stride || n > 1 << 20 || logits.len() < logits_stride {
             return Err(CudaError::new(format!("sample: vocabulary {n}")));
         }
         let s = gpu.stream();
@@ -148,6 +148,23 @@ impl Sampler {
             return Ok(());
         }
         let r = num_rows as usize;
+        // The kernel's chunked sums hold at most 1,024 chunks of 1,024.
+        if n == 0 || n > 1 << 20 {
+            return Err(CudaError::new(format!("chain_accept: vocabulary {n}")));
+        }
+        if stride == 0
+            || drafts.len() < r * stride as usize
+            || target_row.len() < r
+            || draft_row.len() < r
+            || num_drafts.len() < r
+            || target.is_empty()
+            || !target.len().is_multiple_of(n as usize)
+            || !draft.len().is_multiple_of(n as usize)
+        {
+            return Err(CudaError::new(
+                "chain_accept: row arrays too small or not whole rows",
+            ));
+        }
         if scratch.len() < r * n as usize
             || out.len() < r * stride as usize
             || counts.len() < r

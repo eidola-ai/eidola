@@ -1,12 +1,14 @@
 //! Loading manifest-verified kernel images and launching their entries.
 //!
-//! Images reach the driver only through [`ArtifactDir`], which hands out bytes
-//! whose size and SHA-256 match the compiled-in kernel manifest. The images
+//! Images reach the driver only through [`KernelDir`], which hands out bytes
+//! whose size and SHA-256 match the compiled-in kernel manifest: no other
+//! manifest can approve bytes, because none can be supplied. The images
 //! are SASS for the exact target with no PTX, so the driver has nothing to
 //! JIT: an image for the wrong architecture fails to load rather than being
 //! recompiled.
 
 use std::ffi::{CString, c_void};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cudarc::driver::sys;
@@ -15,6 +17,24 @@ use eidola_engine_kernels::{ArtifactDir, Cubin, KernelMeta, Manifest};
 
 use crate::device::{Gpu, ImageArch};
 use crate::{CudaError, Result};
+
+/// A kernel build output, read only through the compiled-in manifest
+/// ([`Manifest::embedded`]).
+#[derive(Clone, Debug)]
+pub struct KernelDir(ArtifactDir<'static>);
+
+impl KernelDir {
+    pub fn new(root: impl Into<PathBuf>) -> KernelDir {
+        KernelDir(ArtifactDir::new(root, Manifest::embedded()))
+    }
+
+    /// Verify every image the manifest lists.
+    pub fn verify_all(&self) -> Result<()> {
+        self.0
+            .verify_all()
+            .map_err(|e| CudaError::new(e.to_string()))
+    }
+}
 
 /// Where a module's image came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +70,7 @@ unsafe impl Sync for KernelModule {}
 impl KernelModule {
     /// Load kernel `name` for this device's exact architecture from its
     /// cubin.
-    pub fn load(gpu: &Gpu, dir: &ArtifactDir<'static>, name: &str) -> Result<KernelModule> {
+    pub fn load(gpu: &Gpu, dir: &KernelDir, name: &str) -> Result<KernelModule> {
         let arch = gpu.image_arch().ok_or_else(|| {
             CudaError::new(format!(
                 "no kernel image for compute capability {:?}",
@@ -63,7 +83,7 @@ impl KernelModule {
     /// Load kernel `name` from an explicit image.
     pub fn load_from(
         gpu: &Gpu,
-        dir: &ArtifactDir<'static>,
+        dir: &KernelDir,
         name: &str,
         source: ImageSource,
     ) -> Result<KernelModule> {
@@ -73,8 +93,8 @@ impl KernelModule {
             .cubin(name, arch)
             .ok_or_else(|| CudaError::new(format!("no cubin {name} {arch} in the manifest")))?;
         let bytes = match source {
-            ImageSource::Cubin(_) => dir.cubin(name, arch),
-            ImageSource::Fatbin(_) => dir.fatbin(name),
+            ImageSource::Cubin(_) => dir.0.cubin(name, arch),
+            ImageSource::Fatbin(_) => dir.0.fatbin(name),
         }
         .map_err(|e| CudaError::new(e.to_string()))?;
         gpu.context().bind_to_thread()?;
@@ -129,6 +149,7 @@ impl KernelModule {
             .result()?;
         }
         Ok(Kernel {
+            ctx: self.ctx.clone(),
             func,
             meta,
             symbol: symbol.to_owned(),
@@ -172,6 +193,7 @@ impl Drop for KernelModule {
 
 /// A resolved kernel entry and its launch contract.
 pub struct Kernel {
+    ctx: Arc<CudaContext>,
     func: sys::CUfunction,
     meta: KernelMeta,
     symbol: String,
@@ -208,6 +230,9 @@ impl Kernel {
         grid: [u32; 3],
         args: &mut [*mut c_void],
     ) -> Result<()> {
+        // The current context is per thread: whichever thread launches binds
+        // the module's own.
+        self.ctx.bind_to_thread()?;
         let m = &self.meta;
         let mut attrs = Vec::with_capacity(1);
         if m.cluster != [1, 1, 1] {

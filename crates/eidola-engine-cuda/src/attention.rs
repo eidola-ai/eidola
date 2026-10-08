@@ -289,6 +289,15 @@ impl Attention {
         if plan.work_items == 0 {
             return Ok(());
         }
+        if layer.num_kv_heads == 0
+            || !num_qo_heads.is_multiple_of(layer.num_kv_heads)
+            || layer.page_size == 0
+            || layer.block_elems == 0
+        {
+            return Err(CudaError::new(
+                "attention: query heads must be whole GQA groups; pages non-empty",
+            ));
+        }
         let s = gpu.stream();
         let kernel = match plan.tile {
             16 => &self.q16,

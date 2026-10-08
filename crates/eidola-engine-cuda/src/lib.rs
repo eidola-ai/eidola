@@ -19,6 +19,7 @@ pub mod module;
 pub mod moe_gemm;
 pub mod ops;
 pub mod sampler;
+pub mod support;
 pub mod tma;
 pub mod weights;
 
@@ -26,21 +27,30 @@ use std::fmt;
 
 pub use device::{DeviceInfo, Gpu, ImageArch};
 pub use executor::{CudaExecutor, CudaExecutorConfig};
-pub use module::{ImageSource, Kernel, KernelModule};
+pub use module::{ImageSource, Kernel, KernelDir, KernelModule};
+pub use support::{Unsupported, check_supported};
 
 /// A CUDA executor failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CudaError(pub String);
+pub enum CudaError {
+    /// A driver call, a launch precondition or a malformed input failed.
+    Failed(String),
+    /// The model is outside the one configuration the kernels are built for.
+    Unsupported(Unsupported),
+}
 
 impl CudaError {
     pub fn new(what: impl Into<String>) -> CudaError {
-        CudaError(what.into())
+        CudaError::Failed(what.into())
     }
 }
 
 impl fmt::Display for CudaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "cuda: {}", self.0)
+        match self {
+            CudaError::Failed(what) => write!(f, "cuda: {what}"),
+            CudaError::Unsupported(u) => write!(f, "cuda: unsupported model: {u}"),
+        }
     }
 }
 
@@ -48,7 +58,13 @@ impl std::error::Error for CudaError {}
 
 impl From<cudarc::driver::DriverError> for CudaError {
     fn from(e: cudarc::driver::DriverError) -> CudaError {
-        CudaError(format!("{e:?}"))
+        CudaError::Failed(format!("{e:?}"))
+    }
+}
+
+impl From<Unsupported> for CudaError {
+    fn from(u: Unsupported) -> CudaError {
+        CudaError::Unsupported(u)
     }
 }
 

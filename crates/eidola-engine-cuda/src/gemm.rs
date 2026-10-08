@@ -294,6 +294,8 @@ impl Gemm {
     /// (the blockwise kernel reads `M` rows of A and of `sfa`, rounded up to
     /// what its tiles touch through TMA, which clamps at the extents).
     pub unsafe fn launch(&self, gpu: &Gpu, a: &GemmArgs) -> Result<()> {
+        // Descriptor encoding needs this thread's current context.
+        gpu.context().bind_to_thread()?;
         let (mut params, grid) = self
             .kind
             .params_with(a, gpu.info().sm_count, |s| s.encode())?;

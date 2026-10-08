@@ -72,7 +72,7 @@ fn fixture() -> Option<Fixture> {
 
 fn executor(
     gpu: Gpu,
-    dir: &eidola_engine_kernels::ArtifactDir<'static>,
+    dir: &eidola_engine_cuda::KernelDir,
     store: Arc<WeightSet>,
     arch: ImageArch,
 ) -> CudaExecutor {

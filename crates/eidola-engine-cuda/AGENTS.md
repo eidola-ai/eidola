@@ -13,6 +13,7 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
 | `attention.rs` | FlashInfer FA2 sink attention: `PagedParams` mirror and the per-step work list. |
 | `sampler.rs` | The device sampler and chain acceptance. |
 | `engine_ops.rs` | Wrappers for our own kernels (`engine_ops.cu`). |
+| `support.rs` | `check_supported`: the one model configuration the kernels can run; `Unsupported` names the field. |
 | `tma.rs` | `cuTensorMapEncodeTiled` specs, CuTe's descriptor fix-up. |
 | `device.rs`, `module.rs`, `launch.rs`, `ops.rs`, `bf16.rs` | Device, verified image loading and launch, argument lists, the RMSNorm smoke kernel and DeepGEMM's grid, BF16 bits. |
 
@@ -23,11 +24,27 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
   - **CUTLASS** (`gemm.rs`): the 2048-byte `GemmUniversal::Params` (problem shape, mainloop TMA descriptors and, for the blockwise kernel, scale-factor pointers and layouts, epilogue alpha and output descriptor, the cluster-launch-control scheduler's tile counts, divisors and raster order, hardware info), field by field. Descriptors are encoded by the driver and post-processed exactly as CuTe does (bit 21 of word 1 cleared unless the first 128 KiB are dense). Pinned by `tests/cutlass_params.rs` against CUTLASS's own host path: every byte CUTLASS defines must match.
   - **DeepGEMM** (`moe_gemm.rs`): the five 2-D descriptors its host code builds (L2 promotion 256 B, packed-FP4 B as `16U4_ALIGN16B`), the `Identity` epilogue arguments, grid = the instance's SM count.
   - **FlashInfer** (`attention.rs`): `PagedParams` as a `repr(C)` struct with compile-time size and offset checks against the generated C++ (296 bytes), CCCL's `fast_mod_div` reproduced for `uint_fastdiv`, and the non-split work list (one CTA per request × query tile × KV head). Sliding layers list only the pages some query can see.
-- **Images only through `ArtifactDir`**, size and SHA-256 checked against the compiled-in manifest. CC 10.0 runs `sm_100a`, 10.3 runs `sm_103a`, any other 10.x runs `sm_100f`; a foreign architecture's cubin is refused, never JIT-compiled. `CudaExecutorConfig::image` can force the family image.
+- **Images only through `KernelDir`**, size and SHA-256 checked against the compiled-in manifest. `KernelDir::new` takes only a directory: no other manifest can be supplied, so nothing but the compiled-in hashes can approve bytes.
+- **Every driver call binds the context first.** The current context is per thread and the executor may run on a thread other than the one that loaded it. `Kernel::launch` binds its module's context, and the paths that make raw driver calls bind before them: descriptor encoding in the GEMM launches and KV maintenance. A plain launch happened to work without a current context on R580, but descriptor encoding fails with `CUDA_ERROR_INVALID_CONTEXT` (`tests/smoke.rs` launches all three from a fresh thread).
+- **Every launch wrapper checks its kernel's limits on the host** and returns an error instead of launching. The checks cover divisibility (128- and 512-wide quantization groups), row and stride coverage, at most 256 experts and 8 per token, whole GQA groups, a vocabulary of at most 2^20 for both sampling and acceptance, and whole rows in every array (`tests/preconditions.rs`). Device-resident indices (block ids, logit rows) are the executor's to keep in range; it builds them from the host mirror. CC 10.0 runs `sm_100a`, 10.3 runs `sm_103a`, any other 10.x runs `sm_100f`; a foreign architecture's cubin is refused, never JIT-compiled. `CudaExecutorConfig::image` can force the family image.
 
 ## The dev-only oracle
 
 `oracle/cutlass_params.cu` is a host program that `#include`s the kernels crate's two CUTLASS translation units, so its types are the AOT kernels' types, runs CUTLASS's `to_underlying_arguments` / `get_grid_shape` / `can_implement` for a list of shapes and fake addresses, logs every `cuTensorMapEncodeTiled` call, and prints the Params bytes with a mask of the bytes CUTLASS defines (padding is found by building the struct three times over different stack contents). Its output is `tests/data/cutlass_params.jsonl`. It is compiled with any CUDA 13 toolkit and the pinned CUTLASS tree on a GPU host (descriptor encoding needs a context); the command is in its header. Never part of the engine. Regenerate it when the CUTLASS pin or either GEMM instantiation changes.
+
+## Supported configuration
+
+The kernels are built for one shape family, and the shapes are template arguments or compile-time constants in them. A different shape would read or write out of bounds rather than fail. `check_supported` runs before any tensor is read and refuses everything else with `CudaError::Unsupported`, naming the field. The requirements, with the kernel that bakes each one in:
+
+- hidden size 4096 (DeepGEMM instances, UE8M0 words);
+- every layer: QK head dim 192, V head dim 128 (FA2, `eidola_qkv_rope_kv`), rotated dims 64 (`eidola_qkv_rope_kv`, the RoPE tables), and query heads in whole GQA groups;
+- dense intermediate size a multiple of 128 (FP8 GEMM tiles, f32-scale SwiGLU);
+- vocabulary a multiple of 8 (the BF16 `lm_head` GEMM);
+- 256 routed experts (DeepGEMM's group count, the router's and placement's shared arrays) of intermediate 2048 (DeepGEMM), `top_k` at most 8 (the router's selection array);
+- `norm_topk_prob = true`, because the router kernel always renormalizes;
+- a sampleable vocabulary of at most 2^20 (`sampling.cu`'s chunks).
+
+Each field, changed alone, is refused (`support::tests`). Every f32 vector loaded (norms, sinks, router bias) must have exactly the model's width; the BF16 and FP8 tensors' shapes are checked likewise.
 
 ## The executor
 

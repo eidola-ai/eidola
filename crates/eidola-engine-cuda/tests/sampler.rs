@@ -402,3 +402,105 @@ fn chain_accept_matches_reference() {
         eprintln!("{arch:?}: {accepted} drafts accepted");
     }
 }
+
+/// `-0.0` and `+0.0` are one value: a row whose maximum is zero, held as
+/// `-0.0` at a low id and `+0.0` at a higher one in another warp (and the
+/// other way round), samples the lower id greedily, as the reference does.
+#[test]
+fn signed_zero_maxima_tie_to_the_lower_id() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    let n = 4096usize;
+    let mut logits = vec![-1.0f32; 2 * n];
+    logits[5] = -0.0;
+    logits[3000] = 0.0;
+    logits[n + 5] = 0.0;
+    logits[n + 3000] = -0.0;
+    for row in 0..2 {
+        let r = &logits[row * n..(row + 1) * n];
+        assert_eq!(sampling::argmax(Logits::new(r, n as u32)), 5);
+    }
+    let dlogits = s.clone_htod(&logits).unwrap();
+    let rows = [
+        SampleRow::new(&SamplingParams::greedy(), 1, 0),
+        SampleRow::new(&SamplingParams::greedy(), 1, 1),
+    ];
+    let drows = s.clone_htod(&rows).unwrap();
+    for &arch in &su.archs {
+        let sampler = Sampler::from_module(su.module("sampling", arch)).unwrap();
+        let mut probs = s.alloc_zeros::<f64>(2 * n).unwrap();
+        let mut tokens = s.alloc_zeros::<u32>(2).unwrap();
+        let mut status = s.alloc_zeros::<u32>(1).unwrap();
+        sampler
+            .sample(
+                gpu,
+                &dlogits,
+                n,
+                n as u32,
+                &drows,
+                2,
+                Some(Stream::Sample),
+                &mut probs,
+                &mut tokens,
+                &mut status,
+            )
+            .unwrap();
+        assert_eq!(s.clone_dtoh(&tokens).unwrap(), vec![5, 5], "{arch:?}");
+    }
+}
+
+/// The chained sums hold at most 1,024 chunks of 1,024: a larger vocabulary
+/// is refused on the host, for acceptance as for sampling.
+#[test]
+fn oversized_vocabularies_are_refused() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    let sampler = Sampler::from_module(su.module("sampling", su.archs[0])).unwrap();
+    let n = (1u32 << 20) + 1;
+    let probs = s.alloc_zeros::<f64>(n as usize).unwrap();
+    let rows = s.clone_htod(&[SampleRow::default()]).unwrap();
+    let idx = s.clone_htod(&[0u32]).unwrap();
+    let mut scratch = s.alloc_zeros::<f64>(n as usize).unwrap();
+    let mut out = s.alloc_zeros::<u32>(2).unwrap();
+    let mut counts = s.alloc_zeros::<u32>(1).unwrap();
+    let e = sampler
+        .chain_accept(
+            gpu,
+            &probs,
+            &probs,
+            n,
+            &rows,
+            &idx,
+            &idx,
+            &idx,
+            &idx,
+            1,
+            1,
+            &mut scratch,
+            &mut out,
+            &mut counts,
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("vocabulary"), "{e}");
+    let logits = s.alloc_zeros::<f32>(n as usize).unwrap();
+    let mut tokens = s.alloc_zeros::<u32>(1).unwrap();
+    let mut status = s.alloc_zeros::<u32>(1).unwrap();
+    let mut p = s.alloc_zeros::<f64>(n as usize).unwrap();
+    let e = sampler
+        .sample(
+            gpu,
+            &logits,
+            n as usize,
+            n,
+            &rows,
+            1,
+            None,
+            &mut p,
+            &mut tokens,
+            &mut status,
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("vocabulary"), "{e}");
+}

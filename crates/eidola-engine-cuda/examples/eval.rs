@@ -34,8 +34,8 @@ use eidola_engine::spec::Bucket;
 use eidola_engine_chat::json::Json;
 use eidola_engine_chat::tool_call::parse_complete;
 use eidola_engine_chat::{ChatInput, ChatTemplate, MimoTokenizer, RenderOptions, ToolSchemas};
+use eidola_engine_cuda::KernelDir;
 use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, Gpu};
-use eidola_engine_kernels::{ArtifactDir, Manifest};
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
 use serde_json::{Value, json};
@@ -69,7 +69,7 @@ fn ids(v: &Value) -> Vec<u32> {
 fn executor(kernels: &str, model: &str, max_tokens: u32, max_seqs: u32) -> (CudaExecutor, u32) {
     let tok = MimoTokenizer::from_model_dir(Path::new(model)).unwrap();
     let gpu = Gpu::open(0).unwrap();
-    let dir = ArtifactDir::new(kernels, Manifest::embedded());
+    let dir = KernelDir::new(kernels);
     let store = Arc::new(WeightSet::open_dir(Path::new(model)).unwrap());
     let cfg = CudaExecutorConfig {
         block_size: 16,

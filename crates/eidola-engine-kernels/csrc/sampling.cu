@@ -271,8 +271,10 @@ __device__ uint32_t argmax_f32(const float* l, uint32_t n, bool* non_finite, Sha
     }
   }
   // Order-free reduction: larger value wins, ties to the lower id. Pack as
-  // (orderable value bits, inverted id) into one u64 and take the max.
-  uint32_t vb = __float_as_uint(best);
+  // (orderable value bits, inverted id) into one u64 and take the max. -0.0
+  // and +0.0 are equal (the reference's `>` sees a tie), so both pack as +0.0
+  // and the lower id wins.
+  uint32_t vb = __float_as_uint(best == 0.0f ? 0.0f : best);
   vb = (vb & 0x80000000u) ? ~vb : (vb | 0x80000000u);
   const uint64_t key = idx == 0xffffffffu ? 0 : (static_cast<uint64_t>(vb) << 32) | (0xffffffffu - idx);
   const uint64_t top = block_max_u64(key, sh);

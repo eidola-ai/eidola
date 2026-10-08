@@ -17,8 +17,8 @@
 
 use std::sync::Arc;
 
+use crate::module::KernelDir;
 use cudarc::driver::CudaSlice;
-use eidola_engine_kernels::ArtifactDir;
 use eidola_engine_model::ModelConfig;
 use eidola_engine_model::attention::rope_cos_sin;
 use eidola_engine_model::config::AttentionSpec;
@@ -49,7 +49,7 @@ pub struct Kernels {
 
 impl Kernels {
     /// Load every image for `arch` (the device's own by default).
-    pub fn load(gpu: &Gpu, dir: &ArtifactDir<'static>, arch: Option<ImageArch>) -> Result<Kernels> {
+    pub fn load(gpu: &Gpu, dir: &KernelDir, arch: Option<ImageArch>) -> Result<Kernels> {
         let arch = arch
             .or(gpu.image_arch())
             .ok_or_else(|| CudaError::new("no kernel image for this device"))?;
