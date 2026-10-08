@@ -320,7 +320,22 @@ impl AttestationCheck {
             .map_err(|e| Error::Connector(format!("flush attestation request: {e}")))?;
 
         let body = read_http1_response(io).await?;
-        bundle::parse_document(&body)
+        self.parse_document(&body)
+    }
+
+    /// Parse a fetched document, refusing a platform with no pinned entry
+    /// before its payloads are decoded. `verify` re-checks the platform on
+    /// the resolved document.
+    fn parse_document(&self, body: &[u8]) -> Result<bundle::ResolvedAttestation, Error> {
+        let pinned: Vec<Platform> = [Platform::SevSnp, Platform::Tdx]
+            .into_iter()
+            .filter(|platform| {
+                self.allowed_measurements
+                    .iter()
+                    .any(|pin| pin.platform() == *platform)
+            })
+            .collect();
+        bundle::parse_document_for(body, &pinned)
     }
 
     /// Verify a freshly-fetched attestation document against the peer cert the
@@ -913,6 +928,45 @@ mod tests {
             let err = check.verify(&doc, &PEER_SPKI, &NONCE).unwrap_err();
             assert!(matches!(err, Error::PlatformNotPinned { .. }), "{err}");
         }
+    }
+
+    /// The handshake parser is gated on the client's own pins: an SEV-SNP
+    /// client handed a TDX envelope it could not even decode answers
+    /// `PlatformNotPinned`.
+    #[test]
+    fn handshake_parser_refuses_unpinned_platforms_before_decoding() {
+        let tdx_envelope = serde_json::to_vec(&serde_json::json!({
+            "format": bundle::ATTESTATION_V3_FORMAT,
+            "challenge": {"nonce": "", "report_data": "", "report_data_algorithm": ""},
+            "cpu_evidence": {
+                "format": bundle::TDX_QUOTE_V1_FORMAT,
+                "report_base64": "%%%",
+                "endorsed": {"crypto_material_hash": "", "device_evidence_hash": ""},
+            },
+            "crypto_material": "",
+            "device_evidence": "",
+            "collateral": [],
+        }))
+        .unwrap();
+        let snp_only = check(&[AllowedMeasurement::from(
+            &snp_record_matching_fixture_rtmrs(),
+        )]);
+        let err = snp_only.parse_document(&tdx_envelope).err().unwrap();
+        assert!(
+            matches!(
+                err,
+                Error::PlatformNotPinned {
+                    platform: Platform::Tdx
+                }
+            ),
+            "{err}"
+        );
+        let both = check(&[
+            AllowedMeasurement::from(&snp_record_matching_fixture_rtmrs()),
+            AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin()),
+        ]);
+        let err = both.parse_document(&tdx_envelope).err().unwrap();
+        assert!(matches!(err, Error::Bundle(_)), "{err}");
     }
 
     #[test]

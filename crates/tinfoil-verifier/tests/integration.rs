@@ -242,6 +242,63 @@ fn tdx_envelope_requires_strict_intel_pcs_collateral() {
     assert!(err.contains("no intel-pcs endorsement"), "{err}");
 }
 
+/// A verifier pinned to SEV-SNP never runs the TDX parsers: a TDX envelope
+/// whose platform payloads are malformed is refused as an unpinned platform,
+/// not as a parse error. The same document does fail to parse when TDX is
+/// pinned, which shows the payload was never read.
+#[test]
+fn unpinned_platform_is_refused_before_its_payloads_are_decoded() {
+    use tinfoil_verifier::{Error, Platform, bundle};
+    let devices = br#"{"format":"https://tinfoil.sh/device-evidence/v1","items":[]}"#;
+    let mut doc: serde_json::Value = serde_json::from_slice(&tdx_document(
+        serde_json::json!([{"url": "u", "body_base64": "not base64!", "extra": 1}]),
+        devices,
+    ))
+    .unwrap();
+    doc["cpu_evidence"]["report_base64"] = "%%%".into();
+    let raw = serde_json::to_vec(&doc).unwrap();
+
+    let err = bundle::parse_document_for(&raw, &[Platform::SevSnp])
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(
+            err,
+            Error::PlatformNotPinned {
+                platform: Platform::Tdx
+            }
+        ),
+        "{err}"
+    );
+    let err = bundle::parse_document_for(&raw, &[Platform::SevSnp, Platform::Tdx])
+        .err()
+        .expect("refused");
+    assert!(matches!(err, Error::Bundle(_)), "{err}");
+
+    // And the reverse: an SEV-SNP envelope against a TDX-only verifier.
+    let mut snp: serde_json::Value = serde_json::from_slice(&synthetic_document()).unwrap();
+    snp["collateral"][0]["data"]["cert_chain_pem"] = "garbage".into();
+    let err = bundle::parse_document_for(&serde_json::to_vec(&snp).unwrap(), &[Platform::Tdx])
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(
+            err,
+            Error::PlatformNotPinned {
+                platform: Platform::SevSnp
+            }
+        ),
+        "{err}"
+    );
+
+    // An unknown format is still a document error, whatever is pinned.
+    doc["cpu_evidence"]["format"] = "https://example.com/other".into();
+    let err = bundle::parse_document_for(&serde_json::to_vec(&doc).unwrap(), &[])
+        .err()
+        .expect("refused");
+    assert!(matches!(err, Error::Bundle(_)), "{err}");
+}
+
 /// Full connector path against a locally running `tinfoil-shim-mock`.
 #[tokio::test]
 async fn mock_attesting_client_e2e() {

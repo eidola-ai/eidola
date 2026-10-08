@@ -245,11 +245,35 @@ pub async fn fetch_well_known(
 /// endorsed section hashes are computed over their exact decoded JSON bytes,
 /// never over a re-serialization.
 pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
+    parse_document_for(raw, &[Platform::SevSnp, Platform::Tdx])
+}
+
+/// [`parse_document`] for a verifier that accepts only `pinned` platforms.
+///
+/// The CPU evidence format is identified right after the envelope's own
+/// JSON is parsed, and a platform outside `pinned` is refused with
+/// [`Error::PlatformNotPinned`] before any section is decoded and before any
+/// platform-specific payload (the CPU report, its vendor collateral) is
+/// touched. A verifier pinned to SEV-SNP never runs the TDX parsers, and the
+/// reverse.
+pub fn parse_document_for(raw: &[u8], pinned: &[Platform]) -> Result<ResolvedAttestation, Error> {
     reject_duplicate_members(raw, "attestation document")?;
     let doc: Document = serde_json::from_slice(raw)
         .map_err(|e| Error::Bundle(format!("parsing attestation document: {e}")))?;
 
     require_eq("document format", &doc.format, ATTESTATION_V3_FORMAT)?;
+    let platform = match doc.cpu_evidence.format.as_str() {
+        SEV_SNP_REPORT_V1_FORMAT => Platform::SevSnp,
+        TDX_QUOTE_V1_FORMAT => Platform::Tdx,
+        other => {
+            return Err(Error::Bundle(format!(
+                "unsupported CPU evidence format: {other}"
+            )));
+        }
+    };
+    if !pinned.contains(&platform) {
+        return Err(Error::PlatformNotPinned { platform });
+    }
     require_eq(
         "report_data_algorithm",
         &doc.challenge.report_data_algorithm,
@@ -322,15 +346,6 @@ pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
         ));
     }
 
-    let platform = match doc.cpu_evidence.format.as_str() {
-        SEV_SNP_REPORT_V1_FORMAT => Platform::SevSnp,
-        TDX_QUOTE_V1_FORMAT => Platform::Tdx,
-        other => {
-            return Err(Error::Bundle(format!(
-                "unsupported CPU evidence format: {other}"
-            )));
-        }
-    };
     let report_bytes = decode_canonical_base64(
         &doc.cpu_evidence.report_base64,
         "cpu_evidence.report_base64",

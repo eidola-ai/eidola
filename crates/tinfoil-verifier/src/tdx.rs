@@ -115,6 +115,8 @@ impl PcsResource {
 pub(crate) struct AuthenticatedQuote {
     pub qe_vendor_id: [u8; 16],
     pub report: TDReport10,
+    /// MR_SERVICETD: the service TD this TD is bound to, zero when unbound.
+    pub mr_service_td: [u8; 48],
     /// FMSPC from the Intel-signed PCK certificate.
     pub fmspc: [u8; 6],
     /// Platform flags from the Intel-signed PCK certificate.
@@ -149,11 +151,16 @@ pub(crate) fn authenticate(
 
     // The verifier re-parses the same bytes; the report it returns is the
     // one its signature check covered.
+    // Only a TD 1.0 body (what a v4 quote carries) is accepted. It has no
+    // MR_SERVICETD field, so the TD is recorded as unbound; appraisal
+    // requires that, so admitting TD 1.5 bodies later cannot silently admit
+    // a service-TD binding.
     let Report::TD10(report) = claims.report else {
         return Err(Error::Quote(
             "verified quote does not carry a TD 1.0 report body".to_string(),
         ));
     };
+    let mr_service_td = [0u8; 48];
     if report != parsed {
         return Err(Error::Quote(
             "verified quote body differs from the parsed quote".to_string(),
@@ -180,6 +187,7 @@ pub(crate) fn authenticate(
     Ok(AuthenticatedQuote {
         qe_vendor_id: claims.header.qe_vendor_id,
         report,
+        mr_service_td,
         fmspc: claims.platform.pck.fmspc,
         dynamic_platform: pck_flag(claims.platform.pck.dynamic_platform),
         cached_keys: pck_flag(claims.platform.pck.cached_keys),
@@ -421,6 +429,15 @@ pub(crate) fn appraise(quote: &AuthenticatedQuote, pin: &CompiledTdxPin) -> Resu
     if report.mr_owner != [0u8; 48] || report.mr_owner_config != [0u8; 48] {
         return violation("MROWNER/MROWNERCONFIG must be zero".to_string());
     }
+    // The IGVM launch is an unbound TD. A service-TD binding hands a
+    // migration or key-management TD authority over this one; a pin that
+    // ever needs one will say so in its policy.
+    if quote.mr_service_td != [0u8; 48] {
+        return violation(format!(
+            "MR_SERVICETD {} binds the TD to a service TD; the launch is unbound",
+            hex::encode(quote.mr_service_td)
+        ));
+    }
     if report.td_attributes != pin.td_attributes {
         return violation(format!(
             "TD_ATTRIBUTES {} is not the pinned {}",
@@ -600,6 +617,7 @@ pub(crate) mod tests {
                 rt_mr3: [0; 48],
                 report_data: [0; 64],
             },
+            mr_service_td: [0; 48],
             fmspc: [0xb0, 0xc0, 0x6f, 0, 0, 0],
             dynamic_platform: PckFlag::True,
             cached_keys: PckFlag::True,
@@ -652,6 +670,7 @@ pub(crate) mod tests {
             ("RTMR3", Box::new(|q, _| q.report.rt_mr3[10] = 1)),
             ("MROWNER", Box::new(|q, _| q.report.mr_owner[0] = 1)),
             ("MROWNER", Box::new(|q, _| q.report.mr_owner_config[0] = 1)),
+            ("MR_SERVICETD", Box::new(|q, _| q.mr_service_td[47] = 1)),
             // DEBUG (bit 0) set on an otherwise identical launch: MRTD does
             // not change, only the attribute pin catches it.
             (
@@ -804,6 +823,7 @@ pub(crate) mod tests {
         .expect("fixture quote authenticates");
         assert_eq!(hex::encode(quote.report.mr_td), FIXTURE_MRTD);
         assert_eq!(quote.report.mr_config_id, [0; 48]);
+        assert_eq!(quote.mr_service_td, [0; 48]);
         assert_eq!(hex::encode(quote.fmspc), "b0c06f000000");
         assert_eq!(quote.tcb_status, TcbStatus::UpToDate);
         assert_eq!(quote.tcb_info_evaluation_data_number, 17);
