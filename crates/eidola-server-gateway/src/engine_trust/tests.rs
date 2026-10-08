@@ -645,7 +645,8 @@ fn every_variable_the_node_requires_is_checked() {
 /// field widths, no MR_SEAM, and unsafe TD attributes.
 #[test]
 fn a_tdx_policy_the_attesting_client_refuses_is_refused() {
-    let cases: [(&str, fn(&mut serde_json::Value)); 5] = [
+    type Edit = fn(&mut serde_json::Value);
+    let cases: [(&str, Edit); 5] = [
         ("{}", |p| *p = serde_json::json!({})),
         ("short xfam", |p| p["xfam"] = "e702".into()),
         ("long mr_seam", |p| {
