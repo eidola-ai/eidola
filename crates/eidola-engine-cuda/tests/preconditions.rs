@@ -24,18 +24,29 @@ fn out_of_range_launches_are_refused() {
         );
         assert!(ops.swiglu_quant_f32scale(gpu, 0, 0, 0, 4, 200, 4).is_err());
         assert!(
-            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 4, 1000, 4, 0).is_err(),
+            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 4, 4, 1000, 4, 0)
+                .is_err(),
             "not whole words"
         );
         assert!(
-            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 130, 2048, 4, 128)
+            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 8, 130, 2048, 4, 128)
                 .is_err(),
             "rows not whole experts"
         );
         assert!(
-            ops.gather_quant_ue8m0(gpu, 0, 0, 0, 0, 8, 4096, 4, 0)
+            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 0, 2, 8, 8, 2048, 8, 0)
+                .is_err(),
+            "more pairs than rows"
+        );
+        assert!(
+            ops.gather_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 8, 8, 4096, 4, 0)
                 .is_err(),
             "rows4 below rows"
+        );
+        assert!(
+            ops.gather_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 9, 16, 4096, 16, 0)
+                .is_err(),
+            "top_k"
         );
         assert!(
             ops.router_topk(gpu, 0, 0, 0, 0, 0, 1, 4096, 300, 8, 1.0)
@@ -48,7 +59,12 @@ fn out_of_range_launches_are_refused() {
             "top_k"
         );
         assert!(
-            ops.moe_permute(gpu, 0, 0, 0, 0, 200, 8, 128, 0).is_err(),
+            ops.router_topk(gpu, 0, 0, 0, 0, 0, 1, 4097, 256, 8, 1.0)
+                .is_err(),
+            "hidden past the staged row"
+        );
+        assert!(
+            ops.moe_permute(gpu, 0, 0, 0, 200, 8, 128, 0).is_err(),
             "masked capacity"
         );
         assert!(

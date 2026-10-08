@@ -59,8 +59,8 @@ pub const GLOBAL_KV_HEADS: usize = 4;
 pub const SLIDING_KV_HEADS: usize = 8;
 /// Visible positions of sliding layers.
 pub const WINDOW: usize = 128;
-/// Routed experts: DeepGEMM's group count, `eidola_router_topk`'s and
-/// `eidola_moe_permute`'s per-expert shared arrays.
+/// Routed experts: DeepGEMM's group count, `eidola_router_topk`'s cluster
+/// (one warp per expert) and `eidola_moe_permute`'s per-expert shared arrays.
 pub const EXPERTS: usize = 256;
 /// Expert intermediate size: DeepGEMM's instances.
 pub const EXPERT_INTER: usize = 2048;
@@ -233,7 +233,8 @@ pub const REQUIRED_SMEM_PER_BLOCK: u32 = 231_424;
 ///   matches it (`sm_100a` only on 10.0, `sm_103a` only on 10.3);
 /// - opt-in shared memory for the largest launch ([`REQUIRED_SMEM_PER_BLOCK`]);
 /// - with any MoE layer: at least the SM count DeepGEMM's persistent instances
-///   are built for, and cluster launches (their 2-CTA clusters).
+///   are built for, and cluster launches (DeepGEMM's 2-CTA clusters, the
+///   router's 8-block clusters).
 ///
 /// The launch paths keep their own checks (`ops::deepgemm_grid`, the
 /// shared-memory opt-in at load); this runs before any device memory is used.
@@ -292,7 +293,7 @@ pub fn check_device(
             return Err(bad(
                 "cluster_launch",
                 "false".into(),
-                "true (DeepGEMM's 2-CTA clusters)".into(),
+                "true (DeepGEMM's 2-CTA clusters, the router's 8-block clusters)".into(),
             ));
         }
     }
@@ -443,7 +444,8 @@ mod tests {
         }
         let e = check_device(&b300(), &c, Some(ImageArch::Sm100a)).expect_err("sm_100a on 10.3");
         assert_eq!(e.field, "device.compute_capability");
-        // Without an MoE layer, DeepGEMM's SM count and clusters do not apply.
+        // Without an MoE layer, DeepGEMM's SM count and the expert path's
+        // clusters do not apply.
         let dense = c.truncated(&[0]).unwrap();
         let mut d = b300();
         d.sm_count = 132;

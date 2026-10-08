@@ -12,77 +12,12 @@
 //     the row count rounded up to 4 (contiguous layout), or per expert
 //     [E][K/512][cap] for the masked layout's `cap` rows per expert.
 
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
+#include <cooperative_groups.h>
 
 #include <cstdint>
 
 #include "eidola_kernel.cuh"
-
-namespace {
-
-constexpr uint32_t kThreads = 256;
-constexpr float kFp8Max = 448.0f;
-
-__device__ __forceinline__ float bf16f(uint16_t b) { return __uint_as_float(static_cast<uint32_t>(b) << 16); }
-
-__device__ __forceinline__ uint16_t f2bf16(float x) {
-  return __bfloat16_as_ushort(__float2bfloat16_rn(x));
-}
-
-__device__ __forceinline__ uint8_t f2e4m3(float x) {
-  return static_cast<uint8_t>(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3));
-}
-
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-  return v;
-}
-
-__device__ __forceinline__ float warp_max(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  return v;
-}
-
-// Sum over a kThreads block.
-__device__ float block_sum(float v) {
-  __shared__ float part[kThreads / 32];
-  __shared__ float total;
-  v = warp_sum(v);
-  if (threadIdx.x % 32 == 0) part[threadIdx.x / 32] = v;
-  __syncthreads();
-  if (threadIdx.x < 32) {
-    float t = threadIdx.x < kThreads / 32 ? part[threadIdx.x] : 0.f;
-    t = warp_sum(t);
-    if (threadIdx.x == 0) total = t;
-  }
-  __syncthreads();
-  const float out = total;
-  __syncthreads();
-  return out;
-}
-
-// UE8M0 exponent byte for a group's amax: 2^ceil(log2(amax / 448)).
-__device__ __forceinline__ uint8_t ue8m0_for(float amax) {
-  const float r = fmaxf(amax, 1e-10f) / kFp8Max;
-  int e = static_cast<int>(ceilf(log2f(r)));
-  e = max(-127, min(127, e));
-  return static_cast<uint8_t>(e + 127);
-}
-
-__device__ __forceinline__ float ue8m0_value(uint8_t b) { return exp2f(static_cast<float>(b) - 127.f); }
-
-// Index of SFA word `w` (of `words` per row) for row `r`: [words][rows4]
-// when cap == 0, else [r / cap][words][cap].
-__device__ __forceinline__ size_t sfa_index(uint32_t r, uint32_t w, uint32_t words, uint32_t rows4,
-                                            uint32_t cap) {
-  if (cap == 0) return static_cast<size_t>(w) * rows4 + r;
-  return (static_cast<size_t>(r / cap) * words + w) * cap + r % cap;
-}
-
-}  // namespace
+#include "engine_ops_common.cuh"
 
 // out[r] = table[tokens[r]] (BF16 -> f32). One block per row.
 extern "C" __global__ void __launch_bounds__(kThreads)
@@ -255,13 +190,19 @@ extern "C" __global__ void __launch_bounds__(32)
 EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_f32scale, 32, 1, 1, 0, 1, 1, 1, 0);
 
 // SwiGLU over BF16 [rows][2I] quantized for DeepGEMM: q [rows][I], packed
-// UE8M0 sf (see sfa_index). Grid (rows, I/512), 4 warps (one per 128 group).
+// UE8M0 sf (see sfa_index), for exactly the rows a routed (token, slot) pair
+// landed in: block x is pair i, its row row_of[i]. Rows no pair names (the
+// expert layout's padding) are not touched; the grouped GEMMs compute every
+// row independently, so what they hold reaches only padding outputs, which
+// the combine never reads. Grid (pairs, I/512), 4 warps (one per 128 group).
 extern "C" __global__ void __launch_bounds__(128)
     eidola_swiglu_quant_fp8_ue8m0(uint8_t* __restrict__ q, int32_t* __restrict__ sf,
-                                  const uint16_t* __restrict__ gu, uint32_t inter,
+                                  const uint16_t* __restrict__ gu,
+                                  const int32_t* __restrict__ row_of, uint32_t inter,
                                   uint32_t rows4, uint32_t cap) {
   __shared__ uint8_t exps[4];
-  const uint32_t r = blockIdx.x, w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const uint32_t r = static_cast<uint32_t>(row_of[blockIdx.x]);
+  const uint32_t w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const uint32_t g = w * 4 + warp;
   const uint16_t* gate = gu + static_cast<size_t>(r) * 2 * inter + g * 128;
   const uint16_t* up = gate + inter;
@@ -292,57 +233,159 @@ EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);
 // Router: logits = x · Wᵀ (x f32 [T][H], W BF16 [E][H], f32 accumulation),
 // scores = sigmoid(logits), top-k of scores + bias (ties to the lower expert),
 // experts sorted ascending, weights = scores / (sum + 1e-20) * scaling.
-// One block per token; E <= 256, k <= 8.
-extern "C" __global__ void __launch_bounds__(kThreads)
+// E <= 256, k <= 8, H <= kRouterMaxHidden.
+//
+// One cluster of kRouterCluster blocks per token (grid T * kRouterCluster),
+// each block 32 warps, one expert per warp: block rank b scores experts
+// 32b .. 32b + 31. A logit is lane l's sequential sum of x[i] * w[i] over
+// i = l, l + 32, ... (fused multiply-add, ascending i), then the xor-butterfly
+// over the 32 lanes: that order is the router's numerics, and the loads only
+// run ahead of it. Rank 0's first warp then reads every block's scores through
+// distributed shared memory and selects: per round, the best untaken expert
+// under (choice greater, or equal and lower id), unless the lowest untaken
+// expert's choice is NaN, in which case that expert. This is exactly what a
+// scan in expert order keeping the first strictly greater choice selects.
+constexpr uint32_t kRouterCluster = 8;
+constexpr uint32_t kRouterWarps = 32;
+constexpr uint32_t kRouterThreads = kRouterWarps * 32;
+constexpr uint32_t kRouterMaxHidden = 4096;
+// W loads in flight per lane before their multiply-adds.
+constexpr uint32_t kRouterBatch = 32;
+
+namespace {
+
+constexpr uint32_t kNone = 0xffffffffu;
+
+// a before b in the selection order: a valid, and b invalid or a's choice
+// greater, or equal with a lower id. A strict total order over valid
+// (non-NaN) candidates with distinct ids, so any reduction tree finds its
+// maximum.
+__device__ __forceinline__ bool router_before(float av, uint32_t ai, float bv, uint32_t bi) {
+  if (ai == kNone) return false;
+  if (bi == kNone) return true;
+  return av > bv || (av == bv && ai < bi);
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(kRouterThreads)
     eidola_router_topk(int32_t* __restrict__ topk_ids, float* __restrict__ topk_w,
                        const float* __restrict__ x, const uint16_t* __restrict__ w,
                        const float* __restrict__ bias, uint32_t hidden, uint32_t experts,
                        uint32_t top_k, float scaling) {
-  __shared__ float score[256];
-  __shared__ float choice[256];
-  __shared__ int32_t picked[8];
-  const uint32_t t = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  namespace cg = cooperative_groups;
+  __shared__ float xs[kRouterMaxHidden];
+  __shared__ float score[kRouterWarps];
+  __shared__ float choice[kRouterWarps];
+  const cg::cluster_group cluster = cg::this_cluster();
+  // A launch without the cluster attribute would score a fraction of the
+  // experts and select among unwritten memory.
+  if (cluster.num_blocks() != kRouterCluster) __trap();
+  const uint32_t t = blockIdx.x / kRouterCluster, rank = cluster.block_rank();
+  const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const float* xr = x + static_cast<size_t>(t) * hidden;
-  for (uint32_t e = warp; e < experts; e += kThreads / 32) {
+  for (uint32_t i = threadIdx.x; i < hidden; i += kRouterThreads) xs[i] = xr[i];
+  __syncthreads();
+  const uint32_t e = rank * kRouterWarps + warp;
+  if (e < experts) {
     const uint16_t* wr = w + static_cast<size_t>(e) * hidden;
     float acc = 0.f;
-    for (uint32_t i = lane; i < hidden; i += 32) acc += xr[i] * bf16f(wr[i]);
+    uint32_t i = lane;
+    for (; i + 32 * (kRouterBatch - 1) < hidden; i += 32 * kRouterBatch) {
+      uint16_t wv[kRouterBatch];
+#pragma unroll
+      for (uint32_t b = 0; b < kRouterBatch; ++b) wv[b] = __ldg(wr + i + 32 * b);
+#pragma unroll
+      for (uint32_t b = 0; b < kRouterBatch; ++b) acc = __fmaf_rn(xs[i + 32 * b], bf16f(wv[b]), acc);
+    }
+    for (; i < hidden; i += 32) acc = __fmaf_rn(xs[i], bf16f(__ldg(wr + i)), acc);
     acc = warp_sum(acc);
     if (lane == 0) {
       const float s = 1.f / (1.f + expf(-acc));
-      score[e] = s;
-      choice[e] = s + bias[e];
+      score[warp] = s;
+      choice[warp] = s + bias[e];
     }
   }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    // k rounds of argmax over the remaining experts (ties to the lower id).
-    for (uint32_t j = 0; j < top_k; ++j) {
-      int32_t best = -1;
-      for (uint32_t e = 0; e < experts; ++e) {
-        bool taken = false;
-        for (uint32_t p = 0; p < j; ++p) taken |= picked[p] == static_cast<int32_t>(e);
-        if (!taken && (best < 0 || choice[e] > choice[best])) best = static_cast<int32_t>(e);
+  cluster.sync();
+  if (rank == 0 && warp == 0) {
+    // Lane l holds experts 32q + l for q < kRouterCluster (block q's slot l).
+    float c[kRouterCluster];
+    uint32_t valid = 0;
+#pragma unroll
+    for (uint32_t q = 0; q < kRouterCluster; ++q) {
+      c[q] = 0.f;
+      if (q * kRouterWarps + lane < experts) {
+        c[q] = cluster.map_shared_rank(choice, q)[lane];
+        valid |= 1u << q;
       }
-      picked[j] = best;
     }
-    // Ascending expert order.
-    for (uint32_t a = 1; a < top_k; ++a)
-      for (uint32_t b = a; b > 0 && picked[b - 1] > picked[b]; --b) {
-        const int32_t tmp = picked[b];
-        picked[b] = picked[b - 1];
-        picked[b - 1] = tmp;
-      }
-    float sum = 0.f;
-    for (uint32_t j = 0; j < top_k; ++j) sum += score[picked[j]];
-    const float denom = sum + 1e-20f;
+    int32_t picked[8];
     for (uint32_t j = 0; j < top_k; ++j) {
-      topk_ids[t * top_k + j] = picked[j];
-      topk_w[t * top_k + j] = score[picked[j]] / denom * scaling;
+      // The lowest untaken expert, and its choice.
+      // `valid` loses an expert's bit when it is taken.
+      uint32_t low = kNone;
+#pragma unroll
+      for (uint32_t q = 0; q < kRouterCluster; ++q)
+        if ((valid >> q & 1u) && low == kNone) low = q * kRouterWarps + lane;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) low = min(low, __shfl_xor_sync(0xffffffffu, low, o));
+      float low_c = 0.f;
+#pragma unroll
+      for (uint32_t q = 0; q < kRouterCluster; ++q)
+        if (q == low / kRouterWarps) low_c = c[q];
+      low_c = __shfl_sync(0xffffffffu, low_c, low % kRouterWarps);
+      uint32_t best = low;
+      if (!isnan(low_c)) {
+        float bv = 0.f;
+        uint32_t bi = kNone;
+#pragma unroll
+        for (uint32_t q = 0; q < kRouterCluster; ++q) {
+          const uint32_t ei = q * kRouterWarps + lane;
+          if ((valid >> q & 1u) && !isnan(c[q]) && router_before(c[q], ei, bv, bi)) {
+            bv = c[q];
+            bi = ei;
+          }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+          const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+          const uint32_t oi = __shfl_xor_sync(0xffffffffu, bi, o);
+          if (router_before(ov, oi, bv, bi)) {
+            bv = ov;
+            bi = oi;
+          }
+        }
+        best = bi;
+      }
+      picked[j] = static_cast<int32_t>(best);
+      if (lane == best % kRouterWarps) valid &= ~(1u << (best / kRouterWarps));
+    }
+    if (lane == 0) {
+      // Ascending expert order.
+      for (uint32_t a = 1; a < top_k; ++a)
+        for (uint32_t b = a; b > 0 && picked[b - 1] > picked[b]; --b) {
+          const int32_t tmp = picked[b];
+          picked[b] = picked[b - 1];
+          picked[b - 1] = tmp;
+        }
+      float sel[8];
+      for (uint32_t j = 0; j < top_k; ++j) {
+        const uint32_t p = static_cast<uint32_t>(picked[j]);
+        sel[j] = cluster.map_shared_rank(score, p / kRouterWarps)[p % kRouterWarps];
+      }
+      float sum = 0.f;
+      for (uint32_t j = 0; j < top_k; ++j) sum += sel[j];
+      const float denom = sum + 1e-20f;
+      for (uint32_t j = 0; j < top_k; ++j) {
+        topk_ids[t * top_k + j] = picked[j];
+        topk_w[t * top_k + j] = sel[j] / denom * scaling;
+      }
     }
   }
+  // Every block's scores stay readable until rank 0 has read them.
+  cluster.sync();
 }
-EIDOLA_KERNEL_META(eidola_router_topk, kThreads, 1, 1, 0, 1, 1, 1, 0);
+EIDOLA_KERNEL_META(eidola_router_topk, kRouterThreads, 1, 1, 0, kRouterCluster, 1, 1, 0);
 
 // Expert-major placement of the T*k routed (token, slot) pairs, deterministic
 // (tokens ascending within an expert). One block of 256 threads, thread e
@@ -354,11 +397,11 @@ EIDOLA_KERNEL_META(eidola_router_topk, kThreads, 1, 1, 0, 1, 1, 1, 0);
 //   masked (cap > 0): expert e's rows are e*cap + i; grouped_layout[e] =
 //     its row count (at most cap).
 //
-// row_of[t*k + j] = the row (token t, slot j) landed in.
-// row_src[row] = the token feeding it (-1 for padding), for the gather.
+// row_of[t*k + j] = the row (token t, slot j) landed in; the gather, the
+// SwiGLU and the combine address rows through it.
 extern "C" __global__ void __launch_bounds__(256)
     eidola_moe_permute(int32_t* __restrict__ grouped_layout, int32_t* __restrict__ row_of,
-                       int32_t* __restrict__ row_src, const int32_t* __restrict__ topk_ids,
+                       const int32_t* __restrict__ topk_ids,
                        uint32_t tokens, uint32_t top_k, uint32_t cap, uint32_t rows_bound) {
   __shared__ uint32_t counts[256];
   __shared__ uint32_t starts[256];
@@ -378,12 +421,7 @@ extern "C" __global__ void __launch_bounds__(256)
   __syncthreads();
   // Clear the layout (contiguous: every row -1; masked: counts below).
   if (cap == 0) {
-    for (uint32_t r = e; r < rows_bound; r += 256) {
-      grouped_layout[r] = -1;
-      row_src[r] = -1;
-    }
-  } else {
-    for (uint32_t r = e; r < 256 * cap; r += 256) row_src[r] = -1;
+    for (uint32_t r = e; r < rows_bound; r += 256) grouped_layout[r] = -1;
   }
   __syncthreads();
   uint32_t k = 0;
@@ -391,7 +429,6 @@ extern "C" __global__ void __launch_bounds__(256)
     if (topk_ids[i] == static_cast<int32_t>(e)) {
       const uint32_t row = starts[e] + k++;
       row_of[i] = static_cast<int32_t>(row);
-      row_src[row] = static_cast<int32_t>(i / top_k);
       if (cap == 0) grouped_layout[row] = static_cast<int32_t>(e);
     }
   }
@@ -406,26 +443,28 @@ extern "C" __global__ void __launch_bounds__(256)
 }
 EIDOLA_KERNEL_META(eidola_moe_permute, 256, 1, 1, 0, 1, 1, 1, 0);
 
-// Gather f32 rows by row_src into DeepGEMM's FP8 A with packed UE8M0 scales:
-// a [rows][K], sf (see sfa_index); rows with row_src -1 become zeros (scale
-// byte 127). Grid (rows, K/512), 4 warps.
+// Gather f32 token rows into DeepGEMM's FP8 A with packed UE8M0 scales:
+// a [rows][K], sf (see sfa_index). Block x is routed pair i: token i / top_k,
+// written to row row_of[i]. Rows no pair names (the expert layout's padding)
+// are not touched; see eidola_swiglu_quant_fp8_ue8m0. Grid (pairs, K/512),
+// 4 warps.
 extern "C" __global__ void __launch_bounds__(128)
     eidola_gather_quant_ue8m0(uint8_t* __restrict__ a, int32_t* __restrict__ sf,
-                              const float* __restrict__ x, const int32_t* __restrict__ row_src,
-                              uint32_t k, uint32_t rows4, uint32_t cap) {
+                              const float* __restrict__ x, const int32_t* __restrict__ row_of,
+                              uint32_t top_k, uint32_t k, uint32_t rows4, uint32_t cap) {
   __shared__ uint8_t exps[4];
-  const uint32_t r = blockIdx.x, w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const uint32_t r = static_cast<uint32_t>(row_of[blockIdx.x]), src = blockIdx.x / top_k;
+  const uint32_t w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const uint32_t g = w * 4 + warp;
-  const int32_t src = row_src[r];
   float v[4];
   float amax = 0.f;
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
-    v[j] = src >= 0 ? x[static_cast<size_t>(src) * k + g * 128 + lane + 32 * j] : 0.f;
+    v[j] = x[static_cast<size_t>(src) * k + g * 128 + lane + 32 * j];
     amax = fmaxf(amax, fabsf(v[j]));
   }
   amax = warp_max(amax);
-  const uint8_t e = src >= 0 ? ue8m0_for(amax) : 127;
+  const uint8_t e = ue8m0_for(amax);
   const float inv = 1.f / ue8m0_value(e);
   uint8_t* dst = a + static_cast<size_t>(r) * k + g * 128;
 #pragma unroll

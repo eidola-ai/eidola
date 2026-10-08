@@ -115,7 +115,15 @@
     },
     {
       "path": "csrc/engine_ops.cu",
-      "sha256": "9774f0329d72efb17dffde3460542c9fc20e56a677d04568a665e7d2a93b2d7e"
+      "sha256": "870d6eb7973991189dc771ac72743efaee8b399fe1900400b8b2b9e7f9238850"
+    },
+    {
+      "path": "csrc/engine_ops_common.cuh",
+      "sha256": "8e736c9372d04049f671057344e691888ecdcbbcbc07805ef460468baa35159a"
+    },
+    {
+      "path": "csrc/engine_ops_reference.cu",
+      "sha256": "24acdab0f9371350b61dd3598f005051b6693895f6344100ace5daf3b62e5496"
     },
     {
       "path": "csrc/flashinfer_fa2_sink_paged.cu",
@@ -123,7 +131,7 @@
     },
     {
       "path": "csrc/kernels.json",
-      "sha256": "76aaf1305070f9413d5383a21e2eb13af65b7f5cb3c49b9d50e81cf9ffbb6011"
+      "sha256": "5a95ea94f0f49a2fecb4f5d451c3877e3a7643d95ac133029b75d56f86659e88"
     },
     {
       "path": "csrc/rmsnorm.cu",
@@ -434,8 +442,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_100a.cubin",
-      "sha256": "f9513ee34289a2db805106ccfe73ac135480e994f67396356f62cd1a994df193",
-      "size": 174448,
+      "sha256": "28b29dad52f34e96f258c5611278348d9ff101c5f5c2181b70bc26640380667a",
+      "size": 201096,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -526,8 +534,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_100f.cubin",
-      "sha256": "47e8f2d95e328ea01de855435117ebda7f7bfbc1e36fe08f5f4993568483907c",
-      "size": 174448,
+      "sha256": "f3c0b347a9a0037cfa888473506f9261b9d516591113470b8bfc1365b7dd2dbd",
+      "size": 201096,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -618,8 +626,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_103a.cubin",
-      "sha256": "35c9d75ffbd66300b4a5cf563b2fb7ecca365e4ab98088d8c04e5f36e45469ab",
-      "size": 174448,
+      "sha256": "ec40ca5e98c76e4f1807cb3e42213b1a0baaae74b8afbd1a8d36453c5ed15ac5",
+      "size": 201096,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -701,6 +709,102 @@
         "eidola_router_topk_meta",
         "eidola_swiglu_quant_fp8_f32scale_meta",
         "eidola_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops_reference",
+      "arch": "sm_100a",
+      "source": "csrc/engine_ops_reference.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops_reference.sm_100a.cubin",
+      "sha256": "2877fa0e89b6cf8113160b550a54166cf3dcac81213a835ca62d85a4b61ed0c6",
+      "size": 58952,
+      "entries": [
+        {
+          "symbol": "eidola_reference_gather_quant_ue8m0",
+          "demangled": "eidola_reference_gather_quant_ue8m0",
+          "meta": "eidola_reference_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_reference_router_topk",
+          "demangled": "eidola_reference_router_topk",
+          "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_reference_gather_quant_ue8m0_meta",
+        "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops_reference",
+      "arch": "sm_100f",
+      "source": "csrc/engine_ops_reference.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops_reference.sm_100f.cubin",
+      "sha256": "92c74c94629c4cff3d0d6351305b767f41f5852665a3c2f0ae37f5a34220108b",
+      "size": 58952,
+      "entries": [
+        {
+          "symbol": "eidola_reference_gather_quant_ue8m0",
+          "demangled": "eidola_reference_gather_quant_ue8m0",
+          "meta": "eidola_reference_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_reference_router_topk",
+          "demangled": "eidola_reference_router_topk",
+          "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_reference_gather_quant_ue8m0_meta",
+        "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops_reference",
+      "arch": "sm_103a",
+      "source": "csrc/engine_ops_reference.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops_reference.sm_103a.cubin",
+      "sha256": "7ca24cd1690ec4c55db8500dc1bf5fe8dccc14de7df4189dd79e61c2f3cc0a6d",
+      "size": 58952,
+      "entries": [
+        {
+          "symbol": "eidola_reference_gather_quant_ue8m0",
+          "demangled": "eidola_reference_gather_quant_ue8m0",
+          "meta": "eidola_reference_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_reference_router_topk",
+          "demangled": "eidola_reference_router_topk",
+          "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_reference_gather_quant_ue8m0_meta",
+        "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
       ],
       "mma_sass": {}
     },
@@ -997,8 +1101,18 @@
     {
       "name": "engine_ops",
       "file": "fatbin/engine_ops.fatbin",
-      "sha256": "52d33f5e519f126f73ed619c1f259aa1341122bea6aa52ac1b21b6668dd317e3",
-      "size": 349128,
+      "sha256": "cfed0cc88908b547576e6d313f4b7cd63df25debfb023e4d2704505aadff5ca4",
+      "size": 402424,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "engine_ops_reference",
+      "file": "fatbin/engine_ops_reference.fatbin",
+      "sha256": "46b27df648a386e6b7cfe310189158ac9b125b9568f43c2a573a69b599398889",
+      "size": 118136,
       "archs": [
         "sm_100a",
         "sm_103a"
