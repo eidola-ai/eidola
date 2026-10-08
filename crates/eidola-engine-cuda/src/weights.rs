@@ -18,12 +18,14 @@
 //!   experts of a layer in one buffer; E8M0 scales repacked four per `i32`
 //!   along K and transposed to `[K/128][N]` per expert (DeepGEMM's SFB).
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use cudarc::driver::CudaSlice;
 use eidola_engine_model::ModelConfig;
 use eidola_engine_model::config::{AttentionSpec, FfnKind};
-use eidola_engine_model::safetensors::{Dtype, WeightSet};
+use eidola_engine_model::safetensors::{Dtype, TensorView, WeightSet};
 
 use crate::model::Kernels;
 use crate::support::check_supported;
@@ -106,17 +108,118 @@ pub struct ModelWeights {
     pub qkv_chunks: u32,
 }
 
+/// Checkpoint tensor families the executor does not serve, and leaves
+/// unread: the vision and audio encoders (text-only serving) and the MTP
+/// draft layers (no drafter yet).
+pub const SKIPPED_PREFIXES: [&str; 4] = [
+    "visual.",
+    "audio_encoder.",
+    "speech_embeddings.",
+    "model.mtp.",
+];
+
+/// Every tensor the loader reads for `config`: the head, and each retained
+/// layer's norms, attention (sinks exactly where the layer has them) and FFN.
+pub fn expected_tensors(config: &ModelConfig) -> BTreeSet<String> {
+    let mut t: BTreeSet<String> = [
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.norm.weight",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let fp8 = |t: &mut BTreeSet<String>, p: &str| {
+        t.insert(format!("{p}.weight"));
+        t.insert(format!("{p}.weight_scale_inv"));
+    };
+    for l in &config.layers {
+        let p = format!("model.layers.{}", l.source_index);
+        t.insert(format!("{p}.input_layernorm.weight"));
+        t.insert(format!("{p}.post_attention_layernorm.weight"));
+        fp8(&mut t, &format!("{p}.self_attn.qkv_proj"));
+        t.insert(format!("{p}.self_attn.o_proj.weight"));
+        if l.attention.has_sinks {
+            t.insert(format!("{p}.self_attn.attention_sink_bias"));
+        }
+        match l.ffn {
+            FfnKind::Dense => {
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    fp8(&mut t, &format!("{p}.mlp.{proj}"));
+                }
+            }
+            FfnKind::Moe => {
+                t.insert(format!("{p}.mlp.gate.weight"));
+                t.insert(format!("{p}.mlp.gate.e_score_correction_bias"));
+                let experts = config.moe.as_ref().map_or(0, |m| m.num_experts);
+                for x in 0..experts {
+                    for proj in ["gate_proj", "up_proj", "down_proj"] {
+                        t.insert(format!("{p}.mlp.experts.{x}.{proj}.weight"));
+                        t.insert(format!("{p}.mlp.experts.{x}.{proj}.weight_scale"));
+                    }
+                }
+            }
+        }
+    }
+    t
+}
+
+/// The checkpoint holds exactly what the loader reads for `config`, besides
+/// the families it skips ([`SKIPPED_PREFIXES`]) and the layers outside the
+/// selection: a tensor the loader would not read (a sink on a layer without
+/// sinks, an unknown module) and one it would read but cannot find are both
+/// layout errors, refused before anything is read.
+pub fn check_layout<'a>(names: impl Iterator<Item = &'a str>, config: &ModelConfig) -> Result<()> {
+    let expected = expected_tensors(config);
+    let retained: BTreeSet<usize> = config.layers.iter().map(|l| l.source_index).collect();
+    let mut found = 0usize;
+    for name in names {
+        if expected.contains(name) {
+            found += 1;
+            continue;
+        }
+        if SKIPPED_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+        let layer = name
+            .strip_prefix("model.layers.")
+            .and_then(|r| r.split_once('.'))
+            .and_then(|(i, _)| i.parse::<usize>().ok());
+        if layer.is_some_and(|i| i < config.source_num_layers && !retained.contains(&i)) {
+            continue;
+        }
+        return Err(CudaError::new(format!(
+            "checkpoint layout: {name} is not a tensor this configuration reads"
+        )));
+    }
+    if found != expected.len() {
+        return Err(CudaError::new(format!(
+            "checkpoint layout: {} expected tensors are missing",
+            expected.len() - found
+        )));
+    }
+    Ok(())
+}
+
 struct Loader<'a> {
     gpu: &'a Gpu,
     store: &'a WeightSet,
     config: &'a ModelConfig,
+    /// Every tensor name read, checked against [`expected_tensors`] at the
+    /// end so the layout check and the loader cannot drift apart.
+    read: RefCell<BTreeSet<String>>,
 }
 
 impl Loader<'_> {
+    fn get(&self, name: &str) -> Result<TensorView<'_>> {
+        self.read.borrow_mut().insert(name.to_owned());
+        self.store.get(name).map_err(err)
+    }
+
     /// A 1-D tensor of exactly `len` elements, widened to f32 (the kernels
     /// index it at the model's width, so a short one would read past it).
     fn f32_vec(&self, name: &str, len: usize) -> Result<CudaSlice<f32>> {
-        let t = self.store.get(name).map_err(err)?;
+        let t = self.get(name)?;
         if t.shape != [len] {
             return Err(CudaError::new(format!(
                 "{name}: shape {:?}, expected [{len}]",
@@ -128,7 +231,7 @@ impl Loader<'_> {
     }
 
     fn bf16(&self, name: &str, shape: &[usize]) -> Result<CudaSlice<u16>> {
-        let t = self.store.get(name).map_err(err)?;
+        let t = self.get(name)?;
         t.expect(name, Dtype::Bf16, shape).map_err(err)?;
         let words: Vec<u16> = t
             .data
@@ -144,9 +247,9 @@ impl Loader<'_> {
     fn fp8_parts(&self, prefix: &str, n: usize, k: usize) -> Result<(&[u8], Vec<f32>, [usize; 2])> {
         let wname = format!("{prefix}.weight");
         let sname = format!("{prefix}.weight_scale_inv");
-        let w = self.store.get(&wname).map_err(err)?;
+        let w = self.get(&wname)?;
         w.expect(&wname, Dtype::F8E4M3, &[n, k]).map_err(err)?;
-        let s = self.store.get(&sname).map_err(err)?;
+        let s = self.get(&sname)?;
         if s.dtype != Dtype::F32 || s.shape.len() != 2 {
             return Err(CudaError::new(format!(
                 "{sname}: {:?} {:?}",
@@ -298,9 +401,9 @@ impl Loader<'_> {
             let get = |proj: &str, rows: usize, cols: usize| -> Result<(&[u8], &[u8])> {
                 let wn = format!("{p}.{proj}.weight");
                 let sn = format!("{p}.{proj}.weight_scale");
-                let w = self.store.get(&wn).map_err(err)?;
+                let w = self.get(&wn)?;
                 w.expect(&wn, Dtype::U8, &[rows, cols / 2]).map_err(err)?;
-                let s = self.store.get(&sn).map_err(err)?;
+                let s = self.get(&sn)?;
                 s.expect(&sn, Dtype::U8, &[rows, cols / 32]).map_err(err)?;
                 Ok((w.data, s.data))
             };
@@ -357,11 +460,13 @@ impl ModelWeights {
         config: ModelConfig,
     ) -> Result<ModelWeights> {
         check_supported(&config)?;
+        check_layout(store.tensor_names(), &config)?;
         let chunks = crate::support::qkv_chunks(store.metadata("tp_size"), &config)?;
         let l = Loader {
             gpu,
             store: &store,
             config: &config,
+            read: RefCell::new(BTreeSet::new()),
         };
         let (h, v) = (config.hidden_size, config.vocab_size);
         let mut layers = Vec::with_capacity(config.layers.len());
@@ -388,10 +493,20 @@ impl ModelWeights {
                 ffn,
             });
         }
+        let (embed, lm_head, final_norm) = (
+            l.bf16("model.embed_tokens.weight", &[v, h])?,
+            l.bf16("lm_head.weight", &[v, h])?,
+            l.f32_vec("model.norm.weight", h)?,
+        );
+        if *l.read.borrow() != expected_tensors(&config) {
+            return Err(CudaError::new(
+                "the loader read other tensors than its layout check expects",
+            ));
+        }
         Ok(ModelWeights {
-            embed: l.bf16("model.embed_tokens.weight", &[v, h])?,
-            lm_head: l.bf16("lm_head.weight", &[v, h])?,
-            final_norm: l.f32_vec("model.norm.weight", h)?,
+            embed,
+            lm_head,
+            final_norm,
             layers,
             qkv_chunks: narrow(chunks, "QKV chunks")?,
             config,
@@ -402,6 +517,85 @@ impl ModelWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flash(keep: &[usize]) -> ModelConfig {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../eidola-engine-model/tests/data/flash-mopd.config.json"
+        );
+        ModelConfig::from_file(std::path::Path::new(path))
+            .unwrap()
+            .truncated(keep)
+            .unwrap()
+    }
+
+    /// The layout check accepts exactly the loader's tensors plus the skipped
+    /// families and unselected layers, and refuses an extra sink, an unknown
+    /// tensor and a missing one.
+    #[test]
+    fn layouts_are_exact() {
+        // Flash: layer 0 global (dense, no sinks), 1 sliding (MoE, sinks), 5 global.
+        let c = flash(&[0, 1, 5]);
+        let expected = expected_tensors(&c);
+        assert!(!expected.contains("model.layers.0.self_attn.attention_sink_bias"));
+        assert!(expected.contains("model.layers.1.self_attn.attention_sink_bias"));
+        let mut names: Vec<String> = expected.iter().cloned().collect();
+        names.extend(
+            [
+                "visual.blocks.0.attn.sinks",
+                "audio_encoder.input_local_transformer.norm.weight",
+                "speech_embeddings.3.weight",
+                "model.mtp.layers.0.eh_proj.weight",
+                "model.layers.2.self_attn.attention_sink_bias",
+                "model.layers.47.mlp.experts.255.down_proj.weight",
+            ]
+            .map(String::from),
+        );
+        let check = |names: &[String]| check_layout(names.iter().map(String::as_str), &c);
+        check(&names).unwrap();
+        for extra in [
+            "model.layers.0.self_attn.attention_sink_bias",
+            "model.layers.5.self_attn.attention_sink_bias",
+            "model.layers.1.self_attn.q_norm.weight",
+            "model.layers.48.input_layernorm.weight",
+            "model.decoder.self_attn.o_proj.weight",
+            "model.layers.1.mlp.experts.256.up_proj.weight",
+            "rotary_emb.inv_freq",
+        ] {
+            let mut with = names.clone();
+            with.push(extra.into());
+            let e = check(&with).expect_err(extra);
+            assert!(e.to_string().contains(extra), "{e}");
+        }
+        for gone in [
+            "lm_head.weight",
+            "model.layers.1.self_attn.attention_sink_bias",
+        ] {
+            let without: Vec<String> = names.iter().filter(|n| *n != gone).cloned().collect();
+            assert!(check(&without).unwrap_err().to_string().contains("missing"));
+        }
+    }
+
+    /// The published Flash checkpoint's index (`EIDOLA_MIMO_INDEX`, its
+    /// `model.safetensors.index.json`) passes, whole and truncated.
+    #[test]
+    fn the_published_index_passes() {
+        let Some(path) = std::env::var_os("EIDOLA_MIMO_INDEX") else {
+            eprintln!("skipping: EIDOLA_MIMO_INDEX not set");
+            return;
+        };
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let names: Vec<&str> = index["weight_map"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for keep in [(0..48).collect::<Vec<_>>(), vec![0, 1, 2, 5]] {
+            check_layout(names.iter().copied(), &flash(&keep)).unwrap();
+        }
+    }
 
     /// A vector shorter (or longer) than the model's width is refused before it
     /// is copied anywhere: the kernels would index it at that width.
@@ -431,6 +625,7 @@ mod tests {
             gpu: &gpu,
             store: &store,
             config: &config,
+            read: RefCell::new(BTreeSet::new()),
         };
         let Err(e) = l.f32_vec("model.norm.weight", 4096) else {
             panic!("a short vector loaded");

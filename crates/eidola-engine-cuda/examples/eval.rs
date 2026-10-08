@@ -470,6 +470,24 @@ fn compare_rows(
             rb["top"].as_array().unwrap().len(),
         );
         assert_eq!(na, nb, "id {id}: {na} positions in a, {nb} in b");
+        // A region must start inside the prompt: one starting at or past
+        // its end would drop the prompt from every metric unseen.
+        if let Some(starts) = starts {
+            let start = *starts
+                .get(id)
+                .unwrap_or_else(|| panic!("id {id} has no start"));
+            assert!(
+                start < na,
+                "id {id}: start {start} is not inside its {na} positions"
+            );
+        }
+    }
+    if let Some(starts) = starts {
+        assert_eq!(
+            starts.len(),
+            ia.len(),
+            "the region file names other prompts"
+        );
     }
     let mut full = full.map(|(fa, fb)| {
         let (fa, fb) = (FullRows::open(fa, a), FullRows::open(fb, b));
@@ -840,6 +858,32 @@ mod tests {
         let a = vec![json!({"id": "p", "top": [[[0, 0.0]], [[0, 0.0]]]})];
         let b = vec![json!({"id": "p", "top": [[[0, 0.0]]]})];
         compare_rows(&a, &b, None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "start 2 is not inside its 2 positions")]
+    fn region_starts_must_be_inside() {
+        let r = json!({"id": "p", "top": [[[0, 0.0]], [[0, 0.0]]]});
+        let starts = HashMap::from([(json!("p").to_string(), 2)]);
+        compare_rows(
+            std::slice::from_ref(&r),
+            std::slice::from_ref(&r),
+            None,
+            Some(&starts),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "names other prompts")]
+    fn region_files_name_the_same_prompts() {
+        let r = json!({"id": "p", "top": [[[0, 0.0]], [[0, 0.0]]]});
+        let starts = HashMap::from([(json!("p").to_string(), 1), (json!("q").to_string(), 0)]);
+        compare_rows(
+            std::slice::from_ref(&r),
+            std::slice::from_ref(&r),
+            None,
+            Some(&starts),
+        );
     }
 
     #[test]
