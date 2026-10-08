@@ -29,6 +29,9 @@ use crate::types::{
 pub enum TeeType {
     /// Tinfoil confidential enclave (AMD SEV-SNP / Intel TDX / NVIDIA CC).
     TinfoilEnclave,
+    /// An Eidola inference node in a confidential VM (Intel TDX with NVIDIA
+    /// confidential-computing GPUs), attested against this gateway's pins.
+    EidolaEngine,
 }
 
 /// Metadata about a backend's execution of a request.

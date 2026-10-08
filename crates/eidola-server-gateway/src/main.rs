@@ -41,6 +41,11 @@ struct Config {
     terms_refresh: std::time::Duration,
     /// How often `src/upstream_trust` re-checks Tinfoil's latest release.
     upstream_refresh: std::time::Duration,
+    /// The bearer token Eidola's inference nodes verify (`ENGINE_TOKEN`).
+    /// Required when this build pins an engine deployment.
+    engine_token: Option<String>,
+    /// How often the engine placement table is re-read.
+    engine_placement_refresh: std::time::Duration,
 }
 
 impl Config {
@@ -88,6 +93,17 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // The gateway's token for Eidola's inference nodes: a secret, measured
+        // by its Argon2id hash like the others when `ENGINE_TOKEN_HASH` is set.
+        let engine_token = std::env::var("ENGINE_TOKEN").ok().filter(|s| !s.is_empty());
+        if engine_token.is_none() && !eidola_server_gateway::engine_trust::PINNED_MODELS.is_empty()
+        {
+            return Err(
+                "ENGINE_TOKEN is required: this build pins Eidola-hosted engine deployments"
+                    .to_string(),
+            );
+        }
+
         let pricing_markup = std::env::var("PRICING_MARKUP")
             .ok()
             .filter(|s| !s.is_empty())
@@ -133,6 +149,7 @@ impl Config {
                 "OTEL_EXPORTER_OTLP_HEADERS",
                 otel_exporter_otlp_headers.as_deref().unwrap_or(""),
             ),
+            ("ENGINE_TOKEN", engine_token.as_deref().unwrap_or("")),
         ])?;
 
         // Terms-acceptance gate. Two independent sources feed the shared
@@ -165,6 +182,10 @@ impl Config {
         let upstream_refresh = eidola_server_gateway::helpers::refresh_secs_from_env(
             "TINFOIL_MEASUREMENT_REFRESH_SECS",
             eidola_server_gateway::upstream_trust::DEFAULT_REFRESH_SECS,
+        )?;
+        let engine_placement_refresh = eidola_server_gateway::helpers::refresh_secs_from_env(
+            "ENGINE_PLACEMENT_REFRESH_SECS",
+            30,
         )?;
 
         let mut terms_seed = Vec::new();
@@ -230,6 +251,8 @@ impl Config {
             terms_feed_base_url,
             terms_refresh,
             upstream_refresh,
+            engine_token,
+            engine_placement_refresh,
         })
     }
 }
@@ -425,6 +448,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })?;
     info!("Tinfoil attestation smoke test succeeded");
 
+    // The router to Eidola-hosted engines, when this build pins any. Each
+    // upstream's client attests against its model's compiled-in pins; the
+    // placement table only says where engines are. A first placement read and
+    // probe run before the server listens, so a healthy deployment takes
+    // traffic from the start; a failure there is not fatal (the refresh task
+    // keeps trying, and requests for those models are refused meanwhile).
+    let engines = match config.engine_token.clone() {
+        Some(token) if !eidola_server_gateway::engine_trust::PINNED_MODELS.is_empty() => {
+            use eidola_server_gateway::engine_router::{self, placement};
+            let token = eidola_server_gateway::engine_trust::protocol::EngineToken::new(token)
+                .map_err(|e| {
+                    error!("ENGINE_TOKEN: {e}");
+                    e.to_string()
+                })?;
+            let models = engine_router::EngineModel::compiled().map_err(|e| {
+                error!("engine pins: {e}");
+                e
+            })?;
+            let mut tls_roots = rustls::RootCertStore::empty();
+            tls_roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let router = engine_router::EngineRouter::new(
+                models,
+                token,
+                engine_router::attesting_client_factory(engine_router::AttestationRoots {
+                    tls_roots,
+                    trusted_ark_der: None,
+                    trusted_ask_der: None,
+                }),
+                engine_router::RouterConfig {
+                    placement_refresh: config.engine_placement_refresh,
+                    ..Default::default()
+                },
+            );
+            let source: std::sync::Arc<dyn placement::PlacementSource> =
+                std::sync::Arc::new(placement::PostgresPlacement(db_pool.clone()));
+            info!("Reading engine placement and probing engines...");
+            router.refresh(source.as_ref()).await;
+            router.spawn(source);
+            Some(router)
+        }
+        _ => None,
+    };
+
     // Create shared state
     let state = AppState::new(
         TinfoilBackend::new(
@@ -433,6 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             config.tinfoil_base_url.clone(),
             config.pricing_markup,
         ),
+        engines,
         db_pool,
         stripe,
         config.stripe_webhook_secret,

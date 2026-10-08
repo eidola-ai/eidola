@@ -459,6 +459,53 @@ pub async fn record_required_document(
     }
 }
 
+/// One `engine_placement` row: where an operator says an engine deployment
+/// of a model can be reached. Availability only, never trust (see
+/// `engine_router::placement`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnginePlacementRow {
+    pub model_id: String,
+    /// The deployment's config hash (`engine-enclaves.json`'s
+    /// `config_sha256`).
+    pub deployment: String,
+    pub base_url: String,
+    pub enabled: bool,
+}
+
+/// Every `engine_placement` row. Only the named columns are read, so a column
+/// a later gateway adds does not disturb this one: the table is shared by
+/// every gateway version running against the database, and grows additively.
+pub async fn get_engine_placement(pool: &Pool) -> Result<Vec<EnginePlacementRow>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+
+    let rows = client
+        .query(
+            "SELECT model_id, deployment, base_url, enabled \
+             FROM engine_placement ORDER BY model_id, base_url",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "query engine_placement failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
+
+    Ok(rows
+        .iter()
+        .map(|r| EnginePlacementRow {
+            model_id: r.get("model_id"),
+            deployment: r.get("deployment"),
+            base_url: r.get("base_url"),
+            enabled: r.get("enabled"),
+        })
+        .collect())
+}
+
 /// The currently required version of every gated document — the highest
 /// recorded version per document. Empty when the acceptance gate is
 /// disabled (nothing seeded or polled yet).

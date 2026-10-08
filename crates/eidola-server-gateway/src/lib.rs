@@ -13,6 +13,7 @@ pub mod auth;
 pub mod backend;
 pub mod credentials;
 pub mod db;
+pub mod engine_router;
 pub mod engine_trust;
 pub mod error;
 pub mod handlers;
@@ -46,6 +47,8 @@ pub struct AppState {
 
 pub struct AppStateInner {
     pub backend: backend::TinfoilBackend,
+    /// The router to Eidola-hosted engines; `None` when this build pins none.
+    pub engines: Option<engine_router::EngineRouter>,
     pub db_pool: deadpool_postgres::Pool,
     pub stripe: Option<stripe::StripeClient>,
     pub stripe_webhook_secret: Option<String>,
@@ -58,6 +61,7 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend: backend::TinfoilBackend,
+        engines: Option<engine_router::EngineRouter>,
         db_pool: deadpool_postgres::Pool,
         stripe: Option<stripe::StripeClient>,
         stripe_webhook_secret: Option<String>,
@@ -68,6 +72,7 @@ impl AppState {
         Self {
             inner: Arc::new(AppStateInner {
                 backend,
+                engines,
                 db_pool,
                 stripe,
                 stripe_webhook_secret,
