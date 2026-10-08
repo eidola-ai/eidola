@@ -156,6 +156,8 @@ pub struct AttnRequest {
 /// ```compile_fail
 /// // Not constructible outside the crate: every field is private.
 /// let _ = eidola_engine_cuda::attention::HostPlan {
+///     group_size: 16,
+///     page_size: 16,
 ///     tile: 16,
 ///     q_indptr: vec![0, 1],
 ///     indices: vec![1],
@@ -168,6 +170,10 @@ pub struct AttnRequest {
 /// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct HostPlan {
+    /// The GQA group size and page size it was checked for: upload takes
+    /// them from here, never from elsewhere.
+    group_size: u32,
+    page_size: u32,
     tile: u32,
     q_indptr: Vec<i32>,
     indices: Vec<i32>,
@@ -201,6 +207,8 @@ impl HostPlan {
             128
         };
         let mut p = HostPlan {
+            group_size,
+            page_size,
             tile,
             q_indptr: vec![0],
             indices: vec![],
@@ -344,16 +352,13 @@ impl Attention {
         })
     }
 
-    /// Upload a host plan (see [`Attention::plan`]).
-    pub fn upload(
-        &self,
-        gpu: &Gpu,
-        host: HostPlan,
-        group_size: u32,
-        page_size: u32,
-    ) -> Result<AttnPlan> {
+    /// Upload a host plan (see [`Attention::plan`]), with the geometry it
+    /// was checked for.
+    pub fn upload(&self, gpu: &Gpu, host: HostPlan) -> Result<AttnPlan> {
         let s = gpu.stream();
         let HostPlan {
+            group_size,
+            page_size,
             tile,
             q_indptr,
             indices,
@@ -401,7 +406,7 @@ impl Attention {
         page_size: u32,
     ) -> Result<AttnPlan> {
         let host = HostPlan::new(requests, group_size, page_size)?;
-        self.upload(gpu, host, group_size, page_size)
+        self.upload(gpu, host)
     }
 
     /// Attention for one layer: `q` is `[rows, num_qo_heads, 192]`, `o` is
@@ -520,6 +525,10 @@ mod tests {
         assert_eq!(p.q_indptr, vec![0, 1, 4]);
         assert_eq!(p.indptr, vec![0, 2, 4]);
         assert_eq!(p.tile, 64);
+        // The geometry it was checked for travels with it.
+        assert_eq!((p.group_size, p.page_size), (16, 16));
+        let p = HostPlan::new(&[req(0, 1, 1, 30)], 8, 32).unwrap();
+        assert_eq!((p.group_size, p.page_size, p.last_page_len[0]), (8, 32, 30));
         let refused = |rs: &[AttnRequest], group: u32, page: u32| {
             HostPlan::new(rs, group, page).expect_err(&format!("{rs:?}"));
         };

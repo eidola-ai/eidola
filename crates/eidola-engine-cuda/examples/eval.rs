@@ -641,12 +641,41 @@ fn gsm8k_answer(text: &str) -> Option<f64> {
     last
 }
 
+/// An integral JSON number, exactly: integers as parsed (64-bit, never
+/// through f64), and a float only when it is a whole number f64 holds
+/// exactly (`5.0`).
+fn integral(n: &serde_json::Number) -> Option<i128> {
+    if let Some(i) = n.as_i64() {
+        return Some(i128::from(i));
+    }
+    if let Some(u) = n.as_u64() {
+        return Some(i128::from(u));
+    }
+    let f = n.as_f64()?;
+    // Below 2^53 every whole f64 is the integer it prints as.
+    (f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0).then(|| {
+        #[expect(clippy::cast_possible_truncation, reason = "a whole number below 2^53")]
+        let i = f as i64;
+        i128::from(i)
+    })
+}
+
+/// Two JSON numbers are one value: integers compared exactly (`5` and `5.0`
+/// are one; `2^53 + 1` and `2^53` are not), other numbers as parsed.
+fn numbers_match(a: &serde_json::Number, b: &serde_json::Number) -> bool {
+    match (integral(a), integral(b)) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => a.as_f64() == b.as_f64(),
+        _ => false,
+    }
+}
+
 /// Exact equality of JSON values: objects with exactly the same keys,
-/// arrays element for element, numbers by value (`5` and `5.0` are one),
+/// arrays element for element, numbers by value ([`numbers_match`]),
 /// everything else by type and value.
 fn values_match(want: &Value, got: &Value) -> bool {
     match (want, got) {
-        (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
+        (Value::Number(a), Value::Number(b)) => numbers_match(a, b),
         (Value::Object(a), Value::Object(b)) => {
             a.len() == b.len()
                 && a.iter()
@@ -802,6 +831,27 @@ mod tests {
         let mut want = vec![70, 90];
         want.extend(20..38);
         assert_eq!(got, want);
+    }
+
+    /// Integers compare exactly, past f64's 2^53 too; a whole float equals
+    /// its integer.
+    #[test]
+    fn numbers_compare_exactly() {
+        let n = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        for (a, b, same) in [
+            ("9007199254740993", "9007199254740992", false),
+            ("9007199254740993", "9007199254740993", true),
+            ("18446744073709551615", "18446744073709551614", false),
+            ("-9007199254740993", "-9007199254740992", false),
+            ("5", "5.0", true),
+            ("9007199254740992", "9007199254740992.0", false),
+            ("5", "5.5", false),
+            ("0.5", "0.50", true),
+            ("-0", "0", true),
+        ] {
+            assert_eq!(values_match(&n(a), &n(b)), same, "{a} vs {b}");
+            assert_eq!(values_match(&n(b), &n(a)), same, "{b} vs {a}");
+        }
     }
 
     #[test]

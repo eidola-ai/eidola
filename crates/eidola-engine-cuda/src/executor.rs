@@ -368,12 +368,7 @@ impl CudaExecutor {
             let group_size = nq / group.num_kv_heads;
             let host = HostPlan::new(&requests[g], group_size, bs)?;
             // Fresh buffers for this step only: no executor state changes.
-            plans.push(
-                self.model
-                    .kernels
-                    .attention
-                    .upload(&self.gpu, host, group_size, bs)?,
-            );
+            plans.push(self.model.kernels.attention.upload(&self.gpu, host)?);
         }
         let input = ForwardInput {
             tokens: &step.token_ids,

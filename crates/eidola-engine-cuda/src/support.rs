@@ -15,7 +15,7 @@
 use std::fmt;
 
 use eidola_engine_model::ModelConfig;
-use eidola_engine_model::config::AttentionKind;
+use eidola_engine_model::config::{AttentionKind, FfnKind};
 
 /// A configuration field the kernels cannot run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +80,12 @@ pub const QKV_CHUNKS: usize = 4;
 pub const FP8_BLOCK: [usize; 2] = [128, 128];
 /// Elements per E8M0 scale of the MXFP4 experts: DeepGEMM's SFB words.
 pub const MXFP4_BLOCK: usize = 32;
+/// Flash's global-attention layers (`hybrid_layer_pattern` 0); every other
+/// layer is sliding-window.
+pub const GLOBAL_LAYERS: [usize; 9] = [0, 5, 11, 17, 23, 29, 35, 41, 47];
+/// Flash's dense-FFN layers (`moe_layer_freq` 0); every other layer routes
+/// to experts.
+pub const DENSE_LAYERS: [usize; 1] = [0];
 /// Largest sampleable vocabulary: `sampling.cu`'s 1,024 chunks of 1,024.
 pub const MAX_SAMPLEABLE: usize = 1 << 20;
 
@@ -157,6 +163,22 @@ pub fn check_supported(c: &ModelConfig) -> Result<(), Unsupported> {
         Some(0.707f32)
     );
     for (i, l) in c.layers.iter().enumerate() {
+        // Each retained layer is Flash's layer of that index, kind for kind.
+        let global = GLOBAL_LAYERS.contains(&l.source_index);
+        exact!(
+            format!("layers[{i}].attention.kind"),
+            matches!(l.attention.kind, AttentionKind::Global),
+            global
+        );
+        exact!(
+            format!("layers[{i}].ffn"),
+            l.ffn,
+            if DENSE_LAYERS.contains(&l.source_index) {
+                FfnKind::Dense
+            } else {
+                FfnKind::Moe
+            }
+        );
         let a = &l.attention;
         let f = |name: &str| format!("layers[{i}].attention.{name}");
         exact!(f("head_dim_qk"), a.head_dim_qk, HEAD_DIM_QK);
@@ -503,6 +525,12 @@ mod tests {
             (1, "rope_theta", |a| a.rope_theta = 1e7),
             (0, "has_sinks", |a| a.has_sinks = true),
             (1, "has_sinks", |a| a.has_sinks = false),
+            (0, "kind", |a| {
+                a.kind = eidola_engine_model::config::AttentionKind::Sliding { window: 128 }
+            }),
+            (1, "kind", |a| {
+                a.kind = eidola_engine_model::config::AttentionKind::Global
+            }),
             (1, "window", |a| {
                 a.kind = eidola_engine_model::config::AttentionKind::Sliding { window: 256 }
             }),
@@ -511,6 +539,20 @@ mod tests {
             set(&mut c.layers[layer].attention);
             refused(&c, &format!("layers[{layer}].attention.{name}"));
         }
+        // Each layer's FFN kind is Flash's for that layer, in a truncation too.
+        for (keep, i, ffn) in [
+            (&[0, 1][..], 0, FfnKind::Moe),
+            (&[0, 1][..], 1, FfnKind::Dense),
+            (&[5, 6][..], 1, FfnKind::Dense),
+        ] {
+            let mut c = flash().truncated(keep).unwrap();
+            c.layers[i].ffn = ffn;
+            refused(&c, &format!("layers[{i}].ffn"));
+        }
+        // And its attention kind, wherever it sits in the selection.
+        let mut c = flash().truncated(&[6, 11]).unwrap();
+        c.layers[1].attention = c.layers[0].attention.clone();
+        refused(&c, "layers[1].attention.kind");
         type M = fn(&mut MoeSpec);
         for (name, set) in [
             ("moe.num_experts", (|m| m.num_experts = 384) as M),
