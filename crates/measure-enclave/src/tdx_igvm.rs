@@ -329,7 +329,7 @@ pub fn release_pin(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use igvm::IgvmRevision;
     use igvm_defs::{IGVM_VHS_PARAMETER, IGVM_VHS_PARAMETER_INSERT, IGVM_VHS_SUPPORTED_PLATFORM};
@@ -337,7 +337,7 @@ mod tests {
 
     const TDX_MASK: u32 = 0x1;
 
-    fn image(directives: Vec<IgvmDirectiveHeader>) -> Vec<u8> {
+    pub(crate) fn image(directives: Vec<IgvmDirectiveHeader>) -> Vec<u8> {
         let file = IgvmFile::new(
             IgvmRevision::V1,
             vec![IgvmPlatformHeader::SupportedPlatform(
@@ -358,7 +358,7 @@ mod tests {
         out
     }
 
-    fn page(gpa: u64, fill: u8, flags: IgvmPageDataFlags) -> IgvmDirectiveHeader {
+    pub(crate) fn page(gpa: u64, fill: u8, flags: IgvmPageDataFlags) -> IgvmDirectiveHeader {
         IgvmDirectiveHeader::PageData {
             gpa,
             compatibility_mask: TDX_MASK,
@@ -455,7 +455,7 @@ mod tests {
         );
     }
 
-    fn manifest(igvm: &[u8], mrtd: &str, rtmr0: &str) -> Vec<u8> {
+    pub(crate) fn manifest(igvm: &[u8], mrtd: &str, rtmr0: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "version": "v0.0.0-test",
             "root": "00",

@@ -28,7 +28,10 @@
 //! - the deployment's sidecar (`deployment.json`, beside the config) states
 //!   the weights provenance, GPU count and TDX machine policy the pin carries;
 //! - every deployment of one model agrees on its weights and prompt-cache
-//!   policy, since the gateway publishes one of each per model.
+//!   policy, since the gateway publishes one of each per model;
+//! - every deployment directory committed under `deploy/engine/` is pinned
+//!   ([`require_every_deployment_pinned`]), so the file is a function of the
+//!   tree in both directions.
 //!
 //! What is **not** recomputed here: a TDX pin's MRTD and a SEV-SNP launch
 //! digest. Both need the platform provider's release images, so they are
@@ -152,6 +155,25 @@ pub fn check(
         checked.push(model.expect("a non-empty deployment list"));
     }
     Ok(checked)
+}
+
+/// Every committed deployment directory must be pinned: `committed` is the
+/// config path of every `deploy/engine/<model>/<variant>/` directory in the
+/// tree. A deployment committed without its pin is one no gateway built from
+/// this tree would accept, which is a release that cannot route to it.
+pub fn require_every_deployment_pinned(
+    committed: &[String],
+    checked: &[CheckedModel],
+) -> Result<(), String> {
+    for config in committed {
+        if !checked.iter().any(|m| m.deployments.contains(config)) {
+            return Err(format!(
+                "{config} is committed but not pinned in releases/trust/engine-enclaves.json \
+                 (measure it with measure-enclave's measure-engine-enclaves)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn check_deployment(

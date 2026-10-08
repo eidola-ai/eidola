@@ -228,12 +228,24 @@
                   isTrustRootPath =
                     relPath == "/releases"
                     || pkgs.lib.hasPrefix "/releases/" relPath;
+                  # `eidola-server-gateway/build.rs` also checks every engine
+                  # pin in `releases/trust/engine-enclaves.json` against the
+                  # committed deployment configs it names.
+                  isEngineDeployPath =
+                    crateSet ? "eidola-server-gateway"
+                    && (
+                      relPath == "/deploy"
+                      || relPath == "/deploy/engine"
+                      || pkgs.lib.hasPrefix "/deploy/engine/" relPath
+                    );
                 in
                 # Exclude irrelevant crate directories entirely
                 if isIrrelevantCrate then
                   false
                 # Trust-root build inputs for `eidola-app-core/build.rs`.
                 else if trustRootFiles && isTrustRootPath then
+                  true
+                else if isEngineDeployPath then
                   true
                 # Keep only root-level files that affect Cargo resolution/builds.
                 # This avoids generated files like artifact-manifest.json from

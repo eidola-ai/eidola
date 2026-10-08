@@ -43,6 +43,16 @@ markdown=true' scripts/fixtures/apple-roundtrip/README.md
 assert_scope 'rust=true
 apple=false
 markdown=false' crates/eidola-apple/src/lib.rs
+# The gateway's build checks the engine pins against the committed engine
+# deployments, so a change to either must run the cargo gates.
+for engine_trust_path in \
+  releases/trust/engine-enclaves.json \
+  deploy/engine/some-model/some-variant/tinfoil-config.yml \
+  deploy/engine/some-model/some-variant/deployment.json; do
+  assert_scope 'rust=true
+apple=false
+markdown=false' "$engine_trust_path"
+done
 assert_scope 'rust=false
 apple=false
 markdown=false' scripts/local-client.sh

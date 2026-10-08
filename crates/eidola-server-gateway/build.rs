@@ -66,6 +66,40 @@ fn main() {
         .expect("write engine_enclaves.gen.rs");
 }
 
+/// The config path of every `deploy/engine/<model>/<variant>/` directory.
+/// Every directory counts, whatever it holds, so a deployment missing its
+/// config is reported rather than overlooked.
+fn committed_deployments(workspace_root: &Path) -> Vec<String> {
+    let root = workspace_root.join(engine_manifest::DEPLOY_ROOT);
+    println!("cargo:rerun-if-changed={}", root.display());
+    let dirs = |dir: &Path| -> Vec<String> {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|e| e.unwrap_or_else(|e| panic!("list {}: {e}", dir.display())))
+            .filter(|e| e.path().is_dir())
+            .map(|e| {
+                e.file_name()
+                    .into_string()
+                    .unwrap_or_else(|n| panic!("{n:?} under {} is not UTF-8", dir.display()))
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let mut committed = Vec::new();
+    for model in dirs(&root) {
+        for variant in dirs(&root.join(&model)) {
+            committed.push(format!(
+                "{}/{model}/{variant}/tinfoil-config.yml",
+                engine_manifest::DEPLOY_ROOT
+            ));
+        }
+    }
+    committed
+}
+
 /// Check `releases/trust/engine-enclaves.json` against the deployments it
 /// names and render the pinned models as Rust.
 fn engine_enclaves(workspace_root: &Path) -> String {
@@ -78,6 +112,9 @@ fn engine_enclaves(workspace_root: &Path) -> String {
         fs::read(&file).map_err(|e| format!("read {relative}: {e}"))
     };
     let models = engine_manifest::check(&bytes, &mut read)
+        .unwrap_or_else(|e| panic!("releases/trust/engine-enclaves.json is not valid: {e}"));
+    let committed = committed_deployments(workspace_root);
+    engine_manifest::require_every_deployment_pinned(&committed, &models)
         .unwrap_or_else(|e| panic!("releases/trust/engine-enclaves.json is not valid: {e}"));
 
     let mut out = String::new();

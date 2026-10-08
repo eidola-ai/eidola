@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "measure-tdx-igvm"
 path = "src/bin/measure-tdx-igvm.rs"
 
+[[bin]]
+name = "measure-engine-enclaves"
+path = "src/bin/measure-engine-enclaves.rs"
+
 [dependencies]
 # SEV-SNP measurement
 sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }

@@ -213,6 +213,22 @@ async fn the_fixture_pin_is_a_tdx_pin_the_verifier_compiles() {
     );
 }
 
+/// A deployment directory committed without a pin is refused; with one, it
+/// passes.
+#[test]
+fn every_committed_deployment_is_pinned() {
+    let checked = Tree::fixture().check().unwrap();
+    manifest::require_every_deployment_pinned(&[CONFIG.to_string()], &checked).unwrap();
+    manifest::require_every_deployment_pinned(&[], &checked).unwrap();
+    let stray = "deploy/engine/fixture-model/tdx-b/tinfoil-config.yml".to_string();
+    let err = manifest::require_every_deployment_pinned(&[CONFIG.to_string(), stray], &checked)
+        .unwrap_err();
+    assert!(
+        err.contains("tdx-b/tinfoil-config.yml is committed but not pinned"),
+        "{err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // One mutation per rule
 // ---------------------------------------------------------------------------
