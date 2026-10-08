@@ -1,0 +1,653 @@
+//! The expert path's router, gather and SwiGLU kernels against their
+//! single-block reference forms (`engine_ops_reference.cu`, the numerics they
+//! must keep) bit for bit, and the router against the model crate's routing,
+//! on every image this device runs, from one token to a full prefill step.
+
+mod common;
+
+use common::{Lcg, setup};
+use eidola_engine_cuda::bf16;
+use eidola_engine_cuda::engine_ops::{EngineOps, ROUTER_CLUSTER, ROUTER_THREADS};
+use eidola_engine_cuda::launch::dptr;
+use eidola_engine_cuda::{Gpu, ImageArch, Kernel};
+use eidola_engine_model::Matrix;
+use eidola_engine_model::config::MoeSpec;
+use eidola_engine_model::forward::route;
+
+const HIDDEN: usize = 4096;
+const EXPERTS: usize = 256;
+const TOP_K: usize = 8;
+const INTER: usize = 2048;
+const CAP: usize = 128;
+const BLOCK_M: usize = 128;
+/// Token counts: decode rows, a masked-layout batch, the largest masked one,
+/// a contiguous one, and a full prefill step.
+const TOKENS: [usize; 7] = [1, 2, 7, 64, 128, 513, 8192];
+
+fn u32_of(x: usize) -> u32 {
+    u32::try_from(x).unwrap()
+}
+
+/// The reference kernels, launched as they were: one block per token (router)
+/// or per layout row (gather, SwiGLU).
+struct Reference {
+    router: Kernel,
+    swiglu: Kernel,
+    gather: Kernel,
+}
+
+impl Reference {
+    fn load(su: &common::Setup, arch: ImageArch) -> Reference {
+        let m = su.module("engine_ops_reference", arch);
+        Reference {
+            router: m.kernel("eidola_reference_router_topk").unwrap(),
+            swiglu: m.kernel("eidola_reference_swiglu_quant_fp8_ue8m0").unwrap(),
+            gather: m.kernel("eidola_reference_gather_quant_ue8m0").unwrap(),
+        }
+    }
+}
+
+struct RouterCase {
+    x: Vec<f32>,
+    w: Vec<u16>,
+    bias: Vec<f32>,
+}
+
+/// Random rows with ties built in: experts 2, 3, 4, 130 and 255 share one
+/// weight row and one bias (equal choices for every token), every fifth token
+/// is zero (every score 0.5, so the choice is the bias, which takes only 16
+/// values), and every seventh token repeats the previous one.
+fn router_case(rng: &mut Lcg, tokens: usize) -> RouterCase {
+    let mut w: Vec<u16> = (0..EXPERTS * HIDDEN)
+        .map(|_| bf16::from_f32(rng.f32() * 0.03))
+        .collect();
+    let shared = w[2 * HIDDEN..3 * HIDDEN].to_vec();
+    for e in [3, 4, 130, 255] {
+        w[e * HIDDEN..(e + 1) * HIDDEN].copy_from_slice(&shared);
+    }
+    let mut bias: Vec<f32> = (0..EXPERTS)
+        .map(|e| ((e * 37) % 16) as f32 * 1e-3)
+        .collect();
+    for e in [3, 4, 130, 255] {
+        bias[e] = bias[2];
+    }
+    let mut x = vec![0f32; tokens * HIDDEN];
+    for t in 0..tokens {
+        let row = t * HIDDEN;
+        if t % 5 == 0 {
+            continue;
+        }
+        if t % 7 == 0 {
+            x.copy_within(row - HIDDEN..row, row);
+            continue;
+        }
+        for v in &mut x[row..row + HIDDEN] {
+            *v = rng.f32();
+        }
+    }
+    RouterCase { x, w, bias }
+}
+
+/// Runs the executor's router and the reference over one case; returns
+/// (ids, weight bits) of each.
+#[allow(clippy::type_complexity)]
+fn run_router(
+    gpu: &Gpu,
+    ops: &EngineOps,
+    reference: &Reference,
+    case: &RouterCase,
+    tokens: usize,
+) -> ((Vec<i32>, Vec<u32>), (Vec<i32>, Vec<u32>)) {
+    let s = gpu.stream();
+    let x = s.clone_htod(&case.x).unwrap();
+    let w = s.clone_htod(&case.w).unwrap();
+    let bias = s.clone_htod(&case.bias).unwrap();
+    let mut out = Vec::new();
+    for new in [true, false] {
+        let ids = s.alloc_zeros::<i32>(tokens * TOP_K).unwrap();
+        let wts = s.alloc_zeros::<f32>(tokens * TOP_K).unwrap();
+        unsafe {
+            if new {
+                ops.router_topk(
+                    gpu,
+                    dptr(&ids, s),
+                    dptr(&wts, s),
+                    dptr(&x, s),
+                    dptr(&w, s),
+                    dptr(&bias, s),
+                    u32_of(tokens),
+                    u32_of(HIDDEN),
+                    u32_of(EXPERTS),
+                    u32_of(TOP_K),
+                    1.0f32,
+                )
+                .unwrap();
+            } else {
+                eidola_engine_cuda::launch!(
+                    gpu,
+                    reference.router,
+                    [u32_of(tokens), 1, 1],
+                    dptr(&ids, s),
+                    dptr(&wts, s),
+                    dptr(&x, s),
+                    dptr(&w, s),
+                    dptr(&bias, s),
+                    u32_of(HIDDEN),
+                    u32_of(EXPERTS),
+                    u32_of(TOP_K),
+                    1.0f32
+                )
+                .unwrap();
+            }
+        }
+        let ids = s.clone_dtoh(&ids).unwrap();
+        let wts: Vec<u32> = s
+            .clone_dtoh(&wts)
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        out.push((ids, wts));
+    }
+    let reference_out = out.pop().unwrap();
+    (out.pop().unwrap(), reference_out)
+}
+
+/// The router's launch contract is the geometry the host launches with.
+#[test]
+fn router_launch_contract() {
+    let Some(su) = setup() else { return };
+    for &arch in &su.archs {
+        let m = su.module("engine_ops", arch);
+        let meta = *m.kernel("eidola_router_topk").unwrap().meta();
+        assert_eq!(meta.block, [ROUTER_THREADS, 1, 1], "{arch:?}");
+        assert_eq!(meta.cluster, [ROUTER_CLUSTER, 1, 1], "{arch:?}");
+        for k in ["eidola_gather_quant_ue8m0", "eidola_swiglu_quant_fp8_ue8m0"] {
+            let meta = *m.kernel(k).unwrap().meta();
+            assert_eq!(meta.block, [128, 1, 1], "{k} {arch:?}");
+            assert_eq!(meta.cluster, [1, 1, 1], "{k} {arch:?}");
+        }
+    }
+}
+
+/// Same expert ids in the same order and the same weights, bit for bit,
+/// ties included, at every token count.
+#[test]
+fn router_matches_reference_bit_for_bit() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    for &arch in &su.archs {
+        let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
+        let reference = Reference::load(&su, arch);
+        for &tokens in &TOKENS {
+            let mut rng = Lcg(0x5eed ^ tokens as u64);
+            let case = router_case(&mut rng, tokens);
+            let (new, old) = run_router(gpu, &ops, &reference, &case, tokens);
+            for t in 0..tokens {
+                let r = t * TOP_K..(t + 1) * TOP_K;
+                assert_eq!(
+                    new.0[r.clone()],
+                    old.0[r.clone()],
+                    "{arch:?} {tokens} tokens, token {t}: ids"
+                );
+                assert_eq!(
+                    new.1[r.clone()],
+                    old.1[r],
+                    "{arch:?} {tokens} tokens, token {t}: weights"
+                );
+            }
+            // The tie cases did tie: a zero token picks the experts with the
+            // largest bias, lowest ids first among equals.
+            let mut zero_pick: Vec<usize> = (0..EXPERTS).collect();
+            zero_pick.sort_by(|&a, &b| case.bias[b].total_cmp(&case.bias[a]).then(a.cmp(&b)));
+            let mut want: Vec<i32> = zero_pick[..TOP_K]
+                .iter()
+                .map(|&e| i32::try_from(e).unwrap())
+                .collect();
+            want.sort_unstable();
+            assert_eq!(
+                new.0[..TOP_K],
+                want[..],
+                "{arch:?} {tokens} tokens: zero token"
+            );
+        }
+    }
+}
+
+/// NaN choices select exactly as the reference's scan does: a NaN at the
+/// lowest untaken expert is taken, one elsewhere never wins.
+#[test]
+fn router_nan_choices_match_reference() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    for &arch in &su.archs {
+        let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
+        let reference = Reference::load(&su, arch);
+        let tokens = 7;
+        let mut rng = Lcg(99);
+        let mut case = router_case(&mut rng, tokens);
+        case.bias[0] = f32::NAN;
+        case.bias[77] = f32::NAN;
+        case.bias[200] = f32::INFINITY;
+        let (new, old) = run_router(gpu, &ops, &reference, &case, tokens);
+        assert_eq!(new, old, "{arch:?}");
+        for t in 0..tokens {
+            let ids = &new.0[t * TOP_K..(t + 1) * TOP_K];
+            assert!(
+                ids.contains(&0) && ids.contains(&200) && !ids.contains(&77),
+                "{arch:?} token {t}: {ids:?}"
+            );
+        }
+    }
+}
+
+/// Against the model crate's routing on inputs whose logits are exact in any
+/// summation order (small dyadic values): the same experts in the same order;
+/// the weights differ only by the device's `expf`, a few ulp. Tokens whose
+/// selection the host decides by a margin within that rounding are not
+/// compared, and they must be rare.
+#[test]
+fn router_matches_model_routing() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let spec = MoeSpec {
+        num_experts: EXPERTS,
+        top_k: TOP_K,
+        intermediate_size: INTER,
+        norm_topk_prob: true,
+        routed_scaling_factor: 1.0,
+        router_dtype: Some("bfloat16".into()),
+    };
+    let tokens = 513;
+    let mut rng = Lcg(4242);
+    let tri = |rng: &mut Lcg| match rng.below(3) {
+        0 => -1.0f32,
+        1 => 0.0,
+        _ => 1.0,
+    };
+    let w: Vec<f32> = (0..EXPERTS * HIDDEN)
+        .map(|_| tri(&mut rng) * 0.125)
+        .collect();
+    let w_bits: Vec<u16> = w.iter().map(|&v| bf16::from_f32(v)).collect();
+    let bias: Vec<f32> = (0..EXPERTS)
+        .map(|e| ((e * 97) % EXPERTS) as f32 / 1024.0)
+        .collect();
+    let mut x = vec![0f32; tokens * HIDDEN];
+    for t in 1..tokens {
+        for v in &mut x[t * HIDDEN..(t + 1) * HIDDEN] {
+            if rng.below(8) == 0 {
+                *v = tri(&mut rng);
+            }
+        }
+    }
+    let router = Matrix::from_vec(EXPERTS, HIDDEN, w.clone());
+    let case = RouterCase {
+        x: x.clone(),
+        w: w_bits,
+        bias: bias.clone(),
+    };
+    for &arch in &su.archs {
+        let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
+        let reference = Reference::load(&su, arch);
+        let (new, _) = run_router(gpu, &ops, &reference, &case, tokens);
+        let mut compared = 0;
+        for t in 0..tokens {
+            let xr = &x[t * HIDDEN..(t + 1) * HIDDEN];
+            // The host's choices, to measure the selection margin.
+            let mut choices: Vec<f32> = (0..EXPERTS)
+                .map(|e| {
+                    let dot: f32 = xr.iter().zip(router.row(e)).map(|(a, b)| a * b).sum();
+                    1.0 / (1.0 + (-dot).exp()) + bias[e]
+                })
+                .collect();
+            choices.sort_by(|a, b| b.total_cmp(a));
+            let (kth, next) = (choices[TOP_K - 1], choices[TOP_K]);
+            if kth != next && kth - next < 1e-5 {
+                continue;
+            }
+            compared += 1;
+            let want = route(&spec, &router, &bias, xr);
+            let ids: Vec<usize> = new.0[t * TOP_K..(t + 1) * TOP_K]
+                .iter()
+                .map(|&e| usize::try_from(e).unwrap())
+                .collect();
+            assert_eq!(ids, want.experts, "{arch:?} token {t}");
+            for (j, &bits) in new.1[t * TOP_K..(t + 1) * TOP_K].iter().enumerate() {
+                let (got, w) = (f32::from_bits(bits), want.weights[j]);
+                assert!(
+                    (got - w).abs() <= 8.0 * f32::EPSILON * w.abs(),
+                    "{arch:?} token {t} slot {j}: {got} vs {w}"
+                );
+            }
+        }
+        assert!(
+            compared * 10 >= tokens * 9,
+            "{arch:?}: only {compared} of {tokens} tokens decided by a clear margin"
+        );
+    }
+}
+
+/// Distinct experts per token, skewed toward low ids so some experts take
+/// more than one 128-row block in the contiguous layout.
+fn topk_ids(rng: &mut Lcg, tokens: usize) -> Vec<i32> {
+    let mut ids = Vec::with_capacity(tokens * TOP_K);
+    for _ in 0..tokens {
+        let mut row: Vec<i32> = Vec::with_capacity(TOP_K);
+        while row.len() < TOP_K {
+            let u = rng.below(EXPERTS as u64);
+            let e = i32::try_from(u * u / EXPERTS as u64).unwrap();
+            if !row.contains(&e) {
+                row.push(e);
+            }
+        }
+        row.sort_unstable();
+        ids.extend(row);
+    }
+    ids
+}
+
+struct Layout {
+    rows: usize,
+    rows4: usize,
+    cap: usize,
+}
+
+impl Layout {
+    fn for_tokens(tokens: usize) -> Layout {
+        if tokens <= CAP {
+            Layout {
+                rows: EXPERTS * CAP,
+                rows4: EXPERTS * CAP,
+                cap: CAP,
+            }
+        } else {
+            let n = tokens * TOP_K;
+            let rows = (n + n.min(EXPERTS) * (BLOCK_M - 1)).div_ceil(BLOCK_M) * BLOCK_M;
+            Layout {
+                rows,
+                rows4: rows.div_ceil(4) * 4,
+                cap: 0,
+            }
+        }
+    }
+
+    fn sf_words(&self, k: usize) -> usize {
+        k / 512 * self.rows4
+    }
+
+    /// `sfa_index` in `engine_ops_common.cuh`.
+    fn sf_index(&self, r: usize, w: usize, k: usize) -> usize {
+        match self.cap {
+            0 => w * self.rows4 + r,
+            cap => (r / cap * (k / 512) + w) * cap + r % cap,
+        }
+    }
+}
+
+/// The executor's placement of `ids`: `row_of` per pair, read back.
+fn place(gpu: &Gpu, ops: &EngineOps, ids: &[i32], tokens: usize, layout: &Layout) -> Vec<i32> {
+    let s = gpu.stream();
+    let dids = s.clone_htod(ids).unwrap();
+    let grouped = s.alloc_zeros::<i32>(layout.rows.max(EXPERTS)).unwrap();
+    let row_of = s.alloc_zeros::<i32>(tokens * TOP_K).unwrap();
+    unsafe {
+        ops.moe_permute(
+            gpu,
+            dptr(&grouped, s),
+            dptr(&row_of, s),
+            dptr(&dids, s),
+            u32_of(tokens),
+            u32_of(TOP_K),
+            u32_of(layout.cap),
+            u32_of(layout.rows),
+        )
+        .unwrap();
+    }
+    let row_of = s.clone_dtoh(&row_of).unwrap();
+    let mut seen = vec![false; layout.rows];
+    for &r in &row_of {
+        let r = usize::try_from(r).unwrap();
+        assert!(
+            r < layout.rows && !seen[r],
+            "row {r} out of range or taken twice"
+        );
+        seen[r] = true;
+    }
+    row_of
+}
+
+const SENTINEL_BYTE: u8 = 0xa5;
+const SENTINEL_WORD: i32 = 0x5a5a_5a5a;
+
+/// Compares the routed rows of two quantized outputs and their scale words,
+/// and checks that the executor's kernel left every other row as it was.
+#[allow(clippy::too_many_arguments)]
+fn compare_rows(
+    what: &str,
+    row_of: &[i32],
+    layout: &Layout,
+    k: usize,
+    new_q: &[u8],
+    new_sf: &[i32],
+    old_q: &[u8],
+    old_sf: &[i32],
+) {
+    let mut routed = vec![false; layout.rows];
+    for &r in row_of {
+        let r = usize::try_from(r).unwrap();
+        routed[r] = true;
+        assert_eq!(
+            new_q[r * k..(r + 1) * k],
+            old_q[r * k..(r + 1) * k],
+            "{what}: row {r} codes"
+        );
+        for w in 0..k / 512 {
+            let i = layout.sf_index(r, w, k);
+            assert_eq!(new_sf[i], old_sf[i], "{what}: row {r} scale word {w}");
+        }
+    }
+    for r in (0..layout.rows).filter(|&r| !routed[r]) {
+        assert!(
+            new_q[r * k..(r + 1) * k]
+                .iter()
+                .all(|&b| b == SENTINEL_BYTE),
+            "{what}: padding row {r} written"
+        );
+        for w in 0..k / 512 {
+            assert_eq!(
+                new_sf[layout.sf_index(r, w, k)],
+                SENTINEL_WORD,
+                "{what}: padding row {r} scale written"
+            );
+        }
+    }
+}
+
+/// A value of magnitude around 2^`e` with a random sign and mantissa.
+fn scaled(rng: &mut Lcg, e: i32) -> f32 {
+    rng.f32() * 2f32.powi(e)
+}
+
+/// The gather quantizes every routed pair's token row into its row exactly as
+/// the reference does (codes and scale words), and touches no other row.
+#[test]
+fn gather_matches_reference_bit_for_bit() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    let k = HIDDEN;
+    for &arch in &su.archs {
+        let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
+        let reference = Reference::load(&su, arch);
+        for &tokens in &TOKENS {
+            let mut rng = Lcg(0x9a7 ^ tokens as u64);
+            let layout = Layout::for_tokens(tokens);
+            let ids = topk_ids(&mut rng, tokens);
+            let row_of = place(gpu, &ops, &ids, tokens, &layout);
+            let mut row_src = vec![-1i32; layout.rows];
+            for (i, &r) in row_of.iter().enumerate() {
+                row_src[usize::try_from(r).unwrap()] = i32::try_from(i / TOP_K).unwrap();
+            }
+            // Per 128-group magnitudes from 2^-140 (subnormal, below the
+            // smallest scale) to 2^127 (past FP8's range at the largest
+            // scale), all-zero groups, and single spikes.
+            let mut x = vec![0f32; tokens * k];
+            for (gi, group) in x.chunks_mut(128).enumerate() {
+                match gi % 9 {
+                    0 => {}
+                    1 => group[usize::try_from(rng.below(128)).unwrap()] = scaled(&mut rng, 10),
+                    _ => {
+                        let e = i32::try_from(rng.below(268)).unwrap() - 140;
+                        for v in group.iter_mut() {
+                            *v = scaled(&mut rng, e);
+                        }
+                    }
+                }
+            }
+            let dx = s.clone_htod(&x).unwrap();
+            let drow_of = s.clone_htod(&row_of).unwrap();
+            let drow_src = s.clone_htod(&row_src).unwrap();
+            let mut outs = Vec::new();
+            for new in [true, false] {
+                let q = s.clone_htod(&vec![SENTINEL_BYTE; layout.rows * k]).unwrap();
+                let sf = s
+                    .clone_htod(&vec![SENTINEL_WORD; layout.sf_words(k)])
+                    .unwrap();
+                unsafe {
+                    if new {
+                        ops.gather_quant_ue8m0(
+                            gpu,
+                            dptr(&q, s),
+                            dptr(&sf, s),
+                            dptr(&dx, s),
+                            dptr(&drow_of, s),
+                            u32_of(tokens),
+                            u32_of(TOP_K),
+                            u32_of(layout.rows),
+                            u32_of(k),
+                            u32_of(layout.rows4),
+                            u32_of(layout.cap),
+                        )
+                        .unwrap();
+                    } else {
+                        eidola_engine_cuda::launch!(
+                            gpu,
+                            reference.gather,
+                            [u32_of(layout.rows), u32_of(k / 512), 1],
+                            dptr(&q, s),
+                            dptr(&sf, s),
+                            dptr(&dx, s),
+                            dptr(&drow_src, s),
+                            u32_of(k),
+                            u32_of(layout.rows4),
+                            u32_of(layout.cap)
+                        )
+                        .unwrap();
+                    }
+                }
+                outs.push((s.clone_dtoh(&q).unwrap(), s.clone_dtoh(&sf).unwrap()));
+            }
+            compare_rows(
+                &format!("gather {arch:?} {tokens} tokens"),
+                &row_of,
+                &layout,
+                k,
+                &outs[0].0,
+                &outs[0].1,
+                &outs[1].0,
+                &outs[1].1,
+            );
+        }
+    }
+}
+
+/// SwiGLU + quantization of every routed row exactly as the reference does,
+/// touching no other row.
+#[test]
+fn swiglu_matches_reference_bit_for_bit() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    for &arch in &su.archs {
+        let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
+        let reference = Reference::load(&su, arch);
+        for &tokens in &TOKENS {
+            let mut rng = Lcg(0x5719 ^ tokens as u64);
+            let layout = Layout::for_tokens(tokens);
+            let ids = topk_ids(&mut rng, tokens);
+            let row_of = place(gpu, &ops, &ids, tokens, &layout);
+            // Gate/up rows of the grouped GEMM's output: magnitudes from 2^-8
+            // to 2^8 per row (exp overflows and underflows in SiLU), plus a
+            // zero row and BF16 infinities and NaN.
+            let mut gu = vec![0u16; layout.rows * 2 * INTER];
+            for (i, &r) in row_of.iter().enumerate() {
+                let row = &mut gu[usize::try_from(r).unwrap() * 2 * INTER..][..2 * INTER];
+                if i % 11 == 3 {
+                    continue;
+                }
+                let e = i32::try_from(rng.below(17)).unwrap() - 8;
+                for v in row.iter_mut() {
+                    *v = bf16::from_f32(scaled(&mut rng, e));
+                }
+                if i % 13 == 5 {
+                    row[7] = bf16::from_f32(f32::INFINITY);
+                    row[INTER + 300] = bf16::from_f32(f32::NEG_INFINITY);
+                    row[1000] = bf16::from_f32(f32::NAN);
+                }
+            }
+            let dgu = s.clone_htod(&gu).unwrap();
+            let drow_of = s.clone_htod(&row_of).unwrap();
+            let mut outs = Vec::new();
+            for new in [true, false] {
+                let q = s
+                    .clone_htod(&vec![SENTINEL_BYTE; layout.rows * INTER])
+                    .unwrap();
+                let sf = s
+                    .clone_htod(&vec![SENTINEL_WORD; layout.sf_words(INTER)])
+                    .unwrap();
+                unsafe {
+                    if new {
+                        ops.swiglu_quant_ue8m0(
+                            gpu,
+                            dptr(&q, s),
+                            dptr(&sf, s),
+                            dptr(&dgu, s),
+                            dptr(&drow_of, s),
+                            u32_of(tokens),
+                            u32_of(TOP_K),
+                            u32_of(layout.rows),
+                            u32_of(INTER),
+                            u32_of(layout.rows4),
+                            u32_of(layout.cap),
+                        )
+                        .unwrap();
+                    } else {
+                        eidola_engine_cuda::launch!(
+                            gpu,
+                            reference.swiglu,
+                            [u32_of(layout.rows), u32_of(INTER / 512), 1],
+                            dptr(&q, s),
+                            dptr(&sf, s),
+                            dptr(&dgu, s),
+                            u32_of(INTER),
+                            u32_of(layout.rows4),
+                            u32_of(layout.cap)
+                        )
+                        .unwrap();
+                    }
+                }
+                outs.push((s.clone_dtoh(&q).unwrap(), s.clone_dtoh(&sf).unwrap()));
+            }
+            compare_rows(
+                &format!("swiglu {arch:?} {tokens} tokens"),
+                &row_of,
+                &layout,
+                INTER,
+                &outs[0].0,
+                &outs[0].1,
+                &outs[1].0,
+                &outs[1].1,
+            );
+        }
+    }
+}
