@@ -125,14 +125,14 @@ All required; an empty value counts as missing. Everything but the secret token 
 | `EIDOLA_ENGINE_WEIGHTS_DIR` | Weights and chat artifacts. |
 | `EIDOLA_ENGINE_WEIGHTS_SHA256` | The expected weights hash (64 hex digits). |
 | `EIDOLA_ENGINE_WEIGHTS_STORAGE` | `verified-readonly` (production: read-only, kernel-verified mount; checked) or `dev-writable` (reported in info and health). |
-| `GATEWAY_TOKEN` / `GATEWAY_TOKEN_HASH` | The gateway's bearer (secret) and its Argon2id hash (measured; make one with `cargo run -p hash-secret`). |
+| `GATEWAY_TOKEN` / `GATEWAY_TOKEN_HASH` | The gateway's bearer (secret) and its Argon2id hash (measured; make one with `cargo run -p hash-secret`; parameters outside that tool's profile are refused before anything is hashed). |
 | `EIDOLA_ENGINE_EXECUTOR` | `cpu` (or `cuda` in a `cuda` build). |
 | `EIDOLA_ENGINE_BIND_ADDR` | `host:port`. |
 | `EIDOLA_ENGINE_KV_BLOCK_SIZE`, `EIDOLA_ENGINE_KV_BLOCKS` | KV geometry (blocks per group, including the null block). |
 | `EIDOLA_ENGINE_MAX_MODEL_LEN` | Longest sequence; ≤ `max_position_embeddings`. |
 | `EIDOLA_ENGINE_MAX_SEQS`, `EIDOLA_ENGINE_MAX_BATCHED_TOKENS`, `EIDOLA_ENGINE_MAX_PREFILL_CHUNK` | Scheduler step limits. |
 | `EIDOLA_ENGINE_DRAFT_TOKENS` | Speculative width `k` (0 disables); ≤ the model's MTP layers. |
-| `EIDOLA_ENGINE_MAX_REQUESTS` | Admission bound (each slot may hold a request body of up to `eidola_common::engine_protocol::MAX_REQUEST_BODY_BYTES`). |
+| `EIDOLA_ENGINE_MAX_REQUESTS` | Admission bound (each slot may hold a request body of up to `eidola_common::engine_protocol::MAX_REQUEST_BODY_BYTES`; the host memory a value commits the node to, read and admission pools together, is `eidola_common::engine_deployment::host_memory_bytes`, which a pinned deployment's VM must hold). |
 | `EIDOLA_ENGINE_PREFIX_CACHE` | `true` / `false`. |
 | `EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS`, `EIDOLA_ENGINE_CACHE_MAX_AGE_SECS` | Prefix-cache retention bounds (idle ≤ max age). With `EIDOLA_ENGINE_PREFIX_CACHE`, the one source of the retention a gateway publishes for the model: its pin records the deployment config's values and its build holds them equal. |
 
