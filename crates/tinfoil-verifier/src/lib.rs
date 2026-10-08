@@ -80,7 +80,7 @@ pub mod tdx;
 pub use bundle::Platform;
 pub use error::Error;
 pub use measurement::{
-    AllowedMeasurement, EnclaveMeasurement, MatchedMeasurement, PlatformMeasurement,
+    AllowedMeasurement, EnclaveMeasurement, MatchedMeasurement, PckFlag, PlatformMeasurement,
     TdxLaunchMeasurement, TdxMeasurement, TdxPin, TdxPolicy,
 };
 pub use sevsnp::{SevSnpObserver, SevSnpTcbObservation, SevSnpTcbPolicy, SevSnpTcbSvns};

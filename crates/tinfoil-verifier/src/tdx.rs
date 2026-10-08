@@ -17,8 +17,10 @@
 //!    [`CompiledTdxPin`]: MRTD and MRCONFIGID (the launch identity), RTMR0–3
 //!    all zero, MROWNER/MROWNERCONFIG zero, and the machine policy (MR_SEAM
 //!    allowlist, exact TD_ATTRIBUTES and XFAM, TEE_TCB_SVN floor, QE vendor,
-//!    collateral evaluation-data floor, optional FMSPC allowlist), with every
-//!    Intel TCB status required to be `UpToDate`.
+//!    collateral evaluation-data floor, optional FMSPC allowlist, and the
+//!    PCK certificate's DynamicPlatform / CachedKeys / SMTEnabled flags, each
+//!    stated explicitly by the pin), with every Intel TCB status required to
+//!    be `UpToDate`.
 //!
 //! `REPORT_DATA` binding is not here: the handshake verifier compares the
 //! quote's signed `REPORT_DATA` with the envelope's recomputation through the
@@ -27,13 +29,13 @@
 use dcap_qvl::configs::RustCryptoConfig;
 use dcap_qvl::quote::{Quote, Report, TDReport10};
 use dcap_qvl::verify::QuoteVerifier;
-use dcap_qvl::{QuoteCollateralV3, QuotePolicy, TcbStatus};
+use dcap_qvl::{PckCertFlag, QuoteCollateralV3, QuotePolicy, TcbStatus};
 use der::Decode as _;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::Error;
-use crate::measurement::CompiledTdxPin;
+use crate::measurement::{CompiledTdxPin, PckFlag};
 
 /// Intel SGX Provisioning Certification Root CA (DER), the root of every
 /// PCK, TCB-signing and CRL chain Intel issues for TDX. Byte-identical to
@@ -115,6 +117,10 @@ pub(crate) struct AuthenticatedQuote {
     pub report: TDReport10,
     /// FMSPC from the Intel-signed PCK certificate.
     pub fmspc: [u8; 6],
+    /// Platform flags from the Intel-signed PCK certificate.
+    pub dynamic_platform: PckFlag,
+    pub cached_keys: PckFlag,
+    pub smt_enabled: PckFlag,
     /// Merged platform/QE/TDX-module status.
     pub tcb_status: TcbStatus,
     pub platform_tcb_status: TcbStatus,
@@ -154,11 +160,22 @@ pub(crate) fn authenticate(
         qe_vendor_id: claims.header.qe_vendor_id,
         report,
         fmspc: claims.platform.pck.fmspc,
+        dynamic_platform: pck_flag(claims.platform.pck.dynamic_platform),
+        cached_keys: pck_flag(claims.platform.pck.cached_keys),
+        smt_enabled: pck_flag(claims.platform.pck.smt_enabled),
         tcb_status: claims.tcb.status,
         platform_tcb_status: claims.platform.tcb_level.tcb_status,
         qe_tcb_status: claims.qe.tcb_level.tcb_status,
         tcb_evaluation_data_number: claims.tcb.eval_data_number,
     })
+}
+
+fn pck_flag(flag: PckCertFlag) -> PckFlag {
+    match flag {
+        PckCertFlag::True => PckFlag::True,
+        PckCertFlag::False => PckFlag::False,
+        PckCertFlag::Undefined => PckFlag::Undefined,
+    }
 }
 
 /// Structural checks the quote library parses past but never constrains:
@@ -444,6 +461,21 @@ pub(crate) fn appraise(quote: &AuthenticatedQuote, pin: &CompiledTdxPin) -> Resu
             hex::encode(quote.fmspc)
         ));
     }
+    for (label, observed, expected) in [
+        (
+            "DynamicPlatform",
+            quote.dynamic_platform,
+            pin.dynamic_platform,
+        ),
+        ("CachedKeys", quote.cached_keys, pin.cached_keys),
+        ("SMTEnabled", quote.smt_enabled, pin.smt_enabled),
+    ] {
+        if observed != expected {
+            return violation(format!(
+                "PCK {label} flag is {observed:?}, pinned {expected:?}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -540,6 +572,9 @@ pub(crate) mod tests {
                 report_data: [0; 64],
             },
             fmspc: [0xb0, 0xc0, 0x6f, 0, 0, 0],
+            dynamic_platform: PckFlag::True,
+            cached_keys: PckFlag::True,
+            smt_enabled: PckFlag::True,
             tcb_status: TcbStatus::UpToDate,
             platform_tcb_status: TcbStatus::UpToDate,
             qe_tcb_status: TcbStatus::UpToDate,
@@ -622,6 +657,33 @@ pub(crate) mod tests {
             (
                 "FMSPC",
                 Box::new(|_, p| p.fmspc = Some(vec![[0x90, 0xc0, 0x6f, 0, 0, 0]])),
+            ),
+            // Each platform flag, both directions and the absent case: the
+            // pin states the value, so a host that differs either way is
+            // refused.
+            (
+                "DynamicPlatform",
+                Box::new(|q, _| q.dynamic_platform = PckFlag::False),
+            ),
+            (
+                "DynamicPlatform",
+                Box::new(|_, p| p.dynamic_platform = PckFlag::False),
+            ),
+            (
+                "CachedKeys",
+                Box::new(|q, _| q.cached_keys = PckFlag::Undefined),
+            ),
+            (
+                "CachedKeys",
+                Box::new(|_, p| p.cached_keys = PckFlag::False),
+            ),
+            (
+                "SMTEnabled",
+                Box::new(|q, _| q.smt_enabled = PckFlag::False),
+            ),
+            (
+                "SMTEnabled",
+                Box::new(|_, p| p.smt_enabled = PckFlag::False),
             ),
         ];
         for (needle, mutate) in cases {
@@ -709,6 +771,11 @@ pub(crate) mod tests {
         assert_eq!(hex::encode(quote.fmspc), "b0c06f000000");
         assert_eq!(quote.tcb_status, TcbStatus::UpToDate);
         assert_eq!(quote.tcb_evaluation_data_number, 17);
+        // A multi-package (Platform CA) host with SMT on, as cloud TDX
+        // hosts commonly are: all three flags asserted.
+        assert_eq!(quote.dynamic_platform, PckFlag::True);
+        assert_eq!(quote.cached_keys, PckFlag::True);
+        assert_eq!(quote.smt_enabled, PckFlag::True);
         assert_eq!(
             hex::encode(quote.qe_vendor_id),
             "939a7233f79c4ca9940a0db3957f0607"
@@ -738,6 +805,9 @@ pub(crate) mod tests {
             minimum_tcb_evaluation_data_number: quote.tcb_evaluation_data_number,
             qe_vendor_id: quote.qe_vendor_id,
             fmspc: Some(vec![quote.fmspc]),
+            dynamic_platform: quote.dynamic_platform,
+            cached_keys: quote.cached_keys,
+            smt_enabled: quote.smt_enabled,
         };
         let err = appraise(&quote, &pin).unwrap_err().to_string();
         assert!(err.contains("RTMR0"), "{err}");

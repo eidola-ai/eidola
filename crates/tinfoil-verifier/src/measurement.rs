@@ -143,6 +143,32 @@ pub struct TdxPolicy {
     /// PCK certificate. `None` accepts any FMSPC Intel's collateral covers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmspc: Option<Vec<String>>,
+    /// Expected `DynamicPlatform` flag of the Intel-signed PCK certificate:
+    /// whether the platform may add or replace CPU packages after its keys
+    /// were registered. Required: there is no default.
+    pub dynamic_platform: PckFlag,
+    /// Expected `CachedKeys` flag: whether Intel's registration service
+    /// keeps the platform's root keys, so a package replacement can recover
+    /// them without the original packages present. Required.
+    pub cached_keys: PckFlag,
+    /// Expected `SMTEnabled` flag: whether simultaneous multithreading is
+    /// on, sharing a core's microarchitectural state between a TD and
+    /// whatever runs on the sibling thread. Required.
+    pub smt_enabled: PckFlag,
+}
+
+/// The expected value of a PCK certificate platform flag. Each flag must be
+/// stated by the pin author; a quote whose flag differs is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PckFlag {
+    /// The certificate asserts the flag.
+    True,
+    /// The certificate denies the flag.
+    False,
+    /// The certificate omits the flag, as Processor-CA certificates (single
+    /// package platforms) do.
+    Undefined,
 }
 
 impl AllowedMeasurement {
@@ -250,6 +276,9 @@ pub(crate) struct CompiledTdxPin {
     pub minimum_tcb_evaluation_data_number: u32,
     pub qe_vendor_id: [u8; 16],
     pub fmspc: Option<Vec<[u8; 6]>>,
+    pub dynamic_platform: PckFlag,
+    pub cached_keys: PckFlag,
+    pub smt_enabled: PckFlag,
 }
 
 /// TD_ATTRIBUTES bit 0: the TD is debuggable by the host.
@@ -324,6 +353,9 @@ fn compile_tdx(pin: &TdxPin, index: usize) -> Result<CompiledTdxPin, Error> {
         minimum_tcb_evaluation_data_number: policy.minimum_tcb_evaluation_data_number,
         qe_vendor_id: pin_hex(&policy.qe_vendor_id, index, "tdx.policy.qe_vendor_id")?,
         fmspc,
+        dynamic_platform: policy.dynamic_platform,
+        cached_keys: policy.cached_keys,
+        smt_enabled: policy.smt_enabled,
     })
 }
 
@@ -356,6 +388,9 @@ pub(crate) mod tests {
                 minimum_tcb_evaluation_data_number: 17,
                 qe_vendor_id: "939a7233f79c4ca9940a0db3957f0607".to_string(),
                 fmspc: None,
+                dynamic_platform: PckFlag::True,
+                cached_keys: PckFlag::True,
+                smt_enabled: PckFlag::True,
             },
         }
     }
@@ -444,8 +479,22 @@ pub(crate) mod tests {
         let back: AllowedMeasurement = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(back, pin);
 
-        let mut unknown = json;
+        assert_eq!(json["platform"]["tdx"]["policy"]["smt_enabled"], "true");
+        let mut unknown = json.clone();
         unknown["platform"]["tdx"]["rtmr1"] = serde_json::Value::String("00".repeat(48));
         assert!(serde_json::from_value::<AllowedMeasurement>(unknown).is_err());
+
+        // Each platform flag is required: omitting one is not a default.
+        for flag in ["dynamic_platform", "cached_keys", "smt_enabled"] {
+            let mut missing = json.clone();
+            missing["platform"]["tdx"]["policy"]
+                .as_object_mut()
+                .unwrap()
+                .remove(flag);
+            let err = serde_json::from_value::<AllowedMeasurement>(missing)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(flag), "{flag}: {err}");
+        }
     }
 }

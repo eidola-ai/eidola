@@ -32,7 +32,38 @@ Parsing and challenge checking alone authenticate nothing. Only the signed hardw
 Only the IGVM launch model (Tinfoil CVM v0.15+) is accepted; the legacy kernel-cmdline RTMR1/RTMR2 model is accepted nowhere. `tdx.rs` has two steps that cannot be applied apart:
 
 1. **`authenticate`** — `dcap-qvl` (`=0.6.6`, RustCrypto backend, `default-features = false`) verifies the v4 quote offline at the handshake's wall-clock time: PCK chain (the one embedded in the quote, certification data type 5) to the built-in Intel SGX root with the PCK and root CA CRLs (`UnknownStatusPolicy::Deny`), TCB Info and QE Identity signatures and issue/next-update windows, QE report signature and attestation-key binding, quote signature, and platform/QE/TDX-module TCB matching. Around it: only v4 TDX quotes, reserved header bytes zero, nothing but zero padding after the signature data, and each CRL's `thisUpdate <= now < nextUpdate` (the library checks only `nextUpdate`). Collateral is `intel-pcs/v1`: captured Intel PCS responses (`url`, `headers`, `body_base64`). Each response is classified by exact Intel host + path into one of four resources (PCK CRL, TCB Info, QE Identity, root CA CRL); each must appear exactly once, and anything else is refused. Issuer chains come from the percent-encoded headers. The `tcbInfo` / `enclaveIdentity` members are taken as the exact served bytes (`serde_json` `raw_value`), never re-serialized, because Intel signs those bytes. The URL only classifies; nothing in it is trusted.
-2. **`appraise`** against the selected `CompiledTdxPin`: MRTD and MRCONFIGID (selection), RTMR0–3 all zero, MROWNER/MROWNERCONFIG zero, exact TD_ATTRIBUTES and XFAM, MR_SEAM in the allowlist, TEE_TCB_SVN component-wise at or above the floor, QE vendor id, platform/QE/merged TCB status all `UpToDate` (matching Tinfoil's own verifier), collateral `tcbEvaluationDataNumber` at or above the floor, FMSPC in the allowlist when one is pinned.
+2. **`appraise`** against the selected `CompiledTdxPin`: MRTD and MRCONFIGID (selection), RTMR0–3 all zero, MROWNER/MROWNERCONFIG zero, exact TD_ATTRIBUTES and XFAM, MR_SEAM in the allowlist, TEE_TCB_SVN component-wise at or above the floor, QE vendor id, platform/QE/merged TCB status all `UpToDate` (matching Tinfoil's own verifier), collateral `tcbEvaluationDataNumber` at or above the floor, FMSPC in the allowlist when one is pinned, and the three PCK platform flags equal to the pin's.
+
+**PCK platform flags are required, explicit pin fields** (`TdxPolicy::{dynamic_platform, cached_keys, smt_enabled}`, each `PckFlag::{True, False, Undefined}`, no serde default). They come from the Intel-signed PCK certificate, and `Undefined` is what a single-package (Processor CA) platform's certificate carries. The pin author states each one, so accepting a host with a weaker property is a visible decision and never an omission. A quote whose flag differs either way is refused.
+
+- `DynamicPlatform`: the platform can add or replace CPU packages after its platform keys were registered with Intel. A host operator could then swap a package without that change being tied to a new registration event visible to us.
+- `CachedKeys`: Intel's registration service keeps the platform root keys, so a replaced package can recover them without the original packages present. Key custody then extends to Intel's registration backend.
+- `SMTEnabled`: hyperthreading is on. A TD's core shares microarchitectural state with whatever the host schedules on the sibling thread, which is the precondition for most cross-thread side channels. These are outside the measurement — see `docs/threat-model.md`.
+
+dcap-qvl's strict policy refuses `True` for all three. The sample real host (`tests/fixtures/dcap-qvl/`) asserts all three, as multi-package cloud TDX hosts commonly do. That is why the verifier asks the pin rather than defaulting to strict: strict would refuse such hosts outright, and lenient would accept them silently.
+
+**Every other claim dcap-qvl returns is enforced or deliberately left out.** `verify_with_policy` runs with `QuotePolicy::claims_only`, so nothing on the claims is appraised unless listed here:
+
+| Claim | Disposition |
+|---|---|
+| `header.version`, `tee_type`, reserved `qe_svn`/`pce_svn`, `attestation_key_type` | Enforced (`parse_quote`; key type by dcap-qvl) |
+| `header.qe_vendor_id` | Pinned |
+| `header.user_data` | Not appraised: QE-defined bytes outside the TD's measured state |
+| `tcb.status`, platform and QE `tcb_level.tcb_status` | `UpToDate` required (Revoked is refused by dcap-qvl regardless) |
+| `tcb.advisory_ids`, level advisory lists | Not appraised: `UpToDate` is Intel's statement that the level carries every mitigation it requires. An advisory denylist would be additive. |
+| `tcb.eval_data_number`, `qe.tcb_eval_data_number` | Floor pinned (on the lower of the two) |
+| `platform.tcb_date_tag`, QE `tcb_date`, grace periods | Not applicable: they only matter for `OutOfDate` statuses, which are refused |
+| `pck.fmspc` | Optional allowlist |
+| `pck.dynamic_platform`, `cached_keys`, `smt_enabled` | Pinned, required |
+| `pck.cpu_svn`, `pce_svn` | Enforced through TCB-level matching, which determines the status |
+| `pck.ppid`, `platform_instance_id` | Not pinned: per-machine identity is a documented gap (`docs/gaps.md`) |
+| `pck.pce_id`, `platform_provider_id` | Not appraised: identifiers, not security state (`platform_provider_id` is never populated) |
+| `pck.sgx_type` | Not appraised: it describes SGX enclave-page protection for the quoting enclave, a platform-family property the FMSPC allowlist bounds. TD memory protection is TDX's own. |
+| `platform.root_key_id` | Equal to the pinned root by construction (chain verification) |
+| `pck_crl_num`, `root_ca_crl_num` | Not appraised: no monotonic CRL state is kept, so replay within the validity window remains (`docs/gaps.md`) |
+| `earliest_issue_date` … `qe_iden_earliest_expiration_date` | Enforced per source: dcap-qvl checks every certificate's, TCB Info's and QE Identity's window at `now`; this crate adds both CRLs' `thisUpdate` |
+| `qe.report` | Enforced by dcap-qvl against the signed QE Identity (MRSIGNER, ISVPRODID, attributes, MISCSELECT, ISVSVN) |
+| `report` (TD report body) | Appraised field by field above; `mr_signer_seam`/`seam_attributes` by dcap-qvl against the TCB Info module identity |
 
 Then the shared `REPORT_DATA` comparison and the device requirement. The Intel root is `src/intel_sgx_root_ca.der`, pinned by SHA-256 in `tdx::tests::pinned_intel_root_is_the_published_certificate`; production has no override (the struct field exists only so this module's tests can construct a checker). `dcap-qvl`'s `std` feature is off on purpose: it enables `serde_json/preserve_order`, which would change `serde_json::Value` key order in every binary linking this crate.
 
