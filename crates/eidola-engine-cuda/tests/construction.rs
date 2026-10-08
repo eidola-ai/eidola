@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use eidola_engine::spec::Bucket;
 use eidola_engine_cuda::{
-    CudaError, CudaExecutor, CudaExecutorConfig, Gpu, ImageArch, KernelDir, KvBlocks,
+    CudaError, CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, ImageArch, KernelDir, KvBlocks,
 };
 use eidola_engine_model::safetensors::WeightSet;
 
@@ -43,6 +43,7 @@ fn config() -> CudaExecutorConfig {
         }],
         sampleable_vocab_size: 151_675,
         image: None,
+        graphs: CudaGraphs::Off,
     }
 }
 

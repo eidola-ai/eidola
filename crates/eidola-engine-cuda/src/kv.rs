@@ -1,12 +1,19 @@
 //! Device KV memory: one pool per KV group, the per-slot block tables, per-slot
 //! model state, and the seam's maintenance operations on them.
 //!
-//! A group's pool is `num_blocks` blocks; block `b` holds, for each of the
+//! A group's pool is `num_blocks` blocks plus one pad block (id `num_blocks`,
+//! [`GroupGeometry::pad_block`]); block `b` holds, for each of the
 //! group's layers in order, K as `[block_size, kv_heads, head_dim_qk]` then V as
 //! `[block_size, kv_heads, head_dim_v]`, BF16, contiguous. A block is therefore
 //! one contiguous byte range across every layer: `Zero` is one memset and `Copy`
 //! one device-to-device copy. Paged attention addresses a layer's K (or V) with
 //! page stride = the whole block and the layer's offset inside it.
+//!
+//! The pad block is outside every id the seam may name (`1..num_blocks`):
+//! no table maps it and no maintenance reaches it. A replayed decode graph
+//! points its padding rows' KV writes and attention reads at it, so padding
+//! never touches a block the host allocates, shares or caches; it holds
+//! only what padding rows wrote (functions of the constant padding token).
 //!
 //! Block tables live on the device as `[slot][group][index]` `i32` rows (the
 //! attention kernels' index type) and change only through table updates and
@@ -65,13 +72,27 @@ impl GroupGeometry {
                 "KV geometry {self:?}: {block} elements per block, the page stride is 32-bit"
             )));
         }
-        m(m(block, self.num_blocks)?, 2)?;
+        block
+            .checked_mul(self.pool_blocks())
+            .and_then(|e| e.checked_mul(2))
+            .ok_or_else(overflow)?;
         if self.num_blocks < 2 || self.num_blocks > i32::MAX as u32 {
             return Err(CudaError::new(format!(
                 "KV geometry {self:?}: blocks must be 2..=i32::MAX (the null block and one more; i32 tables)"
             )));
         }
         Ok(())
+    }
+
+    /// The pad block's id: one past the last id the seam may name, so it
+    /// still fits the `i32` the attention kernel indexes pages with.
+    pub fn pad_block(&self) -> u32 {
+        self.num_blocks
+    }
+
+    /// Blocks the pool holds: the seam's `num_blocks` and the pad block.
+    pub fn pool_blocks(&self) -> usize {
+        self.num_blocks as usize + 1
     }
 
     /// Elements of one layer's K in one block.
@@ -352,7 +373,7 @@ impl KvStore {
             .ok_or_else(overflow)?;
         let state_len = slots.checked_mul(state_width).ok_or_else(overflow)?;
         for g in &geometry {
-            pools.push(s.alloc_zeros::<u16>(g.block_elems() * g.num_blocks as usize)?);
+            pools.push(s.alloc_zeros::<u16>(g.block_elems() * g.pool_blocks())?);
         }
         Ok(KvStore {
             mirror: TableMirror::new(&geometry, slots, mb),

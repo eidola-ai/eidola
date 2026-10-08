@@ -21,7 +21,7 @@ use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::secret::EngineSalt;
 use eidola_engine::spec::Bucket;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, KvBlocks};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, KvBlocks};
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
 
@@ -73,6 +73,14 @@ fn env() -> Option<&'static Env> {
         })
     })
     .as_ref()
+}
+
+/// `EIDOLA_ENGINE_CUDA_GRAPHS` (`on` / `off`, off when unset): the whole
+/// suite runs with decode graphs replaying when it is `on`.
+fn graphs_from_env() -> CudaGraphs {
+    std::env::var("EIDOLA_ENGINE_CUDA_GRAPHS").map_or(CudaGraphs::Off, |v| {
+        CudaGraphs::parse(&v).unwrap_or_else(|e| panic!("EIDOLA_ENGINE_CUDA_GRAPHS: {e}"))
+    })
 }
 
 fn sched(chunk: u32) -> SchedulerConfig {
@@ -142,6 +150,7 @@ impl Harness {
             ],
             sampleable_vocab_size: SAMPLEABLE,
             image: None,
+            graphs: graphs_from_env(),
         };
         let ex = CudaExecutor::new(su.gpu, &su.dir, env.store.clone(), Some(&KEEP), cfg).unwrap();
         Some(Harness {

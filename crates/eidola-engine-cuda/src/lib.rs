@@ -17,6 +17,7 @@ pub mod device;
 pub mod engine_ops;
 pub mod executor;
 pub mod gemm;
+pub mod graph;
 pub mod kv;
 pub mod launch;
 pub mod model;
@@ -31,7 +32,8 @@ pub mod weights;
 use std::fmt;
 
 pub use device::{DeviceInfo, Gpu, ImageArch};
-pub use executor::{CudaExecutor, CudaExecutorConfig, KvBlocks};
+pub use executor::{CudaExecutor, CudaExecutorConfig, DecodeStats, KvBlocks};
+pub use graph::{CudaGraphs, DecodePath};
 pub use module::{ImageSource, Kernel, KernelDir, KernelModule};
 pub use support::{Unsupported, check_device, check_supported};
 
