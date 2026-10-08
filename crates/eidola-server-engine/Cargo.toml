@@ -8,9 +8,10 @@ publish.workspace = true
 license = "AGPL-3.0-only"
 
 [features]
-# The CUDA executor's seam: `EIDOLA_ENGINE_EXECUTOR=cuda` parses only in a build with
-# this feature, and the executor itself is not implemented yet (boot refuses it).
-cuda = []
+# The CUDA executor (`eidola-engine-cuda`): `EIDOLA_ENGINE_EXECUTOR=cuda` parses only in
+# a build with this feature. The driver is loaded at run time, so the feature builds on
+# a machine without CUDA.
+cuda = ["dep:eidola-engine-cuda"]
 
 [[bin]]
 name = "eidola-server-engine"
@@ -20,6 +21,7 @@ path = "src/main.rs"
 eidola-engine = { path = "../eidola-engine" }
 eidola-engine-chat = { path = "../eidola-engine-chat" }
 eidola-engine-cpu = { path = "../eidola-engine-cpu" }
+eidola-engine-cuda = { path = "../eidola-engine-cuda", optional = true }
 eidola-engine-model = { path = "../eidola-engine-model" }
 
 argon2 = "0.6"

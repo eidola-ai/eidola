@@ -2,7 +2,9 @@
 //!
 //! Every value here would sit in the node's measured configuration, so none has a
 //! default: a missing or malformed variable refuses the boot rather than letting code
-//! choose a value the measurement does not show. The one secret (the gateway token) is
+//! choose a value the measurement does not show. What the node derives (the CUDA
+//! executor's per-group KV block counts) it derives from measured values alone, by a
+//! fixed rule, never from the device it finds. The one secret (the gateway token) is
 //! delivered as an environment variable alongside its Argon2id hash, which is the
 //! measured half (see [`crate::auth`]).
 
@@ -32,8 +34,14 @@ pub mod env {
     pub const BIND_ADDR: &str = "EIDOLA_ENGINE_BIND_ADDR";
     /// Positions per KV block.
     pub const KV_BLOCK_SIZE: &str = "EIDOLA_ENGINE_KV_BLOCK_SIZE";
-    /// Physical KV blocks per group, including the reserved null block.
+    /// Physical KV blocks per group, including the reserved null block (`cpu` only).
     pub const KV_BLOCKS: &str = "EIDOLA_ENGINE_KV_BLOCKS";
+    /// Device memory for the KV pools, in bytes; the per-group block counts are derived
+    /// from it (`cuda` only).
+    pub const KV_DEVICE_BYTES: &str = "EIDOLA_ENGINE_KV_DEVICE_BYTES";
+    /// The kernel build output the CUDA executor loads its images from; every image is
+    /// checked against the compiled-in kernel manifest (`cuda` only).
+    pub const KERNELS_DIR: &str = "EIDOLA_ENGINE_KERNELS_DIR";
     /// Longest sequence (prompt plus completion), in tokens.
     pub const MAX_MODEL_LEN: &str = "EIDOLA_ENGINE_MAX_MODEL_LEN";
     /// Sequences per step (and per-sequence state slots).
@@ -59,10 +67,39 @@ pub mod env {
 pub enum ExecutorKind {
     /// The f32 reference executor (`eidola-engine-cpu`).
     Cpu,
-    /// The CUDA executor. Parses only in a build with the `cuda` feature; the executor
-    /// itself lands separately, and until then boot refuses it.
+    /// The CUDA executor (`eidola-engine-cuda`). Parses only in a build with the `cuda`
+    /// feature.
     #[cfg(feature = "cuda")]
     Cuda,
+}
+
+/// The executor and the settings only it takes. A setting of the other executor is
+/// refused rather than ignored, so the measured configuration never shows a value that
+/// does nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorConfig {
+    Cpu {
+        /// Physical blocks per KV group, including the null block.
+        kv_blocks: u32,
+    },
+    #[cfg(feature = "cuda")]
+    Cuda {
+        /// The kernel build output (images checked against the compiled-in manifest).
+        kernels_dir: PathBuf,
+        /// Device memory for the KV pools; the node derives the per-group block counts
+        /// from it (`crate::cuda::derive_kv_blocks`).
+        kv_device_bytes: u64,
+    },
+}
+
+impl ExecutorConfig {
+    pub fn kind(&self) -> ExecutorKind {
+        match self {
+            ExecutorConfig::Cpu { .. } => ExecutorKind::Cpu,
+            #[cfg(feature = "cuda")]
+            ExecutorConfig::Cuda { .. } => ExecutorKind::Cuda,
+        }
+    }
 }
 
 impl ExecutorKind {
@@ -122,7 +159,6 @@ impl WeightsStorage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sizing {
     pub kv_block_size: u32,
-    pub kv_blocks: u32,
     pub max_model_len: u32,
     pub max_seqs: u32,
     pub max_batched_tokens: u32,
@@ -148,7 +184,7 @@ pub struct Config {
     pub expected_weights_sha256: String,
     pub weights_storage: WeightsStorage,
     pub gateway_token: GatewayToken,
-    pub executor: ExecutorKind,
+    pub executor: ExecutorConfig,
     pub bind_addr: SocketAddr,
     pub sizing: Sizing,
     pub cache: CacheConfig,
@@ -234,8 +270,48 @@ impl Config {
         let token_hash = get(env::GATEWAY_TOKEN_HASH)?;
         let gateway_token = GatewayToken::verify(token, &token_hash).map_err(ConfigError)?;
 
-        let executor = ExecutorKind::parse(&get(env::EXECUTOR)?)
+        let kind = ExecutorKind::parse(&get(env::EXECUTOR)?)
             .map_err(|e| ConfigError(format!("{}: {e}", env::EXECUTOR)))?;
+        // Each executor's own settings are required with it and refused without it.
+        let refuse_unless = |name: &str, executor: &str| -> Result<(), ConfigError> {
+            match lookup(name) {
+                Some(v) if !v.is_empty() => Err(ConfigError(format!(
+                    "{name} applies only to the {executor} executor"
+                ))),
+                _ => Ok(()),
+            }
+        };
+        let executor = match kind {
+            ExecutorKind::Cpu => {
+                refuse_unless(env::KV_DEVICE_BYTES, "cuda")?;
+                refuse_unless(env::KERNELS_DIR, "cuda")?;
+                let kv_blocks = positive(env::KV_BLOCKS)?;
+                if kv_blocks < 2 {
+                    return Err(ConfigError(format!(
+                        "{} must be at least 2 (block 0 is reserved)",
+                        env::KV_BLOCKS
+                    )));
+                }
+                ExecutorConfig::Cpu { kv_blocks }
+            }
+            #[cfg(feature = "cuda")]
+            ExecutorKind::Cuda => {
+                refuse_unless(env::KV_BLOCKS, "cpu")?;
+                let kv_device_bytes = match get(env::KV_DEVICE_BYTES)?.parse::<u64>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        return Err(ConfigError(format!(
+                            "{} must be a positive number of bytes",
+                            env::KV_DEVICE_BYTES
+                        )));
+                    }
+                };
+                ExecutorConfig::Cuda {
+                    kernels_dir: PathBuf::from(get(env::KERNELS_DIR)?),
+                    kv_device_bytes,
+                }
+            }
+        };
 
         let bind_addr = get(env::BIND_ADDR)?
             .parse::<SocketAddr>()
@@ -243,7 +319,6 @@ impl Config {
 
         let sizing = Sizing {
             kv_block_size: positive(env::KV_BLOCK_SIZE)?,
-            kv_blocks: positive(env::KV_BLOCKS)?,
             max_model_len: positive(env::MAX_MODEL_LEN)?,
             max_seqs: positive(env::MAX_SEQS)?,
             max_batched_tokens: positive(env::MAX_BATCHED_TOKENS)?,
@@ -251,13 +326,6 @@ impl Config {
             draft_tokens: non_negative(env::DRAFT_TOKENS)?,
             max_requests: positive(env::MAX_REQUESTS)?,
         };
-        if sizing.kv_blocks < 2 {
-            return Err(ConfigError(format!(
-                "{} must be at least 2 (block 0 is reserved)",
-                env::KV_BLOCKS
-            )));
-        }
-
         let enabled = match get(env::PREFIX_CACHE)?.as_str() {
             "true" => true,
             "false" => false,

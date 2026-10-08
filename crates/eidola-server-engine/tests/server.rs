@@ -52,7 +52,7 @@ fn prompt_tokens(text: &str) -> Vec<u32> {
 fn direct_greedy(prompt: Vec<u32>, max_tokens: u32) -> (Vec<u32>, FinishReason) {
     let model = loaded();
     let exec = CpuExecutor::new(
-        model.model().clone(),
+        model.reference().unwrap().clone(),
         CpuExecutorConfig {
             block_size: 16,
             num_blocks: 256,
@@ -208,6 +208,8 @@ async fn info_reports_the_node_identity() {
     assert_eq!(v["weights_sha256"], weights_hash());
     assert_eq!(v["weights_storage"], "dev-writable");
     assert_eq!(v["executor"], "cpu");
+    // The key is always present; the CPU executor has no device.
+    assert_eq!(v.get("device"), Some(&Value::Null));
     assert_eq!(v["build"]["crate"], "eidola-server-engine");
     assert_eq!(v["build"]["version"], env!("CARGO_PKG_VERSION"));
     assert!(v["build"].get("git_sha").is_some());
@@ -912,6 +914,16 @@ fn configuration_refuses_anything_missing_or_malformed() {
         map.insert(env::EXECUTOR, "cuda".into());
         assert!(config_from(&map).unwrap_err().contains("cuda"));
     }
+    // The CUDA executor's settings are refused, not ignored, with the CPU executor.
+    for (key, value) in [
+        (env::KV_DEVICE_BYTES, "1073741824"),
+        (env::KERNELS_DIR, "/k"),
+    ] {
+        let mut map = full.clone();
+        map.insert(key, value.to_string());
+        let err = config_from(&map).unwrap_err();
+        assert!(err.contains(key) && err.contains("cuda"), "{key}: {err}");
+    }
     // An argon2i (not argon2id) hash is refused.
     let mut map = full.clone();
     let argon2i = {
@@ -941,14 +953,6 @@ fn engine_sizing_is_checked_against_the_model() {
         map.insert(key, value.to_string());
         let err = eidola_server_engine::start(config_from(&map).unwrap(), loaded()).unwrap_err();
         assert!(err.to_string().contains(needle), "{key}: {err}");
-    }
-    // The CUDA seam parses in a `cuda` build, and boot refuses it until it exists.
-    #[cfg(feature = "cuda")]
-    {
-        let mut map = env_map();
-        map.insert(env::EXECUTOR, "cuda".into());
-        let err = eidola_server_engine::start(config_from(&map).unwrap(), loaded()).unwrap_err();
-        assert!(err.to_string().contains("cuda"), "{err}");
     }
 }
 

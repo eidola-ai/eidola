@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use eidola_server_engine::config::{Config, WeightsStorage, env};
+use eidola_server_engine::config::{Config, ExecutorKind, WeightsStorage, env};
 use eidola_server_engine::model::LoadedModel;
 use eidola_server_engine::worker::{EngineHandle, Stats};
 use serde_json::{Value, json};
@@ -60,8 +60,13 @@ pub fn loaded() -> Arc<LoadedModel> {
     MODEL
         .get_or_init(|| {
             Arc::new(
-                LoadedModel::load(model_dir(), weights_hash(), WeightsStorage::DevWritable)
-                    .unwrap(),
+                LoadedModel::load(
+                    model_dir(),
+                    weights_hash(),
+                    WeightsStorage::DevWritable,
+                    ExecutorKind::Cpu,
+                )
+                .unwrap(),
             )
         })
         .clone()

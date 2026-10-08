@@ -3,7 +3,7 @@
 //! | Route | Auth | Purpose |
 //! |---|---|---|
 //! | `POST /v1/chat/completions` | gateway token + weights hash | the strict chat subset, streaming or not |
-//! | `GET /v1/engine/info` | gateway token | model id, weights hash, build, executor |
+//! | `GET /v1/engine/info` | gateway token | model id, weights hash, build, executor, device |
 //! | `GET /healthz` | none | content-free liveness/readiness |
 //!
 //! A chat request is refused, in this order and before anything is admitted: a missing
@@ -50,10 +50,26 @@ pub const WEIGHTS_HEADER: &str = "x-eidola-weights-sha256";
 /// Largest accepted request body.
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
+/// The device an executor runs on, as `/v1/engine/info` reports it: the hardware and
+/// the kernel image, nothing about any request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceReport {
+    /// The driver's device name (`NVIDIA B300 SXM6 AC`).
+    pub name: String,
+    /// `major.minor`.
+    pub compute_capability: String,
+    /// The kernel image the device runs (`sm_103a`), when the build has one for it.
+    pub image: Option<&'static str>,
+    pub sm_count: u32,
+    pub memory_bytes: u64,
+}
+
 /// Shared state of every handler.
 pub struct AppState {
     pub model_id: String,
     pub executor: &'static str,
+    /// The executor's device; `None` for the CPU executor.
+    pub device: Option<DeviceReport>,
     pub max_model_len: u32,
     pub model: Arc<LoadedModel>,
     pub token: GatewayToken,
@@ -125,6 +141,13 @@ async fn engine_info(State(state): State<Arc<AppState>>) -> Response {
         "weights_storage": state.model.storage().as_str(),
         "build": build_info(),
         "executor": state.executor,
+        "device": state.device.as_ref().map(|d| json!({
+            "name": d.name,
+            "compute_capability": d.compute_capability,
+            "image": d.image,
+            "sm_count": d.sm_count,
+            "memory_bytes": d.memory_bytes,
+        })),
     }))
     .into_response()
 }

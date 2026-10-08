@@ -27,7 +27,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let bind = config.bind_addr;
     tracing::info!(
         model = %config.model_id,
-        executor = config.executor.as_str(),
+        executor = config.executor.kind().as_str(),
         "verifying and loading weights"
     );
     let node = eidola_server_engine::boot(config)?;
