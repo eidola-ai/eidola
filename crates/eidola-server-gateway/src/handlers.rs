@@ -24,13 +24,15 @@ use crate::auth::{ActSpend, AuthContext, AuthMethod, TokenAuth};
 use crate::backend::{BackendStreamEvent, ChatBackend, PRICING_SCALE_FACTOR};
 use crate::credentials;
 use crate::db;
+use crate::engine_trust::protocol::ValidatedRequest;
 use crate::error::ServerError;
 use crate::response::{
     EidolaResponse, EidolaStreamMetadata, RefundInfo, build_privacy_metadata,
     build_verification_metadata,
 };
 use crate::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ErrorResponse, Model, ModelsResponse, Usage,
+    ChatCompletionChunk, ChatCompletionRequest, ErrorResponse, Model, ModelHosting, ModelsResponse,
+    Usage,
 };
 
 /// Health check endpoint.
@@ -105,7 +107,7 @@ pub(crate) fn chargeable_prompt_tokens_for(request: &ChatCompletionRequest) -> u
 
 /// The effective completion-token ceiling for a request: its
 /// `max_completion_tokens`, falling back to the model's context length.
-fn effective_max_completion(request: &ChatCompletionRequest, model: &Model) -> u64 {
+pub(crate) fn effective_max_completion(request: &ChatCompletionRequest, model: &Model) -> u64 {
     request
         .max_completion_tokens
         .map(|t| t as u64)
@@ -172,6 +174,62 @@ fn actual_cost(
     let prompt_credits = prompt_cost.div_ceil(sf);
     let completion_credits = completion_cost.div_ceil(sf);
     prompt_credits + completion_credits
+}
+
+/// What a completed request costs: its usage priced and clamped to the
+/// contract ([`actual_cost`]), or the whole charge when the upstream reported
+/// no usage. One rule for both hosting paths and both transports.
+pub(crate) fn settled_cost(
+    usage: Option<&Usage>,
+    model: &Model,
+    chargeable_prompt_tokens: u64,
+    max_completion_tokens: u64,
+    charge_credits: u128,
+) -> u128 {
+    usage
+        .map(|u| actual_cost(u, model, chargeable_prompt_tokens, max_completion_tokens))
+        .unwrap_or(charge_credits)
+}
+
+/// Who answers a request for `model`, as its privacy metadata names them.
+fn provider_for(model: &Model) -> &'static str {
+    match model.hosting {
+        ModelHosting::Tinfoil => "tinfoil",
+        ModelHosting::Eidola => crate::engine_router::PROVIDER,
+    }
+}
+
+/// Send a non-streaming request to the upstream that hosts `model`.
+async fn dispatch(
+    state: &AppState,
+    request: &ValidatedRequest,
+    model: &Model,
+) -> Result<crate::backend::BackendResponse, ServerError> {
+    match model.hosting {
+        ModelHosting::Tinfoil => state.backend.send(request.request()).await,
+        ModelHosting::Eidola => engines(state)?.send(request).await,
+    }
+}
+
+/// Send a streaming request to the upstream that hosts `model`.
+async fn dispatch_stream(
+    state: &AppState,
+    request: &ValidatedRequest,
+    model: &Model,
+) -> Result<mpsc::Receiver<Result<BackendStreamEvent, ServerError>>, ServerError> {
+    match model.hosting {
+        ModelHosting::Tinfoil => state.backend.send_stream(request.request()).await,
+        ModelHosting::Eidola => engines(state)?.send_stream(request).await,
+    }
+}
+
+/// The engine router. A build that lists an Eidola-hosted model pins it, and
+/// a gateway pinning any model starts with a router, so this refuses only
+/// what cannot be routed anyway.
+fn engines(state: &AppState) -> Result<&crate::engine_router::EngineRouter, ServerError> {
+    state.engines.as_ref().ok_or_else(|| {
+        ServerError::ServiceUnavailable("no engine is available for this model".to_string())
+    })
 }
 
 /// Issue a refund token, returning `refund_credits` to the client.
@@ -350,14 +408,16 @@ fn check_sufficient_charge(
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 402, description = "Insufficient charge amount", body = ErrorResponse),
         (status = 409, description = "Credential already spent", body = ErrorResponse),
-        (status = 502, description = "Upstream provider error", body = ErrorResponse)
+        (status = 502, description = "Upstream provider error", body = ErrorResponse),
+        (status = 503, description = "No upstream is available for the model", body = ErrorResponse)
     )
 )]
 pub async fn chat_completions(
     TokenAuth(act): TokenAuth,
     State(state): State<AppState>,
-    LoggedJson(request): LoggedJson<ChatCompletionRequest>,
+    ChatRequest(validated): ChatRequest,
 ) -> Result<axum::response::Response, ServerError> {
+    let request = validated.request();
     // The counter's `model` label must come from the catalog, never the
     // caller's string (the fixed-list rule bounding label cardinality):
     // resolve it up front, with anything unresolved collapsing to `other`.
@@ -368,7 +428,7 @@ pub async fn chat_completions(
         .unwrap_or_else(|| "other".to_string());
     let stream = request.stream;
 
-    let result = chat_completions_phases(&state, &act, &request).await;
+    let result = chat_completions_phases(&state, &act, &validated).await;
 
     // An `Ok` from the phases can still be an error *response* — a
     // refund-bearing 4xx/5xx built after the credential was spent — so
@@ -397,8 +457,9 @@ pub async fn chat_completions(
 async fn chat_completions_phases(
     state: &AppState,
     act: &ActSpend,
-    request: &ChatCompletionRequest,
+    validated: &ValidatedRequest,
 ) -> Result<axum::response::Response, ServerError> {
+    let request = validated.request();
     // Phase 1: Verify the ACT cryptographically. Errors here mean the token
     // is invalid/malformed — no nullifier recorded, no refund needed.
     verify_spend_proof(state, act).await?;
@@ -440,27 +501,28 @@ async fn chat_completions_phases(
 
     // Phase 4: Handle the request.
     if request.stream {
-        handle_streaming_request(state.clone(), request, act, &model, charge_credits).await
+        handle_streaming_request(state.clone(), validated, act, &model, charge_credits).await
     } else {
-        handle_non_streaming_request(state, request, act, &model, charge_credits).await
+        handle_non_streaming_request(state, validated, act, &model, charge_credits).await
     }
 }
 
 /// Handle a non-streaming chat completion request.
 async fn handle_non_streaming_request(
     state: &AppState,
-    request: &ChatCompletionRequest,
+    validated: &ValidatedRequest,
     act: &ActSpend,
     model: &Model,
     charge_credits: u128,
 ) -> Result<axum::response::Response, ServerError> {
+    let request = validated.request();
     let auth_context = AuthContext {
         method: AuthMethod::AnonymousCredential,
     };
 
     // Make the backend request. On error, issue a full refund.
     let dispatched_at = Instant::now();
-    let backend_response = match state.backend.send(request).await {
+    let backend_response = match dispatch(state, validated, model).await {
         Ok(resp) => resp,
         Err(e) => {
             // Known error — backend didn't charge. Full refund.
@@ -496,12 +558,14 @@ async fn handle_non_streaming_request(
     // Compute actual cost (clamped to the pricing contract) and refund.
     let chargeable_prompt = chargeable_prompt_tokens_for(request);
     let max_completion = effective_max_completion(request, model);
-    let cost = backend_response
-        .meta
-        .usage
-        .as_ref()
-        .map(|u| actual_cost(u, model, chargeable_prompt, max_completion))
-        .unwrap_or(charge_credits); // No usage → charge worst case
+    // No usage → charge worst case.
+    let cost = settled_cost(
+        backend_response.meta.usage.as_ref(),
+        model,
+        chargeable_prompt,
+        max_completion,
+        charge_credits,
+    );
 
     let refund_credits = charge_credits.saturating_sub(cost);
     let refund_info = match issue_refund_async(
@@ -708,11 +772,12 @@ fn carries_output(chunk: &ChatCompletionChunk) -> bool {
 /// Handle a streaming chat completion request.
 async fn handle_streaming_request(
     state: AppState,
-    request: &ChatCompletionRequest,
+    validated: &ValidatedRequest,
     act: &ActSpend,
     model: &Model,
     charge_credits: u128,
 ) -> Result<axum::response::Response, ServerError> {
+    let request = validated.request();
     let auth_context = AuthContext {
         method: AuthMethod::AnonymousCredential,
     };
@@ -721,7 +786,7 @@ async fn handle_streaming_request(
     // arrival: everything before this point is our own verification work,
     // which the HTTP-level histogram already covers.
     let dispatched_at = Instant::now();
-    let mut upstream_rx = match state.backend.send_stream(request).await {
+    let mut upstream_rx = match dispatch_stream(&state, validated, model).await {
         Ok(rx) => rx,
         Err(e) => {
             // Known error — upstream didn't process any tokens. Full refund.
@@ -764,6 +829,7 @@ async fn handle_streaming_request(
     // over (the spawned task never sees the request itself).
     let chargeable_prompt = chargeable_prompt_tokens_for(request);
     let max_completion = effective_max_completion(request, model);
+    let provider = provider_for(model);
 
     tokio::spawn(async move {
         /// Re-parse the spend proof and issue a refund with the given amount.
@@ -880,10 +946,13 @@ async fn handle_streaming_request(
 
                     // Compute the refund from usage, with the charge clamped
                     // to the pricing contract (same as the blocking path).
-                    let cost = final_usage
-                        .as_ref()
-                        .map(|u| actual_cost(u, &task_model, chargeable_prompt, max_completion))
-                        .unwrap_or(charge_credits);
+                    let cost = settled_cost(
+                        final_usage.as_ref(),
+                        &task_model,
+                        chargeable_prompt,
+                        max_completion,
+                        charge_credits,
+                    );
 
                     let refund_credits = charge_credits.saturating_sub(cost);
                     let refund_info =
@@ -907,7 +976,7 @@ async fn handle_streaming_request(
                     timing.finish("upstream_error", None, Instant::now());
                     let refund_info =
                         try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
-                    let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
+                    let privacy = build_privacy_metadata(&auth_context, true, provider);
                     let verification = build_verification_metadata(None);
                     send_metadata_event(&tx, refund_info, privacy, verification, String::new())
                         .await;
@@ -921,7 +990,7 @@ async fn handle_streaming_request(
         warn!("Upstream channel closed without Done event, issuing zero refund");
         timing.finish("channel_closed", None, Instant::now());
         let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
-        let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
+        let privacy = build_privacy_metadata(&auth_context, true, provider);
         let verification = build_verification_metadata(None);
         send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;
     });
@@ -969,58 +1038,119 @@ where
     type Rejection = axum::response::Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let (parts, body) = req.into_parts();
-        let bytes =
-            axum::body::Bytes::from_request(Request::from_parts(parts.clone(), body), state)
-                .await
-                .map_err(|rejection| {
-                    warn!(
-                        payload_type = std::any::type_name::<T>(),
-                        "request body rejected: bytes error"
-                    );
-                    rejection.into_response()
-                })?;
-        // A malformed body goes on to axum's parse, which refuses it as it always has
-        // (and, since the scan counts values as it goes, holds no more of them before
-        // the error than the cap).
-        use eidola_common::engine_protocol::{JsonShapeError, check_request_json};
-        if let Err(shape @ (JsonShapeError::TooManyValues | JsonShapeError::TooDeep)) =
-            check_request_json(&bytes)
-        {
-            let class = if shape == JsonShapeError::TooDeep {
-                "too deep"
-            } else {
-                "too many values"
+        let (parts, bytes) = checked_body::<T, S>(req, state).await?;
+        parse_logged(parts, bytes, state).await.map(Self)
+    }
+}
+
+/// The body's bytes, held to the JSON shape limits (see [`LoggedJson`]).
+// The error is the refusal itself, built once and returned as the extractor's
+// rejection.
+#[allow(clippy::result_large_err)]
+async fn checked_body<T, S: Send + Sync>(
+    req: Request,
+    state: &S,
+) -> Result<(axum::http::request::Parts, axum::body::Bytes), axum::response::Response> {
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+        .await
+        .map_err(|rejection| {
+            warn!(
+                payload_type = std::any::type_name::<T>(),
+                "request body rejected: bytes error"
+            );
+            rejection.into_response()
+        })?;
+    // A malformed body goes on to axum's parse, which refuses it as it always has
+    // (and, since the scan counts values as it goes, holds no more of them before
+    // the error than the cap).
+    use eidola_common::engine_protocol::{JsonShapeError, check_request_json};
+    if let Err(shape @ (JsonShapeError::TooManyValues | JsonShapeError::TooDeep)) =
+        check_request_json(&bytes)
+    {
+        let class = if shape == JsonShapeError::TooDeep {
+            "too deep"
+        } else {
+            "too many values"
+        };
+        warn!(
+            payload_type = std::any::type_name::<T>(),
+            "request body rejected: {class} error"
+        );
+        return Err(ServerError::BadRequest {
+            message: shape.to_string(),
+        }
+        .into_response());
+    }
+    Ok((parts, bytes))
+}
+
+/// axum's `Json` over `bytes`: its value, or its refusal, logged by class.
+#[allow(clippy::result_large_err)]
+async fn parse_logged<T, S>(
+    parts: axum::http::request::Parts,
+    bytes: axum::body::Bytes,
+    state: &S,
+) -> Result<T, axum::response::Response>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    let req = Request::from_parts(parts, axum::body::Body::from(bytes));
+    match Json::<T>::from_request(req, state).await {
+        Ok(Json(value)) => Ok(value),
+        Err(rejection) => {
+            // Class only — the rejection's message can quote body
+            // values (see the type-level privacy note).
+            let class = match &rejection {
+                JsonRejection::JsonDataError(_) => "data",
+                JsonRejection::JsonSyntaxError(_) => "syntax",
+                JsonRejection::MissingJsonContentType(_) => "missing content-type",
+                JsonRejection::BytesRejection(_) => "bytes",
+                _ => "other",
             };
             warn!(
                 payload_type = std::any::type_name::<T>(),
                 "request body rejected: {class} error"
             );
-            return Err(ServerError::BadRequest {
-                message: shape.to_string(),
-            }
-            .into_response());
+            Err(rejection.into_response())
         }
-        let req = Request::from_parts(parts, axum::body::Body::from(bytes));
-        match Json::<T>::from_request(req, state).await {
-            Ok(Json(value)) => Ok(Self(value)),
-            Err(rejection) => {
-                // Class only — the rejection's message can quote body
-                // values (see the type-level privacy note).
-                let class = match &rejection {
-                    JsonRejection::JsonDataError(_) => "data",
-                    JsonRejection::JsonSyntaxError(_) => "syntax",
-                    JsonRejection::MissingJsonContentType(_) => "missing content-type",
-                    JsonRejection::BytesRejection(_) => "bytes",
-                    _ => "other",
-                };
-                warn!(
-                    payload_type = std::any::type_name::<T>(),
-                    "request body rejected: {class} error"
-                );
-                Err(rejection.into_response())
-            }
+    }
+}
+
+/// The chat request: [`LoggedJson`]'s checks and refusals, keeping the body's
+/// bytes with the strict parse. A request bound for an Eidola-hosted engine
+/// is forwarded from its bytes (`engine_trust::protocol::ValidatedRequest`),
+/// whose only constructor parses exactly those bytes.
+///
+/// The content type and the JSON syntax are checked first by axum's own
+/// extractor over a parse that keeps nothing; a body that fails any check is
+/// refused by axum's parse of the strict type, exactly as before.
+pub struct ChatRequest(pub ValidatedRequest);
+
+impl<S: Send + Sync> FromRequest<S> for ChatRequest {
+    type Rejection = axum::response::Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, bytes) = checked_body::<ChatCompletionRequest, S>(req, state).await?;
+        let shape_ok = Json::<serde::de::IgnoredAny>::from_request(
+            Request::from_parts(parts.clone(), axum::body::Body::from(bytes.clone())),
+            state,
+        )
+        .await
+        .is_ok();
+        if shape_ok && let Ok(validated) = ValidatedRequest::from_bytes(bytes.clone()) {
+            return Ok(Self(validated));
         }
+        parse_logged::<ChatCompletionRequest, S>(parts, bytes.clone(), state).await?;
+        // axum accepted a body the strict parse refused; both parse the same
+        // bytes with the same type, so this is not reached.
+        ValidatedRequest::from_bytes(bytes).map(Self).map_err(|_| {
+            ServerError::BadRequest {
+                message: "invalid request body".to_string(),
+            }
+            .into_response()
+        })
     }
 }
 
@@ -1045,6 +1175,80 @@ mod tests {
                 Err((status, String::from_utf8_lossy(&text).into_owned()))
             }
         }
+    }
+
+    /// The extractor's result as status and text, for comparing refusals.
+    async fn refusal_of(response: axum::response::Response) -> (axum::http::StatusCode, String) {
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&text).into_owned())
+    }
+
+    fn chat_request(body: &str, content_type: Option<&str>) -> Request {
+        let mut builder = Request::builder().method("POST");
+        if let Some(content_type) = content_type {
+            builder = builder.header("content-type", content_type);
+        }
+        builder
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// The chat extractor keeps the exact body bytes with the strict parse,
+    /// and refuses everything the plain extractor refuses, identically.
+    #[tokio::test]
+    async fn the_chat_extractor_keeps_the_bytes_and_refuses_as_before() {
+        let valid = r#"{"model":"m", "messages":[{"role":"user","content":"hi"}]}"#;
+        let ChatRequest(validated) =
+            ChatRequest::from_request(chat_request(valid, Some("application/json")), &())
+                .await
+                .unwrap_or_else(|_| panic!("accepted"));
+        assert_eq!(validated.raw(), valid.as_bytes());
+        assert_eq!(validated.request().model, "m");
+
+        let deep = format!("{}{}", "[".repeat(65), "]".repeat(65));
+        let cases: Vec<(String, Option<&str>)> = vec![
+            (
+                r#"{"model":"m","messages":[],"extra":1}"#.into(),
+                Some("application/json"),
+            ),
+            (
+                r#"{"model":"m","messages":"#.into(),
+                Some("application/json"),
+            ),
+            (
+                r#"{"model":7,"messages":[]}"#.into(),
+                Some("application/json"),
+            ),
+            (valid.into(), None),
+            (valid.into(), Some("text/plain")),
+            (deep, Some("application/json")),
+        ];
+        for (body, content_type) in cases {
+            let chat = match ChatRequest::from_request(chat_request(&body, content_type), &()).await
+            {
+                Ok(_) => panic!("accepted {body:?}"),
+                Err(response) => refusal_of(response).await,
+            };
+            let plain = match LoggedJson::<ChatCompletionRequest>::from_request(
+                chat_request(&body, content_type),
+                &(),
+            )
+            .await
+            {
+                Ok(_) => panic!("the plain extractor accepted {body:?}"),
+                Err(response) => refusal_of(response).await,
+            };
+            assert_eq!(chat, plain, "{body:?} {content_type:?}");
+        }
+        // A suffixed JSON media type is JSON to both.
+        assert!(
+            ChatRequest::from_request(chat_request(valid, Some("application/vnd.x+json")), &())
+                .await
+                .is_ok()
+        );
     }
 
     /// A body past the engine's JSON value or depth limit is refused with a 400 before

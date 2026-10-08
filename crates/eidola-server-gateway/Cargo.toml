@@ -75,9 +75,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.23"
 hex = "0.4"
 
-# Webhook signature verification
+# Webhook signature verification; hashing the engine route key, whose hasher
+# state is scrubbed on drop (`zeroize`).
 hmac = "0.13"
-sha2 = "0.11"
+sha2 = { version = "0.11", features = ["zeroize"] }
 subtle = "2"
 
 # Shared client/server contract logic (pricing formula)
@@ -136,3 +137,7 @@ eidola-common = { path = "../eidola-common", features = ["deployment"] }
 # `InMemoryLogExporter` for the telemetry regression test pinning that
 # exported log records carry no trace context.
 opentelemetry_sdk = { version = "0.33", features = ["testing"] }
+# The engine router's tests run fake engines behind in-process shims that
+# serve real (mock-rooted SEV-SNP) attestation, so routing is exercised over
+# the same attesting client production uses.
+tinfoil-shim-mock = { path = "../tinfoil-shim-mock" }

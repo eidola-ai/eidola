@@ -103,6 +103,12 @@ impl CacheKey {
     pub fn as_bytes(&self) -> &[u8; eidola_common::engine_protocol::CACHE_KEY_BYTES] {
         &self.0
     }
+
+    /// A key from its bytes, for tests of what consumes one.
+    #[cfg(test)]
+    pub(crate) fn from_bytes(bytes: [u8; eidola_common::engine_protocol::CACHE_KEY_BYTES]) -> Self {
+        Self(Box::new(zeroize::Zeroizing::new(bytes)))
+    }
 }
 
 impl std::fmt::Debug for CacheKey {

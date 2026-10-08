@@ -19,7 +19,7 @@
 //! the request type does not serialize it, and only this module writes it.
 //!
 //! Which node serves a model, and the attested client that reaches it, are
-//! the router's concern, not this module's.
+//! the router's concern (`crate::engine_router`), not this module's.
 
 use base64::Engine as _;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
@@ -100,6 +100,11 @@ impl ValidatedRequest {
     /// The strict parse.
     pub fn request(&self) -> &ChatCompletionRequest {
         &self.parsed
+    }
+
+    /// The bytes the request was parsed from.
+    pub(crate) fn raw(&self) -> &[u8] {
+        &self.raw
     }
 }
 

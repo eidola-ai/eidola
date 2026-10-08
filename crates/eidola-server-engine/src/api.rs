@@ -11,7 +11,10 @@
 //! prints both (`eidola-engine-chat/AGENTS.md`).
 
 use base64::Engine as _;
-use eidola_common::engine_protocol::{CACHE_KEY_BYTES, CACHE_KEY_TEXT_LEN};
+use eidola_common::engine_protocol::{
+    CACHE_KEY_BYTES, CACHE_KEY_TEXT_LEN, SubsetError, ToolChoice, check_max_completion_tokens,
+    check_stop, check_tool_choice,
+};
 use eidola_engine::secret::CacheKey;
 use eidola_engine_chat::json::{self as chat_json, Json};
 use serde::Deserialize;
@@ -19,16 +22,15 @@ use zeroize::Zeroize;
 
 use crate::error::ApiError;
 
-/// Most stop sequences a request may carry (OpenAI's limit).
-pub const MAX_STOP_SEQUENCES: usize = 4;
-
-/// Longest stop sequence, in UTF-8 bytes. Stop sequences are delimiters (`"\n\n"`,
-/// `"Observation:"`, an end marker); Eidola's own chat path sends none, and its local
-/// proxy relays only what a local caller sets. The cap is far above any delimiter while
-/// bounding the matcher (`pipeline::StopMatcher`, a pattern copy plus a `usize` table per
-/// byte, plus the held-back text) to a few kilobytes per request, so a body cannot turn
-/// its 32 MiB into hundreds of MiB of matcher state.
-pub const MAX_STOP_BYTES: usize = 256;
+/// Most stop sequences a request may carry, and the longest one in UTF-8 bytes. Stop
+/// sequences are delimiters (`"\n\n"`, `"Observation:"`, an end marker); Eidola's own
+/// chat path sends none, and its local proxy relays only what a local caller sets. The
+/// byte cap is far above any delimiter while bounding the matcher
+/// (`pipeline::StopMatcher`, a pattern copy plus a `usize` table per byte, plus the
+/// held-back text) to a few kilobytes per request, so a body cannot turn its 32 MiB into
+/// hundreds of MiB of matcher state. Both live in `eidola_common::engine_protocol` with
+/// the rest of the subset's rules, which the gateway applies before routing.
+pub use eidola_common::engine_protocol::{MAX_STOP_BYTES, MAX_STOP_SEQUENCES};
 
 /// A chat completion request, as the gateway forwards it.
 #[derive(Debug, Deserialize)]
@@ -191,8 +193,10 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
     if req.model != model_id {
         return Err(ApiError::ModelNotFound);
     }
+    // The subset's rules, by the functions the gateway refuses with before routing.
+    let invalid = |e: SubsetError| ApiError::invalid(e.to_string());
     if req.messages.is_empty() {
-        return Err(ApiError::invalid("messages must not be empty"));
+        return Err(invalid(SubsetError::EmptyMessages));
     }
     for m in &req.messages {
         if let Some(MessageContent::Parts(parts)) = &m.content
@@ -200,43 +204,21 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
                 .iter()
                 .any(|p| matches!(p, ContentPart::ImageUrl { .. }))
         {
-            return Err(ApiError::invalid("this model accepts text only"));
+            return Err(invalid(SubsetError::ImageContent));
         }
     }
-    if req.max_completion_tokens == Some(0) {
-        return Err(ApiError::invalid(
-            "max_completion_tokens must be at least 1",
-        ));
-    }
+    check_max_completion_tokens(req.max_completion_tokens).map_err(invalid)?;
     let stop = match req.stop.take() {
         None => Vec::new(),
         Some(StopSequence::Single(s)) => vec![s],
         Some(StopSequence::Multiple(v)) => v,
     };
-    if stop.len() > MAX_STOP_SEQUENCES {
-        return Err(ApiError::invalid("stop accepts at most 4 sequences"));
-    }
-    if stop.iter().any(String::is_empty) {
-        return Err(ApiError::invalid("stop sequences must not be empty"));
-    }
-    if stop.iter().any(|s| s.len() > MAX_STOP_BYTES) {
-        return Err(ApiError::invalid(format!(
-            "each stop sequence may be at most {MAX_STOP_BYTES} bytes"
-        )));
-    }
+    check_stop(&stop).map_err(invalid)?;
     let tools_given = req.tools.as_ref().is_some_and(|t| !t.is_empty());
-    let parse_tools = match &req.tool_choice {
-        None => tools_given,
-        Some(serde_json::Value::String(s)) if s == "auto" => tools_given,
-        // "none" is honoured by not showing the model any tools (below), so there is
-        // nothing to parse either.
-        Some(serde_json::Value::String(s)) if s == "none" => false,
-        Some(_) => {
-            return Err(ApiError::invalid(
-                "tool_choice supports only \"auto\" and \"none\"",
-            ));
-        }
-    };
+    let tool_choice = check_tool_choice(req.tool_choice.as_ref()).map_err(invalid)?;
+    // "none" is honoured by not showing the model any tools (below), so there is
+    // nothing to parse either.
+    let parse_tools = tool_choice == ToolChoice::Auto && tools_given;
 
     // The same body, parsed order-preserving for the template.
     let text = std::str::from_utf8(body).map_err(|_| ApiError::invalid("body is not UTF-8"))?;
@@ -254,9 +236,11 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
     // `tool_choice: "none"` renders the prompt without the tool definitions, so the model
     // is never offered a tool it may not call (this changes the prompt, and with it the
     // reusable cache prefix, relative to the same request under "auto").
-    let tool_choice_none =
-        matches!(&req.tool_choice, Some(serde_json::Value::String(s)) if s == "none");
-    let tools = if tool_choice_none { None } else { tools };
+    let tools = if tool_choice == ToolChoice::None {
+        None
+    } else {
+        tools
+    };
     if let Some(Json::Str(mut s)) = take("cache_key") {
         s.zeroize();
     }

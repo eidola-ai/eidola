@@ -216,6 +216,15 @@ async fn the_fixture_pin_is_a_tdx_pin_the_verifier_compiles() {
     assert_eq!(pins[0].platform(), tinfoil_verifier::Platform::Tdx);
     assert_eq!(pins[0].expected_gpus, Some(8));
     verifier_accepts(&pins).await;
+    // Each deployment is named by its config's hash, the hash its MRCONFIGID
+    // carries.
+    let deployments = accepted_deployments_in(&json, MODEL).unwrap();
+    assert_eq!(deployments.len(), 1);
+    let config = std::fs::read(fixture_root().join(CONFIG)).unwrap();
+    assert_eq!(
+        deployments[0].config_sha256,
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&config))
+    );
     assert!(
         allowed_measurements_in(&json, "other-model")
             .unwrap()

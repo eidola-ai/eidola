@@ -13,8 +13,9 @@
 //!   (`backend::MODEL_CATALOG`) is bound to this list at compile time: an
 //!   Eidola-hosted row without a pin, or a pin without such a row, does not
 //!   build.
-//! - [`allowed_measurements`] — the attestation pins for one model's
-//!   deployments, in `tinfoil-verifier`'s shape.
+//! - [`allowed_measurements`] / [`accepted_deployments`] — the attestation
+//!   pins for one model's deployments, in `tinfoil-verifier`'s shape, and the
+//!   config hash each deployment is named by.
 //! - [`protocol`] — the headers and body the gateway sends a node.
 //!
 //! **Same-sha pinning.** A gateway build accepts exactly the engine
@@ -112,6 +113,17 @@ pub fn pinned_model(model_id: &str) -> Option<&'static PinnedModel> {
     PINNED_MODELS.iter().find(|m| m.id == model_id)
 }
 
+/// One accepted deployment of a pinned model: its identity and its pin.
+#[derive(Debug, Clone)]
+pub struct AcceptedDeployment {
+    /// SHA-256 of the deployment's committed `tinfoil-config.yml` (lowercase
+    /// hex): what placement data names a deployment by, and, on TDX, the
+    /// launch's MRCONFIGID.
+    pub config_sha256: String,
+    /// The attestation pin, in `tinfoil-verifier`'s shape.
+    pub pin: AllowedMeasurement,
+}
+
 /// The attestation pins for every accepted deployment of `model_id`, in
 /// `tinfoil-verifier`'s shape. Empty when this build pins no such model.
 ///
@@ -119,10 +131,27 @@ pub fn pinned_model(model_id: &str) -> Option<&'static PinnedModel> {
 /// a pin `tinfoil-verifier` cannot read even though its shape passed: the
 /// returned error names the model.
 pub fn allowed_measurements(model_id: &str) -> Result<Vec<AllowedMeasurement>, String> {
-    allowed_measurements_in(ENGINE_ENCLAVES_JSON, model_id)
+    Ok(accepted_deployments(model_id)?
+        .into_iter()
+        .map(|d| d.pin)
+        .collect())
 }
 
+/// Every accepted deployment of `model_id`, with its pin. Empty when this
+/// build pins no such model.
+pub fn accepted_deployments(model_id: &str) -> Result<Vec<AcceptedDeployment>, String> {
+    accepted_deployments_in(ENGINE_ENCLAVES_JSON, model_id)
+}
+
+#[cfg(test)]
 fn allowed_measurements_in(json: &str, model_id: &str) -> Result<Vec<AllowedMeasurement>, String> {
+    Ok(accepted_deployments_in(json, model_id)?
+        .into_iter()
+        .map(|d| d.pin)
+        .collect())
+}
+
+fn accepted_deployments_in(json: &str, model_id: &str) -> Result<Vec<AcceptedDeployment>, String> {
     // The parse the build check also runs first, so a file the build accepted
     // reads here.
     let file = file::parse(json.as_bytes())?;
@@ -130,7 +159,12 @@ fn allowed_measurements_in(json: &str, model_id: &str) -> Result<Vec<AllowedMeas
         .models
         .into_iter()
         .filter(|(id, _)| id == model_id)
-        .flat_map(|(_, deployments)| deployments.into_iter().map(|d| d.pin))
+        .flat_map(|(_, deployments)| {
+            deployments.into_iter().map(|d| AcceptedDeployment {
+                config_sha256: d.config_sha256,
+                pin: d.pin,
+            })
+        })
         .collect())
 }
 

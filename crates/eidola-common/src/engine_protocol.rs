@@ -1,7 +1,7 @@
 //! The wire contract between Eidola's clients, its gateway, and its inference
 //! nodes (`eidola-server-engine`) that every side must spell identically.
 //!
-//! Three things live here:
+//! Five things live here:
 //!
 //! - **The prefix-cache key** a client may send as the request body's
 //!   `cache_key` member: [`CACHE_KEY_BYTES`] bytes, encoded as unpadded
@@ -17,6 +17,14 @@
 //!   [`check_request_json`] before anything is parsed into memory. The node's
 //!   parse trees cost memory per value, not only per byte, so the value count
 //!   is what bounds them; the gateway refuses the same bodies first.
+//! - **The rules of the node's accepted subset** that are not a matter of the
+//!   request type ([`check_tool_choice`], [`check_stop`],
+//!   [`check_max_completion_tokens`], [`SubsetError`]): the gateway refuses a
+//!   request bound for a node by the same functions the node applies, so a
+//!   request the gateway routes is never one the node refuses for its shape.
+//! - **The node's error types** ([`error_type`]) and which refusals precede
+//!   admission ([`refused_before_admission`]): the only refusals a gateway
+//!   may send to another node.
 //!
 //! The key is secret material on every side: a holder never logs it, prints
 //! it redacted, and scrubs it when done. Nothing here holds one; this module
@@ -337,9 +345,235 @@ const fn base64url_value(b: u8) -> Option<u8> {
     }
 }
 
+/// The node's `error.type` values: what a node answers in an OpenAI-shaped
+/// error body (`{"error": {"message", "type", "code"}}`). The node's
+/// `ApiError::error_type` returns these, and the gateway reads a node's
+/// refusal by them, so the two cannot spell one differently.
+pub mod error_type {
+    pub const AUTHENTICATION_ERROR: &str = "authentication_error";
+    pub const WEIGHTS_HASH_REQUIRED: &str = "weights_hash_required";
+    pub const WEIGHTS_HASH_MISMATCH: &str = "weights_hash_mismatch";
+    pub const MODEL_NOT_FOUND: &str = "model_not_found";
+    pub const INVALID_REQUEST: &str = "invalid_request_error";
+    pub const CONTEXT_LENGTH_EXCEEDED: &str = "context_length_exceeded";
+    pub const REQUEST_TOO_LARGE: &str = "request_too_large";
+    pub const OVERLOADED: &str = "overloaded";
+    pub const ENGINE_UNAVAILABLE: &str = "engine_unavailable";
+    pub const INTERNAL_ERROR: &str = "internal_error";
+}
+
+/// A node refusal made before the request was admitted: nothing of it was
+/// rendered, tokenized or scheduled, so another node may run it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreAdmission {
+    /// The node does not serve what the gateway asked for: the gateway's
+    /// token, the pinned weights, or the model.
+    Misconfigured,
+    /// Every read or admission slot is taken.
+    Overloaded,
+}
+
+/// Whether a node's refusal, by its status and `error.type` exactly, was made
+/// before admission. Only these pairs are: every other refusal (an engine that
+/// stopped, `engine_unavailable`, among them) may come after the request ran,
+/// so a gateway returns it rather than sending the request elsewhere. The node
+/// holds itself to this list (`eidola-server-engine`'s
+/// `only_pre_admission_refusals_say_so`).
+pub fn refused_before_admission(status: u16, kind: &str) -> Option<PreAdmission> {
+    use self::error_type as t;
+    match (status, kind) {
+        (401, t::AUTHENTICATION_ERROR)
+        | (428, t::WEIGHTS_HASH_REQUIRED)
+        | (412, t::WEIGHTS_HASH_MISMATCH)
+        | (404, t::MODEL_NOT_FOUND) => Some(PreAdmission::Misconfigured),
+        (503, t::OVERLOADED) => Some(PreAdmission::Overloaded),
+        _ => None,
+    }
+}
+
+/// Most stop sequences a node accepts on one request (OpenAI's limit).
+pub const MAX_STOP_SEQUENCES: usize = 4;
+
+/// Longest stop sequence a node accepts, in UTF-8 bytes. Stop sequences are
+/// delimiters; the cap bounds the node's matcher state per request.
+pub const MAX_STOP_BYTES: usize = 256;
+
+/// How a node treats a request's tools: offered and parsed (`auto`, also the
+/// meaning of an absent `tool_choice`), or withheld from the prompt (`none`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolChoice {
+    Auto,
+    None,
+}
+
+/// A request a node refuses although the gateway's public request type
+/// accepts it: the part of the node's accepted subset that is a rule over a
+/// parsed request rather than over the type. The gateway checks these before
+/// routing a request to a node, the node checks them again on arrival, and
+/// both call the functions below, so the two cannot disagree. `Display` is the
+/// node's refusal text; it is fixed, never quoting the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubsetError {
+    /// `messages` is empty.
+    EmptyMessages,
+    /// A content part is an image (a node serves a text-only model).
+    ImageContent,
+    /// `max_completion_tokens` is 0.
+    ZeroMaxCompletionTokens,
+    /// More than [`MAX_STOP_SEQUENCES`] stop sequences.
+    TooManyStops,
+    /// An empty stop sequence.
+    EmptyStop,
+    /// A stop sequence longer than [`MAX_STOP_BYTES`].
+    StopTooLong,
+    /// `tool_choice` other than `"auto"` or `"none"` (a node has no
+    /// constrained decoding, so `"required"` and named functions are refused).
+    UnsupportedToolChoice,
+}
+
+impl core::fmt::Display for SubsetError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SubsetError::EmptyMessages => f.write_str("messages must not be empty"),
+            SubsetError::ImageContent => f.write_str("this model accepts text only"),
+            SubsetError::ZeroMaxCompletionTokens => {
+                f.write_str("max_completion_tokens must be at least 1")
+            }
+            SubsetError::TooManyStops => {
+                write!(f, "stop accepts at most {MAX_STOP_SEQUENCES} sequences")
+            }
+            SubsetError::EmptyStop => f.write_str("stop sequences must not be empty"),
+            SubsetError::StopTooLong => write!(
+                f,
+                "each stop sequence may be at most {MAX_STOP_BYTES} bytes"
+            ),
+            SubsetError::UnsupportedToolChoice => {
+                f.write_str("tool_choice supports only \"auto\" and \"none\"")
+            }
+        }
+    }
+}
+
+/// The node's reading of `tool_choice`: absent or `"auto"` is
+/// [`ToolChoice::Auto`], `"none"` is [`ToolChoice::None`], anything else is
+/// refused.
+pub fn check_tool_choice(choice: Option<&serde_json::Value>) -> Result<ToolChoice, SubsetError> {
+    match choice {
+        None => Ok(ToolChoice::Auto),
+        Some(serde_json::Value::String(s)) if s == "auto" => Ok(ToolChoice::Auto),
+        Some(serde_json::Value::String(s)) if s == "none" => Ok(ToolChoice::None),
+        Some(_) => Err(SubsetError::UnsupportedToolChoice),
+    }
+}
+
+/// The node's stop-sequence rule: at most [`MAX_STOP_SEQUENCES`], each
+/// non-empty and at most [`MAX_STOP_BYTES`] bytes.
+pub fn check_stop<S: AsRef<str>>(stops: &[S]) -> Result<(), SubsetError> {
+    if stops.len() > MAX_STOP_SEQUENCES {
+        return Err(SubsetError::TooManyStops);
+    }
+    if stops.iter().any(|s| s.as_ref().is_empty()) {
+        return Err(SubsetError::EmptyStop);
+    }
+    if stops.iter().any(|s| s.as_ref().len() > MAX_STOP_BYTES) {
+        return Err(SubsetError::StopTooLong);
+    }
+    Ok(())
+}
+
+/// The node's completion-limit rule: absent, or at least 1.
+pub fn check_max_completion_tokens(limit: Option<u32>) -> Result<(), SubsetError> {
+    if limit == Some(0) {
+        return Err(SubsetError::ZeroMaxCompletionTokens);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_pre_admission_pairs_are_retryable() {
+        use error_type as t;
+        assert_eq!(
+            refused_before_admission(503, t::OVERLOADED),
+            Some(PreAdmission::Overloaded)
+        );
+        for (status, ty) in [
+            (401, t::AUTHENTICATION_ERROR),
+            (428, t::WEIGHTS_HASH_REQUIRED),
+            (412, t::WEIGHTS_HASH_MISMATCH),
+            (404, t::MODEL_NOT_FOUND),
+        ] {
+            assert_eq!(
+                refused_before_admission(status, ty),
+                Some(PreAdmission::Misconfigured)
+            );
+        }
+        for (status, ty) in [
+            (503, t::ENGINE_UNAVAILABLE),
+            (503, "unknown"),
+            (500, t::INTERNAL_ERROR),
+            (400, t::INVALID_REQUEST),
+            (404, "not_found"),
+            (429, t::OVERLOADED),
+        ] {
+            assert_eq!(refused_before_admission(status, ty), None, "{status} {ty}");
+        }
+    }
+
+    #[test]
+    fn the_subset_rules_accept_and_refuse_at_their_bounds() {
+        use serde_json::json;
+        assert_eq!(check_tool_choice(None), Ok(ToolChoice::Auto));
+        assert_eq!(
+            check_tool_choice(Some(&json!("auto"))),
+            Ok(ToolChoice::Auto)
+        );
+        assert_eq!(
+            check_tool_choice(Some(&json!("none"))),
+            Ok(ToolChoice::None)
+        );
+        for refused in [
+            json!("required"),
+            json!("AUTO"),
+            json!(null),
+            json!({"type": "function", "function": {"name": "f"}}),
+        ] {
+            assert_eq!(
+                check_tool_choice(Some(&refused)),
+                Err(SubsetError::UnsupportedToolChoice),
+                "{refused}"
+            );
+        }
+
+        let at_cap = "é".repeat(MAX_STOP_BYTES / 2);
+        assert_eq!(check_stop::<&str>(&[]), Ok(()));
+        assert_eq!(check_stop(&[at_cap.as_str(); MAX_STOP_SEQUENCES]), Ok(()));
+        assert_eq!(
+            check_stop(&["a"; MAX_STOP_SEQUENCES + 1]),
+            Err(SubsetError::TooManyStops)
+        );
+        assert_eq!(check_stop(&["a", ""]), Err(SubsetError::EmptyStop));
+        let over = "x".repeat(MAX_STOP_BYTES + 1);
+        assert_eq!(check_stop(&[over.as_str()]), Err(SubsetError::StopTooLong));
+
+        assert_eq!(check_max_completion_tokens(None), Ok(()));
+        assert_eq!(check_max_completion_tokens(Some(1)), Ok(()));
+        assert_eq!(
+            check_max_completion_tokens(Some(0)),
+            Err(SubsetError::ZeroMaxCompletionTokens)
+        );
+        assert_eq!(
+            SubsetError::StopTooLong.to_string(),
+            "each stop sequence may be at most 256 bytes"
+        );
+        assert_eq!(
+            SubsetError::UnsupportedToolChoice.to_string(),
+            "tool_choice supports only \"auto\" and \"none\""
+        );
+    }
 
     #[test]
     fn a_body_within_the_limits_is_counted() {
