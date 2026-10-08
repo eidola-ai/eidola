@@ -66,7 +66,7 @@ At one decode row these launch per layer, so their geometry is chosen for small 
 | `eidola_swiglu_quant_fp8_ue8m0` | SwiGLU of each routed row of the gate/up GEMM output, FP8 with UE8M0 scales | Grid (pairs, I/512), 4 warps |
 | `eidola_moe_combine` | Each token's routed down-projection rows, weighted, summed in ascending slot order | Grid (T, H/1024), 128 threads of 8 consecutive elements: each thread loads its piece of the token's 8 rows at once (16 bytes each), then runs each element's chain |
 
-The host runs the one-token router up to `ROUTER_PER_TOKEN_MAX` tokens (8) and the tiled one above (`eidola-engine-cuda`'s `engine_ops.rs`, where the constant records the measurements it was chosen from). The one-token form costs about the same from 1 to 8 tokens and then grows with the token count, because each of its clusters reads the whole 2 MiB router weight for one token; the tiled form reads it once per 8 tokens.
+The host runs the one-token router up to `ROUTER_PER_TOKEN_MAX` tokens (24) and the tiled one above (`eidola-engine-cuda`'s `engine_ops.rs`, where the constant records the measurements it was chosen from). The one-token form costs about the same from 1 to 12 tokens and then grows with the token count, because each of its clusters reads the whole 2 MiB router weight for one token; the tiled form reads it once per 8 tokens.
 
 **The numerics are the reference forms'**, bit for bit; the geometry only moves where the arithmetic runs:
 

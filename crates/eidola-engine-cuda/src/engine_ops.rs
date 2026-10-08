@@ -522,16 +522,16 @@ pub const ROUTER_CHUNK: u32 = 128;
 /// The largest token count the router runs in its one-token form; larger
 /// counts take the tiled form.
 ///
-/// Chosen from the one-token form's device time per launch on a B300
-/// (`moe_kernel_bench`, MiMo-V2.6-Flash shapes): 20.5 µs at 1, 2 and 4
-/// tokens, 21.6 µs at 8, then growing with the token count (38.3 µs at 16,
-/// 92 µs at 64, 629 µs at 513, 2,462 µs at 2,048), because each cluster
-/// reads the whole 2 MiB router weight for its one token. The tiled form
-/// reads it once per eight tokens, so it takes over where the one-token
-/// form stops being flat. Both forms give identical ids and weights, so this
-/// moves only time; `moe_kernel_bench` prints both forms at every token count
-/// to retune it.
-pub const ROUTER_PER_TOKEN_MAX: u32 = 8;
+/// Chosen from both forms' device time per launch on a B300
+/// (`moe_kernel_bench`, MiMo-V2.6-Flash shapes). The one-token form costs
+/// 20.5 µs at 1–6 tokens, 21.6 µs at 8–12, 38.3 µs at 16 and 38.9 µs at 24,
+/// then 57 µs at 32 and 92 µs at 64, because each cluster reads the whole
+/// 2 MiB router weight for its one token. The tiled form reads it once per
+/// eight tokens and costs 43–50 µs from 1 to 64 tokens. The one-token form is
+/// the faster up to 24 tokens and the tiled from 32. Both forms give
+/// identical ids and weights, so this moves only time; `moe_kernel_bench`
+/// prints both forms at every token count to retune it.
+pub const ROUTER_PER_TOKEN_MAX: u32 = 24;
 
 /// Which router kernel a launch runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -726,7 +726,7 @@ mod tests {
                 "{tokens}"
             );
         }
-        for tokens in [ROUTER_PER_TOKEN_MAX + 1, 16, 64, 128, 513, 8192, u32::MAX] {
+        for tokens in [ROUTER_PER_TOKEN_MAX + 1, 32, 64, 128, 513, 8192, u32::MAX] {
             assert_eq!(
                 RouterForm::for_tokens(tokens),
                 RouterForm::Tiled,

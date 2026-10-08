@@ -131,9 +131,11 @@ extern "C" __global__ void __launch_bounds__(kThreads)
       const uint32_t j = d % H;
       const float cosv = cs[j], sinv = cs[H + j];
       const float x1 = bf16f(src[j]), x2 = bf16f(src[j + H]);
-      // x1 * cos - x2 * sin and x2 * cos + x1 * sin, each the fused
-      // multiply-add of the first product onto the rounded second.
-      v = d < H ? __fmaf_rn(x1, cosv, -__fmul_rn(x2, sinv)) : __fmaf_rn(x2, cosv, __fmul_rn(x1, sinv));
+      // x1 * cos - x2 * sin fuses the first product onto the rounded second;
+      // x2 * cos + x1 * sin fuses the second product onto the rounded first.
+      // Both are the contractions the reference form compiles to, so every
+      // rotated element is bit-identical to it.
+      v = d < H ? __fmaf_rn(x1, cosv, -__fmul_rn(x2, sinv)) : __fmaf_rn(x1, sinv, __fmul_rn(x2, cosv));
     }
     if (head < a.q_heads_per_chunk) {
       const uint32_t qh = c * a.q_heads_per_chunk + head;
