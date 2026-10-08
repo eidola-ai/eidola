@@ -855,6 +855,7 @@ mod tests {
                 &[],
                 false,
                 false,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -863,6 +864,7 @@ mod tests {
                 &[],
                 true,
                 false,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -871,6 +873,7 @@ mod tests {
                 &[],
                 true,
                 true,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -879,6 +882,7 @@ mod tests {
                 &tools,
                 false,
                 false,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -887,6 +891,7 @@ mod tests {
                 &tools,
                 true,
                 false,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -895,6 +900,7 @@ mod tests {
                 &tools,
                 true,
                 true,
+                None,
             ),
         ];
 

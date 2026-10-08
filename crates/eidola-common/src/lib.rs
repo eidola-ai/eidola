@@ -3,12 +3,14 @@
 //! This crate holds the small pieces of pure logic that MUST be bit-identical
 //! on both sides of a contract boundary — the anonymous-credit pricing
 //! contract for chat-completion prompt holds ([`chargeable_prompt_tokens`]),
-//! outer chat-request construction ([`chat_completion_request_body`]), and
-//! the embed-marker recognition rule shared between the markdown editor's
-//! embed plugin and app-core's upstream quote expansion ([`embed`]). It is
-//! intentionally lib-only, pure Rust, and float-free so `eidola-app-core`,
-//! `eidola-server-gateway`, and tests can depend on it and compute identical results
-//! on any platform.
+//! outer chat-request construction ([`chat_completion_request_body`]), the
+//! wire contract shared by clients, the gateway and the inference nodes
+//! ([`engine_protocol`]: the prefix-cache key's shape and the weights
+//! header), and the embed-marker recognition rule shared between the
+//! markdown editor's embed plugin and app-core's upstream quote expansion
+//! ([`embed`]). It is intentionally lib-only, pure Rust, and float-free so
+//! `eidola-app-core`, `eidola-server-gateway`, `eidola-server-engine`, and
+//! tests can depend on it and compute identical results on any platform.
 //!
 //! # The dependency rule
 //!
@@ -23,11 +25,11 @@
 //! > set is `serde_json`. Any addition needs the same argument written
 //! > down.
 //!
-//! `serde_json` qualifies on both counts: every consumer (app-core, server,
-//! gui; cli via app-core) already carries it, so admitting it adds no code,
-//! no trust surface, and no compile time to any binary — and it is what
-//! lets [`prompt_charge`] be the single walk both sides call rather than
-//! two implementations held together by a test.
+//! `serde_json` qualifies on both counts: every consumer (app-core, gateway,
+//! inference node, gui; cli via app-core) already carries it, so admitting it
+//! adds no code, no trust surface, and no compile time to any binary — and
+//! it is what lets [`prompt_charge`] be the single walk both sides call
+//! rather than two implementations held together by a test.
 //!
 //! # The prompt-hold pricing contract
 //!
@@ -100,6 +102,7 @@
 //! is for the walk, never for the accounting semantics.
 
 pub mod embed;
+pub mod engine_protocol;
 
 use serde_json::Value;
 
@@ -113,6 +116,13 @@ use serde_json::Value;
 ///
 /// An empty `tools` slice omits the field. `include_usage` only matters for a
 /// streaming request; it adds the local-engine `stream_options` request.
+///
+/// `cache_key` is the prefix-cache key ([`engine_protocol`]): `None` omits the
+/// field, so a body built without one is byte-for-byte the body built before
+/// the field existed. A key that is not [`engine_protocol::is_cache_key_text`]
+/// is a caller bug and panics rather than reaching a server that would refuse
+/// it. The key is secret: the returned `Value` holds a copy the caller is
+/// responsible for, and nothing here scrubs it.
 pub fn chat_completion_request_body(
     model: &str,
     messages: &[Value],
@@ -120,6 +130,7 @@ pub fn chat_completion_request_body(
     tools: &[Value],
     stream: bool,
     include_usage: bool,
+    cache_key: Option<&str>,
 ) -> Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -134,6 +145,13 @@ pub fn chat_completion_request_body(
         if include_usage {
             body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
+    }
+    if let Some(key) = cache_key {
+        assert!(
+            engine_protocol::is_cache_key_text(key),
+            "cache_key must be 32 bytes, base64url without padding"
+        );
+        body["cache_key"] = Value::String(key.to_owned());
     }
     body
 }
@@ -396,6 +414,56 @@ fn content_bytes(content: Option<&Value>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // chat_completion_request_body: the cache key is opt-in
+    // -----------------------------------------------------------------
+
+    /// Without a cache key the body is exactly the bytes it was before the
+    /// parameter existed: every shape a client sends today, serialized and
+    /// compared with the same body written out by hand, in construction
+    /// order.
+    #[test]
+    fn a_body_without_a_cache_key_is_unchanged() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        let cases = [
+            (
+                chat_completion_request_body("m", &messages, 256, &[], false, false, None),
+                serde_json::json!({
+                    "model": "m", "messages": messages, "max_completion_tokens": 256,
+                }),
+            ),
+            (
+                chat_completion_request_body("m", &messages, 256, &tools, true, true, None),
+                serde_json::json!({
+                    "model": "m", "messages": messages, "max_completion_tokens": 256,
+                    "tools": tools, "stream": true,
+                    "stream_options": {"include_usage": true},
+                }),
+            ),
+        ];
+        for (built, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&built).unwrap(),
+                serde_json::to_string(&expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_cache_key_is_carried_as_given() {
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let body = chat_completion_request_body("m", &messages, 1, &[], false, false, Some(key));
+        assert_eq!(body["cache_key"], key);
+    }
+
+    #[test]
+    #[should_panic(expected = "cache_key must be 32 bytes")]
+    fn a_malformed_cache_key_is_a_caller_bug() {
+        chat_completion_request_body("m", &[], 1, &[], false, false, Some("short"));
+    }
 
     #[test]
     fn zero_messages_charges_only_the_per_request_constant() {

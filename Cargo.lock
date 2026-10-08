@@ -3104,6 +3104,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidola-server-engine"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "axum",
+ "base64 0.23.1",
+ "eidola-common",
+ "eidola-engine",
+ "eidola-engine-chat",
+ "eidola-engine-cpu",
+ "eidola-engine-model",
+ "flate2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "reqwest",
+ "rustix 1.1.5",
+ "rustls",
+ "rustls-rustcrypto",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
 name = "eidola-server-gateway"
 version = "0.1.0"
 dependencies = [
@@ -3153,36 +3184,6 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "x509-cert 0.2.5",
-]
-
-[[package]]
-name = "eidola-server-engine"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "axum",
- "base64 0.23.1",
- "eidola-engine",
- "eidola-engine-chat",
- "eidola-engine-cpu",
- "eidola-engine-model",
- "flate2",
- "futures-util",
- "getrandom 0.4.3",
- "hex",
- "reqwest",
- "rustix 1.1.5",
- "rustls",
- "rustls-rustcrypto",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "subtle",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zeroize",
 ]
 
 [[package]]

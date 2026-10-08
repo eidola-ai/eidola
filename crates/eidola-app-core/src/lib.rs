@@ -12876,6 +12876,9 @@ impl TurnPrep {
             &self.tool_schemas,
             stream,
             stream && self.spend.is_none(),
+            // No prefix-cache key yet: the turn sends none, so no engine
+            // prefix is shared beyond the request itself.
+            None,
         )
     }
 

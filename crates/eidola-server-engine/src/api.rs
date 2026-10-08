@@ -11,6 +11,7 @@
 //! prints both (`eidola-engine-chat/AGENTS.md`).
 
 use base64::Engine as _;
+use eidola_common::engine_protocol::{CACHE_KEY_BYTES, CACHE_KEY_TEXT_LEN};
 use eidola_engine::secret::CacheKey;
 use eidola_engine_chat::json::{self as chat_json, Json};
 use serde::Deserialize;
@@ -277,7 +278,7 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
 fn decode_cache_key(text: CacheKeyText) -> Result<CacheKey, ApiError> {
     // Room for any 43-character input; a longer one is refused before decoding.
     let mut buf = [0u8; 48];
-    let decoded = if text.as_str().len() == 43 {
+    let decoded = if text.as_str().len() == CACHE_KEY_TEXT_LEN {
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode_slice(text.as_str().as_bytes(), &mut buf)
     } else {
@@ -285,7 +286,7 @@ fn decode_cache_key(text: CacheKeyText) -> Result<CacheKey, ApiError> {
     };
     drop(text);
     let result = match decoded {
-        Ok(32) => {
+        Ok(CACHE_KEY_BYTES) => {
             let key: &mut [u8; 32] = (&mut buf[..32]).try_into().expect("32 bytes");
             Ok(CacheKey::from_buffer(key))
         }
@@ -360,5 +361,41 @@ mod tests {
         let scrubs = take_scrubs();
         assert_eq!(scrubs.len(), 1, "{scrubs:?}");
         assert!(scrubs[0].1);
+    }
+
+    /// The decoder accepts exactly the texts the shared shape rule
+    /// (`eidola_common::engine_protocol::is_cache_key_text`) accepts, which is
+    /// what the gateway checks before a request is paid for: every final
+    /// character after a valid prefix, and lengths, alphabets and padding
+    /// around it.
+    #[test]
+    fn the_decoder_agrees_with_the_shared_shape_rule() {
+        let prefix = &KEY[..42];
+        let mut texts: Vec<String> = (0u8..=255)
+            .filter_map(|b| char::from_u32(b.into()))
+            .map(|c| format!("{prefix}{c}"))
+            .collect();
+        texts.extend([
+            String::new(),
+            prefix.to_string(),
+            format!("{KEY}A"),
+            format!("{prefix}="),
+            format!("+{}", &KEY[1..]),
+            format!("/{}", &KEY[1..]),
+            "_-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJK".to_string(),
+            "_-0123456789abcdefghijklmnopqrstuvwxyzABCDE".to_string(),
+            "_-0123456789abcdefghijklmnopqrstuvwxyzABCDF".to_string(),
+            "_-0123456789abcdefghijklmnopqrstuvwxyzABCDA".to_string(),
+        ]);
+        let mut accepted = 0;
+        for text in texts {
+            let shared = eidola_common::engine_protocol::is_cache_key_text(&text);
+            let decoded = decode_cache_key(CacheKeyText(text.clone())).is_ok();
+            assert_eq!(decoded, shared, "{text:?}");
+            accepted += usize::from(decoded);
+        }
+        // Sixteen canonical final characters after the zero prefix, and the
+        // two mixed-alphabet keys ending in `E` and `A`.
+        assert_eq!(accepted, 18);
     }
 }

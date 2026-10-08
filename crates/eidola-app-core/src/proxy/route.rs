@@ -1100,6 +1100,9 @@ impl Inner {
             // upstream for its own refunds — asking or not asking changes
             // nothing there.)
             stream && request.include_usage,
+            // The proxy relays no prefix-cache key: `cache_key` is not one of
+            // the body fields it reads from a downstream caller.
+            None,
         );
         if let Some(object) = body.as_object_mut() {
             for (key, value) in [

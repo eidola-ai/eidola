@@ -17,6 +17,9 @@ name = "eidola-server-engine"
 path = "src/main.rs"
 
 [dependencies]
+# The wire contract shared with clients and the gateway (the cache key's shape,
+# the weights header).
+eidola-common = { path = "../eidola-common" }
 eidola-engine = { path = "../eidola-engine" }
 eidola-engine-chat = { path = "../eidola-engine-chat" }
 eidola-engine-cpu = { path = "../eidola-engine-cpu" }
