@@ -777,6 +777,12 @@ mod tests {
             "stride below the heads"
         );
         assert!(qkv_grid(1, &args(1, 3392)).is_ok());
+        // A count that is not whole blocks rounds up: 3 x 3,392 = 10,176.
+        let three = QkvArgs {
+            chunks: 3,
+            ..args(1, 3392)
+        };
+        assert_eq!(qkv_grid(2, &three).unwrap(), [2, 40, 1]);
         assert!(
             qkv_grid(
                 1,
