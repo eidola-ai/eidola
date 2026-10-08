@@ -1,0 +1,20 @@
+{
+  "weights": {
+    "repo": "example/fixture-model",
+    "revision": "4444444444444444444444444444444444444444"
+  },
+  "expected_gpus": 8,
+  "tdx_policy": {
+    "mr_seam": [
+      "555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"
+    ],
+    "td_attributes": "0000001000000000",
+    "xfam": "e702060000000000",
+    "minimum_tee_tcb_svn": "06010300000000000000000000000000",
+    "minimum_tcb_evaluation_data_number": 17,
+    "qe_vendor_id": "939a7233f79c4ca9940a0db3957f0607",
+    "dynamic_platform": "true",
+    "cached_keys": "true",
+    "smt_enabled": "false"
+  }
+}

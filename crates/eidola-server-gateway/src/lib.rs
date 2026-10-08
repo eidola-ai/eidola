@@ -13,6 +13,7 @@ pub mod auth;
 pub mod backend;
 pub mod credentials;
 pub mod db;
+pub mod engine_trust;
 pub mod error;
 pub mod handlers;
 pub mod helpers;

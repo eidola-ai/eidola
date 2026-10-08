@@ -209,6 +209,16 @@ pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwe
     })
 }
 
+/// Validate pins exactly as [`attesting_client`] compiles them, without
+/// building a client: every hex field decoded at its width, a TDX policy's
+/// safety bits and non-empty MR_SEAM allowlist enforced. A pin that passes
+/// here is one `attesting_client` accepts, so a consumer can refuse a bad pin
+/// set where it is authored (the gateway does so at build time) rather than
+/// at its first connection.
+pub fn validate_pins(pins: &[AllowedMeasurement]) -> Result<(), Error> {
+    measurement::compile_pins(pins).map(|_| ())
+}
+
 /// Extract the bare host (no scheme, no port, no path) from an inference base URL.
 ///
 /// Used as the `Host` header in the per-handshake inline attestation request.

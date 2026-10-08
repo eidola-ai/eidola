@@ -64,6 +64,87 @@ pub struct ChatCompletionRequest {
     /// pass-through for the same reason as [`Self::tools`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+
+    /// The client's prefix-cache key: 32 bytes, base64url without padding
+    /// (`eidola_common::engine_protocol`). An Eidola-hosted engine scopes
+    /// prefix-cache reuse to requests carrying the same key; without one,
+    /// nothing a request computes is reused by any other.
+    ///
+    /// **Secret, and never serialized.** It is held decoded in a
+    /// scrubbed-on-drop buffer, prints redacted, and `Serialize` skips it, so
+    /// re-serializing a request for the Tinfoil upstream (which has no use
+    /// for it) cannot carry it there. The one writer is
+    /// `engine_trust::protocol::engine_request_body`.
+    // `skip_serializing_if` with a predicate that always skips, rather than
+    // `skip_serializing`, so the OpenAPI schema (which drops a
+    // `skip_serializing` field) still documents the field clients may send.
+    #[serde(default, skip_serializing_if = "never_serialized")]
+    #[schema(value_type = Option<String>, min_length = 43, max_length = 43, pattern = "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$")]
+    pub cache_key: Option<CacheKey>,
+}
+
+/// The `skip_serializing_if` predicate of a member that is never serialized.
+fn never_serialized<T>(_: &T) -> bool {
+    true
+}
+
+/// A client's decoded prefix-cache key.
+///
+/// Deserialized from its wire text, which must satisfy
+/// `eidola_common::engine_protocol::is_cache_key_text`; the text is scrubbed
+/// once decoded, and a refusal names the rule, never the value. Copies out of
+/// reach here: the request body's bytes in the HTTP stack's buffers, and
+/// `serde_json`'s scratch buffer when the JSON string uses escapes.
+#[derive(Clone)]
+pub struct CacheKey(Box<zeroize::Zeroizing<[u8; eidola_common::engine_protocol::CACHE_KEY_BYTES]>>);
+
+impl CacheKey {
+    /// The key's bytes.
+    pub fn as_bytes(&self) -> &[u8; eidola_common::engine_protocol::CACHE_KEY_BYTES] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for CacheKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CacheKey(<redacted>)")
+    }
+}
+
+/// Refuses, always: a request's `cache_key` is skipped when the request
+/// serializes, and this impl exists only because that skip is spelled as a
+/// predicate. Nothing may serialize a key by accident.
+impl Serialize for CacheKey {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("a cache key is never serialized"))
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use base64::Engine as _;
+        use eidola_common::engine_protocol::{CACHE_KEY_BYTES, is_cache_key_text};
+
+        let text = zeroize::Zeroizing::new(String::deserialize(d)?);
+        if !is_cache_key_text(&text) {
+            return Err(serde::de::Error::custom(
+                "cache_key must be 32 bytes, base64url without padding",
+            ));
+        }
+        let mut key = Box::new(zeroize::Zeroizing::new([0u8; CACHE_KEY_BYTES]));
+        // The decoder wants room for its length estimate; the slack is
+        // scrubbed with the buffer.
+        let mut buf = zeroize::Zeroizing::new([0u8; CACHE_KEY_BYTES + 3]);
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode_slice(text.as_bytes(), &mut buf[..]);
+        if decoded != Ok(CACHE_KEY_BYTES) {
+            return Err(serde::de::Error::custom(
+                "cache_key must be 32 bytes, base64url without padding",
+            ));
+        }
+        key.copy_from_slice(&buf[..CACHE_KEY_BYTES]);
+        Ok(Self(key))
+    }
 }
 
 /// Deserialize a real client body through the server's strict request type.
@@ -440,6 +521,9 @@ pub struct Model {
     /// Which public output-budget ladder this model draws from.
     pub output_budget_class: OutputBudgetClass,
 
+    /// Who runs the inference for this model.
+    pub hosting: ModelHosting,
+
     /// What this model can do.
     pub capabilities: ModelCapabilities,
 
@@ -462,6 +546,83 @@ impl Capability {
     /// A leaf carrying `supported`.
     pub const fn new(supported: bool) -> Self {
         Self { supported }
+    }
+}
+
+/// Who runs a model's inference, as the catalog declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelHosting {
+    /// Tinfoil's inference service, reached through its router enclave.
+    Tinfoil,
+    /// Eidola's own inference engine, in deployments this gateway build pins
+    /// by measurement and by weights hash.
+    Eidola,
+}
+
+/// Prompt-cache reuse across requests.
+///
+/// `supported` means requests to this model may carry a `cache_key`, and that
+/// requests carrying the same key can reuse each other's computed prompt
+/// prefix. The two bounds are the serving deployments' measured retention:
+/// a prefix nothing has used for `idle_ttl_secs`, or any prefix older than
+/// `max_age_secs`, is never reused and is zeroed. Both are absent when
+/// `supported` is false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PromptCacheCapability {
+    /// Whether requests may carry a `cache_key`.
+    pub supported: bool,
+    /// Longest a cached prefix stays reusable without being used, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_ttl_secs: Option<u64>,
+    /// Longest a cached prefix stays reusable at all, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_secs: Option<u64>,
+}
+
+impl PromptCacheCapability {
+    /// No prompt-cache reuse.
+    pub const fn unsupported() -> Self {
+        Self {
+            supported: false,
+            idle_ttl_secs: None,
+            max_age_secs: None,
+        }
+    }
+}
+
+/// The exact weights a model is served from, when this gateway pins them.
+///
+/// `supported` means this gateway build accepts only deployments serving the
+/// weights hashed here, and tells each one so on every request. `sha256` is
+/// the engine's weights hash (a SHA-256 over the manifest of every file the
+/// engine reads from its weights directory); `repo` and `revision` say where
+/// those files were taken from. All three are absent when `supported` is
+/// false.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PinnedWeightsCapability {
+    /// Whether the weights are pinned by this gateway.
+    pub supported: bool,
+    /// The weights hash, lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// The source repository, `<owner>/<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The source repository's revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+impl PinnedWeightsCapability {
+    /// Weights this gateway does not pin.
+    pub const fn unsupported() -> Self {
+        Self {
+            supported: false,
+            sha256: None,
+            repo: None,
+            revision: None,
+        }
     }
 }
 
@@ -494,7 +655,8 @@ pub enum OutputBudgetClass {
 ///
 /// Only axes that actually vary across the models this server sells are
 /// carried. An axis every model shares tells a client nothing and is one more
-/// assertion that has to stay true.
+/// assertion that has to stay true. `prompt_cache` and `pinned_weights` are
+/// the axes on which an Eidola-hosted row differs from a Tinfoil-hosted one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ModelCapabilities {
     /// Whether the model accepts a `tools` request field.
@@ -512,6 +674,13 @@ pub struct ModelCapabilities {
 
     /// The content kinds the model produces.
     pub output_modalities: Vec<Modality>,
+
+    /// Whether, and for how long, requests may reuse each other's prompt
+    /// prefix (`cache_key`).
+    pub prompt_cache: PromptCacheCapability,
+
+    /// The weights this gateway pins for the model, and where they came from.
+    pub pinned_weights: PinnedWeightsCapability,
 }
 
 /// Pricing for a model in scaled integer credits per token (or per request).
@@ -855,6 +1024,7 @@ mod tests {
                 &[],
                 false,
                 false,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -863,6 +1033,7 @@ mod tests {
                 &[],
                 true,
                 false,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -871,6 +1042,7 @@ mod tests {
                 &[],
                 true,
                 true,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -879,6 +1051,7 @@ mod tests {
                 &tools,
                 false,
                 false,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -887,6 +1060,7 @@ mod tests {
                 &tools,
                 true,
                 false,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -895,6 +1069,7 @@ mod tests {
                 &tools,
                 true,
                 true,
+                None,
             ),
         ];
 
@@ -1087,6 +1262,128 @@ mod tests {
                 original["choices"][0]["finish_reason"]
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // cache_key: accepted, held secret, never forwarded by serialization
+    // -----------------------------------------------------------------
+
+    /// 32 bytes 0x00..0x1f, base64url without padding.
+    const CACHE_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+    fn with_cache_key(key: &str) -> String {
+        format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"cache_key":"{key}"}}"#
+        )
+    }
+
+    #[test]
+    fn a_well_formed_cache_key_is_accepted_and_decoded() {
+        let request: ChatCompletionRequest =
+            serde_json::from_str(&with_cache_key(CACHE_KEY)).unwrap();
+        let key = request.cache_key.as_ref().expect("cache_key parsed");
+        let expected: Vec<u8> = (0u8..32).collect();
+        assert_eq!(key.as_bytes().as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn a_malformed_cache_key_is_refused_without_echoing_it() {
+        let secretish = "SECRETSECRETSECRETSECRETSECRETSECRETSECRE";
+        for bad in [
+            secretish,                                     // 41 characters
+            &format!("{}=", &CACHE_KEY[..42]),             // padding
+            &format!("{}B", &CACHE_KEY[..42]),             // non-canonical final character
+            "+/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // standard alphabet
+        ] {
+            let err = serde_json::from_str::<ChatCompletionRequest>(&with_cache_key(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cache_key must be 32 bytes"), "{err}");
+            assert!(!err.contains(bad), "the refusal quoted the key: {err}");
+        }
+        let err = serde_json::from_str::<ChatCompletionRequest>(
+            r#"{"model":"m","messages":[],"cache_key":5}"#,
+        );
+        assert!(err.is_err());
+    }
+
+    /// The OpenAPI pattern published for `cache_key` admits exactly the
+    /// texts the decoder accepts: every byte in every position class (a
+    /// leading character, a middle one, the final one), after an otherwise
+    /// valid key, and keys of the wrong length.
+    #[test]
+    fn the_published_cache_key_pattern_is_the_decoders() {
+        let schema =
+            serde_json::to_value(<ChatCompletionRequest as utoipa::PartialSchema>::schema())
+                .unwrap();
+        let pattern = schema["properties"]["cache_key"]["pattern"]
+            .as_str()
+            .expect("cache_key publishes a pattern");
+        let pattern = regex::Regex::new(pattern).unwrap();
+
+        let mut texts = vec![
+            String::new(),
+            CACHE_KEY[..42].to_string(),
+            format!("{CACHE_KEY}A"),
+        ];
+        for b in 0u8..=255 {
+            let Some(c) = char::from_u32(b.into()) else {
+                continue;
+            };
+            texts.push(format!("{}{c}", &CACHE_KEY[..42]));
+            texts.push(format!("{c}{}", &CACHE_KEY[1..]));
+            texts.push(format!("{}{c}{}", &CACHE_KEY[..20], &CACHE_KEY[21..]));
+        }
+        let mut accepted = 0;
+        for text in texts {
+            let published = pattern.is_match(&text);
+            let decoded = serde_json::from_value::<CacheKey>(text.clone().into()).is_ok();
+            assert_eq!(published, decoded, "{text:?}");
+            accepted += usize::from(decoded);
+        }
+        // 16 canonical finals, plus 64 leading and 64 middle characters (one
+        // of each pair is the original key).
+        assert_eq!(accepted, 16 + 64 + 64);
+    }
+
+    #[test]
+    fn a_cache_key_never_prints() {
+        let request: ChatCompletionRequest =
+            serde_json::from_str(&with_cache_key(CACHE_KEY)).unwrap();
+        let printed = format!("{request:?}");
+        assert!(printed.contains("CacheKey(<redacted>)"), "{printed}");
+        assert!(!printed.contains(CACHE_KEY));
+    }
+
+    /// The request re-serializes for the Tinfoil upstream without the key:
+    /// `backend.rs` forwards `.json(request)`, and the key is not something
+    /// that upstream may see.
+    #[test]
+    fn a_cache_key_is_never_serialized() {
+        let request: ChatCompletionRequest =
+            serde_json::from_str(&with_cache_key(CACHE_KEY)).unwrap();
+        let forwarded = serde_json::to_string(&request).unwrap();
+        assert!(!forwarded.contains("cache_key"), "{forwarded}");
+        assert!(!forwarded.contains(CACHE_KEY), "{forwarded}");
+        let cloned = serde_json::to_string(&request.clone()).unwrap();
+        assert!(!cloned.contains("cache_key"));
+        // And the key alone refuses to serialize.
+        assert!(serde_json::to_string(request.cache_key.as_ref().unwrap()).is_err());
+    }
+
+    #[test]
+    fn the_shared_body_with_a_cache_key_is_accepted() {
+        let body = eidola_common::chat_completion_request_body(
+            "test-model",
+            &[serde_json::json!({"role": "user", "content": "Hello."})],
+            256,
+            &[],
+            true,
+            true,
+            Some(CACHE_KEY),
+        );
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        assert!(request.cache_key.is_some());
     }
 
     #[test]

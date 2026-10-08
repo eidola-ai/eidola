@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "models": {
+    "fixture-model": [
+      {
+        "config": "deploy/engine/fixture-model/tdx-a/tinfoil-config.yml",
+        "config_sha256": "8ba12457d0c453e22e39112a68601461636a6a315a9b911d49466387a61aff0a",
+        "cvm_version": "0.15.0@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "pin": {
+          "platform": {
+            "tdx": {
+              "mrtd": "666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666",
+              "mrconfigid": "8ba12457d0c453e22e39112a68601461636a6a315a9b911d49466387a61aff0a00000000000000000000000000000000",
+              "policy": {
+                "mr_seam": [
+                  "555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"
+                ],
+                "td_attributes": "0000001000000000",
+                "xfam": "e702060000000000",
+                "minimum_tee_tcb_svn": "06010300000000000000000000000000",
+                "minimum_tcb_evaluation_data_number": 17,
+                "qe_vendor_id": "939a7233f79c4ca9940a0db3957f0607",
+                "dynamic_platform": "true",
+                "cached_keys": "true",
+                "smt_enabled": "false"
+              }
+            }
+          },
+          "expected_gpus": 8
+        },
+        "weights": {
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "repo": "example/fixture-model",
+          "revision": "4444444444444444444444444444444444444444"
+        },
+        "prompt_cache": {
+          "enabled": true,
+          "idle_ttl_secs": 900,
+          "max_age_secs": 7200
+        }
+      }
+    ]
+  }
+}

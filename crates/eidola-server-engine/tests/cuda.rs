@@ -3,8 +3,8 @@
 //! Without a device: the configuration (the executor's settings required with it and the
 //! CPU's refused), the boot order (storage, weights hash and model files before anything
 //! of the executor's), the executor's own refusal of a model it does not support, the
-//! node's refusals before the device (drafting, a KV budget that cannot hold one
-//! sequence), and a device-less machine failing closed, in process and as the real
+//! refusals before the device (drafting and an oversized block in the grammar, a KV
+//! budget that cannot hold one sequence in the node), and a device-less machine failing closed, in process and as the real
 //! binary, with nothing served and no CPU fallback.
 //!
 //! With a device (`EIDOLA_TEST_CUDA_WEIGHTS` and `EIDOLA_ENGINE_KERNELS_DIR`): the node
@@ -106,6 +106,19 @@ fn cuda_settings_are_required_with_it_and_the_cpus_refused() {
         let err = config_from(&map).unwrap_err();
         assert!(err.contains(env::KV_DEVICE_BYTES), "{bad}: {err}");
     }
+    // An absolute, clean path.
+    for bad in [
+        "kernels",
+        "/",
+        "/opt/../kernels",
+        "/opt//kernels",
+        "/opt/kernels/",
+    ] {
+        let mut map = full.clone();
+        map.insert(env::KERNELS_DIR, bad.into());
+        let err = config_from(&map).unwrap_err();
+        assert!(err.contains(env::KERNELS_DIR), "{bad}: {err}");
+    }
     // Exactly `on` or `off`.
     for bad in ["ON", "true", "1", "auto", "on "] {
         let mut map = full.clone();
@@ -155,25 +168,29 @@ fn an_unsupported_model_is_refused_by_the_executor_before_the_device() {
     assert!(err.contains("hidden_size"), "{err}");
 }
 
-/// The node's own refusals come before the device too.
+/// Drafting, and a block size past its cap, are refused by the configuration grammar;
+/// a KV budget that cannot hold one sequence is the node's refusal, before the device.
 #[test]
 fn drafting_and_a_small_kv_budget_are_refused_before_the_device() {
     let (dir, hash) = flash_shaped_dir();
     let mut map = cuda_env(dir, hash);
     map.insert(env::DRAFT_TOKENS, "2".into());
-    let err = boot_err(&map);
-    assert!(err.contains(env::DRAFT_TOKENS), "{err}");
+    let err = config_from(&map).unwrap_err();
+    assert!(
+        err.contains(env::DRAFT_TOKENS) && err.contains("cuda"),
+        "{err}"
+    );
 
     let mut map = cuda_env(dir, hash);
     map.insert(env::KV_DEVICE_BYTES, (1u64 << 20).to_string());
     let err = boot_err(&map);
     assert!(err.contains(env::KV_DEVICE_BYTES), "{err}");
 
-    // A KV geometry the executor cannot index is the executor's refusal.
+    // A block size the executor could not index never reaches it.
     let mut map = cuda_env(dir, hash);
     map.insert(env::KV_BLOCK_SIZE, "16777217".into());
-    let err = boot_err(&map);
-    assert!(err.contains("KV geometry"), "{err}");
+    let err = config_from(&map).unwrap_err();
+    assert!(err.contains(env::KV_BLOCK_SIZE), "{err}");
 }
 
 /// A configuration the executor accepts on the host fails closed at the device: on a

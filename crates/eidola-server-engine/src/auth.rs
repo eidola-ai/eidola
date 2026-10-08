@@ -39,18 +39,20 @@ impl GatewayToken {
     pub fn verify(mut token: String, hash: &str) -> Result<Self, String> {
         use argon2::PasswordVerifier;
         let result = (|| {
-            let parsed = argon2::PasswordHash::new(hash).map_err(|_| {
-                format!(
-                    "{}: not a valid Argon2 hash string",
-                    crate::config::env::GATEWAY_TOKEN_HASH
-                )
-            })?;
-            if parsed.algorithm.as_str() != "argon2id" {
+            // The token shape the gateway holds its token to: a token outside it
+            // is refused before the node serves, whatever the hash says.
+            if !eidola_common::engine_deployment::is_gateway_token(&token) {
                 return Err(format!(
-                    "{}: must be an Argon2id hash",
-                    crate::config::env::GATEWAY_TOKEN_HASH
+                    "{} must be {} to {} visible ASCII characters",
+                    crate::config::env::GATEWAY_TOKEN,
+                    eidola_common::engine_deployment::GATEWAY_TOKEN_MIN_LEN,
+                    eidola_common::engine_deployment::GATEWAY_TOKEN_MAX_LEN
                 ));
             }
+            // The gateway's pin check reads the measured hash through this same
+            // function, so it accepts exactly the hashes this node boots with.
+            let parsed = eidola_common::engine_deployment::parse_gateway_token_hash(hash)
+                .map_err(|e| format!("{}: {e}", crate::config::env::GATEWAY_TOKEN_HASH))?;
             argon2::Argon2::default()
                 .verify_password(token.as_bytes(), &parsed)
                 .map_err(|_| {
@@ -95,19 +97,21 @@ mod tests {
 
     #[test]
     fn verifies_and_accepts_only_the_token() {
-        let t = GatewayToken::verify("s3cret".into(), &hash("s3cret")).unwrap();
-        assert!(t.accepts(Some(b"Bearer s3cret")));
-        assert!(!t.accepts(Some(b"Bearer s3cret ")));
-        assert!(!t.accepts(Some(b"bearer s3cret")));
-        assert!(!t.accepts(Some(b"s3cret")));
+        let t = GatewayToken::verify("s3cret-gateway-token".into(), &hash("s3cret-gateway-token"))
+            .unwrap();
+        assert!(t.accepts(Some(b"Bearer s3cret-gateway-token")));
+        assert!(!t.accepts(Some(b"Bearer s3cret-gateway-token ")));
+        assert!(!t.accepts(Some(b"bearer s3cret-gateway-token")));
+        assert!(!t.accepts(Some(b"s3cret-gateway-token")));
         assert!(!t.accepts(None));
         assert_eq!(format!("{t:?}"), "GatewayToken(<redacted>)");
     }
 
     #[test]
     fn refuses_mismatch_and_malformed_hashes_without_echoing() {
-        let e = GatewayToken::verify("s3cret".into(), &hash("other")).unwrap_err();
+        let e = GatewayToken::verify("s3cret-gateway-token".into(), &hash("other-gateway-token"))
+            .unwrap_err();
         assert!(!e.contains("s3cret") && !e.contains("other"), "{e}");
-        assert!(GatewayToken::verify("s3cret".into(), "not-a-hash").is_err());
+        assert!(GatewayToken::verify("s3cret-gateway-token".into(), "not-a-hash").is_err());
     }
 }

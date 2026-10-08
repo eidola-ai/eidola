@@ -18,6 +18,10 @@ name = "eidola-server-engine"
 path = "src/main.rs"
 
 [dependencies]
+# The wire contract shared with clients and the gateway (the cache key's shape,
+# the weights header), and the grammar of this node's measured configuration
+# the gateway checks its pins with (`engine_deployment`).
+eidola-common = { path = "../eidola-common", features = ["argon2"] }
 eidola-engine = { path = "../eidola-engine" }
 eidola-engine-chat = { path = "../eidola-engine-chat" }
 eidola-engine-cpu = { path = "../eidola-engine-cpu" }
@@ -37,7 +41,7 @@ sha2 = "0.11"
 subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = "0.3"
 zeroize = "1"
 
 [dev-dependencies]

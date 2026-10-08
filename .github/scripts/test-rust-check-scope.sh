@@ -47,6 +47,18 @@ assert_scope 'rust=true
 apple=false
 markdown=false
 oci=true' crates/eidola-apple/src/lib.rs
+# The gateway's build checks the engine pins against the committed engine
+# deployments, so a change to either must run the cargo gates (and, with
+# them, the OCI rehearsal).
+for engine_trust_path in \
+  releases/trust/engine-enclaves.json \
+  deploy/engine/some-model/some-variant/tinfoil-config.yml \
+  deploy/engine/some-model/some-variant/deployment.json; do
+  assert_scope 'rust=true
+apple=false
+markdown=false
+oci=true' "$engine_trust_path"
+done
 assert_scope 'rust=false
 apple=false
 markdown=false

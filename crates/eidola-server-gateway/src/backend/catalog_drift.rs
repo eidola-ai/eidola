@@ -53,7 +53,9 @@ use std::fmt;
 
 use serde::Deserialize;
 
-use super::{CatalogEntry, MODEL_CATALOG, Modality, NOT_SOLD_UPSTREAM_MODELS, UnsoldModel};
+use super::{
+    CatalogEntry, MODEL_CATALOG, Modality, ModelHosting, NOT_SOLD_UPSTREAM_MODELS, UnsoldModel,
+};
 
 /// The published list the catalog is transcribed from. Public and unkeyed —
 /// the scheduled run needs no secret.
@@ -208,7 +210,12 @@ fn drift_against(
 ) -> Vec<Drift> {
     let mut drifts = Vec::new();
 
-    for entry in catalog {
+    // Only rows Tinfoil serves were transcribed from its list; an
+    // Eidola-hosted row is pinned by `engine-enclaves.json` instead.
+    for entry in catalog
+        .iter()
+        .filter(|entry| entry.hosting == ModelHosting::Tinfoil)
+    {
         let Some(live) = upstream.iter().find(|m| m.id == entry.id) else {
             drifts.push(Drift::Gone {
                 id: entry.id.to_string(),
@@ -455,6 +462,7 @@ mod tests {
     fn a_faithful_list() -> Vec<UpstreamModel> {
         MODEL_CATALOG
             .iter()
+            .filter(|entry| entry.hosting == ModelHosting::Tinfoil)
             .map(mirror)
             .chain(NOT_SOLD_UPSTREAM_MODELS.iter().map(unsold_row))
             .collect()

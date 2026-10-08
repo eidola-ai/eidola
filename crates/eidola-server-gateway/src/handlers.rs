@@ -84,7 +84,7 @@ pub async fn list_models(
 /// already fully re-serializes to forward upstream, on the far side of an
 /// LLM call. Reconstructing the walk over the typed struct to avoid it would
 /// reintroduce exactly the drift the consolidation removed.
-fn chargeable_prompt_tokens_for(request: &ChatCompletionRequest) -> u64 {
+pub(crate) fn chargeable_prompt_tokens_for(request: &ChatCompletionRequest) -> u64 {
     let Ok(value) = serde_json::to_value(request) else {
         // Unreachable in practice (the request was deserialized from JSON and
         // every field is serializable). Falling back to the message count
@@ -951,6 +951,13 @@ async fn handle_streaming_request(
 /// expected u32`). Only the rejection *class* reaches the log path; the
 /// full detail still goes to the client in the rejection response — its
 /// own data, over its own attested connection.
+///
+/// Before any of that, the body's JSON shape is held to the limits an
+/// Eidola-hosted engine enforces (`eidola_common::engine_protocol::
+/// check_request_json`: at most `MAX_REQUEST_JSON_VALUES` values, nested at
+/// most `MAX_REQUEST_JSON_DEPTH` deep), with nothing parsed yet: a body the
+/// node would refuse for its size in values is refused here first, with a
+/// 400.
 pub struct LoggedJson<T>(pub T);
 
 impl<S, T> FromRequest<S> for LoggedJson<T>
@@ -959,9 +966,42 @@ where
     S: Send + Sync,
     T: DeserializeOwned,
 {
-    type Rejection = JsonRejection;
+    type Rejection = axum::response::Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = req.into_parts();
+        let bytes =
+            axum::body::Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+                .await
+                .map_err(|rejection| {
+                    warn!(
+                        payload_type = std::any::type_name::<T>(),
+                        "request body rejected: bytes error"
+                    );
+                    rejection.into_response()
+                })?;
+        // A malformed body goes on to axum's parse, which refuses it as it always has
+        // (and, since the scan counts values as it goes, holds no more of them before
+        // the error than the cap).
+        use eidola_common::engine_protocol::{JsonShapeError, check_request_json};
+        if let Err(shape @ (JsonShapeError::TooManyValues | JsonShapeError::TooDeep)) =
+            check_request_json(&bytes)
+        {
+            let class = if shape == JsonShapeError::TooDeep {
+                "too deep"
+            } else {
+                "too many values"
+            };
+            warn!(
+                payload_type = std::any::type_name::<T>(),
+                "request body rejected: {class} error"
+            );
+            return Err(ServerError::BadRequest {
+                message: shape.to_string(),
+            }
+            .into_response());
+        }
+        let req = Request::from_parts(parts, axum::body::Body::from(bytes));
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(Self(value)),
             Err(rejection) => {
@@ -978,7 +1018,7 @@ where
                     payload_type = std::any::type_name::<T>(),
                     "request body rejected: {class} error"
                 );
-                Err(rejection)
+                Err(rejection.into_response())
             }
         }
     }
@@ -987,8 +1027,53 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extractor's result over `body`: the value, or the refusal's status and text.
+    async fn extract(body: String) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
+        let req = Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        match LoggedJson::<serde_json::Value>::from_request(req, &()).await {
+            Ok(LoggedJson(v)) => Ok(v),
+            Err(response) => {
+                let status = response.status();
+                let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                Err((status, String::from_utf8_lossy(&text).into_owned()))
+            }
+        }
+    }
+
+    /// A body past the engine's JSON value or depth limit is refused with a 400 before
+    /// anything is parsed; one at the limits, and a malformed one, go on as before.
+    #[tokio::test]
+    async fn a_body_past_the_json_shape_limits_is_refused() {
+        use eidola_common::engine_protocol::{MAX_REQUEST_JSON_DEPTH, MAX_REQUEST_JSON_VALUES};
+        let bad = axum::http::StatusCode::BAD_REQUEST;
+        let values = |n: usize| format!("[{}0]", "0,".repeat(n - 2));
+        assert!(extract(values(MAX_REQUEST_JSON_VALUES)).await.is_ok());
+        let (status, text) = extract(values(MAX_REQUEST_JSON_VALUES + 1))
+            .await
+            .unwrap_err();
+        assert_eq!(status, bad);
+        assert!(text.contains("JSON values"), "{text}");
+        let nested = |d: usize| format!("{}{}", "[".repeat(d), "]".repeat(d));
+        assert!(extract(nested(MAX_REQUEST_JSON_DEPTH)).await.is_ok());
+        let (status, text) = extract(nested(MAX_REQUEST_JSON_DEPTH + 1))
+            .await
+            .unwrap_err();
+        assert_eq!(status, bad);
+        assert!(text.contains("deeper"), "{text}");
+        // Malformed JSON is axum's refusal, unchanged.
+        let (status, _) = extract("[1,".into()).await.unwrap_err();
+        assert_eq!(status, bad);
+    }
     use crate::types::{
-        Capability, Modality, ModelCapabilities, ModelPricing, OutputBudgetClass, ScaledPrice,
+        Capability, Modality, ModelCapabilities, ModelHosting, ModelPricing, OutputBudgetClass,
+        PinnedWeightsCapability, PromptCacheCapability, ScaledPrice,
     };
 
     /// A token-priced model with easy integer math at `PRICING_SCALE_FACTOR`:
@@ -1001,11 +1086,14 @@ mod tests {
             context_length: 8192,
             max_output_tokens: Some(4096),
             output_budget_class: OutputBudgetClass::Standard,
+            hosting: ModelHosting::Tinfoil,
             capabilities: ModelCapabilities {
                 tool_calling: Capability::new(true),
                 reasoning: Capability::new(false),
                 input_modalities: vec![Modality::Text],
                 output_modalities: vec![Modality::Text],
+                prompt_cache: PromptCacheCapability::unsupported(),
+                pinned_weights: PinnedWeightsCapability::unsupported(),
             },
             pricing: ModelPricing {
                 per_prompt_token: ScaledPrice {

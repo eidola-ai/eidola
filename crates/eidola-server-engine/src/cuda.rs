@@ -50,7 +50,9 @@ const RETENTION_POINTS: u64 = 3;
 /// the bytes charged to the budget are one block more per group than the count. Block
 /// bytes are the executor's own (`GroupGeometry::block_bytes`). The rule reads only
 /// measured values, never the device, so the same configuration derives the same counts
-/// on every node.
+/// on every node. Its least accepted budget is
+/// `eidola_common::engine_deployment::cuda_kv_min_bytes`, which the gateway's build
+/// holds every pinned deployment to; the two are kept equal by a test here.
 pub fn derive_kv_blocks(
     spec: &ModelSpec,
     kv_device_bytes: u64,
@@ -347,6 +349,37 @@ mod tests {
         // Not even the sliding windows fit.
         let e = derive_kv_blocks(&flash(), sliding_bytes - 1, &sizing(), &cache(true)).unwrap_err();
         assert!(e.0.contains("sliding"), "{e}");
+    }
+
+    /// The gateway's build holds a pinned deployment's budget to
+    /// `cuda_kv_min_bytes`; it is exactly the least this derivation accepts, across
+    /// block sizes, seats, step sizes and the cache switch.
+    #[test]
+    fn the_shared_minimum_is_the_derivations() {
+        use eidola_common::engine_deployment::cuda_kv_min_bytes;
+        for block in [1, 16, 64, 1024] {
+            for (seats, step) in [(1, 1), (8, 512), (64, 8192)] {
+                for enabled in [false, true] {
+                    let sizing = Sizing {
+                        kv_block_size: block,
+                        max_seqs: seats,
+                        max_batched_tokens: step,
+                        max_prefill_chunk: step,
+                        ..sizing()
+                    };
+                    let mut spec = flash();
+                    spec.block_size = block;
+                    let min = cuda_kv_min_bytes(&sizing, &cache(enabled));
+                    let at = (block, seats, step, enabled);
+                    derive_kv_blocks(&spec, min, &sizing, &cache(enabled))
+                        .unwrap_or_else(|e| panic!("{at:?}: {e}"));
+                    assert!(
+                        derive_kv_blocks(&spec, min - 1, &sizing, &cache(enabled)).is_err(),
+                        "{at:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -899,6 +899,13 @@ fn configuration_refuses_anything_missing_or_malformed() {
         (env::CACHE_MAX_AGE_SECS, "60"),
         (env::MODEL_ID, "has space"),
         (env::WEIGHTS_STORAGE, "readonly"),
+        // A decode row with 2 drafts costs 3 query tokens: refused by the
+        // configuration grammar, before any weight is loaded.
+        (env::MAX_BATCHED_TOKENS, "2"),
+        // Allocation-driving sizes are capped before anything is loaded.
+        (env::MAX_SEQS, "4294967295"),
+        (env::KV_BLOCK_SIZE, "1025"),
+        (env::MAX_REQUESTS, "4097"),
     ];
     for (key, value) in bad {
         let mut map = full.clone();
@@ -942,13 +949,36 @@ fn configuration_refuses_anything_missing_or_malformed() {
     assert!(config_from(&map).unwrap_err().contains("Argon2id"));
 }
 
+/// Boot refuses a gateway token outside the shape the gateway holds its own
+/// token to (`eidola_common::engine_deployment::is_gateway_token`), even one
+/// that verifies against its measured hash.
+#[test]
+fn boot_refuses_a_token_of_the_wrong_shape() {
+    use argon2::PasswordHasher;
+    for token in [
+        "has a space in it",
+        "line\nbreak-token-xx",
+        "non-ascii-tøken-xxx",
+        "short",
+    ] {
+        let hash = argon2::Argon2::default()
+            .hash_password(token.as_bytes())
+            .unwrap()
+            .to_string();
+        let mut map = env_map();
+        map.insert(env::GATEWAY_TOKEN, token.to_string());
+        map.insert(env::GATEWAY_TOKEN_HASH, hash);
+        let err = config_from(&map).unwrap_err();
+        assert!(err.contains("visible ASCII characters"), "{token:?}: {err}");
+        assert!(!err.contains(token), "{err}");
+    }
+}
+
 #[test]
 fn engine_sizing_is_checked_against_the_model() {
     for (key, value, needle) in [
         (env::DRAFT_TOKENS, "3", "MTP layers"),
         (env::MAX_MODEL_LEN, "5000", "max_position_embeddings"),
-        // A decode row with 2 drafts costs 3 query tokens.
-        (env::MAX_BATCHED_TOKENS, "2", "decode row"),
     ] {
         let mut map = env_map();
         map.insert(key, value.to_string());

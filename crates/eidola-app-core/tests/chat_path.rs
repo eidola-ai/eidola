@@ -154,8 +154,13 @@ fn assert_shared_request_body(body: &serde_json::Value, expected_stream: bool) {
             tools,
             expected_stream,
             include_usage,
+            None,
         ),
         "dispatch must send exactly the shared chat request body"
+    );
+    assert!(
+        body.get("cache_key").is_none(),
+        "the client sends no prefix-cache key"
     );
     eidola_server_gateway::types::test_chat_completion_request_is_accepted(body.clone())
         .expect("captured body must satisfy the server's strict request type");

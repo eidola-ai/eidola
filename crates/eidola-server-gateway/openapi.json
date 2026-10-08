@@ -1024,6 +1024,16 @@
           "messages"
         ],
         "properties": {
+          "cache_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's prefix-cache key: 32 bytes, base64url without padding\n(`eidola_common::engine_protocol`). An Eidola-hosted engine scopes\nprefix-cache reuse to requests carrying the same key; without one,\nnothing a request computes is reused by any other.\n\n**Secret, and never serialized.** It is held decoded in a\nscrubbed-on-drop buffer, prints redacted, and `Serialize` skips it, so\nre-serializing a request for the Tinfoil upstream (which has no use\nfor it) cannot carry it there. The one writer is\n`engine_trust::protocol::engine_request_body`.",
+            "maxLength": 43,
+            "minLength": 43,
+            "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+          },
           "max_completion_tokens": {
             "type": [
               "integer",
@@ -1826,6 +1836,7 @@
           "description",
           "context_length",
           "output_budget_class",
+          "hosting",
           "capabilities",
           "pricing"
         ],
@@ -1843,6 +1854,10 @@
           "description": {
             "type": "string",
             "description": "Short description of the model's capabilities."
+          },
+          "hosting": {
+            "$ref": "#/components/schemas/ModelHosting",
+            "description": "Who runs the inference for this model."
           },
           "id": {
             "type": "string",
@@ -1873,12 +1888,14 @@
       },
       "ModelCapabilities": {
         "type": "object",
-        "description": "What a model can do, as the catalog declares it.\n\nOnly axes that actually vary across the models this server sells are\ncarried. An axis every model shares tells a client nothing and is one more\nassertion that has to stay true.",
+        "description": "What a model can do, as the catalog declares it.\n\nOnly axes that actually vary across the models this server sells are\ncarried. An axis every model shares tells a client nothing and is one more\nassertion that has to stay true. `prompt_cache` and `pinned_weights` are\nthe axes on which an Eidola-hosted row differs from a Tinfoil-hosted one.",
         "required": [
           "tool_calling",
           "reasoning",
           "input_modalities",
-          "output_modalities"
+          "output_modalities",
+          "prompt_cache",
+          "pinned_weights"
         ],
         "properties": {
           "input_modalities": {
@@ -1895,6 +1912,14 @@
             },
             "description": "The content kinds the model produces."
           },
+          "pinned_weights": {
+            "$ref": "#/components/schemas/PinnedWeightsCapability",
+            "description": "The weights this gateway pins for the model, and where they came from."
+          },
+          "prompt_cache": {
+            "$ref": "#/components/schemas/PromptCacheCapability",
+            "description": "Whether, and for how long, requests may reuse each other's prompt\nprefix (`cache_key`)."
+          },
           "reasoning": {
             "$ref": "#/components/schemas/Capability",
             "description": "Whether the model produces reasoning content before its answer."
@@ -1904,6 +1929,14 @@
             "description": "Whether the model accepts a `tools` request field.\n\nNamed after the wire rather than after an adjective: the question a\nclient actually has is \"will this request be accepted\", and a field\nname answers it where \"supports tool use\" does not."
           }
         }
+      },
+      "ModelHosting": {
+        "type": "string",
+        "description": "Who runs a model's inference, as the catalog declares it.",
+        "enum": [
+          "tinfoil",
+          "eidola"
+        ]
       },
       "ModelPricing": {
         "type": "object",
@@ -1955,6 +1988,40 @@
           "standard",
           "reasoning"
         ]
+      },
+      "PinnedWeightsCapability": {
+        "type": "object",
+        "description": "The exact weights a model is served from, when this gateway pins them.\n\n`supported` means this gateway build accepts only deployments serving the\nweights hashed here, and tells each one so on every request. `sha256` is\nthe engine's weights hash (a SHA-256 over the manifest of every file the\nengine reads from its weights directory); `repo` and `revision` say where\nthose files were taken from. All three are absent when `supported` is\nfalse.",
+        "required": [
+          "supported"
+        ],
+        "properties": {
+          "repo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The source repository, `<owner>/<name>`."
+          },
+          "revision": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The source repository's revision."
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The weights hash, lowercase hex."
+          },
+          "supported": {
+            "type": "boolean",
+            "description": "Whether the weights are pinned by this gateway."
+          }
+        }
       },
       "PortalResponse": {
         "type": "object",
@@ -2052,6 +2119,37 @@
           "transport": {
             "$ref": "#/components/schemas/TransportInfo",
             "description": "Transport security between hops."
+          }
+        }
+      },
+      "PromptCacheCapability": {
+        "type": "object",
+        "description": "Prompt-cache reuse across requests.\n\n`supported` means requests to this model may carry a `cache_key`, and that\nrequests carrying the same key can reuse each other's computed prompt\nprefix. The two bounds are the serving deployments' measured retention:\na prefix nothing has used for `idle_ttl_secs`, or any prefix older than\n`max_age_secs`, is never reused and is zeroed. Both are absent when\n`supported` is false.",
+        "required": [
+          "supported"
+        ],
+        "properties": {
+          "idle_ttl_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Longest a cached prefix stays reusable without being used, in seconds.",
+            "minimum": 0
+          },
+          "max_age_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Longest a cached prefix stays reusable at all, in seconds.",
+            "minimum": 0
+          },
+          "supported": {
+            "type": "boolean",
+            "description": "Whether requests may carry a `cache_key`."
           }
         }
       },

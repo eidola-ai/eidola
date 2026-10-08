@@ -2994,7 +2994,11 @@ dependencies = [
 name = "eidola-common"
 version = "0.1.0"
 dependencies = [
+ "argon2",
+ "serde",
  "serde_json",
+ "serde_yaml",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -3110,6 +3114,7 @@ dependencies = [
  "argon2",
  "axum",
  "base64 0.23.1",
+ "eidola-common",
  "eidola-engine",
  "eidola-engine-chat",
  "eidola-engine-cpu",
@@ -3184,6 +3189,7 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "x509-cert 0.2.5",
+ "zeroize",
 ]
 
 [[package]]
@@ -6467,6 +6473,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "eidola-common",
  "hex",
  "igvm",
  "igvm_defs",
@@ -6476,6 +6483,7 @@ dependencies = [
  "sev",
  "sha2 0.11.0",
  "tdx-measure",
+ "tinfoil-verifier",
 ]
 
 [[package]]

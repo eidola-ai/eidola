@@ -81,7 +81,7 @@ sha2 = "0.11"
 subtle = "2"
 
 # Shared client/server contract logic (pricing formula)
-eidola-common = { path = "../eidola-common" }
+eidola-common = { path = "../eidola-common", features = ["argon2"] }
 
 # Tinfoil attestation verification
 tinfoil-verifier = { path = "../tinfoil-verifier" }
@@ -106,6 +106,10 @@ regex = "1"
 # at construction, so we rebuild the client and swap it atomically).
 arc-swap = "1"
 
+# Scrubbing secret material held in memory (a client's prefix-cache key, the
+# engine gateway token).
+zeroize = "1"
+
 # Utilities
 futures-util = "0.3"
 bytes = "1"
@@ -113,8 +117,22 @@ tokio-stream = "0.1"
 
 [build-dependencies]
 serde_json = "1"
+# `src/engine_trust/file.rs`: the typed parse of engine-enclaves.json.
+serde = { version = "1", features = ["derive"] }
+# `src/engine_trust/manifest.rs`, compiled into the build script: hashing the
+# engine deployment configs it re-derives `engine-enclaves.json` from.
+sha2 = "0.11"
+# The node's own config grammar, and the one deployment check the measurer
+# also runs (`engine_deployment::deployment`).
+eidola-common = { path = "../eidola-common", features = ["deployment"] }
+# The attesting client's own pin compiler (`validate_pins`), so a committed pin
+# the client would refuse fails the build rather than the first connection.
+# Costs a host build of the verifier's dependency tree for the build script.
+tinfoil-verifier = { path = "../tinfoil-verifier" }
 
 [dev-dependencies]
+# The same module, compiled into the crate's tests.
+eidola-common = { path = "../eidola-common", features = ["deployment"] }
 # `InMemoryLogExporter` for the telemetry regression test pinning that
 # exported log records carry no trace context.
 opentelemetry_sdk = { version = "0.33", features = ["testing"] }

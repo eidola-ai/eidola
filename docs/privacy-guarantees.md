@@ -33,6 +33,9 @@ Every item is a permanent property of a specific release. Most are inherent attr
 
 **2.5.** No identifier carried on the inference path (credential bytes, request context, nullifier) is correlatable with any record on the linked surface. The two surfaces share no in-process state and no persistence path beyond the ACT issuance and redemption protocol itself. (Notwithstanding network-layer signals — IP address, packet timing — which are out of scope; see [gaps.md](gaps.md#network-identity-as-a-linking-factor).)
 
+> [!NOTE]
+> **Proposed amendment (pending maintainer sign-off) — not in effect.** The server's request type now accepts an optional `cache_key`, a client-chosen 32-byte value that Eidola-hosted inference engines will use to scope prompt-prefix reuse: requests carrying the same key may share cached computation, and no other requests do. No client sends one yet and no request is routed to such an engine, so no item above changes today. Before either happens, §2 needs an item along these lines: *A `cache_key` is chosen and rotated by the client and links only the requests the client sends it with. The server never derives, records, or logs one; it holds a key only in scrubbed memory for the duration of a request, and never forwards it to any inference provider other than the Eidola-hosted engine that uses it.* The client's choice of scope (per conversation, rotated on a schedule) is what keeps it from becoming a cross-conversation identifier, and is part of the change that makes the client send it.
+
 ## 3. Content
 
 **3.1.** Inference request and response content (prompts, attachments, model outputs, tool inputs and tool results) is never written to durable storage on Eidola-controlled infrastructure.

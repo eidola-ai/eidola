@@ -65,6 +65,14 @@ COPY crates/ ./crates/
 # material, so it introduces no such cycle.
 COPY releases/trust/sigstore-trusted-root.json ./releases/trust/sigstore-trusted-root.json
 
+# Engine trust inputs: `build.rs` embeds the engine deployments this gateway
+# accepts (`engine-enclaves.json`) after checking every pin against the
+# committed deployment configs under `deploy/engine/`. Neither depends on the
+# gateway's own digest, so they add no cycle either. A glob rather than
+# `deploy/engine/` so a tree without that directory still builds; the
+# build script then sees no deployments.
+COPY --parents releases/trust/engine-enclaves.json deploy/engine* ./
+
 # Ensure Cargo detects source changes over the fetch-stage stubs.
 # SOURCE_DATE_EPOCH=0 clamps COPY timestamps to epoch 0, matching the
 # stubs created in the fetch stage, so Cargo's fingerprint check sees
