@@ -540,7 +540,7 @@ mod tests {
         let text = String::from_utf8(engine_request_body(&request).to_vec()).unwrap();
         assert!(text.contains(&format!(
             "\"temperature\":{}",
-            serde_json::to_string(&0.123456789_f32).unwrap()
+            serde_json::to_string(&"0.123456789".parse::<f32>().unwrap()).unwrap()
         )));
         assert!(!text.contains("0.123456789,"), "{text}");
     }
