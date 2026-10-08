@@ -55,6 +55,8 @@ pub struct DeviceInfo {
     pub total_mem_bytes: usize,
     /// Opt-in dynamic shared memory per block.
     pub max_smem_per_block_optin: u32,
+    /// Thread-block cluster launches (DeepGEMM's 2-CTA instances need them).
+    pub cluster_launch: bool,
 }
 
 /// An open device: its primary context and the stream every launch uses.
@@ -100,6 +102,7 @@ impl Gpu {
             max_smem_per_block_optin: attr(
                 sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
             )? as u32,
+            cluster_launch: attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH)? != 0,
         };
         let stream = ctx.new_stream()?;
         Ok(Gpu { ctx, stream, info })

@@ -216,6 +216,23 @@ impl Kernel {
         self.func
     }
 
+    /// Static shared memory the image declares (beside the launch contract's
+    /// dynamic amount).
+    pub fn static_smem_bytes(&self) -> Result<u32> {
+        self.ctx.bind_to_thread()?;
+        let mut v = 0;
+        // SAFETY: valid function handle; writes one int.
+        unsafe {
+            sys::cuFuncGetAttribute(
+                &mut v,
+                sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                self.func,
+            )
+        }
+        .result()?;
+        Ok(v as u32)
+    }
+
     /// Launch with the block shape, dynamic shared memory and cluster shape
     /// of the launch contract.
     ///

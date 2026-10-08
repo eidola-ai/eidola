@@ -28,7 +28,7 @@ use std::fmt;
 pub use device::{DeviceInfo, Gpu, ImageArch};
 pub use executor::{CudaExecutor, CudaExecutorConfig};
 pub use module::{ImageSource, Kernel, KernelDir, KernelModule};
-pub use support::{Unsupported, check_supported};
+pub use support::{Unsupported, check_device, check_supported};
 
 /// A CUDA executor failure.
 #[derive(Debug, Clone, PartialEq, Eq)]

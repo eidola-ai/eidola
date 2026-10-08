@@ -1,5 +1,5 @@
 //! The executor refuses what it cannot run before touching device memory:
-//! the configuration, then the KV geometry, then the kernel images, and only
+//! the configuration and the device, then the KV geometry, then the kernel images, and only
 //! then the weights. The checkpoint here is a configuration with no tensors,
 //! so reaching the weights at all shows up as a missing-tensor error.
 
@@ -8,7 +8,7 @@ mod common;
 use std::sync::Arc;
 
 use eidola_engine::spec::Bucket;
-use eidola_engine_cuda::{CudaError, CudaExecutor, CudaExecutorConfig, Gpu, KernelDir};
+use eidola_engine_cuda::{CudaError, CudaExecutor, CudaExecutorConfig, Gpu, ImageArch, KernelDir};
 use eidola_engine_model::safetensors::WeightSet;
 
 fn tensorless_checkpoint() -> Arc<WeightSet> {
@@ -72,6 +72,20 @@ fn refusals_come_before_device_memory() {
         e.to_string().contains("reading"),
         "a kernel image error, not a weight one: {e}"
     );
+
+    // A device the forced image cannot run: refused as a device requirement,
+    // before the (empty) kernel directory is even read.
+    let mut cfg = config();
+    cfg.image = Some(match open().image_arch().unwrap() {
+        ImageArch::Sm103a => ImageArch::Sm100a,
+        _ => ImageArch::Sm103a,
+    });
+    let e =
+        CudaExecutor::new(open(), &KernelDir::new(&empty), store.clone(), None, cfg).unwrap_err();
+    let CudaError::Unsupported(u) = e else {
+        panic!("a device refusal, not {e}")
+    };
+    assert_eq!(u.field, "device.compute_capability");
 
     // With the kernels present, the next thing it reaches is the weights.
     let e = CudaExecutor::new(open(), &kernels, store, None, config()).unwrap_err();

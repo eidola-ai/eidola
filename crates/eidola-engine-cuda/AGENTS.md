@@ -53,9 +53,20 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
 
 Each field, changed alone, is refused (`support::tests`). Pro differs in its hidden size (6144), query heads (128), global KV heads (8), experts (384), value scale and epsilon; serving it is the multi-GPU executor's scope, not a widening of this one. Every f32 vector loaded (norms, sinks, router bias) must have exactly the model's width; the BF16 and FP8 tensors' shapes are checked likewise.
 
+**The device is part of the configuration.** `check_device` holds every device-side requirement a retained kernel bakes in, and refuses the rest with `CudaError::Unsupported`, naming the field:
+
+| Field | Required | Why |
+|---|---|---|
+| compute capability | 10.x, and a forced image this device runs (`sm_100f` on any 10.x; `sm_100a` / `sm_103a` only on their own) | the images are Blackwell datacenter code |
+| opt-in shared memory per block | at least `REQUIRED_SMEM_PER_BLOCK` (231,424 bytes) | the largest launch: CUTLASS's BF16 GEMM (`o_proj`, `lm_head`), dynamic plus static |
+| SM count (when any layer has experts) | at least 148 | DeepGEMM's persistent instances are compiled for 148 SMs |
+| cluster launch (when any layer has experts) | supported | DeepGEMM launches 2-CTA clusters, the only kernels that do |
+
+A dense-only subset of layers needs neither of the last two. `support::tests` refuses a synthetic device missing each requirement alone; `tests/smoke.rs` reads every kernel's launch contract and static shared memory from the loaded images, and fails if the largest is not exactly `REQUIRED_SMEM_PER_BLOCK` or if anything but DeepGEMM launches a cluster. The launch-time guards (`ops::deepgemm_grid`, the driver's own refusal) stay as defense in depth.
+
 **Construction order is structural.** `CudaExecutor::new` checks, in order:
 
-1. the configuration and the sampleable vocabulary;
+1. the configuration, the sampleable vocabulary and the device;
 2. the KV geometry (`GroupGeometry::validate`: every product in checked `usize`, a block within the 32-bit page stride, block ids within the `i32` tables);
 3. it loads and verifies every kernel image.
 

@@ -21,9 +21,13 @@ fn setup() -> Option<(Gpu, KernelDir)> {
 
 /// Every entry of every kernel resolves (mangled, internal-linkage template
 /// instances included) and its launch contract reads back, from the exact
-/// cubin, the family cubin and the fatbin.
+/// cubin, the family cubin and the fatbin. The contracts also pin the
+/// device-side requirements `check_device` holds: the largest launch's shared
+/// memory is exactly `REQUIRED_SMEM_PER_BLOCK`, and only DeepGEMM's
+/// instances (the MoE path) launch clusters.
 #[test]
 fn every_entry_and_contract_resolves() {
+    use eidola_engine_cuda::support::REQUIRED_SMEM_PER_BLOCK;
     let Some((gpu, dir)) = setup() else { return };
     let exact = gpu.image_arch().unwrap();
     for source in [
@@ -31,14 +35,27 @@ fn every_entry_and_contract_resolves() {
         ImageSource::Cubin(ImageArch::Sm100f),
         ImageSource::Fatbin(exact),
     ] {
+        let mut largest = (0, String::new());
         for fatbin in &Manifest::embedded().fatbins {
             let module = KernelModule::load_from(&gpu, &dir, &fatbin.name, source).unwrap();
             for entry in &module.cubin().entries {
                 let kernel = module.kernel(&entry.symbol).unwrap();
-                assert!(kernel.meta().block.iter().all(|&b| b > 0));
-                assert!(kernel.meta().dynamic_smem_bytes <= gpu.info().max_smem_per_block_optin);
+                let meta = kernel.meta();
+                assert!(meta.block.iter().all(|&b| b > 0));
+                let smem = meta.dynamic_smem_bytes + kernel.static_smem_bytes().unwrap();
+                if smem > largest.0 {
+                    largest = (smem, entry.symbol.clone());
+                }
+                if meta.cluster != [1, 1, 1] {
+                    assert_eq!(fatbin.name, "deepgemm_fp8_fp4_grouped", "{}", entry.symbol);
+                }
             }
         }
+        assert_eq!(
+            largest.0, REQUIRED_SMEM_PER_BLOCK,
+            "{source:?}: {}",
+            largest.1
+        );
     }
 }
 

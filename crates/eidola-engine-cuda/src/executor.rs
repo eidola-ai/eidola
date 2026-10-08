@@ -26,7 +26,7 @@ use crate::device::ImageArch;
 use crate::kv::KvStore;
 use crate::model::{ForwardInput, GpuModel, Kernels, group_geometry, group_layers, read_config};
 use crate::sampler::{STATUS_NON_FINITE, SampleRow};
-use crate::support::{check_sampleable, check_supported};
+use crate::support::{check_device, check_sampleable, check_supported};
 use crate::weights::ModelWeights;
 use crate::{CudaError, Gpu, Result};
 
@@ -93,6 +93,7 @@ impl CudaExecutor {
         let config = read_config(&store, keep_layers)?;
         check_supported(&config)?;
         check_sampleable(cfg.sampleable_vocab_size as usize, config.vocab_size)?;
+        let image = check_device(gpu.info(), &config, cfg.image)?;
         let (keys, layer_kv) = group_layers(&config);
         if cfg.num_blocks.len() != keys.len() {
             return Err(CudaError::new(format!(
@@ -141,7 +142,7 @@ impl CudaExecutor {
             buckets: cfg.buckets.clone(),
         };
         spec.validate().map_err(CudaError::new)?;
-        let kernels = Kernels::load(&gpu, kernels_dir, cfg.image)?;
+        let kernels = Kernels::load(&gpu, kernels_dir, Some(image))?;
         let weights = ModelWeights::load(&gpu, &kernels, store, config)?;
         let last = *spec.buckets.last().expect("validated: a bucket");
         let max_tokens = last.max_tokens as usize;
