@@ -885,14 +885,15 @@ fn allocations_are_capped_and_fit_the_deployment() {
         refused(&tree, &format!("{name} must be at most"));
     }
 
-    // Host, near the limit: each request slot can hold about 5.3 GiB at worst
-    // (a 32 MiB body with both parses in the read pool, and its tree, prompt
-    // and tokens in the admission pool); eleven fit 64 GiB, twelve do not.
+    // Host, near the limit: each request slot can hold 645,922,816 bytes at
+    // worst (a 32 MiB body of up to 2^18 JSON values with both parses in the
+    // read pool, and its tree, prompt and tokens in the admission pool); 99
+    // fit 64 GiB beside the headroom and tables, 100 do not.
     let mut tree = Tree::fixture();
-    tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"11\"");
-    tree.check().expect("eleven request slots fit 64 GiB");
+    tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"99\"");
+    tree.check().expect("99 request slots fit 64 GiB");
     let mut tree = Tree::fixture();
-    tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"12\"");
+    tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"100\"");
     refused(&tree, "more than the VM's");
     // Device: the KV budget holds one longest sequence and every seat's
     // sliding windows, each pool with its pad block, at their smallest

@@ -178,6 +178,11 @@ impl std::fmt::Debug for ValidRequest {
 /// Parses and validates a request body for the model `model_id`. Refusals happen here,
 /// before anything is rendered, tokenized or scheduled.
 pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiError> {
+    // The value count and depth first, with nothing allocated: both parses below
+    // allocate per value, and the host-memory budget per request counts at most
+    // `MAX_REQUEST_JSON_VALUES` of them.
+    eidola_common::engine_protocol::check_request_json(body)
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
     let mut req: ChatCompletionRequest =
         serde_json::from_slice(body).map_err(ApiError::from_serde)?;
     // Decode (and scrub) the key first, so no early return leaves it in memory.
@@ -336,7 +341,6 @@ mod tests {
             format!(r#"{{"cache_key":"{KEY}","unknown":1}}"#),
             format!(r#"{{"cache_key":"{KEY}","messages":[{{"role":"nobody"}}]}}"#),
             format!(r#"{{"cache_key":"{KEY}","cache_key":"{KEY}"}}"#),
-            format!(r#"{{"cache_key":"{KEY}","#),
         ] {
             let e = parse_request(body.as_bytes(), "m").unwrap_err();
             assert!(matches!(e, ApiError::InvalidRequest(_)), "{body}: {e}");
@@ -347,6 +351,17 @@ mod tests {
                 "{body}: {scrubs:?}"
             );
         }
+    }
+
+    /// A body that is not JSON is refused by the shape scan before anything is parsed,
+    /// so no key text is ever allocated.
+    #[test]
+    fn a_malformed_body_never_holds_the_key() {
+        take_scrubs();
+        let body = format!(r#"{{"cache_key":"{KEY}","#);
+        let e = parse_request(body.as_bytes(), "m").unwrap_err();
+        assert!(matches!(e, ApiError::InvalidRequest(_)), "{e}");
+        assert!(take_scrubs().is_empty());
     }
 
     /// The accepted path scrubs it too.

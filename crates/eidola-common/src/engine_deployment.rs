@@ -237,17 +237,49 @@ pub fn cuda_device_reserve_bytes(sizing: &Sizing) -> u64 {
         )
 }
 
-/// Worst-case bytes of `serde_json::Value` tree per byte of JSON text, for
-/// the node's strict parse (`api::parse_request`): the densest text is the
-/// smallest non-empty object, `{"":0}` (7 bytes), which allocates a B-tree
-/// leaf of eleven 24-byte keys and 32-byte values plus its header, about
-/// 640 bytes (≈ 92×), rounded up.
-pub const STRICT_TREE_PER_TEXT_BYTE: u64 = 96;
+/// Bytes a request's parses take per JSON value it holds (object keys
+/// included; `engine_protocol::check_request_json` counts them, and refuses
+/// a body of more than `MAX_REQUEST_JSON_VALUES` before either parse runs),
+/// both parses together: the strict `serde_json` tree and the chat crate's
+/// order-preserving tree, live at once in `api::parse_request`.
+///
+/// Measured by `eidola-server-engine`'s `tests/parse_memory.rs` with a
+/// counting allocator, over the densest bodies at the value cap: the worst
+/// is 425.5 bytes a value (one-member objects nested 30 deep, `serde_json`'s
+/// default B-tree maps), and 414.3 with its `preserve_order` feature, which a
+/// whole-workspace build unifies in (single-element arrays nested 59 deep).
+/// Rounded up to 512.
+pub const PARSE_PER_VALUE_BYTES: u64 = 512;
 
-/// Worst-case bytes of the chat crate's order-preserving tree per byte of
-/// text (`Json`, 32 bytes a node): an array element `0,` (2 bytes) is one node
-/// (16×), and a vector's capacity may be twice its length (32×).
-pub const ORDERED_TREE_PER_TEXT_BYTE: u64 = 32;
+/// Bytes a request's parses take per byte of its body, beside the body
+/// itself: every string's text is copied once into each tree (an escape only
+/// shortens it). Measured as above: 32 MiB of text peaks at three times the
+/// body, the body and its two copies.
+pub const PARSE_PER_TEXT_BYTE: u64 = 2;
+
+/// Bytes the order-preserving tree an admitted request keeps takes per JSON
+/// value: measured as above, at most 126.9 (single-element arrays nested 59
+/// deep), rounded up to 160.
+pub const ORDERED_PER_VALUE_BYTES: u64 = 160;
+
+/// Bytes that tree takes per byte of the body: its strings' text, once.
+pub const ORDERED_PER_TEXT_BYTE: u64 = 1;
+
+/// The most a read slot holds while `api::parse_request` runs, for a body of
+/// `body` bytes and `values` JSON values: the body, its text copied into both
+/// trees ([`PARSE_PER_TEXT_BYTE`]) and both trees' nodes
+/// ([`PARSE_PER_VALUE_BYTES`] a value).
+pub fn read_slot_bytes(body: u64, values: u64) -> u64 {
+    body.saturating_mul(1 + PARSE_PER_TEXT_BYTE)
+        .saturating_add(values.saturating_mul(PARSE_PER_VALUE_BYTES))
+}
+
+/// The most an admitted request's order-preserving tree holds, for a body of
+/// `body` bytes and `values` JSON values.
+pub fn ordered_tree_bytes(body: u64, values: u64) -> u64 {
+    body.saturating_mul(ORDERED_PER_TEXT_BYTE)
+        .saturating_add(values.saturating_mul(ORDERED_PER_VALUE_BYTES))
+}
 
 /// Worst-case bytes a prepared request adds per byte of its body
 /// (`pipeline::prepare`): the rendered prompt (at most twice the message
@@ -260,25 +292,30 @@ pub const PREPARED_PER_BODY_BYTE: u64 = 10;
 pub const PROCESS_HEADROOM_BYTES: u64 = 4 << 30;
 
 /// The host memory a node's configuration commits it to, at worst, from its
-/// own code paths (`http::chat`, `api::parse_request`, `pipeline::prepare`):
+/// own code paths (`http::chat`, `api::parse_request`, `pipeline::prepare`),
+/// for bodies of up to `MAX_REQUEST_BODY_BYTES` and `MAX_REQUEST_JSON_VALUES`:
 ///
-/// - the **read pool**: `MAX_REQUESTS` slots, each a body of up to
-///   `MAX_REQUEST_BODY_BYTES` live at once with its strict parse and its
-///   order-preserving parse (`parse_request` builds both from the body
-///   before the body is dropped): body × (1 + [`STRICT_TREE_PER_TEXT_BYTE`] +
-///   [`ORDERED_TREE_PER_TEXT_BYTE`]);
+/// - the **read pool**: `MAX_REQUESTS` slots, each a body live at once with
+///   its strict parse and its order-preserving parse (`parse_request` builds
+///   both from the body before the body is dropped): [`read_slot_bytes`];
 /// - the **admission pool**: `MAX_REQUESTS` admitted requests, each keeping
 ///   its order-preserving tree while the prompt is rendered and tokenized:
-///   body × ([`ORDERED_TREE_PER_TEXT_BYTE`] + [`PREPARED_PER_BODY_BYTE`]).
-///   Both pools can be full at once (a slot of each per request in flight);
+///   [`ordered_tree_bytes`] plus body × [`PREPARED_PER_BODY_BYTE`]. Both
+///   pools can be full at once (a slot of each per request in flight);
 /// - the block tables: `MAX_SEQS` × ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉
 ///   `i32` entries per KV group, two groups;
 /// - [`PROCESS_HEADROOM_BYTES`].
+///
+/// At the caps a request slot is 645,922,816 bytes (about 616 MiB): 234.9 MB
+/// read, 411.0 MB admitted.
 pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
     let body = crate::engine_protocol::MAX_REQUEST_BODY_BYTES as u64;
+    let values = crate::engine_protocol::MAX_REQUEST_JSON_VALUES as u64;
     let requests = u64::from(sizing.max_requests);
-    let read_pool = requests * body * (1 + STRICT_TREE_PER_TEXT_BYTE + ORDERED_TREE_PER_TEXT_BYTE);
-    let admission_pool = requests * body * (ORDERED_TREE_PER_TEXT_BYTE + PREPARED_PER_BODY_BYTE);
+    let read_pool = requests.saturating_mul(read_slot_bytes(body, values));
+    let admission_pool = requests.saturating_mul(
+        ordered_tree_bytes(body, values).saturating_add(body * PREPARED_PER_BODY_BYTE),
+    );
     let blocks_per_seq = u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size));
     let tables = u64::from(sizing.max_seqs) * blocks_per_seq * 4 * 2;
     read_pool + admission_pool + tables + PROCESS_HEADROOM_BYTES
@@ -1336,17 +1373,29 @@ mod tests {
         };
         let kv = cuda(64 << 30);
         assert!(check_resources(&sizing, &cache, &kv, FIXTURE_PACK, 65_536, 8).is_ok());
-        // Each slot can hold 32 MiB × (129 read + 42 admitted) ≈ 5.3 GiB at
-        // worst; eight of them and the headroom exceed 32 GiB.
-        assert!(check_resources(&sizing, &cache, &kv, FIXTURE_PACK, 32_768, 8).is_err());
-        // Near the limit: eleven slots (60,192 MiB of pools, plus headroom
-        // and tables) fit 64 GiB; twelve (65,664 MiB of pools alone) do not.
+        // A request slot is 645,922,816 bytes at the caps: a 32 MiB body read
+        // with both parses (3 × 32 MiB of text, 512 bytes for each of 2^18
+        // values) and admitted with its tree (32 MiB of text, 160 bytes a
+        // value) and its prompt and tokens (10 × 32 MiB).
+        let one = Sizing {
+            max_requests: 1,
+            ..sizing
+        };
+        let tables = 64 * 8192 * 8;
+        assert_eq!(
+            host_memory_bytes(&one) - tables - PROCESS_HEADROOM_BYTES,
+            645_922_816
+        );
         let near = |n| Sizing {
             max_requests: n,
             ..sizing
         };
-        assert!(check_resources(&near(11), &cache, &kv, FIXTURE_PACK, 65_536, 8).is_ok());
-        assert!(check_resources(&near(12), &cache, &kv, FIXTURE_PACK, 65_536, 8).is_err());
+        // Six slots, the headroom and the tables fit 8 GiB; eight do not.
+        assert!(check_resources(&near(6), &cache, &kv, FIXTURE_PACK, 8192, 8).is_ok());
+        assert!(check_resources(&near(8), &cache, &kv, FIXTURE_PACK, 8192, 8).is_err());
+        // Near the limit: 99 slots fit 64 GiB; 100 do not.
+        assert!(check_resources(&near(99), &cache, &kv, FIXTURE_PACK, 65_536, 8).is_ok());
+        assert!(check_resources(&near(100), &cache, &kv, FIXTURE_PACK, 65_536, 8).is_err());
         // The cuda executor needs a GPU.
         assert!(check_resources(&sizing, &cache, &kv, FIXTURE_PACK, 65_536, 0).is_err());
         // Block size 1 at the longest model length: 2^20 entries per slot.
