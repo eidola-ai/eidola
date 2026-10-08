@@ -31,7 +31,7 @@ igvm_defs = "0.5"
 
 # The engine-deployment config grammar shared with the gateway and the node
 # (`cvm-version`, cache retention).
-eidola-common = { path = "../eidola-common" }
+eidola-common = { path = "../eidola-common", features = ["deployment"] }
 
 # Config parsing
 serde = { version = "1", features = ["derive"] }

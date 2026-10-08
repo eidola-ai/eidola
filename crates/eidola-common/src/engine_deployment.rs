@@ -627,6 +627,9 @@ pub fn check_gpu_attestation(
     }
 }
 
+#[cfg(feature = "deployment")]
+pub mod deployment;
+
 /// Largest prefix-cache retention bound, in seconds: the engine core keeps
 /// retention in milliseconds as a `u64`.
 pub const MAX_CACHE_SECONDS: u64 = u64::MAX / 1000;

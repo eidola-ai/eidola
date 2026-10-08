@@ -29,9 +29,11 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+use eidola_common::engine_deployment::deployment::check_deployment;
 
 use crate::tdx_igvm;
 
@@ -63,38 +65,27 @@ pub fn required_release(config: &[u8]) -> Result<(String, String)> {
 }
 
 /// The `engine-enclaves.json` entry for one deployment of `model_id`.
+///
+/// The deployment is checked by `eidola_common::engine_deployment::deployment::
+/// check_deployment`, the one check the gateway's build also runs on every
+/// pinned deployment, so the generator can only emit a pin the build accepts.
+/// What only this tool adds is the launch identity from the platform release.
 pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result<Value> {
-    let config_yaml: serde_yaml::Value =
-        serde_yaml::from_slice(inputs.config).context("parsing tinfoil-config.yml")?;
-    let cvm_version = config_yaml
-        .get("cvm-version")
-        .and_then(serde_yaml::Value::as_str)
-        .context("cvm-version must be a string")?
-        .to_owned();
-    let env = engine_env(&config_yaml)?;
-    let var = |name: &str| {
-        env.get(name)
-            .cloned()
-            .with_context(|| format!("the engine container's env does not set {name}"))
-    };
-    ensure!(
-        var("EIDOLA_ENGINE_MODEL_ID")? == model_id,
-        "{} serves a model other than {model_id}",
-        inputs.config_path
-    );
-    // The node's own grammar for these values (`eidola_common::engine_deployment`).
-    let enabled =
-        eidola_common::engine_deployment::parse_prefix_cache(&var("EIDOLA_ENGINE_PREFIX_CACHE")?)
-            .context("EIDOLA_ENGINE_PREFIX_CACHE must be true or false")?;
-    let seconds = |name: &str| -> Result<u64> {
-        eidola_common::engine_deployment::parse_cache_seconds(&var(name)?)
-            .with_context(|| format!("{name} must be a positive number of seconds"))
-    };
-
-    let sidecar: Value =
-        serde_json::from_slice(inputs.sidecar).context("parsing deployment.json")?;
-    let tdx_policy = sidecar
-        .get("tdx_policy")
+    let sidecar_path = inputs
+        .config_path
+        .strip_suffix("tinfoil-config.yml")
+        .map(|dir| format!("{dir}deployment.json"))
+        .context("the config path must end in tinfoil-config.yml")?;
+    let checked = check_deployment(
+        model_id,
+        inputs.config_path,
+        inputs.config,
+        &sidecar_path,
+        inputs.sidecar,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let tdx_policy = checked
+        .tdx_policy
         .context("deployment.json states no tdx_policy; only TDX deployments are measured")?;
 
     let (_, manifest_sha256) = required_release(inputs.config)?;
@@ -114,58 +105,24 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
             }
         }
     });
-    // The accelerators the prompt runs on are attested on every handshake,
-    // by the rule the gateway's build applies too.
-    let executor = match var("EIDOLA_ENGINE_EXECUTOR")?.as_str() {
-        "cuda" => eidola_common::engine_deployment::Executor::Cuda,
-        "cpu" => eidola_common::engine_deployment::Executor::Cpu,
-        other => bail!("EIDOLA_ENGINE_EXECUTOR is {other:?}, not cpu or cuda"),
-    };
-    let gpus = match config_yaml.get("gpus") {
-        None => None,
-        Some(gpus) => Some(gpus.as_u64().context("gpus must be a whole number")?),
-    };
-    let expected_gpus = sidecar.get("expected_gpus").and_then(Value::as_u64);
-    eidola_common::engine_deployment::check_gpu_attestation(executor, gpus, expected_gpus)
-        .map_err(anyhow::Error::msg)?;
-    check_secrets_shim_and_weights(&config_yaml, &var("EIDOLA_ENGINE_WEIGHTS_DIR")?, &sidecar)?;
-    // The env is exactly the node's measured variables, and the VM a
-    // launchable shape (the gateway's build holds both).
-    eidola_common::engine_deployment::check_env_names(env.keys().map(String::as_str))
-        .map_err(anyhow::Error::msg)?;
-    let whole = |key: &str| {
-        config_yaml
-            .get(key)
-            .and_then(serde_yaml::Value::as_u64)
-            .with_context(|| format!("{key} must be a whole number"))
-    };
-    eidola_common::engine_deployment::check_vm_resources(whole("cpus")?, whole("memory")?)
-        .map_err(anyhow::Error::msg)?;
-    let (runtime, container_gpus) = engine_gpu_access(&config_yaml)?;
-    eidola_common::engine_deployment::check_container_gpu_access(
-        executor,
-        runtime.as_deref(),
-        container_gpus.as_deref(),
-    )
-    .map_err(anyhow::Error::msg)?;
-    if let Some(gpus) = sidecar.get("expected_gpus") {
-        pin["expected_gpus"] = gpus.clone();
+    if let Some(gpus) = checked.expected_gpus {
+        pin["expected_gpus"] = gpus.into();
     }
-
+    let cache = checked.measured.cache;
     Ok(json!({
         "config": inputs.config_path,
         "config_sha256": hex::encode(Sha256::digest(inputs.config)),
-        "cvm_version": cvm_version,
+        "cvm_version": checked.cvm_version,
         "pin": pin,
         "weights": {
-            "sha256": var("EIDOLA_ENGINE_WEIGHTS_SHA256")?,
-            "repo": sidecar.pointer("/weights/repo").cloned().context("deployment.json has no weights.repo")?,
-            "revision": sidecar.pointer("/weights/revision").cloned().context("deployment.json has no weights.revision")?,
+            "sha256": checked.measured.weights_sha256,
+            "repo": checked.weights_repo,
+            "revision": checked.weights_revision,
         },
         "prompt_cache": {
-            "enabled": enabled,
-            "idle_ttl_secs": seconds("EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS")?,
-            "max_age_secs": seconds("EIDOLA_ENGINE_CACHE_MAX_AGE_SECS")?,
+            "enabled": cache.enabled,
+            "idle_ttl_secs": cache.idle_ttl_secs,
+            "max_age_secs": cache.max_age_secs,
         },
     }))
 }
@@ -183,160 +140,6 @@ pub fn render(entries: BTreeMap<String, Vec<Value>>) -> Result<String> {
 }
 
 /// The single `eidola-server-engine` container's env, as name → value.
-/// Refuse any key of the mapping `value` that `allowed` does not list.
-fn allow_keys(value: &serde_yaml::Value, allowed: &[&str], what: &str) -> Result<()> {
-    let mapping = value
-        .as_mapping()
-        .with_context(|| format!("{what} must be a mapping"))?;
-    let keys = mapping
-        .keys()
-        .map(|k| {
-            k.as_str()
-                .with_context(|| format!("{what} has a non-string key"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if let Some(key) = eidola_common::engine_deployment::first_disallowed_key(allowed, keys) {
-        bail!("{what} may not set {key:?}; an engine deployment uses only {allowed:?} there");
-    }
-    Ok(())
-}
-
-/// The rules the gateway's build also holds (`eidola_common::engine_deployment`): the
-/// gateway token is the only secret, the shim exposes exactly the node's routes, and the
-/// weights directory is the one pinned model pack granted to the engine.
-fn check_secrets_shim_and_weights(
-    config: &serde_yaml::Value,
-    weights_dir: &str,
-    sidecar: &Value,
-) -> Result<()> {
-    use eidola_common::engine_deployment as rules;
-    let strings = |value: Option<&serde_yaml::Value>, what: &str| -> Result<Vec<String>> {
-        match value {
-            None => Ok(Vec::new()),
-            Some(v) => v
-                .as_sequence()
-                .and_then(|l| l.iter().map(|s| s.as_str().map(str::to_owned)).collect())
-                .with_context(|| format!("{what} must be a list of strings")),
-        }
-    };
-    let engine = &config["containers"][0];
-    let secrets = strings(engine.get("secrets"), "the engine container's secrets")?;
-    rules::check_secrets(secrets.iter().map(String::as_str)).map_err(anyhow::Error::msg)?;
-    let paths = strings(
-        config.get("shim").and_then(|s| s.get("paths")),
-        "shim.paths",
-    )?;
-    rules::check_shim_paths(&paths.iter().map(String::as_str).collect::<Vec<_>>())
-        .map_err(anyhow::Error::msg)?;
-    let granted = strings(engine.get("models"), "the engine container's models")?;
-    fn text<'v>(v: &'v serde_yaml::Value, key: &str) -> Option<&'v str> {
-        v.get(key).and_then(serde_yaml::Value::as_str)
-    }
-    let packs: Vec<rules::ModelPack<'_>> = config
-        .get("models")
-        .and_then(serde_yaml::Value::as_sequence)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-        .iter()
-        .map(|m| rules::ModelPack {
-            name: text(m, "name").unwrap_or(""),
-            repo: text(m, "repo"),
-            mpk: text(m, "mpk"),
-        })
-        .collect();
-    let field = |key: &str| {
-        sidecar
-            .pointer(&format!("/weights/{key}"))
-            .and_then(Value::as_str)
-            .with_context(|| format!("deployment.json has no weights.{key}"))
-    };
-    rules::check_weights_pack(
-        &packs,
-        &granted.iter().map(String::as_str).collect::<Vec<_>>(),
-        weights_dir,
-        field("repo")?,
-        field("revision")?,
-    )
-    .map_err(anyhow::Error::msg)
-}
-
-/// The engine container's `runtime` and GPU selection, as written.
-fn engine_gpu_access(config: &serde_yaml::Value) -> Result<(Option<String>, Option<String>)> {
-    let engine = &config["containers"][0];
-    let runtime = engine
-        .get("runtime")
-        .map(|r| {
-            r.as_str()
-                .map(str::to_owned)
-                .context("runtime must be a string")
-        })
-        .transpose()?;
-    let gpus = match engine.get("gpus") {
-        None => None,
-        Some(serde_yaml::Value::String(s)) => Some(s.clone()),
-        Some(serde_yaml::Value::Number(n)) => Some(n.to_string()),
-        Some(_) => bail!("the engine container's gpus must be a count or a selection"),
-    };
-    Ok((runtime, gpus))
-}
-
-fn engine_env(config: &serde_yaml::Value) -> Result<BTreeMap<String, String>> {
-    let containers = config
-        .get("containers")
-        .and_then(serde_yaml::Value::as_sequence)
-        .context("containers must be a list")?;
-    // The gateway's build holds the same rule: exactly one container, the
-    // engine, pinned by a full digest (a tag escapes the measurement).
-    let [engine] = containers.as_slice() else {
-        bail!("an engine deployment runs exactly one container, the engine pinned by digest");
-    };
-    let digest = engine
-        .get("image")
-        .and_then(serde_yaml::Value::as_str)
-        .and_then(|i| i.strip_prefix("ghcr.io/eidola-ai/eidola-server-engine@sha256:"));
-    ensure!(
-        digest.is_some_and(
-            |d| d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        ),
-        "the engine image must be pinned by a 64-hex-digit digest"
-    );
-    // Only the keys an engine deployment needs, as the gateway's build holds.
-    use eidola_common::engine_deployment::allowed_keys;
-    allow_keys(config, allowed_keys::CONFIG, "the config")?;
-    if let Some(shim) = config.get("shim") {
-        allow_keys(shim, allowed_keys::SHIM, "shim")?;
-    }
-    if let Some(models) = config.get("models") {
-        for (i, model) in models
-            .as_sequence()
-            .context("models must be a list")?
-            .iter()
-            .enumerate()
-        {
-            allow_keys(model, allowed_keys::MODEL, &format!("models[{i}]"))?;
-        }
-    }
-    allow_keys(engine, allowed_keys::CONTAINER, "the engine container")?;
-    let mut env = BTreeMap::new();
-    for entry in engine
-        .get("env")
-        .and_then(serde_yaml::Value::as_sequence)
-        .context("the engine container's env must be a list")?
-    {
-        let (name, value) = entry
-            .as_mapping()
-            .filter(|m| m.len() == 1)
-            .and_then(|m| m.iter().next())
-            .and_then(|(k, v)| Some((k.as_str()?, v.as_str()?)))
-            .context("each env entry must be one NAME: \"value\" pair")?;
-        ensure!(
-            env.insert(name.to_owned(), value.to_owned()).is_none(),
-            "env sets {name} twice"
-        );
-    }
-    Ok(env)
-}
-
 #[cfg(test)]
 mod tests {
     use igvm_defs::IgvmPageDataFlags;
@@ -356,6 +159,7 @@ models:
   - name: "weights"
     repo: "example/fixture-model@4444444444444444444444444444444444444444"
     mpk: "{root}_17419419648_3892cd2f"
+    schema: 2
 shim:
   upstream-port: 8080
   paths:
@@ -374,6 +178,15 @@ containers:
       - EIDOLA_ENGINE_WEIGHTS_SHA256: "{weights}"
       - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
       - EIDOLA_ENGINE_EXECUTOR: "cuda"
+      - EIDOLA_ENGINE_BIND_ADDR: "0.0.0.0:8080"
+      - EIDOLA_ENGINE_KV_BLOCK_SIZE: "16"
+      - EIDOLA_ENGINE_KV_BLOCKS: "65536"
+      - EIDOLA_ENGINE_MAX_MODEL_LEN: "131072"
+      - EIDOLA_ENGINE_MAX_SEQS: "64"
+      - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "8192"
+      - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "4096"
+      - EIDOLA_ENGINE_DRAFT_TOKENS: "2"
+      - EIDOLA_ENGINE_MAX_REQUESTS: "256"
       - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA"
       - EIDOLA_ENGINE_PREFIX_CACHE: "true"
       - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
@@ -483,10 +296,12 @@ containers:
         };
         let good = config(&release_sha);
 
-        assert!(entry("other-model", &good, SIDECAR).contains("serves a model other than"));
-        assert!(
-            entry("fixture-model", &good, r#"{"weights": {}}"#).contains("only TDX deployments")
-        );
+        assert!(entry("other-model", &good, SIDECAR).contains("but the deployment is for"));
+        let no_policy = r#"{
+            "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
+            "expected_gpus": 8
+        }"#;
+        assert!(entry("fixture-model", &good, no_policy).contains("only TDX deployments"));
         let unpinned = good.replace(&format!("@sha256:{release_sha}"), "");
         assert!(entry("fixture-model", &unpinned, SIDECAR).contains("pin its release manifest"));
         let other_release = good.replace(&release_sha, &"ab".repeat(32));
@@ -545,6 +360,18 @@ containers:
         let tiny = good.replace("memory: 65536", "memory: 1");
         assert!(entry("fixture-model", &tiny, SIDECAR).contains("memory must be a power of two"));
         let tagged = good.replace(&format!("@sha256:{}", "2".repeat(64)), ":v1");
-        assert!(entry("fixture-model", &tagged, SIDECAR).contains("64-hex-digit digest"));
+        assert!(entry("fixture-model", &tagged, SIDECAR).contains("exactly one container"));
+
+        // The generator runs the gateway's whole deployment check: a variable
+        // the node requires, missing, is refused here as it is there.
+        for name in ["EIDOLA_ENGINE_BIND_ADDR", "EIDOLA_ENGINE_MAX_REQUESTS"] {
+            let line = good.lines().find(|l| l.contains(name)).unwrap();
+            let missing = good.replace(&format!("{line}\n"), "");
+            let err = entry("fixture-model", &missing, SIDECAR);
+            assert!(err.contains(&format!("{name} is not set")), "{name}: {err}");
+        }
+        // And a weights pack whose layout it does not state.
+        let no_schema = good.replace("    schema: 2\n", "");
+        assert!(entry("fixture-model", &no_schema, SIDECAR).contains("schema must be one of"));
     }
 }

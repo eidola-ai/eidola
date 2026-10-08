@@ -367,7 +367,7 @@ fn the_prompt_cache_policy_is_the_configs() {
 
     let mut tree = Tree::fixture();
     tree.deployment()["prompt_cache"]["idle_ttl_secs"] = 9000.into();
-    refused(&tree, "idle_ttl_secs exceeds max_age_secs");
+    refused(&tree, "but the config sets");
 }
 
 #[test]
@@ -500,12 +500,22 @@ fn the_pin_carries_what_the_sidecar_states() {
     let mut sidecar = tree.sidecar();
     sidecar["weights"]["revision"] = "9".repeat(40).into();
     tree.set_sidecar(sidecar);
+    // The sidecar's provenance must be the weights pack's.
+    refused(&tree, "the model pack's repo must be");
+
+    // And the pin's must be the sidecar's.
+    let mut tree = Tree::fixture();
+    tree.deployment()["weights"]["revision"] = "9".repeat(40).into();
     refused(&tree, "weights.repo / weights.revision differ from");
 
+    // The sidecar's GPU count must be the config's; the pin's, the sidecar's.
     let mut tree = Tree::fixture();
     let mut sidecar = tree.sidecar();
     sidecar["expected_gpus"] = 4.into();
     tree.set_sidecar(sidecar);
+    refused(&tree, "so expected_gpus must be 8");
+    let mut tree = Tree::fixture();
+    tree.deployment()["pin"]["expected_gpus"] = 1.into();
     refused(&tree, "pin.expected_gpus differs from");
 
     let mut tree = Tree::fixture();
@@ -1098,4 +1108,23 @@ fn a_step_holds_a_decode_row() {
     tree.edit_config("MAX_BATCHED_TOKENS: \"8192\"", "MAX_BATCHED_TOKENS: \"3\"");
     tree.check()
         .expect("three slots hold a decode row with two drafts");
+}
+
+/// A weights pack states the layout it was built with, one of the known
+/// schemas: its root hash depends on it.
+#[test]
+fn the_weights_pack_states_a_known_layout() {
+    for to in [
+        "",
+        "    schema: 3\n",
+        "    schema: \"2\"\n",
+        "    schema: 0\n",
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config("    schema: 2\n", to);
+        refused(&tree, "models[0].schema must be one of [1, 2]");
+    }
+    let mut tree = Tree::fixture();
+    tree.edit_config("    schema: 2\n", "    schema: 1\n");
+    tree.check().expect("schema 1 is known");
 }

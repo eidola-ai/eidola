@@ -21,5 +21,11 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # and the gateway — and both already depend on `argon2 0.6` themselves.
 argon2 = { version = "0.6", optional = true }
 
+# `engine_deployment::deployment`: one engine deployment's config and sidecar,
+# checked whole. Optional, enabled only by the gateway's build and tests and by
+# `measure-enclave`, each of which already reads YAML deployment configs.
+serde_yaml = { version = "0.9", optional = true }
+
 [features]
 argon2 = ["dep:argon2"]
+deployment = ["argon2", "dep:serde_yaml"]

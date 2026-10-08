@@ -9,6 +9,7 @@ models:
   - name: "weights"
     repo: "example/fixture-model@4444444444444444444444444444444444444444"
     mpk: "5555555555555555555555555555555555555555555555555555555555555555_17419419648_3892cd2f-a06e-5aee-8276-93140b9f06ec"
+    schema: 2
 
 containers:
   - name: "eidola-server-engine"

@@ -2996,6 +2996,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -3168,7 +3169,6 @@ dependencies = [
  "rustls-rustcrypto",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.0",
  "signature 2.2.0",
  "spki 0.7.3",
