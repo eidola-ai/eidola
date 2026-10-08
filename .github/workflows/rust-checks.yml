@@ -21,12 +21,14 @@ on:
     branches:
       - next
       - main
+      - engine
     tags:
       - "v*"
   pull_request:
     branches:
       - main
       - next
+      - engine
 
 # Cancel superseded PR runs; let pushes to main and tag releases finish.
 concurrency:

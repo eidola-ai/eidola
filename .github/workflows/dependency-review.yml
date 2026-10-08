@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - next
+      - engine
 
 permissions:
   contents: read
