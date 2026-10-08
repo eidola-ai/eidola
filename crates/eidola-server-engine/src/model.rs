@@ -21,8 +21,12 @@
 //!   | LC_ALL=C sort | xargs sha256sum | sha256sum
 //! ```
 //!
-//! A file name containing a newline or that is not UTF-8 is refused, so the manifest is
-//! unambiguous.
+//! Every name in the manifest is a **safe name**: ASCII letters, digits, `.`, `_` and `-`,
+//! not starting with `.` or `-` (`model-00001-of-00002.safetensors`). A shard named
+//! otherwise is refused, so the procedure above reproduces the manifest byte for byte:
+//! `sha256sum` escapes names holding a backslash or newline, `xargs` splits on whitespace
+//! and quotes, a leading `-` reads as an option, and the shell's `*` skips a leading `.`.
+//! Any name in the directory that is not UTF-8 is refused too.
 //!
 //! Every byte the node uses is the byte it hashed: the shards are memory-mapped once and
 //! both hashed and loaded from that mapping, and the semantic and chat files are read once
@@ -63,8 +67,8 @@ impl std::error::Error for ModelError {}
 pub fn canonical_manifest(files: &BTreeMap<String, String>) -> Result<String, ModelError> {
     let mut out = String::new();
     for (name, digest) in files {
-        if name.contains('\n') {
-            return Err(ModelError("a weights file name contains a newline".into()));
+        if !is_safe_name(name) {
+            return Err(ModelError(UNSAFE_NAME.into()));
         }
         out.push_str(&digest.to_ascii_lowercase());
         out.push_str("  ");
@@ -73,6 +77,18 @@ pub fn canonical_manifest(files: &BTreeMap<String, String>) -> Result<String, Mo
     }
     Ok(out)
 }
+
+/// Whether `name` is a safe manifest name (module docs): `[A-Za-z0-9_][A-Za-z0-9._-]*`.
+pub fn is_safe_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+const UNSAFE_NAME: &str = "a weights file name has characters other than ASCII letters, digits, \
+     `.`, `_` and `-`, or starts with `.` or `-`";
 
 /// SHA-256 (lowercase hex) of the canonical manifest.
 pub fn weights_hash(files: &BTreeMap<String, String>) -> Result<String, ModelError> {
@@ -352,6 +368,10 @@ impl Inventory {
             .cloned()
             .collect();
         shards.sort_unstable();
+        // Refused from the listing, before anything is hashed.
+        if !shards.iter().all(|n| is_safe_name(n)) {
+            return Err(ModelError(UNSAFE_NAME.into()));
+        }
         if shards.is_empty() {
             return Err(ModelError(
                 "no *.safetensors files in the weights directory".into(),
@@ -402,6 +422,42 @@ mod tests {
         );
         m.insert("bad\nname".into(), "00".repeat(32));
         assert!(canonical_manifest(&m).is_err());
+    }
+
+    /// Only names the offline `sha256sum` procedure reproduces byte for byte.
+    #[test]
+    fn manifest_names_are_safe() {
+        for ok in [
+            "model-00001-of-00002.safetensors",
+            "config.json",
+            "model.safetensors.index.json",
+            "_x.safetensors",
+        ] {
+            assert!(is_safe_name(ok), "{ok}");
+        }
+        for bad in [
+            "a\\b.safetensors",
+            "a b.safetensors",
+            "a\tb.safetensors",
+            "a\nb.safetensors",
+            "a\"b.safetensors",
+            "a'b.safetensors",
+            "-a.safetensors",
+            ".a.safetensors",
+            "é.safetensors",
+            "",
+        ] {
+            assert!(!is_safe_name(bad), "{bad:?}");
+            let m = BTreeMap::from([(bad.to_string(), "00".repeat(32))]);
+            assert!(canonical_manifest(&m).is_err(), "{bad:?}");
+        }
+        // And from the listing, before anything is hashed.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("ok.safetensors"), b"x").unwrap();
+        Inventory::list(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("a\\b.safetensors"), b"x").unwrap();
+        let e = Inventory::list(tmp.path()).err().unwrap();
+        assert!(e.to_string().contains("ASCII"), "{e}");
     }
 
     #[cfg(unix)]
