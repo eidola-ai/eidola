@@ -599,7 +599,8 @@ impl AttestationCheck {
             mr_seam = hex::encode(quote.report.mr_seam),
             tee_tcb_svn = hex::encode(quote.report.tee_tcb_svn),
             fmspc = hex::encode(quote.fmspc),
-            tcb_evaluation_data_number = quote.tcb_evaluation_data_number,
+            tcb_info_evaluation_data_number = quote.tcb_info_evaluation_data_number,
+            qe_identity_evaluation_data_number = quote.qe_identity_evaluation_data_number,
             "TDX attestation verified for new connection",
         );
 

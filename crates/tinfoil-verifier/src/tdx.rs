@@ -125,8 +125,10 @@ pub(crate) struct AuthenticatedQuote {
     pub tcb_status: TcbStatus,
     pub platform_tcb_status: TcbStatus,
     pub qe_tcb_status: TcbStatus,
-    /// The lower of the TCB Info and QE Identity `tcbEvaluationDataNumber`.
-    pub tcb_evaluation_data_number: u32,
+    /// `tcbEvaluationDataNumber` of the verified TCB Info.
+    pub tcb_info_evaluation_data_number: u32,
+    /// `tcbEvaluationDataNumber` of the verified QE Identity.
+    pub qe_identity_evaluation_data_number: u32,
 }
 
 /// Authenticate a raw TDX quote against Intel's root, using only the
@@ -139,6 +141,7 @@ pub(crate) fn authenticate(
 ) -> Result<AuthenticatedQuote, Error> {
     let parsed = parse_quote(quote)?;
     let collateral = assemble_collateral(responses, now)?;
+    let tcb_info_json = collateral.tcb_info.clone();
 
     let claims = QuoteVerifier::<RustCryptoConfig>::new_with_config(intel_root_der.to_vec())
         .verify_with_policy(quote, collateral, now, &QuotePolicy::claims_only(now))
@@ -156,6 +159,24 @@ pub(crate) fn authenticate(
             "verified quote body differs from the parsed quote".to_string(),
         ));
     }
+    // The claims carry the QE Identity's number and the lower of the two;
+    // the TCB Info's own number is read from the bytes Intel's signature
+    // just verified, so each document's floor can be checked and named.
+    let tcb_info_evaluation_data_number = serde_json::from_str::<serde_json::Value>(&tcb_info_json)
+        .ok()
+        .and_then(|v| v.get("tcbEvaluationDataNumber")?.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| {
+            Error::Quote("verified TCB Info carries no tcbEvaluationDataNumber".to_string())
+        })?;
+    let qe_identity_evaluation_data_number = claims.qe.tcb_eval_data_number;
+    if tcb_info_evaluation_data_number.min(qe_identity_evaluation_data_number)
+        != claims.tcb.eval_data_number
+    {
+        return Err(Error::Quote(
+            "collateral evaluation data numbers are inconsistent".to_string(),
+        ));
+    }
     Ok(AuthenticatedQuote {
         qe_vendor_id: claims.header.qe_vendor_id,
         report,
@@ -166,7 +187,8 @@ pub(crate) fn authenticate(
         tcb_status: claims.tcb.status,
         platform_tcb_status: claims.platform.tcb_level.tcb_status,
         qe_tcb_status: claims.qe.tcb_level.tcb_status,
-        tcb_evaluation_data_number: claims.tcb.eval_data_number,
+        tcb_info_evaluation_data_number,
+        qe_identity_evaluation_data_number,
     })
 }
 
@@ -447,11 +469,18 @@ pub(crate) fn appraise(quote: &AuthenticatedQuote, pin: &CompiledTdxPin) -> Resu
             return violation(format!("{label} TCB status is {status:?}, not UpToDate"));
         }
     }
-    if quote.tcb_evaluation_data_number < pin.minimum_tcb_evaluation_data_number {
-        return violation(format!(
-            "collateral tcbEvaluationDataNumber {} is below the minimum {}",
-            quote.tcb_evaluation_data_number, pin.minimum_tcb_evaluation_data_number
-        ));
+    // The floor bounds how old either signed collateral document may be, so
+    // it applies to each, and the refusal names the stale one.
+    for (document, number) in [
+        ("TCB Info", quote.tcb_info_evaluation_data_number),
+        ("QE Identity", quote.qe_identity_evaluation_data_number),
+    ] {
+        if number < pin.minimum_tcb_evaluation_data_number {
+            return violation(format!(
+                "{document} tcbEvaluationDataNumber {number} is below the minimum {}",
+                pin.minimum_tcb_evaluation_data_number
+            ));
+        }
     }
     if let Some(allowed) = &pin.fmspc
         && !allowed.contains(&quote.fmspc)
@@ -578,7 +607,8 @@ pub(crate) mod tests {
             tcb_status: TcbStatus::UpToDate,
             platform_tcb_status: TcbStatus::UpToDate,
             qe_tcb_status: TcbStatus::UpToDate,
-            tcb_evaluation_data_number: 19,
+            tcb_info_evaluation_data_number: 19,
+            qe_identity_evaluation_data_number: 19,
         }
     }
 
@@ -651,8 +681,14 @@ pub(crate) mod tests {
                 Box::new(|q, _| q.tcb_status = TcbStatus::ConfigurationNeeded),
             ),
             (
-                "tcbEvaluationDataNumber",
-                Box::new(|q, _| q.tcb_evaluation_data_number = 18),
+                "TCB Info tcbEvaluationDataNumber 18",
+                Box::new(|q, _| q.tcb_info_evaluation_data_number = 18),
+            ),
+            // A stale QE Identity under a fresh TCB Info: the floor binds
+            // each document, not only the TCB Info.
+            (
+                "QE Identity tcbEvaluationDataNumber 18",
+                Box::new(|q, _| q.qe_identity_evaluation_data_number = 18),
             ),
             (
                 "FMSPC",
@@ -770,7 +806,8 @@ pub(crate) mod tests {
         assert_eq!(quote.report.mr_config_id, [0; 48]);
         assert_eq!(hex::encode(quote.fmspc), "b0c06f000000");
         assert_eq!(quote.tcb_status, TcbStatus::UpToDate);
-        assert_eq!(quote.tcb_evaluation_data_number, 17);
+        assert_eq!(quote.tcb_info_evaluation_data_number, 17);
+        assert_eq!(quote.qe_identity_evaluation_data_number, 17);
         // A multi-package (Platform CA) host with SMT on, as cloud TDX
         // hosts commonly are: all three flags asserted.
         assert_eq!(quote.dynamic_platform, PckFlag::True);
@@ -802,7 +839,7 @@ pub(crate) mod tests {
             td_attributes: quote.report.td_attributes,
             xfam: quote.report.xfam,
             minimum_tee_tcb_svn: quote.report.tee_tcb_svn,
-            minimum_tcb_evaluation_data_number: quote.tcb_evaluation_data_number,
+            minimum_tcb_evaluation_data_number: 17,
             qe_vendor_id: quote.qe_vendor_id,
             fmspc: Some(vec![quote.fmspc]),
             dynamic_platform: quote.dynamic_platform,
@@ -990,7 +1027,8 @@ pub(crate) mod tests {
     fn appraisal_accepts_higher_svns_and_a_listed_fmspc() {
         let mut quote = authenticated();
         quote.report.tee_tcb_svn = [4, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        quote.tcb_evaluation_data_number = 20;
+        quote.tcb_info_evaluation_data_number = 20;
+        quote.qe_identity_evaluation_data_number = 21;
         let mut pin = pin();
         pin.fmspc = Some(vec![[0x90, 0xc0, 0x6f, 0, 0, 0], quote.fmspc]);
         pin.mr_seam.push([0x44; 48]);
