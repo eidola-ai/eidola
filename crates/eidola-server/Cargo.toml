@@ -94,7 +94,7 @@ tinfoil-verifier = { path = "../tinfoil-verifier" }
 # This whole subsystem is temporary — it goes away when we self-host inference
 # and revert to a statically pinned measurement set.
 const-oid = { version = "0.9", features = ["db"] }
-der = { version = "0.7", features = ["pem", "alloc"] }
+der = { version = "0.8", features = ["pem", "alloc"] }
 spki = { version = "0.7", features = ["pem"] }
 x509-cert = "0.2"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
