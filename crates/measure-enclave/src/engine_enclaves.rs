@@ -37,6 +37,8 @@ use eidola_common::engine_deployment::deployment::{
     ModelIdentity, check_deployment, check_model_agreement,
 };
 
+use tinfoil_verifier::{AllowedMeasurement, PlatformMeasurement, TdxPin, TdxPolicy};
+
 use crate::tdx_igvm;
 
 /// The schema version emitted.
@@ -71,7 +73,9 @@ pub fn required_release(config: &[u8]) -> Result<(String, String)> {
 /// The deployment is checked by `eidola_common::engine_deployment::deployment::
 /// check_deployment`, the one check the gateway's build also runs on every
 /// pinned deployment, so the generator can only emit a pin the build accepts.
-/// What only this tool adds is the launch identity from the platform release.
+/// What only this tool adds is the launch identity from the platform release;
+/// the pin is then compiled by the attesting client's own pin compiler
+/// (`tinfoil_verifier::validate_pins`), as the gateway's build compiles it.
 pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result<Entry> {
     let sidecar_path = inputs
         .config_path
@@ -99,18 +103,27 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
         inputs.config,
     )?;
 
-    let mut pin = json!({
-        "platform": {
-            "tdx": {
-                "mrtd": launch.mrtd,
-                "mrconfigid": launch.mrconfigid,
-                "policy": tdx_policy,
-            }
-        }
-    });
-    if let Some(gpus) = checked.expected_gpus {
-        pin["expected_gpus"] = gpus.into();
-    }
+    // The pin in the attesting client's own type, compiled by its own pin
+    // compiler (the one the gateway's build runs over the file): a policy the
+    // client would refuse — an empty MR_SEAM list, DEBUG attributes, a wrong
+    // width — fails here, before the file is rendered.
+    let policy: TdxPolicy =
+        serde_json::from_value(tdx_policy).context("deployment.json: tdx_policy")?;
+    let pin = AllowedMeasurement {
+        platform: PlatformMeasurement::Tdx(TdxPin {
+            mrtd: launch.mrtd,
+            mrconfigid: launch.mrconfigid,
+            policy,
+        }),
+        expected_gpus: checked
+            .expected_gpus
+            .map(u32::try_from)
+            .transpose()
+            .context("expected_gpus must fit a u32")?,
+    };
+    tinfoil_verifier::validate_pins(std::slice::from_ref(&pin))
+        .map_err(|e| anyhow::anyhow!("the attesting client refuses this pin: {e}"))?;
+    let pin = serde_json::to_value(&pin)?;
     let cache = checked.measured.cache;
     let json = json!({
         "config": inputs.config_path,
@@ -277,7 +290,7 @@ containers:
         "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
         "expected_gpus": 8,
         "tdx_policy": {
-            "mr_seam": ["55"],
+            "mr_seam": ["555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"],
             "td_attributes": "0000001000000000",
             "xfam": "e702060000000000",
             "minimum_tee_tcb_svn": "06010300000000000000000000000000",
@@ -460,6 +473,28 @@ containers:
         assert!(entry("fixture-model", &unpinned, SIDECAR).contains("pin its release manifest"));
         let other_release = good.replace(&release_sha, &"ab".repeat(32));
         assert!(entry("fixture-model", &other_release, SIDECAR).contains("not the pinned"));
+
+        // A machine policy the attesting client would refuse is refused here,
+        // by its own pin compiler, before anything is rendered: an empty
+        // MR_SEAM list, DEBUG set in TD_ATTRIBUTES, a short field.
+        let seam = format!("[\"{}\"]", "5".repeat(96));
+        for (name, from, to) in [
+            ("empty mr_seam", seam.as_str(), "[]"),
+            (
+                "debug attributes",
+                "\"0000001000000000\"",
+                "\"0100001000000000\"",
+            ),
+            ("short xfam", "\"e702060000000000\"", "\"e702\""),
+        ] {
+            let policy = SIDECAR.replace(from, to);
+            assert_ne!(policy, SIDECAR, "{name}: the edit applied");
+            let err = entry("fixture-model", &good, &policy);
+            assert!(
+                err.contains("the attesting client refuses this pin"),
+                "{name}: {err}"
+            );
+        }
 
         // A CUDA deployment that asks for no GPU evidence, or a different
         // count than it attaches.

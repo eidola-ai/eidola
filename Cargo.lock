@@ -6483,6 +6483,7 @@ dependencies = [
  "sev",
  "sha2 0.11.0",
  "tdx-measure",
+ "tinfoil-verifier",
 ]
 
 [[package]]

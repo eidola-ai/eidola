@@ -33,6 +33,10 @@ igvm_defs = "0.5"
 # (`cvm-version`, cache retention).
 eidola-common = { path = "../eidola-common", features = ["deployment"] }
 
+# The attesting client's pin types and its pin compiler: every pin emitted is
+# one the client (and the gateway's build) accepts.
+tinfoil-verifier = { path = "../tinfoil-verifier" }
+
 # Config parsing
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
