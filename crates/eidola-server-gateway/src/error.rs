@@ -158,9 +158,12 @@ impl std::error::Error for ServerError {}
 /// this crate's own bucket for upstream error bodies that didn't parse.
 const KNOWN_UPSTREAM_ERROR_TYPES: &[&str] = &[
     "authentication_error",
+    "context_length_exceeded",
+    "engine_unavailable",
     "insufficient_quota",
     "invalid_request_error",
     "not_found_error",
+    "overloaded",
     "permission_error",
     "rate_limit_error",
     "server_error",

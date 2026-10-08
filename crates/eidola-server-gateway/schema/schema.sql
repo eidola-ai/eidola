@@ -366,6 +366,45 @@ COMMENT ON COLUMN nullifier.refund_token IS
     'it is only useful to the client holding the matching PreRefund state.';
 
 -- ---------------------------------------------------------------------------
+-- Engine Placement
+-- ---------------------------------------------------------------------------
+--
+-- Self-contained and idempotent (IF NOT EXISTS throughout), so it can be
+-- applied on its own to a database created before it existed. Shared by every
+-- gateway version running against the database, so it changes additively
+-- only: gateways read named columns, and a column one adds must not change
+-- what an older gateway's read means.
+
+CREATE TABLE IF NOT EXISTS engine_placement (
+    model_id    TEXT NOT NULL,
+    deployment  TEXT NOT NULL CHECK (deployment ~ '^[0-9a-f]{64}$'),
+    base_url    TEXT NOT NULL CHECK (base_url ~ '^https://'),
+    enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (model_id, base_url)
+);
+
+COMMENT ON TABLE engine_placement IS
+    'Where Eidola-hosted inference engines can be reached, edited by an '
+    'operator. Availability only, never trust: a gateway uses a row only '
+    'when it is enabled and names a model and a deployment that gateway''s '
+    'own build pins, and attests every connection to the engine against '
+    'those compiled-in pins. Health is each gateway''s own and is never '
+    'written here.';
+
+COMMENT ON COLUMN engine_placement.deployment IS
+    'The engine deployment''s config hash: config_sha256 in '
+    'releases/trust/engine-enclaves.json (on Intel TDX, the launch''s '
+    'MRCONFIGID). A gateway built from a tree that does not pin this '
+    'deployment ignores the row.';
+
+COMMENT ON COLUMN engine_placement.base_url IS
+    'The engine''s https origin (optionally with a path prefix); the gateway '
+    'calls /v1/chat/completions, /v1/engine/info and /healthz under it.';
+
+-- ---------------------------------------------------------------------------
 -- Helper Functions
 -- ---------------------------------------------------------------------------
 

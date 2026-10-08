@@ -408,7 +408,8 @@ fn check_sufficient_charge(
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 402, description = "Insufficient charge amount", body = ErrorResponse),
         (status = 409, description = "Credential already spent", body = ErrorResponse),
-        (status = 502, description = "Upstream provider error", body = ErrorResponse)
+        (status = 502, description = "Upstream provider error", body = ErrorResponse),
+        (status = 503, description = "No upstream is available for the model", body = ErrorResponse)
     )
 )]
 pub async fn chat_completions(

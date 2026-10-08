@@ -1072,3 +1072,47 @@ fn catalog_model() -> Model {
         },
     }
 }
+
+/// The production source reads the table `schema.sql` creates. Needs a
+/// database with the schema applied (`DATABASE_URL`).
+#[tokio::test]
+#[ignore]
+async fn placement_reads_the_schemas_table() {
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let pool = crate::db::create_pool(&url, None, None).unwrap();
+    let model = format!("placement-test-{}", uuid::Uuid::new_v4());
+    let client = pool.get().await.unwrap();
+    for (url, enabled) in [("https://b.test", true), ("https://a.test", false)] {
+        client
+            .execute(
+                "INSERT INTO engine_placement (model_id, deployment, base_url, enabled) \
+                 VALUES ($1, $2, $3, $4)",
+                &[&model, &DEPLOYMENT_A, &url, &enabled],
+            )
+            .await
+            .unwrap();
+    }
+    let rows = placement::PostgresPlacement(pool.clone())
+        .load()
+        .await
+        .unwrap();
+    client
+        .execute(
+            "DELETE FROM engine_placement WHERE model_id = $1",
+            &[&model],
+        )
+        .await
+        .unwrap();
+    let ours: Vec<EnginePlacementRow> = rows.into_iter().filter(|r| r.model_id == model).collect();
+    let row = |url: &str, enabled| EnginePlacementRow {
+        model_id: model.clone(),
+        deployment: DEPLOYMENT_A.into(),
+        base_url: url.into(),
+        enabled,
+    };
+    assert_eq!(
+        ours,
+        vec![row("https://a.test", false), row("https://b.test", true)]
+    );
+}

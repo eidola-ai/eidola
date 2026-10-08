@@ -584,6 +584,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "No upstream is available for the model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
