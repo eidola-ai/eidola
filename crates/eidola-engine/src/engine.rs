@@ -385,8 +385,7 @@ impl<E: Executor> Engine<E> {
     pub fn cancel(&mut self, id: RequestId, now: Millis) -> Option<Event> {
         let seq = self.seqs.remove(&id)?;
         if self.running.remove(&seq.arrival).is_some() {
-            self.kv
-                .release(id, Release::Finish, seq.req.prompt.len() as u32, now);
+            self.kv.release(id, Release::Finish, now);
         } else {
             self.waiting.remove(&seq.arrival);
             self.kv.forget(id);
@@ -428,8 +427,7 @@ impl<E: Executor> Engine<E> {
         self.waiting.insert(seq.arrival, id);
         seq.preemptions += 1;
         self.stats.preemptions += 1;
-        let prompt_len = seq.req.prompt.len() as u32;
-        self.kv.release(id, Release::Preempt, prompt_len, now);
+        self.kv.release(id, Release::Preempt, now);
     }
 
     /// Plans and executes one step. Returns the events it produced (empty when idle).
@@ -506,22 +504,12 @@ impl<E: Executor> Engine<E> {
                     break;
                 };
                 let Some((mut entry, mut cost)) = self.plan_row(id, budget, k) else {
-                    self.kv.release(
-                        id,
-                        Release::Preempt,
-                        self.seqs[&id].req.prompt.len() as u32,
-                        now,
-                    );
+                    self.kv.release(id, Release::Preempt, now);
                     break;
                 };
                 if !self.allocate_row(id, &mut entry, &mut cost, &mut planned, &mut budget, &mut k)
                 {
-                    self.kv.release(
-                        id,
-                        Release::Preempt,
-                        self.seqs[&id].req.prompt.len() as u32,
-                        now,
-                    );
+                    self.kv.release(id, Release::Preempt, now);
                     if self.running.is_empty() && planned.is_empty() {
                         // Nothing else holds memory: it can never be admitted.
                         self.waiting.remove(&arrival);
@@ -558,8 +546,7 @@ impl<E: Executor> Engine<E> {
     fn finish_now(&mut self, id: RequestId, reason: FinishReason, now: Millis) -> Event {
         let seq = self.seqs.remove(&id).expect("running sequence");
         self.running.remove(&seq.arrival);
-        self.kv
-            .release(id, Release::Finish, seq.req.prompt.len() as u32, now);
+        self.kv.release(id, Release::Finish, now);
         Event {
             id,
             tokens: Vec::new(),
@@ -583,9 +570,9 @@ impl<E: Executor> Engine<E> {
     ///    all-or-nothing rule (a row drafts `k` or nothing) and makes a step under
     ///    pressure a uniform plain decode.
     /// 2. **The prefill chunk**, cut to the minimum progress unit.
-    /// 3. **This sequence's regeneration pins** ([`KvManager::unpin`]): retention of the
-    ///    prompt's last window for a future regeneration hit, which the sequence itself
-    ///    never needs.
+    /// 3. **This sequence's retention** ([`KvManager::unpin`]): the windows it keeps at its
+    ///    branch and regeneration points for later requests' hits, which the sequence
+    ///    itself never needs.
     ///
     /// Only when the minimum progress unit still does not fit does this return false;
     /// the caller then preempts the newest peer and retries, and a sequence that is
@@ -633,7 +620,7 @@ impl<E: Executor> Engine<E> {
                 return true;
             }
         }
-        // 3. This sequence's regeneration pins.
+        // 3. This sequence's branch and regeneration retention.
         self.kv.unpin(id) && fits(&mut self.kv, entry)
     }
 
@@ -767,10 +754,9 @@ impl<E: Executor> Engine<E> {
                 computed += accepted_drafts;
             }
             let computed = computed.min(seq.tokens.len() as u32 - 1).max(e.context_len);
-            let prompt_len = seq.req.prompt.len() as u32;
             self.kv.commit(id, computed, &seq.tokens, now);
             if let Some(reason) = finish {
-                self.kv.release(id, Release::Finish, prompt_len, now);
+                self.kv.release(id, Release::Finish, now);
                 let seq = self.seqs.remove(&id).expect("sequence");
                 self.running.remove(&seq.arrival);
                 events.push(Event {

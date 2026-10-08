@@ -647,7 +647,7 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
 /// What a downstream tool is told about a failure.
 ///
 /// **The audience decides, and here it is the opposite audience from the
-/// server's.** `eidola-server` hands its client every detail and redacts its
+/// server's.** `eidola-server-gateway` hands its client every detail and redacts its
 /// own logs, because there the detail *is* the client's own data and the log is
 /// the surface a stranger might read. This proxy is the mirror image: the
 /// detail is about **this machine** — a models directory on someone's disk, a

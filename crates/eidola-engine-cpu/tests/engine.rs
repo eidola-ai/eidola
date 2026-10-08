@@ -183,6 +183,82 @@ fn prefix_hits_and_salt_isolation() {
     }
 }
 
+/// Requests under one key share a prefix spanning several sliding windows (window 8, the
+/// drafter's too) and then diverge. The first divergent request recomputes and keeps its
+/// window at the branch; every later one resumes there, target and drafter KV and the
+/// drafter's boundary tap included, and produces exactly what a cold run produces.
+#[test]
+fn divergent_turns_after_a_shared_prefix_hit_at_the_branch() {
+    for spec_on in [false, true] {
+        let mut rng = TestRng(8);
+        let prefix = rng.tokens(40, VOCAB);
+        let prompts: Vec<Vec<u32>> = (0..5)
+            .map(|i| {
+                let mut t = prefix.clone();
+                t.push(i);
+                t.extend(rng.tokens(6, VOCAB));
+                t
+            })
+            .collect();
+        // Seeded speculative sampling is exact only in distribution (the first sample is
+        // speculative or not depending on where the prefill starts), so it runs greedy.
+        let sampling = |i: usize| {
+            if spec_on {
+                SamplingParams::greedy()
+            } else {
+                params(i as u64)
+            }
+        };
+
+        let mut h = Harness::fixture(512, vec![0, 1], sched(spec_on));
+        let mut hits = Vec::new();
+        for (i, p) in prompts.iter().enumerate() {
+            let id = i as u64;
+            h.submit(request(
+                id,
+                p.clone(),
+                sampling(i),
+                5,
+                CacheScope::Keyed(salt(1)),
+            ));
+            h.step();
+            hits.push(h.eng.cached_prompt_tokens(id).unwrap());
+            h.run();
+        }
+        assert_eq!(hits, [0, 0, 40, 40, 40], "speculative {spec_on}");
+        let sum = h.check_all(spec_on);
+        eprintln!("speculative {spec_on}: {sum:?}");
+
+        // Cold: every prompt alone, nothing cached.
+        let mut cold = Harness::fixture(512, vec![0, 1], sched(spec_on));
+        for (i, p) in prompts.iter().enumerate() {
+            cold.submit(request(
+                i as u64,
+                p.clone(),
+                sampling(i),
+                5,
+                CacheScope::Private,
+            ));
+            cold.run();
+        }
+        for i in 0..prompts.len() as u64 {
+            assert_eq!(h.outputs[&i], cold.outputs[&i], "request {i}");
+        }
+        // Another key never hits the branch.
+        h.submit(request(
+            9,
+            prompts[4].clone(),
+            sampling(4),
+            5,
+            CacheScope::Keyed(salt(2)),
+        ));
+        h.step();
+        assert_eq!(h.eng.cached_prompt_tokens(9), Some(0));
+        h.run();
+        assert_eq!(h.outputs[&9], cold.outputs[&4]);
+    }
+}
+
 #[test]
 fn preemption_and_resume_reproduce_uninterrupted_outputs() {
     for spec_on in [false, true] {

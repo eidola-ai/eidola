@@ -26,14 +26,28 @@
 //!
 //! Full blocks are sealed into the cache under the salted SHA-256 chain of
 //! [`crate::hash`]. A cache entry always holds its full-attention blocks. Sliding-window
-//! blocks are attached to entries only where they complete the window of a *hit point*:
-//! when a sequence is released, the windows ending at (a) its last sealed boundary (the
-//! point a continuation of the conversation resumes from) and (b) the last full block of
-//! its prompt before the final token (the point a regeneration of the same prompt resumes
-//! from) are retained. A lookup accepts a hit of `m` blocks only if every full-attention
-//! block `0..m` is cached and every sliding-window group has its blocks covering
-//! `[first_visible(m * block_size), m * block_size)` attached. Hits are therefore always
-//! correct, and windows are retained only where they can be used.
+//! blocks are attached to entries only where they complete the window of a *hit point*,
+//! a boundary a later request under the same salt resumes from. A keyed sequence retains
+//! the window at three such points:
+//!
+//! - **branch**: the boundary where its chain left the cached trie at admission (the
+//!   deepest boundary whose blocks were cached, if their window was not). A request that
+//!   shares a prefix with an earlier one and then diverges finds the earlier one's
+//!   full-attention blocks but no window there; it recomputes the prefix, and the window
+//!   it computes at the divergence is kept, so every later request that shares the prefix
+//!   and diverges anywhere after it hits there;
+//! - **regeneration**: the last full block of its prompt before the final token;
+//! - **continuation**: its last sealed boundary, where a continuation of the
+//!   conversation resumes.
+//!
+//! The first two are attached as soon as the boundary is sealed (before the window slides
+//! past it), so requests that arrive while the sequence is still running can hit them;
+//! the third is attached at release. A lookup accepts a hit of `m` blocks only if every
+//! full-attention block `0..m` is cached and every sliding-window group has its blocks
+//! covering `[first_visible(m * block_size), m * block_size)` attached. Hits are therefore
+//! always correct, and windows are retained only where they can be used: at most
+//! `ceil((window - 1) / block_size) + 1` blocks per sliding group per point, three points
+//! per sequence.
 //!
 //! Entries form a tree (each chains its parent). Eviction under pressure takes the least
 //! recently used unreferenced leaf, then cascades to ancestors that became unreferenced
@@ -133,7 +147,11 @@ struct SeqKv {
     chain_broken: bool,
     blocks: Vec<Vec<u32>>,
     computed: u32,
-    pins: Vec<(u32, u32)>,
+    /// Branch and regeneration points not yet sealed, ascending (block boundaries).
+    points: Vec<u32>,
+    /// Window blocks this sequence attached to entries at those points, as
+    /// `(entry, group, block)`, while it runs (so [`KvManager::unpin`] can take them back).
+    attached: Vec<(EntryId, usize, u32)>,
     slide_cursor: Vec<u32>,
 }
 
@@ -224,7 +242,8 @@ impl KvManager {
     /// no slot is free.
     ///
     /// `prompt_len` is the length of the original prompt (it fixes the regeneration hit
-    /// point whose window is retained).
+    /// point whose window is retained). A keyed sequence (`retain`) whose chain matches
+    /// cached blocks beyond its hit also records that boundary as its branch point.
     pub fn admit(
         &mut self,
         id: SeqId,
@@ -249,21 +268,10 @@ impl KvManager {
             chain_broken: false,
             blocks: vec![Vec::new(); groups],
             computed: 0,
-            pins: vec![(0, 0); groups],
+            points: Vec::new(),
+            attached: Vec::new(),
             slide_cursor: vec![0; groups],
         };
-        // Regeneration pins keep the prompt's last window mapped so `release` can attach it
-        // to a cache entry; with caching off nothing can use them, so none are taken.
-        let regen_point = (prompt_len.max(1) - 1) / bs;
-        for g in 0..groups {
-            if !self.policy.enabled {
-                break;
-            }
-            if let AttentionKind::Sliding { .. } = self.attention[g] {
-                let lo = self.attention[g].first_visible(regen_point * bs) / bs;
-                seq.pins[g] = (lo, regen_point);
-            }
-        }
 
         if self.policy.enabled {
             let cap_blocks = (tokens.len() as u32 - 1) / bs;
@@ -283,7 +291,8 @@ impl KvManager {
                 }
                 chain.push(eid);
             }
-            let mut m = chain.len() as u32;
+            let branch = chain.len() as u32;
+            let mut m = branch;
             while m > 0 && !self.window_covered(&chain, m) {
                 m -= 1;
             }
@@ -319,6 +328,16 @@ impl KvManager {
             seq.computed = m * bs;
             for g in 0..groups {
                 seq.slide_cursor[g] = self.attention[g].first_visible(m * bs) / bs;
+            }
+            // Retention points this sequence will attach its window at once sealed. Only a
+            // keyed sequence's entries outlive it, and only sliding groups need them.
+            let sliding = self.attention.iter().any(|a| *a != AttentionKind::Full);
+            if retain && sliding {
+                let regen = (prompt_len.max(1) - 1) / bs;
+                let mut points: Vec<u32> = [branch, regen].into_iter().filter(|&p| p > m).collect();
+                points.sort_unstable();
+                points.dedup();
+                seq.points = points;
             }
         }
         let cached = seq.computed;
@@ -401,27 +420,27 @@ impl KvManager {
         self.seqs.insert(id, seq);
     }
 
-    /// Drops `id`'s regeneration pins and releases the sliding-window blocks they alone
-    /// kept mapped (those already behind the window). The prompt's regeneration point is
-    /// then no longer retained at release; the sequence itself loses nothing. Returns
-    /// whether any block was freed.
+    /// Gives up `id`'s branch and regeneration retention: forgets the points not yet
+    /// sealed and takes back the window blocks it already attached to cache entries at the
+    /// others, freeing those no sequence maps any more (the ones already behind its own
+    /// window). The sequence itself loses nothing; those points are simply not retained.
+    /// Returns whether any block was freed.
     pub fn unpin(&mut self, id: SeqId) -> bool {
-        let mut seq = self.seqs.remove(&id).expect("live sequence");
+        let seq = self.seqs.get_mut(&id).expect("live sequence");
+        seq.points.clear();
+        let attached = std::mem::take(&mut seq.attached);
         let mut freed = false;
-        for g in 0..self.pools.len() {
-            let (lo, hi) = std::mem::take(&mut seq.pins[g]);
-            let behind = hi.min(seq.slide_cursor[g]);
-            for idx in lo..behind {
-                if seq.blocks[g]
-                    .get(idx as usize)
-                    .is_some_and(|&b| b != NULL_BLOCK)
-                {
-                    self.unmap(&mut seq, g, idx as usize);
-                    freed = true;
-                }
+        for (eid, g, b) in attached {
+            let Some(entry) = self.entries.get_mut(&eid) else {
+                continue;
+            };
+            if entry.blocks[g] != b {
+                continue;
             }
+            entry.blocks[g] = NULL_BLOCK;
+            freed |= self.pools[g].refs[b as usize] == 1;
+            self.decref(g, b);
         }
-        self.seqs.insert(id, seq);
         freed
     }
 
@@ -467,17 +486,26 @@ impl KvManager {
             }
         }
 
+        // Attach the windows of retention points sealed by now, before they slide away:
+        // the window of a boundary at or past the previous sealed one is still mapped.
+        while let Some(&point) = seq.points.first() {
+            if point > sealable && !seq.chain_broken {
+                break;
+            }
+            seq.points.remove(0);
+            if point <= seq.entries.len() as u32 {
+                let attached = self.attach_window(&seq, point);
+                seq.attached.extend(attached);
+            }
+        }
+
         // Slide windows behind the newest sealed boundary.
         for g in 0..groups {
             if let AttentionKind::Sliding { .. } = self.attention[g] {
                 let lo_keep = self.attention[g].first_visible(sealable * bs) / bs;
-                let (pin_lo, pin_hi) = seq.pins[g];
                 while seq.slide_cursor[g] < lo_keep {
                     let idx = seq.slide_cursor[g];
                     seq.slide_cursor[g] += 1;
-                    if idx >= pin_lo && idx < pin_hi {
-                        continue;
-                    }
                     if (idx as usize) < seq.blocks[g].len() {
                         self.unmap(&mut seq, g, idx as usize);
                     }
@@ -488,41 +516,15 @@ impl KvManager {
     }
 
     /// Releases a sequence's slot and blocks. See [`Release`].
-    pub fn release(&mut self, id: SeqId, kind: Release, prompt_len: u32, now: Millis) {
-        let bs = self.block_size;
+    pub fn release(&mut self, id: SeqId, kind: Release, now: Millis) {
         let groups = self.pools.len();
         let seq = self.seqs.remove(&id).expect("live sequence");
         let retain = kind == Release::Preempt || seq.retain;
 
         if self.policy.enabled && retain {
-            let sealed = seq.entries.len() as u32;
-            let regen = (prompt_len.max(1) - 1) / bs;
-            for point in [regen, sealed] {
-                if point == 0 || point > sealed {
-                    continue;
-                }
-                for g in 0..groups {
-                    if self.attention[g] == AttentionKind::Full {
-                        continue;
-                    }
-                    let lo = self.attention[g].first_visible(point * bs) / bs;
-                    for idx in lo..point {
-                        let eid = seq.entries[idx as usize];
-                        let Some(b) = seq.blocks[g].get(idx as usize).copied() else {
-                            continue;
-                        };
-                        if b == NULL_BLOCK {
-                            continue;
-                        }
-                        if let Some(entry) = self.entries.get_mut(&eid)
-                            && entry.blocks[g] == NULL_BLOCK
-                        {
-                            entry.blocks[g] = b;
-                            self.pools[g].refs[b as usize] += 1;
-                        }
-                    }
-                }
-            }
+            // The continuation point; branch and regeneration points were attached when
+            // they were sealed.
+            self.attach_window(&seq, seq.entries.len() as u32);
         }
 
         for g in 0..groups {
@@ -849,6 +851,39 @@ impl KvManager {
         true
     }
 
+    /// Attaches `seq`'s sliding-window blocks covering the window before boundary `point`
+    /// to the entries sealed there, where an entry has none yet. Returns what it attached.
+    fn attach_window(&mut self, seq: &SeqKv, point: u32) -> Vec<(EntryId, usize, u32)> {
+        let mut attached = Vec::new();
+        if point == 0 || point > seq.entries.len() as u32 {
+            return attached;
+        }
+        let bs = self.block_size;
+        for g in 0..self.pools.len() {
+            if self.attention[g] == AttentionKind::Full {
+                continue;
+            }
+            let lo = self.attention[g].first_visible(point * bs) / bs;
+            for idx in lo..point {
+                let eid = seq.entries[idx as usize];
+                let Some(b) = seq.blocks[g].get(idx as usize).copied() else {
+                    continue;
+                };
+                if b == NULL_BLOCK {
+                    continue;
+                }
+                if let Some(entry) = self.entries.get_mut(&eid)
+                    && entry.blocks[g] == NULL_BLOCK
+                {
+                    entry.blocks[g] = b;
+                    self.pools[g].refs[b as usize] += 1;
+                    attached.push((eid, g, b));
+                }
+            }
+        }
+        attached
+    }
+
     fn is_hit_point(&self, eid: EntryId) -> bool {
         let mut chain = Vec::new();
         let mut cur = Some(eid);
@@ -1023,7 +1058,7 @@ mod tests {
         assert!(!kv.allocate(1, 20));
         kv.check_invariants();
         assert_eq!(kv.free_blocks(0), 0);
-        kv.release(1, Release::Preempt, 40, 0);
+        kv.release(1, Release::Preempt, 0);
         kv.check_invariants();
         assert_eq!(kv.free_blocks(0), 4);
     }

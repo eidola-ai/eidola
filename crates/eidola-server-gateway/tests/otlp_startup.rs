@@ -20,7 +20,7 @@ fn starts_with_an_https_otlp_endpoint_and_no_system_trust_store() {
     let empty_bundle = dir.join("empty.pem");
     std::fs::write(&empty_bundle, b"").expect("write empty CA bundle");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_eidola-server"))
+    let output = Command::new(env!("CARGO_BIN_EXE_eidola-server-gateway"))
         .env_clear()
         .env("SSL_CERT_FILE", &empty_bundle)
         .env("SSL_CERT_DIR", &dir)
@@ -28,7 +28,7 @@ fn starts_with_an_https_otlp_endpoint_and_no_system_trust_store() {
         // on the way out is refused at once rather than leaving the machine.
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", "https://127.0.0.1:9/otlp")
         .output()
-        .expect("run eidola-server");
+        .expect("run eidola-server-gateway");
     let _ = std::fs::remove_dir_all(&dir);
 
     let stderr = String::from_utf8_lossy(&output.stderr);

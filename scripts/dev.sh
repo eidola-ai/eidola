@@ -5,9 +5,9 @@
 #   scripts/dev.sh [--container|--host]
 #
 # Modes:
-#   --container  (default)  eidola-server runs inside docker. Shim forwards
-#                           to the in-network `server` container.
-#   --host                  eidola-server runs on the host with cargo. Shim
+#   --container  (default)  eidola-server-gateway runs inside docker. Shim forwards
+#                           to the in-network `gateway` container.
+#   --host                  eidola-server-gateway runs on the host with cargo. Shim
 #                           forwards to host.docker.internal:8080. The script
 #                           writes `.env.local` with BIND_ADDR (and the
 #                           captured Stripe webhook secret) for the host
@@ -51,6 +51,7 @@ esac
 
 BAKE_TARGETS=(postgres shim)
 if [ "$MODE" = "container" ]; then
+    # The gateway image's bake target is `server` (docker-bake.hcl).
     BAKE_TARGETS+=(server)
 fi
 if [ -n "${STRIPE_API_KEY:-}" ]; then
@@ -111,9 +112,9 @@ fi
 UP_SERVICES=(shim)
 UP_PROFILES=()
 if [ "$MODE" = "container" ]; then
-    SHIM_UPSTREAM_URL="http://server:8080"
-    UP_SERVICES+=(server)
-    UP_PROFILES+=(--profile server)
+    SHIM_UPSTREAM_URL="http://gateway:8080"
+    UP_SERVICES+=(gateway)
+    UP_PROFILES+=(--profile gateway)
 else
     SHIM_UPSTREAM_URL="http://host.docker.internal:8080"
 fi
@@ -151,16 +152,16 @@ cat <<EOF
     postgres : localhost:5432
     shim     : https://localhost:8443  (-> $SHIM_UPSTREAM_URL)
 EOF
-[ "$MODE" = "container" ] && echo "    server   : http://localhost:8080  (in docker)"
+[ "$MODE" = "container" ] && echo "    gateway  : http://localhost:8080  (in docker)"
 [ -n "$STRIPE_WEBHOOK_SECRET" ] && echo "    stripe-cli: forwarding to https://shim:8443/v1/webhooks/stripe"
 echo ""
 
 if [ "$MODE" = "host" ]; then
     cat <<EOF
-To run the server on the host:
+To run the gateway on the host:
 
     set -a; source .env; source .env.local; set +a
-    cargo run -p eidola-server
+    cargo run -p eidola-server-gateway
 
 EOF
 fi

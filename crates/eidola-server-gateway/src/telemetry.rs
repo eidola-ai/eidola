@@ -6,7 +6,7 @@
 //! Standard OTel env vars control the exporter:
 //! - `OTEL_EXPORTER_OTLP_ENDPOINT` — OTLP endpoint (e.g., `https://otlp-gateway-*.grafana.net/otlp`)
 //! - `OTEL_EXPORTER_OTLP_HEADERS` — auth headers (e.g., `Authorization=Basic <base64>`)
-//! - `OTEL_SERVICE_NAME` — overrides the default `eidola-server`
+//! - `OTEL_SERVICE_NAME` — overrides the default `eidola-server-gateway`
 //!
 //! # Spans are recorded everywhere and exported only on request
 //!
@@ -157,12 +157,13 @@ pub fn init() -> Option<OtelGuard> {
     let fmt_layer = tracing_subscriber::fmt::layer();
 
     let env_filter = EnvFilter::from_default_env()
-        .add_directive("eidola_server=info".parse().unwrap())
+        .add_directive("eidola_server_gateway=info".parse().unwrap())
         .add_directive("hyper=warn".parse().unwrap());
 
     let (otel_trace_layer, otel_log_layer) = match &otel {
         Some(guard) => {
-            let trace_layer = otel_trace_layer(guard.tracer_provider.tracer("eidola-server"));
+            let trace_layer =
+                otel_trace_layer(guard.tracer_provider.tracer("eidola-server-gateway"));
             let log_layer = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
                 &guard.logger_provider,
             );
@@ -268,7 +269,7 @@ fn init_otel_providers() -> Option<OtelGuard> {
     let http_clients = otlp_http_clients();
 
     let service_name =
-        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "eidola-server".to_string());
+        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "eidola-server-gateway".to_string());
 
     let resource = Resource::builder()
         .with_attributes([KeyValue::new("service.name", service_name)])
@@ -359,7 +360,7 @@ pub mod metrics {
     use std::sync::LazyLock;
 
     fn meter() -> opentelemetry::metrics::Meter {
-        opentelemetry::global::meter("eidola-server")
+        opentelemetry::global::meter("eidola-server-gateway")
     }
 
     // The SDK's default explicit-bucket boundaries, reproduced for reference
@@ -779,7 +780,9 @@ mod tests {
             .build();
 
         let subscriber = tracing_subscriber::registry()
-            .with(otel_trace_layer(tracer_provider.tracer("eidola-server")))
+            .with(otel_trace_layer(
+                tracer_provider.tracer("eidola-server-gateway"),
+            ))
             .with(
                 opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
                     &logger_provider,
