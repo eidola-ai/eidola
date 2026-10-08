@@ -19,9 +19,9 @@ use std::collections::BTreeMap;
 use serde_json::Value as Json;
 
 use super::{
-    MeasuredConfig, ModelPack, WeightsStorage, check_container_gpu_access, check_env_names,
-    check_gpu_attestation, check_secrets, check_shim_paths, check_vm_resources, check_weights_pack,
-    env, parse_cvm_version, parse_measured,
+    Executor, MeasuredConfig, ModelPack, WeightsStorage, check_container_gpu_access,
+    check_env_names, check_gpu_attestation, check_resources, check_secrets, check_shim_paths,
+    check_vm_resources, check_weights_pack, env, parse_cvm_version, parse_measured,
 };
 
 /// The image every engine deployment runs, pinned by digest.
@@ -71,6 +71,15 @@ pub fn check_deployment(
         ));
     }
     check_env_names(c.env.keys().map(String::as_str)).map_err(|e| format!("{at}: {e}"))?;
+    // A pinned deployment runs the CUDA executor: the CPU executor is the
+    // numerics reference and the development path, and nothing confidential
+    // ships on it.
+    if measured.executor != Executor::Cuda {
+        return Err(format!(
+            "{at}: a pinned deployment runs the cuda executor; cpu is the reference and \
+             development path"
+        ));
+    }
     if measured.model_id != model_id {
         return Err(format!(
             "{at}: EIDOLA_ENGINE_MODEL_ID is {:?}, but the deployment is for {model_id:?}",
@@ -135,6 +144,10 @@ pub fn check_deployment(
         c.container_gpus.as_deref(),
     )
     .map_err(|e| format!("{at}: {e}"))?;
+
+    // What the node allocates fits the VM and the GPUs it attaches.
+    check_resources(&measured.sizing, c.memory, c.gpus.unwrap_or(0))
+        .map_err(|e| format!("{at}: {e}"))?;
 
     Ok(Deployment {
         cvm_version: c.cvm_version,

@@ -100,6 +100,82 @@ pub fn check_env_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(
     }
 }
 
+/// Caps on the node's allocation-driving sizes. The engine serves one model
+/// family, MiMo-V2.6-Flash (`eidola-engine-cuda`'s `support::check_supported`
+/// refuses every other), so each cap follows from that model and the CUDA
+/// executor's own limits, generous but finite.
+pub mod caps {
+    /// The model's context window (`support::MAX_POSITIONS`, 2^20).
+    pub const MAX_MODEL_LEN: u32 = 1 << 20;
+    /// Positions per KV block: a block is the attention kernel's page and the
+    /// prefix cache's unit of reuse; beyond 1,024 positions paging stops
+    /// paying, and the page stride (32-bit) stays far from overflow.
+    pub const KV_BLOCK_SIZE: u32 = 1024;
+    /// Blocks per KV group: the device block tables are `i32`
+    /// (`kv::GroupGeometry::validate`). The device bytes they cost are held
+    /// to the attached GPUs separately ([`super::check_resources`]).
+    pub const KV_BLOCKS: u32 = i32::MAX as u32;
+    /// Sequences per step, which is also the state slots: the sampler's
+    /// scratch is rows × the 152,576-entry vocabulary × 4 bytes (625 MB at
+    /// 1,024), and each slot holds a block table.
+    pub const MAX_SEQS: u32 = 1024;
+    /// Query tokens per step: the forward's activation scratch scales with it
+    /// (tokens × the 16,384-wide dense intermediate × 2 bytes, 2 GiB at
+    /// 65,536).
+    pub const MAX_BATCHED_TOKENS: u32 = 65_536;
+    /// Largest prefill chunk: bounded by a step's tokens, so the same.
+    pub const MAX_PREFILL_CHUNK: u32 = 65_536;
+    /// Speculative draft width: MiMo's MTP heads are a handful; the node also
+    /// refuses more than the loaded model has.
+    pub const DRAFT_TOKENS: u32 = 8;
+    /// Admission slots: each may hold a request body of up to
+    /// `engine_protocol::MAX_REQUEST_BODY_BYTES` and its parse, held to the
+    /// VM's memory separately ([`super::check_resources`]).
+    pub const MAX_REQUESTS: u32 = 4096;
+}
+
+/// KV-cache bytes per position, every layer of MiMo-V2.6-Flash
+/// (`eidola-engine-cuda` `support`): 9 global layers of 4 KV heads and 39
+/// sliding layers of 8, each head 192 K + 128 V dims, in bf16.
+pub const KV_BYTES_PER_POSITION: u64 = (9 * 4 + 39 * 8) * (192 + 128) * 2;
+
+/// Largest memory of one confidential GPU the platform offers, in bytes: the
+/// largest NVIDIA-CC part's HBM, rounded up (288 GiB).
+pub const MAX_GPU_MEMORY_BYTES: u64 = 288 << 30;
+
+/// Whether the deployment's VM and GPUs hold what its configuration
+/// allocates, as far as configuration alone fixes it:
+///
+/// - host memory (`memory`, MiB) holds every admission slot's request body and
+///   its parse (2 × `MAX_REQUEST_BODY_BYTES` each) plus the block tables
+///   (`MAX_SEQS` × ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉ `i32` entries, one
+///   table per KV group, two groups);
+/// - GPU memory (`gpus` × [`MAX_GPU_MEMORY_BYTES`]) holds the KV cache
+///   (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`KV_BYTES_PER_POSITION`]).
+///
+/// The weights' own footprint is the model's and is not estimated here.
+pub fn check_resources(sizing: &Sizing, memory_mib: u64, gpus: u64) -> Result<(), String> {
+    let body = crate::engine_protocol::MAX_REQUEST_BODY_BYTES as u64;
+    let blocks_per_seq = u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size));
+    let host = u64::from(sizing.max_requests) * 2 * body
+        + u64::from(sizing.max_seqs) * blocks_per_seq * 4 * 2;
+    let host_limit = memory_mib << 20;
+    if host > host_limit {
+        return Err(format!(
+            "the node's request buffers and block tables need {host} bytes, more than the VM's \
+             {host_limit} (memory)"
+        ));
+    }
+    let kv = u64::from(sizing.kv_blocks) * u64::from(sizing.kv_block_size) * KV_BYTES_PER_POSITION;
+    let device_limit = gpus * MAX_GPU_MEMORY_BYTES;
+    if kv > device_limit {
+        return Err(format!(
+            "the KV cache needs {kv} bytes, more than {gpus} GPUs hold ({device_limit})"
+        ));
+    }
+    Ok(())
+}
+
 /// Fewest vCPUs a deployment may give its VM.
 pub const MIN_CPUS: u64 = 1;
 /// Most vCPUs a deployment may give its VM.
@@ -308,6 +384,40 @@ pub fn parse_measured(
     // only on these values (a zero seat, prefill chunk or block count) are the
     // positivity rules above; the rest need the model (its position limit and
     // MTP depth) or the node build (its executor).
+    // Every allocation-driving value is capped, so a configuration cannot ask
+    // the node for an allocation it cannot make (a table of `MAX_SEQS` slots,
+    // a scratch of `MAX_BATCHED_TOKENS` rows): refused here, before any
+    // weight is loaded. The caps are in [`caps`], each with its reason.
+    for (name, value, cap) in [
+        (
+            env::KV_BLOCK_SIZE,
+            sizing.kv_block_size,
+            caps::KV_BLOCK_SIZE,
+        ),
+        (env::KV_BLOCKS, sizing.kv_blocks, caps::KV_BLOCKS),
+        (
+            env::MAX_MODEL_LEN,
+            sizing.max_model_len,
+            caps::MAX_MODEL_LEN,
+        ),
+        (env::MAX_SEQS, sizing.max_seqs, caps::MAX_SEQS),
+        (
+            env::MAX_BATCHED_TOKENS,
+            sizing.max_batched_tokens,
+            caps::MAX_BATCHED_TOKENS,
+        ),
+        (
+            env::MAX_PREFILL_CHUNK,
+            sizing.max_prefill_chunk,
+            caps::MAX_PREFILL_CHUNK,
+        ),
+        (env::DRAFT_TOKENS, sizing.draft_tokens, caps::DRAFT_TOKENS),
+        (env::MAX_REQUESTS, sizing.max_requests, caps::MAX_REQUESTS),
+    ] {
+        if value > cap {
+            return Err(ConfigError(format!("{name} must be at most {cap}")));
+        }
+    }
     if sizing.max_batched_tokens <= sizing.draft_tokens {
         return Err(ConfigError(format!(
             "{} must exceed {}: a decode row needs 1 + {} query slots",
@@ -556,7 +666,9 @@ pub const CUDA_GPU_COUNTS: &[u64] = &[1, 8];
 /// - the `cuda` executor needs GPUs, in one of [`CUDA_GPU_COUNTS`], and a pin
 ///   requiring all of them, or its accelerators would go unattested (or, with
 ///   no `gpus`, every handshake would fail for want of evidence);
-/// - the `cpu` executor attaches none and requires none.
+/// - the `cpu` executor attaches none and requires none. A pinned deployment
+///   never takes this branch (the deployment check refuses `cpu` first); it
+///   stays so the rule is total over the grammar's executors.
 ///
 /// `gpus` and `expected_gpus` are `None` when absent; `0` reads as absent.
 pub fn check_gpu_attestation(
@@ -784,6 +896,44 @@ mod tests {
                 "{executor:?} gpus={gpus:?} expected={expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn resources_fit_the_vm_and_gpus() {
+        let sizing = Sizing {
+            kv_block_size: 16,
+            kv_blocks: 65_536,
+            max_model_len: 131_072,
+            max_seqs: 64,
+            max_batched_tokens: 8192,
+            max_prefill_chunk: 4096,
+            draft_tokens: 2,
+            max_requests: 256,
+        };
+        assert!(check_resources(&sizing, 65_536, 8).is_ok());
+        // 256 slots × 64 MiB = 16 GiB of request memory.
+        assert!(check_resources(&sizing, 8192, 8).is_err());
+        assert!(
+            check_resources(
+                &Sizing {
+                    kv_blocks: 1 << 30,
+                    ..sizing
+                },
+                65_536,
+                8
+            )
+            .is_err()
+        );
+        assert!(check_resources(&sizing, 65_536, 0).is_err());
+        // Block size 1 at the longest model length: 2^20 entries per slot.
+        let tables = Sizing {
+            kv_block_size: 1,
+            max_model_len: caps::MAX_MODEL_LEN,
+            max_seqs: caps::MAX_SEQS,
+            kv_blocks: 2,
+            ..sizing
+        };
+        assert!(check_resources(&tables, 16_384, 8).is_err());
     }
 
     #[test]

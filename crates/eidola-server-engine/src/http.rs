@@ -48,7 +48,7 @@ use crate::worker::{Admission, EngineHandle, Output, RequestGuard};
 pub const WEIGHTS_HEADER: &str = eidola_common::engine_protocol::WEIGHTS_HEADER;
 
 /// Largest accepted request body.
-pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_BODY_BYTES: usize = eidola_common::engine_protocol::MAX_REQUEST_BODY_BYTES;
 
 /// Shared state of every handler.
 pub struct AppState {

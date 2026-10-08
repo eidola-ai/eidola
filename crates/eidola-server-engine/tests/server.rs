@@ -900,6 +900,10 @@ fn configuration_refuses_anything_missing_or_malformed() {
         // A decode row with 2 drafts costs 3 query tokens: refused by the
         // configuration grammar, before any weight is loaded.
         (env::MAX_BATCHED_TOKENS, "2"),
+        // Allocation-driving sizes are capped before anything is loaded.
+        (env::MAX_SEQS, "4294967295"),
+        (env::KV_BLOCK_SIZE, "1025"),
+        (env::MAX_REQUESTS, "4097"),
     ];
     for (key, value) in bad {
         let mut map = full.clone();

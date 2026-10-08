@@ -24,6 +24,11 @@ pub const CACHE_KEY_BYTES: usize = 32;
 /// base64url without padding.
 pub const CACHE_KEY_TEXT_LEN: usize = (CACHE_KEY_BYTES * 8).div_ceil(6);
 
+/// Largest chat request body a node reads, in bytes. A node holds at most one
+/// such body per admission slot (`EIDOLA_ENGINE_MAX_REQUESTS`), so a
+/// deployment's host-memory check counts it.
+pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// The request header carrying the weights hash a gateway expects a node to
 /// serve: the node's weights hash, 64 hex digits. Header names are
 /// case-insensitive; this is the lowercase spelling both sides use.

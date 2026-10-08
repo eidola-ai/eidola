@@ -755,18 +755,46 @@ fn a_cuda_deployment_attests_its_gpus() {
     set_expected_gpus(&mut tree, Some(1));
     tree.check().expect("a single-GPU CUDA deployment");
 
-    // The CPU executor attaches and requires no GPUs.
+    // A pinned deployment runs the CUDA executor: a CPU deployment is refused
+    // even when it is consistent in every other way (no GPUs, no evidence).
     let mut tree = Tree::fixture();
     tree.edit_config("gpus: 8\n", "");
     tree.edit_config("    runtime: nvidia\n", "");
     tree.edit_config("    gpus: all\n", "");
     tree.edit_config("EXECUTOR: \"cuda\"", "EXECUTOR: \"cpu\"");
     set_expected_gpus(&mut tree, None);
-    tree.check().expect("a CPU deployment without GPU evidence");
+    refused(&tree, "a pinned deployment runs the cuda executor");
+}
 
+/// Every allocation-driving size is capped, and what the node allocates fits
+/// the VM's memory and the attached GPUs.
+#[test]
+fn allocations_are_capped_and_fit_the_deployment() {
+    for (name, from, to) in [
+        ("EIDOLA_ENGINE_MAX_SEQS", "\"64\"", "\"4294967295\""),
+        ("EIDOLA_ENGINE_MAX_SEQS", "\"64\"", "\"1025\""),
+        ("EIDOLA_ENGINE_MAX_BATCHED_TOKENS", "\"8192\"", "\"65537\""),
+        ("EIDOLA_ENGINE_MAX_PREFILL_CHUNK", "\"4096\"", "\"65537\""),
+        ("EIDOLA_ENGINE_MAX_MODEL_LEN", "\"131072\"", "\"1048577\""),
+        ("EIDOLA_ENGINE_MAX_REQUESTS", "\"256\"", "\"4097\""),
+        ("EIDOLA_ENGINE_DRAFT_TOKENS", "\"2\"", "\"9\""),
+        ("EIDOLA_ENGINE_KV_BLOCK_SIZE", "\"16\"", "\"1025\""),
+        ("EIDOLA_ENGINE_KV_BLOCKS", "\"65536\"", "\"2147483648\""),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(&format!("{name}: {from}"), &format!("{name}: {to}"));
+        refused(&tree, &format!("{name} must be at most"));
+    }
+
+    // Host: 4,096 admission slots hold 256 GiB of bodies and parses, more
+    // than 64 GiB.
     let mut tree = Tree::fixture();
-    tree.edit_config("EXECUTOR: \"cuda\"", "EXECUTOR: \"cpu\"");
-    refused(&tree, "the cpu executor attaches no GPUs");
+    tree.edit_config("MAX_REQUESTS: \"256\"", "MAX_REQUESTS: \"4096\"");
+    refused(&tree, "more than the VM's");
+    // Device: 2^30 blocks of 16 positions do not fit eight GPUs.
+    let mut tree = Tree::fixture();
+    tree.edit_config("KV_BLOCKS: \"65536\"", "KV_BLOCKS: \"1073741824\"");
+    refused(&tree, "more than 8 GPUs hold");
 }
 
 /// The shim forwards to the port the node listens on, on every interface.
