@@ -57,8 +57,10 @@ impl std::error::Error for BootError {}
 pub struct Node {
     pub router: axum::Router,
     pub engine: EngineHandle,
+    /// The admission bound (its count is content-free).
+    pub admission: Arc<Admission>,
     pub weights_hash: String,
-    /// Resolves if the engine thread stops (an executor failure).
+    /// Resolves when the engine thread stops, however it stops.
     pub engine_stopped: oneshot::Receiver<()>,
 }
 
@@ -68,6 +70,35 @@ impl std::fmt::Debug for Node {
             .field("weights_hash", &self.weights_hash)
             .finish_non_exhaustive()
     }
+}
+
+/// Serves `router` on `listener` until `shutdown` resolves (`Ok`) or the engine thread
+/// stops for any reason (`Err`): `engine_stopped` resolving, whether by its signal or by
+/// its sender going away, is fatal, and the caller exits non-zero.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    engine_stopped: oneshot::Receiver<()>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), BootError> {
+    let (failed_tx, mut failed_rx) = oneshot::channel::<()>();
+    let signal = async move {
+        tokio::select! {
+            _ = shutdown => {}
+            _ = engine_stopped => {
+                tracing::error!("the engine thread stopped");
+                let _ = failed_tx.send(());
+            }
+        }
+    };
+    axum::serve(listener, router)
+        .with_graceful_shutdown(signal)
+        .await
+        .map_err(|e| BootError(format!("serving failed: {}", e.kind())))?;
+    if failed_rx.try_recv().is_ok() {
+        return Err(BootError("the engine stopped".into()));
+    }
+    Ok(())
 }
 
 /// Verifies and loads the configured weights, then starts the node.
@@ -154,6 +185,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
     .map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
 
     let weights_hash = model.weights_hash().to_string();
+    let admission = Admission::new(sizing.max_requests);
     let state = Arc::new(AppState {
         model_id: config.model_id,
         executor: config.executor.as_str(),
@@ -162,11 +194,12 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         token: config.gateway_token,
         salts: SaltDeriver::new(),
         engine: engine.clone(),
-        admission: Admission::new(sizing.max_requests),
+        admission: admission.clone(),
     });
     Ok(Node {
         router: http::router(state),
         engine,
+        admission,
         weights_hash,
         engine_stopped: stopped_rx,
     })

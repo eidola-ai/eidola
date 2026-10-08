@@ -93,8 +93,11 @@ pub enum MessageContent {
     Parts(Vec<ContentPart>),
 }
 
+/// A content part. Every variant denies unknown fields: the template renders the parts
+/// from the raw body, and it treats an `image_url`, `image`, `audio` or `video` key on a
+/// part as multimodal content, so a key this type does not name must never get through.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentPart {
     Text { text: String },
     ImageUrl { image_url: ImageUrl },
@@ -174,6 +177,8 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
     let parse_tools = match &req.tool_choice {
         None => tools_given,
         Some(serde_json::Value::String(s)) if s == "auto" => tools_given,
+        // "none" is honoured by not showing the model any tools (below), so there is
+        // nothing to parse either.
         Some(serde_json::Value::String(s)) if s == "none" => false,
         Some(_) => {
             return Err(ApiError::invalid(
@@ -195,6 +200,12 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
     };
     let messages = take("messages").expect("validated above");
     let tools = take("tools").filter(|t| !matches!(t, Json::Null));
+    // `tool_choice: "none"` renders the prompt without the tool definitions, so the model
+    // is never offered a tool it may not call (this changes the prompt, and with it the
+    // reusable cache prefix, relative to the same request under "auto").
+    let tool_choice_none =
+        matches!(&req.tool_choice, Some(serde_json::Value::String(s)) if s == "none");
+    let tools = if tool_choice_none { None } else { tools };
     if let Some(Json::Str(mut s)) = take("cache_key") {
         s.zeroize();
     }

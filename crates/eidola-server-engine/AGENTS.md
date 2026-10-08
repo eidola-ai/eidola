@@ -35,7 +35,7 @@ The node trusts its measured configuration (the environment; see below) and the 
 | `X-Eidola-Weights-Sha256` present | 428 | `weights_hash_required` |
 | … and equal to this node's weights hash (hex, any case); **checked before the body is read** | 412 | `weights_hash_mismatch` |
 | body ≤ 32 MiB | 413 | `request_too_large` |
-| strict subset (`deny_unknown_fields`), text-only content, `tool_choice` `auto`/`none`, ≤ 4 non-empty stops, `max_completion_tokens` ≥ 1, valid `cache_key` | 400 | `invalid_request_error` |
+| strict subset (`deny_unknown_fields` at every level, every content-part variant included), text-only content, `tool_choice` `auto`/`none`, ≤ 4 non-empty stops, `max_completion_tokens` ≥ 1, valid `cache_key` | 400 | `invalid_request_error` |
 | `model` is the configured model id | 404 | `model_not_found` |
 | an admission slot is free | 503 | `overloaded` |
 | template accepts the messages; sampling parameters valid (`SamplingParams::new`) | 400 | `invalid_request_error` |
@@ -67,6 +67,8 @@ Every byte used is a byte hashed: shards are memory-mapped once and both hashed 
 
 `POST /v1/chat/completions` accepts the server's strict request subset (`eidola-server/src/types.rs`: `model`, `messages`, `max_completion_tokens`, `temperature`, `top_p`, `stream`, `stream_options.include_usage`, `stop`, `tools`, `tool_choice`, with the same nullability and nested strictness) plus `cache_key`. Keep the two in step: a field the gateway starts forwarding must be added here, or every such request is refused.
 
+- **Content parts** are stricter than the server's: every variant denies unknown fields. The template renders parts from the raw body and treats an `image_url`, `image`, `audio` or `video` key on any part as multimodal content, so a key the strict type does not name must never reach it. `image_url` parts are refused outright (text-only model).
+- **`tool_choice`**: absent or `auto` offers the tools and parses calls; `none` renders the prompt **without** the tool definitions (the model is never offered a tool it may not call) and parses nothing, so it changes the prompt, and with it the reusable cache prefix, relative to the same request under `auto`; `required` and named functions are refused (no constrained decoding). App-core's chat path never sets `tool_choice`, but its local inference proxy relays whatever a local caller sends, so `none` is reachable and is supported exactly rather than refused.
 - **`cache_key`**: 32 bytes, base64url without padding. Decoded at parse time, the text scrubbed, and turned into the engine salt `HMAC-SHA256(boot_key, "eidola/kv/v1" ‖ key)` under the core's per-boot key (`SaltDeriver`). No key ⇒ `CacheScope::Private`: a fresh salt, nothing reusable by any other request.
 - **Messages and tools render from the body as sent.** The strict serde types only validate; the prompt is rendered from the same bytes parsed by the chat crate's order-preserving JSON parser, because `serde_json::Value` would sort keys and round big integers that the template prints.
 - **Sampling**: `temperature` and `top_p` from the request, else `generation_config.json`'s (as vLLM applies a model's generation config), else 1.0; `top_k` from the generation config; a fresh random seed per request.
@@ -81,9 +83,9 @@ Every byte used is a byte hashed: shards are memory-mapped once and both hashed 
 
 The executor seam is synchronous, so one dedicated thread owns the `Engine` and runs its step loop. HTTP tasks reach it over channels: commands (`Submit`, `Cancel`) in, one unbounded event channel per request out (bounded in practice by `max_tokens`; the engine thread never blocks on a slow reader). Between steps the thread drains every pending command; when idle it sleeps until a command arrives or the one-second sweep is due, and sweeps the prefix cache so expired KV is zeroed without traffic.
 
-- **Admission** is bounded by `EIDOLA_ENGINE_MAX_REQUESTS` (running plus queued in the engine). A permit is taken before rendering or tokenizing, travels with the submission, and is released when the request leaves the engine. With none free the request is refused at once (`overloaded`); nothing queues unboundedly in front of the engine. Rendering and tokenization run on the blocking pool.
+- **Admission** is bounded by `EIDOLA_ENGINE_MAX_REQUESTS` (rendering, tokenizing, running or queued). A permit is taken before rendering or tokenizing and is **owned by the work it bounds** for that work's whole life: it moves into the blocking preparation task (which runs to completion even when a disconnect drops the handler), comes back with the prepared request, travels with the submission, and is released when the request leaves the engine. With none free the request is refused at once (`overloaded`); nothing queues unboundedly in front of the engine. Rendering and tokenization run on the blocking pool.
 - **Cancellation**: each request holds a guard that sends `Cancel` when dropped, so a client disconnect (the SSE stream or the handler future dropped) releases the sequence before the engine's next step, including a request still waiting for a seat. Independently, the engine thread cancels a request whose reader has gone away the next time it has output for it.
-- **Failure**: an `ExecutorError` is fatal (the host cannot know which writes landed). In-flight requests get an error, health turns `503`, and the process exits non-zero.
+- **Failure**: an `ExecutorError` is fatal (the host cannot know which writes landed). **Any** exit of the engine thread (that, a panic, every handle dropped) is fatal, structurally: the thread owns an `ExitSignal` whose drop (on return or unwind alike) turns health `503` and resolves `Node::engine_stopped`; `serve` treats that receiver resolving in any way, signal or dropped sender, as fatal and returns an error, and `main` exits non-zero. In-flight requests see their channel close and get an error.
 
 ## Content-free by construction
 
@@ -147,9 +149,11 @@ curl -N 127.0.0.1:8090/v1/chat/completions -H 'Authorization: Bearer dev-gateway
 - streaming chunk shapes, the usage chunk with and without `include_usage`, and text equal to non-streaming;
 - stop sequences (streaming and not) truncating at the first match and cancelling the engine request;
 - client disconnect cancelling a running request and a request still queued for a seat (the latter only the guard can cancel);
-- the admission bound refusing with `overloaded` and recovering;
+- the admission bound refusing with `overloaded` and recovering, and a client disconnect during preparation keeping the slot until the abandoned preparation ends;
+- `tool_choice: none` rendering the same prompt as no tools; a multimodal key (`image_url`, `image`, `audio`, `video`, …) on any content part refused;
+- an injected executor panic (`tests/engine_exit.rs`, over the core's mock executor) turning health unhealthy, closing the in-flight request's channel, releasing its permit, and ending `serve` with an error;
 - `cache_key`: the same key reports whole cached blocks with identical output; another key, and no key, report none;
 - tool definitions and tool-call history with string arguments rendering, and non-object history arguments refused;
 - prompts beyond the model length; a full `boot` from the directory; boot refusing a wrong expected hash (before loading) and a loaded model's hash mismatching the configuration; every configuration variable's absence and malformations; sizing the model or the core cannot honour.
 
-Each of these was checked to fail under a deliberate bug: no cancel on guard drop (the queued-disconnect test), no cancel on either path, a dropped first output token, a different prompt rendering, a salt not derived from the key, the weights check moved after body parsing. Keep that true when changing the tests.
+Each of these was checked to fail under a deliberate bug: no cancel on guard drop (the queued-disconnect test), no cancel on either path, a dropped first output token, a different prompt rendering, a salt not derived from the key, the weights check moved after body parsing, the permit kept by the handler instead of the preparation task, the exit signal skipped on panic, `serve` reacting only to a sent stop signal, tools rendered under `tool_choice: none`, content parts accepting unknown fields. Keep that true when changing the tests.

@@ -846,3 +846,105 @@ fn engine_sizing_is_checked_against_the_model() {
         assert!(err.to_string().contains("cuda"), "{err}");
     }
 }
+
+/// A disconnect while the prompt is still being prepared does not free the admission
+/// slot: the preparation keeps running on the blocking pool, so it keeps the permit.
+#[tokio::test(flavor = "multi_thread")]
+async fn disconnect_during_preparation_keeps_the_admission_slot() {
+    let node = TestNode::start(&[(env::MAX_REQUESTS, "1")]).await;
+    // Seconds of rendering and tokenizing (refused afterwards as too long).
+    let big = request(&"lorem ipsum dolor sit amet ".repeat(600_000), 4);
+    let probe = request("hi", 1);
+    let big_request = node.chat(&big);
+    let big_task = tokio::spawn(async move { big_request.send().await });
+    // Wait until the big request holds the only slot.
+    while node.admission.in_flight() == 0 {
+        assert!(!big_task.is_finished());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        !big_task.is_finished(),
+        "preparation finished too soon to test"
+    );
+    // The client goes away mid-preparation.
+    big_task.abort();
+    let _ = big_task.await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        node.admission.in_flight(),
+        1,
+        "the abandoned preparation still holds it"
+    );
+    let (status, v) = node.chat_json(&probe).await;
+    assert_eq!(status, 503, "the bound was exceeded: {v}");
+    assert_eq!(v["error"]["type"], "overloaded");
+    // The slot comes back when the abandoned preparation ends.
+    let mut admitted = false;
+    for _ in 0..3000 {
+        let (status, _) = node.chat_json(&probe).await;
+        if status == 200 {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(admitted);
+}
+
+/// `tool_choice: "none"` shows the model no tools: the prompt is the one rendered
+/// without them.
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_choice_none_renders_without_tools() {
+    let node = TestNode::start(&[]).await;
+    let tools = json!([{
+        "type": "function",
+        "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+    }]);
+    let prompt_tokens = |v: &Value| v["usage"]["prompt_tokens"].as_u64().unwrap();
+    let (_, plain) = node.chat_json(&request("Weather in Paris?", 2)).await;
+    let mut with_tools = request("Weather in Paris?", 2);
+    with_tools["tools"] = tools;
+    let (_, auto) = node.chat_json(&with_tools).await;
+    with_tools["tool_choice"] = "none".into();
+    let (status, none) = node.chat_json(&with_tools).await;
+    assert_eq!(status, 200, "{none}");
+    assert!(prompt_tokens(&auto) > prompt_tokens(&plain));
+    assert_eq!(prompt_tokens(&none), prompt_tokens(&plain));
+    assert_eq!(
+        none["choices"], plain["choices"],
+        "the same prompt, the same greedy output"
+    );
+}
+
+/// No multimodal key can ride along on a text part: every part variant denies unknown
+/// fields, so the template never sees one.
+#[tokio::test(flavor = "multi_thread")]
+async fn multimodal_keys_in_text_parts_are_refused() {
+    let node = TestNode::start(&[]).await;
+    for key in [
+        "image_url",
+        "image",
+        "audio",
+        "video",
+        "input_audio",
+        "file",
+    ] {
+        let mut part = json!({"type": "text", "text": "hi"});
+        part[key] = json!({"url": "data:,"});
+        let body = json!({
+            "model": MODEL_ID,
+            "messages": [{"role": "user", "content": [part]}],
+            "max_completion_tokens": 2,
+        });
+        let (status, v) = node.chat_json(&body).await;
+        assert_eq!(status, 400, "{key}: {v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        // And on the image part itself.
+        let mut part = json!({"type": "image_url", "image_url": {"url": "data:,"}});
+        part[key] = json!("x");
+        let body = json!({"model": MODEL_ID, "messages": [{"role": "user", "content": [part]}]});
+        let (status, _) = node.chat_json(&body).await;
+        assert_eq!(status, 400, "{key} on an image part");
+    }
+    assert_eq!(node.stats(), Stats::default());
+}

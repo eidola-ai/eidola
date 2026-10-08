@@ -86,6 +86,7 @@ pub fn config_from(map: &HashMap<&'static str, String>) -> Result<Config, String
 pub struct TestNode {
     pub base: String,
     pub engine: EngineHandle,
+    pub admission: Arc<eidola_server_engine::worker::Admission>,
     pub client: reqwest::Client,
     server: tokio::task::JoinHandle<()>,
 }
@@ -118,6 +119,7 @@ impl TestNode {
         TestNode {
             base,
             engine: node.engine,
+            admission: node.admission,
             client: reqwest::Client::new(),
             server,
         }

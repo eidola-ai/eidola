@@ -39,23 +39,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         tracing::info!(%bind, "listening");
-        let engine_stopped = node.engine_stopped;
-        let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel::<()>();
-        let shutdown = async move {
-            tokio::select! {
-                _ = shutdown_signal() => tracing::info!("shutting down"),
-                Ok(()) = engine_stopped => {
-                    let _ = failed_tx.send(());
-                }
-            }
-        };
-        axum::serve(listener, node.router)
-            .with_graceful_shutdown(shutdown)
-            .await?;
-        if failed_rx.try_recv().is_ok() {
-            return Err("the engine stopped".into());
-        }
-        Ok::<(), Box<dyn std::error::Error>>(())
+        eidola_server_engine::serve(listener, node.router, node.engine_stopped, async {
+            shutdown_signal().await;
+            tracing::info!("shutting down");
+        })
+        .await?;
+        Ok(())
     })
 }
 

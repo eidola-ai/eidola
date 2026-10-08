@@ -216,7 +216,7 @@ pub fn spawn<E, F>(
     make_executor: F,
     scheduler: SchedulerConfig,
     sweep_interval: Duration,
-    on_fatal: oneshot::Sender<()>,
+    stopped: oneshot::Sender<()>,
 ) -> Result<EngineHandle, String>
 where
     E: Executor + 'static,
@@ -227,15 +227,22 @@ where
     let healthy = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
     let thread_stats = stats.clone();
-    let thread_healthy = healthy.clone();
+    let exit = ExitSignal {
+        healthy: healthy.clone(),
+        stopped: Some(stopped),
+    };
     std::thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
+            // Owned by the thread for its whole life: however the thread ends (a return,
+            // an executor error, a panic unwinding through here), dropping it marks the
+            // node unhealthy and signals `stopped`.
+            let exit = exit;
             let engine = make_executor()
                 .and_then(|exec| Engine::new(exec, scheduler).map_err(|e| e.to_string()));
             let engine = match engine {
                 Ok(engine) => {
-                    thread_healthy.store(true, Ordering::Release);
+                    exit.healthy.store(true, Ordering::Release);
                     let _ = ready_tx.send(Ok(()));
                     engine
                 }
@@ -254,8 +261,7 @@ where
                 sweep_interval,
             }
             .run();
-            thread_healthy.store(false, Ordering::Release);
-            let _ = on_fatal.send(());
+            drop(exit);
         })
         .map_err(|e| format!("cannot start the engine thread: {e}"))?;
     ready_rx
@@ -267,6 +273,22 @@ where
         stats,
         healthy,
     })
+}
+
+/// Marks the engine stopped when dropped: health turns unhealthy and the `stopped`
+/// receiver resolves.
+struct ExitSignal {
+    healthy: Arc<AtomicBool>,
+    stopped: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for ExitSignal {
+    fn drop(&mut self) {
+        self.healthy.store(false, Ordering::Release);
+        if let Some(tx) = self.stopped.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 struct Live {

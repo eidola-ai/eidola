@@ -147,9 +147,16 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
     let include_usage = req.include_usage;
     let id = state.engine.next_id();
     let prep_state = state.clone();
-    let prepared = tokio::task::spawn_blocking(move || prepare(&prep_state, id, req))
-        .await
-        .map_err(|_| ApiError::Internal("request preparation panicked"))??;
+    // The permit bounds the work, so the work owns it: it moves into the blocking task
+    // (which runs to completion even if this handler is dropped by a disconnect), comes
+    // back with the prepared request, and goes on into the engine with the submission.
+    // It is released only when the work it admitted has ended.
+    let (prepared, permit) = tokio::task::spawn_blocking(move || {
+        let prepared = prepare(&prep_state, id, req);
+        prepared.map(|p| (p, permit))
+    })
+    .await
+    .map_err(|_| ApiError::Internal("request preparation panicked"))??;
     let Prepared {
         request,
         prompt_tokens,
