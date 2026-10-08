@@ -1040,3 +1040,62 @@ fn the_gateway_token_is_the_only_secret() {
     );
     refused(&tree, "secrets must be exactly [\"GATEWAY_TOKEN\"]");
 }
+
+/// The env sets exactly the node's measured variables: a name any dependency
+/// reads (tokio's worker count, the loader's preload, CUDA's device list) or
+/// any other name is refused.
+#[test]
+fn the_env_is_exactly_the_measured_variables() {
+    for name in [
+        "TOKIO_WORKER_THREADS",
+        "LD_PRELOAD",
+        "CUDA_VISIBLE_DEVICES",
+        "SOMETHING_ELSE",
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(
+            "      - EIDOLA_ENGINE_MODEL_ID",
+            &format!("      - {name}: \"0\"\n      - EIDOLA_ENGINE_MODEL_ID"),
+        );
+        refused(&tree, &format!("env may not set {name:?}"));
+    }
+}
+
+/// The VM's cpus and memory are a launchable shape.
+#[test]
+fn the_vm_is_a_launchable_shape() {
+    for (from, to, needle) in [
+        (
+            "memory: 65536",
+            "memory: 1",
+            "memory must be a power of two",
+        ),
+        (
+            "memory: 65536",
+            "memory: 65000",
+            "memory must be a power of two",
+        ),
+        ("cpus: 16", "cpus: 0", "cpus must be from"),
+        ("cpus: 16", "cpus: 1000", "cpus must be from"),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(from, to);
+        refused(&tree, needle);
+    }
+}
+
+/// A step that cannot hold one decode row is refused, as the node's
+/// scheduler would refuse it at boot.
+#[test]
+fn a_step_holds_a_decode_row() {
+    let mut tree = Tree::fixture();
+    tree.edit_config("MAX_BATCHED_TOKENS: \"8192\"", "MAX_BATCHED_TOKENS: \"2\"");
+    refused(
+        &tree,
+        "EIDOLA_ENGINE_MAX_BATCHED_TOKENS must exceed EIDOLA_ENGINE_DRAFT_TOKENS",
+    );
+    let mut tree = Tree::fixture();
+    tree.edit_config("MAX_BATCHED_TOKENS: \"8192\"", "MAX_BATCHED_TOKENS: \"3\"");
+    tree.check()
+        .expect("three slots hold a decode row with two drafts");
+}

@@ -112,7 +112,12 @@ pub fn run(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     on_listening: impl FnOnce(std::net::SocketAddr),
 ) -> Result<(), BootError> {
+    // An explicit worker count, so the runtime never reads `TOKIO_WORKER_THREADS`
+    // (or any other ambient variable): one worker per vCPU the measured VM shape
+    // gives, at least one.
+    let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .build()
         .map_err(|e| BootError(format!("cannot start the runtime: {}", e.kind())))?;

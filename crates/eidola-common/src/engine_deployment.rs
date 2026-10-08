@@ -61,6 +61,72 @@ pub mod env {
     pub const CACHE_IDLE_TTL_SECS: &str = "EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS";
     /// Prefix-cache maximum age, seconds.
     pub const CACHE_MAX_AGE_SECS: &str = "EIDOLA_ENGINE_CACHE_MAX_AGE_SECS";
+
+    /// Every variable of the measured environment: exactly the names
+    /// [`super::parse_measured`] reads. A deployment's env sets these and
+    /// nothing else, so no variable a dependency happens to consume
+    /// (`TOKIO_WORKER_THREADS`, `RUST_MIN_STACK`, `MALLOC_*`, `LD_*`,
+    /// `CUDA_*`, …) can reach the node through its measured config.
+    pub const MEASURED: &[&str] = &[
+        MODEL_ID,
+        WEIGHTS_DIR,
+        WEIGHTS_SHA256,
+        WEIGHTS_STORAGE,
+        GATEWAY_TOKEN_HASH,
+        EXECUTOR,
+        BIND_ADDR,
+        KV_BLOCK_SIZE,
+        KV_BLOCKS,
+        MAX_MODEL_LEN,
+        MAX_SEQS,
+        MAX_BATCHED_TOKENS,
+        MAX_PREFILL_CHUNK,
+        DRAFT_TOKENS,
+        MAX_REQUESTS,
+        PREFIX_CACHE,
+        CACHE_IDLE_TTL_SECS,
+        CACHE_MAX_AGE_SECS,
+    ];
+}
+
+/// Whether a deployment's measured env sets only [`env::MEASURED`] names.
+pub fn check_env_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    match names.into_iter().find(|name| !env::MEASURED.contains(name)) {
+        None => Ok(()),
+        Some(name) => Err(format!(
+            "the engine container's env may not set {name:?}; it sets exactly the node's \
+             measured variables"
+        )),
+    }
+}
+
+/// Fewest vCPUs a deployment may give its VM.
+pub const MIN_CPUS: u64 = 1;
+/// Most vCPUs a deployment may give its VM.
+pub const MAX_CPUS: u64 = 256;
+/// Smallest VM memory, in MiB.
+pub const MIN_MEMORY_MIB: u64 = 8192;
+/// Largest VM memory, in MiB.
+pub const MAX_MEMORY_MIB: u64 = 2 * 1024 * 1024;
+
+/// Whether the VM's `cpus` and `memory` (MiB) are a shape the platform
+/// launches: `cpus` from [`MIN_CPUS`] to [`MAX_CPUS`], and `memory` a power of
+/// two from [`MIN_MEMORY_MIB`] (8 GiB) to [`MAX_MEMORY_MIB`] (2 TiB), the sizes
+/// the platform provider's deployment accepts. Tinfoil's published checks
+/// (`measure-image-action`) require only positive values, so these bounds are
+/// ours; the same rule holds for every `cvm-version` an engine pins.
+pub fn check_vm_resources(cpus: u64, memory_mib: u64) -> Result<(), String> {
+    if !(MIN_CPUS..=MAX_CPUS).contains(&cpus) {
+        return Err(format!(
+            "cpus must be from {MIN_CPUS} to {MAX_CPUS} (got {cpus})"
+        ));
+    }
+    if !memory_mib.is_power_of_two() || !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&memory_mib) {
+        return Err(format!(
+            "memory must be a power of two from {MIN_MEMORY_MIB} to {MAX_MEMORY_MIB} MiB (got {memory_mib})"
+        ));
+    }
+    Ok(())
 }
 
 /// Which executor the configuration selects. Whether a given node build can
@@ -236,6 +302,20 @@ pub fn parse_measured(
         draft_tokens: non_negative(env::DRAFT_TOKENS)?,
         max_requests: positive(env::MAX_REQUESTS)?,
     };
+    // The scheduler's own boot refusal (`Engine::new`): a decode row costs
+    // `1 + draft_tokens` query slots, so a step must hold more than
+    // `draft_tokens` of them. The engine's other boot refusals that depend
+    // only on these values (a zero seat, prefill chunk or block count) are the
+    // positivity rules above; the rest need the model (its position limit and
+    // MTP depth) or the node build (its executor).
+    if sizing.max_batched_tokens <= sizing.draft_tokens {
+        return Err(ConfigError(format!(
+            "{} must exceed {}: a decode row needs 1 + {} query slots",
+            env::MAX_BATCHED_TOKENS,
+            env::DRAFT_TOKENS,
+            env::DRAFT_TOKENS
+        )));
+    }
     if sizing.kv_blocks < 2 {
         return Err(ConfigError(format!(
             "{} must be at least 2 (block 0 is reserved)",
@@ -771,6 +851,37 @@ mod tests {
             (Cpu, None, Some("all")),
         ] {
             assert!(check_container_gpu_access(executor, runtime, gpus).is_err());
+        }
+    }
+
+    #[test]
+    fn the_env_names_are_exactly_the_measured_ones() {
+        assert!(check_env_names(env::MEASURED.iter().copied()).is_ok());
+        for extra in [
+            "TOKIO_WORKER_THREADS",
+            "RUST_MIN_STACK",
+            "CUDA_VISIBLE_DEVICES",
+            "LD_PRELOAD",
+            "GATEWAY_TOKEN",
+        ] {
+            assert!(check_env_names([env::MODEL_ID, extra]).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn vm_resources_are_a_launchable_shape() {
+        assert!(check_vm_resources(16, 65536).is_ok());
+        assert!(check_vm_resources(1, 8192).is_ok());
+        assert!(check_vm_resources(MAX_CPUS, MAX_MEMORY_MIB).is_ok());
+        for (cpus, memory) in [
+            (0, 65536),
+            (MAX_CPUS + 1, 65536),
+            (16, 1),
+            (16, 4096),
+            (16, 65535),
+            (16, MAX_MEMORY_MIB * 2),
+        ] {
+            assert!(check_vm_resources(cpus, memory).is_err(), "{cpus} {memory}");
         }
     }
 

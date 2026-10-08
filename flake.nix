@@ -247,6 +247,15 @@
                   true
                 else if isEngineDeployPath then
                   true
+                # Test fixtures of a crate in the set: a package build runs
+                # that crate's tests (`doCheck`), and fixtures are rarely Rust
+                # source, so crane's filter would drop them (the gateway's
+                # engine-trust fixtures are YAML and JSON).
+                else if
+                  matchingCrate != null
+                  && pkgs.lib.hasInfix "/tests/fixtures/" relPath
+                then
+                  true
                 # Keep only root-level files that affect Cargo resolution/builds.
                 # This avoids generated files like artifact-manifest.json from
                 # perturbing package hashes for unrelated Nix builds.

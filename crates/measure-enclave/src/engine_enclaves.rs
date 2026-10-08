@@ -129,6 +129,18 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
     eidola_common::engine_deployment::check_gpu_attestation(executor, gpus, expected_gpus)
         .map_err(anyhow::Error::msg)?;
     check_secrets_shim_and_weights(&config_yaml, &var("EIDOLA_ENGINE_WEIGHTS_DIR")?, &sidecar)?;
+    // The env is exactly the node's measured variables, and the VM a
+    // launchable shape (the gateway's build holds both).
+    eidola_common::engine_deployment::check_env_names(env.keys().map(String::as_str))
+        .map_err(anyhow::Error::msg)?;
+    let whole = |key: &str| {
+        config_yaml
+            .get(key)
+            .and_then(serde_yaml::Value::as_u64)
+            .with_context(|| format!("{key} must be a whole number"))
+    };
+    eidola_common::engine_deployment::check_vm_resources(whole("cpus")?, whole("memory")?)
+        .map_err(anyhow::Error::msg)?;
     let (runtime, container_gpus) = engine_gpu_access(&config_yaml)?;
     eidola_common::engine_deployment::check_container_gpu_access(
         executor,
@@ -520,6 +532,18 @@ containers:
             entry("fixture-model", &ungranted, SIDECAR)
                 .contains("granted exactly the weights pack")
         );
+        // A variable the node does not read, and a VM shape the platform does
+        // not launch.
+        let ambient = good.replace(
+            "      - EIDOLA_ENGINE_MODEL_ID",
+            "      - TOKIO_WORKER_THREADS: \"0\"\n      - EIDOLA_ENGINE_MODEL_ID",
+        );
+        assert!(
+            entry("fixture-model", &ambient, SIDECAR)
+                .contains("may not set \"TOKIO_WORKER_THREADS\"")
+        );
+        let tiny = good.replace("memory: 65536", "memory: 1");
+        assert!(entry("fixture-model", &tiny, SIDECAR).contains("memory must be a power of two"));
         let tagged = good.replace(&format!("@sha256:{}", "2".repeat(64)), ":v1");
         assert!(entry("fixture-model", &tagged, SIDECAR).contains("64-hex-digit digest"));
     }

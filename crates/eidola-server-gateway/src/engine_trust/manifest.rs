@@ -387,6 +387,13 @@ fn check_deployment(
             "{at_config}: GATEWAY_TOKEN must not be a measured environment value"
         ));
     }
+    // The env is exactly the node's measured variables, so nothing a
+    // dependency reads (`TOKIO_WORKER_THREADS`, `LD_*`, `CUDA_*`, …) reaches
+    // it; and the VM is a shape the platform launches.
+    engine_deployment::check_env_names(config.env.keys().map(String::as_str))
+        .map_err(|e| format!("{at_config}: {e}"))?;
+    engine_deployment::check_vm_resources(config.cpus, config.memory)
+        .map_err(|e| format!("{at_config}: {e}"))?;
 
     // The pin, and the sidecar stating what source cannot derive.
     let sidecar_path = format!("{DEPLOY_ROOT}/{model_id}/{variant}/deployment.json");
@@ -520,6 +527,9 @@ struct EngineConfig {
     granted: Vec<String>,
     /// The shim's `paths`.
     shim_paths: Vec<String>,
+    /// The VM's vCPUs and memory (MiB).
+    cpus: u64,
+    memory: u64,
 }
 
 /// A YAML list of strings.
@@ -717,6 +727,14 @@ impl EngineConfig {
             .and_then(|shim| shim.get("upstream-port"))
             .and_then(serde_yaml::Value::as_u64)
             .ok_or_else(|| format!("{path}: shim.upstream-port must be a port number"))?;
+        let whole = |key: &str| -> Result<u64, String> {
+            config
+                .get(key)
+                .and_then(serde_yaml::Value::as_u64)
+                .ok_or_else(|| format!("{path}: {key} must be a whole number"))
+        };
+        let cpus = whole("cpus")?;
+        let memory = whole("memory")?;
         let gpus = match config.get("gpus") {
             None => None,
             Some(gpus) => Some(
@@ -736,6 +754,8 @@ impl EngineConfig {
             packs,
             granted,
             shim_paths,
+            cpus,
+            memory,
         })
     }
 }

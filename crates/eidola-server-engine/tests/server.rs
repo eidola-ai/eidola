@@ -897,6 +897,9 @@ fn configuration_refuses_anything_missing_or_malformed() {
         (env::CACHE_MAX_AGE_SECS, "60"),
         (env::MODEL_ID, "has space"),
         (env::WEIGHTS_STORAGE, "readonly"),
+        // A decode row with 2 drafts costs 3 query tokens: refused by the
+        // configuration grammar, before any weight is loaded.
+        (env::MAX_BATCHED_TOKENS, "2"),
     ];
     for (key, value) in bad {
         let mut map = full.clone();
@@ -959,8 +962,6 @@ fn engine_sizing_is_checked_against_the_model() {
     for (key, value, needle) in [
         (env::DRAFT_TOKENS, "3", "MTP layers"),
         (env::MAX_MODEL_LEN, "5000", "max_position_embeddings"),
-        // A decode row with 2 drafts costs 3 query tokens.
-        (env::MAX_BATCHED_TOKENS, "2", "decode row"),
     ] {
         let mut map = env_map();
         map.insert(key, value.to_string());
