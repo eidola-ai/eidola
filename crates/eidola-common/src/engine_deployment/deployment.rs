@@ -459,80 +459,95 @@ struct Sidecar {
     tdx_policy: Option<Json>,
 }
 
+// The typed shape of `deployment.json`. Every level refuses unknown members,
+// and serde's derived struct parse refuses a repeated member (`duplicate
+// field`), so a file whose meaning depends on which of two equal keys a
+// reader keeps never parses.
+
+/// `deployment.json`, top level.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SidecarFile {
+    weights: SidecarWeights,
+    #[serde(default, deserialize_with = "present")]
+    expected_gpus: Option<u32>,
+    #[serde(default, deserialize_with = "present")]
+    tdx_policy: Option<TdxPolicy>,
+}
+
+/// An optional member that, when present, holds a value: absent is `None`,
+/// and `null` is refused rather than read as absent.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
+/// Where the weight files came from.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SidecarWeights {
+    repo: String,
+    revision: String,
+}
+
+/// The machine-side Intel TDX policy, in the attesting client's shape
+/// (`tinfoil_verifier::TdxPolicy`, member for member): the shape is held
+/// here, and the values (widths, MR_SEAM non-empty, safe attributes) by the
+/// client's own pin compiler, which the gateway's build runs over the pin.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct TdxPolicy {
+    mr_seam: Vec<String>,
+    td_attributes: String,
+    xfam: String,
+    minimum_tee_tcb_svn: String,
+    minimum_tcb_evaluation_data_number: u32,
+    qe_vendor_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fmspc: Option<Vec<String>>,
+    dynamic_platform: PckFlag,
+    cached_keys: PckFlag,
+    smt_enabled: PckFlag,
+}
+
+/// A PCK certificate platform flag's expected value
+/// (`tinfoil_verifier::PckFlag`).
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PckFlag {
+    True,
+    False,
+    Undefined,
+}
+
 impl Sidecar {
     fn parse(bytes: &[u8], path: &str) -> Result<Self, String> {
-        let value: Json = serde_json::from_slice(bytes).map_err(|e| format!("{path}: {e}"))?;
-        let sidecar = object(&value, path)?;
-        exact_keys(
-            sidecar,
-            &["weights"],
-            &["expected_gpus", "tdx_policy"],
-            path,
-        )?;
-        let weights = object(&sidecar["weights"], &format!("{path}: weights"))?;
-        exact_keys(
-            weights,
-            &["repo", "revision"],
-            &[],
-            &format!("{path}: weights"),
-        )?;
-        let repo = weights["repo"]
-            .as_str()
-            .filter(|r| is_repo(r))
-            .ok_or_else(|| {
-                format!("{path}: weights.repo must be <owner>/<name> of [A-Za-z0-9._-]")
-            })?;
-        let revision = weights["revision"]
-            .as_str()
-            .filter(|r| is_lower_hex(r, 20))
-            .ok_or_else(|| format!("{path}: weights.revision must be 40 lowercase hex digits"))?;
-        let expected_gpus = match sidecar.get("expected_gpus") {
-            None => None,
-            Some(v) => Some(
-                v.as_u64()
-                    .filter(|n| u32::try_from(*n).is_ok())
-                    .ok_or_else(|| format!("{path}: expected_gpus must be a u32"))?,
-            ),
-        };
-        let tdx_policy = match sidecar.get("tdx_policy") {
-            None => None,
-            Some(policy) => {
-                object(policy, &format!("{path}: tdx_policy"))?;
-                Some(policy.clone())
-            }
-        };
+        let file: SidecarFile =
+            serde_json::from_slice(bytes).map_err(|e| format!("{path}: {e}"))?;
+        if !is_repo(&file.weights.repo) {
+            return Err(format!(
+                "{path}: weights.repo must be <owner>/<name> of [A-Za-z0-9._-]"
+            ));
+        }
+        if !is_lower_hex(&file.weights.revision, 20) {
+            return Err(format!(
+                "{path}: weights.revision must be 40 lowercase hex digits"
+            ));
+        }
+        let tdx_policy = file
+            .tdx_policy
+            .map(|p| serde_json::to_value(p).map_err(|e| format!("{path}: tdx_policy: {e}")))
+            .transpose()?;
         Ok(Self {
-            repo: repo.to_owned(),
-            revision: revision.to_owned(),
-            expected_gpus,
+            repo: file.weights.repo,
+            revision: file.weights.revision,
+            expected_gpus: file.expected_gpus.map(u64::from),
             tdx_policy,
         })
     }
-}
-
-fn object<'a>(value: &'a Json, at: &str) -> Result<&'a serde_json::Map<String, Json>, String> {
-    value
-        .as_object()
-        .ok_or_else(|| format!("{at}: must be an object"))
-}
-
-fn exact_keys(
-    object: &serde_json::Map<String, Json>,
-    required: &[&str],
-    optional: &[&str],
-    at: &str,
-) -> Result<(), String> {
-    for key in required {
-        if !object.contains_key(*key) {
-            return Err(format!("{at}: missing member {key:?}"));
-        }
-    }
-    for key in object.keys() {
-        if !required.contains(&key.as_str()) && !optional.contains(&key.as_str()) {
-            return Err(format!("{at}: unknown member {key:?}"));
-        }
-    }
-    Ok(())
 }
 
 fn is_lower_hex(s: &str, bytes: usize) -> bool {

@@ -528,7 +528,77 @@ fn the_pin_carries_what_the_sidecar_states() {
     let mut sidecar = tree.sidecar();
     sidecar["unexpected"] = 1.into();
     tree.set_sidecar(sidecar);
-    refused(&tree, "unknown member \"unexpected\"");
+    refused(&tree, "unknown field `unexpected`");
+}
+
+/// The sidecar is read with a typed, strict parse at every level: a repeated
+/// member (which a plain map would collapse to its last value), an unknown
+/// one inside the TDX policy or the weights, and `null` for an optional
+/// member are each refused.
+#[test]
+fn the_sidecar_is_read_strictly_at_every_level() {
+    let tree = Tree::fixture();
+    let text = String::from_utf8(tree.files[SIDECAR].clone()).unwrap();
+    let sidecar = tree.sidecar();
+    let policy = serde_json::to_string(&sidecar["tdx_policy"]).unwrap();
+    let null_policy = {
+        let mut sidecar = sidecar.clone();
+        sidecar["tdx_policy"] = serde_json::Value::Null;
+        serde_json::to_string_pretty(&sidecar).unwrap()
+    };
+    let with = |edited: String| {
+        assert_ne!(edited, text, "the edit applied");
+        let mut tree = Tree::fixture();
+        tree.files.insert(SIDECAR.to_string(), edited.into_bytes());
+        tree
+    };
+    for (name, edited, needle) in [
+        (
+            "tdx_policy",
+            text.replacen(
+                "\"tdx_policy\":",
+                &format!("\"tdx_policy\": {policy}, \"tdx_policy\":"),
+                1,
+            ),
+            "duplicate field `tdx_policy`",
+        ),
+        (
+            "a policy member",
+            text.replacen("\"xfam\":", "\"xfam\": \"e702060000000000\", \"xfam\":", 1),
+            "duplicate field `xfam`",
+        ),
+        (
+            "weights.revision",
+            text.replacen(
+                "\"revision\":",
+                &format!("\"revision\": \"{}\", \"revision\":", "4".repeat(40)),
+                1,
+            ),
+            "duplicate field `revision`",
+        ),
+        (
+            "an unknown policy member",
+            text.replacen("\"xfam\":", "\"debug\": \"ok\", \"xfam\":", 1),
+            "unknown field `debug`",
+        ),
+        (
+            "an unknown weights member",
+            text.replacen("\"revision\":", "\"branch\": \"main\", \"revision\":", 1),
+            "unknown field `branch`",
+        ),
+        (
+            "a null GPU count",
+            text.replacen("\"expected_gpus\": 8", "\"expected_gpus\": null", 1),
+            "invalid type: null",
+        ),
+        ("a null policy", null_policy, "invalid type: null"),
+    ] {
+        let err = with(edited).check().expect_err(name);
+        assert!(
+            err.contains("deployment.json") && err.contains(needle),
+            "{name}: {err}"
+        );
+    }
 }
 
 #[test]

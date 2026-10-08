@@ -203,7 +203,17 @@ containers:
     const SIDECAR: &str = r#"{
         "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
         "expected_gpus": 8,
-        "tdx_policy": {"mr_seam": ["55"], "smt_enabled": "false"}
+        "tdx_policy": {
+            "mr_seam": ["55"],
+            "td_attributes": "0000001000000000",
+            "xfam": "e702060000000000",
+            "minimum_tee_tcb_svn": "06010300000000000000000000000000",
+            "minimum_tcb_evaluation_data_number": 17,
+            "qe_vendor_id": "939a7233f79c4ca9940a0db3957f0607",
+            "dynamic_platform": "true",
+            "cached_keys": "true",
+            "smt_enabled": "false"
+        }
     }"#;
 
     #[test]
@@ -241,7 +251,7 @@ containers:
                     "platform": {"tdx": {
                         "mrtd": mrtd,
                         "mrconfigid": format!("{config_sha}{}", "00".repeat(16)),
-                        "policy": {"mr_seam": ["55"], "smt_enabled": "false"},
+                        "policy": serde_json::from_str::<serde_json::Value>(SIDECAR).unwrap()["tdx_policy"],
                     }},
                     "expected_gpus": 8,
                 },
