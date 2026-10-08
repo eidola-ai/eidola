@@ -208,11 +208,11 @@
                   matchingCrate = getCrateForPath relPath;
                   # Is this an irrelevant crate? (in a crate dir but not in our set)
                   isIrrelevantCrate = matchingCrate != null && !(crateSet ? ${matchingCrate});
-                  # Both `eidola-app-core/build.rs` and `eidola-server/build.rs`
+                  # Both `eidola-app-core/build.rs` and `eidola-server-gateway/build.rs`
                   # consume pinned trust data from `releases/`:
                   #   * eidola-app-core → all of `releases/trust/*.json` +
                   #     `releases/schema/*.json` (client trust root)
-                  #   * eidola-server → just `releases/trust/sigstore-trusted-root.json`
+                  #   * eidola-server-gateway → just `releases/trust/sigstore-trusted-root.json`
                   #     (pinned Sigstore root; the runtime measurement resolver
                   #     verifies Tinfoil release attestations against it)
                   # Include `releases/` when either crate is in the set, but
@@ -224,7 +224,7 @@
                   # from reaching a fixed point.
                   trustRootFiles =
                     crateSet ? "eidola-app-core"
-                    || crateSet ? "eidola-server";
+                    || crateSet ? "eidola-server-gateway";
                   isTrustRootPath =
                     relPath == "/releases"
                     || pkgs.lib.hasPrefix "/releases/" relPath;
@@ -566,8 +566,8 @@
           nixCrossSystem = null;
         };
 
-        # Generate OpenAPI specification from the server code
-        serverOpenApiSpec =
+        # Generate OpenAPI specification from the gateway code
+        gatewayOpenApiSpec =
           pkgs.runCommand "eidola-openapi-spec"
             {
               nativeBuildInputs = [ generateOpenapiBin ];
@@ -1715,12 +1715,12 @@ with open(path, "wb") as f:
       in
       {
         packages = {
-          server = mkPackage {
-            pname = "eidola-server";
+          gateway = mkPackage {
+            pname = "eidola-server-gateway";
             rustTarget = nativeRustTarget;
             nixCrossSystem = null;
           };
-          server-openapi-spec = serverOpenApiSpec;
+          gateway-openapi-spec = gatewayOpenApiSpec;
           # Static llama.cpp `llama-server` — the bundled on-device inference
           # engine sidecar. Buildable on its own (`nix build .#llama-server`)
           # for the dev-path `just engine` recipe.
@@ -1825,12 +1825,12 @@ with open(path, "wb") as f:
               ''
                 echo "Checking if committed OpenAPI spec matches generated one..."
 
-                GENERATED="${self.packages.${system}.server-openapi-spec}/openapi.json"
-                COMMITTED="${repoSrc}/crates/eidola-server/openapi.json"
+                GENERATED="${self.packages.${system}.gateway-openapi-spec}/openapi.json"
+                COMMITTED="${repoSrc}/crates/eidola-server-gateway/openapi.json"
 
                 if [ ! -f "$COMMITTED" ]; then
-                  echo "ERROR: No committed OpenAPI spec found at crates/eidola-server/openapi.json"
-                  echo "Run: nix run '.#update-server-openapi'"
+                  echo "ERROR: No committed OpenAPI spec found at crates/eidola-server-gateway/openapi.json"
+                  echo "Run: nix run '.#update-gateway-openapi'"
                   echo "Then commit the generated file."
                   exit 1
                 fi
@@ -1840,7 +1840,7 @@ with open(path, "wb") as f:
                   echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
                   echo ""
                   echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-server-openapi'"
+                  echo "  1. Run: nix run '.#update-gateway-openapi'"
                   echo "  2. Review the changes"
                   echo "  3. Commit the updated spec"
                   echo ""
@@ -1854,22 +1854,22 @@ with open(path, "wb") as f:
         };
 
         apps = {
-          update-server-openapi = {
+          update-gateway-openapi = {
             type = "app";
             meta.description = "Update committed OpenAPI spec from generated sources";
             program = "${
               pkgs.writeShellApplication {
-                name = "update-server-openapi";
+                name = "update-gateway-openapi";
                 runtimeInputs = [
                   pkgs.coreutils
                   pkgs.git
                 ];
 
                 text = ''
-                  ${./scripts/update-server-openapi.sh} "${self.packages.${system}.server-openapi-spec}/openapi.json"
+                  ${./scripts/update-gateway-openapi.sh} "${self.packages.${system}.gateway-openapi-spec}/openapi.json"
                 '';
               }
-            }/bin/update-server-openapi";
+            }/bin/update-gateway-openapi";
           };
 
           format-rust = {

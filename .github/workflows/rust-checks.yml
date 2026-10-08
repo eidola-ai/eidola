@@ -289,7 +289,7 @@ jobs:
         if: steps.scope.outputs.rust == 'true'
         run: |
           cargo run -q -p generate-openapi > /tmp/openapi-generated.json
-          if ! diff /tmp/openapi-generated.json crates/eidola-server/openapi.json; then
+          if ! diff /tmp/openapi-generated.json crates/eidola-server-gateway/openapi.json; then
             echo ""
             echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
             echo "Run: just update-openapi"

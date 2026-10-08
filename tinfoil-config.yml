@@ -1,12 +1,13 @@
-# Tinfoil Container configuration for eidola-server.
+# Tinfoil Container configuration for eidola-server-gateway.
 #
 # The SHA-256 of this file is embedded in the kernel command line and bound
 # into the enclave measurement. Any change — image digest, secret hash,
 # resource allocation — produces a different measurement.
 #
-# Image digests below must match artifact-manifest.json.  After building,
-# run `just update-manifest` to stamp in the current digests and recompute
-# the enclave measurement.
+# Image digests below must match artifact-manifest.json (the gateway image
+# is recorded there under its artifact key, `eidola-server`).  After
+# building, run `just update-manifest` to stamp in the current digests and
+# recompute the enclave measurement.
 #
 # Secret hashes are generated with:
 #   cargo run -p hash-secret -- "<secret>"
@@ -17,8 +18,8 @@ cpus: 2
 memory: 8192
 
 containers:
-  - name: "eidola-server"
-    image: "ghcr.io/eidola-ai/eidola-server@sha256:a3d085af891e7f18d132c1563fef17d0a139b2bcac2a3fbdef3b16729115be8d"
+  - name: "eidola-server-gateway"
+    image: "ghcr.io/eidola-ai/eidola-server-gateway@sha256:a3d085af891e7f18d132c1563fef17d0a139b2bcac2a3fbdef3b16729115be8d"
     devices:
       - /dev/sev-guest
     secrets:

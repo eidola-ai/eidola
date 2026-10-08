@@ -1300,7 +1300,7 @@ async fn handle_proxy(
             // the upstream's stream ended before sending a single byte
             // to the client. On a long generation the client's TCP
             // connection would die waiting and report "connection closed
-            // before message completed", with no eidola-server log
+            // before message completed", with no eidola-server-gateway log
             // entry because the server was happily emitting chunks the
             // shim never forwarded.
             let body = Body::from_stream(resp.bytes_stream());

@@ -14,7 +14,7 @@
 //! capture a fresh fixture from a current release rather than loosening the
 //! verifier.
 
-use eidola_server::upstream_trust::sigstore::{
+use eidola_server_gateway::upstream_trust::sigstore::{
     TrustError, load_trusted_root, verify_release_attestation,
 };
 
@@ -31,7 +31,7 @@ fn verify(
     repo: &str,
     tag: &str,
     digest: &str,
-) -> Result<eidola_server::upstream_trust::sigstore::VerifiedMeasurement, TrustError> {
+) -> Result<eidola_server_gateway::upstream_trust::sigstore::VerifiedMeasurement, TrustError> {
     let trust = load_trusted_root().expect("embedded trusted root parses");
     verify_release_attestation(BUNDLE, repo, tag, digest, &trust)
 }

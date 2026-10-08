@@ -114,9 +114,9 @@ This means **two layers of confidential compute** protect the inference content:
 
 | Subsystem | File |
 |---|---|
-| Anonymous credentials (Privacy Pass ACT) | `crates/eidola-server/src/credentials.rs` |
-| Inference proxying | `crates/eidola-server/src/chat.rs` |
-| Auth extractors | `crates/eidola-server/src/auth.rs` |
-| Linked/unlinked routing | `crates/eidola-server/src/middleware.rs` |
-| Telemetry boundary | `crates/eidola-server/src/telemetry.rs` |
-| OpenAPI surface (tags = linked / unlinked / public) | `crates/eidola-server/src/api_doc.rs` |
+| Anonymous credentials (Privacy Pass ACT) | `crates/eidola-server-gateway/src/credentials.rs` |
+| Inference proxying | `crates/eidola-server-gateway/src/chat.rs` |
+| Auth extractors | `crates/eidola-server-gateway/src/auth.rs` |
+| Linked/unlinked routing | `crates/eidola-server-gateway/src/middleware.rs` |
+| Telemetry boundary | `crates/eidola-server-gateway/src/telemetry.rs` |
+| OpenAPI surface (tags = linked / unlinked / public) | `crates/eidola-server-gateway/src/api_doc.rs` |

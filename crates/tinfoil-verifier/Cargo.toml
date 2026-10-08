@@ -71,6 +71,6 @@ tracing = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 rustls = { version = "0.23", features = ["ring"] }
 # Live integration tests pull in WebPKI roots so they can talk to
-# inference.tinfoil.sh. Production callers (eidola-server) bring their
+# inference.tinfoil.sh. Production callers (eidola-server-gateway) bring their
 # own.
 webpki-roots = "1"

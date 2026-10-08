@@ -215,8 +215,8 @@ mod tests {
             "https://github.com/eidola-ai/eidola/blob/main/README.md"
         );
         assert_eq!(
-            rewrite_link("../crates/eidola-server/schema/schema.sql", "docs"),
-            "https://github.com/eidola-ai/eidola/blob/main/crates/eidola-server/schema/schema.sql"
+            rewrite_link("../crates/eidola-server-gateway/schema/schema.sql", "docs"),
+            "https://github.com/eidola-ai/eidola/blob/main/crates/eidola-server-gateway/schema/schema.sql"
         );
     }
 

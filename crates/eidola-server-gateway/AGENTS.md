@@ -1,4 +1,4 @@
-# eidola-server — Agent Development Guide
+# eidola-server-gateway — Agent Development Guide
 
 An OpenAI-compatible proxy that translates requests to upstream AI providers, with a billing system using anonymous credentials for privacy-preserving usage tracking.
 
@@ -6,6 +6,8 @@ An OpenAI-compatible proxy that translates requests to upstream AI providers, wi
 - **Database:** PostgreSQL 17+ (`schema/schema.sql`).
 - **Deployment:** Tinfoil Containers — all services run inside confidential enclaves. The Tinfoil shim terminates TLS and serves self-contained v3 attestation; the server runs plain HTTP behind it.
 - **API endpoints:** defined in `openapi.json`, generated from utoipa annotations — see Conventions in the top-level AGENTS.md (`just update-openapi`).
+- **Role:** the gateway — accounts, billing, anonymous credentials, routing. Inference itself is an upstream's job (today Tinfoil's; later Eidola's own engine nodes).
+- **Names that did not follow the crate:** the image is `ghcr.io/eidola-ai/eidola-server-gateway`, but its bake targets are still `server` / `ci-server` and its `artifact-manifest.json` key is still `eidola-server`. The key is what installed clients compare (`EXPECTED_ARTIFACTS` in `eidola-app-core/src/updates.rs`), and `scripts/artifact-manifest.sh` derives it from the bake target name, so changing either is a manifest artifact-set rotation — accept side one release, emit side the next (`releases/README.md`) — never a rename in place. An OCI digest does not depend on the repository name, so the row checks the same image whichever name it was pushed under; images of releases cut before the rename live at `ghcr.io/eidola-ai/eidola-server` and must stay there.
 
 ## Key design decisions
 
@@ -80,7 +82,7 @@ The server runs plain HTTP inside a Tinfoil Container; the shim terminates WebPK
 - With an external PostgreSQL (until Tinfoil supports persistent disks): connection metadata in `DATABASE_URL`, `DATABASE_PASSWORD` as a Tinfoil secret, `DATABASE_SSL_CERT` if the server cert doesn't chain to a WebPKI root.
 - The container has `/dev/sev-guest` (via the undocumented `devices` field in `tinfoil-config.yml`) so the shim can obtain a fresh SEV-SNP report for each v3 challenge; shim runtime material is mounted at `/tinfoil/`.
 
-`tinfoil-config.yml` (workspace root) is the Tinfoil Container configuration: image digests from `artifact-manifest.json`, `_HASH` env vars for measured secrets (Argon2id hashes via `cargo run -p hash-secret`), CVM resources. Its SHA-256 is embedded in the kernel command line and bound into the enclave measurement — any change produces a different measurement.
+`tinfoil-config.yml` (workspace root) is the Tinfoil Container configuration: image digests from `artifact-manifest.json`, `_HASH` env vars for measured secrets (Argon2id hashes via `cargo run -p hash-secret`), CVM resources. Its SHA-256 is embedded in the kernel command line and bound into the enclave measurement — any change produces a different measurement. `scripts/artifact-manifest.sh stamp-config` refuses a config with no `ghcr.io/eidola-ai/eidola-server-gateway@sha256:` image line to stamp, so a renamed image cannot silently ship a stale digest.
 
 ## Upstream measurement resolution (`src/upstream_trust/`)
 
@@ -97,9 +99,9 @@ The server runs plain HTTP inside a Tinfoil Container; the shim terminates WebPK
 
 `compose.yaml` — two supported workflows share one file:
 
-- **Full container stack** (`just dev` → `scripts/dev.sh --container`): postgres + server + shim + stripe-cli in containers, detached. Server image rebuilt each invocation.
+- **Full container stack** (`just dev` → `scripts/dev.sh --container`): postgres + gateway + shim + stripe-cli in containers, detached. Gateway image rebuilt each invocation.
 - **Host mode** (`just services` → `scripts/dev.sh --host`): postgres + shim + stripe-cli in containers, with `SHIM_UPSTREAM_URL=http://host.docker.internal:8080` so the shim forwards to a cargo-built server on the host. Writes `.env.local` (`STRIPE_WEBHOOK_SECRET` + `BIND_ADDR=0.0.0.0:8080`) for the host server to source.
 
 The shim service forwards `DEV_MEASUREMENT` as a bare pass-through (`- DEV_MEASUREMENT`, no `=`), so it reaches the container only when set in the environment running compose or in `.env` (which compose reads from the project directory automatically) — an unset var leaves the shim on its all-zeros default rather than an empty measurement, which would panic it. `scripts/local-client.sh` resolves the same variable the same way, environment before `.env`, so one value governs both what the shim advertises and what the client trusts on every documented path. Its `.env` reader covers compose's grammar except `${VAR}` interpolation (reimplementing that is reimplementing compose): such a value warns and then fails the script's own shape check, pointing at exporting the variable instead. The script's other settings (`EIDOLA_DEV_CERT_DIR` / `EIDOLA_DEV_BASE_URL`) are client-side only by design — they say where a stack already is, and have no compose counterpart to follow.
 
-Both build only the images they need, idempotently apply `schema.sql`, capture the Stripe webhook secret if `STRIPE_API_KEY` is set (else skip stripe-cli), and start detached. `just down` tears down both. Profiles: `server` gates the server container, `stripe` gates stripe-cli; postgres and shim have no profile. The shim has `extra_hosts: host.docker.internal:host-gateway` (Linux host-gateway) and intentionally no `depends_on: server` (host mode); `postgres`/`server`/`shim` declare `platform: linux/amd64` so compose doesn't warn on arm64 hosts.
+Both build only the images they need, idempotently apply `schema.sql`, capture the Stripe webhook secret if `STRIPE_API_KEY` is set (else skip stripe-cli), and start detached. `just down` tears down both. Profiles: `gateway` gates the gateway container, `stripe` gates stripe-cli; postgres and shim have no profile. The shim has `extra_hosts: host.docker.internal:host-gateway` (Linux host-gateway) and intentionally no `depends_on: gateway` (host mode); `postgres`/`gateway`/`shim` declare `platform: linux/amd64` so compose doesn't warn on arm64 hosts.

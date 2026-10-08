@@ -1,5 +1,5 @@
 [package]
-name = "eidola-server"
+name = "eidola-server-gateway"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -13,7 +13,7 @@ license = "AGPL-3.0-only"
 test-support = []
 
 [[bin]]
-name = "eidola-server"
+name = "eidola-server-gateway"
 path = "src/main.rs"
 
 [dependencies]

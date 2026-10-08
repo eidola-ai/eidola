@@ -120,14 +120,14 @@ releases/
     attestation-templates.json          # pinned claim templates
   trust/
     trust-constants.json                # non-derivable trust values (input)
-    sigstore-trusted-root.json          # upstream Sigstore TrustedRoot snapshot (input — both eidola-app-core (updater) and eidola-server (runtime upstream-measurement resolver) build.rs embed it)
+    sigstore-trusted-root.json          # upstream Sigstore TrustedRoot snapshot (input — both eidola-app-core (updater) and eidola-server-gateway (runtime upstream-measurement resolver) build.rs embed it)
     server-enclave.json                 # paired-server enclave measurement (input — projection of artifact-manifest.json's enclave block, materialized as its own file so the cli build context can COPY it without dragging the manifest in)
     attestant-provenance/               # informational hardware-attestation evidence for pinned attestant keys (NOT a build input — no build.rs or client reads it; auditor-facing only)
 artifact-manifest.json                  # full deployment record (output, signed by CI)
 crates/eidola-app-core/
   build.rs                              # generator: server-enclave.json + trust-constants.json + … → trust_root.gen.rs
   src/trust_root.rs                     # exposes the generated constants
-crates/eidola-server/
+crates/eidola-server-gateway/
   build.rs                              # generator: sigstore-trusted-root.json → sigstore_root.gen.rs
   src/upstream_trust/                   # runtime upstream-measurement resolver (embeds SIGSTORE_TRUSTED_ROOT_JSON; resolves + Sigstore-verifies Tinfoil's latest release at runtime — no static measurement pin)
 ```

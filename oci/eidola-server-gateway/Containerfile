@@ -43,7 +43,7 @@ RUN cargo fetch --locked --target ${TARGET}
 # previous approach) don't survive across CI runs because each run creates a
 # fresh BuildKit daemon; layer caching does survive via type=local export.
 RUN --network=none \
-    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-server
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-server-gateway
 
 # ── build ──────────────────────────────────────────────────────────────────────
 # Copy real source over the stubs and compile (no network access).
@@ -55,7 +55,7 @@ ARG CARGO_PROFILE=release
 
 COPY crates/ ./crates/
 
-# Trust-root build input: `eidola-server/build.rs` embeds the pinned Sigstore
+# Trust-root build input: `eidola-server-gateway/build.rs` embeds the pinned Sigstore
 # trusted root (sigstore-trusted-root.json) that the runtime measurement
 # resolver (`src/upstream_trust`) verifies Tinfoil release attestations
 # against. We deliberately COPY only this one path rather than `releases/`
@@ -73,14 +73,14 @@ COPY releases/trust/sigstore-trusted-root.json ./releases/trust/sigstore-trusted
 RUN find crates/ -name '*.rs' -exec touch {} +
 
 RUN --network=none \
-    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-server \
-    && install -D target/${TARGET}/${CARGO_PROFILE}/eidola-server /out/eidola-server
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-server-gateway \
+    && install -D target/${TARGET}/${CARGO_PROFILE}/eidola-server-gateway /out/eidola-server-gateway
 
 # ── install ────────────────────────────────────────────────────────────────────
 # Place binary into /rootfs.
 FROM scratch AS install
 
-COPY --from=build /out/eidola-server /rootfs/eidola-server
+COPY --from=build /out/eidola-server-gateway /rootfs/eidola-server-gateway
 
 # ── package ────────────────────────────────────────────────────────────────────
 # Final minimal image.
@@ -90,4 +90,4 @@ COPY --from=install /rootfs/ /
 ENV BIND_ADDR=0.0.0.0:8080
 EXPOSE 8080
 USER 65534:65534
-ENTRYPOINT ["/eidola-server"]
+ENTRYPOINT ["/eidola-server-gateway"]

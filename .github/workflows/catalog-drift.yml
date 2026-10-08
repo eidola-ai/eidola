@@ -1,6 +1,6 @@
 name: Model Catalog Drift
 
-# `MODEL_CATALOG` (crates/eidola-server/src/backend.rs) hand-transcribes what
+# `MODEL_CATALOG` (crates/eidola-server-gateway/src/backend.rs) hand-transcribes what
 # Tinfoil publishes per model — ids, context windows, prices, capability flags.
 # Upstream republishes on its own clock, so a row that was right when it was
 # written stops being right with nothing in this tree changing, and no in-repo
@@ -29,7 +29,7 @@ jobs:
   catalog-drift:
     name: Catalog drift
     runs-on: ubuntu-24.04
-    # Generous for a COLD-cache run: eidola-server's dep tree builds at
+    # Generous for a COLD-cache run: eidola-server-gateway's dep tree builds at
     # opt-level 2 (root Cargo.toml dev profile). Warm runs are minutes.
     timeout-minutes: 45
     permissions:
@@ -46,7 +46,7 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         # Job-scoped key (no shared-key), so this cache holds only the
-        # eidola-server lib test build and the daily run keeps it warm.
+        # eidola-server-gateway lib test build and the daily run keeps it warm.
         # Schedule and dispatch both run on the default branch, so saving
         # here never thrashes per-PR.
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -58,7 +58,7 @@ jobs:
           # so no other ignored test in this crate (the Stripe ones) is run.
           DRIFT_TEST: backend::catalog_drift::the_live_upstream_list_still_matches_the_catalog
         run: |
-          cargo test -p eidola-server --lib -- \
+          cargo test -p eidola-server-gateway --lib -- \
             --exact --ignored --nocapture "$DRIFT_TEST" 2>&1 | tee drift.log
           # A filter that matches nothing exits 0, so a renamed or un-ignored
           # test would leave this workflow permanently green while checking

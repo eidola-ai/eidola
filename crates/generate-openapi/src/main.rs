@@ -8,7 +8,7 @@ fn main() {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
 
     // Build the full router so OpenApiRouter collects paths from handler annotations.
-    let (_, spec) = eidola_server::build_router().split_for_parts();
+    let (_, spec) = eidola_server_gateway::build_router().split_for_parts();
 
     let json = spec
         .to_pretty_json()

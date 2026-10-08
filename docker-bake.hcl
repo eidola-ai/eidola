@@ -70,9 +70,14 @@ target "_cache_postgres" {
 # --set '*.output=type=image,push=false,rewrite-timestamp=true,force-compression=true,oci-mediatypes=true'
 # (the default docker driver does not support these options).
 
+# The `server` and `ci-server` targets build the gateway image
+# (eidola-server-gateway). The target name is not cosmetic:
+# scripts/artifact-manifest.sh records each target's digest under the
+# manifest key `eidola-<target>`, and installed clients compare that key set,
+# so renaming a target is a manifest artifact-set rotation (releases/README.md).
 target "server" {
   inherits = ["_common", "_cache_server"]
-  tags     = ["eidola-server:dev"]
+  tags     = ["eidola-server-gateway:dev"]
 }
 
 target "cli" {
@@ -119,8 +124,8 @@ target "_ci" {
 target "ci-server" {
   inherits   = ["_ci", "_cache_server"]
   context    = "."
-  dockerfile = "oci/eidola-server/Containerfile"
-  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server:${t}"]
+  dockerfile = "oci/eidola-server-gateway/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server-gateway:${t}"]
 }
 
 target "ci-cli" {

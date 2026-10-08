@@ -10,12 +10,12 @@ use axum::http::StatusCode;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use eidola_server::AppState;
-use eidola_server::backend::TinfoilBackend;
-use eidola_server::credentials;
-use eidola_server::helpers::EpochConfig;
-use eidola_server::stripe::StripeClient;
-use eidola_server::telemetry;
+use eidola_server_gateway::AppState;
+use eidola_server_gateway::backend::TinfoilBackend;
+use eidola_server_gateway::credentials;
+use eidola_server_gateway::helpers::EpochConfig;
+use eidola_server_gateway::stripe::StripeClient;
+use eidola_server_gateway::telemetry;
 
 /// Server configuration.
 struct Config {
@@ -33,7 +33,7 @@ struct Config {
     /// Static seed for the required-terms gate (dev/test pin; see
     /// `terms_seed` parsing). Applied via the same monotonic upsert the
     /// terms-feed poller uses.
-    terms_seed: Vec<eidola_server::db::RequiredDocumentRow>,
+    terms_seed: Vec<eidola_server_gateway::db::RequiredDocumentRow>,
     /// Base URL of the published website to poll for the current legal
     /// document versions (e.g. `https://www.eidola.ai`). None = no polling.
     terms_feed_base_url: Option<String>,
@@ -99,8 +99,8 @@ impl Config {
         // Refuse to start with a markup below the pricing contract's safe
         // cost factor — see `validate_pricing_markup` for the loss-window
         // rationale (and the future dynamic-factor-via-/models note).
-        eidola_server::backend::validate_pricing_markup(
-            pricing_markup.unwrap_or(eidola_server::backend::DEFAULT_PRICING_MARKUP),
+        eidola_server_gateway::backend::validate_pricing_markup(
+            pricing_markup.unwrap_or(eidola_server_gateway::backend::DEFAULT_PRICING_MARKUP),
         )?;
 
         let credential_master_key_hex = std::env::var("CREDENTIAL_MASTER_KEY")
@@ -161,10 +161,10 @@ impl Config {
         // ticker, or a poll with no sleep between passes), so it is refused
         // here instead.
         let terms_refresh =
-            eidola_server::helpers::refresh_secs_from_env("TERMS_REFRESH_SECS", 600)?;
-        let upstream_refresh = eidola_server::helpers::refresh_secs_from_env(
+            eidola_server_gateway::helpers::refresh_secs_from_env("TERMS_REFRESH_SECS", 600)?;
+        let upstream_refresh = eidola_server_gateway::helpers::refresh_secs_from_env(
             "TINFOIL_MEASUREMENT_REFRESH_SECS",
-            eidola_server::upstream_trust::DEFAULT_REFRESH_SECS,
+            eidola_server_gateway::upstream_trust::DEFAULT_REFRESH_SECS,
         )?;
 
         let mut terms_seed = Vec::new();
@@ -206,7 +206,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| default_url.to_string());
-            terms_seed.push(eidola_server::db::RequiredDocumentRow {
+            terms_seed.push(eidola_server_gateway::db::RequiredDocumentRow {
                 document: document.to_string(),
                 version,
                 sha256: sha256.to_lowercase(),
@@ -295,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Starting Eidola server on {}", config.bind_addr);
 
     // Create database connection pool
-    let db_pool = eidola_server::db::create_pool(
+    let db_pool = eidola_server_gateway::db::create_pool(
         &config.database_url,
         config.database_password.as_deref(),
         config.database_ssl_cert.as_deref(),
@@ -357,7 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // observers) lives here so `upstream_trust` stays
     // free of a telemetry dependency. `attesting_client` does no network
     // I/O, so rebuilding is cheap.
-    let client_factory: eidola_server::upstream_trust::AttestingClientFactory = {
+    let client_factory: eidola_server_gateway::upstream_trust::AttestingClientFactory = {
         let inference_base_url = inference_base_url.to_string();
         std::sync::Arc::new(move |allowed: Vec<tinfoil_verifier::EnclaveMeasurement>| {
             let inference_base_url = inference_base_url.clone();
@@ -385,7 +385,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // refresh task. There is no static fallback — if the measurement can't be
     // resolved and verified at boot, the server refuses to start.
     info!("Resolving Tinfoil upstream measurement and building attesting client...");
-    let upstream = eidola_server::upstream_trust::UpstreamTrust::bootstrap(
+    let upstream = eidola_server_gateway::upstream_trust::UpstreamTrust::bootstrap(
         config.tinfoil_repo.clone(),
         client_factory,
     )
@@ -441,12 +441,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // node would otherwise create issuer keys with bogus issuance
     // windows that other (correctly-clocked) nodes would never
     // produce, polluting shared state.
-    eidola_server::db::check_clock_skew(&state.db_pool, eidola_server::db::MAX_CLOCK_SKEW)
-        .await
-        .map_err(|e| {
-            error!("Database clock skew check failed: {}", e);
-            e.to_string()
-        })?;
+    eidola_server_gateway::db::check_clock_skew(
+        &state.db_pool,
+        eidola_server_gateway::db::MAX_CLOCK_SKEW,
+    )
+    .await
+    .map_err(|e| {
+        error!("Database clock skew check failed: {}", e);
+        e.to_string()
+    })?;
 
     // Terms-acceptance gate: seed any static env pins into the shared
     // required_document table (monotonic — a stale pin can't regress a
@@ -455,8 +458,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // gate that silently doesn't apply would be worse than not starting);
     // poller failures are per-tick and logged.
     for doc in &config.terms_seed {
-        use eidola_server::db::RecordRequiredOutcome;
-        match eidola_server::db::record_required_document(&state.db_pool, doc).await {
+        use eidola_server_gateway::db::RecordRequiredOutcome;
+        match eidola_server_gateway::db::record_required_document(&state.db_pool, doc).await {
             Ok(RecordRequiredOutcome::Recorded) => info!(
                 "terms gate: {} seeded at version {} ({})",
                 doc.document, doc.version, doc.sha256
@@ -488,7 +491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "terms feed: polling {} every {:?}",
             base_url, config.terms_refresh
         );
-        eidola_server::terms_feed::spawn_terms_feed_task(
+        eidola_server_gateway::terms_feed::spawn_terms_feed_task(
             state.db_pool.clone(),
             base_url,
             config.terms_refresh,
@@ -517,10 +520,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Keep the database connection pool warm and prevent serverless Postgres
     // (e.g. Neon) from autosuspending the compute during quiet periods.
-    eidola_server::db::spawn_keepalive(state.db_pool.clone(), std::time::Duration::from_secs(60));
+    eidola_server_gateway::db::spawn_keepalive(
+        state.db_pool.clone(),
+        std::time::Duration::from_secs(60),
+    );
 
     // Build the router with OpenAPI integration
-    let (router, api) = eidola_server::build_router()
+    let (router, api) = eidola_server_gateway::build_router()
         .with_state(state)
         .split_for_parts();
 
@@ -535,7 +541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }),
         )
         .layer(axum::middleware::from_fn(
-            eidola_server::middleware::observe,
+            eidola_server_gateway::middleware::observe,
         ));
 
     let listener = TcpListener::bind(config.bind_addr).await?;
@@ -624,7 +630,7 @@ mod tests {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
 
         // Build the full router to capture paths from handler annotations.
-        let (_, spec) = eidola_server::build_router().split_for_parts();
+        let (_, spec) = eidola_server_gateway::build_router().split_for_parts();
 
         // Verify basic info
         assert_eq!(spec.info.title, "Eidola API");

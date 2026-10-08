@@ -1672,7 +1672,7 @@ impl Inner {
             // failure after the nullifier is recorded — request validation,
             // `send_stream`, a spend-proof re-encode — answers with a
             // refund-bearing JSON error body rather than an SSE stream
-            // (`eidola-server/src/handlers.rs`: `error_response_with_refund`).
+            // (`eidola-server-gateway/src/handlers.rs`: `error_response_with_refund`).
             // Persisting that token for recovery is best-effort there, so the
             // in-band value is again the only one that can answer for the arm
             // where persistence failed. Third door, same rule: the refund the
