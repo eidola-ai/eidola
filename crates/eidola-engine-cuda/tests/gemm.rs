@@ -69,9 +69,9 @@ fn fp8_blockwise_matches_reference() {
             }
         }
         for &arch in &su.archs {
-            let (name, entry) = GemmKind::Fp8Blockwise.kernel();
+            let (name, _) = GemmKind::Fp8Blockwise.kernel();
             let module = su.module(name, arch);
-            let gemm = Gemm::new(GemmKind::Fp8Blockwise, module.kernel(entry).unwrap()).unwrap();
+            let gemm = Gemm::from_module(GemmKind::Fp8Blockwise, &module).unwrap();
             let dd = s.alloc_zeros::<u16>(mu * nu).unwrap();
             let args = GemmArgs {
                 m,
@@ -136,9 +136,9 @@ fn bf16_matches_reference() {
             }
         }
         for &arch in &su.archs {
-            let (name, entry) = GemmKind::Bf16.kernel();
+            let (name, _) = GemmKind::Bf16.kernel();
             let module = su.module(name, arch);
-            let gemm = Gemm::new(GemmKind::Bf16, module.kernel(entry).unwrap()).unwrap();
+            let gemm = Gemm::from_module(GemmKind::Bf16, &module).unwrap();
             let dd = s.alloc_zeros::<f32>(mu * nu).unwrap();
             let args = GemmArgs {
                 m,

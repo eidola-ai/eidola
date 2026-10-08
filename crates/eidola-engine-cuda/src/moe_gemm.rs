@@ -208,6 +208,7 @@ pub struct MoeGemm {
 
 impl MoeGemm {
     pub fn from_module(module: KernelModule) -> Result<MoeGemm> {
+        module.expect_image("deepgemm_fp8_fp4_grouped")?;
         let mut kernels = Vec::new();
         for layout in [MoeLayout::Contiguous, MoeLayout::Masked] {
             for proj in [MoeProj::GateUp, MoeProj::Down] {

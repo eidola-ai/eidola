@@ -51,6 +51,7 @@ impl EngineOps {
     }
 
     pub fn from_module(m: KernelModule) -> Result<EngineOps> {
+        m.expect_image("engine_ops")?;
         let qkv = m.kernel("eidola_qkv_rope_kv")?;
         if qkv.meta().params_bytes as usize != std::mem::size_of::<QkvArgs>() {
             return Err(crate::CudaError::new(

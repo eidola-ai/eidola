@@ -53,9 +53,9 @@ impl Kernels {
             .ok_or_else(|| CudaError::new("no kernel image for this device"))?;
         let load = |name: &str| KernelModule::load_from(gpu, dir, name, ImageSource::Cubin(arch));
         let gemm = |kind: GemmKind| -> Result<(Gemm, KernelModule)> {
-            let (name, entry) = kind.kernel();
+            let (name, _) = kind.kernel();
             let m = load(name)?;
-            Ok((Gemm::new(kind, m.kernel(entry)?)?, m))
+            Ok((Gemm::from_module(kind, &m)?, m))
         };
         let (fp8_gemm, fp8_module) = gemm(GemmKind::Fp8Blockwise)?;
         let (bf16_gemm, bf16_module) = gemm(GemmKind::Bf16)?;

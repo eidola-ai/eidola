@@ -8,7 +8,8 @@
 //! ```
 
 use eidola_engine_cuda::KernelDir;
-use eidola_engine_cuda::{Gpu, ImageArch, ImageSource, KernelModule, bf16, ops};
+use eidola_engine_cuda::ops::RmsNorm;
+use eidola_engine_cuda::{Gpu, ImageArch, ImageSource, KernelModule, bf16};
 use eidola_engine_kernels::Manifest;
 
 fn main() {
@@ -66,9 +67,9 @@ fn main() {
             println!("rmsnorm {source:?}: not loadable on this device");
             continue;
         };
-        let kernel = module.kernel("eidola_rmsnorm_bf16").expect("entry");
+        let norm = RmsNorm::from_module(&module).expect("entry");
         for (rows, hidden) in [(1u32, 4096u32), (37, 4096), (5, 1000), (3, 256)] {
-            let (max_ulps, mismatches) = rmsnorm_vs_reference(&gpu, &kernel, rows, hidden);
+            let (max_ulps, mismatches) = rmsnorm_vs_reference(&gpu, &norm, rows, hidden);
             println!(
                 "rmsnorm {source:?} rows {rows} hidden {hidden}: {mismatches} of {} outputs differ from the f32 reference rounded to bf16, max {max_ulps} bf16 ulp",
                 rows * hidden
@@ -77,12 +78,7 @@ fn main() {
     }
 }
 
-fn rmsnorm_vs_reference(
-    gpu: &Gpu,
-    kernel: &eidola_engine_cuda::Kernel,
-    rows: u32,
-    hidden: u32,
-) -> (u32, usize) {
+fn rmsnorm_vs_reference(gpu: &Gpu, norm: &RmsNorm, rows: u32, hidden: u32) -> (u32, usize) {
     let n = (rows * hidden) as usize;
     let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ n as u64;
     let mut next = || {
@@ -97,7 +93,7 @@ fn rmsnorm_vs_reference(
     let dx = stream.clone_htod(&x).unwrap();
     let dw = stream.clone_htod(&w).unwrap();
     let mut dout = stream.alloc_zeros::<u16>(n).unwrap();
-    ops::rmsnorm_bf16(gpu, kernel, &mut dout, &dx, &dw, hidden, 1e-6).unwrap();
+    norm.launch(gpu, &mut dout, &dx, &dw, hidden, 1e-6).unwrap();
     let out = stream.clone_dtoh(&dout).unwrap();
 
     let wf: Vec<f32> = w.iter().map(|&b| bf16::to_f32(b)).collect();

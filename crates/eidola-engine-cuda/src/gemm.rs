@@ -17,7 +17,7 @@
 
 use std::ffi::c_void;
 
-use crate::module::Kernel;
+use crate::module::{Kernel, KernelModule};
 use crate::tma::{TmaL2, TmaSpec, TmaSwizzle, TmaType};
 use crate::{CudaError, Gpu, Result};
 
@@ -272,7 +272,11 @@ pub struct Gemm {
 }
 
 impl Gemm {
-    pub fn new(kind: GemmKind, kernel: Kernel) -> Result<Gemm> {
+    /// The GEMM of `kind`, from its own image and entry only: the Params
+    /// layout built for one kind never reaches another kind's kernel.
+    pub fn from_module(kind: GemmKind, module: &KernelModule) -> Result<Gemm> {
+        let (image, entry) = kind.kernel();
+        let kernel = module.bound_kernel(image, entry)?;
         if kernel.meta().params_bytes as usize != PARAMS_BYTES {
             return Err(CudaError::new(format!(
                 "{kind:?}: the image's Params is {} bytes, the host mirror {PARAMS_BYTES}",

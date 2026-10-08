@@ -2,7 +2,8 @@
 //! (`EIDOLA_ENGINE_KERNELS_DIR`); without either they print why and pass.
 
 use eidola_engine_cuda::KernelDir;
-use eidola_engine_cuda::{Gpu, ImageArch, ImageSource, KernelModule, bf16, ops};
+use eidola_engine_cuda::ops::RmsNorm;
+use eidola_engine_cuda::{Gpu, ImageArch, ImageSource, KernelModule, bf16};
 use eidola_engine_kernels::Manifest;
 
 fn setup() -> Option<(Gpu, KernelDir)> {
@@ -99,9 +100,10 @@ fn rmsnorm_matches_reference() {
     for arch in archs {
         let module =
             KernelModule::load_from(&gpu, &dir, "rmsnorm", ImageSource::Cubin(arch)).unwrap();
-        let kernel = module.kernel("eidola_rmsnorm_bf16").unwrap();
+        let norm = RmsNorm::from_module(&module).unwrap();
         let mut dout = stream.alloc_zeros::<u16>(rows * hidden).unwrap();
-        ops::rmsnorm_bf16(&gpu, &kernel, &mut dout, &dx, &dw, hidden as u32, 1e-6).unwrap();
+        norm.launch(&gpu, &mut dout, &dx, &dw, hidden as u32, 1e-6)
+            .unwrap();
         check_rmsnorm(&stream.clone_dtoh(&dout).unwrap(), &x, &w, rows, hidden);
     }
 }
@@ -124,18 +126,16 @@ fn kernels_outlive_their_module_handle() {
         stream.clone_htod(&x).unwrap(),
         stream.clone_htod(&w).unwrap(),
     );
-    let kernel = KernelModule::load(&gpu, &dir, "rmsnorm")
-        .unwrap()
-        .kernel("eidola_rmsnorm_bf16")
-        .unwrap();
+    let norm = RmsNorm::from_module(&KernelModule::load(&gpu, &dir, "rmsnorm").unwrap()).unwrap();
     let others: Vec<_> = ["engine_ops", "sampling", "rmsnorm"]
         .into_iter()
         .map(|name| KernelModule::load(&gpu, &dir, name).unwrap())
         .collect();
     drop(others);
-    kernel.static_smem_bytes().unwrap();
+    norm.kernel().static_smem_bytes().unwrap();
     let mut dout = stream.alloc_zeros::<u16>(rows * hidden).unwrap();
-    ops::rmsnorm_bf16(&gpu, &kernel, &mut dout, &dx, &dw, hidden as u32, 1e-6).unwrap();
+    norm.launch(&gpu, &mut dout, &dx, &dw, hidden as u32, 1e-6)
+        .unwrap();
     check_rmsnorm(&stream.clone_dtoh(&dout).unwrap(), &x, &w, rows, hidden);
 }
 
@@ -168,10 +168,10 @@ fn launches_from_another_thread() {
 
     let Some((gpu, dir)) = setup() else { return };
     let module = KernelModule::load(&gpu, &dir, "rmsnorm").unwrap();
-    let kernel = module.kernel("eidola_rmsnorm_bf16").unwrap();
-    let (name, entry) = GemmKind::Bf16.kernel();
+    let norm = RmsNorm::from_module(&module).unwrap();
+    let (name, _) = GemmKind::Bf16.kernel();
     let gemm_module = KernelModule::load(&gpu, &dir, name).unwrap();
-    let gemm = Gemm::new(GemmKind::Bf16, gemm_module.kernel(entry).unwrap()).unwrap();
+    let gemm = Gemm::from_module(GemmKind::Bf16, &gemm_module).unwrap();
     let (rows, hidden) = (4usize, 256usize);
     let x: Vec<u16> = (0..rows * hidden)
         .map(|i| bf16::from_f32((i % 7) as f32 - 3.0))
@@ -225,7 +225,11 @@ fn launches_from_another_thread() {
                 &mut h as *mut _ as *mut std::ffi::c_void,
                 &mut eps as *mut _ as *mut std::ffi::c_void,
             ];
-            unsafe { kernel.launch(gpu.stream(), [rows as u32, 1, 1], &mut args) }.unwrap();
+            unsafe {
+                norm.kernel()
+                    .launch(gpu.stream(), [rows as u32, 1, 1], &mut args)
+            }
+            .unwrap();
             unsafe { gemm.launch(&gpu, &gemm_args) }.unwrap();
             kv.apply(&gpu, &[Maintenance::Zero { group: 0, block: 1 }], &[])
                 .unwrap();

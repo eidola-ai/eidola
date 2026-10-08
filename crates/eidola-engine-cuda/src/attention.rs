@@ -278,6 +278,7 @@ pub struct Attention {
 
 impl Attention {
     pub fn from_module(module: KernelModule) -> Result<Attention> {
+        module.expect_image("flashinfer_fa2_sink_paged")?;
         let get = |s: &str| -> Result<Kernel> {
             let k = module.kernel(s)?;
             if k.meta().params_bytes as usize != std::mem::size_of::<PagedParams>() {

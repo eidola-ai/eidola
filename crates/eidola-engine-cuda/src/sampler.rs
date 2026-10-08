@@ -63,6 +63,7 @@ impl Sampler {
     }
 
     pub fn from_module(module: KernelModule) -> Result<Sampler> {
+        module.expect_image("sampling")?;
         Ok(Sampler {
             sample: module.kernel("eidola_sample")?,
             accept: module.kernel("eidola_chain_accept")?,

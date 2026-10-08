@@ -54,6 +54,23 @@ impl ImageSource {
     }
 }
 
+/// Refuse unless `cubin` is image `image` and (when given) holds entry
+/// `symbol`.
+pub fn check_entry(cubin: &Cubin, image: &str, symbol: Option<&str>) -> Result<()> {
+    if cubin.name != image {
+        return Err(CudaError::new(format!(
+            "image {} where {image} is required",
+            cubin.name
+        )));
+    }
+    if let Some(symbol) = symbol
+        && cubin.entry(symbol).is_none()
+    {
+        return Err(CudaError::new(format!("no entry {symbol} in {image}")));
+    }
+    Ok(())
+}
+
 /// One loaded kernel image.
 pub struct KernelModule {
     loaded: Arc<Loaded>,
@@ -140,6 +157,19 @@ impl KernelModule {
     /// The manifest record of the cubin this module runs.
     pub fn cubin(&self) -> &'static Cubin {
         self.cubin
+    }
+
+    /// Refuse unless this module runs image `image`: a typed wrapper's
+    /// argument layouts are its image's.
+    pub fn expect_image(&self, image: &str) -> Result<()> {
+        check_entry(self.cubin, image, None)
+    }
+
+    /// Resolve `symbol` of image `image`, refused for any other image or
+    /// entry: what a typed launch wrapper takes its kernel from.
+    pub fn bound_kernel(&self, image: &str, symbol: &str) -> Result<Kernel> {
+        check_entry(self.cubin, image, Some(symbol))?;
+        self.kernel(symbol)
     }
 
     /// Resolve an entry by symbol and read its launch contract out of the
@@ -291,5 +321,58 @@ impl Kernel {
         }
         .result()
         .map_err(|e| CudaError::new(format!("launching {}: {e:?}", self.symbol)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cubin(name: &str) -> &'static Cubin {
+        Manifest::embedded()
+            .cubin(name, "sm_103a")
+            .unwrap_or_else(|| panic!("{name}"))
+    }
+
+    /// A typed wrapper's kernel is bound by image and entry: another image's
+    /// module, or another entry of the right image, is refused.
+    #[test]
+    fn entries_are_bound_to_their_image() {
+        let rms = cubin("rmsnorm");
+        check_entry(rms, "rmsnorm", Some("eidola_rmsnorm_bf16")).unwrap();
+        check_entry(rms, "rmsnorm", None).unwrap();
+        assert!(check_entry(rms, "rmsnorm", Some("eidola_embed")).is_err());
+        let ops = cubin("engine_ops");
+        assert!(ops.entry("eidola_embed").is_some());
+        assert!(check_entry(ops, "rmsnorm", Some("eidola_rmsnorm_bf16")).is_err());
+        assert!(check_entry(ops, "rmsnorm", None).is_err());
+        assert!(check_entry(rms, "engine_ops", Some("eidola_embed")).is_err());
+        // Each GEMM kind binds its own image only: both share a Params size,
+        // so the size check alone would not tell them apart.
+        use crate::gemm::GemmKind;
+        let kinds = [GemmKind::Fp8Blockwise, GemmKind::Bf16];
+        for kind in kinds {
+            let (image, entry) = kind.kernel();
+            check_entry(cubin(image), image, Some(entry)).unwrap();
+            for other in kinds.iter().filter(|&&k| k != kind) {
+                assert!(check_entry(cubin(other.kernel().0), image, Some(entry)).is_err());
+            }
+        }
+        // The images the module-taking wrappers require exist.
+        for image in [
+            crate::ops::RmsNorm::IMAGE,
+            "engine_ops",
+            "flashinfer_fa2_sink_paged",
+            "sampling",
+            "deepgemm_fp8_fp4_grouped",
+        ] {
+            check_entry(cubin(image), image, None).unwrap();
+        }
+        check_entry(
+            cubin(crate::ops::RmsNorm::IMAGE),
+            crate::ops::RmsNorm::IMAGE,
+            Some(crate::ops::RmsNorm::SYMBOL),
+        )
+        .unwrap();
     }
 }

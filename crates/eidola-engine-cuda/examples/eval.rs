@@ -5,9 +5,9 @@
 //! ```text
 //! eval render   <model_dir> <tasks.jsonl> <prompts.jsonl>
 //! eval generate <kernels_dir> <model_dir> <prompts.jsonl> <outputs.jsonl> <max_tokens>
-//! eval logprobs <kernels_dir> <model_dir> <prompts.jsonl> <out.jsonl> [--reference]
+//! eval logprobs <kernels_dir> <model_dir> <prompts.jsonl> <out.jsonl> [--reference] [--full <out.f32>]
 //! eval score    <model_dir> <tasks.jsonl> <outputs.jsonl>
-//! eval compare  <a.jsonl> <b.jsonl>
+//! eval compare  <a.jsonl> <b.jsonl> [--full <a.f32> <b.f32>] [--from <prompts.jsonl>]
 //! ```
 //!
 //! - `tasks.jsonl`: `{"id", "messages", "tools"?, "enable_thinking"?, "kind",
@@ -18,7 +18,16 @@
 //! - `outputs.jsonl`: `{"id", "output_ids"}` (greedy, stopped at EOS).
 //! - `logprobs`: per prompt, the 20 most likely next tokens at every position
 //!   with their log-probabilities over the sampleable vocabulary, from the GPU
-//!   executor or (`--reference`) the f32 reference forward.
+//!   executor or (`--reference`) the f32 reference forward. `--full` also
+//!   writes every position's whole log-probability row (little-endian f32,
+//!   sampleable vocabulary wide, prompts in order).
+//! - `compare`: top-1 agreement and top-20 overlap always. With both sides'
+//!   full rows (`--full`), KL(a ‖ b) itself. With only top-20 lists (another
+//!   engine's API), never KL but a labelled lower bound on it: the KL of both
+//!   distributions coarse-grained to the tokens both lists hold plus one
+//!   bucket for all other mass, which by the data-processing inequality can
+//!   only understate KL. `--from` restricts both to positions from each
+//!   prompt's `start` on. Ids and per-id position counts must match exactly.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -190,8 +199,8 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32) 
     write_jsonl(out, &out_rows);
 }
 
-/// Top-`TOP` (id, log-probability) of one logit row over `n` ids.
-fn top(row: &[f32], n: usize) -> Vec<(u32, f64)> {
+/// Log-probabilities of one logit row over its first `n` ids.
+fn log_softmax(row: &[f32], n: usize) -> Vec<f32> {
     let row = &row[..n];
     let max = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v)) as f64;
     let lse = max
@@ -200,18 +209,48 @@ fn top(row: &[f32], n: usize) -> Vec<(u32, f64)> {
             .map(|&v| (v as f64 - max).exp())
             .sum::<f64>()
             .ln();
-    let mut idx: Vec<u32> = (0..n as u32).collect();
-    idx.select_nth_unstable_by(TOP, |&a, &b| row[b as usize].total_cmp(&row[a as usize]));
-    idx.truncate(TOP);
-    idx.sort_by(|&a, &b| row[b as usize].total_cmp(&row[a as usize]).then(a.cmp(&b)));
-    idx.iter()
-        .map(|&i| (i, row[i as usize] as f64 - lse))
-        .collect()
+    row.iter().map(|&v| (v as f64 - lse) as f32).collect()
 }
 
-fn logprobs(kernels: &str, model: &str, prompts: &str, out: &str, reference: bool) {
+/// Top-`TOP` (id, log-probability) of one log-probability row.
+fn top(lp: &[f32]) -> Vec<(u32, f64)> {
+    let mut idx: Vec<u32> = (0..lp.len() as u32).collect();
+    idx.select_nth_unstable_by(TOP, |&a, &b| lp[b as usize].total_cmp(&lp[a as usize]));
+    idx.truncate(TOP);
+    idx.sort_by(|&a, &b| lp[b as usize].total_cmp(&lp[a as usize]).then(a.cmp(&b)));
+    idx.iter().map(|&i| (i, lp[i as usize] as f64)).collect()
+}
+
+/// Writes rows' top lists, and their whole rows when `full` is open.
+struct LogprobSink {
+    full: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl LogprobSink {
+    fn row(&mut self, logits: &[f32], n: usize) -> Vec<(u32, f64)> {
+        let lp = log_softmax(logits, n);
+        if let Some(f) = &mut self.full {
+            for v in &lp {
+                f.write_all(&v.to_le_bytes()).unwrap();
+            }
+        }
+        top(&lp)
+    }
+}
+
+fn logprobs(
+    kernels: &str,
+    model: &str,
+    prompts: &str,
+    out: &str,
+    reference: bool,
+    full: Option<&str>,
+) {
     let rows = read_jsonl(prompts);
     let vocab = 152_576usize;
+    let mut sink = LogprobSink {
+        full: full.map(|p| std::io::BufWriter::new(std::fs::File::create(p).unwrap())),
+    };
     let mut result = Vec::new();
     if reference {
         let tok = MimoTokenizer::from_model_dir(Path::new(model)).unwrap();
@@ -236,7 +275,7 @@ fn logprobs(kernels: &str, model: &str, prompts: &str, out: &str, reference: boo
                 .unwrap();
             eprintln!("reference: {} positions in {:.1?}", p.len(), t0.elapsed());
             let tops: Vec<_> = (0..p.len())
-                .map(|i| top(f.logits.row(i), tok.vocab_size()))
+                .map(|i| sink.row(f.logits.row(i), tok.vocab_size()))
                 .collect();
             result.push(json!({"id": r["id"], "top": tops}));
         }
@@ -287,55 +326,171 @@ fn logprobs(kernels: &str, model: &str, prompts: &str, out: &str, reference: boo
             ex.execute(&step).unwrap();
             let all = ex.take_all_logits().unwrap();
             let tops: Vec<_> = (0..p.len())
-                .map(|i| top(&all[i * vocab..(i + 1) * vocab], n as usize))
+                .map(|i| sink.row(&all[i * vocab..(i + 1) * vocab], n as usize))
                 .collect();
             result.push(json!({"id": r["id"], "top": tops}));
         }
     }
     write_jsonl(out, &result);
+    if let Some(mut f) = sink.full {
+        f.flush().unwrap();
+    }
 }
 
-fn compare(a: &str, b: &str) {
+/// One position's top list.
+fn top_list(v: &Value) -> Vec<(u64, f64)> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e[0].as_u64().unwrap(), e[1].as_f64().unwrap()))
+        .collect()
+}
+
+/// A lower bound on KL(a ‖ b) from top lists alone: both distributions
+/// coarse-grained to the tokens both lists hold plus one bucket for all
+/// other mass. Coarse-graining never increases KL, so this never overstates
+/// it; a token in only one list contributes only through the bucket.
+fn kl_lower_bound(ta: &[(u64, f64)], tb: &[(u64, f64)]) -> f64 {
+    let lb: HashMap<u64, f64> = tb.iter().copied().collect();
+    let (mut kl, mut sa, mut sb) = (0f64, 0f64, 0f64);
+    for &(t, la) in ta {
+        if let Some(&lbt) = lb.get(&t) {
+            kl += la.exp() * (la - lbt);
+            sa += la.exp();
+            sb += lbt.exp();
+        }
+    }
+    let (ra, rb) = ((1.0 - sa).max(0.0), (1.0 - sb).max(f64::MIN_POSITIVE));
+    if ra > 0.0 {
+        kl += ra * (ra / rb).ln();
+    }
+    kl
+}
+
+/// Reads whole log-probability rows of `width` from a `--full` file.
+struct FullRows {
+    file: std::io::BufReader<std::fs::File>,
+    width: usize,
+}
+
+impl FullRows {
+    fn open(path: &str, rows: usize) -> FullRows {
+        let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let bytes = file.metadata().unwrap().len() as usize;
+        assert!(
+            rows > 0 && bytes.is_multiple_of(rows * 4),
+            "{path}: {bytes} bytes is not {rows} whole rows"
+        );
+        FullRows {
+            file: std::io::BufReader::new(file),
+            width: bytes / (rows * 4),
+        }
+    }
+
+    fn next(&mut self) -> Vec<f64> {
+        use std::io::Read;
+        let mut buf = vec![0u8; self.width * 4];
+        self.file.read_exact(&mut buf).unwrap();
+        buf.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c) as f64)
+            .collect()
+    }
+}
+
+fn compare(a: &str, b: &str, full: Option<(&str, &str)>, from: Option<&str>) {
     let (a, b) = (read_jsonl(a), read_jsonl(b));
-    let by_id: HashMap<String, &Value> = b.iter().map(|r| (r["id"].to_string(), r)).collect();
-    let (mut n, mut top1, mut kl_sum, mut kl_max) = (0usize, 0usize, 0f64, 0f64);
+    let key = |r: &Value| r["id"].to_string();
+    let by_id: HashMap<String, &Value> = b.iter().map(|r| (key(r), r)).collect();
+    assert_eq!(a.len(), b.len(), "the files hold different prompt sets");
+    let starts: HashMap<String, usize> = from.map_or_else(HashMap::new, |p| {
+        read_jsonl(p)
+            .iter()
+            .map(|r| (key(r), r["start"].as_u64().unwrap() as usize))
+            .collect()
+    });
+    // Every id in both files, with the same number of positions: a
+    // shortened side would otherwise drop out of every metric unseen.
+    let mut lens = Vec::with_capacity(a.len());
     for ra in &a {
-        let rb = by_id[&ra["id"].to_string()];
-        for (pa, pb) in ra["top"]
+        let rb = by_id
+            .get(&key(ra))
+            .unwrap_or_else(|| panic!("id {} is missing from b", key(ra)));
+        let (na, nb) = (
+            ra["top"].as_array().unwrap().len(),
+            rb["top"].as_array().unwrap().len(),
+        );
+        assert_eq!(na, nb, "id {}: {na} positions in a, {nb} in b", key(ra));
+        lens.push(na);
+    }
+    let total: usize = lens.iter().sum();
+    let mut full = full.map(|(fa, fb)| {
+        let (fa, fb) = (FullRows::open(fa, total), FullRows::open(fb, total));
+        assert_eq!(fa.width, fb.width, "full rows of different widths");
+        (fa, fb)
+    });
+    let (mut n, mut top1, mut overlap) = (0usize, 0usize, 0usize);
+    let (mut lb_sum, mut lb_max, mut kl_sum, mut kl_max) = (0f64, 0f64, 0f64, 0f64);
+    for ra in &a {
+        let rb = by_id[&key(ra)];
+        let start = if from.is_some() {
+            *starts
+                .get(&key(ra))
+                .unwrap_or_else(|| panic!("id {} has no start", key(ra)))
+        } else {
+            0
+        };
+        for (pos, (pa, pb)) in ra["top"]
             .as_array()
             .unwrap()
             .iter()
             .zip(rb["top"].as_array().unwrap())
+            .enumerate()
         {
-            let parse = |v: &Value| -> Vec<(u64, f64)> {
-                v.as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|e| (e[0].as_u64().unwrap(), e[1].as_f64().unwrap()))
-                    .collect()
-            };
-            let (ta, tb) = (parse(pa), parse(pb));
+            let rows = full.as_mut().map(|(fa, fb)| (fa.next(), fb.next()));
+            if pos < start {
+                continue;
+            }
+            let (ta, tb) = (top_list(pa), top_list(pb));
             n += 1;
             top1 += (ta[0].0 == tb[0].0) as usize;
-            // KL(a || b) over a's top tokens; a token missing from b's list is
-            // charged b's smallest listed log-probability (an upper bound on
-            // its true value, so this underestimates nothing it can see).
-            let floor = tb.last().unwrap().1;
-            let lb: HashMap<u64, f64> = tb.iter().copied().collect();
-            let kl: f64 = ta
+            overlap += ta
                 .iter()
-                .map(|&(t, la)| la.exp() * (la - lb.get(&t).copied().unwrap_or(floor)))
-                .sum();
-            kl_sum += kl;
-            kl_max = kl_max.max(kl);
+                .filter(|(t, _)| tb.iter().any(|(u, _)| u == t))
+                .count();
+            let lb = kl_lower_bound(&ta, &tb);
+            lb_sum += lb;
+            lb_max = lb_max.max(lb);
+            if let Some((la, lb)) = rows {
+                let kl: f64 = la
+                    .iter()
+                    .zip(&lb)
+                    .map(|(&x, &y)| {
+                        if x == f64::NEG_INFINITY {
+                            0.0
+                        } else {
+                            x.exp() * (x - y)
+                        }
+                    })
+                    .sum();
+                kl_sum += kl;
+                kl_max = kl_max.max(kl);
+            }
         }
     }
-    println!(
-        "positions {n}: top-1 {top1}/{n} ({:.2}%), top-{TOP} KL mean {:.3e} max {:.3e}",
-        100.0 * top1 as f64 / n as f64,
-        kl_sum / n as f64,
-        kl_max
+    let nf = n as f64;
+    print!(
+        "positions {n}: top-1 {top1}/{n} ({:.2}%), top-{TOP} overlap {:.2}%, KL lower bound (shared top-{TOP} + remainder) mean {:.3e} max {:.3e}",
+        100.0 * top1 as f64 / nf,
+        100.0 * overlap as f64 / (nf * TOP as f64),
+        lb_sum / nf,
+        lb_max
     );
+    if full.is_some() {
+        print!(", KL mean {:.3e} max {:.3e}", kl_sum / nf, kl_max);
+    }
+    println!();
 }
 
 fn number(s: &str) -> Option<f64> {
@@ -425,11 +580,12 @@ fn score(model: &str, tasks: &str, outputs: &str) {
                 let parsed = parse_complete(&content, &schemas);
                 let ok = match &t["expect"] {
                     Value::Null => parsed.calls.is_empty(),
-                    e => parsed.calls.first().is_some_and(|(name, args)| {
-                        name == e["name"].as_str().unwrap()
+                    // Exactly the one expected call: a further call would
+                    // run an unintended tool.
+                    e => matches!(&parsed.calls[..], [(name, args)]
+                        if name == e["name"].as_str().unwrap()
                             && serde_json::from_str::<Value>(args)
-                                .is_ok_and(|a| values_match(&e["arguments"], &a))
-                    }),
+                                .is_ok_and(|a| values_match(&e["arguments"], &a))),
                 };
                 tool_ok += ok as usize;
                 println!(
@@ -447,6 +603,18 @@ fn score(model: &str, tasks: &str, outputs: &str) {
     );
 }
 
+/// The `count` values after `name` in `args`, if it is there.
+fn flag<'a>(args: &'a [String], name: &str, count: usize) -> Option<Vec<&'a str>> {
+    let i = args.iter().position(|x| x == name)?;
+    let v: Vec<&str> = args[i + 1..]
+        .iter()
+        .take(count)
+        .map(String::as_str)
+        .collect();
+    assert_eq!(v.len(), count, "{name} takes {count} values");
+    Some(v)
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     match a.get(1).map(String::as_str) {
@@ -457,10 +625,16 @@ fn main() {
             &a[3],
             &a[4],
             &a[5],
-            a.get(6).map(String::as_str) == Some("--reference"),
+            a[6..].iter().any(|x| x == "--reference"),
+            flag(&a[6..], "--full", 1).map(|v| v[0]),
         ),
         Some("score") => score(&a[2], &a[3], &a[4]),
-        Some("compare") => compare(&a[2], &a[3]),
+        Some("compare") => compare(
+            &a[2],
+            &a[3],
+            flag(&a[4..], "--full", 2).map(|v| (v[0], v[1])),
+            flag(&a[4..], "--from", 1).map(|v| v[0]),
+        ),
         _ => eprintln!("usage: see the module docs"),
     }
 }
