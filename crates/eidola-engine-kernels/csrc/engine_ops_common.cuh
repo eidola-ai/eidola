@@ -1,8 +1,8 @@
 // Helpers shared by the executor's own kernels (engine_ops.cu) and the
 // reference kernels the GPU tests compare them against
-// (engine_ops_reference.cu): conversions, warp reductions, the UE8M0 recipe
-// and the packed scale layout. Internal linkage, as in a single translation
-// unit.
+// (engine_ops_reference.cu): conversions, warp reductions, the UE8M0 recipe,
+// the packed scale layout, and the fused-QKV kernel's parameter struct.
+// Internal linkage, as in a single translation unit.
 #pragma once
 
 #include <cuda_bf16.h>
@@ -74,3 +74,21 @@ __device__ __forceinline__ size_t sfa_index(uint32_t r, uint32_t w, uint32_t wor
 }
 
 }  // namespace
+
+// eidola_qkv_rope_kv's parameters (see engine_ops.cu).
+struct EidolaQkvArgs {
+  const uint16_t* qkv;
+  uint16_t* q_out;  // [T][num_q_heads][192]
+  uint16_t* pool;
+  const uint32_t* positions;  // RoPE position per token
+  const uint32_t* kv_block;
+  const uint32_t* kv_slot;  // position within the block
+  const float* rope;
+  uint64_t block_elems;
+  uint64_t k_off;
+  uint64_t v_off;
+  uint32_t chunk_stride;
+  uint32_t chunks;
+  uint32_t q_heads_per_chunk;
+  uint32_t kv_heads_per_chunk;
+};

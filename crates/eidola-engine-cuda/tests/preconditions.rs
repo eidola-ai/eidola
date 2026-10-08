@@ -64,12 +64,39 @@ fn out_of_range_launches_are_refused() {
             "hidden past the staged row"
         );
         assert!(
+            ops.router_topk(gpu, 0, 0, 0, 0, 0, 1, 4000, 256, 8, 1.0)
+                .is_err(),
+            "hidden not whole chunks"
+        );
+        assert!(
+            ops.router_topk(gpu, 0, 0, 8, 0, 0, 1, 4096, 256, 8, 1.0)
+                .is_err(),
+            "rows unaligned"
+        );
+        assert!(
+            ops.router_topk(gpu, 0, 0, 0, 8, 0, 64, 4096, 256, 8, 1.0)
+                .is_err(),
+            "weights unaligned"
+        );
+        assert!(
             ops.moe_permute(gpu, 0, 0, 0, 200, 8, 128, 0).is_err(),
             "masked capacity"
         );
         assert!(
             ops.moe_combine(gpu, 0, 0, 0, 0, 1, 4096, 0).is_err(),
             "top_k 0"
+        );
+        assert!(
+            ops.moe_combine(gpu, 0, 0, 0, 0, 1, 4000, 8).is_err(),
+            "hidden not whole pieces"
+        );
+        assert!(
+            ops.moe_combine(gpu, 8, 0, 0, 0, 1, 4096, 8).is_err(),
+            "output unaligned"
+        );
+        assert!(
+            ops.moe_combine(gpu, 0, 8, 0, 0, 1, 4096, 8).is_err(),
+            "expert rows unaligned"
         );
         assert!(
             ops.rmsnorm(gpu, 0, 0, 0, 100, 0, 4096, 1e-6, 1).is_err(),

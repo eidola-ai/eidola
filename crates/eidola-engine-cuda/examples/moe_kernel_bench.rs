@@ -1,7 +1,7 @@
-//! Per-launch device time of the expert path's router, gather and SwiGLU
-//! kernels against their single-block reference forms
-//! (`engine_ops_reference.cu`), at Flash's shapes on synthetic data, per token
-//! count. No checkpoint needed.
+//! Per-launch device time of the expert path's kernels (the router in both
+//! forms, gather, SwiGLU, combine) and the fused-QKV RoPE + KV write against
+//! their single-block reference forms (`engine_ops_reference.cu`), at Flash's
+//! shapes on synthetic data, per token count. No checkpoint needed.
 //!
 //! ```text
 //! moe_kernel_bench <kernels_dir> [--iters N] [--tokens 1,2,4,...]
@@ -11,13 +11,16 @@
 //! long-running launch, so the device runs them back to back whatever the
 //! host's launch rate, and divides the time between two events around them.
 //! The expert layout is the executor's for that token count (masked up to 128
-//! tokens, contiguous above), placed from the router's own selection. Prints a
-//! table and one JSON line per kernel and token count
-//! (`{"kernel", "tokens", "new_us", "reference_us"}`).
+//! tokens, contiguous above), placed from the router's own selection. The
+//! router is timed in both forms at every token count (`router/token`,
+//! `router/tiled`), with the form the executor picks marked `*`: the data
+//! `ROUTER_PER_TOKEN_MAX` is chosen from. `qkv` is a sliding layer's (two KV
+//! heads per chunk). Prints a table and one JSON line per kernel and token
+//! count (`{"kernel", "tokens", "new_us", "reference_us", "executor"}`).
 
 use cudarc::driver::sys::CUevent_flags;
 use eidola_engine_cuda::bf16;
-use eidola_engine_cuda::engine_ops::EngineOps;
+use eidola_engine_cuda::engine_ops::{EngineOps, QkvArgs, RouterForm};
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::{Gpu, KernelDir, KernelModule};
 
@@ -30,6 +33,12 @@ const BLOCK_M: u32 = 128;
 /// Tokens of the launch that keeps the device busy while the timed launches
 /// are enqueued (the reference router at this size runs for milliseconds).
 const HEAD_START_TOKENS: u32 = 4096;
+/// A sliding layer's fused QKV: 4 chunks of 16 Q and 2 KV heads.
+const QKV_CHUNKS: u32 = 4;
+const QKV_Q_HEADS: u32 = 16;
+const QKV_KV_HEADS: u32 = 2;
+const QKV_STRIDE: u32 = 3712;
+const KV_BLOCK: u32 = 16;
 
 struct Lcg(u64);
 
@@ -102,6 +111,8 @@ fn main() {
     let ref_swiglu = reference
         .kernel("eidola_reference_swiglu_quant_fp8_ue8m0")
         .unwrap();
+    let ref_combine = reference.kernel("eidola_reference_moe_combine").unwrap();
+    let ref_qkv = reference.kernel("eidola_reference_qkv_rope_kv").unwrap();
     let s = gpu.stream();
 
     let max_tokens = token_counts
@@ -149,7 +160,7 @@ fn main() {
     };
 
     println!(
-        "{:>6} {:>8} {:>12} {:>14} {:>8}",
+        "{:>6} {:>13} {:>12} {:>14} {:>8}",
         "tokens", "kernel", "new us", "reference us", "speedup"
     );
     let mut json = Vec::new();
@@ -165,21 +176,28 @@ fn main() {
             )
         };
         let rows4 = rows.div_ceil(4) * 4;
-        let mut report = |kernel: &str, new_us: f64, ref_us: f64| {
+        let mut report = |kernel: &str, executor: bool, new_us: f64, ref_us: f64| {
+            let mark = if executor { "*" } else { " " };
             println!(
-                "{t:>6} {kernel:>8} {new_us:>12.2} {ref_us:>14.2} {:>7.1}x",
+                "{t:>6} {kernel:>12}{mark} {new_us:>12.2} {ref_us:>14.2} {:>7.1}x",
                 ref_us / new_us
             );
             json.push(format!(
-                "{{\"kernel\":\"{kernel}\",\"tokens\":{t},\"new_us\":{new_us:.3},\"reference_us\":{ref_us:.3}}}"
+                "{{\"kernel\":\"{kernel}\",\"tokens\":{t},\"new_us\":{new_us:.3},\"reference_us\":{ref_us:.3},\"executor\":{executor}}}"
             ));
         };
 
-        // Router.
-        let new = time_us(&gpu, iters, &head_start, &|| unsafe {
-            ops.router_topk(&gpu, pid, pw, px, prw, pb, t, HIDDEN, EXPERTS, TOP_K, 1.0)
+        // Router, both forms.
+        let router = |form: RouterForm| {
+            time_us(&gpu, iters, &head_start, &|| unsafe {
+                ops.router_topk_form(
+                    &gpu, form, pid, pw, px, prw, pb, t, HIDDEN, EXPERTS, TOP_K, 1.0,
+                )
                 .unwrap();
-        });
+            })
+        };
+        let per_token = router(RouterForm::PerToken);
+        let tiled = router(RouterForm::Tiled);
         let old = time_us(&gpu, iters, &head_start, &|| unsafe {
             eidola_engine_cuda::launch!(
                 gpu,
@@ -197,7 +215,14 @@ fn main() {
             )
             .unwrap();
         });
-        report("router", new, old);
+        let chosen = RouterForm::for_tokens(t);
+        report(
+            "router/token",
+            chosen == RouterForm::PerToken,
+            per_token,
+            old,
+        );
+        report("router/tiled", chosen == RouterForm::Tiled, tiled, old);
 
         // The layout from this selection.
         unsafe {
@@ -254,7 +279,7 @@ fn main() {
             )
             .unwrap();
         });
-        report("gather", new, old);
+        report("gather", true, new, old);
 
         // SwiGLU.
         let gu = s
@@ -283,7 +308,78 @@ fn main() {
             )
             .unwrap();
         });
-        report("swiglu", new, old);
+        report("swiglu", true, new, old);
+
+        // Combine, over the down projection's rows.
+        let edown = s
+            .alloc_zeros::<u16>(usize_of(rows) * usize_of(HIDDEN))
+            .unwrap();
+        let out = s.alloc_zeros::<f32>(usize_of(t * HIDDEN)).unwrap();
+        let (pedown, pout) = (dptr(&edown, s), dptr(&out, s));
+        let new = time_us(&gpu, iters, &head_start, &|| unsafe {
+            ops.moe_combine(&gpu, pout, pedown, prow_of, pw, t, HIDDEN, TOP_K)
+                .unwrap();
+        });
+        let old = time_us(&gpu, iters, &head_start, &|| unsafe {
+            eidola_engine_cuda::launch!(
+                gpu,
+                ref_combine,
+                [t, 1, 1],
+                pout,
+                pedown,
+                prow_of,
+                pw,
+                HIDDEN,
+                TOP_K
+            )
+            .unwrap();
+        });
+        report("combine", true, new, old);
+
+        // Fused QKV RoPE + KV write: token i at block 1 + i / 16, slot i % 16.
+        let nkv = QKV_CHUNKS * QKV_KV_HEADS;
+        let block_elems = u64::from(KV_BLOCK * nkv * (192 + 128));
+        let qkv = s
+            .alloc_zeros::<u16>(usize_of(t * QKV_CHUNKS * QKV_STRIDE))
+            .unwrap();
+        let q = s
+            .alloc_zeros::<u16>(usize_of(t * QKV_CHUNKS * QKV_Q_HEADS * 192))
+            .unwrap();
+        let blocks = t.div_ceil(KV_BLOCK) + 1;
+        let pool = s
+            .alloc_zeros::<u16>(usize_of(blocks) * usize::try_from(block_elems).unwrap())
+            .unwrap();
+        let rope = s.alloc_zeros::<f32>(usize_of(t * 64)).unwrap();
+        let positions = s.clone_htod(&(0..t).collect::<Vec<u32>>()).unwrap();
+        let kv_block = s
+            .clone_htod(&(0..t).map(|i| 1 + i / KV_BLOCK).collect::<Vec<u32>>())
+            .unwrap();
+        let kv_slot = s
+            .clone_htod(&(0..t).map(|i| i % KV_BLOCK).collect::<Vec<u32>>())
+            .unwrap();
+        let args = QkvArgs {
+            qkv: dptr(&qkv, s),
+            q_out: dptr(&q, s),
+            pool: dptr(&pool, s),
+            positions: dptr(&positions, s),
+            kv_block: dptr(&kv_block, s),
+            kv_slot: dptr(&kv_slot, s),
+            rope: dptr(&rope, s),
+            block_elems,
+            k_off: 0,
+            v_off: u64::from(KV_BLOCK * nkv * 192),
+            chunk_stride: QKV_STRIDE,
+            chunks: QKV_CHUNKS,
+            q_heads_per_chunk: QKV_Q_HEADS,
+            kv_heads_per_chunk: QKV_KV_HEADS,
+        };
+        let new = time_us(&gpu, iters, &head_start, &|| unsafe {
+            ops.qkv_rope_kv(&gpu, args, t).unwrap();
+        });
+        let old = time_us(&gpu, iters, &head_start, &|| unsafe {
+            eidola_engine_cuda::launch!(gpu, ref_qkv, [t, 1, 1], args).unwrap();
+        });
+        report("qkv", true, new, old);
     }
     println!();
     for line in json {
