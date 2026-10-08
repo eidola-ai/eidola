@@ -355,6 +355,187 @@ fn sliding_window_hits_require_the_window() {
     assert_eq!(h.outputs[&2], h.expected(&diverging, &g, 4, &[]));
 }
 
+/// A shared prefix (a system prompt) under one key, followed by a different turn each
+/// time: tails that differ from their first token.
+fn branching_prompts(rng: &mut TestRng, prefix: &[u32], n: usize) -> Vec<Vec<u32>> {
+    (0..n)
+        .map(|i| {
+            let mut t = prefix.to_vec();
+            t.push(i as u32);
+            t.extend(rng.tokens(8, 32));
+            t
+        })
+        .collect()
+}
+
+/// Requests that share a long prefix under one key and then diverge hit at the branch:
+/// the first divergent request finds the prefix's full-attention blocks but no window
+/// there and recomputes, keeping the window it computes at the divergence, and every
+/// later one hits. Other keys and private requests never hit it.
+#[test]
+fn divergent_turns_after_a_shared_prefix_hit_at_the_branch() {
+    for spec_on in [false, true] {
+        let mut h = Harness::new(small_spec(512), sched(spec_on), MockConfig::default());
+        let mut rng = TestRng(20);
+        // Ten blocks: several sliding windows (6) and drafter windows (10).
+        let prefix = rng.tokens(40, 32);
+        let prompts = branching_prompts(&mut rng, &prefix, 6);
+        let g = SamplingParams::greedy();
+        let mut id = 0;
+        let mut run = |h: &mut Harness, prompt: &[u32], cache: CacheScope| {
+            id += 1;
+            h.submit(request(id, prompt.to_vec(), g, 4, cache));
+            h.step();
+            let cached = h.eng.cached_prompt_tokens(id).unwrap();
+            h.run();
+            assert_eq!(
+                h.outputs[&id],
+                h.expected(prompt, &g, 4, &[]),
+                "request {id}"
+            );
+            cached
+        };
+        let hits: Vec<u32> = prompts
+            .iter()
+            .map(|p| run(&mut h, p, CacheScope::Keyed(salt(1))))
+            .collect();
+        assert_eq!(hits, [0, 0, 40, 40, 40, 40], "speculative {spec_on}");
+        // Another key sees none of it, and builds its own branch the same way.
+        let hits: Vec<u32> = prompts[..3]
+            .iter()
+            .map(|p| run(&mut h, p, CacheScope::Keyed(salt(2))))
+            .collect();
+        assert_eq!(hits, [0, 0, 40]);
+        assert_eq!(run(&mut h, &prompts[3], CacheScope::Private), 0);
+        assert_eq!(run(&mut h, &prompts[3], CacheScope::Private), 0);
+    }
+}
+
+/// The branch window is attached as soon as the branching request seals the boundary, so
+/// a request arriving while it is still decoding already hits there.
+#[test]
+fn a_branch_serves_requests_that_arrive_while_it_runs() {
+    let mut h = Harness::new(small_spec(512), sched(false), MockConfig::default());
+    let mut rng = TestRng(21);
+    let prefix = rng.tokens(40, 32);
+    let prompts = branching_prompts(&mut rng, &prefix, 3);
+    let g = SamplingParams::greedy();
+    let key = || CacheScope::Keyed(salt(1));
+    h.submit(request(1, prompts[0].clone(), g, 4, key()));
+    h.run();
+    h.submit(request(2, prompts[1].clone(), g, 60, key()));
+    h.step();
+    h.now += 1;
+    assert_eq!(h.eng.cached_prompt_tokens(2), Some(0));
+    h.submit(request(3, prompts[2].clone(), g, 4, key()));
+    h.step();
+    h.now += 1;
+    assert!(
+        !h.finished.contains_key(&2),
+        "the branching request is still running"
+    );
+    assert_eq!(h.eng.cached_prompt_tokens(3), Some(40));
+    h.run();
+    assert_eq!(h.outputs[&2], h.expected(&prompts[1], &g, 60, &[]));
+    assert_eq!(h.outputs[&3], h.expected(&prompts[2], &g, 4, &[]));
+}
+
+/// Branch windows are ordinary cache blocks: they expire with their entries on the idle
+/// TTL and are zeroed exactly like the rest, and an expired branch is never hit.
+#[test]
+fn branch_windows_expire_and_are_zeroed_like_any_entry() {
+    let mut cfg = sched(false);
+    cfg.sweep_interval_ms = u64::MAX;
+    let ttl = cfg.cache.idle_ttl_ms;
+    let mut h = Harness::new(small_spec(512), cfg, MockConfig::default());
+    let mut rng = TestRng(22);
+    let prefix = rng.tokens(40, 32);
+    let prompts = branching_prompts(&mut rng, &prefix, 4);
+    let g = SamplingParams::greedy();
+    for (i, p) in prompts[..2].iter().enumerate() {
+        h.submit(request(
+            i as u64,
+            p.clone(),
+            g,
+            4,
+            CacheScope::Keyed(salt(1)),
+        ));
+        h.run();
+    }
+    h.eng.sweep(h.now).unwrap();
+    let cached = h.eng.kv().cache_blocks();
+    // Each request keeps its regeneration (block 12) and continuation (block 13) windows:
+    // blocks 10..13 of the sliding group (window 6) and 9..13 of the drafter group
+    // (window 10), where block 9 is the shared prefix's, held once. The second also keeps
+    // the branch at block 10 on the shared entries: blocks 8..10 and 7..10, of which only
+    // 7 and 8 of the drafter group were not already held.
+    let count = |g: u32| cached.iter().filter(|(gr, _)| *gr == g).count();
+    assert_eq!((count(1), count(2)), (3 + 3 + 2, 4 + 3 + 2));
+    let finished_at = h.now - 1;
+    let mark = h.eng.executor().zero_log().len();
+    h.eng.sweep(finished_at + ttl).unwrap();
+    assert_eq!(
+        zeros_since(&h, mark),
+        cached,
+        "exactly the cached blocks are zeroed"
+    );
+    assert_eq!(h.eng.kv().cache_entries(), 0);
+    for (gr, b) in cached {
+        assert!(h.eng.executor().block_is_zero(gr, b));
+    }
+    h.now = finished_at + ttl;
+    h.submit(request(
+        9,
+        prompts[2].clone(),
+        g,
+        4,
+        CacheScope::Keyed(salt(1)),
+    ));
+    h.step();
+    assert_eq!(h.eng.cached_prompt_tokens(9), Some(0));
+    h.run();
+    assert_eq!(h.outputs[&9], h.expected(&prompts[2], &g, 4, &[]));
+    h.check();
+}
+
+/// Branch retention lives in the same pools as everything else: with room for little
+/// more than one request, a stream of divergent turns keeps hitting at the branch while
+/// older entries are evicted, and a request needing nearly the whole pool still runs.
+#[test]
+fn branch_retention_stays_within_the_pool() {
+    // 29 allocatable blocks per group; one request needs 14 in the full group.
+    let mut h = Harness::new(small_spec(30), sched(false), MockConfig::default());
+    let mut rng = TestRng(23);
+    let prefix = rng.tokens(40, 32);
+    let prompts = branching_prompts(&mut rng, &prefix, 12);
+    let g = SamplingParams::greedy();
+    let mut hits = Vec::new();
+    for (i, p) in prompts.iter().enumerate() {
+        h.submit(request(
+            i as u64,
+            p.clone(),
+            g,
+            4,
+            CacheScope::Keyed(salt(1)),
+        ));
+        h.step();
+        hits.push(h.eng.cached_prompt_tokens(i as u64).unwrap());
+        h.run();
+        assert_eq!(h.outputs[&(i as u64)], h.expected(p, &g, 4, &[]));
+    }
+    assert_eq!(hits[..2], [0, 0]);
+    assert!(hits[2..].iter().all(|&c| c == 40), "{hits:?}");
+    assert_eq!(h.eng.stats().preemptions, 0);
+    // 108 prompt tokens plus 3 decoded positions: 28 blocks per group.
+    let big = rng.tokens(108, 32);
+    h.submit(request(100, big.clone(), g, 4, CacheScope::Private));
+    h.run();
+    assert_eq!(h.outputs[&100], h.expected(&big, &g, 4, &[]));
+    h.eng.sweep(h.now + 100 * 3_600_000).unwrap();
+    assert_eq!(h.eng.kv().cache_entries(), 0);
+    h.check();
+}
+
 fn zeros_since(h: &Harness, mark: usize) -> BTreeSet<(u32, u32)> {
     h.eng.executor().zero_log()[mark..]
         .iter()
@@ -1092,11 +1273,11 @@ fn tight_sliding_spec() -> eidola_engine::spec::ModelSpec {
     spec
 }
 
-/// With caching off, no regeneration pins are taken: nothing could ever attach them to a
-/// cache entry, and holding the prompt's window would stop the sliding groups recycling
-/// (a five-token prompt used to end with `Length` once decoding needed a fourth block).
+/// With caching off, no regeneration window is retained: nothing could ever hit it, and
+/// holding the prompt's window would stop the sliding groups recycling (a five-token
+/// prompt used to end with `Length` once decoding needed a fourth block).
 #[test]
-fn no_regeneration_pins_without_caching() {
+fn no_regeneration_retention_without_caching() {
     let mut cfg = sched(false);
     cfg.cache.enabled = false;
     let mut h = Harness::new(tight_sliding_spec(), cfg, MockConfig::default());
@@ -1111,8 +1292,9 @@ fn no_regeneration_pins_without_caching() {
 /// `Length` means the sequence cannot make its minimum progress even holding every
 /// reclaimable block. Under the tight sliding geometry, before concluding that the
 /// scheduler sheds drafts, then the prefill chunk (down to one block), then the
-/// sequence's own regeneration pins. Each case used to end with `Length` early (the
-/// 8-token prompt with no output at all).
+/// sequence's own branch and regeneration retention (the windows it attached to cache
+/// entries, which only its own release would otherwise give back). Each case used to end
+/// with `Length` early (the 8-token prompt with no output at all).
 #[test]
 fn optional_reservations_are_shed_before_length() {
     let greedy = SamplingParams::greedy();
@@ -1120,14 +1302,21 @@ fn optional_reservations_are_shed_before_length() {
         for (prompt, chunk) in [
             // Needs the prefill chunk cut: 8 tokens at once is four sliding blocks.
             (vec![1u32, 2, 3, 4, 5, 6, 7, 8], 8),
-            // Needs the regeneration pins dropped (caching on): the prompt's window
-            // stays pinned behind the sliding window once decoding moves on.
+            // Needs the regeneration retention given back (keyed, caching on): the
+            // prompt's window stays attached behind the sliding window once decoding
+            // moves on.
             (vec![1u32, 2, 3, 4, 5], 2),
         ] {
             let mut cfg = sched(spec_on);
             cfg.max_prefill_chunk = chunk;
             let mut h = Harness::new(tight_sliding_spec(), cfg, MockConfig::default());
-            h.submit(request(1, prompt.clone(), greedy, 8, CacheScope::Private));
+            h.submit(request(
+                1,
+                prompt.clone(),
+                greedy,
+                8,
+                CacheScope::Keyed(salt(1)),
+            ));
             h.run();
             assert_eq!(
                 h.outputs[&1],
