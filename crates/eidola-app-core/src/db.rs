@@ -1331,14 +1331,31 @@ fn opt_str(v: Option<&str>) -> Value {
 // Layer 1 — Transport: prefix-cache keys
 // ---------------------------------------------------------------------------
 
+/// A key handed to one request, and what is needed to record that the request
+/// left with it ([`record_cache_key_use`]).
+pub(crate) struct ClaimedCacheKey {
+    pub key: crate::prefix_cache::CacheKey,
+    /// The key's place in its lineage's sequence of keys.
+    pub generation: i64,
+    /// When this request was attempted, by the rotation rule's clock.
+    pub attempt_at: i64,
+}
+
 /// Hand one request its lineage's prefix-cache key: the stored key when the
 /// rotation rule keeps it ([`crate::prefix_cache::decide`]), a freshly minted
-/// one otherwise — and stamp the use either way.
+/// one otherwise.
 ///
 /// **A lineage is `(space_id, participant_id)`**: one participant answering in
 /// one space, on whatever branch and whether replying or regenerating. The key
-/// row carries the `model` it was minted for, so a participant whose model
-/// changes starts a new key.
+/// row carries the `model` and the `trust_domain` it was minted under, so a
+/// participant whose model changes, or a client pointed at another endpoint or
+/// trust bundle, starts a new key.
+///
+/// **Claiming is not using.** A reused key's `last_used_at` is not advanced
+/// here: the request may yet fail before anything leaves this machine, and a
+/// use recorded for it would renew idleness nobody observed. The caller records
+/// the use once the attempt's fate is known ([`record_cache_key_use`]). A fresh
+/// key is born with `last_used_at = created_at`, the attempt time.
 ///
 /// Decided at the write, in one `BEGIN IMMEDIATE`: two turns of one lineage
 /// racing each other (a regeneration beside a reply, a driven turn beside a
@@ -1352,14 +1369,17 @@ pub(crate) async fn claim_prefix_cache_key(
     space_id: &str,
     participant_id: &str,
     model: &str,
-    policy: &crate::prefix_cache::PromptCachePolicy,
+    scope: &crate::prefix_cache::CacheScope,
     now: i64,
-) -> Result<Option<crate::prefix_cache::CacheKey>, AppError> {
+) -> Result<Option<ClaimedCacheKey>, AppError> {
     begin_write(conn).await?;
-    match claim_prefix_cache_key_body(conn, space_id, participant_id, model, policy, now).await {
-        Ok(key) => {
+    match claim_prefix_cache_key_body(conn, space_id, participant_id, model, scope, now).await {
+        Ok((claimed, replaced)) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
-            Ok(key)
+            if replaced {
+                truncate_log_after_forgetting_keys(conn).await;
+            }
+            Ok(claimed)
         }
         Err(e) => {
             // Best-effort rollback; propagate the original error regardless.
@@ -1374,9 +1394,9 @@ async fn claim_prefix_cache_key_body(
     space_id: &str,
     participant_id: &str,
     model: &str,
-    policy: &crate::prefix_cache::PromptCachePolicy,
+    scope: &crate::prefix_cache::CacheScope,
     now: i64,
-) -> Result<Option<crate::prefix_cache::CacheKey>, AppError> {
+) -> Result<(Option<ClaimedCacheKey>, bool), AppError> {
     use crate::prefix_cache::{CacheKey, Claim, StoredKeyAge, decide, mint};
     use eidola_common::engine_protocol::CACHE_KEY_BYTES;
     use zeroize::Zeroizing;
@@ -1387,61 +1407,293 @@ async fn claim_prefix_cache_key_body(
     );
     let mut rows = conn
         .query(
-            "SELECT model, created_at, last_used_at, key_bytes FROM prefix_cache_key \
-             WHERE space_id = ?1 AND participant_id = ?2",
+            &format!(
+                "SELECT model, trust_domain, created_at, last_used_at, generation, key_bytes \
+                 FROM prefix_cache_key WHERE {LINEAGE_IS}"
+            ),
             lineage.clone(),
         )
         .await
         .map_err(AppError::db)?;
-    let mut stored: Option<(StoredKeyAge, Zeroizing<Vec<u8>>)> = None;
+    let mut stored: Option<(StoredKeyAge, i64, Zeroizing<Vec<u8>>)> = None;
     if let Some(row) = rows.next().await.map_err(AppError::db)? {
         let age = StoredKeyAge {
             model: row.get::<String>(0).map_err(AppError::db)?,
-            created_at: row.get::<i64>(1).map_err(AppError::db)?,
-            last_used_at: row.get::<i64>(2).map_err(AppError::db)?,
+            trust_domain: row.get::<String>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+            last_used_at: row.get::<i64>(3).map_err(AppError::db)?,
         };
-        let bytes = Zeroizing::new(row.get::<Vec<u8>>(3).map_err(AppError::db)?);
-        stored = Some((age, bytes));
+        let generation = row.get::<i64>(4).map_err(AppError::db)?;
+        let bytes = Zeroizing::new(row.get::<Vec<u8>>(5).map_err(AppError::db)?);
+        stored = Some((age, generation, bytes));
     }
     drop(rows);
 
-    if let Some((age, bytes)) = &stored
-        && decide(Some(age), model, policy, now) == Claim::Reuse
+    if let Some((age, generation, bytes)) = &stored
+        && decide(Some(age), model, &scope.trust_domain, &scope.policy, now) == Claim::Reuse
         && let Ok(bytes) = <&[u8; CACHE_KEY_BYTES]>::try_from(&bytes[..])
     {
-        conn.execute(
-            "UPDATE prefix_cache_key SET last_used_at = ?3 \
-             WHERE space_id = ?1 AND participant_id = ?2",
-            (lineage.0, lineage.1, Value::Integer(now)),
-        )
-        .await
-        .map_err(AppError::db)?;
-        return Ok(Some(CacheKey::from_bytes(bytes)));
+        return Ok((
+            Some(ClaimedCacheKey {
+                key: CacheKey::from_bytes(bytes),
+                generation: *generation,
+                attempt_at: now,
+            }),
+            false,
+        ));
     }
 
     let Some(fresh) = mint() else {
-        return Ok(None);
+        return Ok((None, false));
+    };
+    // **The retiring key is overwritten in place before it is replaced.** The
+    // upsert below rewrites the row's cell in place only when the new record
+    // is exactly as long as the old one; a different `model` changes the
+    // length, and turso then frees the old cell without clearing it, leaving
+    // the old key in the page's free space. Zeroing first is a same-length
+    // write, so it always lands on the old bytes, whatever follows.
+    let generation = match &stored {
+        Some((_, previous, _)) => {
+            scrub_cache_keys_where(conn, LINEAGE_IS, (lineage.0.clone(), lineage.1.clone()))
+                .await?;
+            previous.saturating_add(1)
+        }
+        None => 1,
     };
     // The parameter is a copy turso owns from here; the local one is scrubbed
     // when `fresh` drops.
     conn.execute(
         "INSERT INTO prefix_cache_key \
-             (space_id, participant_id, model, key_bytes, created_at, last_used_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+             (space_id, participant_id, model, trust_domain, generation, key_bytes, \
+              created_at, last_used_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
          ON CONFLICT (space_id, participant_id) DO UPDATE SET \
-             model = excluded.model, key_bytes = excluded.key_bytes, \
+             model = excluded.model, trust_domain = excluded.trust_domain, \
+             generation = excluded.generation, key_bytes = excluded.key_bytes, \
              created_at = excluded.created_at, last_used_at = excluded.last_used_at",
-        (
+        vec![
             lineage.0,
             lineage.1,
             Value::Text(model.to_string()),
+            Value::Text(scope.trust_domain.clone()),
+            Value::Integer(generation),
             Value::Blob(fresh.to_vec()),
             Value::Integer(now),
+        ],
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok((
+        Some(ClaimedCacheKey {
+            key: CacheKey::from_bytes(&fresh),
+            generation,
+            attempt_at: now,
+        }),
+        stored.is_some(),
+    ))
+}
+
+/// Record that a request may have left this machine with a lineage's key
+/// `generation`, attempted at `attempt_at`: advance `last_used_at` to it.
+///
+/// Called by the turn once the attempt's fate is known, and **only when the
+/// request may have been delivered** — a response arrived, or the connection
+/// failed after the request could have been sent. An attempt that failed
+/// before anything left (no connection, a refused handshake, a request that
+/// could not be built) records nothing, so it cannot renew the lineage's idle
+/// clock. The time recorded is the attempt's, not the answer's: earlier than
+/// any engine could have seen the request, so the rotation rule's idle
+/// measure stays at least the engine's. Scoped to the generation the request
+/// carried, so a use of a key that has since been rotated away touches
+/// nothing; never moves `last_used_at` backwards.
+pub(crate) async fn record_cache_key_use(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    generation: i64,
+    attempt_at: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        &format!(
+            "UPDATE prefix_cache_key SET last_used_at = ?4 \
+             WHERE {LINEAGE_IS} AND generation = ?3 AND last_used_at < ?4"
+        ),
+        (
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Integer(generation),
+            Value::Integer(attempt_at),
         ),
     )
     .await
     .map_err(AppError::db)?;
-    Ok(Some(CacheKey::from_bytes(&fresh)))
+    Ok(())
+}
+
+/// Every lineage holding a key, **without the key**: `(space, participant,
+/// generation, created_at, last_used_at)`. For tests of the key's lifecycle,
+/// which must observe the row and must not be handed the secret to do it.
+#[cfg(feature = "test-support")]
+pub(crate) async fn prefix_cache_lineages(
+    conn: &Connection,
+) -> Result<Vec<(String, String, i64, i64, i64)>, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT space_id, participant_id, generation, created_at, last_used_at \
+             FROM prefix_cache_key ORDER BY space_id, participant_id",
+            (),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<String>(1).map_err(AppError::db)?,
+            row.get::<i64>(2).map_err(AppError::db)?,
+            row.get::<i64>(3).map_err(AppError::db)?,
+            row.get::<i64>(4).map_err(AppError::db)?,
+        ));
+    }
+    Ok(out)
+}
+
+/// Forget every key minted under a trust domain other than `current`,
+/// overwritten before it goes — run when the eidola endpoint or trust bundle
+/// changes, so no key outlives the domain it was minted for even until its
+/// lineage's next claim would have rotated it. Returns how many were
+/// forgotten; the caller empties the log when any were
+/// ([`truncate_log_after_forgetting_keys`]).
+pub(crate) async fn forget_cache_keys_outside(
+    conn: &Connection,
+    current: &str,
+) -> Result<u64, AppError> {
+    begin_write(conn).await?;
+    let outcome = async {
+        scrub_cache_keys_where(
+            conn,
+            "trust_domain <> ?1",
+            (Value::Text(current.to_string()),),
+        )
+        .await?;
+        conn.execute(
+            "DELETE FROM prefix_cache_key WHERE trust_domain <> ?1",
+            (Value::Text(current.to_string()),),
+        )
+        .await
+        .map_err(AppError::db)
+    }
+    .await;
+    match outcome {
+        Ok(n) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            if n > 0 {
+                truncate_log_after_forgetting_keys(conn).await;
+            }
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+/// One lineage's row, by `?1` (space) and `?2` (participant).
+const LINEAGE_IS: &str = "space_id = ?1 AND participant_id = ?2";
+
+/// **A lineage that can no longer send.** Its space is archived (archival,
+/// retirement's notebook and rooms, a departing owner's delegations — every
+/// door that closes a space writes `archived_at`), its participant is retired
+/// or removed, or the participant is no longer a live member of the space (an
+/// owned participant struck, a referenced one left). No turn can be prepared
+/// for such a lineage — `prepare_turn` refuses an archived space and resolves
+/// only live members — so its key would sit on disk unsent.
+const UNSENDABLE_LINEAGE: &str = "space_id IN (SELECT id FROM space WHERE archived_at IS NOT NULL) \
+     OR participant_id IN (SELECT id FROM participant WHERE removed_at IS NOT NULL) \
+     OR NOT ( \
+         EXISTS (SELECT 1 FROM participant p \
+                 WHERE p.id = prefix_cache_key.participant_id \
+                   AND p.owner_space_id = prefix_cache_key.space_id) \
+         OR EXISTS (SELECT 1 FROM space_participant sp \
+                    WHERE sp.space_id = prefix_cache_key.space_id \
+                      AND sp.participant_id = prefix_cache_key.participant_id \
+                      AND sp.left_at IS NULL) \
+     )";
+
+/// Overwrite the stored key bytes of every row matching `predicate` with
+/// zeros, in place.
+///
+/// Same-length, so turso rewrites each cell where it lies
+/// (`BTreeCursor::overwrite_cell`'s in-place arm) rather than freeing it, and
+/// whatever follows — a replacement of another length, a delete, which frees
+/// cells **without clearing them** — can only leave zeros behind in the page.
+async fn scrub_cache_keys_where(
+    conn: &Connection,
+    predicate: &str,
+    params: impl turso::IntoParams,
+) -> Result<(), AppError> {
+    let sql = format!(
+        "UPDATE prefix_cache_key SET key_bytes = zeroblob({}) WHERE {predicate}",
+        eidola_common::engine_protocol::CACHE_KEY_BYTES
+    );
+    conn.execute(&sql, params).await.map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Fold the write-ahead log into the database file and empty it, after a key
+/// was replaced or deleted — best-effort, outside any transaction.
+///
+/// **The overwrite in [`scrub_cache_keys_where`] reaches the page, not its
+/// history.** turso keeps every committed version of a page as a frame in the
+/// `-wal` file, and has no `secure_delete`, so until the log is checkpointed
+/// and reset, frames from before the overwrite still hold the old key. A
+/// `TRUNCATE` checkpoint copies the current pages (zeros where the key was)
+/// into the database file and empties the log. It is attempted only on the
+/// rare writes that retire a key. If a reader holds the log it cannot complete
+/// now; the frames then go at the next checkpoint that empties the log, and the
+/// warning says so without naming any key.
+async fn truncate_log_after_forgetting_keys(conn: &Connection) {
+    let outcome = async {
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .map_err(AppError::db)?;
+        let busy = match rows.next().await.map_err(AppError::db)? {
+            Some(row) => row.get::<i64>(0).map_err(AppError::db)? != 0,
+            None => false,
+        };
+        Ok::<bool, AppError>(busy)
+    }
+    .await;
+    match outcome {
+        Ok(false) => {}
+        Ok(true) => eprintln!(
+            "warning: the database log could not be emptied after a prefix-cache key was retired; \
+             it will be at the next checkpoint"
+        ),
+        Err(e) => eprintln!(
+            "warning: the database log could not be emptied after a prefix-cache key was retired: {e}"
+        ),
+    }
+}
+
+/// Delete the key of every lineage that can no longer send
+/// ([`UNSENDABLE_LINEAGE`]), each overwritten before it goes.
+///
+/// Stated as the invariant rather than per door, and run inside the
+/// transaction of every write that can end a lineage — archival, retirement,
+/// a removal from a space — so a door added later that ends a lineage through
+/// one of those writes is covered without naming it here. Returns how many
+/// keys were forgotten.
+pub(crate) async fn forget_unsendable_cache_keys(conn: &Connection) -> Result<u64, AppError> {
+    scrub_cache_keys_where(conn, UNSENDABLE_LINEAGE, ()).await?;
+    conn.execute(
+        &format!("DELETE FROM prefix_cache_key WHERE {UNSENDABLE_LINEAGE}"),
+        (),
+    )
+    .await
+    .map_err(AppError::db)
 }
 
 // ---------------------------------------------------------------------------
@@ -1702,10 +1954,11 @@ pub async fn space_footprint_counts(
 /// leg. If that ever stopped being true the FK would abort this transaction
 /// and the space would be kept, which is the direction this whole feature errs
 /// in; deleting the rows to be safe would err the other way, taking a grant
-/// with a space nobody proved was empty. **`prefix_cache_key` is the same
-/// case** (it names the space and a participant): only a turn writes a key
-/// row, and a turn answers a post in its space, so a space holding one is
-/// refused by the first leg; it is not deleted either. The inbound edges of a
+/// with a space nobody proved was empty. **`prefix_cache_key`** (it names the
+/// space and a participant) is empty for anything reapable too — only a turn
+/// writes a key row, and a turn answers a post in its space — but unlike a
+/// grant a key is nothing anyone is owed, so its rows are scrubbed and
+/// deleted first rather than left to hold the space. The inbound edges of a
 /// space-owned `participant` are `action`, `memory_block` (both checked) and
 /// `prefix_cache_key` (empty, as above; `space_participant` /
 /// `space_template_participant` are CHECK-pinned to globals and
@@ -1744,7 +1997,11 @@ async fn discard_space_if_pristine_body(
         return Ok(false);
     }
 
+    // A pristine space has had no turn, so it has no key; the delete is the
+    // statement of that, and it is scrubbed first like every other.
+    scrub_cache_keys_where(conn, "space_id = ?1", (Value::Text(space_id.to_string()),)).await?;
     for stmt in [
+        "DELETE FROM prefix_cache_key WHERE space_id = ?1",
         "DELETE FROM space_participant WHERE space_id = ?1",
         "DELETE FROM participant WHERE scope = 'space' AND owner_space_id = ?1",
         "DELETE FROM space WHERE id = ?1",
@@ -3859,9 +4116,18 @@ pub(crate) async fn retire_participant_tx(
     now: i64,
 ) -> Result<Retirement, AppError> {
     begin_write(conn).await?;
-    match retire_participant_tx_body(conn, participant_id, now).await {
-        Ok(retirement) => {
+    match async {
+        let done = retire_participant_tx_body(conn, participant_id, now).await?;
+        let forgotten = forget_unsendable_cache_keys(conn).await?;
+        Ok((done, forgotten))
+    }
+    .await
+    {
+        Ok((retirement, forgotten)) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            if forgotten > 0 {
+                truncate_log_after_forgetting_keys(conn).await;
+            }
             Ok(retirement)
         }
         Err(e) => {
@@ -4609,9 +4875,18 @@ pub(crate) async fn remove_space_participant_tx(
     now: i64,
 ) -> Result<SpaceDeparture, AppError> {
     begin_write(conn).await?;
-    match remove_space_participant_tx_body(conn, space_id, participant_id, now).await {
-        Ok(outcome) => {
+    match async {
+        let done = remove_space_participant_tx_body(conn, space_id, participant_id, now).await?;
+        let forgotten = forget_unsendable_cache_keys(conn).await?;
+        Ok((done, forgotten))
+    }
+    .await
+    {
+        Ok((outcome, forgotten)) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            if forgotten > 0 {
+                truncate_log_after_forgetting_keys(conn).await;
+            }
             Ok(outcome)
         }
         Err(e) => {
@@ -8313,9 +8588,18 @@ pub(crate) async fn archive_space_tx(
     archived_at: i64,
 ) -> Result<Vec<String>, AppError> {
     begin_write(conn).await?;
-    match archive_space_tx_body(conn, space_id, archived_at).await {
-        Ok(archived) => {
+    match async {
+        let done = archive_space_tx_body(conn, space_id, archived_at).await?;
+        let forgotten = forget_unsendable_cache_keys(conn).await?;
+        Ok((done, forgotten))
+    }
+    .await
+    {
+        Ok((archived, forgotten)) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            if forgotten > 0 {
+                truncate_log_after_forgetting_keys(conn).await;
+            }
             Ok(archived)
         }
         Err(e) => {
@@ -9140,6 +9424,7 @@ pub async fn touch_proxy_key(conn: &Connection, id: &str, now: i64) -> Result<()
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /// REGRESSION: **the exposure write carries its own premise.**
@@ -9287,6 +9572,161 @@ mod tests {
     /// constraints only fire with `foreign_keys = ON`).
     async fn fk_conn(db: &Database) -> Connection {
         connect(db).await.unwrap()
+    }
+
+    fn cache_scope(domain: &str) -> crate::prefix_cache::CacheScope {
+        crate::prefix_cache::CacheScope {
+            policy: crate::prefix_cache::PromptCachePolicy {
+                idle_ttl_ms: 900_000,
+                max_age_ms: 7_200_000,
+            },
+            trust_domain: domain.to_string(),
+        }
+    }
+
+    async fn stored_key_bytes(conn: &Connection) -> Vec<Vec<u8>> {
+        let mut rows = conn
+            .query("SELECT key_bytes FROM prefix_cache_key", ())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push(row.get::<Vec<u8>>(0).unwrap());
+        }
+        out
+    }
+
+    /// **A key replaced by one of another record length leaves no copy in
+    /// the database's files.** A different model makes the row longer or
+    /// shorter, so turso moves the cell and frees the old one without
+    /// clearing it — and a *shorter* record is the case that leaves the old
+    /// bytes outside the new cell; the key is overwritten in place first, and the log that
+    /// held the page's history is emptied once the replacement commits.
+    #[tokio::test]
+    async fn a_key_replaced_across_a_model_change_leaves_no_copy_in_the_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database = open(dir.path()).await.expect("open");
+        let conn = fk_conn(&database).await;
+        initialize(&conn).await.unwrap();
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "s",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        let agent = list_space_owned_participants(&conn, "s").await.unwrap()[0]
+            .id
+            .clone();
+        let scope = cache_scope("d");
+        claim_prefix_cache_key(
+            &conn,
+            "s",
+            &agent,
+            // Long enough that the shorter record placed after it does not
+            // reach back over where the old key lay.
+            &"a-model-with-a-long-name/".repeat(8),
+            &scope,
+            10_000,
+        )
+        .await
+        .unwrap()
+        .expect("a key");
+        let old = stored_key_bytes(&conn).await.remove(0);
+        claim_prefix_cache_key(&conn, "s", &agent, "m", &scope, 10_001)
+            .await
+            .unwrap()
+            .expect("a new key for the new model");
+        let new = stored_key_bytes(&conn).await.remove(0);
+        assert_ne!(old, new);
+
+        let on_disk = |key: &[u8]| {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.is_file())
+                .any(|p| {
+                    std::fs::read(p)
+                        .unwrap()
+                        .windows(key.len())
+                        .any(|w| w == key)
+                })
+        };
+        assert!(
+            on_disk(&new),
+            "the live key is stored (the scan's baseline)"
+        );
+        assert!(
+            !on_disk(&old),
+            "the replaced key is in neither the database nor its log"
+        );
+    }
+
+    /// The reaper deletes a pristine space's key rows with it — there can be
+    /// none in practice (a key needs a turn, a turn a post), but if there were,
+    /// the space's foreign keys would otherwise keep it.
+    #[tokio::test]
+    async fn the_pristine_reaper_takes_a_spaces_keys_with_it() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "p",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        let agent = list_space_owned_participants(&conn, "p").await.unwrap()[0]
+            .id
+            .clone();
+        claim_prefix_cache_key(&conn, "p", &agent, "m", &cache_scope("d"), 10)
+            .await
+            .unwrap()
+            .expect("a key");
+        assert!(discard_space_if_pristine(&conn, "p").await.unwrap());
+        assert!(stored_key_bytes(&conn).await.is_empty());
+    }
+
+    /// The configuration hook's primitive: keys of every other trust domain go,
+    /// the current one's stay.
+    #[tokio::test]
+    async fn only_the_current_trust_domains_keys_survive_a_change() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        for space in ["a", "b"] {
+            instantiate_template(
+                &conn,
+                crate::config::DEFAULT_TEMPLATE_ID,
+                space,
+                None,
+                "unlinked",
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        let agent_a = list_space_owned_participants(&conn, "a").await.unwrap()[0]
+            .id
+            .clone();
+        let agent_b = list_space_owned_participants(&conn, "b").await.unwrap()[0]
+            .id
+            .clone();
+        claim_prefix_cache_key(&conn, "a", &agent_a, "m", &cache_scope("old"), 10)
+            .await
+            .unwrap();
+        claim_prefix_cache_key(&conn, "b", &agent_b, "m", &cache_scope("new"), 10)
+            .await
+            .unwrap();
+        assert_eq!(forget_cache_keys_outside(&conn, "new").await.unwrap(), 1);
+        let left = prefix_cache_lineages(&conn).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, "b");
     }
 
     async fn open_memory_migrated() -> Database {

@@ -14,9 +14,14 @@
 //!   ([`PromptCachePolicy::from_catalog`]); every other model gets no key and
 //!   a request body byte-for-byte the one it had before keys existed.
 //! - **Rotated before the cache it unlocks is gone** ([`decide`]): idle past
-//!   the engine's idle TTL, older than its maximum age, a different model, or a
-//!   clock that disagrees with itself. Rotation mints a fresh random key, so a
-//!   lineage's requests are linkable only within one key's window.
+//!   the engine's idle TTL, older than its maximum age, or a clock that
+//!   disagrees with itself. Rotation mints a fresh random key, so a lineage's
+//!   requests are linkable only within one key's window.
+//! - **Never carried across a boundary**: a key is bound to the model and to
+//!   the [`trust_domain`] — the eidola endpoint and trust bundle — it was minted
+//!   under, and a change of either mints a new one.
+//! - **Forgotten when it can no longer be sent**
+//!   ([`crate::db::forget_unsendable_cache_keys`]), overwritten before it goes.
 //!
 //! The key is secret on this side as on the server's: [`CacheKey`] prints
 //! redacted and scrubs its text on drop, and the bytes are scrubbed wherever
@@ -69,14 +74,62 @@ impl PromptCachePolicy {
     }
 }
 
+/// The digest naming the trust domain a key is minted under: the eidola
+/// backend's resolved base URL and its whole trust bundle (accepted
+/// measurements, hardware root and intermediate CA overrides).
+///
+/// A key is a linking identifier, so it must never be seen by two servers
+/// that answer to different trust: pointing the client at a dev stack and back
+/// (`just client-local` / `client-reset`), or at any other endpoint, would
+/// otherwise carry one secret into both and link the lineage across them.
+/// Domain-separated and length-prefixed, so no two bundles share a digest by
+/// concatenation.
+pub(crate) fn trust_domain(
+    base_url: &str,
+    measurements_json: &str,
+    hardware_root_ca: Option<&str>,
+    hardware_intermediate_ca: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"eidola/prefix-cache/trust-domain/v1");
+    for part in [
+        Some(base_url),
+        Some(measurements_json),
+        hardware_root_ca,
+        hardware_intermediate_ca,
+    ] {
+        match part {
+            Some(s) => {
+                h.update([1u8]);
+                h.update((s.len() as u64).to_be_bytes());
+                h.update(s.as_bytes());
+            }
+            None => h.update([0u8]),
+        }
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What a turn's requests may be keyed under: the model's retention and the
+/// trust domain this turn talks to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CacheScope {
+    pub policy: PromptCachePolicy,
+    pub trust_domain: String,
+}
+
 /// A lineage's stored key, minus the key: what [`decide`] judges it by.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredKeyAge {
     /// The model the key was minted for.
     pub model: String,
+    /// The [`trust_domain`] the key was minted under.
+    pub trust_domain: String,
     /// When the key was minted, by this client's clock.
     pub created_at: i64,
-    /// When the key was last handed to a request, by this client's clock.
+    /// The attempt time of the latest request known to have left with the key
+    /// (its birth, until one has), by this client's clock.
     pub last_used_at: i64,
 }
 
@@ -94,7 +147,8 @@ pub(crate) enum Claim {
 /// catalog promised.
 ///
 /// - No stored key, or one minted for another model (a participant whose
-///   model changed is answered by another engine, under another retention).
+///   model changed is answered by another engine, under another retention) or
+///   under another trust domain (a key never reaches two).
 /// - **The clock disagrees with itself**: `now` earlier than either stored
 ///   time, or a last use before the birth. The client cannot tell a clock set
 ///   back from a clock that was ahead, and either way it cannot measure the
@@ -102,13 +156,16 @@ pub(crate) enum Claim {
 /// - Idle for `idle_ttl_ms` or more since its last request.
 /// - `max_age_ms` or more since it was minted.
 ///
-/// The client stamps a key's use when it builds the request, before the
-/// engine sees it, and its birth before the first request reaches any engine,
-/// so both of its measures run at least as long as the engine's own: the key
-/// is retired no later than the cache could still answer for it.
+/// Both stored times are attempt times, taken before the request could reach
+/// any engine, so both measures run at least as long as the engine's own: the
+/// key is retired no later than the cache could still answer for it. And a use
+/// is recorded only for an attempt that may have left this machine
+/// ([`crate::db::record_cache_key_use`]), so idleness is measured from the
+/// last request an observer could have seen, never renewed by one nobody did.
 pub(crate) fn decide(
     stored: Option<&StoredKeyAge>,
     model: &str,
+    trust_domain: &str,
     policy: &PromptCachePolicy,
     now: i64,
 ) -> Claim {
@@ -116,6 +173,7 @@ pub(crate) fn decide(
         return Claim::Mint;
     };
     if stored.model != model
+        || stored.trust_domain != trust_domain
         || now < stored.created_at
         || now < stored.last_used_at
         || stored.last_used_at < stored.created_at
@@ -186,6 +244,7 @@ mod tests {
     fn stored(model: &str, created_at: i64, last_used_at: i64) -> StoredKeyAge {
         StoredKeyAge {
             model: model.to_string(),
+            trust_domain: "d".to_string(),
             created_at,
             last_used_at,
         }
@@ -238,25 +297,52 @@ mod tests {
     #[test]
     fn a_key_inside_every_bound_is_reused() {
         let s = stored("m", 1_000, 2_000);
-        assert_eq!(decide(Some(&s), "m", &POLICY, 2_000), Claim::Reuse);
+        assert_eq!(decide(Some(&s), "m", "d", &POLICY, 2_000), Claim::Reuse);
         assert_eq!(
-            decide(Some(&s), "m", &POLICY, 2_000 + POLICY.idle_ttl_ms - 1),
+            decide(Some(&s), "m", "d", &POLICY, 2_000 + POLICY.idle_ttl_ms - 1),
             Claim::Reuse
         );
     }
 
     #[test]
     fn no_key_or_another_models_key_mints() {
-        assert_eq!(decide(None, "m", &POLICY, 5_000), Claim::Mint);
+        assert_eq!(decide(None, "m", "d", &POLICY, 5_000), Claim::Mint);
         let s = stored("other", 1_000, 2_000);
-        assert_eq!(decide(Some(&s), "m", &POLICY, 2_000), Claim::Mint);
+        assert_eq!(decide(Some(&s), "m", "d", &POLICY, 2_000), Claim::Mint);
+    }
+
+    #[test]
+    fn another_trust_domains_key_mints() {
+        let s = stored("m", 1_000, 2_000);
+        assert_eq!(decide(Some(&s), "m", "d", &POLICY, 2_000), Claim::Reuse);
+        assert_eq!(decide(Some(&s), "m", "e", &POLICY, 2_000), Claim::Mint);
+    }
+
+    #[test]
+    fn a_trust_domain_names_the_whole_bundle() {
+        let base = trust_domain("https://a", "[]", None, None);
+        assert_eq!(base, trust_domain("https://a", "[]", None, None));
+        for other in [
+            trust_domain("https://b", "[]", None, None),
+            trust_domain("https://a", "[1]", None, None),
+            trust_domain("https://a", "[]", Some(""), None),
+            trust_domain("https://a", "[]", None, Some("ask")),
+            trust_domain("https://a", "[]", Some("ask"), None),
+        ] {
+            assert_ne!(base, other);
+        }
+        // Length-prefixed: moving a boundary changes the digest.
+        assert_ne!(
+            trust_domain("https://ab", "c", None, None),
+            trust_domain("https://a", "bc", None, None)
+        );
     }
 
     #[test]
     fn idleness_reaching_the_ttl_mints() {
         let s = stored("m", 1_000, 2_000);
         assert_eq!(
-            decide(Some(&s), "m", &POLICY, 2_000 + POLICY.idle_ttl_ms),
+            decide(Some(&s), "m", "d", &POLICY, 2_000 + POLICY.idle_ttl_ms),
             Claim::Mint
         );
     }
@@ -266,20 +352,20 @@ mod tests {
         // Used a moment ago, but born max_age ago.
         let now = 10_000_000;
         let s = stored("m", now - POLICY.max_age_ms, now - 1);
-        assert_eq!(decide(Some(&s), "m", &POLICY, now), Claim::Mint);
+        assert_eq!(decide(Some(&s), "m", "d", &POLICY, now), Claim::Mint);
         let s = stored("m", now - POLICY.max_age_ms + 1, now - 1);
-        assert_eq!(decide(Some(&s), "m", &POLICY, now), Claim::Reuse);
+        assert_eq!(decide(Some(&s), "m", "d", &POLICY, now), Claim::Reuse);
     }
 
     #[test]
     fn a_clock_that_disagrees_with_itself_mints() {
         let s = stored("m", 1_000, 2_000);
         // Set back past the last use, and past the birth.
-        assert_eq!(decide(Some(&s), "m", &POLICY, 1_999), Claim::Mint);
-        assert_eq!(decide(Some(&s), "m", &POLICY, 999), Claim::Mint);
+        assert_eq!(decide(Some(&s), "m", "d", &POLICY, 1_999), Claim::Mint);
+        assert_eq!(decide(Some(&s), "m", "d", &POLICY, 999), Claim::Mint);
         // A stored row whose last use precedes its birth.
         let s = stored("m", 2_000, 1_000);
-        assert_eq!(decide(Some(&s), "m", &POLICY, 2_500), Claim::Mint);
+        assert_eq!(decide(Some(&s), "m", "d", &POLICY, 2_500), Claim::Mint);
     }
 
     #[test]

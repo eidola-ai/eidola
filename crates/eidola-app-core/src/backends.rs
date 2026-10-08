@@ -589,6 +589,19 @@ impl Inner {
         if repointed {
             self.retire_engines_for(id).await;
         }
+        // **A prefix-cache key never outlives the trust domain it was minted
+        // under.** Every key is bound to the digest of the eidola endpoint and
+        // trust bundle and a mismatch rotates it at the next claim; this is
+        // the belt to that brace, so a key minted against a dev stack or an
+        // overridden bundle does not stay on disk once the client is pointed
+        // elsewhere. Read back from the row just written, still under the
+        // configuration lock, so the domain kept is the one now in force. A
+        // write that changed nothing keeps every key.
+        if kind == BackendKind::Eidola {
+            let current = db::get_backend(&conn, id).await?;
+            let domain = crate::EidolaResolved::from_row(current.as_ref())?.cache_trust_domain();
+            db::forget_cache_keys_outside(&conn, &domain).await?;
+        }
         self.bus.emit(Change::Backends);
         Ok(())
     }

@@ -7796,7 +7796,7 @@ fn a_turn_does_not_follow_a_redirect() {
 use chat_harness::{CACHE_IDLE_TTL_SECS, CACHE_MAX_AGE_SECS, supported_prompt_cache};
 
 /// What the Record keeps in place of a request's key.
-const WITHHELD_CACHE_KEY: &str = "[withheld: prefix-cache key]";
+const WITHHELD_CACHE_KEY: &str = "[withheld: this request's prefix-cache key]";
 
 /// A core over a catalog that declares MODEL's engine caches prompt prefixes.
 fn cache_setup(chat: ChatBehavior) -> (MockServer, AppCore, tempfile::TempDir) {
@@ -8385,5 +8385,356 @@ fn a_trailing_block_is_the_only_part_of_a_request_the_next_one_drops() {
                 "request {a} up to its trailing block is the head of request {b}"
             );
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// A key's end: forgotten when its lineage can no longer send, overwritten on
+// disk whenever it is replaced or forgotten, and never carried from one trust
+// domain to another.
+// ---------------------------------------------------------------------------
+
+/// The lineages holding a key, as `(space, participant)`.
+fn lineages(core: &AppCore) -> Vec<(String, String)> {
+    core.runtime()
+        .block_on(core.test_prefix_cache_lineages())
+        .expect("lineages")
+        .into_iter()
+        .map(|(s, p, ..)| (s, p))
+        .collect()
+}
+
+/// A lineage's `(generation, created_at, last_used_at)`.
+fn lineage_times(core: &AppCore, space: &str) -> (i64, i64, i64) {
+    let rows = core
+        .runtime()
+        .block_on(core.test_prefix_cache_lineages())
+        .expect("lineages");
+    let row = rows
+        .iter()
+        .find(|(s, ..)| s == space)
+        .unwrap_or_else(|| panic!("a key for {space}: {rows:?}"));
+    (row.2, row.3, row.4)
+}
+
+/// Whether any file of the profile's database still holds `key`'s bytes —
+/// the database itself and its write-ahead log alike.
+fn key_on_disk(dir: &tempfile::TempDir, key: &str) -> bool {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(key)
+        .expect("a key decodes");
+    std::fs::read_dir(dir.path().join("data"))
+        .expect("data dir")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.is_file())
+        .any(|path| {
+            let contents = std::fs::read(&path).unwrap_or_default();
+            contents.windows(bytes.len()).any(|w| w == bytes.as_slice())
+        })
+}
+
+fn agent_of(core: &AppCore, space: &str) -> String {
+    core.runtime()
+        .block_on(core.list_space_participants(space.to_string()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("an agent")
+        .id
+}
+
+#[test]
+fn archiving_a_conversation_forgets_its_keys_and_leaves_no_copy_on_disk() {
+    run(|| {
+        let (mock, core, dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let other = turn(&core, "Another conversation.", None, None);
+        let key = sent_key(&mock.chat_bodies()[0]);
+        assert!(
+            key_on_disk(&dir, &key),
+            "a live key is stored (the scan's baseline)"
+        );
+        assert_eq!(lineages(&core).len(), 2);
+
+        core.runtime()
+            .block_on(core.archive_space(first.space_id.clone()))
+            .expect("archive");
+
+        let left = lineages(&core);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(
+            left[0].0, other.space_id,
+            "only the open conversation keeps its key"
+        );
+        assert!(
+            !key_on_disk(&dir, &key),
+            "and the forgotten key is nowhere on disk"
+        );
+    });
+}
+
+#[test]
+fn a_participant_that_leaves_forgets_its_key_and_the_others_keep_theirs() {
+    run(|| {
+        let (_mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        let ada = core
+            .runtime()
+            .block_on(core.add_space_participant(
+                space.clone(),
+                eidola_app_core::NewParticipant {
+                    label: "Ada".into(),
+                    model_ref: Some(MODEL.into()),
+                    system_prompt: None,
+                    notify_policy: "explicit".into(),
+                },
+            ))
+            .expect("add agent");
+        let asked = core
+            .runtime()
+            .block_on(core.post_reply("Ada?".into(), Some(space.clone()), None))
+            .expect("post");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.respond_stream_as(space.clone(), ada.id.clone(), asked.action_id, tx))
+            .expect("Ada answers");
+        assert_eq!(lineages(&core).len(), 2);
+
+        core.runtime()
+            .block_on(core.remove_space_participant(space.clone(), ada.id.clone()))
+            .expect("Ada leaves");
+        let left = lineages(&core);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_ne!(left[0].1, ada.id);
+    });
+}
+
+#[test]
+fn a_shared_agent_that_leaves_one_space_or_retires_forgets_those_keys() {
+    run(|| {
+        let (_mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let home = first.space_id.clone();
+        let agent = agent_of(&core, &home);
+        core.runtime()
+            .block_on(core.promote_participant(agent.clone(), None, None))
+            .expect("share the agent");
+        let answer_in = |prompt: &str| {
+            let post = core
+                .runtime()
+                .block_on(core.post_reply(prompt.into(), None, None))
+                .expect("a new space");
+            core.runtime()
+                .block_on(core.add_global_participant(post.space_id.clone(), agent.clone(), None))
+                .expect("join");
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            core.runtime()
+                .block_on(core.respond_stream_as(
+                    post.space_id.clone(),
+                    agent.clone(),
+                    post.action_id,
+                    tx,
+                ))
+                .expect("answer");
+            post.space_id
+        };
+        let elsewhere = answer_in("Elsewhere.");
+        let third = answer_in("A third place.");
+        let ours = |core: &AppCore| {
+            lineages(core)
+                .into_iter()
+                .filter(|(_, p)| *p == agent)
+                .map(|(s, _)| s)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ours(&core).len(), 3);
+
+        core.runtime()
+            .block_on(core.remove_space_participant(elsewhere.clone(), agent.clone()))
+            .expect("leave one space");
+        let kept = ours(&core);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(!kept.contains(&elsewhere));
+        assert!(kept.contains(&third));
+
+        core.runtime()
+            .block_on(core.retire_participant(agent.clone()))
+            .expect("retire");
+        assert!(
+            ours(&core).is_empty(),
+            "a retired agent sends nothing, anywhere"
+        );
+    });
+}
+
+#[test]
+fn a_rotated_key_leaves_no_copy_on_disk() {
+    run(|| {
+        let (mock, core, dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        core.test_advance_cache_clock(CACHE_IDLE_TTL_SECS * 1000);
+        turn(&core, "After a pause.", Some(first.space_id.clone()), None);
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        assert_ne!(sent[0], sent[1]);
+        assert!(key_on_disk(&dir, &sent[1]), "the live key is stored");
+        assert!(
+            !key_on_disk(&dir, &sent[0]),
+            "the one it replaced is nowhere on disk"
+        );
+    });
+}
+
+/// Pointing the client at another endpoint and back — the `client-local` /
+/// `client-reset` round trip — never carries a key across: each trust domain
+/// gets keys of its own, and the pinned endpoint never sees the local one.
+#[test]
+fn a_key_never_crosses_from_one_trust_domain_to_another() {
+    run(|| {
+        let (pinned, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let local = core.runtime().block_on(chat_harness::start(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            ..MockConfig::default()
+        }));
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+
+        core.runtime()
+            .block_on(core.set_base_url(local.base_url.clone()))
+            .expect("point at the local stack");
+        assert!(
+            lineages(&core).is_empty(),
+            "the old domain's keys are forgotten at once"
+        );
+        turn(&core, "Against the local stack.", Some(space.clone()), None);
+
+        core.runtime()
+            .block_on(core.set_base_url(pinned.base_url.clone()))
+            .expect("point back");
+        assert!(lineages(&core).is_empty());
+        turn(&core, "Back again.", Some(space.clone()), None);
+
+        let at_pinned: Vec<String> = keys(&pinned).into_iter().map(Option::unwrap).collect();
+        let at_local: Vec<String> = keys(&local).into_iter().map(Option::unwrap).collect();
+        assert_eq!((at_pinned.len(), at_local.len()), (2, 1));
+        assert!(
+            !at_pinned.contains(&at_local[0]),
+            "the local key never reaches the pinned endpoint"
+        );
+        assert_ne!(
+            at_pinned[0], at_pinned[1],
+            "and the pinned lineage starts over on return"
+        );
+
+        // Re-asserting the same configuration is not a change.
+        core.runtime()
+            .block_on(core.set_base_url(pinned.base_url.clone()))
+            .expect("same URL");
+        assert_eq!(
+            lineages(&core).len(),
+            1,
+            "a write that changed nothing keeps the key"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// When a request counts as a key's use: only once it may have left.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_delivered_request_records_its_attempt_as_the_keys_last_use() {
+    run(|| {
+        let (_mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let (generation, born, used) = lineage_times(&core, &first.space_id);
+        assert_eq!(born, used, "a fresh key is born used at its attempt");
+        core.test_advance_cache_clock(100_000);
+        turn(&core, "Later.", Some(first.space_id.clone()), None);
+        let (g, b, u) = lineage_times(&core, &first.space_id);
+        assert_eq!((g, b), (generation, born), "the same key");
+        assert!(
+            u >= used + 100_000,
+            "its use moved to the second attempt: {used} → {u}"
+        );
+    });
+}
+
+/// A request refused at connect never left: it must not renew the lineage's
+/// idle clock, or a later reuse could link requests further apart than the
+/// idle TTL the catalog promised.
+#[test]
+fn a_request_that_never_left_does_not_count_as_a_use() {
+    run(|| {
+        let close = chat_harness::CloseSwitch::default();
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            close_switch: close.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let first = turn(&core, "How do tides work?", None, None);
+        let before = lineage_times(&core, &first.space_id);
+        core.test_advance_cache_clock(100_000);
+        // The next catalog fetch is answered, then the listener goes away.
+        close.arm();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let err = core
+            .runtime()
+            .block_on(core.chat_stream_reply(
+                "Refused.".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+                None,
+                tx,
+            ))
+            .expect_err("the completion's connection is refused");
+        assert!(matches!(err, AppError::Network { .. }), "{err:?}");
+        assert_eq!(
+            lineage_times(&core, &first.space_id),
+            before,
+            "nothing left, so nothing was used"
+        );
+    });
+}
+
+/// A connection that drops after the request was written may have delivered
+/// it: counted as used, at the attempt time.
+#[test]
+fn a_request_whose_delivery_is_unknown_counts_as_a_use_at_its_attempt() {
+    run(|| {
+        let (_mock, core, _dir) = cache_setup(ChatBehavior::DropBeforeResponse);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let space = core
+            .runtime()
+            .block_on(core.post_reply("How do tides work?".into(), None, None))
+            .expect("post")
+            .space_id;
+        let ask = |prompt: &str| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            core.runtime()
+                .block_on(core.chat_stream_reply(
+                    prompt.into(),
+                    MODEL.into(),
+                    Some(space.clone()),
+                    None,
+                    tx,
+                ))
+                .expect_err("the connection drops")
+        };
+        drop(tx);
+        ask("First.");
+        let (generation, _, used) = lineage_times(&core, &space);
+        core.test_advance_cache_clock(100_000);
+        ask("Second.");
+        let (g, _, u) = lineage_times(&core, &space);
+        assert_eq!(g, generation);
+        assert!(
+            u >= used + 100_000,
+            "an unknown delivery is a use: {used} → {u}"
+        );
     });
 }

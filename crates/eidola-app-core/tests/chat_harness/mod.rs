@@ -564,6 +564,11 @@ pub struct MockConfig {
     /// every model the server sells today; [`supported_prompt_cache`] is the
     /// leaf an Eidola-hosted row carries.
     pub declared_prompt_cache: Option<serde_json::Value>,
+    /// Armed by a test to make the mock **stop listening** once it has served
+    /// the next `GET /v1/models` — so the turn that fetched the catalog then
+    /// meets a refused connection for its completion, the one failure that
+    /// provably sends nothing.
+    pub close_switch: CloseSwitch,
     /// List [`FLAT_MODEL`], the flat-priced entry, in the catalog. Opt-in so
     /// the listings every other test pins are unchanged.
     pub list_flat_model: bool,
@@ -589,8 +594,49 @@ impl Default for MockConfig {
             tool_script: tool_script(),
             declared_tool_calling: None,
             declared_prompt_cache: None,
+            close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
+        }
+    }
+}
+
+/// See [`MockConfig::close_switch`].
+#[derive(Clone, Default)]
+pub struct CloseSwitch(Arc<CloseSwitchState>);
+
+#[derive(Default)]
+struct CloseSwitchState {
+    armed: std::sync::atomic::AtomicBool,
+    tx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
+    >,
+}
+
+impl CloseSwitch {
+    /// Close the listener after the next catalog fetch.
+    pub fn arm(&self) {
+        self.0.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn install(&self, tx: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>) {
+        *self.0.tx.lock().unwrap() = Some(tx);
+    }
+
+    async fn trip_if_armed(&self) {
+        if !self.0.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let (ack, closed) = tokio::sync::oneshot::channel();
+        let sent = self
+            .0
+            .tx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|tx| tx.send(ack).is_ok());
+        if sent == Some(true) {
+            let _ = closed.await;
         }
     }
 }
@@ -1042,6 +1088,9 @@ impl Issuer {
 
 /// Start the mock upstream on an ephemeral loopback port.
 pub async fn start(config: MockConfig) -> MockServer {
+    let (close_tx, mut close_rx) =
+        tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
+    config.close_switch.install(close_tx);
     let issuer = Arc::new(Issuer::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
@@ -1069,7 +1118,17 @@ pub async fn start(config: MockConfig) -> MockServer {
         let models_hits = models_hits.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    Some(ack) = close_rx.recv() => {
+                        // Stop listening *before* acknowledging, so the next
+                        // connection attempt is refused rather than queued.
+                        drop(listener);
+                        let _ = ack.send(());
+                        break;
+                    }
+                };
+                let Ok((stream, _)) = accepted else {
                     break;
                 };
                 let issuer = issuer.clone();
@@ -1203,6 +1262,7 @@ async fn handle_conn(
     match (req.method.as_str(), path) {
         ("GET", "/v1/models") => {
             models_hits.fetch_add(1, Ordering::SeqCst);
+            config.close_switch.trip_if_armed().await;
             match config.models_status {
                 Some(status) => {
                     write_json(&mut stream, status, r#"{"error":"models unavailable"}"#).await?;

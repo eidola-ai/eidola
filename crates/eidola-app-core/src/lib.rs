@@ -2783,25 +2783,34 @@ impl Inner {
     /// The prefix-cache key this request of `prep`'s turn carries, if any.
     ///
     /// `None` unless the catalog declared the model's prefix cache
-    /// (`TurnPrep::prompt_cache`), so every other request is untouched. Asked
+    /// (`TurnPrep::cache_scope`), so every other request is untouched. Asked
     /// **per request** rather than once per turn: a tool round can run past
-    /// the idle TTL, and each request stamps the lineage's last use as it is
-    /// built. A failure to read or write the key is not the turn's failure —
-    /// the request goes without one, which costs a cache miss and links
-    /// nothing — and the warning names neither the key nor the lineage.
-    async fn claim_cache_key(&self, prep: &TurnPrep) -> Option<prefix_cache::CacheKey> {
-        let policy = prep.prompt_cache.as_ref()?;
+    /// the idle TTL. The claim leaves the attempt pending on `prep`, and
+    /// [`TurnPrep::send`] records the use only if the request may have left
+    /// ([`db::record_cache_key_use`]). A failure to read or write the key is
+    /// not the turn's failure — the request goes without one, which costs a
+    /// cache miss and links nothing — and the warning names neither the key
+    /// nor the lineage.
+    async fn claim_cache_key(&self, prep: &mut TurnPrep) -> Option<prefix_cache::CacheKey> {
+        let scope = prep.cache_scope.as_ref()?;
         match db::claim_prefix_cache_key(
             &prep.db_conn,
             &prep.space_id,
             &prep.model_participant_id,
             &prep.model,
-            policy,
+            scope,
             self.cache_clock_ms(),
         )
         .await
         {
-            Ok(key) => key,
+            Ok(Some(claimed)) => {
+                prep.pending_cache_use = Some(PendingCacheUse {
+                    generation: claimed.generation,
+                    attempt_at: claimed.attempt_at,
+                });
+                Some(claimed.key)
+            }
+            Ok(None) => None,
             Err(_) => {
                 eprintln!("warning: a turn's prefix-cache key could not be claimed; sending none");
                 None
@@ -2824,6 +2833,20 @@ struct EidolaResolved {
 }
 
 impl EidolaResolved {
+    /// The trust domain a prefix-cache key minted for this connection belongs
+    /// to ([`prefix_cache::trust_domain`]): the resolved base URL and every
+    /// member of the trust bundle, pinned or overridden alike.
+    fn cache_trust_domain(&self) -> String {
+        let measurements =
+            serde_json::to_string(&self.measurements).unwrap_or_else(|_| String::new());
+        prefix_cache::trust_domain(
+            &self.base_url,
+            &measurements,
+            self.hardware_root_ca.as_deref(),
+            self.hardware_intermediate_ca.as_deref(),
+        )
+    }
+
     fn from_row(row: Option<&db::BackendRow>) -> Result<Self, AppError> {
         let base_url_override = row.and_then(|r| r.base_url.clone());
         let base_url_is_override = base_url_override.is_some();
@@ -6370,7 +6393,7 @@ impl Inner {
             remote_pricing,
             external_auth,
             tool_policy,
-            prompt_cache,
+            cache_scope,
         ) = match backend_kind {
             BackendKind::Local | BackendKind::LlamaCpp => {
                 // A request *is* the load trigger: an unloaded engine is
@@ -6515,7 +6538,12 @@ impl Inner {
                     // whoever's catalog this is: it shapes the request and
                     // vouches for nothing, and the server it describes already
                     // reads every prompt it would link.
-                    model_entry.declared_prompt_cache(),
+                    model_entry
+                        .declared_prompt_cache()
+                        .map(|policy| prefix_cache::CacheScope {
+                            policy,
+                            trust_domain: eidola.cache_trust_domain(),
+                        }),
                 )
             }
         };
@@ -7239,7 +7267,8 @@ impl Inner {
             consumer_tools,
             auto_tools,
             tool_policy,
-            prompt_cache,
+            cache_scope,
+            pending_cache_use: None,
             remote_pricing,
             budget,
             charge_credits,
@@ -7698,7 +7727,7 @@ impl Inner {
             self.bus.emit(Change::Space(space_for_emit.clone()));
         };
 
-        let cache_key = self.claim_cache_key(prep).await;
+        let cache_key = self.claim_cache_key(&mut *prep).await;
         let request_body_json = prep.request_body(false, cache_key.as_ref());
         drop(cache_key);
         let request_at = now_ms();
@@ -8420,7 +8449,7 @@ impl Inner {
         // Sending it from the client is harmless (the server ignores
         // and overrides the value), but it's also unnecessary, so we
         // keep our outgoing request minimal.
-        let cache_key = self.claim_cache_key(prep).await;
+        let cache_key = self.claim_cache_key(&mut *prep).await;
         let request_body_json = prep.request_body(true, cache_key.as_ref());
         drop(cache_key);
         let request_at = now_ms();
@@ -9988,6 +10017,24 @@ impl AppCore {
         self.inner
             .trust_declared_capabilities
             .store(trusted, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// **Test-only seam.** Every lineage that holds a prefix-cache key, as
+    /// `(space, participant, generation, created_at, last_used_at)` — the row's
+    /// lifecycle without the secret, which no seam hands out.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_prefix_cache_lineages(
+        &self,
+    ) -> Result<Vec<(String, String, i64, i64, i64)>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                db::prefix_cache_lineages(&conn).await
+            })
+            .await
+            .map_err(join_err)?
     }
 
     /// **Test-only seam.** Move the clock the prefix-cache rotation rule reads
@@ -12778,6 +12825,32 @@ impl ModelListEntry {
 /// and streaming transports differ only in how they carry the request and
 /// read the response; everything durable before and after the wire lives
 /// here.
+/// Whether a request with a prefix-cache key **may have left this machine**,
+/// read off how its send ended — the line between a use the key's lineage must
+/// count and an attempt nobody saw.
+///
+/// - A response arrived: delivered.
+/// - The send failed before the request could be written — no connection
+///   (DNS, refused, a handshake or attestation that did not pass) or a request
+///   that could not be built: not sent, so not a use.
+/// - Any other failure (a connection that dropped after the request went, a
+///   timeout mid-exchange): delivery unknown, so counted as delivered at the
+///   attempt time — the reading that keeps both the engine-side bound and the
+///   linkability window honest.
+fn may_have_left(result: &Result<reqwest::Response, reqwest::Error>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(e) => !(e.is_connect() || e.is_builder()),
+    }
+}
+
+/// A claimed key's attempt, waiting for [`TurnPrep::send`] to learn whether
+/// the request left with it.
+struct PendingCacheUse {
+    generation: i64,
+    attempt_at: i64,
+}
+
 /// One request's body, as sent: scrubs its prefix-cache key when the request
 /// is done with it.
 ///
@@ -12908,8 +12981,12 @@ struct TurnPrep {
     /// The model's engine prefix cache as the catalog declared it, or `None`
     /// for every model without one — every non-eidola backend included. Only
     /// a `Some` here ever puts a `cache_key` on the wire
-    /// ([`Inner::claim_cache_key`]).
-    prompt_cache: Option<prefix_cache::PromptCachePolicy>,
+    /// ([`Inner::claim_cache_key`]). Carries the trust domain the turn talks
+    /// to, so a key never crosses from one endpoint or trust bundle to another.
+    cache_scope: Option<prefix_cache::CacheScope>,
+    /// The current request's claimed key, until its send says whether it left
+    /// ([`Inner::claim_cache_key`], [`TurnPrep::send`]).
+    pending_cache_use: Option<PendingCacheUse>,
     /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
     /// for every non-spend backend. Kept so a later round can re-estimate.
     remote_pricing: Option<ChargePricing>,
@@ -13126,9 +13203,25 @@ impl TurnPrep {
         &mut self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, reqwest::Error> {
+        // Taken first, so a request that cannot even be built records no use.
+        let pending = self.pending_cache_use.take();
         let request = request.build()?;
         self.attach_plain_connection().await;
-        self.client.execute(request).await
+        let result = self.client.execute(request).await;
+        if let Some(pending) = pending
+            && may_have_left(&result)
+            && let Err(e) = db::record_cache_key_use(
+                &self.db_conn,
+                &self.space_id,
+                &self.model_participant_id,
+                pending.generation,
+                pending.attempt_at,
+            )
+            .await
+        {
+            eprintln!("warning: a prefix-cache key's use was not recorded: {e}");
+        }
+        result
     }
 
     /// Settle this round's hold: **the refund the server handed us first, and
@@ -17046,6 +17139,56 @@ async fn insert_plain_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused connection sent nothing; a connection that took the request
+    /// and dropped may have delivered it. Real errors from a real client, so
+    /// the classification is held to how reqwest actually reports each.
+    #[test]
+    fn only_a_request_that_may_have_left_counts_as_a_keys_use() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        runtime.block_on(async {
+            let client = reqwest::Client::builder().build().unwrap();
+
+            let refused_port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let refused = client
+                .post(format!(
+                    "http://127.0.0.1:{refused_port}/v1/chat/completions"
+                ))
+                .body("{}")
+                .send()
+                .await;
+            assert!(
+                refused.as_ref().is_err_and(|e| e.is_connect()),
+                "{refused:?}"
+            );
+            assert!(!may_have_left(&refused));
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let dropper = std::thread::spawn(move || {
+                use std::io::Read;
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                // Dropped without answering.
+            });
+            let dropped = client
+                .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                .body("{}")
+                .send()
+                .await;
+            dropper.join().unwrap();
+            assert!(
+                dropped.as_ref().is_err_and(|e| !e.is_connect()),
+                "{dropped:?}"
+            );
+            assert!(may_have_left(&dropped));
+        });
+    }
 
     /// **An event ends at any two line terminators the format allows.**
     ///
