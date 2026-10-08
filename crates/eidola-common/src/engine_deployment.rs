@@ -261,8 +261,8 @@ pub const ROPE_DEVICE_BYTES_PER_POSITION: u64 = 3 * 64 * 4;
 /// [`STEP_TOKEN_DEVICE_BYTES`] per `MAX_BATCHED_TOKENS`,
 /// [`EXPERT_FLOOR_DEVICE_BYTES`], per `MAX_SEQS` [`sampler_rows`] of
 /// [`SAMPLER_ROW_DEVICE_BYTES`], the device block tables (`MAX_SEQS` ×
-/// ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉ `i32` entries per KV group, two
-/// groups, three with drafting) and the RoPE tables
+/// ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉ `i32` entries per KV group,
+/// [`kv_groups`]) and the RoPE tables
 /// ([`ROPE_DEVICE_BYTES_PER_POSITION`] per `MAX_MODEL_LEN`). With
 /// `DRAFT_TOKENS` `k` > 0, per `MAX_SEQS` also [`drafter_seat_rows`] rows of
 /// 16 KiB, [`DRAFT_TABLE_SEAT_BYTES`], and the global page lists of a
@@ -276,7 +276,7 @@ pub fn cuda_device_reserve_bytes(sizing: &Sizing) -> u64 {
         u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size.max(1)));
     let seats = u64::from(sizing.max_seqs);
     let drafting = sizing.draft_tokens > 0;
-    let groups = if drafting { 3 } else { 2 };
+    let groups = kv_groups(sizing.draft_tokens);
     let per_seat = sampler_rows(sizing.draft_tokens)
         .saturating_mul(SAMPLER_ROW_DEVICE_BYTES)
         .saturating_add(drafter_seat_rows(sizing.draft_tokens).saturating_mul(16 << 10))
@@ -351,6 +351,15 @@ pub fn ordered_tree_bytes(body: u64, values: u64) -> u64 {
 /// per prompt byte at worst, so four bytes each), 2 + 8.
 pub const PREPARED_PER_BODY_BYTE: u64 = 10;
 
+/// KV groups an executor keeps block tables for, host mirror and device
+/// copy alike: MiMo's global and sliding target groups, and with
+/// `DRAFT_TOKENS` > 0 the drafter's. The node refuses to boot an executor
+/// that reports another count (`cuda::derive_kv_blocks` in
+/// `eidola-server-engine`), so the memory bounds below cannot undercount it.
+pub fn kv_groups(draft_tokens: u32) -> u64 {
+    if draft_tokens > 0 { 3 } else { 2 }
+}
+
 /// The node process's own fixed footprint beside its pools (runtime, engine
 /// state, the model's host-side metadata): 4 GiB.
 pub const PROCESS_HEADROOM_BYTES: u64 = 4 << 30;
@@ -366,8 +375,9 @@ pub const PROCESS_HEADROOM_BYTES: u64 = 4 << 30;
 ///   its order-preserving tree while the prompt is rendered and tokenized:
 ///   [`ordered_tree_bytes`] plus body × [`PREPARED_PER_BODY_BYTE`]. Both
 ///   pools can be full at once (a slot of each per request in flight);
-/// - the block tables: `MAX_SEQS` × ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉
-///   `i32` entries per KV group, two groups;
+/// - the block tables' host mirror: `MAX_SEQS` × ⌈`MAX_MODEL_LEN` /
+///   `KV_BLOCK_SIZE`⌉ `i32` entries per KV group ([`kv_groups`]: two, three
+///   with drafting);
 /// - [`PROCESS_HEADROOM_BYTES`].
 ///
 /// At the caps a request slot is 645,922,816 bytes (about 616 MiB): 234.9 MB
@@ -381,7 +391,7 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
         ordered_tree_bytes(body, values).saturating_add(body * PREPARED_PER_BODY_BYTE),
     );
     let blocks_per_seq = u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size));
-    let tables = u64::from(sizing.max_seqs) * blocks_per_seq * 4 * 2;
+    let tables = u64::from(sizing.max_seqs) * blocks_per_seq * 4 * kv_groups(sizing.draft_tokens);
     read_pool + admission_pool + tables + PROCESS_HEADROOM_BYTES
 }
 
@@ -1467,6 +1477,20 @@ mod tests {
             host_memory_bytes(&one) - tables - PROCESS_HEADROOM_BYTES,
             645_922_816
         );
+        // Drafting adds the drafter group's block tables to the host mirror
+        // (and to the device's): a third 64 × 8,192 × 4 bytes.
+        for k in 1..=3 {
+            let drafting = Sizing {
+                draft_tokens: k,
+                ..one
+            };
+            assert_eq!(kv_groups(k), 3);
+            assert_eq!(
+                host_memory_bytes(&drafting) - host_memory_bytes(&one),
+                64 * 8192 * 4
+            );
+        }
+        assert_eq!(kv_groups(0), 2);
         let near = |n| Sizing {
             max_requests: n,
             ..sizing

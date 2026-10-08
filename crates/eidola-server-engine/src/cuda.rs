@@ -65,6 +65,17 @@ pub fn derive_kv_blocks(
     sizing: &Sizing,
     cache: &CacheConfig,
 ) -> Result<KvBlocks, BootError> {
+    // The memory bounds the deployment was checked against count this many
+    // groups' block tables, host and device (`engine_deployment::kv_groups`).
+    let groups = eidola_common::engine_deployment::kv_groups(sizing.draft_tokens);
+    if spec.kv_groups.len() as u64 != groups {
+        return Err(BootError(format!(
+            "the executor reports {} KV groups; {} {} accounts for {groups}",
+            spec.kv_groups.len(),
+            env::DRAFT_TOKENS,
+            sizing.draft_tokens
+        )));
+    }
     let b = u64::from(sizing.kv_block_size);
     let overflow = || BootError(format!("{} overflows the KV sizing", env::KV_DEVICE_BYTES));
     let block_bytes = |g: &KvGroupSpec| -> Result<u64, BootError> {
@@ -375,8 +386,12 @@ mod tests {
         // positions × 3 depths × 8 heads × (192 + 128) × 2 bytes and a tap of 3 × 4,096
         // f32; the global pool what is left.
         let drafter_bytes = 16 * 3 * 8 * 320 * 2 + 3 * 4096 * 4u64;
+        let drafting = Sizing {
+            draft_tokens: 3,
+            ..sizing()
+        };
         let blocks =
-            derive_kv_blocks(&flash_drafting(3), 4096, budget, &sizing(), &cache(true)).unwrap();
+            derive_kv_blocks(&flash_drafting(3), 4096, budget, &drafting, &cache(true)).unwrap();
         assert_eq!(
             (blocks.sliding, blocks.drafter),
             (sliding as u32, sliding as u32)
@@ -436,6 +451,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The host and device bounds count `kv_groups(DRAFT_TOKENS)` block tables;
+    /// an executor reporting another count is refused rather than undercounted.
+    #[test]
+    fn the_group_count_is_the_accounted_one() {
+        let drafting = Sizing {
+            draft_tokens: 3,
+            ..sizing()
+        };
+        let budget = u64::MAX;
+        derive_kv_blocks(&flash_drafting(3), 4096, budget, &drafting, &cache(true)).unwrap();
+        let e = derive_kv_blocks(&flash_drafting(3), 4096, budget, &sizing(), &cache(true))
+            .unwrap_err();
+        assert!(e.0.contains("3 KV groups"), "{e}");
+        let e = derive_kv_blocks(&flash(), 4096, budget, &drafting, &cache(true)).unwrap_err();
+        assert!(e.0.contains("2 KV groups"), "{e}");
     }
 
     #[test]
