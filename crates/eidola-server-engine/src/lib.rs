@@ -5,6 +5,7 @@
 //! * [`config`] — the node's configuration, from the environment; nothing defaulted.
 //! * [`auth`] — the gateway token (measured Argon2id hash, constant-time per request).
 //! * [`model`] — the weights hash, checked before loading, and the loaded model.
+//! * [`storage`] — the `verified-readonly` storage check (mount and superblock read-only).
 //! * [`api`] — the strict request subset; [`error`] — refusals, with log-safe `Display`.
 //! * [`pipeline`] — template, tokens, sampling and cache scope in; detokenizer, stop
 //!   sequences, reasoning and tool calls out.
@@ -20,6 +21,7 @@ pub mod error;
 pub mod http;
 pub mod model;
 pub mod pipeline;
+pub mod storage;
 pub mod worker;
 
 use std::sync::Arc;

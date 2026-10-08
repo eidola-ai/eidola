@@ -99,8 +99,9 @@ impl ExecutorKind {
 /// and checked rather than implicit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightsStorage {
-    /// Production. Boot refuses unless every weights file is on a filesystem mounted
-    /// read-only (`statvfs` `ST_RDONLY`).
+    /// Production. Boot refuses, before opening any weights file, unless every weights
+    /// file is on read-only storage: a read-only mount everywhere, and on Linux also a
+    /// read-only superblock (`crate::storage`).
     VerifiedReadonly,
     /// Development. Boots on any filesystem; reported by `/v1/engine/info` and `/healthz`
     /// so it can never be mistaken for production. A gateway pins the production

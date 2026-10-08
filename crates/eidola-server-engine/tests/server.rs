@@ -1034,3 +1034,25 @@ fn verified_readonly_refuses_a_writable_weights_directory() {
     let err = eidola_server_engine::start(config_from(&map).unwrap(), loaded()).unwrap_err();
     assert!(err.to_string().contains("storage"), "{err}");
 }
+
+/// The storage check comes before any weights file is opened or parsed: an unparseable
+/// shard in a writable directory is refused for its storage, never parsed.
+#[test]
+fn verified_readonly_checks_storage_before_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("model.safetensors"),
+        b"not a safetensors file",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+    let mut map = env_map();
+    map.insert(env::WEIGHTS_STORAGE, "verified-readonly".into());
+    map.insert(env::WEIGHTS_DIR, dir.path().display().to_string());
+    let err = eidola_server_engine::boot(config_from(&map).unwrap()).unwrap_err();
+    assert!(err.to_string().contains("read-only mount"), "{err}");
+    // The same directory in development mode does get parsed (and fails there).
+    map.insert(env::WEIGHTS_STORAGE, "dev-writable".into());
+    let err = eidola_server_engine::boot(config_from(&map).unwrap()).unwrap_err();
+    assert!(err.to_string().contains("cannot open the weights"), "{err}");
+}

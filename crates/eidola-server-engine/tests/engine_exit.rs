@@ -45,7 +45,7 @@ async fn an_engine_thread_panic_stops_the_node() {
     ));
 
     let admission = Admission::new(1);
-    let (_guard, mut events) = handle
+    let (guard, mut events) = handle
         .submit(
             Request {
                 id: handle.next_id(),
@@ -68,6 +68,9 @@ async fn an_engine_thread_panic_stops_the_node() {
         .unwrap();
     assert!(result.is_err(), "an engine stop is an error exit");
     assert!(!handle.is_healthy());
+    // The slot is released once the response side lets go of the request too.
+    assert_eq!(admission.in_flight(), 1);
+    drop((guard, events));
     assert_eq!(
         admission.in_flight(),
         0,

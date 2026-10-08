@@ -243,7 +243,7 @@ struct ResponseMeta {
 struct Run {
     state: Arc<AppState>,
     guard: RequestGuard,
-    events: mpsc::UnboundedReceiver<Output>,
+    events: mpsc::Receiver<Output>,
     response: ResponseMeta,
     cached_prompt_tokens: u32,
 }

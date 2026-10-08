@@ -6,15 +6,24 @@
 //!
 //! * **Commands** in (`Submit`, `Cancel`) on an unbounded channel. Between steps the
 //!   thread drains every pending command, so a submission waits at most one step.
-//! * **Events** out, one unbounded channel per request. The thread never blocks on a
-//!   slow reader: a request's output is bounded by its `max_tokens`, and a reader that
-//!   has gone away is noticed on the next send, which cancels the request in the engine.
+//! * **Events** out, one bounded channel per request ([`EVENT_BUFFER`] events, each one
+//!   step's few tokens). The thread never blocks on a reader: a reader that has gone
+//!   away, or that has stopped reading for so long that its buffer is full, is cut off
+//!   at the next send (the request is cancelled in the engine and its channel closed,
+//!   so the reader sees an error once it drains what was buffered). A stalled consumer
+//!   therefore costs at most [`EVENT_BUFFER`] events and stops costing compute. An SSE
+//!   stream drains the buffer as fast as its socket accepts data and the kernel's socket
+//!   buffers absorb far more than one step, so only a reader that has truly stopped fills
+//!   it; a non-streaming response drains it in process.
 //!
 //! **Admission is bounded** by [`Admission`]: an HTTP task takes a permit before it
-//! renders or tokenizes anything, and the permit travels with the submission and is
-//! released when the request leaves the engine (finished, cancelled or refused). With
+//! renders or tokenizes anything. The permit is shared (`Arc`) between the engine's
+//! record of the request and the [`RequestGuard`], which lives exactly as long as the
+//! response holding the request's receiver, so a slot is released only when the request
+//! has left the engine **and** its buffered output has been drained or dropped. With
 //! every permit taken a request is refused at once with `overloaded`; nothing queues
-//! without bound in front of the engine.
+//! without bound in front of the engine, and buffered output is bounded by
+//! `EIDOLA_ENGINE_MAX_REQUESTS × EVENT_BUFFER` events.
 //!
 //! **Cancellation**: dropping a request's [`RequestGuard`] (the HTTP response future or
 //! stream going away, for example on a client disconnect) sends `Cancel`, and the engine
@@ -36,6 +45,13 @@ use eidola_engine::engine::{
 };
 use eidola_engine::executor::Executor;
 use tokio::sync::{mpsc, oneshot};
+
+/// Events buffered per request before a reader that stopped reading is cut off.
+pub const EVENT_BUFFER: usize = 256;
+
+/// The engine thread has stopped; nothing can be submitted.
+#[derive(Debug)]
+pub struct EngineStopped;
 
 /// What a request's channel carries.
 #[derive(Debug)]
@@ -62,8 +78,10 @@ pub struct Stats {
     pub submitted: u64,
     /// Requests that finished on their own (EOS or length).
     pub finished: u64,
-    /// Requests cancelled (disconnects and stop sequences).
+    /// Requests cancelled (disconnects, stop sequences, and readers cut off).
     pub cancelled: u64,
+    /// Of those, readers cut off because they stopped draining their buffer.
+    pub cut_off: u64,
     /// Requests the engine refused at submission.
     pub rejected: u64,
     /// Requests in the engine now (waiting or running).
@@ -78,8 +96,8 @@ pub struct Stats {
 enum Command {
     Submit {
         request: Request,
-        events: mpsc::UnboundedSender<Output>,
-        permit: Permit,
+        events: mpsc::Sender<Output>,
+        permit: Arc<Permit>,
     },
     Cancel(RequestId),
 }
@@ -147,29 +165,33 @@ impl EngineHandle {
 
     /// Submits a request. The returned guard cancels it when dropped (unless it
     /// finished); the receiver yields [`Output::Accepted`] or [`Output::Rejected`] first.
+    ///
+    /// The permit is held by both the engine's record and the guard; keep the guard
+    /// together with the receiver (the slot is released when both are gone).
     pub fn submit(
         &self,
         request: Request,
         permit: Permit,
-    ) -> Result<(RequestGuard, mpsc::UnboundedReceiver<Output>), Permit> {
+    ) -> Result<(RequestGuard, mpsc::Receiver<Output>), EngineStopped> {
         let id = request.id;
-        let (tx, rx) = mpsc::unbounded_channel();
-        match self.commands.send(Command::Submit {
-            request,
-            events: tx,
-            permit,
-        }) {
-            Ok(()) => Ok((
-                RequestGuard {
-                    id,
-                    commands: self.commands.clone(),
-                    done: false,
-                },
-                rx,
-            )),
-            Err(std_mpsc::SendError(Command::Submit { permit, .. })) => Err(permit),
-            Err(_) => unreachable!("sent a Submit"),
-        }
+        let (tx, rx) = mpsc::channel(EVENT_BUFFER);
+        let permit = Arc::new(permit);
+        self.commands
+            .send(Command::Submit {
+                request,
+                events: tx,
+                permit: permit.clone(),
+            })
+            .map_err(|_| EngineStopped)?;
+        Ok((
+            RequestGuard {
+                id,
+                commands: self.commands.clone(),
+                done: false,
+                _permit: permit,
+            },
+            rx,
+        ))
     }
 
     pub fn stats(&self) -> Stats {
@@ -187,6 +209,7 @@ pub struct RequestGuard {
     id: RequestId,
     commands: std_mpsc::Sender<Command>,
     done: bool,
+    _permit: Arc<Permit>,
 }
 
 impl RequestGuard {
@@ -292,8 +315,8 @@ impl Drop for ExitSignal {
 }
 
 struct Live {
-    events: mpsc::UnboundedSender<Output>,
-    _permit: Permit,
+    events: mpsc::Sender<Output>,
+    _permit: Arc<Permit>,
     reported_cached: bool,
 }
 
@@ -359,7 +382,7 @@ impl<E: Executor> Worker<E> {
                 match self.engine.submit(request) {
                     Ok(()) => {
                         self.counters.submitted += 1;
-                        let _ = events.send(Output::Accepted);
+                        let _ = events.try_send(Output::Accepted);
                         self.live.insert(
                             id,
                             Live {
@@ -371,7 +394,7 @@ impl<E: Executor> Worker<E> {
                     }
                     Err(e) => {
                         self.counters.rejected += 1;
-                        let _ = events.send(Output::Rejected(e));
+                        let _ = events.try_send(Output::Rejected(e));
                     }
                 }
             }
@@ -397,16 +420,22 @@ impl<E: Executor> Worker<E> {
             None
         };
         live.reported_cached |= cached.is_some();
-        let sent = live.events.send(Output::Tokens {
+        let sent = live.events.try_send(Output::Tokens {
             tokens: ev.tokens,
             cached_prompt_tokens: cached,
             finish: ev.finish,
         });
         if ev.finish.is_some() {
+            // Finished either way; a full buffer just means the reader misses the end
+            // (its channel closes now, so it sees an error after draining).
             self.live.remove(&ev.id);
             self.counters.finished += 1;
-        } else if sent.is_err() {
-            // The reader is gone (its guard's cancel may still be in flight).
+        } else if let Err(e) = sent {
+            // The reader is gone (its guard's cancel may still be in flight), or has
+            // stopped reading: cut it off, which also closes its channel.
+            if matches!(e, mpsc::error::TrySendError::Full(_)) {
+                self.counters.cut_off += 1;
+            }
             self.live.remove(&ev.id);
             self.engine.cancel(ev.id, now);
             self.counters.cancelled += 1;
@@ -416,7 +445,7 @@ impl<E: Executor> Worker<E> {
     fn fail(mut self) {
         tracing::error!("executor failure; the engine has stopped");
         for (_, live) in self.live.drain() {
-            let _ = live.events.send(Output::Failed);
+            let _ = live.events.try_send(Output::Failed);
         }
         self.publish();
     }

@@ -148,27 +148,33 @@ impl LoadedModel {
     /// refuses unless it equals `expected` (lowercase hex), and only then loads the
     /// weights and chat artifacts.
     pub fn load(dir: &Path, expected: &str, storage: WeightsStorage) -> Result<Self, ModelError> {
+        // Storage first, before any weights file is opened, mapped or parsed: the
+        // directory, then (from its listing, which reads only names) every file the node
+        // will read.
+        let verified = storage == WeightsStorage::VerifiedReadonly;
+        if verified {
+            crate::storage::require_immutable(dir)?;
+        }
+        let inventory = Inventory::list(dir)?;
+        if verified {
+            for name in inventory.all() {
+                crate::storage::require_immutable(&dir.join(name))?;
+            }
+        }
         let store = WeightSet::open_dir(dir)
             .map_err(|e| ModelError(format!("cannot open the weights: {e}")))?;
-        if store.file_names().is_empty() {
+        let mut opened: Vec<&str> = store.file_names();
+        opened.sort_unstable();
+        if opened
+            != inventory
+                .shards
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        {
             return Err(ModelError(
-                "no *.safetensors files in the weights directory".into(),
+                "the weights directory changed while it was being opened".into(),
             ));
-        }
-        if storage == WeightsStorage::VerifiedReadonly {
-            let mut paths = vec![dir.to_path_buf()];
-            for name in store.file_names() {
-                paths.extend(store.path_of(name).map(Path::to_path_buf));
-            }
-            for name in SEMANTIC_FILES.iter().chain(CHAT_FILES.iter()) {
-                let p = dir.join(name);
-                if p.exists() {
-                    paths.push(p);
-                }
-            }
-            for p in &paths {
-                require_read_only(p)?;
-            }
         }
         let mut manifest = store.sha256_manifest();
         if !manifest.contains_key("config.json") {
@@ -250,23 +256,58 @@ impl LoadedModel {
     }
 }
 
-/// Refuses unless `path` lives on a filesystem mounted read-only (`statvfs` reports
-/// `ST_RDONLY`; it follows symlinks, so the file's real filesystem is checked).
-pub fn require_read_only(path: &Path) -> Result<(), ModelError> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "the weights directory".into());
-    let stat = rustix::fs::statvfs(path)
-        .map_err(|e| ModelError(format!("cannot inspect the filesystem of {name}: {e}")))?;
-    if stat.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY) {
-        Ok(())
-    } else {
-        Err(ModelError(format!(
-            "{name} is on a writable filesystem; verified-readonly weights must be on a \
-             read-only mount"
-        )))
+/// The files the node will read from a weights directory, from its listing alone.
+struct Inventory {
+    /// `*.safetensors`, sorted by name.
+    shards: Vec<String>,
+    /// The semantic and chat files present.
+    others: Vec<String>,
+}
+
+impl Inventory {
+    /// Lists `dir`. Every entry's name must be UTF-8 (the manifest is keyed by exact
+    /// names, and the offline `sha256sum` procedure works on bytes): any other name is
+    /// refused here, before anything is hashed.
+    fn list(dir: &Path) -> Result<Self, ModelError> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| ModelError(format!("cannot list the weights directory: {}", e.kind())))?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                ModelError(format!("cannot list the weights directory: {}", e.kind()))
+            })?;
+            names.push(utf8_name(&entry.file_name())?.to_string());
+        }
+        let mut shards: Vec<String> = names
+            .iter()
+            .filter(|n| n.ends_with(".safetensors"))
+            .cloned()
+            .collect();
+        shards.sort_unstable();
+        if shards.is_empty() {
+            return Err(ModelError(
+                "no *.safetensors files in the weights directory".into(),
+            ));
+        }
+        let others = SEMANTIC_FILES
+            .iter()
+            .chain(CHAT_FILES.iter())
+            .filter(|n| names.iter().any(|m| m == *n))
+            .map(|n| n.to_string())
+            .collect();
+        Ok(Inventory { shards, others })
     }
+
+    fn all(&self) -> impl Iterator<Item = &str> {
+        self.shards.iter().chain(&self.others).map(String::as_str)
+    }
+}
+
+/// A directory entry's name, refused unless it is UTF-8.
+fn utf8_name(name: &std::ffi::OsStr) -> Result<&str, ModelError> {
+    name.to_str().ok_or_else(|| {
+        ModelError("the weights directory holds a file whose name is not UTF-8".into())
+    })
 }
 
 #[cfg(test)]
@@ -295,6 +336,18 @@ mod tests {
         assert!(canonical_manifest(&m).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_names_are_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let e = utf8_name(std::ffi::OsStr::from_bytes(b"\x80.safetensors")).unwrap_err();
+        assert!(e.to_string().contains("not UTF-8"), "{e}");
+        assert_eq!(
+            utf8_name(std::ffi::OsStr::new("a.safetensors")).unwrap(),
+            "a.safetensors"
+        );
+    }
+
     #[test]
     fn generation_defaults_are_validated() {
         let d = GenerationDefaults::parse(br#"{"temperature": 0.6, "top_p": 0.95}"#).unwrap();
@@ -303,27 +356,5 @@ mod tests {
         assert_eq!((d.temperature, d.top_p, d.top_k), (1.0, 1.0, 0));
         assert!(GenerationDefaults::parse(br#"{"top_p": 0}"#).is_err());
         assert!(GenerationDefaults::parse(br#"{"temperature": "hot"}"#).is_err());
-    }
-}
-
-#[cfg(test)]
-mod storage_tests {
-    use super::*;
-
-    #[test]
-    fn a_writable_directory_is_refused() {
-        let dir = std::env::temp_dir();
-        let e = require_read_only(&dir).unwrap_err();
-        assert!(e.to_string().contains("writable"), "{e}");
-    }
-
-    /// Run where a read-only mount is available (CI or a container: mount one and set
-    /// `EIDOLA_TEST_READ_ONLY_DIR`); skipped otherwise.
-    #[test]
-    fn a_read_only_mount_is_accepted() {
-        let Some(dir) = std::env::var_os("EIDOLA_TEST_READ_ONLY_DIR") else {
-            return;
-        };
-        require_read_only(Path::new(&dir)).unwrap();
     }
 }
