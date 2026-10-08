@@ -73,7 +73,7 @@ pub struct CudaExecutorConfig {
     /// by the checkpoint's MTP layer `d` (0 disables drafting; at most
     /// [`crate::support::MTP_LAYERS`]).
     pub draft_tokens: u32,
-    /// Which hidden state chains into the MTP depths.
+    /// Which of the target's hidden states every MTP depth conditions on.
     pub mtp_hidden: MtpHidden,
 }
 
@@ -391,6 +391,7 @@ impl CudaExecutor {
                     &gpu,
                     &ctx,
                     hidden,
+                    max_tokens,
                     cfg.sampleable_vocab_size,
                 )?,
                 ctx,

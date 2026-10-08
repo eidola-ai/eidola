@@ -234,14 +234,13 @@ pub fn sampler_rows(draft_tokens: u32) -> u64 {
 /// Rows of the hidden size (4,096 f32, 16 KiB) a drafting executor keeps
 /// per seat for `k` drafts: the slot's drafter state (every depth's level
 /// at each of the `k + 1` positions a step can leave it at), and the step's
-/// level rows (`draft::Levels`: `k` loaded, `k (k + 1) / 2` from the draft
-/// phase, `2 (k + 1)` write-only).
+/// level rows (`draft::Levels`: `k` loaded, `2 (k + 1) k` write-only).
 pub fn drafter_seat_rows(draft_tokens: u32) -> u64 {
     let k = u64::from(draft_tokens);
     if k == 0 {
         return 0;
     }
-    (k + 1) * k + k + k * (k + 1) / 2 + 2 * (k + 1)
+    (k + 1) * k + k + 2 * (k + 1) * k
 }
 
 /// Step-table bytes a drafting executor may hold per seat beside its global
@@ -269,7 +268,8 @@ pub const ROPE_DEVICE_BYTES_PER_POSITION: u64 = 3 * 64 * 4;
 /// 16 KiB, [`DRAFT_TABLE_SEAT_BYTES`], and the global page lists of a
 /// drafted step's table twice over (a graph's and an eager step's, one
 /// `i32` per block of `MAX_MODEL_LEN`). The MTP layers' own scratch (their
-/// copy lists, 36 bytes a token) is inside [`STEP_TOKEN_DEVICE_BYTES`]'s
+/// copy lists, 36 bytes a token) and the drafted step's copy of the target's
+/// states (one 16 KiB row a token) are inside [`STEP_TOKEN_DEVICE_BYTES`]'s
 /// rounding, and their weights inside the pack. Saturates.
 pub fn cuda_device_reserve_bytes(sizing: &Sizing) -> u64 {
     let blocks_per_seq =
@@ -1574,8 +1574,8 @@ mod tests {
         assert_eq!(reserve, 16_831_741_952);
         // A sampler row holds an f64 distribution over every id of the head.
         const { assert!(SAMPLER_ROW_DEVICE_BYTES >= 152_576 * 8) };
-        // Drafting three tokens: per seat 8 sampler rows, 29 rows of 16 KiB
-        // (12 of drafter state, 3 + 6 + 8 level rows), 32 KiB of step tables
+        // Drafting three tokens: per seat 8 sampler rows, 39 rows of 16 KiB
+        // (12 of drafter state, 3 + 24 level rows), 32 KiB of step tables
         // and two global page lists of 8,192 entries; and a third group's
         // block tables.
         let drafting = Sizing {
@@ -1583,13 +1583,13 @@ mod tests {
             ..sizing
         };
         assert_eq!(sampler_rows(3), 8);
-        assert_eq!(drafter_seat_rows(3), 29);
+        assert_eq!(drafter_seat_rows(3), 39);
         assert_eq!(
             cuda_device_reserve_bytes(&drafting),
             (4 << 30)
                 + 8192 * (5 << 18)
                 + 65_536 * (24 << 10)
-                + 64 * (8 * (5 << 18) + 29 * (16 << 10) + (32 << 10) + 8192 * 8)
+                + 64 * (8 * (5 << 18) + 39 * (16 << 10) + (32 << 10) + 8192 * 8)
                 + 64 * 8192 * 12
                 + 131_072 * 768
         );

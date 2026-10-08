@@ -3,11 +3,13 @@
 //! runs it.
 //!
 //! **Drafter row layout.** MTP depth `d`'s row at *slot* `s` consumes the token at `s`
-//! and chain level `d` at `s - 1` (level 0 is the main model's hidden state, level `d` is
-//! depth `d - 1`'s output), attends with RoPE position `s - 1`, and predicts the token at
-//! `s + 1`. Rows exist for `s >= d + 1`. Depth `d`'s KV at slot `s` therefore depends only
-//! on tokens `0 ..= s`, which is what lets drafter blocks be prefix-cached like target
-//! blocks. The draft for position `p + 1 + i` is depth `i`'s prediction at slot `p + i`.
+//! and the main model's hidden state at the *anchor* `a = s - 1 - d`, attends with RoPE
+//! position `a`, and predicts the token at `s + 1`; rows exist for `s >= d + 1`. In the
+//! vendor's own indexing (by anchor) that is MTP layer `d` combining `h_a` with the token
+//! `d + 1` past it, every layer conditioned on the main model's state rather than on the
+//! previous layer's output. Depth `d`'s KV at slot `s` therefore depends only on tokens
+//! `0 ..= s`, which is what lets drafter blocks be prefix-cached like target blocks. The
+//! draft for position `p + 1 + i` is depth `i`'s prediction at slot `p + i`.
 
 use eidola_engine::sampling::{self, Logits, SamplingParams};
 use eidola_engine_model::{ForwardOptions, LogitsAt, Matrix, ReferenceModel, Result};
@@ -64,24 +66,23 @@ impl DenseOracle<'_> {
             MtpHidden::Normed => normed.clone(),
             MtpHidden::PreNorm => hidden.clone(),
         };
-        // Level `d` for slots `d ..` (row `i` is slot `d + i`).
-        let mut level = pick(&fwd.hidden, &fwd.hidden_normed);
+        // The main model's state at every position: what every depth continues from.
+        let state = pick(&fwd.hidden, &fwd.hidden_normed);
         let mut drafter_logits = Vec::new();
         let len = tokens.len();
         for (d, &layer) in self.mtp_depths.iter().enumerate() {
             if len < d + 2 {
                 break;
             }
-            // Slots `d + 1 .. len`, continuing from level `d` at slots `d .. len - 1`.
+            // Slots `d + 1 .. len`, anchored at `0 .. len - 1 - d`.
             let slots: Vec<usize> = (d + 1..len).collect();
-            let prev = level.select_rows(&(0..slots.len()).collect::<Vec<_>>());
-            let positions: Vec<usize> = slots.iter().map(|s| s - 1).collect();
+            let anchors: Vec<usize> = slots.iter().map(|s| s - 1 - d).collect();
+            let prev = state.select_rows(&anchors);
             let toks: Vec<u32> = slots.iter().map(|&s| tokens[s]).collect();
             let out = self
                 .model
-                .mtp_forward(layer, &toks, &prev, &positions, &LogitsAt::All)?;
+                .mtp_forward(layer, &toks, &prev, &anchors, &LogitsAt::All)?;
             drafter_logits.push(out.logits);
-            level = pick(&out.hidden, &out.hidden_normed);
         }
         Ok(DenseRun {
             logits: fwd.logits,

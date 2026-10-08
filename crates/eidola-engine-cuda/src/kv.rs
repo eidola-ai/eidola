@@ -16,7 +16,7 @@
 //! exactly the positions a drafter row sees, one position per page (depth `d`
 //! has no KV below position `d + 1`, which a block's first page would
 //! otherwise expose). Beside the planes, every block holds a **boundary tap**:
-//! the drafter's chain levels at the block's last position, `taps` f32 rows
+//! the drafter's levels at the block's last position, `taps` f32 rows
 //! of `hidden` (`eidola-engine`'s executor contract). `Zero` and `Copy` of a
 //! drafter block touch its rows in every plane and its tap, and nothing else.
 //!

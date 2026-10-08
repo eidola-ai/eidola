@@ -537,11 +537,11 @@ impl GpuModel {
     }
 
     /// The f32 rows of `hidden` a forward leaves its states in, and the MTP
-    /// forward reads its previous level from: `(normed, pre-norm, mtp input)`
+    /// forward reads its hidden input from: `(normed, pre-norm, mtp input)`
     /// as `(device address, rows)`. After a forward, row `i` of the first is
     /// token `i`'s final-norm output and of the second its residual stream;
-    /// [`GpuModel::launch_mtp`] reads row `i` of the third as row `i`'s
-    /// previous chain level.
+    /// [`GpuModel::launch_mtp`] reads row `i` of the third as the target
+    /// state row `i` is anchored at.
     pub(crate) fn level_buffers(&self, s: &cudarc::driver::CudaStream) -> [(u64, usize); 3] {
         let h = self.weights.config.hidden_size;
         let sc = &self.scratch;
@@ -865,8 +865,8 @@ impl GpuModel {
     }
 
     /// MTP depth `depth`'s launches over `src.tokens` rows, from the input
-    /// projection to the head: row `i` reads its previous chain level from
-    /// row `i` of the MTP input buffer ([`GpuModel::level_buffers`]), which
+    /// projection to the head: row `i` reads the target state it is anchored
+    /// at from row `i` of the MTP input buffer ([`GpuModel::level_buffers`]), which
     /// the caller has filled, embeds its token, normalizes both (`hnorm`,
     /// `enorm`), interleaves them into `[e ‖ h]` rows (one bounded row
     /// copy), projects with `eh_proj`, and runs the layer: attention over the
@@ -921,7 +921,7 @@ impl GpuModel {
         let h = c.hidden_size;
         let (h32, t32): (u32, u32) = (narrow(h, "hidden size")?, narrow(t, "MTP rows")?);
         let eps = c.rms_norm_eps;
-        // 1. hnorm(previous level) and enorm(embedding), as BF16 rows of
+        // 1. hnorm(the anchored target state) and enorm(embedding), as BF16 rows of
         //    `hidden`, then interleaved into `[e ‖ h]` rows of `2 × hidden`.
         {
             let sc = &self.scratch;

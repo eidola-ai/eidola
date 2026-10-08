@@ -5,50 +5,54 @@
 //!
 //! # The drafter rows
 //!
-//! MTP depth `d`'s row at position `s` consumes the token at `s` and chain
-//! level `d` at `s - 1` (level 0 is the target's hidden state, level `d + 1`
-//! depth `d`'s output), uses RoPE position `s - 1`, writes its KV at `s` in
-//! the drafter group, and predicts the token at `s + 1`; rows exist for
-//! `s >= d + 1`. The draft for `p + 1 + i` (after the last host position `p`)
-//! is depth `i`'s prediction at `p + i`. Which hidden state a level is (the
-//! final-norm output or the residual stream before it) is [`MtpHidden`].
+//! MTP depth `d`'s row at position `s` consumes the token at `s` and the
+//! **target's** hidden state at the anchor `a = s - 1 - d`, uses RoPE
+//! position `a`, writes its KV at `s` in the drafter group, and predicts the
+//! token at `s + 1`; rows exist for `s >= d + 1`. The draft for `p + 1 + i`
+//! (after the last host position `p`) is depth `i`'s prediction at `p + i`,
+//! anchored at `p - 1` like every depth's. No depth reads another's output:
+//! that is how the model vendor serves its MTP layers (layer `d` at anchor
+//! `x` combines `h_x` with `t_{x+d+1}`; `eidola-engine-cpu/AGENTS.md` → MTP
+//! row layout). Level `l` at `x` names the target's state at `x - l` (zeros
+//! before position 0), so the slot state and the taps keep levels `0 .. D`
+//! at a position. Which hidden state that is (the final-norm output or the
+//! residual stream before it) is [`MtpHidden`].
 //!
 //! # One step
 //!
 //! A row that drafts has exactly one host token (a decode row: the serving
-//! core drafts only those), so everything its drafter needs at its host
-//! position comes from earlier steps, and the target runs once over the host
-//! tokens and the drafts together. The step, in launch order:
+//! core drafts only those), so everything its drafter needs comes from
+//! earlier steps (every draft row is anchored at or before `p - 1`), and the
+//! target runs once over the host tokens and the drafts together. The step,
+//! in launch order:
 //!
-//! 1. **Load**: every row's chain levels at `c - 1` (`c` its first host
-//!    position) are copied into the level buffer, from the slot's state when
-//!    it was left at `c - 1`, or from the boundary tap of the drafter block
-//!    ending at `c - 1` (a fresh slot after a prefix hit or a resume, which the
-//!    host makes only at block boundaries).
+//! 1. **Load**: every row's levels at `c - 1` (`c` its first host position)
+//!    are copied into the level buffer, from the slot's state when it was
+//!    left at `c - 1`, or from the boundary tap of the drafter block ending
+//!    at `c - 1` (a fresh slot after a prefix hit or a resume, which the host
+//!    makes only at block boundaries).
 //! 2. **Draft**, depth by depth for the drafting rows: depth `i` runs at `p`
 //!    and, while `i < k`, at the chain positions `p + 1 ..= p + i` (consuming
 //!    drafts `1 ..= i`); its logits at `p + i` give draft `i + 1`, drawn on
 //!    the device (stream `Draft` at position `p + 1 + i`, the argmax for
 //!    greedy rows), its distribution kept for acceptance.
 //! 3. **Verify**: the target over every row's host tokens and drafts, KV
-//!    written for all of them.
+//!    written for all of them. One copy launch then keeps its states for the
+//!    fill phase (the target buffer, since every MTP forward reuses the
+//!    forward scratch) and stores every level at each position the row may
+//!    continue from (`p ..= p + k`; the host knows after the step which) into
+//!    the slot's state, and at each block-final position into the block's
+//!    tap. A tap written for a rejected draft's position is rewritten when
+//!    that position is computed again, before its block can be sealed.
 //! 4. **Accept**: target distributions at `p ..= p + k` and chain acceptance
 //!    (the bonus or replacement token included); rows without drafts sample
 //!    their one token.
 //! 5. **Fill**: depth by depth, the drafter rows not computed yet: every
 //!    host position of rows without drafts, and `p + 1 ..= p + k` of drafting
-//!    rows (less the chain rows step 2 computed). Rows past the accepted
-//!    drafts write KV at positions the host reserved for drafts and are
-//!    rewritten when those positions are computed again.
-//!
-//! After each forward the levels it produced are stored: into the slot's
-//! state for positions `p ..= p + k` (the host knows after the step which of
-//! them the sequence continues from), into the boundary tap of every block
-//! whose last position the row covers, and, for draft-phase outputs, into the
-//! level buffer for the fill phase. A tap written for a rejected draft's
-//! position is rewritten when that position is computed again, before its
-//! block can be sealed. Levels that do not exist (level `l` at a position
-//! below `l`) are stored as zeros.
+//!    rows (less the chain rows step 2 computed), each anchored at a state
+//!    the target computed this step or at a loaded level. Rows past the
+//!    accepted drafts write KV at positions the host reserved for drafts and
+//!    are rewritten when those positions are computed again.
 //!
 //! # Device data
 //!
@@ -70,12 +74,10 @@ use eidola_engine::spec::AttentionKind;
 use crate::attention::AttnRequest;
 use crate::sampler::SampleRow;
 
-/// Which hidden state feeds an MTP depth: the target's into depth 0, and
-/// each depth's own output into the next.
+/// Which of the target's hidden states every MTP depth conditions on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MtpHidden {
-    /// The state after the final norm (the target's `norm`, each MTP layer's
-    /// `final_layernorm`): what vLLM and SGLang feed.
+    /// The state after the target's final `norm`: what vLLM and SGLang feed.
     #[default]
     Normed,
     /// The state before it: what llama.cpp feeds.
@@ -89,7 +91,7 @@ pub(crate) mod buf {
     pub const NORMED: u32 = 0;
     /// The last forward's residual stream.
     pub const PRENORM: u32 = 1;
-    /// The MTP forward's input: each row's previous chain level.
+    /// The MTP forward's input: the target state each row is anchored at.
     pub const INPUT: u32 = 2;
     /// The step's level rows ([`super::Levels`]).
     pub const LEVELS: u32 = 3;
@@ -99,6 +101,8 @@ pub(crate) mod buf {
     pub const TAPS: u32 = 5;
     /// The step table, one word per row (token copies).
     pub const TABLE: u32 = 6;
+    /// The target's states over the step's tokens ([`super::DraftBuffers`]).
+    pub const TARGET: u32 = 7;
 }
 
 /// Row `level` of `entry` of `slot`'s state: entry `j` holds the levels at
@@ -113,9 +117,8 @@ pub(crate) fn tap_row(depths: u32, block: u32, level: u32) -> u32 {
 }
 
 /// The level buffer's rows, for at most `rows` rows a step and `depths`
-/// draft depths: a zero row, each row's loaded levels, each drafting row's
-/// draft-phase outputs per depth, and write-only rows padding and graph steps
-/// store into instead of a tap or a state row.
+/// draft depths: a zero row, each row's loaded levels, and write-only rows
+/// padding and graph steps store into instead of a tap or a state row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Levels {
     pub rows: u32,
@@ -130,25 +133,15 @@ impl Levels {
         1 + r * self.depths + level
     }
 
-    fn pre_base(&self, depth: u32) -> u32 {
-        // Depth i keeps i + 1 rows per drafting row.
-        1 + self.rows * self.depths + self.rows * depth * (depth + 1) / 2
-    }
-
-    /// Depth `depth`'s output at position `p + j` of drafting row `rd`.
-    pub fn pre(&self, rd: u32, depth: u32, j: u32) -> u32 {
-        self.pre_base(depth) + rd * (depth + 1) + j
-    }
-
     /// The first write-only row.
     pub fn dummy(&self) -> u32 {
-        self.pre_base(self.depths)
+        1 + self.rows * self.depths
     }
 
-    /// Write-only rows one store launch can need: two per item of a
-    /// forward over at most `depths + 1` positions of every row.
+    /// Write-only rows the store launch can need: two per level of each of
+    /// at most `depths + 1` positions of every row.
     pub fn dummies(&self) -> u32 {
-        2 * self.rows * (self.depths + 1)
+        2 * self.rows * (self.depths + 1) * self.depths
     }
 
     /// Every row.
@@ -286,7 +279,8 @@ pub(crate) enum Op {
         width: Width,
         items: Vec<CopyItem>,
     },
-    /// MTP depth `depth` over rows (positions are RoPE positions, `s - 1`).
+    /// MTP depth `depth` over rows (positions are RoPE positions, the
+    /// anchors `s - 1 - depth`).
     Mtp {
         depth: u32,
         tokens: Vec<u32>,
@@ -398,7 +392,6 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
         );
     }
     let mut ops: Vec<Op> = Vec::new();
-    let mut dummies = 0u32;
     let dummy = |dummies: &mut u32| {
         let at = lv.dummy() + *dummies;
         *dummies += 1;
@@ -444,48 +437,6 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
     }
     push_copy(&mut ops, Width::Hidden, items);
 
-    // Stores of `level` for one forward's items (`(row, position, item)`),
-    // in one launch with `extra` items.
-    let stores = |ops: &mut Vec<Op>,
-                  dummies: &mut u32,
-                  level: u32,
-                  items: &[(usize, u32, u32)],
-                  pre: Option<u32>,
-                  extra: Vec<CopyItem>| {
-        *dummies = 0;
-        let mut out = extra;
-        for &(r, x, n) in items {
-            let row = &rows[r];
-            let p = row.p();
-            let src = Loc::Buf(level_buf, n);
-            if let (Some(depth), Some(rd)) = (pre, rd_of[r]) {
-                out.push(CopyItem {
-                    src,
-                    dst: Loc::Buf(buf::LEVELS, lv.pre(rd, depth, x - p)),
-                });
-            }
-            if level >= d_count {
-                continue;
-            }
-            let in_state = x >= p && x <= p + row.k;
-            if in_state {
-                out.push(CopyItem {
-                    src,
-                    dst: state_at(row, x - p, level).unwrap_or_else(|| dummy(dummies)),
-                });
-            }
-            match tap_at(row, x, level) {
-                Some(dst) => out.push(CopyItem { src, dst }),
-                None if in_state && (ctx.graph || row.slot.is_none()) => out.push(CopyItem {
-                    src,
-                    dst: dummy(dummies),
-                }),
-                None => {}
-            }
-        }
-        push_copy(ops, Width::Hidden, out);
-    };
-
     // The drafter's KV request for one row's run of queries at `first ..=
     // last` of depth `depth`: one-position pages from the first position its
     // first query sees (and depth `depth` has, `depth + 1` on) to `last`.
@@ -505,7 +456,9 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
     };
     let mtp_page_bound = ctx.drafter_window - 1 + d_count + 1;
 
-    // 2. Draft: depth i at p and the chain positions p + 1 ..= p + i (i < k).
+    // 2. Draft: depth i at p and the chain positions p + 1 ..= p + i (i < k),
+    // every row anchored at or before c - 1 = p - 1, so its target state is
+    // a loaded level.
     for i in 0..d_count {
         let mut items: Vec<(usize, u32, u32)> = Vec::new();
         let mut hp = Vec::new();
@@ -528,12 +481,9 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
                 let n = u32::try_from(items.len()).expect("items fit u32");
                 items.push((r, s, n));
                 let r32 = u32::try_from(r).expect("rows fit u32");
+                // The anchor s - 1 - i is p - 1 - (i - j): level i - j at p - 1.
                 hp.push(CopyItem {
-                    src: if j == 0 {
-                        Loc::Buf(buf::LEVELS, lv.load(r32, i))
-                    } else {
-                        Loc::Buf(buf::LEVELS, lv.pre(rd, i - 1, j - 1))
-                    },
+                    src: Loc::Buf(buf::LEVELS, lv.load(r32, i - j)),
                     dst: Loc::Buf(buf::INPUT, n),
                 });
                 if j == 0 {
@@ -545,7 +495,7 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
                         dst: Loc::Tokens(op_index, n),
                     });
                 }
-                positions.push(s - 1);
+                positions.push(s - 1 - i);
                 kv_rows.push(kv.drafter_row(row.slot, s, true));
             }
             let end = u32::try_from(items.len()).expect("items fit u32");
@@ -603,14 +553,6 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
                 tokens: TokenOut::Lane(i),
             });
         }
-        stores(
-            &mut ops,
-            &mut dummies,
-            i + 1,
-            &items,
-            (i + 1 < d_count).then_some(i),
-            Vec::new(),
-        );
     }
 
     // 3. Verify: the target over host tokens and drafts.
@@ -686,28 +628,51 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
         logit_rows: logit_rows.clone(),
         final_norm: ctx.hidden == MtpHidden::Normed,
     });
-    // Level 0 stores, and the zeros of levels that do not exist.
-    let mut zeros = Vec::new();
-    for row in rows {
-        let p = row.p();
-        for x in row.c..=p + row.k {
-            for l in 1..d_count {
-                if x >= l {
-                    continue;
-                }
-                let src = Loc::Buf(buf::LEVELS, Levels::ZERO);
-                if x >= p
-                    && let Some(dst) = state_at(row, x - p, l)
-                {
-                    zeros.push(CopyItem { src, dst });
-                }
-                if let Some(dst) = tap_at(row, x, l) {
-                    zeros.push(CopyItem { src, dst });
-                }
+    // The target's states, in one launch: every computed position's state
+    // into the target buffer the fill phase reads (the MTP forwards reuse
+    // the forward scratch), and every level at each position the row may
+    // continue from (`p ..= p + k`) or that ends a block into the slot's
+    // state and the block's tap. Level `l` at `x` is the target's state at
+    // `x - l`: this forward's when `x - l >= c`, a loaded level below it,
+    // zeros before position 0.
+    let mut out = Vec::new();
+    let mut dummies = 0u32;
+    for &(r, x, n) in &target_items {
+        out.push(CopyItem {
+            src: Loc::Buf(level_buf, n),
+            dst: Loc::Buf(buf::TARGET, n),
+        });
+        let row = &rows[r];
+        let (c, p) = (row.c, row.p());
+        let in_state = x >= p && x <= p + row.k;
+        let tap = (x + 1).is_multiple_of(bs);
+        if !in_state && !(tap && row.slot.is_some()) {
+            continue;
+        }
+        let r32 = u32::try_from(r).expect("rows fit u32");
+        for l in 0..d_count {
+            let src = match x.checked_sub(l) {
+                None => Loc::Buf(buf::LEVELS, Levels::ZERO),
+                Some(a) if a >= c => Loc::Buf(level_buf, n - l),
+                Some(a) => Loc::Buf(buf::LEVELS, lv.load(r32, c - 1 - a)),
+            };
+            if in_state {
+                out.push(CopyItem {
+                    src,
+                    dst: state_at(row, x - p, l).unwrap_or_else(|| dummy(&mut dummies)),
+                });
+            }
+            match tap_at(row, x, l) {
+                Some(dst) => out.push(CopyItem { src, dst }),
+                None if in_state && (ctx.graph || row.slot.is_none()) => out.push(CopyItem {
+                    src,
+                    dst: dummy(&mut dummies),
+                }),
+                None => {}
             }
         }
     }
-    stores(&mut ops, &mut dummies, 0, &target_items, None, zeros);
+    push_copy(&mut ops, Width::Hidden, out);
 
     // 4. Accept, and plain samples.
     let mut out = vec![RowOut::None; rows.len()];
@@ -773,8 +738,8 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
         });
     }
 
-    // 5. Fill: the drafter rows not computed yet, depth by depth.
-    let mut prev: Vec<(usize, u32, u32)> = Vec::new();
+    // 5. Fill: the drafter rows not computed yet, depth by depth, each
+    // anchored at a position this step's target computed or a loaded level.
     for d in 0..d_count {
         let mut items: Vec<(usize, u32, u32)> = Vec::new();
         let mut hp = Vec::new();
@@ -788,12 +753,6 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
                 .find(|&&(rr, xx, _)| rr == r && xx == x)
                 .map(|&(_, _, n)| n)
                 .expect("the target computed this position")
-        };
-        let prev_n = |r: usize, x: u32| -> u32 {
-            prev.iter()
-                .find(|&&(rr, xx, _)| rr == r && xx == x)
-                .map(|&(_, _, n)| n)
-                .expect("the previous fill depth computed this position")
         };
         for (r, row) in rows.iter().enumerate() {
             let r32 = u32::try_from(r).expect("rows fit u32");
@@ -816,17 +775,11 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
             for s in lo..=hi {
                 let n = u32::try_from(items.len()).expect("items fit u32");
                 items.push((r, s, n));
-                let x = s - 1;
-                let src = match rd_of[r] {
-                    None if s == row.c => Loc::Buf(buf::LEVELS, lv.load(r32, d)),
-                    None if d == 0 => Loc::Buf(level_buf, target_n(r, x)),
-                    None => Loc::Buf(level_buf, prev_n(r, x)),
-                    Some(_) if d == 0 => Loc::Buf(level_buf, target_n(r, x)),
-                    Some(rd) if x == p => Loc::Buf(buf::LEVELS, lv.pre(rd, d - 1, 0)),
-                    Some(rd) if x - p <= done(d - 1) => {
-                        Loc::Buf(buf::LEVELS, lv.pre(rd, d - 1, x - p))
-                    }
-                    Some(_) => Loc::Buf(level_buf, prev_n(r, x)),
+                let a = s - 1 - d;
+                let src = if a >= row.c {
+                    Loc::Buf(buf::TARGET, target_n(r, a))
+                } else {
+                    Loc::Buf(buf::LEVELS, lv.load(r32, row.c - 1 - a))
                 };
                 hp.push(CopyItem {
                     src,
@@ -841,13 +794,12 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
                         dst: Loc::Tokens(op_index, n),
                     });
                 }
-                positions.push(s - 1);
+                positions.push(a);
                 kv_rows.push(kv.drafter_row(row.slot, s, true));
             }
             requests.push(mtp_request(row, d, start, lo, hi));
         }
         if items.is_empty() {
-            prev = items;
             continue;
         }
         push_copy(&mut ops, Width::Hidden, hp);
@@ -865,8 +817,6 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
             page_bound: mtp_page_bound,
             logit_rows: Vec::new(),
         });
-        stores(&mut ops, &mut dummies, d + 1, &items, None, Vec::new());
-        prev = items;
     }
     Plan {
         ops,
@@ -1453,10 +1403,11 @@ pub(crate) fn split(words: &[u32], cap_rows: u32, depths: u32) -> Readback<'_> {
 }
 
 /// What drafted steps keep on the device besides the KV store and the
-/// model's scratch, allocated once: the level rows, the sampler's
-/// distributions, and the read-back.
+/// model's scratch, allocated once: the level rows, the target's states over
+/// a step's tokens, the sampler's distributions, and the read-back.
 pub(crate) struct DraftBuffers {
     pub levels: cudarc::driver::CudaSlice<f32>,
+    pub target: cudarc::driver::CudaSlice<f32>,
     pub probs: cudarc::driver::CudaSlice<f64>,
     pub readback: cudarc::driver::CudaSlice<u32>,
 }
@@ -1466,6 +1417,7 @@ impl DraftBuffers {
         gpu: &crate::Gpu,
         ctx: &PlanCtx,
         hidden: usize,
+        max_tokens: usize,
         sampleable: u32,
     ) -> crate::Result<Self> {
         let overflow = || crate::CudaError::new("drafted step buffers overflow");
@@ -1480,6 +1432,7 @@ impl DraftBuffers {
                     .checked_mul(hidden)
                     .ok_or_else(overflow)?,
             )?,
+            target: s.alloc_zeros(max_tokens.checked_mul(hidden).ok_or_else(overflow)?)?,
             probs: s.alloc_zeros(
                 (probs_rows(ctx.cap_rows, ctx.depths) as usize)
                     .checked_mul(sampleable as usize)
@@ -1621,6 +1574,10 @@ pub(crate) unsafe fn run(
                         taps.map_or((0, 0), |t| (dptr(t, &s), rows(t.len()))),
                     ),
                     (buf::TABLE, (table, table_rows)),
+                    (
+                        buf::TARGET,
+                        (dptr(&a.bufs.target, &s), rows(a.bufs.target.len())),
+                    ),
                 ] {
                     args.buf[b as usize] = base;
                     args.rows[b as usize] = n;
@@ -2105,10 +2062,11 @@ impl DraftGraphs {
 mod tests {
     //! The planner, layout, packing and launch list, run on the host by an
     //! emulator that executes a packed table's launches symbolically: every
-    //! hidden row is a tag naming which chain level of which row at which
-    //! position it holds, every token a host token or a named draft. The
-    //! emulator checks each forward's inputs (the previous level at `s - 1`,
-    //! the token at `s`, the RoPE position, the KV row, the attention pages)
+    //! hidden row is a tag naming whose state at which position it holds
+    //! (the target's, or an MTP depth's output), every token a host token or
+    //! a named draft. The emulator checks each forward's inputs (the
+    //! target's state at the anchor `s - 1 - d`, the token at `s`, the RoPE
+    //! position, the KV row, the attention pages)
     //! and the state and taps the step leaves, against the definition in the
     //! module docs.
 
@@ -2119,10 +2077,16 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     enum V {
         Zero,
-        /// Level `level` of row `row` at position `pos`.
-        L {
+        /// The target's state of row `row` at position `pos`.
+        H {
             row: usize,
-            level: u32,
+            pos: u32,
+        },
+        /// MTP depth `depth`'s output for row `row` at slot `pos` (feeds
+        /// nothing but its logits).
+        M {
+            row: usize,
+            depth: u32,
             pos: u32,
         },
         /// A padding row's level (never checked against anything real).
@@ -2234,15 +2198,15 @@ mod tests {
             accepts: 0,
             plain_samples: 0,
         };
-        // Seed what loads read: each real row's levels at c - 1.
+        // Seed what loads read: each real row's levels at c - 1 (level `l`
+        // the target's state at `c - 1 - l`).
         w.rows.insert((buf::LEVELS, Levels::ZERO), V::Zero);
         for (r, row) in rows.iter().enumerate() {
             for l in 0..d_count {
                 let v = if row.c > l {
-                    V::L {
+                    V::H {
                         row: r,
-                        level: l,
-                        pos: row.c - 1,
+                        pos: row.c - 1 - l,
                     }
                 } else {
                     V::Zero
@@ -2351,8 +2315,9 @@ mod tests {
                     op_rows.clear();
                     for n in 0..t {
                         // Which row: the one whose drafter rows hold this KV
-                        // row (padding rows share the pad block).
-                        let s = pos[n] + 1;
+                        // row (padding rows share the pad block), at the
+                        // slot its RoPE position (the anchor) implies.
+                        let s = pos[n] + 1 + depth;
                         let (r, row) = rows
                             .iter()
                             .enumerate()
@@ -2367,14 +2332,9 @@ mod tests {
                         let input = w.rows[&(buf::INPUT, u32::try_from(n).unwrap())];
                         if row.slot.is_some() {
                             assert!(s > *depth, "depth {depth} row at {s}");
-                            let want = if s > *depth {
-                                V::L {
-                                    row: r,
-                                    level: *depth,
-                                    pos: s - 1,
-                                }
-                            } else {
-                                V::Zero
+                            let want = V::H {
+                                row: r,
+                                pos: s - 1 - depth,
                             };
                             assert_eq!(input, want, "depth {depth} row {r} at {s}: input");
                             let p = row.p();
@@ -2389,9 +2349,9 @@ mod tests {
                         outs.insert(
                             u32::try_from(n).unwrap(),
                             if row.slot.is_some() {
-                                V::L {
+                                V::M {
                                     row: r,
-                                    level: depth + 1,
+                                    depth: *depth,
                                     pos: s,
                                 }
                             } else {
@@ -2455,11 +2415,7 @@ mod tests {
                             outs.insert(
                                 u32::try_from(n).unwrap(),
                                 if row.slot.is_some() {
-                                    V::L {
-                                        row: r,
-                                        level: 0,
-                                        pos: x,
-                                    }
+                                    V::H { row: r, pos: x }
                                 } else {
                                     V::Pad
                                 },
@@ -2651,11 +2607,7 @@ mod tests {
             let p = row.p();
             let lv = |l: u32, x: u32| {
                 if x >= l {
-                    V::L {
-                        row: r,
-                        level: l,
-                        pos: x,
-                    }
+                    V::H { row: r, pos: x - l }
                 } else {
                     V::Zero
                 }
@@ -2796,7 +2748,7 @@ mod tests {
 
     /// Pre-norm chaining reads the residual stream's rows.
     #[test]
-    fn pre_norm_chains_the_residual_stream() {
+    fn pre_norm_feeds_the_residual_stream() {
         let kv = FakeKv { bs: 4 };
         let mut c = ctx(3, 4, 4, false);
         c.hidden = MtpHidden::PreNorm;
