@@ -364,6 +364,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let tls_roots = tls_roots.clone();
             let snp_observer = snp_observer.clone();
             Box::pin(async move {
+                // The router's release records pin SEV-SNP only.
+                let allowed: Vec<tinfoil_verifier::AllowedMeasurement> = allowed
+                    .iter()
+                    .map(tinfoil_verifier::AllowedMeasurement::from)
+                    .collect();
                 tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
                     allowed_measurements: allowed.as_slice(),
                     inference_base_url: &inference_base_url,

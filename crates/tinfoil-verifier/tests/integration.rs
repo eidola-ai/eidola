@@ -11,56 +11,10 @@ const LIVE_ATTESTATION_URL: &str = "https://inference.tinfoil.sh/.well-known/tin
 
 fn synthetic_document() -> Vec<u8> {
     let b64 = &base64::engine::general_purpose::STANDARD;
-    let nonce = [0x47; 32];
-    let tls = [0x19; 32];
-    let hpke = [0x45; 32];
-    let crypto = serde_json::to_vec(&serde_json::json!({
-        "format": "https://tinfoil.sh/crypto-material/v1",
-        "items": [
-            {
-                "id": "tls",
-                "format": "https://tinfoil.sh/key/spki-fp-sha256/v1",
-                "data": hex::encode(tls),
-            },
-            {
-                "id": "hpke",
-                "format": "https://tinfoil.sh/key/x25519-hpke/v1",
-                "data": hex::encode(hpke),
-            },
-        ],
-    }))
-    .unwrap();
-    let devices = br#"{"format":"https://tinfoil.sh/device-evidence/v1","items":[]}"#;
-    let crypto_hash: [u8; 32] = Sha256::digest(&crypto).into();
-    let device_hash: [u8; 32] = Sha256::digest(devices).into();
-    let mut digest = Sha256::new();
-    digest.update(b"https://tinfoil.sh/report-data/v1");
-    digest.update(nonce);
-    digest.update(crypto_hash);
-    digest.update(device_hash);
-    let mut report_data = [0u8; 64];
-    report_data[..32].copy_from_slice(&digest.finalize());
-    let mut report = vec![0u8; 1184];
-    report[0x50..0x90].copy_from_slice(&report_data);
-
-    serde_json::to_vec(&serde_json::json!({
-        "format": "https://tinfoil.sh/predicate/attestation/v3",
-        "challenge": {
-            "nonce": hex::encode(nonce),
-            "report_data": hex::encode(report_data),
-            "report_data_algorithm": "https://tinfoil.sh/report-data/v1",
-        },
-        "cpu_evidence": {
-            "format": "https://tinfoil.sh/format/sev-snp-report/v1",
-            "report_base64": b64.encode(report),
-            "endorsed": {
-                "crypto_material_hash": hex::encode(crypto_hash),
-                "device_evidence_hash": hex::encode(device_hash),
-            },
-        },
-        "crypto_material": b64.encode(crypto),
-        "device_evidence": b64.encode(devices),
-        "collateral": [
+    synthetic_document_with(
+        "https://tinfoil.sh/format/sev-snp-report/v1",
+        vec![0u8; 1184],
+        serde_json::json!([
             {
                 "id": "cpu-endorsement",
                 "role": "endorsement",
@@ -81,7 +35,68 @@ fn synthetic_document() -> Vec<u8> {
                 "subjects": ["cpu"],
                 "data": {"crl_der_base64": b64.encode([4, 5, 6])},
             },
+        ]),
+        br#"{"format":"https://tinfoil.sh/device-evidence/v1","items":[]}"#,
+    )
+}
+
+fn synthetic_document_with(
+    cpu_format: &str,
+    mut report: Vec<u8>,
+    collateral: serde_json::Value,
+    devices: &[u8],
+) -> Vec<u8> {
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let nonce = [0x47; 32];
+    let tls = [0x19; 32];
+    let hpke = [0x45; 32];
+    let crypto = serde_json::to_vec(&serde_json::json!({
+        "format": "https://tinfoil.sh/crypto-material/v1",
+        "items": [
+            {
+                "id": "tls",
+                "format": "https://tinfoil.sh/key/spki-fp-sha256/v1",
+                "data": hex::encode(tls),
+            },
+            {
+                "id": "hpke",
+                "format": "https://tinfoil.sh/key/x25519-hpke/v1",
+                "data": hex::encode(hpke),
+            },
         ],
+    }))
+    .unwrap();
+    let crypto_hash: [u8; 32] = Sha256::digest(&crypto).into();
+    let device_hash: [u8; 32] = Sha256::digest(devices).into();
+    let mut digest = Sha256::new();
+    digest.update(b"https://tinfoil.sh/report-data/v1");
+    digest.update(nonce);
+    digest.update(crypto_hash);
+    digest.update(device_hash);
+    let mut report_data = [0u8; 64];
+    report_data[..32].copy_from_slice(&digest.finalize());
+    if report.len() >= 0x90 {
+        report[0x50..0x90].copy_from_slice(&report_data);
+    }
+
+    serde_json::to_vec(&serde_json::json!({
+        "format": "https://tinfoil.sh/predicate/attestation/v3",
+        "challenge": {
+            "nonce": hex::encode(nonce),
+            "report_data": hex::encode(report_data),
+            "report_data_algorithm": "https://tinfoil.sh/report-data/v1",
+        },
+        "cpu_evidence": {
+            "format": cpu_format,
+            "report_base64": b64.encode(report),
+            "endorsed": {
+                "crypto_material_hash": hex::encode(crypto_hash),
+                "device_evidence_hash": hex::encode(device_hash),
+            },
+        },
+        "crypto_material": b64.encode(crypto),
+        "device_evidence": b64.encode(devices),
+        "collateral": collateral,
     }))
     .unwrap()
 }
@@ -136,6 +151,97 @@ fn v3_envelope_rejects_malformed_amd_certificate_chain() {
     assert!(err.to_string().contains("outside CERTIFICATE blocks"));
 }
 
+fn tdx_document(responses: serde_json::Value, devices: &[u8]) -> Vec<u8> {
+    synthetic_document_with(
+        "https://tinfoil.sh/format/tdx-quote/v1",
+        b"quote bytes".to_vec(),
+        serde_json::json!([{
+            "id": "cpu-endorsement",
+            "role": "endorsement",
+            "format": "https://tinfoil.sh/collateral/intel-pcs/v1",
+            "subjects": ["cpu"],
+            "data": {"responses": responses},
+        }]),
+        devices,
+    )
+}
+
+#[test]
+fn tdx_envelope_carries_captured_intel_pcs_responses() {
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let raw = tdx_document(
+        serde_json::json!([
+            {
+                "url": "https://api.trustedservices.intel.com/tdx/certification/v4/qe/identity",
+                "headers": {"SGX-Enclave-Identity-Issuer-Chain": ["chain"]},
+                "body_base64": b64.encode(b"{}"),
+            },
+            {
+                "url": "https://certificates.trustedservices.intel.com/IntelSGXRootCA.der",
+                "headers": null,
+                "body_base64": b64.encode([0x30, 0x00]),
+            },
+            {
+                "url": "https://api.trustedservices.intel.com/sgx/certification/v4/pckcrl?ca=platform&encoding=der",
+                "body_base64": b64.encode([0x30, 0x01]),
+            },
+        ]),
+        br#"{"format":"https://tinfoil.sh/device-evidence/v1","items":[{"id":"gpu0","kind":"gpu","vendor":"nvidia","format":"https://tinfoil.sh/format/nvidia-gpu-evidence/v1","evidence":{"arch":"HOPPER","certificate":"","evidence":"","nonce":"00"}}]}"#,
+    );
+    let resolved = tinfoil_verifier::bundle::parse_document(&raw).expect("valid TDX envelope");
+    assert_eq!(resolved.platform, tinfoil_verifier::Platform::Tdx);
+    assert_eq!(resolved.report_bytes, b"quote bytes");
+    assert!(resolved.vcek_der.is_none());
+    let pcs = resolved.intel_pcs.expect("intel-pcs collateral");
+    assert_eq!(pcs.len(), 3);
+    assert_eq!(pcs[0].body, b"{}");
+    assert_eq!(
+        pcs[0].headers,
+        vec![(
+            "SGX-Enclave-Identity-Issuer-Chain".to_string(),
+            vec!["chain".to_string()]
+        )]
+    );
+    assert!(pcs[1].headers.is_empty());
+    assert!(pcs[2].headers.is_empty());
+    assert_eq!(resolved.device_evidence.len(), 1);
+    assert_eq!(resolved.device_evidence[0].id, "gpu0");
+}
+
+#[test]
+fn tdx_envelope_requires_strict_intel_pcs_collateral() {
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let devices = br#"{"format":"https://tinfoil.sh/device-evidence/v1","items":[]}"#;
+    let cases = [
+        (
+            serde_json::json!([{"url": "u", "body_base64": b64.encode([1]), "status": 200}]),
+            "unknown field",
+        ),
+        (
+            serde_json::json!([{"url": "u", "body_base64": "AQ"}]),
+            "body_base64",
+        ),
+        (serde_json::json!([{"url": "u"}]), "missing field"),
+    ];
+    for (responses, needle) in cases {
+        let err = tinfoil_verifier::bundle::parse_document(&tdx_document(responses, devices))
+            .err()
+            .expect(needle)
+            .to_string();
+        assert!(err.contains(needle), "{needle}: {err}");
+    }
+
+    // A TDX document must carry intel-pcs collateral for the CPU.
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&tdx_document(serde_json::json!([]), devices)).unwrap();
+    doc["collateral"][0]["subjects"] = serde_json::json!(["gpu0"]);
+    let err = tinfoil_verifier::bundle::parse_document(&serde_json::to_vec(&doc).unwrap())
+        .err()
+        .expect("no CPU collateral")
+        .to_string();
+    assert!(err.contains("no intel-pcs endorsement"), "{err}");
+}
+
 /// Full connector path against a locally running `tinfoil-shim-mock`.
 #[tokio::test]
 async fn mock_attesting_client_e2e() {
@@ -163,13 +269,9 @@ async fn mock_attesting_client_e2e() {
         )))
         .expect("add tls-ca");
 
-    let allowed = vec![tinfoil_verifier::EnclaveMeasurement {
-        snp_measurement: "00".repeat(48),
-        tdx_measurement: tinfoil_verifier::TdxMeasurement {
-            rtmr1: "0".repeat(96),
-            rtmr2: "0".repeat(96),
-        },
-    }];
+    let allowed = vec![tinfoil_verifier::AllowedMeasurement::sev_snp(
+        "00".repeat(48),
+    )];
     let client = tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
         allowed_measurements: &allowed,
         inference_base_url: &base_url,
@@ -244,13 +346,9 @@ async fn live_attesting_client() {
             .await
             .expect("fetch live measurement");
     let report = tinfoil_verifier::sevsnp::parse_report(&resolved.report_bytes).unwrap();
-    let allowed = vec![tinfoil_verifier::EnclaveMeasurement {
-        snp_measurement: hex::encode(report.measurement),
-        tdx_measurement: tinfoil_verifier::TdxMeasurement {
-            rtmr1: "0".repeat(96),
-            rtmr2: "0".repeat(96),
-        },
-    }];
+    let allowed = vec![tinfoil_verifier::AllowedMeasurement::sev_snp(hex::encode(
+        report.measurement,
+    ))];
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let client = tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
