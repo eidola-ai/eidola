@@ -279,14 +279,22 @@ impl<'de> serde::Deserialize<'de> for Canonical {
                 self,
                 mut map: A,
             ) -> Result<Canonical, A::Error> {
+                // Each key's position, so a repeated key is found in constant
+                // time: an opaque tool schema can carry any number of members.
                 let mut members: Vec<(String, Canonical)> = Vec::new();
+                let mut positions: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
                 while let Some((key, value)) = map.next_entry::<String, Canonical>()? {
-                    match members.iter_mut().find(|(k, _)| *k == key) {
-                        Some((_, previous)) => {
+                    match positions.get(&key) {
+                        Some(&i) => {
+                            let previous = &mut members[i].1;
                             previous.scrub();
                             *previous = value;
                         }
-                        None => members.push((key, value)),
+                        None => {
+                            positions.insert(key.clone(), members.len());
+                            members.push((key, value));
+                        }
                     }
                 }
                 Ok(Canonical::Object(members))
@@ -393,6 +401,106 @@ mod tests {
             r#"{"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"zeta":{"type":"number","default":1.0},"alpha":{"type":"integer","maximum":100.0,"description":"A"}}}}}],"model":"fixture-model","messages":[{"role":"user","content":"hi","name":"z"}],"temperature":0.5,"stream":true,"stream_options":{"include_usage":true},"cache_key":"_-0123456789abcdefghijklmnopqrstuvwxyzABCDE"}"#
         );
         serde_json::from_slice::<ChatCompletionRequest>(&body).unwrap();
+    }
+
+    /// The member-merging rule written the obvious way (scan the members
+    /// collected so far), as the reference the indexed implementation must
+    /// reproduce byte for byte.
+    fn reference(raw_members: &[(String, serde_json::Value)]) -> Vec<u8> {
+        let mut members: Vec<(String, Vec<u8>)> = Vec::new();
+        for (key, value) in raw_members {
+            let text = serde_json::to_vec(value).unwrap();
+            match members.iter_mut().find(|(k, _)| k == key) {
+                Some((_, previous)) => *previous = text,
+                None => members.push((key.clone(), text)),
+            }
+        }
+        let mut out = b"{".to_vec();
+        for (i, (key, text)) in members.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend(serde_json::to_vec(key).unwrap());
+            out.push(b':');
+            out.extend(text);
+        }
+        out.push(b'}');
+        out
+    }
+
+    /// An object's members as written, duplicates included, and its JSON text.
+    fn object_with_duplicates(n: usize, seed: u64) -> (Vec<(String, serde_json::Value)>, String) {
+        let mut state = seed;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut members = Vec::new();
+        for i in 0..n {
+            // About one member in four repeats an earlier key.
+            let key = if i > 0 && next() % 4 == 0 {
+                format!("k{}", next() % i as u64)
+            } else {
+                format!("k{i}")
+            };
+            let value = match next() % 3 {
+                0 => serde_json::json!(next() % 1000),
+                1 => serde_json::json!(format!("v{}", next() % 97)),
+                _ => serde_json::json!(1.5),
+            };
+            members.push((key, value));
+        }
+        let text = format!(
+            "{{{}}}",
+            members
+                .iter()
+                .map(|(k, v)| format!("{}:{}", serde_json::to_string(k).unwrap(), v))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        (members, text)
+    }
+
+    fn canonical(text: &str) -> Vec<u8> {
+        let value: Canonical = serde_json::from_str(text).unwrap();
+        let mut out = Vec::new();
+        value.write(&mut out);
+        out
+    }
+
+    /// The indexed merge produces exactly what the scanning rule produces:
+    /// same member order, first position, last value.
+    #[test]
+    fn indexed_member_merging_matches_the_scanning_rule() {
+        for seed in 1..=50u64 {
+            let (members, text) = object_with_duplicates(200, seed);
+            assert_eq!(canonical(&text), reference(&members), "seed {seed}");
+        }
+    }
+
+    /// Merging is linear in the number of members: a 200,000-member object
+    /// with repeated keys canonicalizes well inside a bound a quadratic scan
+    /// (about 10^10 key comparisons here) cannot meet.
+    #[test]
+    fn a_large_object_canonicalizes_in_linear_time() {
+        let (members, text) = object_with_duplicates(200_000, 7);
+        let started = std::time::Instant::now();
+        let out = canonical(&text);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "took {elapsed:?}"
+        );
+        let distinct = members
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let parsed: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.len(), distinct);
     }
 
     /// The bytes forwarded are the bytes priced: each forwarded tool schema
