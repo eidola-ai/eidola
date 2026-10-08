@@ -685,6 +685,55 @@ async fn admission_is_bounded() {
     assert!(admitted);
 }
 
+/// Bodies being read or parsed are bounded before admission: with every read slot held
+/// by an upload that never finishes, the next request is refused `overloaded` without
+/// its body being read, and the stalled upload holds no admission slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_bodies_is_bounded_before_admission() {
+    use std::io::Write;
+    let node = TestNode::start(&[(env::MAX_REQUESTS, "1")]).await;
+    let addr = node.base.strip_prefix("http://").unwrap();
+    let mut stalled = std::net::TcpStream::connect(addr).unwrap();
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\nauthorization: Bearer {TOKEN}\r\n\
+         x-eidola-weights-sha256: {}\r\ncontent-type: application/json\r\n\
+         content-length: 1000000\r\n\r\n{{\"model\":",
+        weights_hash()
+    );
+    stalled.write_all(head.as_bytes()).unwrap();
+
+    // Once the stalled upload holds the only read slot, a complete request is refused.
+    let mut refused = None;
+    for _ in 0..500 {
+        let (status, v) = node.chat_json(&request("hi", 1)).await;
+        if status == 503 {
+            refused = Some(v);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let v = refused.expect("a request was refused while every read slot was held");
+    assert_eq!(v["error"]["type"], "overloaded");
+    assert_eq!(
+        node.admission.in_flight(),
+        0,
+        "reading holds no admission slot"
+    );
+
+    // The upload going away frees its read slot.
+    drop(stalled);
+    let mut admitted = false;
+    for _ in 0..500 {
+        let (status, _) = node.chat_json(&request("hi", 1)).await;
+        if status == 200 {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(admitted);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cache_key_reuses_the_prefix_only_for_the_same_key() {
     let node = TestNode::start(&[]).await;

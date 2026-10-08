@@ -8,9 +8,16 @@
 //!
 //! A chat request is refused, in this order and before anything is admitted: a missing
 //! or wrong gateway token; a missing or different `X-Eidola-Weights-Sha256` (checked
-//! before the body is read); a body that is too large, malformed, outside the subset, or
-//! for another model; a full admission bound. Only then is the prompt rendered,
-//! tokenized and submitted.
+//! before the body is read); a full read bound (checked before the body is read); a body
+//! that is too large, malformed, outside the subset, or for another model; a full
+//! admission bound. Only then is the prompt rendered, tokenized and submitted.
+//!
+//! **Memory before the engine is bounded.** A request holds a slot of the read bound
+//! (`AppState::reading`, as many slots as the admission bound) from before its first
+//! body byte is read until it holds an admission permit or is refused, so at most
+//! `EIDOLA_ENGINE_MAX_REQUESTS` bodies (each at most [`MAX_BODY_BYTES`]) and their parses
+//! exist outside admission at once, and at most as many parsed requests inside it. With
+//! no read slot free a request is refused at once (`overloaded`), unread.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -53,6 +60,8 @@ pub struct AppState {
     pub salts: SaltDeriver,
     pub engine: EngineHandle,
     pub admission: Arc<Admission>,
+    /// The read bound: requests whose body is being read or parsed (module docs).
+    pub reading: Arc<Admission>,
 }
 
 /// The node's router.
@@ -143,12 +152,16 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
 
 async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiError> {
     check_weights_header(&state, request.headers())?;
+    // Held from before the first body byte until the request is admitted or refused, so
+    // the bodies and parses outside admission are bounded too.
+    let reading = state.reading.try_acquire().ok_or(ApiError::Overloaded)?;
     let body = axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES)
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
     let req = api::parse_request(&body, &state.model_id)?;
     drop(body);
     let permit = state.admission.try_acquire().ok_or(ApiError::Overloaded)?;
+    drop(reading);
 
     let stream = req.stream;
     let include_usage = req.include_usage;

@@ -244,6 +244,8 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
 
     let weights_hash = model.weights_hash().to_string();
     let admission = Admission::new(sizing.max_requests);
+    // The read bound has as many slots as admission (`http` module docs).
+    let reading = Admission::new(sizing.max_requests);
     let state = Arc::new(AppState {
         model_id: config.model_id,
         executor: config.executor.as_str(),
@@ -253,6 +255,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         salts: SaltDeriver::new(),
         engine: engine.clone(),
         admission: admission.clone(),
+        reading,
     });
     Ok(Node {
         router: http::router(state),

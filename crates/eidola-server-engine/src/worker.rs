@@ -102,7 +102,8 @@ enum Command {
     Cancel(RequestId),
 }
 
-/// The bound on requests in the engine (running or queued).
+/// A counting bound with non-blocking acquisition: admission (requests being prepared,
+/// queued or running in the engine) and, in `http`, the read bound in front of it.
 #[derive(Debug)]
 pub struct Admission {
     in_flight: AtomicU32,
