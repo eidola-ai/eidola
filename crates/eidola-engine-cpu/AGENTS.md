@@ -119,7 +119,7 @@ The random fixture's MTP layers are unrelated to its target, so its greedy accep
 
 | File | What it proves |
 |---|---|
-| `tests/engine.rs` | Through the engine: single requests (greedy and seeded), chunk sizes 1–1000, greedy speculation equals plain at `k` = 1, 2, 3, seeded sampling with three depths, prefix hits and salt isolation (including drafter resume from taps), preemption and resume, idle-TTL eviction and eviction mid-workload (exactly the evicted blocks zeroed in the pools), cancellation, `PreNorm` chaining, unfolded value scale, padded batches, and a randomized workload. The randomized workload covers multi-turn keyed conversations, private requests, cancellations, TTL jumps, small pools and `k` ∈ {1, 2, 3}, and checks the KV invariants, "every free block is zero or queued" and "every free slot's model state is zero or its reset queued" after every step. |
+| `tests/engine.rs` | Through the engine: single requests (greedy and seeded), chunk sizes 1–1000, greedy speculation equals plain at `k` = 1, 2, 3, seeded sampling with three depths, prefix hits and salt isolation (including drafter resume from taps), divergent turns after a shared prefix hitting at the branch with outputs equal to cold runs, preemption and resume, idle-TTL eviction and eviction mid-workload (exactly the evicted blocks zeroed in the pools), cancellation, `PreNorm` chaining, unfolded value scale, padded batches, and a randomized workload. The randomized workload covers multi-turn keyed conversations, private requests, cancellations, TTL jumps, small pools and `k` ∈ {1, 2, 3}, and checks the KV invariants, "every free block is zero or queued" and "every free slot's model state is zero or its reset queued" after every step. |
 | `tests/executor.rs` | Driven directly through the seam: zero really zeroes (and only the named block), `ResetSlot` really scrubs the slot's model state (and only that slot's), a copied block plus its tap resumes exactly in a fresh slot, and rows are independent of batch, slot and chunking. Panics on unmapped reads, zeroed reads, shared-block writes, resuming off a boundary, and too many drafts. |
 | `tests/speculative.rs` | Echo drafter: greedy speculation equals plain decoding, with about 97 % acceptance and whole chains accepted. Vocabulary 4: the joint distribution of three speculative samples (three chained depths) passes a chi-square fit against the exact dense distribution at p = 0.001, for plain temperature and for filtered sampling. |
 | `tests/real_flash.rs` (ignored) | The truncated real Flash checkpoint (layers 0, 1, 2, 5 plus 3 MTP layers): chunked prefill, MTP-3 speculation and a prefix hit through the engine. Every logit row is bit-exact against the dense forward. |
@@ -134,7 +134,8 @@ The random fixture's MTP layers are unrelated to its target, so its greedy accep
 - ignoring per-slot state;
 - the wrong random stream for drafts;
 - a chain row skipped;
-- a drafter reading below its first row.
+- a drafter reading below its first row;
+- a boundary tap holding the previous position's levels (caught at a branch hit).
 
 Keep that true when changing the tests.
 

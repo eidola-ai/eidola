@@ -319,7 +319,8 @@ fn sliding_window_hits_require_the_window() {
     }
     let g = SamplingParams::greedy();
 
-    // MiMo-like (full + sliding + drafter): block 5 is not a retained hit point.
+    // MiMo-like (full + sliding + drafter): block 5 is not yet a retained hit point (the
+    // diverging request keeps it as its branch, for the next one).
     let mut h = Harness::new(small_spec(512), sched(false), MockConfig::default());
     h.submit(request(1, base.clone(), g, 4, CacheScope::Keyed(salt(1))));
     h.run();
