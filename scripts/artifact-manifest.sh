@@ -151,7 +151,11 @@ assert_manifest_complete() {
 }
 
 # CVM image artifacts for enclave measurement computation.
-# The OVMF firmware version is pinned to match tinfoilsh/measure-image-action.
+# The OVMF firmware version must equal the one the tinfoilsh/measure-image-action
+# release pinned in .github/workflows/tinfoil-build.yml measures with
+# (`defaultEDK2Version` in its orchestrator); otherwise the tag workflow's
+# cross-check fails. See crates/eidola-server-gateway/AGENTS.md → Release
+# checklist.
 CVM_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/eidola/cvm"
 OVMF_VERSION="v0.0.3"
 OVMF_URL="https://github.com/tinfoilsh/edk2/releases/download/${OVMF_VERSION}/OVMF.fd"

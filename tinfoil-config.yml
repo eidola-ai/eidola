@@ -20,8 +20,6 @@ memory: 8192
 containers:
   - name: "eidola-server-gateway"
     image: "ghcr.io/eidola-ai/eidola-server-gateway@sha256:a3d085af891e7f18d132c1563fef17d0a139b2bcac2a3fbdef3b16729115be8d"
-    devices:
-      - /dev/sev-guest
     secrets:
       - CREDENTIAL_MASTER_KEY
       - DATABASE_PASSWORD
