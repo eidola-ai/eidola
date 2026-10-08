@@ -28,8 +28,8 @@ use crate::model::ModelError;
 
 /// Refuses unless `path` is on read-only storage as described in the module docs. Only
 /// metadata is read (`statvfs`, `stat`, `/proc/self/mountinfo`); `path` is not opened.
-pub fn require_immutable(path: &Path) -> Result<(), ModelError> {
-    let name = display_name(path);
+/// `name` is what refusals call it.
+pub fn require_immutable(path: &Path, name: &str) -> Result<(), ModelError> {
     let stat = rustix::fs::statvfs(path)
         .map_err(|e| ModelError(format!("cannot inspect the filesystem of {name}: {e}")))?;
     if !stat.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY) {
@@ -39,24 +39,20 @@ pub fn require_immutable(path: &Path) -> Result<(), ModelError> {
         )));
     }
     #[cfg(target_os = "linux")]
-    require_read_only_superblock(path, &name)?;
+    require_read_only_superblock(path, name)?;
     Ok(())
-}
-
-fn display_name(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "the weights directory".into())
 }
 
 #[cfg(target_os = "linux")]
 fn require_read_only_superblock(path: &Path, name: &str) -> Result<(), ModelError> {
     use std::os::unix::fs::MetadataExt;
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|e| ModelError(format!("cannot resolve {name}: {}", e.kind())))?;
-    let dev = std::fs::metadata(&canonical)
+    // The device from `path` itself (which may be a pinned `/proc/self/fd` path); the
+    // canonical text only places it among the mount points.
+    let dev = std::fs::metadata(path)
         .map_err(|e| ModelError(format!("cannot inspect {name}: {}", e.kind())))?
         .dev();
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| ModelError(format!("cannot resolve {name}: {}", e.kind())))?;
     // Bytes, not text: mount points are byte strings, and an unrelated mount whose path is
     // not UTF-8 must not stop this check.
     let text = std::fs::read("/proc/self/mountinfo")
@@ -276,7 +272,7 @@ mod tests {
 
     #[test]
     fn a_writable_directory_is_refused() {
-        let e = require_immutable(&std::env::temp_dir()).unwrap_err();
+        let e = require_immutable(&std::env::temp_dir(), "tmp").unwrap_err();
         assert!(e.to_string().contains("writable"), "{e}");
     }
 
@@ -287,7 +283,7 @@ mod tests {
         let Some(dir) = std::env::var_os("EIDOLA_TEST_READ_ONLY_DIR") else {
             return;
         };
-        require_immutable(Path::new(&dir)).unwrap();
+        require_immutable(Path::new(&dir), "dir").unwrap();
     }
 
     /// The other half, where such a mount is available: a read-only bind of a writable
@@ -297,7 +293,7 @@ mod tests {
         let Some(dir) = std::env::var_os("EIDOLA_TEST_READ_ONLY_BIND_DIR") else {
             return;
         };
-        let e = require_immutable(Path::new(&dir)).unwrap_err();
+        let e = require_immutable(Path::new(&dir), "dir").unwrap_err();
         assert!(
             cfg!(not(target_os = "linux")) || e.to_string().contains("superblock"),
             "{e}"

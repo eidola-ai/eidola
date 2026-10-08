@@ -151,14 +151,21 @@ impl LoadedModel {
         // Storage first, before any weights file is opened, mapped or parsed: the
         // directory, then (from its listing, which reads only names) every file the node
         // will read.
+        //
+        // The directory is resolved once (`PinnedDir`), and every check, listing and open
+        // below goes through that resolution, never through `dir` again: a symlink on the
+        // configured path retargeted after the check cannot redirect what is opened.
+        let pinned = PinnedDir::open(dir)?;
+        let dir = pinned.path();
         let verified = storage == WeightsStorage::VerifiedReadonly;
         if verified {
-            crate::storage::require_immutable(dir)?;
+            crate::storage::require_immutable(dir, "the weights directory")?;
         }
         let inventory = Inventory::list(dir)?;
         if verified {
             for name in inventory.all() {
-                crate::storage::require_immutable(&dir.join(name))?;
+                require_regular_file(dir, name)?;
+                crate::storage::require_immutable(&dir.join(name), name)?;
             }
         }
         let store = WeightSet::open_dir(dir)
@@ -256,6 +263,67 @@ impl LoadedModel {
     }
 }
 
+/// The weights directory, resolved once. Every later check, listing and open goes through
+/// [`PinnedDir::path`]:
+///
+/// * on Linux, `/proc/self/fd/<n>` of an `O_PATH` descriptor opened on the configured path
+///   (no read access, nothing in it opened): the kernel resolves that magic link to the
+///   directory the descriptor holds, whatever the configured path (or any directory above
+///   it) points to later;
+/// * elsewhere (development only), the canonical path at the time of opening, free of
+///   symlinks.
+struct PinnedDir {
+    path: std::path::PathBuf,
+    #[cfg(target_os = "linux")]
+    _fd: std::os::fd::OwnedFd,
+}
+
+impl PinnedDir {
+    fn open(dir: &Path) -> Result<Self, ModelError> {
+        let refused = |e: std::io::Error| {
+            ModelError(format!("cannot open the weights directory: {}", e.kind()))
+        };
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{Mode, OFlags};
+            use std::os::fd::AsRawFd;
+            let fd = rustix::fs::open(
+                dir,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| refused(e.into()))?;
+            let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+            Ok(PinnedDir { path, _fd: fd })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let path = std::fs::canonicalize(dir).map_err(refused)?;
+            Ok(PinnedDir { path })
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Under `verified-readonly`, refuses an entry the node will read unless it is a regular
+/// file (`lstat`, not followed). A symlink's target is resolved again at every open,
+/// through paths outside the pinned directory that its read-only mount does not cover;
+/// a regular file in a directory on a read-only superblock cannot be replaced.
+fn require_regular_file(dir: &Path, name: &str) -> Result<(), ModelError> {
+    let meta = std::fs::symlink_metadata(dir.join(name))
+        .map_err(|e| ModelError(format!("cannot inspect {name}: {}", e.kind())))?;
+    if meta.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(ModelError(format!(
+            "{name} is not a regular file; verified-readonly weights may not be symlinks"
+        )))
+    }
+}
+
 /// The files the node will read from a weights directory, from its listing alone.
 struct Inventory {
     /// `*.safetensors`, sorted by name.
@@ -346,6 +414,54 @@ mod tests {
             utf8_name(std::ffi::OsStr::new("a.safetensors")).unwrap(),
             "a.safetensors"
         );
+    }
+
+    /// The directory is resolved once: retargeting a symlink on the configured path
+    /// afterwards does not change what is listed or opened.
+    #[cfg(unix)]
+    #[test]
+    fn the_weights_directory_is_resolved_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b, link) = (
+            tmp.path().join("a"),
+            tmp.path().join("b"),
+            tmp.path().join("w"),
+        );
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("a.safetensors"), b"a").unwrap();
+        std::fs::write(b.join("b.safetensors"), b"b").unwrap();
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let pinned = PinnedDir::open(&link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        assert_eq!(
+            Inventory::list(pinned.path()).unwrap().shards,
+            ["a.safetensors"]
+        );
+        assert_eq!(
+            std::fs::read(pinned.path().join("a.safetensors")).unwrap(),
+            b"a"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_entries_must_be_regular_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.safetensors"), b"x").unwrap();
+        std::fs::write(outside.path().join("elsewhere"), b"x").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("elsewhere"),
+            tmp.path().join("link.safetensors"),
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join("dir.safetensors")).unwrap();
+        require_regular_file(tmp.path(), "real.safetensors").unwrap();
+        let e = require_regular_file(tmp.path(), "link.safetensors").unwrap_err();
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+        assert!(require_regular_file(tmp.path(), "dir.safetensors").is_err());
     }
 
     #[test]
