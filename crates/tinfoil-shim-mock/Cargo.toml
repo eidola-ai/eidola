@@ -7,6 +7,9 @@ repository.workspace = true
 publish.workspace = true
 license = "MIT OR Apache-2.0"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "tinfoil-shim-mock"
 path = "src/main.rs"
