@@ -6952,6 +6952,143 @@ fn a_streamed_turn_settles_from_the_refund_its_metadata_event_carried() {
     }
 }
 
+/// What a streamed turn hands back and what it emitted on the way: the result,
+/// and every live content delta in order.
+fn stream_collecting(
+    core: &AppCore,
+    prompt: &str,
+) -> (Result<eidola_app_core::ChatResult, AppError>, Vec<String>) {
+    let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+    core.runtime().block_on(async {
+        let collect = async {
+            let mut deltas = Vec::new();
+            while let Some(event) = events_rx.recv().await {
+                if let ChatStreamEvent::ContentDelta(text) = event {
+                    deltas.push(text);
+                }
+            }
+            deltas
+        };
+        let chat = core.chat_stream(prompt.into(), MODEL.into(), None, tx);
+        tokio::join!(chat, collect)
+    })
+}
+
+/// **A padded stream reads exactly as an unpadded one.** The Eidola server
+/// frames every stream as fixed-size writes on a fixed tick (comment events,
+/// trailing whitespace on a JSON line, an event carried across frames); the
+/// harness frames this one with the server's own framer. The turn yields the
+/// same text, the same usage and the same charge, settles from the same
+/// in-band refund, emits the same changes, and the Record keeps every event
+/// that carried data and none of the padding, saying how much it left out.
+#[test]
+fn a_padded_stream_reads_exactly_as_an_unpadded_one() {
+    let outcome = |behavior: ChatBehavior| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: behavior,
+                refund: RefundMode::NotStored,
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let mut changes_rx = core.subscribe_changes();
+            let (res, deltas) = stream_collecting(&core, "stream me");
+            let res = res.expect("the turn completes");
+            assert_settled(&core);
+            assert_eq!(mock.refund_hits(), 0, "{behavior:?}: settled in-band");
+            let mut changes = drain(&mut changes_rx);
+            changes.sort_by_key(|c| format!("{c:?}"));
+            changes.dedup();
+            let rows = completion_rows(&core);
+            let recorded = request_detail(&core, &rows[0].id)
+                .response_body
+                .expect("a recorded body");
+            tx.send((
+                res.content,
+                deltas.concat(),
+                res.input_tokens,
+                res.output_tokens,
+                res.credits_charged,
+                changes
+                    .iter()
+                    .map(|c| format!("{c:?}").split('(').next().unwrap().to_string())
+                    .collect::<Vec<_>>(),
+                recorded,
+            ))
+            .unwrap();
+        });
+        rx.recv().unwrap()
+    };
+    let plain = outcome(ChatBehavior::StreamingWithMetadataRefund);
+    let padded = outcome(ChatBehavior::StreamingPadded);
+    assert_eq!(padded.0, "Hello from the stream.");
+    assert_eq!(padded.0, plain.0, "the answer");
+    assert_eq!(padded.1, plain.1, "the live deltas");
+    assert_eq!((padded.2, padded.3), (plain.2, plain.3), "the usage");
+    assert_eq!(padded.4, plain.4, "the charge");
+    assert_eq!(padded.5, plain.5, "the changes emitted");
+
+    let text = String::from_utf8(padded.6).expect("UTF-8");
+    assert!(!text.contains("\n:"), "no padding comment is kept: {text}");
+    for piece in [
+        "Hello ",
+        "from the ",
+        "stream.",
+        "[DONE]",
+        "eidola.chat.completion.metadata",
+    ] {
+        assert!(text.contains(piece), "{piece} is kept: {text}");
+    }
+    assert!(
+        text.contains("bytes of stream padding"),
+        "and the omission is stated: {text}"
+    );
+}
+
+/// **The read ceiling bounds the answer, not its padding.** A slow answer's
+/// frames keep coming at the frame rate, so a stream can carry far more
+/// padding than the eight-megabyte ceiling while its answer is a few words.
+/// Counted, that padding ended the turn at the ceiling with nothing read;
+/// kept, it filled the Record and pushed the answer out of it.
+#[test]
+fn a_long_padded_stream_is_not_cut_at_the_ceiling_or_lost_from_the_record() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingPaddedPastReadCeiling,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let res = stream_once(&core, "stream me").expect("the turn completes");
+        assert_eq!(res.content, "Hello from the stream.");
+        assert_settled(&core);
+
+        let rows = completion_rows(&core);
+        assert_eq!(rows[0].error, None);
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        assert!(recorded.len() < 64 * 1024, "{} bytes kept", recorded.len());
+        let text = String::from_utf8(recorded).expect("UTF-8");
+        assert!(
+            text.contains("stream.") && text.contains("[DONE]"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("this Record entry keeps the first"),
+            "nothing that carried data was cut: {text}"
+        );
+        let padding: usize = text
+            .split("[eidola: ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("the padding note states a count");
+        assert!(padding > 10 * 1024 * 1024 - 64 * 1024, "{padding}");
+    });
+}
+
 /// REGRESSION: **a stream that never opened still settles from the refund its
 /// error body carried.**
 ///

@@ -1840,7 +1840,6 @@ impl Inner {
                     break;
                 }
             };
-            raw.push(&bytes);
             buf.extend_from_slice(&bytes);
             let mut oversized = false;
             while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
@@ -1852,6 +1851,12 @@ impl Inner {
                 }
                 let event: Vec<u8> = buf.drain(..pos).collect();
                 let terminator: Vec<u8> = buf.drain(..boundary_len).collect();
+                // Recorded event by event, so the server's stream padding is
+                // counted rather than kept (`RecordedBody::push_event`). It is
+                // still forwarded: the caller is on this machine, where there
+                // is no network observer for it to hide anything from, and
+                // every server-sent-events reader already ignores it.
+                raw.push_event(&event, &terminator);
                 let (mut out, refund) = forward_sse_event(&event, &route.canonical);
                 if refund.is_some() {
                     inline_refund = refund;
@@ -1896,6 +1901,8 @@ impl Inner {
                 // Refused, so not forwarded: the tail below exists to hand a
                 // downstream parser the bytes the upstream really sent, and
                 // these are the bytes this app has just declined to accept.
+                // They did arrive, so the Record keeps them.
+                raw.push_event(&buf, &[]);
                 buf.clear();
                 break;
             }
@@ -1910,6 +1917,7 @@ impl Inner {
         // is the same fact: an unterminated tail nobody received is not a
         // complete delivery, and discarding the result sealed the row as one.
         if !buf.is_empty() {
+            raw.push_event(&buf, &[]);
             let (out, refund) = forward_sse_event(&buf, &route.canonical);
             if refund.is_some() {
                 inline_refund = refund;

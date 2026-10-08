@@ -41,6 +41,9 @@ pub(crate) const RECORD_BODY_MAX_BYTES: usize = 1 << 20;
 pub(crate) struct RecordedBody {
     pub(crate) kept: Vec<u8>,
     pub(crate) received: usize,
+    /// Bytes of stream padding received and not kept (see
+    /// [`RecordedBody::push_event`]); counted in `received` too.
+    pub(crate) padding: usize,
 }
 
 impl RecordedBody {
@@ -55,6 +58,36 @@ impl RecordedBody {
         }
     }
 
+    /// Take one server-sent event and the terminator that ended it (empty for
+    /// the unterminated rest of a stream) — **unless it is padding**, which is
+    /// counted and not kept.
+    ///
+    /// The Eidola server writes its streams as fixed-size frames on a fixed
+    /// tick, filling each with comment events, so that a network observer
+    /// cannot read token lengths or timing off the ciphertext. That padding
+    /// runs at the frame rate for as long as the answer does, so kept
+    /// byte for byte it would fill the retention cap within seconds and push
+    /// the answer itself out of the Record. A padding event
+    /// ([`crate::is_padding_event`]: nothing but comments and blank lines)
+    /// dispatches nothing, so omitting it loses nothing a reader could use,
+    /// and the seal states how much was omitted.
+    pub(crate) fn push_event(&mut self, event: &[u8], terminator: &[u8]) {
+        if crate::is_padding_event(event) {
+            let len = event.len() + terminator.len();
+            self.received += len;
+            self.padding += len;
+        } else {
+            self.push(event);
+            self.push(terminator);
+        }
+    }
+
+    /// What arrived, less padding: the bytes the answer is made of, which is
+    /// what a read ceiling bounds.
+    pub(crate) fn payload_received(&self) -> usize {
+        self.received - self.padding
+    }
+
     /// The bytes to record for a **response**, with the cap's note when they
     /// are not all of them, and nothing about how the response ended — that is
     /// the caller's ending to state (see the module doc).
@@ -63,11 +96,22 @@ impl RecordedBody {
     /// only then is `received` the response's size rather than how far this app
     /// got.
     pub(crate) fn seal_response(self, read_to_end: bool) -> Vec<u8> {
-        seal_recorded_body(
+        let mut out = seal_recorded_body(
             self.kept,
-            self.received,
+            self.received - self.padding,
             RecordedSide::Response { read_to_end },
-        )
+        );
+        if self.padding > 0 {
+            out.extend_from_slice(
+                format!(
+                    "\n\n[eidola: {} bytes of stream padding (events carrying only comments \
+                     or blank lines, which carry no data) were received and not kept.]\n",
+                    self.padding
+                )
+                .as_bytes(),
+            );
+        }
+        out
     }
 
     /// The bytes to record for a **request** body.
@@ -258,6 +302,32 @@ mod tests {
         let mut response = RecordedBody::default();
         response.push(b"data: hi\n\n");
         assert_eq!(response.seal_response(true), b"data: hi\n\n".to_vec());
+    }
+
+    /// Padding events are counted and not kept; everything else is kept in
+    /// order, and the seal says how much padding there was. A body with none
+    /// seals exactly as before.
+    #[test]
+    fn stream_padding_is_counted_and_not_kept() {
+        let mut body = RecordedBody::default();
+        body.push_event(b": ", b"\n\n");
+        body.push_event(b"data: {\"a\":1}", b"\n\n");
+        body.push_event(b"", b"\n\n");
+        body.push_event(b"\n:   ", b"\n\n");
+        body.push_event(b"id: 1\ndata: [DONE]", b"\n\n");
+        assert_eq!(body.padding, 4 + 2 + 7);
+        assert_eq!(body.payload_received(), 15 + 20);
+        let sealed = String::from_utf8(body.seal_response(true)).unwrap();
+        assert!(
+            sealed.starts_with(
+                "data: {\"a\":1}\n\nid: 1\ndata: [DONE]\n\n\n\n[eidola: 13 bytes of stream padding"
+            ),
+            "{sealed}"
+        );
+
+        let mut plain = RecordedBody::default();
+        plain.push_event(b"data: x", b"\n\n");
+        assert_eq!(plain.seal_response(true), b"data: x\n\n".to_vec());
     }
 
     /// A response read to its end names its size; one this app stopped reading
