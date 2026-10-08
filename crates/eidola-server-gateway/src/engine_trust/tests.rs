@@ -1155,6 +1155,11 @@ fn the_config_holds_to_tinfoils_decoder_and_validator() {
     tree.set_config(format!("{text}#{}\n", "x".repeat(1 << 20)));
     refused(&tree, "exceeds Tinfoil's 1048576-byte config limit");
 
+    // A `%YAML` directive.
+    let mut tree = Tree::fixture();
+    tree.set_config(format!("%YAML 1.1\n---\n{text}"));
+    refused(&tree, "YAML directives are refused");
+
     // decode.go: one document (a trailing one is refused).
     let mut tree = Tree::fixture();
     tree.set_config(format!("{text}---\n{text}"));
@@ -1240,6 +1245,39 @@ fn the_config_holds_to_tinfoils_decoder_and_validator() {
             "memory: 65536\n",
             "memory: *n\n",
             "anchors and aliases are refused",
+        ),
+        // Read from the parser's events: an anchor on an explicit key too.
+        (
+            "cpus: 16\n",
+            "? &a cpus\n: 16\n",
+            "anchors and aliases are refused",
+        ),
+        // Constructs yaml.v3 and libyaml can read differently.
+        ("cpus: 16\n", "<<: {cpus: 16}\n", "merge keys are refused"),
+        (
+            "cpus: 16\n",
+            "cpus: !!int 16\n",
+            "explicit YAML tags are refused",
+        ),
+        (
+            "cvm-version: ",
+            "cvm-version: !!str ",
+            "explicit YAML tags are refused",
+        ),
+        (
+            "cpus: 16\n",
+            "\"cpus\": 16\n",
+            "mapping keys must be plain scalars",
+        ),
+        (
+            "cpus: 16\n",
+            "{cpus: 16}: 16\ncpus: 16\n",
+            "mapping keys must be plain scalars",
+        ),
+        (
+            "cpus: 16\n",
+            "? [cpus]\n: 16\ncpus: 16\n",
+            "mapping keys must be plain scalars",
         ),
     ];
     for (from, to, needle) in cases {

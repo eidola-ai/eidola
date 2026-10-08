@@ -594,6 +594,8 @@ pub fn check_gpu_attestation(
 
 #[cfg(feature = "deployment")]
 pub mod deployment;
+#[cfg(feature = "deployment")]
+mod yaml_events;
 
 /// Largest prefix-cache retention bound, in seconds: the engine core keeps
 /// retention in milliseconds as a `u64`.

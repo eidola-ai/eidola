@@ -297,7 +297,7 @@ impl EngineConfig {
                 bytes.len()
             ));
         }
-        refuse_anchors_and_aliases(bytes, path)?;
+        super::yaml_events::refuse_divergent_constructs(bytes, path)?;
         // One document, every struct strict (decode.go: `KnownFields(true)`,
         // a trailing document refused), duplicate keys refused.
         let config: TinfoilConfig =
@@ -427,53 +427,6 @@ impl EngineConfig {
             memory: config.memory,
         })
     }
-}
-
-/// Refuse YAML anchors (`&name`) and aliases (`*name`). Tinfoil's shim decoder
-/// refuses aliases (shim.go `validateYAMLTree`); an engine config has no use
-/// for either anywhere, and an alias would let one value stand for another
-/// field's. A plain scalar cannot begin with `&` or `*` (they are YAML
-/// indicators), so outside quoted scalars and comments, either character where
-/// a node can start is one.
-fn refuse_anchors_and_aliases(bytes: &[u8], path: &str) -> Result<(), String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| format!("{path}: not UTF-8"))?;
-    for (n, line) in text.lines().enumerate() {
-        let mut quote: Option<char> = None;
-        let mut node_start = true;
-        let mut previous = ' ';
-        for c in line.chars() {
-            match quote {
-                Some(q) => {
-                    if c == q {
-                        quote = None;
-                    }
-                }
-                None => {
-                    if c == '#' && previous.is_whitespace() {
-                        break;
-                    }
-                    if node_start && (c == '&' || c == '*') {
-                        return Err(format!(
-                            "{path}: line {}: YAML anchors and aliases are refused",
-                            n + 1
-                        ));
-                    }
-                    if c == '"' || c == '\'' {
-                        if node_start {
-                            quote = Some(c);
-                        }
-                        node_start = false;
-                    } else if c.is_whitespace() {
-                        node_start = matches!(previous, ':' | '-' | ',' | '[' | '{') || node_start;
-                    } else {
-                        node_start = matches!(c, '[' | '{' | ',');
-                    }
-                }
-            }
-            previous = c;
-        }
-    }
-    Ok(())
 }
 
 /// A deployment's `deployment.json`: what a pin carries that the config does
