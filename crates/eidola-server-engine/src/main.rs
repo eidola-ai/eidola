@@ -1,17 +1,20 @@
 //! The inference node's process. Configuration is environment-only (`config.rs`); see
 //! this crate's `AGENTS.md` for the contract.
 //!
-//! Logs go to stdout through `tracing` (`RUST_LOG` filters, default `info`). Nothing
-//! request-derived is ever logged: no prompt, output, cache key, salt or per-request size.
+//! Logs go to stdout through `tracing` at a fixed `info` level. The filter is part of the
+//! measured image rather than read from the environment: everything that changes the
+//! node's behaviour is measured, and a level (or a per-crate directive) delivered any other
+//! way could turn on a dependency's debug logging, which this crate's content-free
+//! discipline does not cover. Nothing request-derived is ever logged: no prompt, output,
+//! cache key, salt or per-request size.
 
 use std::process::ExitCode;
 
 use eidola_server_engine::config::Config;
-use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_max_level(tracing::Level::INFO)
         .init();
     match run() {
         Ok(()) => ExitCode::SUCCESS,

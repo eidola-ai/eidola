@@ -39,6 +39,16 @@ impl GatewayToken {
     pub fn verify(mut token: String, hash: &str) -> Result<Self, String> {
         use argon2::PasswordVerifier;
         let result = (|| {
+            // The token shape the gateway holds its token to: a token outside it
+            // is refused before the node serves, whatever the hash says.
+            if !eidola_common::engine_deployment::is_gateway_token(&token) {
+                return Err(format!(
+                    "{} must be {} to {} visible ASCII characters",
+                    crate::config::env::GATEWAY_TOKEN,
+                    eidola_common::engine_deployment::GATEWAY_TOKEN_MIN_LEN,
+                    eidola_common::engine_deployment::GATEWAY_TOKEN_MAX_LEN
+                ));
+            }
             // The gateway's pin check reads the measured hash through this same
             // function, so it accepts exactly the hashes this node boots with.
             let parsed = eidola_common::engine_deployment::parse_gateway_token_hash(hash)

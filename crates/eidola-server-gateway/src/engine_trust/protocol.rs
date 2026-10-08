@@ -35,12 +35,13 @@ use crate::types::ChatCompletionRequest;
 pub struct EngineToken(Zeroizing<String>);
 
 impl EngineToken {
-    /// Wrap the token. Refuses an empty token, or one that cannot travel in a
-    /// header (anything but visible ASCII), without echoing it.
+    /// Wrap the token. Refuses one outside the shape the node also boots
+    /// with (`eidola_common::engine_deployment::is_gateway_token`: visible
+    /// ASCII, bounded length), without echoing it.
     pub fn new(mut token: String) -> Result<Self, &'static str> {
-        if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        if !eidola_common::engine_deployment::is_gateway_token(&token) {
             token.zeroize();
-            return Err("the engine token must be non-empty visible ASCII");
+            return Err("the engine token must be 16 to 1024 visible ASCII characters");
         }
         Ok(Self(Zeroizing::new(token)))
     }
@@ -353,6 +354,8 @@ mod tests {
         assert!(EngineToken::new(String::new()).is_err());
         assert!(EngineToken::new("two words".into()).is_err());
         assert!(EngineToken::new("line\nbreak".into()).is_err());
+        assert!(EngineToken::new("short".into()).is_err());
+        assert!(EngineToken::new("non-ascii-tøken-xxx".into()).is_err());
     }
 
     /// A request carrying a key reaches the node with it, in the shape the

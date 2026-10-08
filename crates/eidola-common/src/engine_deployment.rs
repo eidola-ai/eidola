@@ -304,10 +304,12 @@ pub mod allowed_keys {
     pub const CONTAINER: &[&str] = &[
         "name", "image", "env", "secrets", "models", "runtime", "gpus",
     ];
-    /// A model pack: its name, source, and the pinned pack it is built from.
-    /// Not `exec` (weights are never programs), and not the encrypted forms
-    /// (`emwp`, `key-secret`), which public weights do not need.
-    pub const MODEL: &[&str] = &["name", "repo", "mpk", "mwp", "schema"];
+    /// A model pack: its name, source (`repo`), the pack pinned by its root
+    /// hash (`mpk`), and its layout version. Not `exec` (weights are never
+    /// programs), not the encrypted forms (`emwp`, `key-secret`), which public
+    /// weights do not need, and not `mwp`, a delivery the pinned `mpk` makes
+    /// unnecessary.
+    pub const MODEL: &[&str] = &["name", "repo", "mpk", "schema"];
 }
 
 /// The first of `keys` that `allowed` does not list.
@@ -338,6 +340,162 @@ pub fn check_container_gpu_access(
             Err("the cpu executor's container takes no `runtime` or `gpus`".into())
         }
     }
+}
+
+/// Shortest gateway token accepted, in bytes.
+pub const GATEWAY_TOKEN_MIN_LEN: usize = 16;
+/// Longest gateway token accepted, in bytes.
+pub const GATEWAY_TOKEN_MAX_LEN: usize = 1024;
+
+/// The shape of the gateway's bearer token (`GATEWAY_TOKEN`): visible ASCII
+/// (no space, no control character), [`GATEWAY_TOKEN_MIN_LEN`] to
+/// [`GATEWAY_TOKEN_MAX_LEN`] bytes, so it travels in an `Authorization`
+/// header unchanged. The gateway refuses to hold any other token and the node
+/// refuses to boot with one.
+pub fn is_gateway_token(token: &str) -> bool {
+    (GATEWAY_TOKEN_MIN_LEN..=GATEWAY_TOKEN_MAX_LEN).contains(&token.len())
+        && token.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// The one secret an engine container takes: everything else it reads is in
+/// the measured env. A secret is delivered outside the measurement, so any
+/// other one (a log level, say) would change the node's behaviour unmeasured.
+pub const SECRETS: &[&str] = &[env::GATEWAY_TOKEN];
+
+/// Whether the engine container's `secrets` are exactly [`SECRETS`].
+pub fn check_secrets<'a>(secrets: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let secrets: Vec<&str> = secrets.into_iter().collect();
+    if secrets == SECRETS {
+        Ok(())
+    } else {
+        Err(format!(
+            "the engine container's secrets must be exactly {SECRETS:?}; any other secret \
+             reaches the node outside the measurement"
+        ))
+    }
+}
+
+/// Where Tinfoil mounts a model pack granted to a container: read-only, at
+/// `/tinfoil/models/<name>`, in the granted containers only (cvmimage
+/// `docs/runtime-policy.md`; `ContainerModelsDir` in its boot paths).
+pub const MODEL_MOUNT_ROOT: &str = "/tinfoil/models";
+
+/// A model pack as an engine config declares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelPack<'a> {
+    pub name: &'a str,
+    /// `<owner>/<name>@<revision>`.
+    pub repo: Option<&'a str>,
+    /// The pinned pack: `<root hash>_<size>_<id>`.
+    pub mpk: Option<&'a str>,
+}
+
+/// Whether the weights the node reads are the verified model pack: exactly
+/// one pack, from `<weights_repo>@<weights_revision>` and pinned by its root
+/// hash (`mpk`), granted to the engine container (and only it), with the
+/// node's weights directory inside that pack's mount.
+pub fn check_weights_pack(
+    packs: &[ModelPack<'_>],
+    granted: &[&str],
+    weights_dir: &str,
+    weights_repo: &str,
+    weights_revision: &str,
+) -> Result<(), String> {
+    let [pack] = packs else {
+        return Err("an engine deployment declares exactly one model pack, its weights".into());
+    };
+    let name_ok = {
+        let mut bytes = pack.name.bytes();
+        bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+            && pack.name.len() <= 128
+            && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    if !name_ok {
+        return Err(format!(
+            "model pack name {:?} is not a valid pack name",
+            pack.name
+        ));
+    }
+    let source = format!("{weights_repo}@{weights_revision}");
+    if pack.repo != Some(source.as_str()) {
+        return Err(format!(
+            "the model pack's repo must be {source:?}, the weights' recorded provenance"
+        ));
+    }
+    let root_hash_ok = pack.mpk.is_some_and(|mpk| {
+        mpk.split('_').next().is_some_and(|root| {
+            root.len() == 64 && root.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+    });
+    if !root_hash_ok {
+        return Err("the model pack must be pinned by its root hash (`mpk: <64 hex>_…`)".into());
+    }
+    if granted != [pack.name] {
+        return Err(format!(
+            "the engine container must be granted exactly the weights pack ({:?})",
+            pack.name
+        ));
+    }
+    let mount = format!("{MODEL_MOUNT_ROOT}/{}", pack.name);
+    let inside = weights_dir == mount
+        || weights_dir
+            .strip_prefix(&format!("{mount}/"))
+            .is_some_and(|rest| {
+                rest.split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..")
+            });
+    if !inside {
+        return Err(format!(
+            "EIDOLA_ENGINE_WEIGHTS_DIR must be inside the weights pack's mount, {mount}"
+        ));
+    }
+    Ok(())
+}
+
+/// The node routes the shim must expose: the chat route the gateway sends
+/// requests to, the info route it checks a node's weights with, and the
+/// health route probes read.
+pub const NODE_ROUTES: &[&str] = &["/v1/chat/completions", "/v1/engine/info", "/healthz"];
+
+/// Whether a shim path pattern matches a request path, as the shim decides
+/// it (cvmimage `tinfoil/cmd/shim/api.go`, `pathMatchesPattern`): an exact
+/// path, or a trailing `*` matching on a segment boundary (`/v1/*` matches
+/// `/v1/x`; `/v1*` matches `/v1` and `/v1/x`).
+pub fn shim_path_matches(pattern: &str, path: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        None => pattern == path,
+        Some(prefix) if prefix.ends_with('/') => path.starts_with(prefix),
+        Some(prefix) => {
+            path == prefix
+                || path
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }
+    }
+}
+
+/// Whether the shim's `paths` expose exactly the node's routes: every route
+/// in [`NODE_ROUTES`] matched, and every pattern matching at least one of
+/// them (a wildcard such as `/*` does). An absent or empty list is refused
+/// even though the shim would then forward every path: the exposure should
+/// be stated, not defaulted.
+pub fn check_shim_paths(paths: &[&str]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("shim.paths must list the node's routes".into());
+    }
+    for pattern in paths {
+        if !pattern.starts_with('/') || !NODE_ROUTES.iter().any(|r| shim_path_matches(pattern, r)) {
+            return Err(format!(
+                "shim.paths entry {pattern:?} exposes none of the node's routes {NODE_ROUTES:?}"
+            ));
+        }
+    }
+    for route in NODE_ROUTES {
+        if !paths.iter().any(|p| shim_path_matches(p, route)) {
+            return Err(format!("shim.paths must expose {route}"));
+        }
+    }
+    Ok(())
 }
 
 /// The GPU counts a confidential NVIDIA deployment may attach (the
@@ -614,6 +772,89 @@ mod tests {
         ] {
             assert!(check_container_gpu_access(executor, runtime, gpus).is_err());
         }
+    }
+
+    #[test]
+    fn the_gateway_token_shape() {
+        assert!(is_gateway_token("dev-gateway-token"));
+        assert!(is_gateway_token(&"a".repeat(GATEWAY_TOKEN_MAX_LEN)));
+        for bad in [
+            "short".to_string(),
+            "has a space in it".to_string(),
+            "line\nbreak-token-xx".to_string(),
+            "non-ascii-tøken-xx".to_string(),
+            "a".repeat(GATEWAY_TOKEN_MAX_LEN + 1),
+        ] {
+            assert!(!is_gateway_token(&bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_only_secret_is_the_gateway_token() {
+        assert!(check_secrets(["GATEWAY_TOKEN"]).is_ok());
+        assert!(check_secrets([]).is_err());
+        assert!(check_secrets(["GATEWAY_TOKEN", "RUST_LOG"]).is_err());
+        assert!(check_secrets(["GATEWAY_TOKEN", "GATEWAY_TOKEN"]).is_err());
+    }
+
+    #[test]
+    fn shim_paths_match_as_the_shim_matches() {
+        assert!(shim_path_matches(
+            "/v1/chat/completions",
+            "/v1/chat/completions"
+        ));
+        assert!(!shim_path_matches(
+            "/v1/chat/completions",
+            "/v1/chat/completions/x"
+        ));
+        assert!(shim_path_matches("/*", "/healthz"));
+        assert!(shim_path_matches("/v1/*", "/v1/engine/info"));
+        assert!(!shim_path_matches("/v1/*", "/v1"));
+        assert!(shim_path_matches("/v1*", "/v1"));
+        assert!(shim_path_matches("/v1*", "/v1/x"));
+        assert!(!shim_path_matches("/v1*", "/v10"));
+
+        assert!(check_shim_paths(&["/*"]).is_ok());
+        assert!(check_shim_paths(&["/v1/*", "/healthz"]).is_ok());
+        assert!(check_shim_paths(&NODE_ROUTES.to_vec()).is_ok());
+        assert!(check_shim_paths(&[]).is_err());
+        assert!(check_shim_paths(&["/v1/chat/completions"]).is_err());
+        assert!(check_shim_paths(&["/*", "/admin"]).is_err());
+        assert!(check_shim_paths(&["v1/*", "/healthz"]).is_err());
+    }
+
+    #[test]
+    fn the_weights_are_the_granted_pinned_pack() {
+        let mpk = format!("{}_17419419648_3892cd2f", "d".repeat(64));
+        let pack = ModelPack {
+            name: "weights",
+            repo: Some("o/m@4444"),
+            mpk: Some(&mpk),
+        };
+        let ok = |packs: &[ModelPack<'_>], granted: &[&str], dir: &str| {
+            check_weights_pack(packs, granted, dir, "o/m", "4444")
+        };
+        assert!(ok(&[pack], &["weights"], "/tinfoil/models/weights").is_ok());
+        assert!(ok(&[pack], &["weights"], "/tinfoil/models/weights/original").is_ok());
+        assert!(ok(&[], &[], "/tinfoil/models/weights").is_err());
+        assert!(ok(&[pack, pack], &["weights"], "/tinfoil/models/weights").is_err());
+        assert!(ok(&[pack], &[], "/tinfoil/models/weights").is_err());
+        assert!(ok(&[pack], &["other"], "/tinfoil/models/weights").is_err());
+        for dir in [
+            "/weights",
+            "/tinfoil/models/weightsx",
+            "/tinfoil/models/weights/../x",
+            "/tinfoil/models/weights//x",
+        ] {
+            assert!(ok(&[pack], &["weights"], dir).is_err(), "{dir}");
+        }
+        let other_repo = ModelPack {
+            repo: Some("o/m@5555"),
+            ..pack
+        };
+        assert!(ok(&[other_repo], &["weights"], "/tinfoil/models/weights").is_err());
+        let unpinned = ModelPack { mpk: None, ..pack };
+        assert!(ok(&[unpinned], &["weights"], "/tinfoil/models/weights").is_err());
     }
 
     #[test]

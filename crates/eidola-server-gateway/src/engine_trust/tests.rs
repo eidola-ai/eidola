@@ -374,7 +374,7 @@ fn the_prompt_cache_policy_is_the_configs() {
 fn the_gateway_token_is_a_secret_and_only_its_hash_is_measured() {
     let mut tree = Tree::fixture();
     tree.edit_config("      - GATEWAY_TOKEN\n", "");
-    refused(&tree, "must take GATEWAY_TOKEN as a secret");
+    refused(&tree, "secrets must be exactly [\"GATEWAY_TOKEN\"]");
 
     let mut tree = Tree::fixture();
     tree.edit_config(
@@ -469,7 +469,7 @@ fn the_config_runs_one_digest_pinned_engine_with_quoted_values() {
 
     let mut tree = Tree::fixture();
     let engine = tree.config_text();
-    let start = engine.find("  - name:").unwrap();
+    let start = engine.find("  - name: \"eidola-server-engine\"").unwrap();
     let end = engine.find("\nshim:").unwrap();
     let container = engine[start..end].to_string();
     tree.edit_config(&container, &format!("{container}{container}"));
@@ -748,7 +748,8 @@ fn a_cuda_deployment_attests_its_gpus() {
     // The CPU executor attaches and requires no GPUs.
     let mut tree = Tree::fixture();
     tree.edit_config("gpus: 8\n", "");
-    tree.edit_config("    runtime: nvidia\n    gpus: all\n", "");
+    tree.edit_config("    runtime: nvidia\n", "");
+    tree.edit_config("    gpus: all\n", "");
     tree.edit_config("EXECUTOR: \"cuda\"", "EXECUTOR: \"cpu\"");
     set_expected_gpus(&mut tree, None);
     tree.check().expect("a CPU deployment without GPU evidence");
@@ -789,7 +790,7 @@ fn the_shim_reaches_the_node() {
 fn every_image_is_the_digest_pinned_engine() {
     let digest = format!("@sha256:{}", "2".repeat(64));
     let text = Tree::fixture().config_text();
-    let start = text.find("  - name:").unwrap();
+    let start = text.find("  - name: \"eidola-server-engine\"").unwrap();
     let end = text.find("\nshim:").unwrap();
     let engine = text[start..end].to_string();
 
@@ -920,18 +921,10 @@ fn the_config_uses_only_the_keys_an_engine_needs() {
 
     let mut tree = Tree::fixture();
     tree.edit_config(
-        "gpus: 8\n",
-        "gpus: 8\nmodels:\n  - name: weights\n    mpk: abc\n    exec: true\n",
+        "  - name: \"weights\"\n",
+        "  - name: \"weights\"\n    exec: true\n",
     );
     refused(&tree, "models[0] may not set \"exec\"");
-
-    // The model packs that carry the weights are allowed in their plain form.
-    let mut tree = Tree::fixture();
-    tree.edit_config(
-        "gpus: 8\n",
-        "gpus: 8\nmodels:\n  - name: weights\n    mpk: abc\n",
-    );
-    tree.check().expect("a plain model pack");
 }
 
 /// The CUDA engine sees every attested GPU through the NVIDIA runtime; the
@@ -947,4 +940,103 @@ fn the_engine_container_has_the_gpu_access_its_executor_needs() {
         tree.edit_config(from, to);
         refused(&tree, "needs `runtime: nvidia` and `gpus: all`");
     }
+}
+
+/// The shim exposes exactly the node's routes (chat, info, health), by the
+/// shim's own matching: an empty list (which the shim reads as "everything"),
+/// a partial one, or a pattern reaching none of the node's routes is refused.
+#[test]
+fn the_shim_exposes_exactly_the_nodes_routes() {
+    for (paths, needle) in [
+        ("  paths: []\n", "shim.paths must list the node's routes"),
+        (
+            "  paths:\n    - /v1/chat/completions\n",
+            "shim.paths must expose /v1/engine/info",
+        ),
+        (
+            "  paths:\n    - /*\n    - /admin\n",
+            "shim.paths entry \"/admin\"",
+        ),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config("  paths:\n    - /*\n", paths);
+        refused(&tree, needle);
+    }
+    let mut tree = Tree::fixture();
+    tree.edit_config("  paths:\n    - /*\n", "");
+    refused(&tree, "shim.paths must list the node's routes");
+
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "  paths:\n    - /*\n",
+        "  paths:\n    - /v1/*\n    - /healthz\n",
+    );
+    tree.check().expect("the node's routes, listed by prefix");
+}
+
+/// The weights the node reads are the one model pack, pinned and granted to
+/// the engine container, mounted where the node looks.
+#[test]
+fn the_weights_dir_is_the_granted_pinned_pack() {
+    let pack = "models:\n  - name: \"weights\"\n";
+    let text = Tree::fixture().config_text();
+    let start = text.find(pack).unwrap();
+    let end = start + text[start..].find("\ncontainers:").unwrap() + 1;
+    let block = text[start..end].to_string();
+
+    let mut tree = Tree::fixture();
+    tree.edit_config(&block, "");
+    tree.edit_config("    models: [\"weights\"]\n", "");
+    refused(&tree, "declares exactly one model pack");
+
+    let mut tree = Tree::fixture();
+    tree.edit_config("    models: [\"weights\"]\n", "");
+    refused(&tree, "must be granted exactly the weights pack");
+
+    let mut tree = Tree::fixture();
+    tree.edit_config("    models: [\"weights\"]\n", "    models: [\"other\"]\n");
+    refused(&tree, "must be granted exactly the weights pack");
+
+    for dir in [
+        "/weights",
+        "/tinfoil/models/other",
+        "/tinfoil/models/weights/../x",
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config("\"/tinfoil/models/weights\"", &format!("\"{dir}\""));
+        refused(
+            &tree,
+            "EIDOLA_ENGINE_WEIGHTS_DIR must be inside the weights pack's mount",
+        );
+    }
+
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "@4444444444444444444444444444444444444444",
+        &format!("@{}", "9".repeat(40)),
+    );
+    refused(&tree, "the model pack's repo must be");
+
+    let mut tree = Tree::fixture();
+    tree.edit_config("    mpk: \"5555", "    mpk: \"zz");
+    refused(&tree, "pinned by its root hash");
+
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "\"/tinfoil/models/weights\"",
+        "\"/tinfoil/models/weights/original\"",
+    );
+    tree.check().expect("a weights directory inside the pack");
+}
+
+/// Any secret besides the gateway token is refused: it would reach the node
+/// outside the measurement.
+#[test]
+fn the_gateway_token_is_the_only_secret() {
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "      - GATEWAY_TOKEN\n",
+        "      - GATEWAY_TOKEN\n      - RUST_LOG\n",
+    );
+    refused(&tree, "secrets must be exactly [\"GATEWAY_TOKEN\"]");
 }

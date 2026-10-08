@@ -347,12 +347,41 @@ fn check_deployment(
         ));
     }
 
-    // The gateway token: a secret, never a measured value.
-    if !config.secrets.iter().any(|s| s == "GATEWAY_TOKEN") {
-        return Err(format!(
-            "{at_config}: the engine container must take GATEWAY_TOKEN as a secret"
-        ));
-    }
+    // The gateway token is the one secret: anything else would reach the
+    // node outside the measurement.
+    engine_deployment::check_secrets(config.secrets.iter().map(String::as_str))
+        .map_err(|e| format!("{at_config}: {e}"))?;
+    // The shim exposes exactly the node's routes, and the weights the node
+    // reads are the pinned, granted model pack.
+    engine_deployment::check_shim_paths(
+        &config
+            .shim_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|e| format!("{at_config}: {e}"))?;
+    let packs: Vec<engine_deployment::ModelPack<'_>> = config
+        .packs
+        .iter()
+        .map(|(name, repo, mpk)| engine_deployment::ModelPack {
+            name,
+            repo: repo.as_deref(),
+            mpk: mpk.as_deref(),
+        })
+        .collect();
+    engine_deployment::check_weights_pack(
+        &packs,
+        &config
+            .granted
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        &measured.weights_dir,
+        &weights.repo,
+        &weights.revision,
+    )
+    .map_err(|e| format!("{at_config}: {e}"))?;
     if config.env.contains_key("GATEWAY_TOKEN") {
         return Err(format!(
             "{at_config}: GATEWAY_TOKEN must not be a measured environment value"
@@ -485,6 +514,24 @@ struct EngineConfig {
     runtime: Option<String>,
     /// The engine container's GPU selection (`gpus`), as written.
     container_gpus: Option<String>,
+    /// The model packs, as `(name, repo, mpk)`.
+    packs: Vec<(String, Option<String>, Option<String>)>,
+    /// The model packs granted to the engine container.
+    granted: Vec<String>,
+    /// The shim's `paths`.
+    shim_paths: Vec<String>,
+}
+
+/// A YAML list of strings.
+fn string_list(value: &serde_yaml::Value, path: &str, what: &str) -> Result<Vec<String>, String> {
+    value
+        .as_sequence()
+        .and_then(|l| {
+            l.iter()
+                .map(|s| s.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or_else(|| format!("{path}: {what} must be a list of strings"))
 }
 
 /// Refuse any key of the mapping `value` that `allowed` does not list.
@@ -531,6 +578,31 @@ impl EngineConfig {
                 allow_keys(model, allowed_keys::MODEL, path, &format!("models[{i}]"))?;
             }
         }
+        let mut packs = Vec::new();
+        for (i, model) in config
+            .get("models")
+            .and_then(serde_yaml::Value::as_sequence)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+        {
+            let field = |key: &str| -> Result<Option<String>, String> {
+                match model.get(key) {
+                    None => Ok(None),
+                    Some(v) => v
+                        .as_str()
+                        .map(|s| Some(s.to_owned()))
+                        .ok_or_else(|| format!("{path}: models[{i}].{key} must be a string")),
+                }
+            };
+            let name = field("name")?.ok_or_else(|| format!("{path}: models[{i}] has no name"))?;
+            packs.push((name, field("repo")?, field("mpk")?));
+        }
+        let shim_paths = match config.get("shim").and_then(|shim| shim.get("paths")) {
+            None => Vec::new(),
+            Some(paths) => string_list(paths, path, "shim.paths")?,
+        };
         let cvm_version = config
             .get("cvm-version")
             .and_then(serde_yaml::Value::as_str)
@@ -578,6 +650,10 @@ impl EngineConfig {
             path,
             "the engine container",
         )?;
+        let granted = match engine.get("models") {
+            None => Vec::new(),
+            Some(models) => string_list(models, path, "the engine container's models")?,
+        };
         let runtime = match engine.get("runtime") {
             None => None,
             Some(runtime) => Some(
@@ -657,6 +733,9 @@ impl EngineConfig {
             gpus,
             runtime,
             container_gpus,
+            packs,
+            granted,
+            shim_paths,
         })
     }
 }

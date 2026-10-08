@@ -128,6 +128,7 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
     let expected_gpus = sidecar.get("expected_gpus").and_then(Value::as_u64);
     eidola_common::engine_deployment::check_gpu_attestation(executor, gpus, expected_gpus)
         .map_err(anyhow::Error::msg)?;
+    check_secrets_shim_and_weights(&config_yaml, &var("EIDOLA_ENGINE_WEIGHTS_DIR")?, &sidecar)?;
     let (runtime, container_gpus) = engine_gpu_access(&config_yaml)?;
     eidola_common::engine_deployment::check_container_gpu_access(
         executor,
@@ -186,6 +187,63 @@ fn allow_keys(value: &serde_yaml::Value, allowed: &[&str], what: &str) -> Result
         bail!("{what} may not set {key:?}; an engine deployment uses only {allowed:?} there");
     }
     Ok(())
+}
+
+/// The rules the gateway's build also holds (`eidola_common::engine_deployment`): the
+/// gateway token is the only secret, the shim exposes exactly the node's routes, and the
+/// weights directory is the one pinned model pack granted to the engine.
+fn check_secrets_shim_and_weights(
+    config: &serde_yaml::Value,
+    weights_dir: &str,
+    sidecar: &Value,
+) -> Result<()> {
+    use eidola_common::engine_deployment as rules;
+    let strings = |value: Option<&serde_yaml::Value>, what: &str| -> Result<Vec<String>> {
+        match value {
+            None => Ok(Vec::new()),
+            Some(v) => v
+                .as_sequence()
+                .and_then(|l| l.iter().map(|s| s.as_str().map(str::to_owned)).collect())
+                .with_context(|| format!("{what} must be a list of strings")),
+        }
+    };
+    let engine = &config["containers"][0];
+    let secrets = strings(engine.get("secrets"), "the engine container's secrets")?;
+    rules::check_secrets(secrets.iter().map(String::as_str)).map_err(anyhow::Error::msg)?;
+    let paths = strings(
+        config.get("shim").and_then(|s| s.get("paths")),
+        "shim.paths",
+    )?;
+    rules::check_shim_paths(&paths.iter().map(String::as_str).collect::<Vec<_>>())
+        .map_err(anyhow::Error::msg)?;
+    let granted = strings(engine.get("models"), "the engine container's models")?;
+    let text = |v: &serde_yaml::Value, key: &str| v.get(key).and_then(serde_yaml::Value::as_str);
+    let packs: Vec<rules::ModelPack<'_>> = config
+        .get("models")
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .map(|m| rules::ModelPack {
+            name: text(m, "name").unwrap_or(""),
+            repo: text(m, "repo"),
+            mpk: text(m, "mpk"),
+        })
+        .collect();
+    let field = |key: &str| {
+        sidecar
+            .pointer(&format!("/weights/{key}"))
+            .and_then(Value::as_str)
+            .with_context(|| format!("deployment.json has no weights.{key}"))
+    };
+    rules::check_weights_pack(
+        &packs,
+        &granted.iter().map(String::as_str).collect::<Vec<_>>(),
+        weights_dir,
+        field("repo")?,
+        field("revision")?,
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 /// The engine container's `runtime` and GPU selection, as written.
@@ -280,15 +338,25 @@ mod tests {
 cpus: 16
 memory: 65536
 gpus: 8
+models:
+  - name: "weights"
+    repo: "example/fixture-model@4444444444444444444444444444444444444444"
+    mpk: "{root}_17419419648_3892cd2f"
+shim:
+  upstream-port: 8080
+  paths:
+    - /*
 containers:
   - name: "eidola-server-engine"
     image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:{digest}"
     runtime: nvidia
     gpus: all
+    models: ["weights"]
     secrets:
       - GATEWAY_TOKEN
     env:
       - EIDOLA_ENGINE_MODEL_ID: "fixture-model"
+      - EIDOLA_ENGINE_WEIGHTS_DIR: "/tinfoil/models/weights"
       - EIDOLA_ENGINE_WEIGHTS_SHA256: "{weights}"
       - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
       - EIDOLA_ENGINE_EXECUTOR: "cuda"
@@ -299,6 +367,7 @@ containers:
 "#,
             digest = "2".repeat(64),
             weights = "3".repeat(64),
+            root = "5".repeat(64),
         )
     }
 
@@ -436,6 +505,19 @@ containers:
         );
         let no_runtime = good.replace("    runtime: nvidia\n", "");
         assert!(entry("fixture-model", &no_runtime, SIDECAR).contains("runtime: nvidia"));
+        // Another secret, a partial shim, an ungranted pack.
+        let extra_secret = good.replace(
+            "      - GATEWAY_TOKEN\n",
+            "      - GATEWAY_TOKEN\n      - RUST_LOG\n",
+        );
+        assert!(entry("fixture-model", &extra_secret, SIDECAR).contains("secrets must be exactly"));
+        let partial = good.replace("    - /*\n", "    - /v1/chat/completions\n");
+        assert!(entry("fixture-model", &partial, SIDECAR).contains("shim.paths must expose"));
+        let ungranted = good.replace("    models: [\"weights\"]\n", "");
+        assert!(
+            entry("fixture-model", &ungranted, SIDECAR)
+                .contains("granted exactly the weights pack")
+        );
         let tagged = good.replace(&format!("@sha256:{}", "2".repeat(64)), ":v1");
         assert!(entry("fixture-model", &tagged, SIDECAR).contains("64-hex-digit digest"));
     }

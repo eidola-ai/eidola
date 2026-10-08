@@ -5,16 +5,22 @@ cpus: 16
 memory: 65536
 gpus: 8
 
+models:
+  - name: "weights"
+    repo: "example/fixture-model@4444444444444444444444444444444444444444"
+    mpk: "5555555555555555555555555555555555555555555555555555555555555555_17419419648_3892cd2f-a06e-5aee-8276-93140b9f06ec"
+
 containers:
   - name: "eidola-server-engine"
     image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222"
     runtime: nvidia
+    models: ["weights"]
     gpus: all
     secrets:
       - GATEWAY_TOKEN
     env:
       - EIDOLA_ENGINE_MODEL_ID: "fixture-model"
-      - EIDOLA_ENGINE_WEIGHTS_DIR: "/weights"
+      - EIDOLA_ENGINE_WEIGHTS_DIR: "/tinfoil/models/weights"
       - EIDOLA_ENGINE_WEIGHTS_SHA256: "3333333333333333333333333333333333333333333333333333333333333333"
       - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
       - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA"
