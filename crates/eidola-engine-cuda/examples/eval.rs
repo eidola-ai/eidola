@@ -12,7 +12,10 @@
 //!
 //! - `tasks.jsonl`: `{"id", "messages", "tools"?, "enable_thinking"?, "kind",
 //!   "answer"? | "expect"?}` — `kind` is `"gsm8k"` (with a numeric `answer`) or
-//!   `"tool"` (with `expect`: `{"name", "arguments"}`, or `null` for "no call").
+//!   `"tool"` (with `expect`: `{"name", "arguments", "free"?}`, or `null` for
+//!   "no call"). A tool task passes only with exactly one call of that name
+//!   whose arguments are exactly `arguments` plus each `free` key (free text,
+//!   value not scored), and nothing else.
 //! - `prompts.jsonl`: `{"id", "prompt_ids"}` (the chat template rendered with
 //!   the generation prompt, then encoded).
 //! - `outputs.jsonl`: `{"id", "output_ids"}` (greedy, stopped at EOS).
@@ -154,6 +157,7 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32) 
     };
     let mut eng = Engine::new(ex, sched).unwrap();
     let rows = read_jsonl(prompts);
+    by_id(&rows, "prompts");
     let mut index = HashMap::new();
     for (i, r) in rows.iter().enumerate() {
         index.insert(i as u64, r["id"].clone());
@@ -194,7 +198,7 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32) 
         eng.stats()
     );
     let out_rows: Vec<Value> = (0..rows.len() as u64)
-        .map(|i| json!({"id": index[&i], "output_ids": outputs.get(&i).cloned().unwrap_or_default(), "finish": finish.get(&i)}))
+        .map(|i| json!({"id": index[&i], "output_ids": outputs.get(&i).cloned().unwrap_or_default(), "finish": finish[&i]}))
         .collect();
     write_jsonl(out, &out_rows);
 }
@@ -215,9 +219,15 @@ fn log_softmax(row: &[f32], n: usize) -> Vec<f32> {
 /// Top-`TOP` (id, log-probability) of one log-probability row.
 fn top(lp: &[f32]) -> Vec<(u32, f64)> {
     let mut idx: Vec<u32> = (0..lp.len() as u32).collect();
-    idx.select_nth_unstable_by(TOP, |&a, &b| lp[b as usize].total_cmp(&lp[a as usize]));
-    idx.truncate(TOP);
-    idx.sort_by(|&a, &b| lp[b as usize].total_cmp(&lp[a as usize]).then(a.cmp(&b)));
+    // One total order (log-probability descending, then id ascending) for
+    // both the cut and the sort: which of several tied tokens make the list
+    // never depends on the selection algorithm.
+    let order = |&a: &u32, &b: &u32| lp[b as usize].total_cmp(&lp[a as usize]).then(a.cmp(&b));
+    if idx.len() > TOP {
+        idx.select_nth_unstable_by(TOP, order);
+        idx.truncate(TOP);
+    }
+    idx.sort_by(order);
     idx.iter().map(|&i| (i, lp[i as usize] as f64)).collect()
 }
 
@@ -247,6 +257,7 @@ fn logprobs(
     full: Option<&str>,
 ) {
     let rows = read_jsonl(prompts);
+    by_id(&rows, "prompts");
     let vocab = 152_576usize;
     let mut sink = LogprobSink {
         full: full.map(|p| std::io::BufWriter::new(std::fs::File::create(p).unwrap())),
@@ -367,14 +378,34 @@ fn kl_lower_bound(ta: &[(u64, f64)], tb: &[(u64, f64)]) -> f64 {
     kl
 }
 
-/// Reads whole log-probability rows of `width` from a `--full` file.
+/// Rows by id, refusing a duplicate id: a repeated id would otherwise
+/// shadow or double-count a prompt.
+fn by_id<'a>(rows: &'a [Value], what: &str) -> HashMap<String, &'a Value> {
+    let mut m = HashMap::with_capacity(rows.len());
+    for r in rows {
+        let id = r["id"].to_string();
+        assert!(m.insert(id.clone(), r).is_none(), "{what}: id {id} twice");
+    }
+    m
+}
+
+/// The whole log-probability rows of a `--full` file, found by prompt id
+/// through the order of the top-list file written beside it.
 struct FullRows {
-    file: std::io::BufReader<std::fs::File>,
+    file: std::fs::File,
     width: usize,
+    /// Each id's first row.
+    first: HashMap<String, usize>,
 }
 
 impl FullRows {
-    fn open(path: &str, rows: usize) -> FullRows {
+    fn open(path: &str, tops: &[Value]) -> FullRows {
+        let mut first = HashMap::new();
+        let mut rows = 0;
+        for r in tops {
+            first.insert(r["id"].to_string(), rows);
+            rows += r["top"].as_array().unwrap().len();
+        }
         let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let bytes = file.metadata().unwrap().len() as usize;
         assert!(
@@ -382,14 +413,20 @@ impl FullRows {
             "{path}: {bytes} bytes is not {rows} whole rows"
         );
         FullRows {
-            file: std::io::BufReader::new(file),
+            file,
             width: bytes / (rows * 4),
+            first,
         }
     }
 
-    fn next(&mut self) -> Vec<f64> {
-        use std::io::Read;
+    /// Row `pos` of prompt `id`.
+    fn row(&mut self, id: &str, pos: usize) -> Vec<f64> {
+        use std::io::{Read, Seek, SeekFrom};
+        let row = self.first[id] + pos;
         let mut buf = vec![0u8; self.width * 4];
+        self.file
+            .seek(SeekFrom::Start((row * self.width * 4) as u64))
+            .unwrap();
         self.file.read_exact(&mut buf).unwrap();
         buf.as_chunks::<4>()
             .0
@@ -399,70 +436,68 @@ impl FullRows {
     }
 }
 
-fn compare(a: &str, b: &str, full: Option<(&str, &str)>, from: Option<&str>) {
-    let (a, b) = (read_jsonl(a), read_jsonl(b));
-    let key = |r: &Value| r["id"].to_string();
-    let by_id: HashMap<String, &Value> = b.iter().map(|r| (key(r), r)).collect();
-    assert_eq!(a.len(), b.len(), "the files hold different prompt sets");
-    let starts: HashMap<String, usize> = from.map_or_else(HashMap::new, |p| {
-        read_jsonl(p)
-            .iter()
-            .map(|r| (key(r), r["start"].as_u64().unwrap() as usize))
-            .collect()
-    });
+/// What `compare` reports.
+#[derive(Debug, Default, PartialEq)]
+struct Metrics {
+    positions: usize,
+    top1: usize,
+    /// Tokens in both top lists, summed over positions.
+    overlap: usize,
+    lower_bound_sum: f64,
+    lower_bound_max: f64,
+    /// KL(a ‖ b) from whole rows (`--full` only).
+    kl: Option<(f64, f64)>,
+}
+
+/// Compare two log-probability files, pairing every position by prompt id
+/// and position, never by file order.
+fn compare_rows(
+    a: &[Value],
+    b: &[Value],
+    full: Option<(&str, &str)>,
+    starts: Option<&HashMap<String, usize>>,
+) -> Metrics {
+    let (ia, ib) = (by_id(a, "a"), by_id(b, "b"));
+    assert_eq!(ia.len(), ib.len(), "the files hold different prompt sets");
     // Every id in both files, with the same number of positions: a
     // shortened side would otherwise drop out of every metric unseen.
-    let mut lens = Vec::with_capacity(a.len());
-    for ra in &a {
-        let rb = by_id
-            .get(&key(ra))
-            .unwrap_or_else(|| panic!("id {} is missing from b", key(ra)));
+    for (id, ra) in &ia {
+        let rb = ib
+            .get(id)
+            .unwrap_or_else(|| panic!("id {id} is missing from b"));
         let (na, nb) = (
             ra["top"].as_array().unwrap().len(),
             rb["top"].as_array().unwrap().len(),
         );
-        assert_eq!(na, nb, "id {}: {na} positions in a, {nb} in b", key(ra));
-        lens.push(na);
+        assert_eq!(na, nb, "id {id}: {na} positions in a, {nb} in b");
     }
-    let total: usize = lens.iter().sum();
     let mut full = full.map(|(fa, fb)| {
-        let (fa, fb) = (FullRows::open(fa, total), FullRows::open(fb, total));
+        let (fa, fb) = (FullRows::open(fa, a), FullRows::open(fb, b));
         assert_eq!(fa.width, fb.width, "full rows of different widths");
         (fa, fb)
     });
-    let (mut n, mut top1, mut overlap) = (0usize, 0usize, 0usize);
-    let (mut lb_sum, mut lb_max, mut kl_sum, mut kl_max) = (0f64, 0f64, 0f64, 0f64);
-    for ra in &a {
-        let rb = by_id[&key(ra)];
-        let start = if from.is_some() {
-            *starts
-                .get(&key(ra))
-                .unwrap_or_else(|| panic!("id {} has no start", key(ra)))
-        } else {
-            0
-        };
-        for (pos, (pa, pb)) in ra["top"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .zip(rb["top"].as_array().unwrap())
-            .enumerate()
-        {
-            let rows = full.as_mut().map(|(fa, fb)| (fa.next(), fb.next()));
-            if pos < start {
-                continue;
-            }
-            let (ta, tb) = (top_list(pa), top_list(pb));
-            n += 1;
-            top1 += (ta[0].0 == tb[0].0) as usize;
-            overlap += ta
+    let mut m = Metrics::default();
+    let (mut kl_sum, mut kl_max) = (0f64, 0f64);
+    for ra in a {
+        let id = ra["id"].to_string();
+        let rb = ib[&id];
+        let start = starts.map_or(0, |s| {
+            *s.get(&id).unwrap_or_else(|| panic!("id {id} has no start"))
+        });
+        let (pa, pb) = (ra["top"].as_array().unwrap(), rb["top"].as_array().unwrap());
+        for pos in start..pa.len() {
+            let (ta, tb) = (top_list(&pa[pos]), top_list(&pb[pos]));
+            m.positions += 1;
+            m.top1 += (ta[0].0 == tb[0].0) as usize;
+            m.overlap += ta
                 .iter()
                 .filter(|(t, _)| tb.iter().any(|(u, _)| u == t))
                 .count();
             let lb = kl_lower_bound(&ta, &tb);
-            lb_sum += lb;
-            lb_max = lb_max.max(lb);
-            if let Some((la, lb)) = rows {
+            m.lower_bound_sum += lb;
+            m.lower_bound_max = m.lower_bound_max.max(lb);
+            if let Some((fa, fb)) = &mut full {
+                let (la, lb) = (fa.row(&id, pos), fb.row(&id, pos));
                 let kl: f64 = la
                     .iter()
                     .zip(&lb)
@@ -479,16 +514,35 @@ fn compare(a: &str, b: &str, full: Option<(&str, &str)>, from: Option<&str>) {
             }
         }
     }
-    let nf = n as f64;
-    print!(
-        "positions {n}: top-1 {top1}/{n} ({:.2}%), top-{TOP} overlap {:.2}%, KL lower bound (shared top-{TOP} + remainder) mean {:.3e} max {:.3e}",
-        100.0 * top1 as f64 / nf,
-        100.0 * overlap as f64 / (nf * TOP as f64),
-        lb_sum / nf,
-        lb_max
-    );
     if full.is_some() {
-        print!(", KL mean {:.3e} max {:.3e}", kl_sum / nf, kl_max);
+        m.kl = Some((kl_sum, kl_max));
+    }
+    m
+}
+
+fn compare(a: &str, b: &str, full: Option<(&str, &str)>, from: Option<&str>) {
+    let (a, b) = (read_jsonl(a), read_jsonl(b));
+    let starts: Option<HashMap<String, usize>> = from.map(|p| {
+        let rows = read_jsonl(p);
+        by_id(&rows, "prompts")
+            .into_iter()
+            .map(|(id, r)| (id, r["start"].as_u64().unwrap() as usize))
+            .collect()
+    });
+    let m = compare_rows(&a, &b, full, starts.as_ref());
+    let n = m.positions as f64;
+    print!(
+        "positions {}: top-1 {}/{} ({:.2}%), top-{TOP} overlap {:.2}%, KL lower bound (shared top-{TOP} + remainder) mean {:.3e} max {:.3e}",
+        m.positions,
+        m.top1,
+        m.positions,
+        100.0 * m.top1 as f64 / n,
+        100.0 * m.overlap as f64 / (n * TOP as f64),
+        m.lower_bound_sum / n,
+        m.lower_bound_max
+    );
+    if let Some((sum, max)) = m.kl {
+        print!(", KL mean {:.3e} max {max:.3e}", sum / n);
     }
     println!();
 }
@@ -531,18 +585,17 @@ fn gsm8k_answer(text: &str) -> Option<f64> {
     last
 }
 
+/// Exact equality of JSON values: objects with exactly the same keys,
+/// arrays element for element, numbers by value (`5` and `5.0` are one),
+/// everything else by type and value.
 fn values_match(want: &Value, got: &Value) -> bool {
     match (want, got) {
-        (Value::String(a), Value::String(b)) => a.trim().eq_ignore_ascii_case(b.trim()),
-        (Value::Number(a), Value::Number(b)) => {
-            (a.as_f64().unwrap() - b.as_f64().unwrap()).abs() < 1e-9
+        (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|g| values_match(v, g)))
         }
-        (Value::Number(a), Value::String(b)) | (Value::String(b), Value::Number(a)) => {
-            number(b).is_some_and(|x| (x - a.as_f64().unwrap()).abs() < 1e-9)
-        }
-        (Value::Object(a), Value::Object(b)) => a
-            .iter()
-            .all(|(k, v)| b.get(k).is_some_and(|g| values_match(v, g))),
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| values_match(x, y))
         }
@@ -550,15 +603,46 @@ fn values_match(want: &Value, got: &Value) -> bool {
     }
 }
 
+/// Whether a call's arguments are exactly what `expect` names: its
+/// `arguments`, value for value, plus each `free` key (free text, such as a
+/// search query, whose wording is not scored), and no other key.
+fn arguments_match(expect: &Value, got: &Value) -> bool {
+    let (Some(want), Some(got)) = (expect["arguments"].as_object(), got.as_object()) else {
+        return false;
+    };
+    let free: Vec<&str> = expect
+        .get("free")
+        .and_then(Value::as_array)
+        .map_or_else(Vec::new, |f| {
+            f.iter().map(|k| k.as_str().unwrap()).collect()
+        });
+    assert!(
+        free.iter().all(|k| !want.contains_key(*k)),
+        "a free key with an expected value: {expect}"
+    );
+    got.len() == want.len() + free.len()
+        && free.iter().all(|k| got.contains_key(*k))
+        && want
+            .iter()
+            .all(|(k, v)| got.get(k).is_some_and(|g| values_match(v, g)))
+}
+
 fn score(model: &str, tasks: &str, outputs: &str) {
     let tok = MimoTokenizer::from_model_dir(Path::new(model)).unwrap();
-    let outs: HashMap<String, Value> = read_jsonl(outputs)
-        .into_iter()
-        .map(|r| (r["id"].to_string(), r))
-        .collect();
+    let (outputs, tasks) = (read_jsonl(outputs), read_jsonl(tasks));
+    // One output per task, paired by id: a missing, repeated or extra output
+    // would otherwise go uncounted.
+    let outs = by_id(&outputs, "outputs");
+    assert_eq!(
+        by_id(&tasks, "tasks").len(),
+        outs.len(),
+        "outputs and tasks differ"
+    );
     let (mut gsm, mut gsm_ok, mut tool, mut tool_ok, mut truncated) = (0, 0, 0, 0, 0);
-    for t in read_jsonl(tasks) {
-        let o = &outs[&t["id"].to_string()];
+    for t in &tasks {
+        let o = outs
+            .get(&t["id"].to_string())
+            .unwrap_or_else(|| panic!("no output for {}", t["id"]));
         let out_ids = ids(&o["output_ids"]);
         if !out_ids.last().is_some_and(|&x| tok.is_eos(x)) {
             truncated += 1;
@@ -585,7 +669,7 @@ fn score(model: &str, tasks: &str, outputs: &str) {
                     e => matches!(&parsed.calls[..], [(name, args)]
                         if name == e["name"].as_str().unwrap()
                             && serde_json::from_str::<Value>(args)
-                                .is_ok_and(|a| values_match(&e["arguments"], &a))),
+                                .is_ok_and(|a| arguments_match(e, &a))),
                 };
                 tool_ok += ok as usize;
                 println!(
@@ -636,5 +720,132 @@ fn main() {
             flag(&a[4..], "--from", 1).map(|v| v[0]),
         ),
         _ => eprintln!("usage: see the module docs"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ties are cut by id inside the selection itself: with more than `TOP`
+    /// tokens tied (at the maximum, or at the cut), the lowest ids are kept,
+    /// in id order.
+    #[test]
+    fn top_lists_break_ties_by_id() {
+        let tied = vec![-3.0f32; 64];
+        let want: Vec<u32> = (0..TOP as u32).collect();
+        assert_eq!(top(&tied).iter().map(|t| t.0).collect::<Vec<_>>(), want);
+        // Two maxima at high ids, then 40 tokens tied at the cut.
+        let mut lp = vec![-9.0f32; 100];
+        lp[90] = -0.5;
+        lp[70] = -0.5;
+        for v in &mut lp[20..60] {
+            *v = -2.0;
+        }
+        let got: Vec<u32> = top(&lp).iter().map(|t| t.0).collect();
+        let mut want = vec![70, 90];
+        want.extend(20..38);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn arguments_match_exactly() {
+        let e = json!({"name": "f", "arguments": {"city": "Paris", "opts": {"a": [1, 2]}}});
+        let ok = json!({"city": "Paris", "opts": {"a": [1.0, 2]}});
+        assert!(arguments_match(&e, &ok));
+        for bad in [
+            json!({"city": "Paris", "opts": {"a": [1, 2]}, "unit": "c"}),
+            json!({"city": "Paris"}),
+            json!({"city": "paris", "opts": {"a": [1, 2]}}),
+            json!({"city": "Paris", "opts": {"a": [1, 2], "b": 0}}),
+            json!({"city": "Paris", "opts": {"a": [1, 2, 3]}}),
+            json!({"city": "Paris", "opts": {"a": ["1", 2]}}),
+            json!(["Paris"]),
+        ] {
+            assert!(!arguments_match(&e, &bad), "{bad}");
+        }
+        let free =
+            json!({"name": "web_search", "arguments": {"max_results": 3}, "free": ["query"]});
+        assert!(arguments_match(
+            &free,
+            &json!({"query": "anything", "max_results": 3})
+        ));
+        assert!(!arguments_match(&free, &json!({"max_results": 3})));
+        assert!(!arguments_match(
+            &free,
+            &json!({"query": "x", "max_results": 10})
+        ));
+        assert!(!arguments_match(
+            &free,
+            &json!({"query": "x", "max_results": 3, "lang": "en"})
+        ));
+    }
+
+    fn write_full(path: &std::path::Path, rows: &[Vec<f32>]) {
+        let mut f = std::fs::File::create(path).unwrap();
+        for r in rows {
+            for v in r {
+                f.write_all(&v.to_le_bytes()).unwrap();
+            }
+        }
+    }
+
+    /// Positions pair by prompt id in the top lists and in the whole rows,
+    /// whatever order each file holds the prompts in.
+    #[test]
+    fn rows_pair_by_id_in_any_order() {
+        let dir = std::env::temp_dir().join(format!("eidola-eval-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Prompt p0 has 2 positions, p1 has 3; every row a distinct
+        // distribution over 24 ids.
+        let row = |seed: usize| -> Vec<f32> {
+            let logits: Vec<f32> = (0..24)
+                .map(|i| ((i * 7 + seed * 5) % 11) as f32 * 0.3)
+                .collect();
+            log_softmax(&logits, 24)
+        };
+        let prompts = [
+            ("p0", vec![row(1), row(2)]),
+            ("p1", vec![row(3), row(4), row(5)]),
+        ];
+        let file = |order: &[usize], name: &str| {
+            let tops: Vec<Value> = order
+                .iter()
+                .map(|&i| json!({"id": prompts[i].0, "top": prompts[i].1.iter().map(|r| top(r)).collect::<Vec<_>>()}))
+                .collect();
+            let rows: Vec<Vec<f32>> = order.iter().flat_map(|&i| prompts[i].1.clone()).collect();
+            let path = dir.join(name);
+            write_full(&path, &rows);
+            (tops, path)
+        };
+        let (ta, fa) = file(&[0, 1], "a.f32");
+        let (tb, fb) = file(&[1, 0], "b.f32");
+        let m = compare_rows(
+            &ta,
+            &tb,
+            Some((fa.to_str().unwrap(), fb.to_str().unwrap())),
+            None,
+        );
+        assert_eq!((m.positions, m.top1, m.overlap), (5, 5, 5 * TOP));
+        assert_eq!(m.kl, Some((0.0, 0.0)));
+        assert_eq!((m.lower_bound_sum, m.lower_bound_max), (0.0, 0.0));
+        let starts = HashMap::from([(json!("p0").to_string(), 1), (json!("p1").to_string(), 2)]);
+        assert_eq!(compare_rows(&ta, &tb, None, Some(&starts)).positions, 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "positions in a")]
+    fn position_counts_must_match() {
+        let a = vec![json!({"id": "p", "top": [[[0, 0.0]], [[0, 0.0]]]})];
+        let b = vec![json!({"id": "p", "top": [[[0, 0.0]]]})];
+        compare_rows(&a, &b, None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "twice")]
+    fn ids_must_be_unique() {
+        let r = json!({"id": "p", "top": [[[0, 0.0]]]});
+        compare_rows(&[r.clone(), r.clone()], &[r.clone(), r], None, None);
     }
 }
