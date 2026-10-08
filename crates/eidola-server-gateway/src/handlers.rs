@@ -1028,15 +1028,23 @@ where
 mod tests {
     use super::*;
 
-    async fn extract(body: String) -> Result<serde_json::Value, axum::response::Response> {
+    /// The extractor's result over `body`: the value, or the refusal's status and text.
+    async fn extract(body: String) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
         let req = Request::builder()
             .method("POST")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body))
             .unwrap();
-        LoggedJson::<serde_json::Value>::from_request(req, &())
-            .await
-            .map(|LoggedJson(v)| v)
+        match LoggedJson::<serde_json::Value>::from_request(req, &()).await {
+            Ok(LoggedJson(v)) => Ok(v),
+            Err(response) => {
+                let status = response.status();
+                let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                Err((status, String::from_utf8_lossy(&text).into_owned()))
+            }
+        }
     }
 
     /// A body past the engine's JSON value or depth limit is refused with a 400 before
@@ -1044,28 +1052,24 @@ mod tests {
     #[tokio::test]
     async fn a_body_past_the_json_shape_limits_is_refused() {
         use eidola_common::engine_protocol::{MAX_REQUEST_JSON_DEPTH, MAX_REQUEST_JSON_VALUES};
+        let bad = axum::http::StatusCode::BAD_REQUEST;
         let values = |n: usize| format!("[{}0]", "0,".repeat(n - 2));
         assert!(extract(values(MAX_REQUEST_JSON_VALUES)).await.is_ok());
-        let over = extract(values(MAX_REQUEST_JSON_VALUES + 1))
+        let (status, text) = extract(values(MAX_REQUEST_JSON_VALUES + 1))
             .await
             .unwrap_err();
-        assert_eq!(over.status(), axum::http::StatusCode::BAD_REQUEST);
-        let text = axum::body::to_bytes(over.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(
-            String::from_utf8_lossy(&text).contains("JSON values"),
-            "{text:?}"
-        );
+        assert_eq!(status, bad);
+        assert!(text.contains("JSON values"), "{text}");
         let nested = |d: usize| format!("{}{}", "[".repeat(d), "]".repeat(d));
         assert!(extract(nested(MAX_REQUEST_JSON_DEPTH)).await.is_ok());
-        let deep = extract(nested(MAX_REQUEST_JSON_DEPTH + 1))
+        let (status, text) = extract(nested(MAX_REQUEST_JSON_DEPTH + 1))
             .await
             .unwrap_err();
-        assert_eq!(deep.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(status, bad);
+        assert!(text.contains("deeper"), "{text}");
         // Malformed JSON is axum's refusal, unchanged.
-        let malformed = extract("[1,".into()).await.unwrap_err();
-        assert_eq!(malformed.status(), axum::http::StatusCode::BAD_REQUEST);
+        let (status, _) = extract("[1,".into()).await.unwrap_err();
+        assert_eq!(status, bad);
     }
     use crate::types::{
         Capability, Modality, ModelCapabilities, ModelHosting, ModelPricing, OutputBudgetClass,
