@@ -31,6 +31,10 @@
 //!   bucket for all other mass, which by the data-processing inequality can
 //!   only understate KL. `--from` restricts both to positions from each
 //!   prompt's `start` on. Ids and per-id position counts must match exactly.
+//!
+//! The executor replays decode graphs when `EIDOLA_ENGINE_CUDA_GRAPHS` is `on`
+//! (`off`, eager, when unset), so `generate` runs with each setting give the
+//! outputs to compare.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -47,7 +51,7 @@ use eidola_engine_chat::json::Json;
 use eidola_engine_chat::tool_call::parse_complete;
 use eidola_engine_chat::{ChatInput, ChatTemplate, MimoTokenizer, RenderOptions, ToolSchemas};
 use eidola_engine_cuda::KernelDir;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, Gpu, KvBlocks};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, KvBlocks};
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
 use serde_json::{Value, json};
@@ -115,6 +119,9 @@ fn executor(kernels: &str, model: &str, max_tokens: u32, max_seqs: u32) -> (Cuda
         ],
         sampleable_vocab_size: u32::try_from(tok.vocab_size()).unwrap(),
         image: None,
+        graphs: std::env::var("EIDOLA_ENGINE_CUDA_GRAPHS").map_or(CudaGraphs::Off, |v| {
+            CudaGraphs::parse(&v).unwrap_or_else(|e| panic!("EIDOLA_ENGINE_CUDA_GRAPHS: {e}"))
+        }),
     };
     let t0 = Instant::now();
     let ex = CudaExecutor::new(gpu, &dir, store, None, cfg).unwrap();

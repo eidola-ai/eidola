@@ -42,6 +42,9 @@ pub mod env {
     /// The kernel build output the CUDA executor loads its images from; every image is
     /// checked against the compiled-in kernel manifest (`cuda` only).
     pub const KERNELS_DIR: &str = "EIDOLA_ENGINE_KERNELS_DIR";
+    /// Whether the CUDA executor replays captured graphs for decode steps: `on` or `off`
+    /// (`cuda` only).
+    pub const CUDA_GRAPHS: &str = "EIDOLA_ENGINE_CUDA_GRAPHS";
     /// Longest sequence (prompt plus completion), in tokens.
     pub const MAX_MODEL_LEN: &str = "EIDOLA_ENGINE_MAX_MODEL_LEN";
     /// Sequences per step (and per-sequence state slots).
@@ -89,6 +92,8 @@ pub enum ExecutorConfig {
         /// Device memory for the KV pools; the node derives the per-group block counts
         /// from it (`crate::cuda::derive_kv_blocks`).
         kv_device_bytes: u64,
+        /// Whether decode steps replay captured graphs.
+        graphs: eidola_engine_cuda::CudaGraphs,
     },
 }
 
@@ -285,6 +290,7 @@ impl Config {
             ExecutorKind::Cpu => {
                 refuse_unless(env::KV_DEVICE_BYTES, "cuda")?;
                 refuse_unless(env::KERNELS_DIR, "cuda")?;
+                refuse_unless(env::CUDA_GRAPHS, "cuda")?;
                 let kv_blocks = positive(env::KV_BLOCKS)?;
                 if kv_blocks < 2 {
                     return Err(ConfigError(format!(
@@ -306,9 +312,12 @@ impl Config {
                         )));
                     }
                 };
+                let graphs = eidola_engine_cuda::CudaGraphs::parse(&get(env::CUDA_GRAPHS)?)
+                    .map_err(|e| ConfigError(format!("{}: {e}", env::CUDA_GRAPHS)))?;
                 ExecutorConfig::Cuda {
                     kernels_dir: PathBuf::from(get(env::KERNELS_DIR)?),
                     kv_device_bytes,
+                    graphs,
                 }
             }
         };

@@ -918,6 +918,7 @@ fn configuration_refuses_anything_missing_or_malformed() {
     for (key, value) in [
         (env::KV_DEVICE_BYTES, "1073741824"),
         (env::KERNELS_DIR, "/k"),
+        (env::CUDA_GRAPHS, "on"),
     ] {
         let mut map = full.clone();
         map.insert(key, value.to_string());

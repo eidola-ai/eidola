@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, ModelSpec};
 use eidola_engine_cuda::kv::GroupGeometry;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, Gpu, KernelDir, KvBlocks};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, KernelDir, KvBlocks};
 use eidola_engine_model::safetensors::WeightSet;
 
 use crate::BootError;
@@ -42,10 +42,13 @@ const RETENTION_POINTS: u64 = 3;
 ///   positions one step adds. So sliding blocks never run out while the global pool still
 ///   has room, and the global pool is the one that bounds concurrency and context;
 /// * each **global** group gets what is left, `floor((kv_device_bytes − sliding bytes) /
-///   global block bytes)`, and must hold at least one `MAX_MODEL_LEN` sequence plus the
+///   global block bytes) − 1`, and must hold at least one `MAX_MODEL_LEN` sequence plus the
 ///   null block.
 ///
-/// Block bytes are the executor's own (`GroupGeometry::block_bytes`). The rule reads only
+/// Every pool also holds one pad block past the counts given here (the executor's
+/// `GroupGeometry::pad_block`, where padding rows of a replayed decode graph write), so
+/// the bytes charged to the budget are one block more per group than the count. Block
+/// bytes are the executor's own (`GroupGeometry::block_bytes`). The rule reads only
 /// measured values, never the device, so the same configuration derives the same counts
 /// on every node.
 pub fn derive_kv_blocks(
@@ -88,7 +91,8 @@ pub fn derive_kv_blocks(
                         x.checked_add(1 + u64::from(sizing.max_batched_tokens).div_ceil(b))
                     })
                     .ok_or_else(overflow)?;
-                sliding_bytes = blocks
+                // The count, plus the pool's pad block.
+                sliding_bytes = (blocks + 1)
                     .checked_mul(block_bytes(g)?)
                     .and_then(|x| x.checked_add(sliding_bytes))
                     .ok_or_else(overflow)?;
@@ -120,7 +124,8 @@ pub fn derive_kv_blocks(
                     sizing.max_seqs
                 ))
             })?;
-            let blocks = rest / bytes;
+            // What fits, less the pool's pad block.
+            let blocks = (rest / bytes).saturating_sub(1);
             let needed = u64::from(sizing.max_model_len).div_ceil(b) + 1;
             if blocks < needed {
                 return Err(BootError(format!(
@@ -182,6 +187,7 @@ pub fn prepare(
     cache: &CacheConfig,
     kernels_dir: &Path,
     kv_device_bytes: u64,
+    graphs: CudaGraphs,
 ) -> Result<Prepared, BootError> {
     let refused = |e: eidola_engine_cuda::CudaError| {
         BootError(format!("the engine refused its configuration: {e}"))
@@ -208,6 +214,7 @@ pub fn prepare(
         sampleable_vocab_size: u32::try_from(model.tokenizer().vocab_size())
             .map_err(|_| BootError("the tokenizer's vocabulary does not fit u32".into()))?,
         image: None,
+        graphs,
     };
     let spec = CudaExecutor::preflight(model.store(), None, &config).map_err(refused)?;
     config.num_blocks = derive_kv_blocks(&spec, kv_device_bytes, sizing, cache)?;
@@ -307,13 +314,15 @@ mod tests {
         let budget = 40 << 30;
         let blocks = derive_kv_blocks(&flash(), budget, &sizing(), &cache(true)).unwrap();
         assert_eq!(blocks.sliding, sliding as u32);
+        // Each pool holds one pad block past its count.
         assert_eq!(
             u64::from(blocks.global),
-            (budget - sliding * sliding_bytes) / global_bytes
+            (budget - (sliding + 1) * sliding_bytes) / global_bytes - 1
         );
-        // Every derived byte fits the budget.
+        // Every derived byte, pad blocks included, fits the budget.
         assert!(
-            u64::from(blocks.global) * global_bytes + u64::from(blocks.sliding) * sliding_bytes
+            (u64::from(blocks.global) + 1) * global_bytes
+                + (u64::from(blocks.sliding) + 1) * sliding_bytes
                 <= budget
         );
 
@@ -324,10 +333,12 @@ mod tests {
 
     #[test]
     fn a_budget_that_cannot_hold_one_sequence_is_refused() {
-        let sliding_bytes = (1 + 8 * 37 + 32) * 16 * 39 * 8 * 320 * 2u64;
+        // The sliding count plus its pad block.
+        let sliding_bytes = (1 + 8 * 37 + 32 + 1) * 16 * 39 * 8 * 320 * 2u64;
         let global_bytes = 16 * 9 * 4 * 320 * 2u64;
-        // One 4096-token sequence needs 256 blocks plus the null block.
-        let enough = sliding_bytes + 257 * global_bytes;
+        // One 4096-token sequence needs 256 blocks plus the null block, and the pool
+        // its pad block.
+        let enough = sliding_bytes + 258 * global_bytes;
         let blocks = derive_kv_blocks(&flash(), enough, &sizing(), &cache(true)).unwrap();
         assert_eq!(blocks.global, 257);
         let e = derive_kv_blocks(&flash(), enough - 1, &sizing(), &cache(true)).unwrap_err();

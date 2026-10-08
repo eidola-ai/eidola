@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use eidola_engine_cuda::Gpu;
-use eidola_server_engine::config::{ExecutorKind, WeightsStorage, env};
+use eidola_engine_cuda::{CudaGraphs, Gpu};
+use eidola_server_engine::config::{ExecutorConfig, ExecutorKind, WeightsStorage, env};
 use serde_json::{Value, json};
 
 /// The message a machine without a CUDA driver or device refuses with.
@@ -39,6 +39,12 @@ fn cuda_env(dir: &Path, hash: &str) -> HashMap<&'static str, String> {
     map.insert(env::DRAFT_TOKENS, "0".into());
     map.insert(env::KV_DEVICE_BYTES, (8u64 << 30).to_string());
     map.insert(env::KERNELS_DIR, "/nonexistent/eidola-kernels".into());
+    // The process's own setting when it has one (the GPU tests run either way), else
+    // off.
+    map.insert(
+        env::CUDA_GRAPHS,
+        std::env::var(env::CUDA_GRAPHS).unwrap_or_else(|_| "off".into()),
+    );
     map
 }
 
@@ -86,7 +92,7 @@ fn cuda_settings_are_required_with_it_and_the_cpus_refused() {
     let full = cuda_env(model_dir(), weights_hash());
     let config = config_from(&full).unwrap();
     assert_eq!(config.executor.kind(), ExecutorKind::Cuda);
-    for key in [env::KV_DEVICE_BYTES, env::KERNELS_DIR] {
+    for key in [env::KV_DEVICE_BYTES, env::KERNELS_DIR, env::CUDA_GRAPHS] {
         let mut map = full.clone();
         map.remove(key);
         let err = config_from(&map).unwrap_err();
@@ -99,6 +105,21 @@ fn cuda_settings_are_required_with_it_and_the_cpus_refused() {
         map.insert(env::KV_DEVICE_BYTES, bad.into());
         let err = config_from(&map).unwrap_err();
         assert!(err.contains(env::KV_DEVICE_BYTES), "{bad}: {err}");
+    }
+    // Exactly `on` or `off`.
+    for bad in ["ON", "true", "1", "auto", "on "] {
+        let mut map = full.clone();
+        map.insert(env::CUDA_GRAPHS, bad.into());
+        let err = config_from(&map).unwrap_err();
+        assert!(err.contains(env::CUDA_GRAPHS), "{bad}: {err}");
+    }
+    for (value, graphs) in [("on", CudaGraphs::On), ("off", CudaGraphs::Off)] {
+        let mut map = full.clone();
+        map.insert(env::CUDA_GRAPHS, value.into());
+        match config_from(&map).unwrap().executor {
+            ExecutorConfig::Cuda { graphs: g, .. } => assert_eq!(g, graphs),
+            _ => unreachable!(),
+        }
     }
     // The CPU executor's block count is refused, not ignored.
     let mut map = full.clone();
@@ -221,11 +242,12 @@ async fn real_flash_serves_what_the_executor_computes() {
     map.insert(env::MAX_MODEL_LEN, "4096".into());
     let config = config_from(&map).unwrap();
     let (sizing, cache) = (config.sizing, config.cache);
-    let (kernels_dir, kv_device_bytes) = match &config.executor {
-        eidola_server_engine::config::ExecutorConfig::Cuda {
+    let (kernels_dir, kv_device_bytes, graphs) = match &config.executor {
+        ExecutorConfig::Cuda {
             kernels_dir,
             kv_device_bytes,
-        } => (kernels_dir.clone(), *kv_device_bytes),
+            graphs,
+        } => (kernels_dir.clone(), *kv_device_bytes, *graphs),
         _ => unreachable!(),
     };
 
@@ -377,6 +399,7 @@ async fn real_flash_serves_what_the_executor_computes() {
             &cache,
             &kernels_dir,
             kv_device_bytes,
+            graphs,
         )
         .unwrap()
         .build()
