@@ -136,7 +136,7 @@ All required; an empty value counts as missing. Everything but the secret token 
 | `EIDOLA_ENGINE_PREFIX_CACHE` | `true` / `false`. |
 | `EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS`, `EIDOLA_ENGINE_CACHE_MAX_AGE_SECS` | Prefix-cache retention bounds (idle ≤ max age). With `EIDOLA_ENGINE_PREFIX_CACHE`, the one source of the retention a gateway publishes for the model: its pin records the deployment config's values and its build holds them equal. |
 
-`RUST_LOG` filters logs (default `info`).
+Logging is fixed at `info` in the binary (`main.rs`), and `RUST_LOG` is not read: everything that changes the node's behaviour must be measured, and a filter delivered any other way (a secret, say) could turn on a dependency's debug logging, which the content-free discipline below does not cover. `GATEWAY_TOKEN` must have the shape the gateway holds its own token to (`eidola_common::engine_deployment::is_gateway_token`: 16 to 1024 visible ASCII characters); boot refuses any other token before verifying it, and the gateway's build refuses any secret besides it.
 
 ## Running it locally
 
