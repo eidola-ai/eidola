@@ -1087,7 +1087,13 @@ mod tests {
             let want = if i < 3 { rows.samples[i] } else { pad_sample() };
             assert_eq!(w[at..at + SAMPLE_ROW_WORDS], sample_row_words(&want));
         }
-        assert_eq!(pad_sample().temperature, 0.0, "greedy");
+        // A padding row samples greedily (temperature 0) from real row 0's
+        // logits, never its own.
+        for i in 3..8 {
+            let at = l.sample_rows + i * SAMPLE_ROW_WORDS;
+            assert_eq!(w[at], 0f32.to_bits(), "row {i} greedy");
+            assert_eq!(w[at + 7], 0, "row {i} reads real row 0");
+        }
         for (g, (s, r)) in slots.iter().zip(&l.groups).enumerate() {
             // KV writes: real rows where the executor put them, padding rows
             // only into the pad block, which the seam can never name.

@@ -8,6 +8,8 @@
 //! checked against the f32 reference forward over the same tokens: each
 //! produced token must be the reference's choice or within the measured
 //! logit tolerance of it ([`MARGIN`]); sampled outputs must be sampleable ids.
+//! With `EIDOLA_ENGINE_CUDA_GRAPHS=on` every workload runs with decode graphs
+//! replaying.
 
 mod common;
 

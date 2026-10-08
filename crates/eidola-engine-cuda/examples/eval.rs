@@ -31,6 +31,10 @@
 //!   bucket for all other mass, which by the data-processing inequality can
 //!   only understate KL. `--from` restricts both to positions from each
 //!   prompt's `start` on. Ids and per-id position counts must match exactly.
+//!
+//! The executor replays decode graphs when `EIDOLA_ENGINE_CUDA_GRAPHS` is `on`
+//! (`off`, eager, when unset), so `generate` runs with each setting give the
+//! outputs to compare.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
