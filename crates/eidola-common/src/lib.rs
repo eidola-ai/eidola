@@ -22,8 +22,14 @@
 //!
 //! > **A dependency is admissible here only if it is already in every
 //! > consumer's graph and is required for contract fidelity.** Today that
-//! > set is `serde_json`. Any addition needs the same argument written
-//! > down.
+//! > set is `serde_json`, plus `argon2` behind the optional `argon2` feature.
+//! > Any addition needs the same argument written down.
+//!
+//! `argon2` qualifies because it is optional: it enters a graph only when a
+//! consumer enables the feature, and the two that do (the inference node and
+//! the gateway) already depend on `argon2 0.6` directly. It is what lets the
+//! node's boot and the gateway's pin check read a gateway-token hash through
+//! one function ([`engine_deployment::parse_gateway_token_hash`]).
 //!
 //! `serde_json` qualifies on both counts: every consumer (app-core, gateway,
 //! inference node, gui; cli via app-core) already carries it, so admitting it
@@ -102,6 +108,7 @@
 //! is for the walk, never for the accounting semantics.
 
 pub mod embed;
+pub mod engine_deployment;
 pub mod engine_protocol;
 
 use serde_json::Value;

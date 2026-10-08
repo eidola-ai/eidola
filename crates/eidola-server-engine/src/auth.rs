@@ -39,18 +39,10 @@ impl GatewayToken {
     pub fn verify(mut token: String, hash: &str) -> Result<Self, String> {
         use argon2::PasswordVerifier;
         let result = (|| {
-            let parsed = argon2::PasswordHash::new(hash).map_err(|_| {
-                format!(
-                    "{}: not a valid Argon2 hash string",
-                    crate::config::env::GATEWAY_TOKEN_HASH
-                )
-            })?;
-            if parsed.algorithm.as_str() != "argon2id" {
-                return Err(format!(
-                    "{}: must be an Argon2id hash",
-                    crate::config::env::GATEWAY_TOKEN_HASH
-                ));
-            }
+            // The gateway's pin check reads the measured hash through this same
+            // function, so it accepts exactly the hashes this node boots with.
+            let parsed = eidola_common::engine_deployment::parse_gateway_token_hash(hash)
+                .map_err(|e| format!("{}: {e}", crate::config::env::GATEWAY_TOKEN_HASH))?;
             argon2::Argon2::default()
                 .verify_password(token.as_bytes(), &parsed)
                 .map_err(|_| {

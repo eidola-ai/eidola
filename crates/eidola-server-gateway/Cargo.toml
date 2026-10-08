@@ -81,7 +81,7 @@ sha2 = "0.11"
 subtle = "2"
 
 # Shared client/server contract logic (pricing formula)
-eidola-common = { path = "../eidola-common" }
+eidola-common = { path = "../eidola-common", features = ["argon2"] }
 
 # Tinfoil attestation verification
 tinfoil-verifier = { path = "../tinfoil-verifier" }
@@ -122,6 +122,9 @@ serde_json = "1"
 # hashing them.
 serde_yaml = "0.9"
 sha2 = "0.11"
+# The node's own config grammar (`engine_deployment`), so a pin is accepted
+# only for a config the node boots with.
+eidola-common = { path = "../eidola-common", features = ["argon2"] }
 
 [dev-dependencies]
 # The same module, compiled into the crate's tests.

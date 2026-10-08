@@ -336,15 +336,24 @@ fn the_prompt_cache_policy_is_the_configs() {
         "CACHE_IDLE_TTL_SECS: \"900\"",
         "CACHE_IDLE_TTL_SECS: \"600\"",
     );
-    refused(&tree, "EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS is \"600\"");
+    refused(
+        &tree,
+        "but the config sets CheckedCachePolicy { enabled: true, idle_ttl_secs: 600",
+    );
 
     let mut tree = Tree::fixture();
     tree.deployment()["prompt_cache"]["max_age_secs"] = 3600.into();
-    refused(&tree, "EIDOLA_ENGINE_CACHE_MAX_AGE_SECS is \"7200\"");
+    refused(
+        &tree,
+        "but the config sets CheckedCachePolicy { enabled: true, idle_ttl_secs: 900, max_age_secs: 7200",
+    );
 
     let mut tree = Tree::fixture();
     tree.edit_config("PREFIX_CACHE: \"true\"", "PREFIX_CACHE: \"false\"");
-    refused(&tree, "EIDOLA_ENGINE_PREFIX_CACHE is \"false\"");
+    refused(
+        &tree,
+        "but the config sets CheckedCachePolicy { enabled: false",
+    );
 
     let mut tree = Tree::fixture();
     tree.deployment()["prompt_cache"]["idle_ttl_secs"] = 9000.into();
@@ -369,7 +378,68 @@ fn the_gateway_token_is_a_secret_and_only_its_hash_is_measured() {
 
     let mut tree = Tree::fixture();
     tree.edit_config("$argon2id$", "$argon2i$");
-    refused(&tree, "GATEWAY_TOKEN_HASH must be an Argon2id hash");
+    refused(&tree, "GATEWAY_TOKEN_HASH: must be an Argon2id hash");
+
+    // The node parses the whole PHC string, not just its prefix.
+    let mut tree = Tree::fixture();
+    let hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA";
+    tree.edit_config(hash, "$argon2id$garbage");
+    refused(&tree, "GATEWAY_TOKEN_HASH: not a valid Argon2 hash string");
+}
+
+/// A retention bound the node refuses at boot is refused here even when the
+/// pin and the config agree on it: zero, and anything that overflows the
+/// engine's millisecond clock.
+#[test]
+fn the_prompt_cache_policy_is_one_the_node_boots_with() {
+    let max = eidola_common::engine_deployment::MAX_CACHE_SECONDS;
+    for (idle, max_age) in [(0u64, 7200u64), (900, max + 1)] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(
+            "CACHE_IDLE_TTL_SECS: \"900\"",
+            &format!("CACHE_IDLE_TTL_SECS: \"{idle}\""),
+        );
+        tree.edit_config(
+            "CACHE_MAX_AGE_SECS: \"7200\"",
+            &format!("CACHE_MAX_AGE_SECS: \"{max_age}\""),
+        );
+        tree.deployment()["prompt_cache"]["idle_ttl_secs"] = idle.into();
+        tree.deployment()["prompt_cache"]["max_age_secs"] = max_age.into();
+        refused(
+            &tree,
+            "which the node refuses: it must be a positive number of seconds",
+        );
+    }
+
+    // The largest bound the node accepts is accepted.
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "CACHE_MAX_AGE_SECS: \"7200\"",
+        &format!("CACHE_MAX_AGE_SECS: \"{max}\""),
+    );
+    tree.deployment()["prompt_cache"]["max_age_secs"] = max.into();
+    tree.check().expect("the node boots with the largest bound");
+}
+
+/// `cvm-version` is read by the grammar `measure-enclave` measures with: a
+/// bare version and exactly one inline manifest pin.
+#[test]
+fn the_release_grammar_is_the_measurers() {
+    let pinned = format!("0.15.0@sha256:{}", "1".repeat(64));
+    for bad in [
+        format!("v{pinned}"),
+        format!("{pinned}@sha256:{}", "1".repeat(64)),
+        format!("0.15.0@sha256:{}", "A".repeat(64)),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(&pinned, &bad);
+        tree.deployment()["cvm_version"] = bad.clone().into();
+        refused(&tree, "cvm-version");
+        assert!(
+            tree.check().unwrap_err().contains("tinfoil-config.yml: "),
+            "{bad}"
+        );
+    }
 }
 
 #[test]

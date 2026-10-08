@@ -193,13 +193,12 @@ impl Config {
                 .parse::<u32>()
                 .map_err(|_| ConfigError(format!("{name} must be a non-negative integer")))
         };
+        // The gateway's pin check reads these through the same functions
+        // (`eidola_common::engine_deployment`), so it accepts exactly the
+        // configs this node boots with.
         let seconds = |name: &str| -> Result<u64, ConfigError> {
-            match get(name)?.parse::<u64>() {
-                Ok(n) if n > 0 && n <= u64::MAX / 1000 => Ok(n),
-                _ => Err(ConfigError(format!(
-                    "{name} must be a positive number of seconds"
-                ))),
-            }
+            eidola_common::engine_deployment::parse_cache_seconds(&get(name)?)
+                .ok_or_else(|| ConfigError(format!("{name} must be a positive number of seconds")))
         };
 
         let model_id = get(env::MODEL_ID)?;
@@ -258,16 +257,11 @@ impl Config {
             )));
         }
 
-        let enabled = match get(env::PREFIX_CACHE)?.as_str() {
-            "true" => true,
-            "false" => false,
-            _ => {
-                return Err(ConfigError(format!(
-                    "{} must be `true` or `false`",
-                    env::PREFIX_CACHE
-                )));
-            }
-        };
+        let enabled =
+            eidola_common::engine_deployment::parse_prefix_cache(&get(env::PREFIX_CACHE)?)
+                .ok_or_else(|| {
+                    ConfigError(format!("{} must be `true` or `false`", env::PREFIX_CACHE))
+                })?;
         let cache = CacheConfig {
             enabled,
             idle_ttl_secs: seconds(env::CACHE_IDLE_TTL_SECS)?,

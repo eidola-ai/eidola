@@ -29,6 +29,10 @@ tdx-measure = { git = "https://github.com/virtee/tdx-measure", tag = "v0.1.1" }
 igvm = "0.5"
 igvm_defs = "0.5"
 
+# The engine-deployment config grammar shared with the gateway and the node
+# (`cvm-version`, cache retention).
+eidola-common = { path = "../eidola-common" }
+
 # Config parsing
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -228,22 +228,11 @@ pub fn config_release(config: &[u8]) -> Result<ConfigRelease> {
         Some(other) => bail!("cvm-version must be a string, got {other:?}"),
         None => bail!("tinfoil-config.yml has no cvm-version"),
     };
-    let (version, manifest_sha256) = match raw.split_once('@') {
-        None => (raw, None),
-        Some((version, pin)) => {
-            let hex = pin
-                .strip_prefix("sha256:")
-                .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-                .with_context(|| {
-                    format!("malformed cvm-version pin {raw:?}: expected VERSION@sha256:<64 lowercase hex>")
-                })?;
-            (version, Some(hex.to_string()))
-        }
-    };
-    ensure!(
-        !version.is_empty() && !version.starts_with('v'),
-        "cvm-version {version:?} must be a bare version such as 0.15.0"
-    );
+    // The grammar is shared with the gateway's pin check, which must accept
+    // exactly the configs this tool measures.
+    let parsed = eidola_common::engine_deployment::parse_cvm_version(raw)
+        .map_err(|e| anyhow::anyhow!("{e} (got {raw:?})"))?;
+    let (version, manifest_sha256) = (parsed.version, parsed.manifest_sha256.map(str::to_owned));
     Ok(ConfigRelease {
         version: version.to_string(),
         manifest_sha256,

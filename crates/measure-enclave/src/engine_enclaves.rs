@@ -82,15 +82,13 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
         "{} serves a model other than {model_id}",
         inputs.config_path
     );
-    let enabled = match var("EIDOLA_ENGINE_PREFIX_CACHE")?.as_str() {
-        "true" => true,
-        "false" => false,
-        other => bail!("EIDOLA_ENGINE_PREFIX_CACHE is {other:?}, not true or false"),
-    };
+    // The node's own grammar for these values (`eidola_common::engine_deployment`).
+    let enabled =
+        eidola_common::engine_deployment::parse_prefix_cache(&var("EIDOLA_ENGINE_PREFIX_CACHE")?)
+            .context("EIDOLA_ENGINE_PREFIX_CACHE must be true or false")?;
     let seconds = |name: &str| -> Result<u64> {
-        var(name)?
-            .parse()
-            .with_context(|| format!("{name} is not a whole number of seconds"))
+        eidola_common::engine_deployment::parse_cache_seconds(&var(name)?)
+            .with_context(|| format!("{name} must be a positive number of seconds"))
     };
 
     let sidecar: Value =

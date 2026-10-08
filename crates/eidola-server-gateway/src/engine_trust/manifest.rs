@@ -6,7 +6,8 @@
 //! build on any disagreement, and by the crate's tests, which run the same
 //! function over fixtures. It therefore uses nothing from the crate and only
 //! dependencies that are both build- and dev-dependencies (`serde_json`,
-//! `serde_yaml`, `sha2`).
+//! `serde_yaml`, `sha2`, and `eidola-common` with its `argon2` feature, whose
+//! `engine_deployment` module holds the grammar the node boots with).
 //!
 //! # What is checked
 //!
@@ -39,6 +40,7 @@
 
 use std::collections::BTreeMap;
 
+use eidola_common::engine_deployment;
 use sha2::{Digest, Sha256};
 
 /// The schema version this gateway reads.
@@ -293,25 +295,33 @@ fn check_deployment(
             "{at}: prompt_cache.idle_ttl_secs exceeds max_age_secs, which the node refuses"
         ));
     }
-    config.require_env(
-        &at_config,
-        "EIDOLA_ENGINE_PREFIX_CACHE",
-        if prompt_cache.enabled {
-            "true"
-        } else {
-            "false"
-        },
-    )?;
-    config.require_env(
-        &at_config,
-        "EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS",
-        &prompt_cache.idle_ttl_secs.to_string(),
-    )?;
-    config.require_env(
-        &at_config,
-        "EIDOLA_ENGINE_CACHE_MAX_AGE_SECS",
-        &prompt_cache.max_age_secs.to_string(),
-    )?;
+    // The config's values, read by the node's own grammar, so a pin is
+    // accepted only for a config the node boots with and reads the same way.
+    let configured = CheckedCachePolicy {
+        enabled: config.env_value(
+            &at_config,
+            "EIDOLA_ENGINE_PREFIX_CACHE",
+            engine_deployment::parse_prefix_cache,
+            "true or false",
+        )?,
+        idle_ttl_secs: config.env_value(
+            &at_config,
+            "EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS",
+            engine_deployment::parse_cache_seconds,
+            "a positive number of seconds",
+        )?,
+        max_age_secs: config.env_value(
+            &at_config,
+            "EIDOLA_ENGINE_CACHE_MAX_AGE_SECS",
+            engine_deployment::parse_cache_seconds,
+            "a positive number of seconds",
+        )?,
+    };
+    if configured != prompt_cache {
+        return Err(format!(
+            "{at}: prompt_cache is {prompt_cache:?}, but the config sets {configured:?}"
+        ));
+    }
 
     // The gateway token: a secret, never a measured value.
     if !config.secrets.iter().any(|s| s == "GATEWAY_TOKEN") {
@@ -324,15 +334,12 @@ fn check_deployment(
             "{at_config}: GATEWAY_TOKEN must not be a measured environment value"
         ));
     }
-    if !config
-        .env
-        .get("GATEWAY_TOKEN_HASH")
-        .is_some_and(|h| h.starts_with("$argon2id$"))
-    {
-        return Err(format!(
-            "{at_config}: GATEWAY_TOKEN_HASH must be an Argon2id hash"
-        ));
-    }
+    let token_hash = config.env.get("GATEWAY_TOKEN_HASH").ok_or_else(|| {
+        format!("{at_config}: the engine container's env does not set GATEWAY_TOKEN_HASH")
+    })?;
+    // The node verifies its token against the result of this same function.
+    engine_deployment::parse_gateway_token_hash(token_hash)
+        .map_err(|e| format!("{at_config}: GATEWAY_TOKEN_HASH: {e}"))?;
 
     // The pin, and the sidecar stating what source cannot derive.
     let sidecar_path = format!("{DEPLOY_ROOT}/{model_id}/{variant}/deployment.json");
@@ -443,14 +450,14 @@ impl EngineConfig {
             .get("cvm-version")
             .and_then(serde_yaml::Value::as_str)
             .ok_or_else(|| format!("{path}: cvm-version must be a string"))?;
-        match cvm_version.split_once("@sha256:") {
-            Some((version, hex)) if !version.is_empty() && is_lower_hex(hex, 32) => {}
-            _ => {
-                return Err(format!(
-                    "{path}: cvm-version must pin its release manifest inline, \
-                     as VERSION@sha256:<64 lowercase hex>"
-                ));
-            }
+        // `measure-enclave` reads the release through this same grammar.
+        let release = engine_deployment::parse_cvm_version(cvm_version)
+            .map_err(|e| format!("{path}: {e}"))?;
+        if release.manifest_sha256.is_none() {
+            return Err(format!(
+                "{path}: cvm-version must pin its release manifest inline, \
+                 as VERSION@sha256:<64 lowercase hex>"
+            ));
         }
 
         let containers = config
@@ -517,6 +524,23 @@ impl EngineConfig {
             cvm_version: cvm_version.to_owned(),
             secrets,
             env,
+        })
+    }
+
+    /// `name`'s value read by `parse`, the node's grammar for it.
+    fn env_value<T>(
+        &self,
+        at: &str,
+        name: &str,
+        parse: fn(&str) -> Option<T>,
+        expected: &str,
+    ) -> Result<T, String> {
+        let value = self
+            .env
+            .get(name)
+            .ok_or_else(|| format!("{at}: the engine container's env does not set {name}"))?;
+        parse(value).ok_or_else(|| {
+            format!("{at}: {name} is {value:?}, which the node refuses: it must be {expected}")
         })
     }
 

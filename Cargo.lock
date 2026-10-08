@@ -2994,6 +2994,7 @@ dependencies = [
 name = "eidola-common"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "serde_json",
 ]
 
@@ -6469,6 +6470,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "eidola-common",
  "hex",
  "igvm",
  "igvm_defs",

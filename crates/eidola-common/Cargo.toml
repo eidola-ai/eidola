@@ -16,3 +16,10 @@ license = "MIT OR Apache-2.0"
 # `preserve_order` cannot skew the measure, and the crate docs for the rule
 # that governs any future dependency here.
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# The Argon2id rule of `engine_deployment` (`parse_gateway_token_hash`). Optional,
+# so it enters only the graphs of the two consumers that enable it — the node
+# and the gateway — and both already depend on `argon2 0.6` themselves.
+argon2 = { version = "0.6", optional = true }
+
+[features]
+argon2 = ["dep:argon2"]
