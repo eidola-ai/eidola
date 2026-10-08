@@ -7049,8 +7049,8 @@ fn a_padded_stream_reads_exactly_as_an_unpadded_one() {
 /// **The read ceiling bounds the answer, not its padding.** A slow answer's
 /// frames keep coming at the frame rate, so a stream can carry far more
 /// padding than the eight-megabyte ceiling while its answer is a few words.
-/// Counted, that padding ended the turn at the ceiling with nothing read;
-/// kept, it filled the Record and pushed the answer out of it.
+/// Counted, that padding would end the turn at the ceiling with nothing read;
+/// kept, it would fill the Record and push the answer out of it.
 #[test]
 fn a_long_padded_stream_is_not_cut_at_the_ceiling_or_lost_from_the_record() {
     run(|| {
