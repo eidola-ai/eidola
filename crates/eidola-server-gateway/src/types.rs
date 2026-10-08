@@ -75,9 +75,17 @@ pub struct ChatCompletionRequest {
     /// re-serializing a request for the Tinfoil upstream (which has no use
     /// for it) cannot carry it there. The one writer is
     /// `engine_trust::protocol::engine_request_body`.
-    #[serde(default, skip_serializing)]
+    // `skip_serializing_if` with a predicate that always skips, rather than
+    // `skip_serializing`, so the OpenAPI schema (which drops a
+    // `skip_serializing` field) still documents the field clients may send.
+    #[serde(default, skip_serializing_if = "never_serialized")]
     #[schema(value_type = Option<String>, min_length = 43, max_length = 43, pattern = "^[A-Za-z0-9_-]{43}$")]
     pub cache_key: Option<CacheKey>,
+}
+
+/// The `skip_serializing_if` predicate of a member that is never serialized.
+fn never_serialized<T>(_: &T) -> bool {
+    true
 }
 
 /// A client's decoded prefix-cache key.
@@ -100,6 +108,15 @@ impl CacheKey {
 impl std::fmt::Debug for CacheKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CacheKey(<redacted>)")
+    }
+}
+
+/// Refuses, always: a request's `cache_key` is skipped when the request
+/// serializes, and this impl exists only because that skip is spelled as a
+/// predicate. Nothing may serialize a key by accident.
+impl Serialize for CacheKey {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("a cache key is never serialized"))
     }
 }
 
@@ -1311,6 +1328,8 @@ mod tests {
         assert!(!forwarded.contains(CACHE_KEY), "{forwarded}");
         let cloned = serde_json::to_string(&request.clone()).unwrap();
         assert!(!cloned.contains("cache_key"));
+        // And the key alone refuses to serialize.
+        assert!(serde_json::to_string(request.cache_key.as_ref().unwrap()).is_err());
     }
 
     #[test]
