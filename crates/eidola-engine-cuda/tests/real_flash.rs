@@ -25,6 +25,20 @@ use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
 
 const KEEP: [usize; 4] = [0, 1, 2, 5];
+
+/// The checkpoint layers to run: the truncation by default, every layer with
+/// `EIDOLA_MIMO_LAYERS=all`.
+fn layers() -> Option<Vec<usize>> {
+    match std::env::var("EIDOLA_MIMO_LAYERS").as_deref() {
+        Ok("all") => None,
+        _ => Some(KEEP.to_vec()),
+    }
+}
+
+/// The checkpoint index of model layer `l`.
+fn source(l: usize) -> usize {
+    layers().map_or(l, |k| k[l])
+}
 const BS: u32 = 16;
 const SAMPLEABLE: u32 = 151_675;
 
@@ -64,7 +78,7 @@ fn executor(
 ) -> CudaExecutor {
     let cfg = CudaExecutorConfig {
         block_size: BS,
-        num_blocks: vec![64, 64],
+        num_blocks: vec![128, 128],
         num_state_slots: 4,
         max_model_len: 1024,
         buckets: vec![Bucket {
@@ -74,7 +88,7 @@ fn executor(
         sampleable_vocab_size: SAMPLEABLE,
         image: Some(arch),
     };
-    CudaExecutor::new(gpu, dir, store, Some(&KEEP), cfg).unwrap()
+    CudaExecutor::new(gpu, dir, store, layers().as_deref(), cfg).unwrap()
 }
 
 /// Map `slot`'s logical blocks `0..n` to `base + i` in both groups.
@@ -151,7 +165,10 @@ fn truncated_flash_matches_the_reference() {
     // Reference.
     let t0 = Instant::now();
     let store = Arc::new(WeightSet::open_dir(&fx.dir).unwrap());
-    let config = store.model_config().unwrap().truncated(&KEEP).unwrap();
+    let mut config = store.model_config().unwrap();
+    if let Some(keep) = layers() {
+        config = config.truncated(&keep).unwrap();
+    }
     let opts = LoadOptions {
         load_mtp: false,
         ..LoadOptions::default()
@@ -176,14 +193,19 @@ fn truncated_flash_matches_the_reference() {
     println!("quantization emulated vs f32 reference: layer | rel L2 | max|Δ|/max|ref|");
     for (l, got) in q_layers.iter().enumerate() {
         let (l2, mx) = rel(&got.data, &want.layer_outputs[l].data);
-        println!("  {l} (checkpoint {}) | {l2:.3e} | {mx:.3e}", KEEP[l]);
+        println!("  {l} (checkpoint {}) | {l2:.3e} | {mx:.3e}", source(l));
     }
     let q_agree = compare_logits(&want.logits.data, &q_logits.data, vocab).unwrap();
     println!("quantization emulated vs f32 reference, logits: {q_agree}");
     drop(reference);
 
     let gpu = su.gpu;
-    let archs = su.archs.clone();
+    // `EIDOLA_IMAGES=exact` runs only the device's own image (the full model
+    // takes minutes to load).
+    let mut archs = su.archs.clone();
+    if std::env::var("EIDOLA_IMAGES").as_deref() == Ok("exact") {
+        archs.truncate(1);
+    }
     let dir = su.dir;
     let mut gpu_slot = Some(gpu);
     for arch in archs {
@@ -215,7 +237,7 @@ fn truncated_flash_matches_the_reference() {
             let (l2, mx) = rel(got, &want.layer_outputs[l].data);
             println!(
                 "{arch:?}:   {l} (checkpoint {}) | {l2:.3e} | {mx:.3e}",
-                KEEP[l]
+                source(l)
             );
         }
         println!("{arch:?}: vs quantization emulation: layer | rel L2 | max|Δ|/max|ref|");
@@ -223,7 +245,7 @@ fn truncated_flash_matches_the_reference() {
             let (l2, mx) = rel(got, &q_layers[l].data);
             println!(
                 "{arch:?}:   {l} (checkpoint {}) | {l2:.3e} | {mx:.3e}",
-                KEEP[l]
+                source(l)
             );
         }
         let agree = compare_logits(&want.logits.data, &logits, vocab).unwrap();

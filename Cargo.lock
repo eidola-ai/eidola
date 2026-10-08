@@ -2874,6 +2874,7 @@ version = "0.1.0"
 dependencies = [
  "cudarc",
  "eidola-engine",
+ "eidola-engine-chat",
  "eidola-engine-kernels",
  "eidola-engine-model",
  "serde_json",

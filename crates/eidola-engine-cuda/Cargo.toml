@@ -23,4 +23,5 @@ eidola-engine-kernels = { path = "../eidola-engine-kernels" }
 eidola-engine-model = { path = "../eidola-engine-model" }
 
 [dev-dependencies]
+eidola-engine-chat = { path = "../eidola-engine-chat" }
 serde_json = "1"
