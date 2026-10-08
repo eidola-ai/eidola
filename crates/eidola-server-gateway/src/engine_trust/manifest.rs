@@ -379,23 +379,10 @@ fn check_deployment(
                 .ok_or_else(|| format!("{at}: pin.expected_gpus must be a u32"))?,
         ),
     };
-    // GPU evidence is what attests the accelerators the prompt is processed
-    // on: a CUDA deployment must require at least one GPU's evidence on every
-    // handshake, and a deployment that states its GPU count must require
-    // exactly that many.
-    if measured.executor == engine_deployment::Executor::Cuda && expected_gpus.unwrap_or(0) == 0 {
-        return Err(format!(
-            "{at}: the config runs the cuda executor, so pin.expected_gpus must be at least 1 \
-             (absent or 0 would leave its GPUs unattested)"
-        ));
-    }
-    if let Some(gpus) = config.gpus.filter(|n| *n > 0)
-        && expected_gpus != Some(gpus)
-    {
-        return Err(format!(
-            "{at}: the config attaches {gpus} GPUs, so pin.expected_gpus must be {gpus}"
-        ));
-    }
+    // The accelerators the prompt runs on are attested on every handshake,
+    // by the rule the measurer applies too.
+    engine_deployment::check_gpu_attestation(measured.executor, config.gpus, expected_gpus)
+        .map_err(|e| format!("{at}: {e}"))?;
     if expected_gpus != sidecar.expected_gpus {
         return Err(format!(
             "{at}: pin.expected_gpus differs from {sidecar_path}"

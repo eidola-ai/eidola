@@ -707,37 +707,43 @@ fn set_expected_gpus(tree: &mut Tree, gpus: Option<u64>) {
     tree.set_sidecar(sidecar);
 }
 
-/// A CUDA deployment must require GPU evidence on every handshake, as many
-/// items as the GPUs its config attaches; a CPU deployment need not.
+/// A CUDA deployment attaches an NVIDIA-CC shape of GPUs (`gpus`, 1 or 8)
+/// and its pin requires exactly that many evidence items, which is what the
+/// shim collects; a CPU deployment attaches and requires none.
 #[test]
 fn a_cuda_deployment_attests_its_gpus() {
-    for gpus in [None, Some(0)] {
+    for gpus in [None, Some(0), Some(4)] {
         let mut tree = Tree::fixture();
-        tree.edit_config("gpus: 8\n", "");
         set_expected_gpus(&mut tree, gpus);
-        refused(&tree, "so pin.expected_gpus must be at least 1");
+        refused(&tree, "so expected_gpus must be 8");
     }
 
-    let mut tree = Tree::fixture();
-    set_expected_gpus(&mut tree, Some(4));
-    refused(
-        &tree,
-        "the config attaches 8 GPUs, so pin.expected_gpus must be 8",
-    );
-
-    // Without a stated count, any positive requirement stands.
+    // No stated `gpus`: the CVM has none and the shim collects no evidence.
     let mut tree = Tree::fixture();
     tree.edit_config("gpus: 8\n", "");
-    set_expected_gpus(&mut tree, Some(4));
-    tree.check()
-        .expect("a CUDA deployment requiring four GPUs' evidence");
+    refused(&tree, "the cuda executor needs the config to attach GPUs");
 
-    // The CPU executor needs no GPU evidence.
+    // A GPU count outside the NVIDIA-CC shapes.
+    let mut tree = Tree::fixture();
+    tree.edit_config("gpus: 8\n", "gpus: 2\n");
+    set_expected_gpus(&mut tree, Some(2));
+    refused(&tree, "`gpus: 2` is not an NVIDIA-CC shape");
+
+    let mut tree = Tree::fixture();
+    tree.edit_config("gpus: 8\n", "gpus: 1\n");
+    set_expected_gpus(&mut tree, Some(1));
+    tree.check().expect("a single-GPU CUDA deployment");
+
+    // The CPU executor attaches and requires no GPUs.
     let mut tree = Tree::fixture();
     tree.edit_config("gpus: 8\n", "");
     tree.edit_config("EXECUTOR: \"cuda\"", "EXECUTOR: \"cpu\"");
     set_expected_gpus(&mut tree, None);
     tree.check().expect("a CPU deployment without GPU evidence");
+
+    let mut tree = Tree::fixture();
+    tree.edit_config("EXECUTOR: \"cuda\"", "EXECUTOR: \"cpu\"");
+    refused(&tree, "the cpu executor attaches no GPUs");
 }
 
 /// The shim forwards to the port the node listens on, on every interface.

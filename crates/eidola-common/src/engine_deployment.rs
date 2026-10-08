@@ -271,6 +271,55 @@ pub fn parse_measured(
     })
 }
 
+/// The GPU counts a confidential NVIDIA deployment may attach (the
+/// config's top-level `gpus`): the platform provider's NVIDIA-CC shapes.
+pub const CUDA_GPU_COUNTS: &[u64] = &[1, 8];
+
+/// Whether a deployment's GPUs are attested on every handshake.
+///
+/// The attestation shim collects exactly the config's top-level `gpus` worth
+/// of GPU evidence items (Tinfoil's `shimConfig.ExpectedGPUs = config.GPUs`),
+/// and a pin's `expected_gpus` requires exactly that many. So:
+///
+/// - the `cuda` executor needs GPUs, in one of [`CUDA_GPU_COUNTS`], and a pin
+///   requiring all of them, or its accelerators would go unattested (or, with
+///   no `gpus`, every handshake would fail for want of evidence);
+/// - the `cpu` executor attaches none and requires none.
+///
+/// `gpus` and `expected_gpus` are `None` when absent; `0` reads as absent.
+pub fn check_gpu_attestation(
+    executor: Executor,
+    gpus: Option<u64>,
+    expected_gpus: Option<u64>,
+) -> Result<(), String> {
+    let gpus = gpus.filter(|n| *n > 0);
+    let expected = expected_gpus.filter(|n| *n > 0);
+    match executor {
+        Executor::Cuda => match gpus {
+            None => Err("the cuda executor needs the config to attach GPUs (`gpus`)".into()),
+            Some(n) if !CUDA_GPU_COUNTS.contains(&n) => Err(format!(
+                "`gpus: {n}` is not an NVIDIA-CC shape; it must be one of {CUDA_GPU_COUNTS:?}"
+            )),
+            Some(n) if expected != Some(n) => Err(format!(
+                "the config attaches {n} GPUs, so expected_gpus must be {n} (the shim collects \
+                 exactly that many evidence items)"
+            )),
+            Some(_) => Ok(()),
+        },
+        Executor::Cpu => {
+            if gpus.is_some() || expected.is_some() {
+                Err(
+                    "the cpu executor attaches no GPUs and requires no GPU evidence \
+                     (`gpus` and expected_gpus absent or 0)"
+                        .into(),
+                )
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Largest prefix-cache retention bound, in seconds: the engine core keeps
 /// retention in milliseconds as a `u64`.
 pub const MAX_CACHE_SECONDS: u64 = u64::MAX / 1000;
@@ -432,6 +481,31 @@ mod tests {
             &(MAX_CACHE_SECONDS + 1).to_string(),
         ] {
             assert_eq!(parse_cache_seconds(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_deployments_gpus_are_attested_exactly() {
+        use Executor::{Cpu, Cuda};
+        assert!(check_gpu_attestation(Cuda, Some(8), Some(8)).is_ok());
+        assert!(check_gpu_attestation(Cuda, Some(1), Some(1)).is_ok());
+        assert!(check_gpu_attestation(Cpu, None, None).is_ok());
+        assert!(check_gpu_attestation(Cpu, Some(0), Some(0)).is_ok());
+        for (executor, gpus, expected) in [
+            (Cuda, None, Some(4)),
+            (Cuda, None, None),
+            (Cuda, Some(0), Some(8)),
+            (Cuda, Some(2), Some(2)),
+            (Cuda, Some(8), Some(4)),
+            (Cuda, Some(8), None),
+            (Cuda, Some(8), Some(0)),
+            (Cpu, Some(8), Some(8)),
+            (Cpu, None, Some(1)),
+        ] {
+            assert!(
+                check_gpu_attestation(executor, gpus, expected).is_err(),
+                "{executor:?} gpus={gpus:?} expected={expected:?}"
+            );
         }
     }
 

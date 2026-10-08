@@ -114,24 +114,20 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
             }
         }
     });
-    // GPU evidence attests the accelerators the prompt runs on: a CUDA
-    // deployment requires at least one GPU's, and a stated GPU count exactly
-    // that many (the gateway's build holds the same rule).
+    // The accelerators the prompt runs on are attested on every handshake,
+    // by the rule the gateway's build applies too.
+    let executor = match var("EIDOLA_ENGINE_EXECUTOR")?.as_str() {
+        "cuda" => eidola_common::engine_deployment::Executor::Cuda,
+        "cpu" => eidola_common::engine_deployment::Executor::Cpu,
+        other => bail!("EIDOLA_ENGINE_EXECUTOR is {other:?}, not cpu or cuda"),
+    };
+    let gpus = match config_yaml.get("gpus") {
+        None => None,
+        Some(gpus) => Some(gpus.as_u64().context("gpus must be a whole number")?),
+    };
     let expected_gpus = sidecar.get("expected_gpus").and_then(Value::as_u64);
-    ensure!(
-        var("EIDOLA_ENGINE_EXECUTOR")? != "cuda" || expected_gpus.unwrap_or(0) > 0,
-        "a cuda deployment must state expected_gpus of at least 1 in deployment.json"
-    );
-    if let Some(gpus) = config_yaml
-        .get("gpus")
-        .and_then(serde_yaml::Value::as_u64)
-        .filter(|n| *n > 0)
-    {
-        ensure!(
-            expected_gpus == Some(gpus),
-            "the config attaches {gpus} GPUs, so deployment.json's expected_gpus must be {gpus}"
-        );
-    }
+    eidola_common::engine_deployment::check_gpu_attestation(executor, gpus, expected_gpus)
+        .map_err(anyhow::Error::msg)?;
     if let Some(gpus) = sidecar.get("expected_gpus") {
         pin["expected_gpus"] = gpus.clone();
     }
@@ -221,6 +217,7 @@ mod tests {
             r#"cvm-version: 0.0.0-test@sha256:{manifest_sha}
 cpus: 16
 memory: 65536
+gpus: 8
 containers:
   - name: "eidola-server-engine"
     image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:{digest}"
@@ -351,11 +348,15 @@ containers:
         // A CUDA deployment that asks for no GPU evidence, or a different
         // count than it attaches.
         let no_gpus = SIDECAR.replace("\"expected_gpus\": 8,", "");
-        assert!(entry("fixture-model", &good, &no_gpus).contains("at least 1"));
+        assert!(entry("fixture-model", &good, &no_gpus).contains("expected_gpus must be 8"));
         let zero_gpus = SIDECAR.replace("\"expected_gpus\": 8", "\"expected_gpus\": 0");
-        assert!(entry("fixture-model", &good, &zero_gpus).contains("at least 1"));
-        let attaches_four = good.replace("memory: 65536\n", "memory: 65536\ngpus: 4\n");
-        assert!(entry("fixture-model", &attaches_four, SIDECAR).contains("must be 4"));
+        assert!(entry("fixture-model", &good, &zero_gpus).contains("expected_gpus must be 8"));
+        let unstated = good.replace("gpus: 8\n", "");
+        assert!(
+            entry("fixture-model", &unstated, SIDECAR).contains("needs the config to attach GPUs")
+        );
+        let two = good.replace("gpus: 8\n", "gpus: 2\n");
+        assert!(entry("fixture-model", &two, SIDECAR).contains("not an NVIDIA-CC shape"));
 
         // A companion container, or an engine named by a tag.
         let companion =
