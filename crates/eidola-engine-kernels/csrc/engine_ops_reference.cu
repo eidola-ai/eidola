@@ -1,5 +1,6 @@
-// Reference kernels for the GPU tests: the router, the UE8M0 SwiGLU and the
-// UE8M0 gather in their single-block, row-per-block forms, which define the
+// Reference kernels for the GPU tests and the kernel bench: the router, the
+// UE8M0 SwiGLU, the UE8M0 gather, the fused-QKV RoPE + KV write and the expert
+// combine in their single-block, row-per-block forms, which define the
 // numerics the executor's kernels (engine_ops.cu) reproduce bit for bit. Not
 // loaded by the executor.
 //
@@ -135,3 +136,64 @@ extern "C" __global__ void __launch_bounds__(128)
   }
 }
 EIDOLA_KERNEL_META(eidola_reference_gather_quant_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);
+
+// Fused QKV RoPE + paged KV write (EidolaQkvArgs; the layout is described at
+// eidola_qkv_rope_kv in engine_ops.cu). One block per token.
+extern "C" __global__ void __launch_bounds__(kThreads)
+    eidola_reference_qkv_rope_kv(const __grid_constant__ EidolaQkvArgs a) {
+  constexpr uint32_t D = 192, DV = 128, R = 64, H = R / 2;
+  const uint32_t t = blockIdx.x;
+  const uint16_t* row = a.qkv + static_cast<size_t>(t) * a.chunk_stride * a.chunks;
+  const float* cs = a.rope + static_cast<size_t>(a.positions[t]) * R;
+  const uint32_t nq = a.q_heads_per_chunk * a.chunks, nkv = a.kv_heads_per_chunk * a.chunks;
+  const size_t kv_base = static_cast<size_t>(a.kv_block[t]) * a.block_elems;
+  uint16_t* kdst = a.pool + kv_base + a.k_off + static_cast<size_t>(a.kv_slot[t]) * nkv * D;
+  uint16_t* vdst = a.pool + kv_base + a.v_off + static_cast<size_t>(a.kv_slot[t]) * nkv * DV;
+  // Q and K: one (head, dim) per thread step.
+  const uint32_t per_chunk_qk = (a.q_heads_per_chunk + a.kv_heads_per_chunk) * D;
+  for (uint32_t i = threadIdx.x; i < a.chunks * per_chunk_qk; i += kThreads) {
+    const uint32_t c = i / per_chunk_qk, within = i % per_chunk_qk;
+    const uint32_t head = within / D, d = within % D;
+    const uint16_t* src = row + static_cast<size_t>(c) * a.chunk_stride + head * D;
+    float v = bf16f(src[d]);
+    if (d < R) {
+      const uint32_t j = d % H;
+      const float cosv = cs[j], sinv = cs[H + j];
+      const float x1 = bf16f(src[j]), x2 = bf16f(src[j + H]);
+      v = d < H ? x1 * cosv + (-x2) * sinv : x2 * cosv + x1 * sinv;
+    }
+    if (head < a.q_heads_per_chunk) {
+      const uint32_t qh = c * a.q_heads_per_chunk + head;
+      a.q_out[(static_cast<size_t>(t) * nq + qh) * D + d] = f2bf16(v);
+    } else {
+      const uint32_t kh = c * a.kv_heads_per_chunk + (head - a.q_heads_per_chunk);
+      kdst[kh * D + d] = f2bf16(v);
+    }
+  }
+  // V: copied as is.
+  const uint32_t per_chunk_v = a.kv_heads_per_chunk * DV;
+  for (uint32_t i = threadIdx.x; i < a.chunks * per_chunk_v; i += kThreads) {
+    const uint32_t c = i / per_chunk_v, within = i % per_chunk_v;
+    const uint16_t* src = row + static_cast<size_t>(c) * a.chunk_stride + per_chunk_qk + within;
+    vdst[c * per_chunk_v + within] = *src;
+  }
+}
+EIDOLA_KERNEL_META(eidola_reference_qkv_rope_kv, kThreads, 1, 1, 0, 1, 1, 1, sizeof(EidolaQkvArgs));
+
+// out[t] = sum over slots j (experts ascending) of w[t][j] * d[row_of[t][j]]
+// (d BF16 [rows][H]), accumulated in f32. One block per token.
+extern "C" __global__ void __launch_bounds__(kThreads)
+    eidola_reference_moe_combine(float* __restrict__ out, const uint16_t* __restrict__ d,
+                       const int32_t* __restrict__ row_of, const float* __restrict__ topk_w,
+                       uint32_t hidden, uint32_t top_k) {
+  const uint32_t t = blockIdx.x;
+  for (uint32_t i = threadIdx.x; i < hidden; i += kThreads) {
+    float acc = 0.f;
+    for (uint32_t j = 0; j < top_k; ++j) {
+      const int32_t row = row_of[t * top_k + j];
+      acc += topk_w[t * top_k + j] * bf16f(d[static_cast<size_t>(row) * hidden + i]);
+    }
+    out[static_cast<size_t>(t) * hidden + i] = acc;
+  }
+}
+EIDOLA_KERNEL_META(eidola_reference_moe_combine, kThreads, 1, 1, 0, 1, 1, 1, 0);

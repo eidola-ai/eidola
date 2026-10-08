@@ -1,13 +1,16 @@
-//! The expert path's router, gather and SwiGLU kernels against their
-//! single-block reference forms (`engine_ops_reference.cu`, the numerics they
-//! must keep) bit for bit, and the router against the model crate's routing,
-//! on every image this device runs, from one token to a full prefill step.
+//! The expert path's router (both forms), gather, SwiGLU and combine kernels
+//! against their single-block reference forms (`engine_ops_reference.cu`, the
+//! numerics they must keep) bit for bit, and the router against the model
+//! crate's routing, on every image this device runs, from one token to a full
+//! prefill step.
 
 mod common;
 
 use common::{Lcg, setup};
 use eidola_engine_cuda::bf16;
-use eidola_engine_cuda::engine_ops::{EngineOps, ROUTER_CLUSTER, ROUTER_THREADS};
+use eidola_engine_cuda::engine_ops::{
+    COMBINE_WIDTH, EngineOps, ROUTER_CLUSTER, ROUTER_THREADS, ROUTER_TILED_THREADS, RouterForm,
+};
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::{Gpu, ImageArch, Kernel};
 use eidola_engine_model::Matrix;
@@ -21,19 +24,23 @@ const INTER: usize = 2048;
 const CAP: usize = 128;
 const BLOCK_M: usize = 128;
 /// Token counts: decode rows, a masked-layout batch, the largest masked one,
-/// a contiguous one, and a full prefill step.
-const TOKENS: [usize; 7] = [1, 2, 7, 64, 128, 513, 8192];
+/// contiguous ones (513 leaves the tiled router a one-token last tile), and a
+/// full prefill step.
+const TOKENS: [usize; 8] = [1, 2, 7, 64, 128, 513, 2048, 8192];
+/// Both router forms, whatever the token count.
+const FORMS: [RouterForm; 2] = [RouterForm::PerToken, RouterForm::Tiled];
 
 fn u32_of(x: usize) -> u32 {
     u32::try_from(x).unwrap()
 }
 
-/// The reference kernels, launched as they were: one block per token (router)
-/// or per layout row (gather, SwiGLU).
+/// The reference kernels, launched as they were: one block per token (router,
+/// combine) or per layout row (gather, SwiGLU).
 struct Reference {
     router: Kernel,
     swiglu: Kernel,
     gather: Kernel,
+    combine: Kernel,
 }
 
 impl Reference {
@@ -43,6 +50,7 @@ impl Reference {
             router: m.kernel("eidola_reference_router_topk").unwrap(),
             swiglu: m.kernel("eidola_reference_swiglu_quant_fp8_ue8m0").unwrap(),
             gather: m.kernel("eidola_reference_gather_quant_ue8m0").unwrap(),
+            combine: m.kernel("eidola_reference_moe_combine").unwrap(),
         }
     }
 }
@@ -88,12 +96,13 @@ fn router_case(rng: &mut Lcg, tokens: usize) -> RouterCase {
     RouterCase { x, w, bias }
 }
 
-/// Runs the executor's router and the reference over one case; returns
-/// (ids, weight bits) of each.
+/// Runs the executor's router in `form` and the reference over one case;
+/// returns (ids, weight bits) of each.
 #[allow(clippy::type_complexity)]
 fn run_router(
     gpu: &Gpu,
     ops: &EngineOps,
+    form: RouterForm,
     reference: &Reference,
     case: &RouterCase,
     tokens: usize,
@@ -108,8 +117,9 @@ fn run_router(
         let wts = s.alloc_zeros::<f32>(tokens * TOP_K).unwrap();
         unsafe {
             if new {
-                ops.router_topk(
+                ops.router_topk_form(
                     gpu,
+                    form,
                     dptr(&ids, s),
                     dptr(&wts, s),
                     dptr(&x, s),
@@ -153,7 +163,8 @@ fn run_router(
     (out.pop().unwrap(), reference_out)
 }
 
-/// The router's launch contract is the geometry the host launches with.
+/// The expert kernels' launch contracts are the geometry the host launches
+/// with.
 #[test]
 fn router_launch_contract() {
     let Some(su) = setup() else { return };
@@ -162,6 +173,13 @@ fn router_launch_contract() {
         let meta = *m.kernel("eidola_router_topk").unwrap().meta();
         assert_eq!(meta.block, [ROUTER_THREADS, 1, 1], "{arch:?}");
         assert_eq!(meta.cluster, [ROUTER_CLUSTER, 1, 1], "{arch:?}");
+        let meta = *m.kernel("eidola_router_topk_tiled").unwrap().meta();
+        assert_eq!(meta.block, [ROUTER_TILED_THREADS, 1, 1], "{arch:?}");
+        assert_eq!(meta.cluster, [ROUTER_CLUSTER, 1, 1], "{arch:?}");
+        assert_eq!(meta.dynamic_smem_bytes, 0, "{arch:?}");
+        let meta = *m.kernel("eidola_moe_combine").unwrap().meta();
+        assert_eq!(meta.block, [COMBINE_WIDTH / 8, 1, 1], "{arch:?}");
+        assert_eq!(meta.cluster, [1, 1, 1], "{arch:?}");
         for k in ["eidola_gather_quant_ue8m0", "eidola_swiglu_quant_fp8_ue8m0"] {
             let meta = *m.kernel(k).unwrap().meta();
             assert_eq!(meta.block, [128, 1, 1], "{k} {arch:?}");
@@ -171,7 +189,7 @@ fn router_launch_contract() {
 }
 
 /// Same expert ids in the same order and the same weights, bit for bit,
-/// ties included, at every token count.
+/// ties included, at every token count, in both forms.
 #[test]
 fn router_matches_reference_bit_for_bit() {
     let Some(su) = setup() else { return };
@@ -180,42 +198,46 @@ fn router_matches_reference_bit_for_bit() {
         let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
         let reference = Reference::load(&su, arch);
         for &tokens in &TOKENS {
-            let mut rng = Lcg(0x5eed ^ tokens as u64);
-            let case = router_case(&mut rng, tokens);
-            let (new, old) = run_router(gpu, &ops, &reference, &case, tokens);
-            for t in 0..tokens {
-                let r = t * TOP_K..(t + 1) * TOP_K;
+            for form in FORMS {
+                let mut rng = Lcg(0x5eed ^ tokens as u64);
+                let case = router_case(&mut rng, tokens);
+                let (new, old) = run_router(gpu, &ops, form, &reference, &case, tokens);
+                for t in 0..tokens {
+                    let r = t * TOP_K..(t + 1) * TOP_K;
+                    assert_eq!(
+                        new.0[r.clone()],
+                        old.0[r.clone()],
+                        "{arch:?} {form:?} {tokens} tokens, token {t}: ids"
+                    );
+                    assert_eq!(
+                        new.1[r.clone()],
+                        old.1[r],
+                        "{arch:?} {form:?} {tokens} tokens, token {t}: weights"
+                    );
+                }
+                // The tie cases did tie: a zero token picks the experts with the
+                // largest bias, lowest ids first among equals.
+                let mut zero_pick: Vec<usize> = (0..EXPERTS).collect();
+                zero_pick.sort_by(|&a, &b| case.bias[b].total_cmp(&case.bias[a]).then(a.cmp(&b)));
+                let mut want: Vec<i32> = zero_pick[..TOP_K]
+                    .iter()
+                    .map(|&e| i32::try_from(e).unwrap())
+                    .collect();
+                want.sort_unstable();
                 assert_eq!(
-                    new.0[r.clone()],
-                    old.0[r.clone()],
-                    "{arch:?} {tokens} tokens, token {t}: ids"
-                );
-                assert_eq!(
-                    new.1[r.clone()],
-                    old.1[r],
-                    "{arch:?} {tokens} tokens, token {t}: weights"
+                    new.0[..TOP_K],
+                    want[..],
+                    "{arch:?} {form:?} {tokens} tokens: zero token"
                 );
             }
-            // The tie cases did tie: a zero token picks the experts with the
-            // largest bias, lowest ids first among equals.
-            let mut zero_pick: Vec<usize> = (0..EXPERTS).collect();
-            zero_pick.sort_by(|&a, &b| case.bias[b].total_cmp(&case.bias[a]).then(a.cmp(&b)));
-            let mut want: Vec<i32> = zero_pick[..TOP_K]
-                .iter()
-                .map(|&e| i32::try_from(e).unwrap())
-                .collect();
-            want.sort_unstable();
-            assert_eq!(
-                new.0[..TOP_K],
-                want[..],
-                "{arch:?} {tokens} tokens: zero token"
-            );
         }
     }
 }
 
 /// NaN choices select exactly as the reference's scan does: a NaN at the
-/// lowest untaken expert is taken, one elsewhere never wins.
+/// lowest untaken expert is taken, one elsewhere never wins. Both forms, at
+/// every token count, with NaN logits too (a NaN in a token's row makes every
+/// one of its scores NaN).
 #[test]
 fn router_nan_choices_match_reference() {
     let Some(su) = setup() else { return };
@@ -223,20 +245,28 @@ fn router_nan_choices_match_reference() {
     for &arch in &su.archs {
         let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
         let reference = Reference::load(&su, arch);
-        let tokens = 7;
-        let mut rng = Lcg(99);
-        let mut case = router_case(&mut rng, tokens);
-        case.bias[0] = f32::NAN;
-        case.bias[77] = f32::NAN;
-        case.bias[200] = f32::INFINITY;
-        let (new, old) = run_router(gpu, &ops, &reference, &case, tokens);
-        assert_eq!(new, old, "{arch:?}");
-        for t in 0..tokens {
-            let ids = &new.0[t * TOP_K..(t + 1) * TOP_K];
-            assert!(
-                ids.contains(&0) && ids.contains(&200) && !ids.contains(&77),
-                "{arch:?} token {t}: {ids:?}"
-            );
+        for &tokens in &TOKENS {
+            let mut rng = Lcg(99 ^ tokens as u64);
+            let mut case = router_case(&mut rng, tokens);
+            case.bias[0] = f32::NAN;
+            case.bias[77] = f32::NAN;
+            case.bias[200] = f32::INFINITY;
+            // Token 3's row holds a NaN; token 4's an infinity.
+            if tokens > 4 {
+                case.x[3 * HIDDEN + 1000] = f32::NAN;
+                case.x[4 * HIDDEN + 17] = f32::INFINITY;
+            }
+            for form in FORMS {
+                let (new, old) = run_router(gpu, &ops, form, &reference, &case, tokens);
+                assert_eq!(new, old, "{arch:?} {form:?} {tokens} tokens");
+                for t in (0..tokens).filter(|&t| t != 3 || tokens <= 4) {
+                    let ids = &new.0[t * TOP_K..(t + 1) * TOP_K];
+                    assert!(
+                        ids.contains(&0) && ids.contains(&200) && !ids.contains(&77),
+                        "{arch:?} {form:?} {tokens} tokens, token {t}: {ids:?}"
+                    );
+                }
+            }
         }
     }
 }
@@ -289,41 +319,43 @@ fn router_matches_model_routing() {
     for &arch in &su.archs {
         let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
         let reference = Reference::load(&su, arch);
-        let (new, _) = run_router(gpu, &ops, &reference, &case, tokens);
-        let mut compared = 0;
-        for t in 0..tokens {
-            let xr = &x[t * HIDDEN..(t + 1) * HIDDEN];
-            // The host's choices, to measure the selection margin.
-            let mut choices: Vec<f32> = (0..EXPERTS)
-                .map(|e| {
-                    let dot: f32 = xr.iter().zip(router.row(e)).map(|(a, b)| a * b).sum();
-                    1.0 / (1.0 + (-dot).exp()) + bias[e]
-                })
-                .collect();
-            choices.sort_by(|a, b| b.total_cmp(a));
-            let (kth, next) = (choices[TOP_K - 1], choices[TOP_K]);
-            if kth != next && kth - next < 1e-5 {
-                continue;
+        for form in FORMS {
+            let (new, _) = run_router(gpu, &ops, form, &reference, &case, tokens);
+            let mut compared = 0;
+            for t in 0..tokens {
+                let xr = &x[t * HIDDEN..(t + 1) * HIDDEN];
+                // The host's choices, to measure the selection margin.
+                let mut choices: Vec<f32> = (0..EXPERTS)
+                    .map(|e| {
+                        let dot: f32 = xr.iter().zip(router.row(e)).map(|(a, b)| a * b).sum();
+                        1.0 / (1.0 + (-dot).exp()) + bias[e]
+                    })
+                    .collect();
+                choices.sort_by(|a, b| b.total_cmp(a));
+                let (kth, next) = (choices[TOP_K - 1], choices[TOP_K]);
+                if kth != next && kth - next < 1e-5 {
+                    continue;
+                }
+                compared += 1;
+                let want = route(&spec, &router, &bias, xr);
+                let ids: Vec<usize> = new.0[t * TOP_K..(t + 1) * TOP_K]
+                    .iter()
+                    .map(|&e| usize::try_from(e).unwrap())
+                    .collect();
+                assert_eq!(ids, want.experts, "{arch:?} {form:?} token {t}");
+                for (j, &bits) in new.1[t * TOP_K..(t + 1) * TOP_K].iter().enumerate() {
+                    let (got, w) = (f32::from_bits(bits), want.weights[j]);
+                    assert!(
+                        (got - w).abs() <= 8.0 * f32::EPSILON * w.abs(),
+                        "{arch:?} {form:?} token {t} slot {j}: {got} vs {w}"
+                    );
+                }
             }
-            compared += 1;
-            let want = route(&spec, &router, &bias, xr);
-            let ids: Vec<usize> = new.0[t * TOP_K..(t + 1) * TOP_K]
-                .iter()
-                .map(|&e| usize::try_from(e).unwrap())
-                .collect();
-            assert_eq!(ids, want.experts, "{arch:?} token {t}");
-            for (j, &bits) in new.1[t * TOP_K..(t + 1) * TOP_K].iter().enumerate() {
-                let (got, w) = (f32::from_bits(bits), want.weights[j]);
-                assert!(
-                    (got - w).abs() <= 8.0 * f32::EPSILON * w.abs(),
-                    "{arch:?} token {t} slot {j}: {got} vs {w}"
-                );
-            }
+            assert!(
+                compared * 10 >= tokens * 9,
+                "{arch:?} {form:?}: only {compared} of {tokens} tokens decided by a clear margin"
+            );
         }
-        assert!(
-            compared * 10 >= tokens * 9,
-            "{arch:?}: only {compared} of {tokens} tokens decided by a clear margin"
-        );
     }
 }
 
@@ -648,6 +680,98 @@ fn swiglu_matches_reference_bit_for_bit() {
                 &outs[1].0,
                 &outs[1].1,
             );
+        }
+    }
+}
+
+/// The combine sums every token's k routed rows in ascending slot order
+/// exactly as the reference does, over rows with infinities, NaN, zero
+/// weights and magnitudes whose sums round differently in another order.
+#[test]
+fn combine_matches_reference_bit_for_bit() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    for &arch in &su.archs {
+        let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
+        let reference = Reference::load(&su, arch);
+        for &tokens in &TOKENS {
+            let mut rng = Lcg(0xc0b1 ^ tokens as u64);
+            let layout = Layout::for_tokens(tokens);
+            let ids = topk_ids(&mut rng, tokens);
+            let row_of = place(gpu, &ops, &ids, tokens, &layout);
+            let mut d = vec![0u16; layout.rows * HIDDEN];
+            for (i, &r) in row_of.iter().enumerate() {
+                let row = &mut d[usize::try_from(r).unwrap() * HIDDEN..][..HIDDEN];
+                let e = i32::try_from(rng.below(41)).unwrap() - 20;
+                for v in row.iter_mut() {
+                    *v = bf16::from_f32(scaled(&mut rng, e));
+                }
+                if i % 17 == 4 {
+                    row[5] = bf16::from_f32(f32::INFINITY);
+                    row[6] = bf16::from_f32(f32::NEG_INFINITY);
+                    row[2047] = bf16::from_f32(f32::NAN);
+                }
+            }
+            let w: Vec<f32> = (0..tokens * TOP_K)
+                .map(|i| {
+                    if i % 23 == 9 {
+                        0.0
+                    } else {
+                        rng.f32().abs() * 0.5
+                    }
+                })
+                .collect();
+            let dd = s.clone_htod(&d).unwrap();
+            let dw = s.clone_htod(&w).unwrap();
+            let drow_of = s.clone_htod(&row_of).unwrap();
+            let mut outs = Vec::new();
+            for new in [true, false] {
+                let out = s.clone_htod(&vec![f32::NAN; tokens * HIDDEN]).unwrap();
+                unsafe {
+                    if new {
+                        ops.moe_combine(
+                            gpu,
+                            dptr(&out, s),
+                            dptr(&dd, s),
+                            dptr(&drow_of, s),
+                            dptr(&dw, s),
+                            u32_of(tokens),
+                            u32_of(HIDDEN),
+                            u32_of(TOP_K),
+                        )
+                        .unwrap();
+                    } else {
+                        eidola_engine_cuda::launch!(
+                            gpu,
+                            reference.combine,
+                            [u32_of(tokens), 1, 1],
+                            dptr(&out, s),
+                            dptr(&dd, s),
+                            dptr(&drow_of, s),
+                            dptr(&dw, s),
+                            u32_of(HIDDEN),
+                            u32_of(TOP_K)
+                        )
+                        .unwrap();
+                    }
+                }
+                let bits: Vec<u32> = s
+                    .clone_dtoh(&out)
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                outs.push(bits);
+            }
+            for t in 0..tokens {
+                let r = t * HIDDEN..(t + 1) * HIDDEN;
+                assert_eq!(
+                    outs[0][r.clone()],
+                    outs[1][r],
+                    "{arch:?} {tokens} tokens, token {t}"
+                );
+            }
         }
     }
 }
