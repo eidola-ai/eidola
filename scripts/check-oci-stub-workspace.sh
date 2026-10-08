@@ -10,9 +10,10 @@
 # a full checkout but not over stubs, and the image build — which only runs on
 # `main` — is the first place that would notice. So, for each such
 # Containerfile:
-#   - the stub step is extracted verbatim from it (a Containerfile that copies
-#     the workspace manifests but has no recognizable stub step is an error,
-#     never a skip), and run over a copy of the manifests;
+#   - it is found by its cargo invocations, and must copy the workspace
+#     manifests and carry a recognizable stub step (either missing is an
+#     error, never a skip); the stub step is extracted verbatim and run over a
+#     copy of the manifests;
 #   - `cargo fetch --locked` runs inside that Containerfile's own base image
 #     (its first `FROM`), so manifest parsing uses the cargo the image build
 #     uses, not this checkout's `rust-toolchain.toml`.
@@ -28,8 +29,16 @@ command -v docker >/dev/null || { echo "error: docker is required" >&2; exit 1; 
 status=0
 found=0
 for containerfile in oci/*/Containerfile; do
-  grep -q '^COPY --parents crates/\*/Cargo.toml' "$containerfile" || continue
+  # A workspace image is any Containerfile that runs cargo; identified
+  # independently of the manifest-copy line this check protects, so dropping
+  # that line is an error rather than a silent skip.
+  grep -Eq '^RUN .*cargo (fetch|build)' "$containerfile" || continue
   found=$((found + 1))
+  if ! grep -q '^COPY --parents crates/\*/Cargo.toml' "$containerfile"; then
+    echo "error: $containerfile runs cargo but does not copy the workspace manifests the way this check expects" >&2
+    status=1
+    continue
+  fi
 
   # The stub step: from `RUN find . -name Cargo.toml` through its last
   # backslash-continued line.
@@ -62,7 +71,7 @@ for containerfile in oci/*/Containerfile; do
 done
 
 if [ "$found" -eq 0 ]; then
-  echo "error: no Containerfile copies the workspace manifests; this check matched nothing" >&2
+  echo "error: no Containerfile runs cargo; this check matched nothing" >&2
   exit 1
 fi
 exit "$status"
