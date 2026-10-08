@@ -24,7 +24,7 @@ const-oid = { version = "0.9", features = ["db"] }
 der = { version = "0.7", features = ["pem", "alloc"] }
 dirs = "6"
 ecdsa = { version = "0.16", features = ["der", "verifying"] }
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 eidola-attestation = { path = "../eidola-attestation" }
 eidola-common = { path = "../eidola-common" }
 # Advisory (flock) file locking for the local-database lockfile. Pure Rust
