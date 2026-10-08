@@ -128,6 +128,13 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
     let expected_gpus = sidecar.get("expected_gpus").and_then(Value::as_u64);
     eidola_common::engine_deployment::check_gpu_attestation(executor, gpus, expected_gpus)
         .map_err(anyhow::Error::msg)?;
+    let (runtime, container_gpus) = engine_gpu_access(&config_yaml)?;
+    eidola_common::engine_deployment::check_container_gpu_access(
+        executor,
+        runtime.as_deref(),
+        container_gpus.as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
     if let Some(gpus) = sidecar.get("expected_gpus") {
         pin["expected_gpus"] = gpus.clone();
     }
@@ -163,6 +170,44 @@ pub fn render(entries: BTreeMap<String, Vec<Value>>) -> Result<String> {
 }
 
 /// The single `eidola-server-engine` container's env, as name → value.
+/// Refuse any key of the mapping `value` that `allowed` does not list.
+fn allow_keys(value: &serde_yaml::Value, allowed: &[&str], what: &str) -> Result<()> {
+    let mapping = value
+        .as_mapping()
+        .with_context(|| format!("{what} must be a mapping"))?;
+    let keys = mapping
+        .keys()
+        .map(|k| {
+            k.as_str()
+                .with_context(|| format!("{what} has a non-string key"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(key) = eidola_common::engine_deployment::first_disallowed_key(allowed, keys) {
+        bail!("{what} may not set {key:?}; an engine deployment uses only {allowed:?} there");
+    }
+    Ok(())
+}
+
+/// The engine container's `runtime` and GPU selection, as written.
+fn engine_gpu_access(config: &serde_yaml::Value) -> Result<(Option<String>, Option<String>)> {
+    let engine = &config["containers"][0];
+    let runtime = engine
+        .get("runtime")
+        .map(|r| {
+            r.as_str()
+                .map(str::to_owned)
+                .context("runtime must be a string")
+        })
+        .transpose()?;
+    let gpus = match engine.get("gpus") {
+        None => None,
+        Some(serde_yaml::Value::String(s)) => Some(s.clone()),
+        Some(serde_yaml::Value::Number(n)) => Some(n.to_string()),
+        Some(_) => bail!("the engine container's gpus must be a count or a selection"),
+    };
+    Ok((runtime, gpus))
+}
+
 fn engine_env(config: &serde_yaml::Value) -> Result<BTreeMap<String, String>> {
     let containers = config
         .get("containers")
@@ -183,6 +228,23 @@ fn engine_env(config: &serde_yaml::Value) -> Result<BTreeMap<String, String>> {
         ),
         "the engine image must be pinned by a 64-hex-digit digest"
     );
+    // Only the keys an engine deployment needs, as the gateway's build holds.
+    use eidola_common::engine_deployment::allowed_keys;
+    allow_keys(config, allowed_keys::CONFIG, "the config")?;
+    if let Some(shim) = config.get("shim") {
+        allow_keys(shim, allowed_keys::SHIM, "shim")?;
+    }
+    if let Some(models) = config.get("models") {
+        for (i, model) in models
+            .as_sequence()
+            .context("models must be a list")?
+            .iter()
+            .enumerate()
+        {
+            allow_keys(model, allowed_keys::MODEL, &format!("models[{i}]"))?;
+        }
+    }
+    allow_keys(engine, allowed_keys::CONTAINER, "the engine container")?;
     let mut env = BTreeMap::new();
     for entry in engine
         .get("env")
@@ -221,6 +283,8 @@ gpus: 8
 containers:
   - name: "eidola-server-engine"
     image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:{digest}"
+    runtime: nvidia
+    gpus: all
     secrets:
       - GATEWAY_TOKEN
     env:
@@ -362,6 +426,16 @@ containers:
         let companion =
             format!("{good}  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar:latest\"\n");
         assert!(entry("fixture-model", &companion, SIDECAR).contains("exactly one container"));
+        // A key an engine deployment does not need.
+        let entrypoint = good.replace(
+            "    runtime: nvidia\n",
+            "    runtime: nvidia\n    entrypoint: [\"/bin/sh\"]\n",
+        );
+        assert!(
+            entry("fixture-model", &entrypoint, SIDECAR).contains("may not set \"entrypoint\"")
+        );
+        let no_runtime = good.replace("    runtime: nvidia\n", "");
+        assert!(entry("fixture-model", &no_runtime, SIDECAR).contains("runtime: nvidia"));
         let tagged = good.replace(&format!("@sha256:{}", "2".repeat(64)), ":v1");
         assert!(entry("fixture-model", &tagged, SIDECAR).contains("64-hex-digit digest"));
     }

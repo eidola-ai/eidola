@@ -8,6 +8,8 @@ gpus: 8
 containers:
   - name: "eidola-server-engine"
     image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    runtime: nvidia
+    gpus: all
     secrets:
       - GATEWAY_TOKEN
     env:

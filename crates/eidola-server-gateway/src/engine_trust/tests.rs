@@ -748,6 +748,7 @@ fn a_cuda_deployment_attests_its_gpus() {
     // The CPU executor attaches and requires no GPUs.
     let mut tree = Tree::fixture();
     tree.edit_config("gpus: 8\n", "");
+    tree.edit_config("    runtime: nvidia\n    gpus: all\n", "");
     tree.edit_config("EXECUTOR: \"cuda\"", "EXECUTOR: \"cpu\"");
     set_expected_gpus(&mut tree, None);
     tree.check().expect("a CPU deployment without GPU evidence");
@@ -875,5 +876,75 @@ fn a_repeated_member_anywhere_is_refused() {
             file::parse(edited.as_bytes()).is_err(),
             "{name}: the runtime refuses it too"
         );
+    }
+}
+
+/// Only the keys an engine deployment needs are accepted, at every level that
+/// can change what runs or what it reaches: an `entrypoint` or `command`
+/// would run another executable from the pinned image, and every other key
+/// Tinfoil's schema offers is refused unless listed as needed.
+#[test]
+fn the_config_uses_only_the_keys_an_engine_needs() {
+    let image = format!(
+        "    image: \"ghcr.io/eidola-ai/eidola-server-engine@sha256:{}\"\n",
+        "2".repeat(64)
+    );
+    for (extra, key) in [
+        ("    entrypoint: [\"/bin/sh\"]\n", "entrypoint"),
+        ("    command: [\"--serve-something-else\"]\n", "command"),
+        ("    privileged: true\n", "privileged"),
+        ("    volumes: [\"/:/host\"]\n", "volumes"),
+        ("    no_such_key: 1\n", "no_such_key"),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(&image, &format!("{image}{extra}"));
+        refused(&tree, &format!("the engine container may not set {key:?}"));
+    }
+
+    for (extra, key) in [
+        ("networks:\n  egress:\n    egress: open\n", "networks"),
+        ("cvm-network:\n  inbound-ports: [22]\n", "cvm-network"),
+        ("attested-keys: []\n", "attested-keys"),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config("gpus: 8\n", &format!("gpus: 8\n{extra}"));
+        refused(&tree, &format!("the config may not set {key:?}"));
+    }
+
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "  upstream-port: 8080\n",
+        "  upstream-port: 8080\n  dummy-attestation: true\n",
+    );
+    refused(&tree, "shim may not set \"dummy-attestation\"");
+
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "gpus: 8\n",
+        "gpus: 8\nmodels:\n  - name: weights\n    mpk: abc\n    exec: true\n",
+    );
+    refused(&tree, "models[0] may not set \"exec\"");
+
+    // The model packs that carry the weights are allowed in their plain form.
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "gpus: 8\n",
+        "gpus: 8\nmodels:\n  - name: weights\n    mpk: abc\n",
+    );
+    tree.check().expect("a plain model pack");
+}
+
+/// The CUDA engine sees every attested GPU through the NVIDIA runtime; the
+/// CPU engine takes no GPU access.
+#[test]
+fn the_engine_container_has_the_gpu_access_its_executor_needs() {
+    for (from, to) in [
+        ("    gpus: all\n", "    gpus: 1\n"),
+        ("    gpus: all\n", ""),
+        ("    runtime: nvidia\n", ""),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(from, to);
+        refused(&tree, "needs `runtime: nvidia` and `gpus: all`");
     }
 }

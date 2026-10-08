@@ -271,6 +271,75 @@ pub fn parse_measured(
     })
 }
 
+/// The keys an engine deployment's `tinfoil-config.yml` may use, section by
+/// section. Anything else is refused, because Tinfoil's schema
+/// (`tinfoil-config/types.go`) can change what runs or what it can reach in
+/// ways the engine's own measurement does not show: a container `entrypoint`
+/// or `command` runs another executable from the pinned image, `volumes`,
+/// `devices`, `cap_add` or `privileged` widen what it can touch, `networks`
+/// and `cvm-network` open egress or inbound ports, and the shim's
+/// `dummy-attestation` replaces the hardware evidence. Each allowed key is one
+/// the deployment needs:
+pub mod allowed_keys {
+    /// Top level: the platform release (`cvm-version`), the VM's resources
+    /// (`cpus`, `memory`, `gpus`, all measured), the read-only model packs
+    /// that carry the weights to verified storage (`models`), the one
+    /// container, and the attestation shim in front of it.
+    pub const CONFIG: &[&str] = &[
+        "cvm-version",
+        "cpus",
+        "memory",
+        "gpus",
+        "models",
+        "containers",
+        "shim",
+    ];
+    /// The shim: where it forwards (`upstream-port`, which must be the node's
+    /// port) and which paths it serves (`paths`).
+    pub const SHIM: &[&str] = &["upstream-port", "paths"];
+    /// The container: its identity (`name`), the digest-pinned image, its
+    /// measured environment (`env`) and secret (`secrets`, the gateway
+    /// token), its grant to the weights' model pack (`models`), and GPU access
+    /// for the `cuda` executor (`runtime: nvidia` with `gpus: all`).
+    pub const CONTAINER: &[&str] = &[
+        "name", "image", "env", "secrets", "models", "runtime", "gpus",
+    ];
+    /// A model pack: its name, source, and the pinned pack it is built from.
+    /// Not `exec` (weights are never programs), and not the encrypted forms
+    /// (`emwp`, `key-secret`), which public weights do not need.
+    pub const MODEL: &[&str] = &["name", "repo", "mpk", "mwp", "schema"];
+}
+
+/// The first of `keys` that `allowed` does not list.
+pub fn first_disallowed_key<'a>(
+    allowed: &[&str],
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    keys.into_iter().find(|key| !allowed.contains(key))
+}
+
+/// Whether the engine container's GPU access matches its executor: the
+/// `cuda` executor needs `runtime: nvidia` and every attested GPU
+/// (`gpus: all`, so the GPUs the shim attests are the ones the node uses);
+/// the `cpu` executor needs neither. `gpus` is the container's selection as
+/// written (a number reads as its decimal text).
+pub fn check_container_gpu_access(
+    executor: Executor,
+    runtime: Option<&str>,
+    gpus: Option<&str>,
+) -> Result<(), String> {
+    match (executor, runtime, gpus) {
+        (Executor::Cuda, Some("nvidia"), Some("all")) => Ok(()),
+        (Executor::Cuda, _, _) => {
+            Err("the cuda executor's container needs `runtime: nvidia` and `gpus: all`".into())
+        }
+        (Executor::Cpu, None, None) => Ok(()),
+        (Executor::Cpu, _, _) => {
+            Err("the cpu executor's container takes no `runtime` or `gpus`".into())
+        }
+    }
+}
+
 /// The GPU counts a confidential NVIDIA deployment may attach (the
 /// config's top-level `gpus`): the platform provider's NVIDIA-CC shapes.
 pub const CUDA_GPU_COUNTS: &[u64] = &[1, 8];
@@ -506,6 +575,44 @@ mod tests {
                 check_gpu_attestation(executor, gpus, expected).is_err(),
                 "{executor:?} gpus={gpus:?} expected={expected:?}"
             );
+        }
+    }
+
+    #[test]
+    fn only_allowed_keys_pass() {
+        assert_eq!(
+            first_disallowed_key(allowed_keys::CONTAINER, ["name", "image"]),
+            None
+        );
+        assert_eq!(
+            first_disallowed_key(allowed_keys::CONTAINER, ["name", "entrypoint", "command"]),
+            Some("entrypoint")
+        );
+        assert_eq!(
+            first_disallowed_key(allowed_keys::SHIM, ["upstream-port", "dummy-attestation"]),
+            Some("dummy-attestation")
+        );
+        assert_eq!(
+            first_disallowed_key(allowed_keys::MODEL, ["name", "exec"]),
+            Some("exec")
+        );
+    }
+
+    #[test]
+    fn container_gpu_access_follows_the_executor() {
+        use Executor::{Cpu, Cuda};
+        assert!(check_container_gpu_access(Cuda, Some("nvidia"), Some("all")).is_ok());
+        assert!(check_container_gpu_access(Cpu, None, None).is_ok());
+        for (executor, runtime, gpus) in [
+            (Cuda, None, None),
+            (Cuda, Some("nvidia"), None),
+            (Cuda, Some("nvidia"), Some("1")),
+            (Cuda, Some("nvidia"), Some("0,1")),
+            (Cuda, Some("runc"), Some("all")),
+            (Cpu, Some("nvidia"), None),
+            (Cpu, None, Some("all")),
+        ] {
+            assert!(check_container_gpu_access(executor, runtime, gpus).is_err());
         }
     }
 

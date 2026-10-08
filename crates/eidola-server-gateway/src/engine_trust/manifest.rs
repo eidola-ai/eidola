@@ -42,7 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use eidola_common::engine_deployment;
+use eidola_common::engine_deployment::{self, allowed_keys};
 use sha2::{Digest, Sha256};
 
 /// The schema version this gateway reads.
@@ -387,6 +387,12 @@ fn check_deployment(
     // by the rule the measurer applies too.
     engine_deployment::check_gpu_attestation(measured.executor, config.gpus, expected_gpus)
         .map_err(|e| format!("{at}: {e}"))?;
+    engine_deployment::check_container_gpu_access(
+        measured.executor,
+        config.runtime.as_deref(),
+        config.container_gpus.as_deref(),
+    )
+    .map_err(|e| format!("{at_config}: {e}"))?;
     if expected_gpus != sidecar.expected_gpus {
         return Err(format!(
             "{at}: pin.expected_gpus differs from {sidecar_path}"
@@ -475,12 +481,56 @@ struct EngineConfig {
     shim_upstream_port: u64,
     /// The GPUs the deployment attaches (`gpus`), when it states a count.
     gpus: Option<u64>,
+    /// The engine container's `runtime`.
+    runtime: Option<String>,
+    /// The engine container's GPU selection (`gpus`), as written.
+    container_gpus: Option<String>,
+}
+
+/// Refuse any key of the mapping `value` that `allowed` does not list.
+fn allow_keys(
+    value: &serde_yaml::Value,
+    allowed: &[&str],
+    path: &str,
+    what: &str,
+) -> Result<(), String> {
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| format!("{path}: {what} must be a mapping"))?;
+    let mut keys = Vec::with_capacity(mapping.len());
+    for key in mapping.keys() {
+        keys.push(
+            key.as_str()
+                .ok_or_else(|| format!("{path}: {what} has a non-string key"))?,
+        );
+    }
+    match engine_deployment::first_disallowed_key(allowed, keys) {
+        None => Ok(()),
+        Some(key) => Err(format!(
+            "{path}: {what} may not set {key:?}; an engine deployment uses only {allowed:?} there"
+        )),
+    }
 }
 
 impl EngineConfig {
     fn parse(bytes: &[u8], path: &str) -> Result<Self, String> {
         let config: serde_yaml::Value =
             serde_yaml::from_slice(bytes).map_err(|e| format!("{path}: {e}"))?;
+        // Only the keys an engine deployment needs, at every level that can
+        // change what runs (`engine_deployment::allowed_keys`, which the
+        // measurer applies too).
+        allow_keys(&config, allowed_keys::CONFIG, path, "the config")?;
+        if let Some(shim) = config.get("shim") {
+            allow_keys(shim, allowed_keys::SHIM, path, "shim")?;
+        }
+        if let Some(models) = config.get("models") {
+            let models = models
+                .as_sequence()
+                .ok_or_else(|| format!("{path}: models must be a list"))?;
+            for (i, model) in models.iter().enumerate() {
+                allow_keys(model, allowed_keys::MODEL, path, &format!("models[{i}]"))?;
+            }
+        }
         let cvm_version = config
             .get("cvm-version")
             .and_then(serde_yaml::Value::as_str)
@@ -518,6 +568,34 @@ impl EngineConfig {
                     "{path}: an engine deployment runs exactly one container, its image \
                      {ENGINE_IMAGE_PREFIX}<64 lowercase hex>; every other container, and any \
                      image named by a tag or a short digest, escapes the measurement"
+                ));
+            }
+        };
+
+        allow_keys(
+            engine,
+            allowed_keys::CONTAINER,
+            path,
+            "the engine container",
+        )?;
+        let runtime = match engine.get("runtime") {
+            None => None,
+            Some(runtime) => Some(
+                runtime
+                    .as_str()
+                    .ok_or_else(|| {
+                        format!("{path}: the engine container's runtime must be a string")
+                    })?
+                    .to_owned(),
+            ),
+        };
+        let container_gpus = match engine.get("gpus") {
+            None => None,
+            Some(serde_yaml::Value::String(s)) => Some(s.clone()),
+            Some(serde_yaml::Value::Number(n)) => Some(n.to_string()),
+            Some(_) => {
+                return Err(format!(
+                    "{path}: the engine container's gpus must be a count or a selection"
                 ));
             }
         };
@@ -577,6 +655,8 @@ impl EngineConfig {
             env,
             shim_upstream_port,
             gpus,
+            runtime,
+            container_gpus,
         })
     }
 }
