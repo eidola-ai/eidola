@@ -568,10 +568,15 @@ fn tls_leaf_extensions(
         extn_value: der::asn1::OctetString::new(eku.to_der()?)?,
     };
 
-    let general_names: Vec<GeneralName> = dns_names
+    let mut general_names: Vec<GeneralName> = dns_names
         .iter()
         .map(|n| Ok::<_, der::Error>(GeneralName::DnsName(Ia5String::new(*n)?)))
         .collect::<Result<_, _>>()?;
+    // The IPv4 loopback too, so a client can reach an in-process shim
+    // without resolving a name (a build sandbox may have no resolver).
+    general_names.push(GeneralName::IpAddress(der::asn1::OctetString::new(
+        [127u8, 0, 0, 1].to_vec(),
+    )?));
     let san = x509_cert::ext::pkix::SubjectAltName(general_names);
     let san_ext = x509_cert::ext::Extension {
         extn_id: ObjectIdentifier::new_unwrap("2.5.29.17"),

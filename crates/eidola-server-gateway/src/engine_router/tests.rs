@@ -231,7 +231,7 @@ async fn engine(identity: Identity) -> Engine {
     .unwrap();
     Engine {
         state,
-        base_url: format!("https://localhost:{}", shim.local_addr.port()),
+        base_url: format!("https://127.0.0.1:{}", shim.local_addr.port()),
         shim: Some(shim),
         _server: server,
     }
