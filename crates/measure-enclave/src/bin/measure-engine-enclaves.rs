@@ -41,7 +41,7 @@ fn main() -> Result<()> {
         |path: &Path| std::fs::read(path).with_context(|| format!("reading {}", path.display()));
     let root = cli.workspace.join("deploy/engine");
 
-    let mut entries: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    let mut entries: BTreeMap<String, Vec<engine_enclaves::Entry>> = BTreeMap::new();
     for model in sorted_dirs(&root)? {
         let model_id = name(&model)?;
         for variant in sorted_dirs(&model)? {

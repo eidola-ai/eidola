@@ -19,10 +19,10 @@ use std::collections::BTreeMap;
 use serde_json::Value as Json;
 
 use super::{
-    ExecutorSettings, MeasuredConfig, ModelPack, WeightsStorage, artifact_data_bytes,
+    CacheConfig, ExecutorSettings, MeasuredConfig, ModelPack, WeightsStorage, artifact_data_bytes,
     check_container_gpu_access, check_env_names, check_gpu_attestation, check_kernels_dir,
     check_resources, check_secrets, check_shim_paths, check_vm_resources, check_weights_pack, env,
-    parse_cvm_version, parse_measured,
+    is_safe_component, parse_cvm_version, parse_measured,
 };
 
 /// The image every engine deployment runs, pinned by digest.
@@ -174,6 +174,81 @@ pub fn check_deployment(
         expected_gpus: side.expected_gpus,
         tdx_policy: side.tdx_policy,
     })
+}
+
+impl Deployment {
+    /// What this deployment shares with every other deployment of its model.
+    pub fn model_identity(&self) -> ModelIdentity {
+        ModelIdentity {
+            weights_sha256: self.measured.weights_sha256.clone(),
+            weights_repo: self.weights_repo.clone(),
+            weights_revision: self.weights_revision.clone(),
+            prompt_cache: self.measured.cache,
+        }
+    }
+}
+
+/// What every deployment of one model must agree on: the gateway publishes
+/// one model id per set of weights and one prompt-cache retention policy per
+/// model, so two deployments of a model that differ in either would make
+/// what a client is told depend on which deployment serves it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelIdentity {
+    /// The node's weights hash (lowercase hex).
+    pub weights_sha256: String,
+    /// Where the weight files came from: `<owner>/<name>` and a revision.
+    pub weights_repo: String,
+    pub weights_revision: String,
+    pub prompt_cache: CacheConfig,
+}
+
+/// Check the deployments of `model_id`, each given as `(where, identity)`
+/// with `where` naming it in errors: the id is a safe path component, there
+/// is at least one deployment, and every deployment shares the first one's
+/// weights and prompt-cache policy. Returns that shared identity.
+///
+/// The gateway's build runs this over the pinned file's models and
+/// `measure-enclave` over the deployments it is about to render, so the
+/// generator never emits a file the build refuses for disagreement.
+pub fn check_model_agreement<'a>(
+    model_id: &str,
+    deployments: impl IntoIterator<Item = (&'a str, &'a ModelIdentity)>,
+) -> Result<ModelIdentity, String> {
+    if !is_safe_component(model_id) {
+        return Err(format!(
+            "model {model_id:?}: a model id must match [a-z0-9][a-z0-9._-]*"
+        ));
+    }
+    let mut first: Option<&ModelIdentity> = None;
+    for (at, identity) in deployments {
+        let Some(first) = first else {
+            first = Some(identity);
+            continue;
+        };
+        if (
+            &identity.weights_sha256,
+            &identity.weights_repo,
+            &identity.weights_revision,
+        ) != (
+            &first.weights_sha256,
+            &first.weights_repo,
+            &first.weights_revision,
+        ) {
+            return Err(format!(
+                "{at}: weights differ from the model's other deployments; one model id names \
+                 one set of weights"
+            ));
+        }
+        if identity.prompt_cache != first.prompt_cache {
+            return Err(format!(
+                "{at}: prompt_cache differs from the model's other deployments; the gateway \
+                 publishes one retention policy per model"
+            ));
+        }
+    }
+    first
+        .cloned()
+        .ok_or_else(|| format!("model {model_id:?}: must have at least one deployment"))
 }
 
 /// Largest config Tinfoil decodes (`tinfoil-config/decode.go`:

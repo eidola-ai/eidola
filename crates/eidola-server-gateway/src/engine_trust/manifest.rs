@@ -26,7 +26,9 @@
 //!   TDX MRCONFIGID equal to the config's hash; and the attesting client's
 //!   own pin compiler accepts it.
 //! - Every deployment of one model agrees on its weights and prompt-cache
-//!   policy, since the gateway publishes one of each per model.
+//!   policy, since the gateway publishes one of each per model:
+//!   `deployment::check_model_agreement`, which `measure-enclave` also runs
+//!   before it renders the file.
 //! - Every deployment directory committed under `deploy/engine/` is pinned
 //!   ([`require_every_deployment_pinned`]), so the file is a function of the
 //!   tree in both directions.
@@ -37,7 +39,7 @@
 
 use std::collections::BTreeMap;
 
-use eidola_common::engine_deployment::{deployment, is_safe_component};
+use eidola_common::engine_deployment::{CacheConfig, deployment, is_safe_component};
 use sha2::{Digest, Sha256};
 
 /// The schema version this gateway reads.
@@ -117,7 +119,8 @@ pub fn check(
             .as_array()
             .filter(|d| !d.is_empty())
             .ok_or_else(|| format!("{at}: must be a non-empty array of deployments"))?;
-        let mut model: Option<CheckedModel> = None;
+        let mut configs = Vec::new();
+        let mut identities = Vec::new();
         for (index, deployment) in deployments.iter().enumerate() {
             let at = format!("{at}, deployment {index}");
             let (config, weights, prompt_cache) = check_deployment(id, deployment, &at, read)?;
@@ -126,33 +129,40 @@ pub fn check(
                     "{at}: {config} is already pinned under model {previous:?}"
                 ));
             }
-            match &mut model {
-                None => {
-                    model = Some(CheckedModel {
-                        id: id.clone(),
-                        weights,
-                        prompt_cache,
-                        deployments: vec![config],
-                    })
-                }
-                Some(model) => {
-                    if model.weights != weights {
-                        return Err(format!(
-                            "{at}: weights differ from the model's other deployments; \
-                             one model id names one set of weights"
-                        ));
-                    }
-                    if model.prompt_cache != prompt_cache {
-                        return Err(format!(
-                            "{at}: prompt_cache differs from the model's other deployments; \
-                             the gateway publishes one retention policy per model"
-                        ));
-                    }
-                    model.deployments.push(config);
-                }
-            }
+            configs.push(config);
+            identities.push((
+                at,
+                deployment::ModelIdentity {
+                    weights_sha256: weights.sha256,
+                    weights_repo: weights.repo,
+                    weights_revision: weights.revision,
+                    prompt_cache: CacheConfig {
+                        enabled: prompt_cache.enabled,
+                        idle_ttl_secs: prompt_cache.idle_ttl_secs,
+                        max_age_secs: prompt_cache.max_age_secs,
+                    },
+                },
+            ));
         }
-        checked.push(model.expect("a non-empty deployment list"));
+        // The per-model rule `measure-enclave` also runs before it renders.
+        let identity = deployment::check_model_agreement(
+            id,
+            identities.iter().map(|(at, i)| (at.as_str(), i)),
+        )?;
+        checked.push(CheckedModel {
+            id: id.clone(),
+            weights: CheckedWeights {
+                sha256: identity.weights_sha256,
+                repo: identity.weights_repo,
+                revision: identity.weights_revision,
+            },
+            prompt_cache: CheckedCachePolicy {
+                enabled: identity.prompt_cache.enabled,
+                idle_ttl_secs: identity.prompt_cache.idle_ttl_secs,
+                max_age_secs: identity.prompt_cache.max_age_secs,
+            },
+            deployments: configs,
+        });
     }
     Ok(checked)
 }

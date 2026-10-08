@@ -33,7 +33,9 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use eidola_common::engine_deployment::deployment::check_deployment;
+use eidola_common::engine_deployment::deployment::{
+    ModelIdentity, check_deployment, check_model_agreement,
+};
 
 use crate::tdx_igvm;
 
@@ -70,7 +72,7 @@ pub fn required_release(config: &[u8]) -> Result<(String, String)> {
 /// check_deployment`, the one check the gateway's build also runs on every
 /// pinned deployment, so the generator can only emit a pin the build accepts.
 /// What only this tool adds is the launch identity from the platform release.
-pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result<Value> {
+pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result<Entry> {
     let sidecar_path = inputs
         .config_path
         .strip_suffix("tinfoil-config.yml")
@@ -84,6 +86,7 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
         inputs.sidecar,
     )
     .map_err(anyhow::Error::msg)?;
+    let identity = checked.model_identity();
     let tdx_policy = checked
         .tdx_policy
         .context("deployment.json states no tdx_policy; only TDX deployments are measured")?;
@@ -109,7 +112,7 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
         pin["expected_gpus"] = gpus.into();
     }
     let cache = checked.measured.cache;
-    Ok(json!({
+    let json = json!({
         "config": inputs.config_path,
         "config_sha256": hex::encode(Sha256::digest(inputs.config)),
         "cvm_version": checked.cvm_version,
@@ -124,12 +127,46 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
             "idle_ttl_secs": cache.idle_ttl_secs,
             "max_age_secs": cache.max_age_secs,
         },
-    }))
+    });
+    Ok(Entry {
+        config_path: inputs.config_path.to_owned(),
+        json,
+        identity,
+    })
 }
 
-/// The whole file: entries grouped by model id, each model's deployments in
-/// config-path order.
-pub fn render(entries: BTreeMap<String, Vec<Value>>) -> Result<String> {
+/// One deployment's entry, with what it must share with its model's other
+/// deployments.
+#[derive(Debug)]
+pub struct Entry {
+    pub config_path: String,
+    pub json: Value,
+    pub identity: ModelIdentity,
+}
+
+/// The whole file, from every model's checked entries. Each model's
+/// deployments are first held to agree by
+/// `eidola_common::engine_deployment::deployment::check_model_agreement`, the
+/// per-model rule the gateway's build also runs, so the file rendered is one
+/// that build accepts.
+pub fn render(entries: BTreeMap<String, Vec<Entry>>) -> Result<String> {
+    let mut models = BTreeMap::new();
+    for (model, deployments) in entries {
+        check_model_agreement(
+            &model,
+            deployments
+                .iter()
+                .map(|e| (e.config_path.as_str(), &e.identity)),
+        )
+        .map_err(anyhow::Error::msg)?;
+        models.insert(model, deployments.into_iter().map(|e| e.json).collect());
+    }
+    render_values(models)
+}
+
+/// The file's canonical text: entries grouped by model id, each model's
+/// deployments in config-path order.
+fn render_values(entries: BTreeMap<String, Vec<Value>>) -> Result<String> {
     let mut models = serde_json::Map::new();
     for (model, mut deployments) in entries {
         deployments.sort_by(|a, b| a["config"].as_str().cmp(&b["config"].as_str()));
@@ -242,7 +279,7 @@ containers:
 
         let config_sha = hex::encode(Sha256::digest(config.as_bytes()));
         assert_eq!(
-            entry,
+            entry.json,
             json!({
                 "config": PATH,
                 "config_sha256": config_sha,
@@ -271,6 +308,75 @@ containers:
         assert_eq!(parsed["models"]["fixture-model"][0]["config"], PATH);
     }
 
+    /// Every variant of a model shares its weights and prompt-cache policy:
+    /// the generator refuses to render a file whose variants disagree, by the
+    /// same rule the gateway's build holds the file to.
+    #[test]
+    fn the_variants_of_a_model_agree() {
+        let igvm = image(vec![page(0x2000, 1, IgvmPageDataFlags::new())]);
+        let mrtd = hex::encode(tdx_igvm::mrtd_from_igvm(&igvm).unwrap());
+        let release = manifest(&igvm, &mrtd, &"00".repeat(48));
+        let release_sha = hex::encode(Sha256::digest(&release));
+        let good = config(&release_sha);
+        let entry = |path: &str, config: &str, sidecar: &str| {
+            deployment_entry(
+                "fixture-model",
+                &DeploymentInputs {
+                    config_path: path,
+                    config: config.as_bytes(),
+                    sidecar: sidecar.as_bytes(),
+                    release_manifest: &release,
+                    igvm: &igvm,
+                },
+            )
+            .unwrap()
+        };
+        const OTHER: &str = "deploy/engine/fixture-model/tdx-b/tinfoil-config.yml";
+        let two = |b: Entry| {
+            render(BTreeMap::from([(
+                "fixture-model".to_string(),
+                vec![entry(PATH, &good, SIDECAR), b],
+            )]))
+        };
+
+        let rendered = two(entry(OTHER, &good, SIDECAR)).unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["models"]["fixture-model"][1]["config"], OTHER);
+
+        let other_weights = good.replace(&"3".repeat(64), &"6".repeat(64));
+        let err = two(entry(OTHER, &other_weights, SIDECAR))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(OTHER) && err.contains("weights differ"),
+            "{err}"
+        );
+
+        let other_revision = SIDECAR.replace(&"4".repeat(40), &"7".repeat(40));
+        let other_pack = good.replace(&"4".repeat(40), &"7".repeat(40));
+        let err = two(entry(OTHER, &other_pack, &other_revision))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("weights differ"), "{err}");
+
+        let other_cache = good.replace(
+            "CACHE_MAX_AGE_SECS: \"7200\"",
+            "CACHE_MAX_AGE_SECS: \"3600\"",
+        );
+        let err = two(entry(OTHER, &other_cache, SIDECAR))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(OTHER) && err.contains("prompt_cache differs"),
+            "{err}"
+        );
+        let no_cache = good.replace("PREFIX_CACHE: \"true\"", "PREFIX_CACHE: \"false\"");
+        let err = two(entry(OTHER, &no_cache, SIDECAR))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prompt_cache differs"), "{err}");
+    }
+
     /// The committed file is in this tool's canonical form: re-rendering
     /// what it holds reproduces it byte for byte. With no deployment
     /// committed that is the whole file; with some, the gateway's build
@@ -283,7 +389,7 @@ containers:
         let parsed: Value = serde_json::from_str(&committed).unwrap();
         let models: BTreeMap<String, Vec<Value>> =
             serde_json::from_value(parsed["models"].clone()).unwrap();
-        assert_eq!(render(models).unwrap(), committed);
+        assert_eq!(render_values(models).unwrap(), committed);
     }
 
     #[test]
