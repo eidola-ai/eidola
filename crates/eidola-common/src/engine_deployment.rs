@@ -143,27 +143,66 @@ pub const KV_BYTES_PER_POSITION: u64 = (9 * 4 + 39 * 8) * (192 + 128) * 2;
 /// largest NVIDIA-CC part's HBM, rounded up (288 GiB).
 pub const MAX_GPU_MEMORY_BYTES: u64 = 288 << 30;
 
-/// Whether the deployment's VM and GPUs hold what its configuration
-/// allocates, as far as configuration alone fixes it:
+/// Worst-case bytes of `serde_json::Value` tree per byte of JSON text, for
+/// the node's strict parse (`api::parse_request`): the densest text is the
+/// smallest non-empty object, `{"":0}` (7 bytes), which allocates a B-tree
+/// leaf of eleven 24-byte keys and 32-byte values plus its header, about
+/// 640 bytes (≈ 92×), rounded up.
+pub const STRICT_TREE_PER_TEXT_BYTE: u64 = 96;
+
+/// Worst-case bytes of the chat crate's order-preserving tree per byte of
+/// text (`Json`, 32 bytes a node): an array element `0,` (2 bytes) is one node
+/// (16×), and a vector's capacity may be twice its length (32×).
+pub const ORDERED_TREE_PER_TEXT_BYTE: u64 = 32;
+
+/// Worst-case bytes a prepared request adds per byte of its body
+/// (`pipeline::prepare`): the rendered prompt (at most twice the message
+/// text, the template's per-message markup counted) and its tokens (a `u32`
+/// per prompt byte at worst, so four bytes each), 2 + 8.
+pub const PREPARED_PER_BODY_BYTE: u64 = 10;
+
+/// The node process's own fixed footprint beside its pools (runtime, engine
+/// state, the model's host-side metadata): 4 GiB.
+pub const PROCESS_HEADROOM_BYTES: u64 = 4 << 30;
+
+/// The host memory a node's configuration commits it to, at worst, from its
+/// own code paths (`http::chat`, `api::parse_request`, `pipeline::prepare`):
 ///
-/// - host memory (`memory`, MiB) holds every admission slot's request body and
-///   its parse (2 × `MAX_REQUEST_BODY_BYTES` each) plus the block tables
-///   (`MAX_SEQS` × ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉ `i32` entries, one
-///   table per KV group, two groups);
-/// - GPU memory (`gpus` × [`MAX_GPU_MEMORY_BYTES`]) holds the KV cache
-///   (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`KV_BYTES_PER_POSITION`]).
-///
-/// The weights' own footprint is the model's and is not estimated here.
-pub fn check_resources(sizing: &Sizing, memory_mib: u64, gpus: u64) -> Result<(), String> {
+/// - the **read pool**: `MAX_REQUESTS` slots, each a body of up to
+///   `MAX_REQUEST_BODY_BYTES` live at once with its strict parse and its
+///   order-preserving parse (`parse_request` builds both from the body
+///   before the body is dropped): body × (1 + [`STRICT_TREE_PER_TEXT_BYTE`] +
+///   [`ORDERED_TREE_PER_TEXT_BYTE`]);
+/// - the **admission pool**: `MAX_REQUESTS` admitted requests, each keeping
+///   its order-preserving tree while the prompt is rendered and tokenized:
+///   body × ([`ORDERED_TREE_PER_TEXT_BYTE`] + [`PREPARED_PER_BODY_BYTE`]).
+///   Both pools can be full at once (a slot of each per request in flight);
+/// - the block tables: `MAX_SEQS` × ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉
+///   `i32` entries per KV group, two groups;
+/// - [`PROCESS_HEADROOM_BYTES`].
+pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
     let body = crate::engine_protocol::MAX_REQUEST_BODY_BYTES as u64;
+    let requests = u64::from(sizing.max_requests);
+    let read_pool = requests * body * (1 + STRICT_TREE_PER_TEXT_BYTE + ORDERED_TREE_PER_TEXT_BYTE);
+    let admission_pool = requests * body * (ORDERED_TREE_PER_TEXT_BYTE + PREPARED_PER_BODY_BYTE);
     let blocks_per_seq = u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size));
-    let host = u64::from(sizing.max_requests) * 2 * body
-        + u64::from(sizing.max_seqs) * blocks_per_seq * 4 * 2;
+    let tables = u64::from(sizing.max_seqs) * blocks_per_seq * 4 * 2;
+    read_pool + admission_pool + tables + PROCESS_HEADROOM_BYTES
+}
+
+/// Whether the deployment's VM and GPUs hold what its configuration
+/// allocates, as far as configuration alone fixes it: host memory (`memory`,
+/// MiB) holds [`host_memory_bytes`], and GPU memory (`gpus` ×
+/// [`MAX_GPU_MEMORY_BYTES`]) holds the KV cache (`KV_BLOCKS` ×
+/// `KV_BLOCK_SIZE` × [`KV_BYTES_PER_POSITION`]). The weights' own footprint is
+/// the model's and is not estimated here.
+pub fn check_resources(sizing: &Sizing, memory_mib: u64, gpus: u64) -> Result<(), String> {
+    let host = host_memory_bytes(sizing);
     let host_limit = memory_mib << 20;
     if host > host_limit {
         return Err(format!(
-            "the node's request buffers and block tables need {host} bytes, more than the VM's \
-             {host_limit} (memory)"
+            "the node's request pools, block tables and headroom need {host} bytes, more than \
+             the VM's {host_limit} (memory)"
         ));
     }
     let kv = u64::from(sizing.kv_blocks) * u64::from(sizing.kv_block_size) * KV_BYTES_PER_POSITION;
@@ -535,6 +574,29 @@ pub fn check_secrets<'a>(secrets: impl IntoIterator<Item = &'a str>) -> Result<(
 /// `docs/runtime-policy.md`; `ContainerModelsDir` in its boot paths).
 pub const MODEL_MOUNT_ROOT: &str = "/tinfoil/models";
 
+/// Whether `mpk` is a modelwrap artifact reference, `rootHash_hashOffset_uuid`
+/// (tinfoilsh/modelwrap `modelwrap.go` `ParseRef` at e61ae511): a 64-hex
+/// root hash, a decimal hash offset that fits a `u64` (`HashOffsetBytes`), and
+/// a lowercase UUID (8-4-4-4-12 hex), joined by exactly two underscores.
+pub fn is_artifact_ref(mpk: &str) -> bool {
+    let hex = |s: &str, n: usize| {
+        s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let parts: Vec<&str> = mpk.split('_').collect();
+    let [root, offset, uuid] = parts.as_slice() else {
+        return false;
+    };
+    let uuid_ok = {
+        let groups: Vec<&str> = uuid.split('-').collect();
+        groups.len() == 5 && groups.iter().zip([8, 4, 4, 4, 12]).all(|(g, n)| hex(g, n))
+    };
+    hex(root, 64)
+        && !offset.is_empty()
+        && offset.bytes().all(|b| b.is_ascii_digit())
+        && offset.parse::<u64>().is_ok()
+        && uuid_ok
+}
+
 /// A model pack as an engine config declares it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelPack<'a> {
@@ -577,13 +639,10 @@ pub fn check_weights_pack(
             "the model pack's repo must be {source:?}, the weights' recorded provenance"
         ));
     }
-    let root_hash_ok = pack.mpk.is_some_and(|mpk| {
-        mpk.split('_').next().is_some_and(|root| {
-            root.len() == 64 && root.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        })
-    });
-    if !root_hash_ok {
-        return Err("the model pack must be pinned by its root hash (`mpk: <64 hex>_…`)".into());
+    if !pack.mpk.is_some_and(is_artifact_ref) {
+        return Err("the model pack must be pinned by its artifact reference \
+             (`mpk: <64 hex root hash>_<offset>_<uuid>`)"
+            .into());
     }
     if granted != [pack.name] {
         return Err(format!(
@@ -797,6 +856,9 @@ pub enum TokenHashError {
     NotArgon2id,
     /// No salt, or no hash output, so no token can ever verify against it.
     Incomplete,
+    /// Parameters outside the operational profile ([`TOKEN_HASH_M_COST`] and
+    /// its siblings), refused before anything is hashed.
+    OutsideProfile,
     /// Parameters, version, salt or output length `argon2` refuses to hash
     /// with (a memory cost below its minimum, a salt shorter than eight
     /// bytes, …), so no token can ever verify against it.
@@ -811,9 +873,31 @@ impl core::fmt::Display for TokenHashError {
             Self::NotArgon2id => "must be an Argon2id hash",
             Self::Incomplete => "must carry a salt and a hash output",
             Self::Unusable => "has parameters, a salt or an output Argon2 cannot verify with",
+            Self::OutsideProfile => {
+                "must use the hash-secret profile: Argon2id v=19, m 19456 to 65536 KiB, t 2 to 4, \
+                 p 1 to 4, a 32-byte output"
+            }
         })
     }
 }
+
+/// The Argon2 version a gateway-token hash must use (0x13, `v=19`).
+#[cfg(feature = "argon2")]
+pub const TOKEN_HASH_VERSION: u32 = 0x13;
+/// Memory cost, KiB: from `hash-secret`'s own (`Argon2::default()`, 19,456,
+/// OWASP's minimum for Argon2id) up to 64 MiB, a small band for a stronger
+/// hash that still costs a boot nothing worth noticing.
+#[cfg(feature = "argon2")]
+pub const TOKEN_HASH_M_COST: std::ops::RangeInclusive<u32> = 19_456..=65_536;
+/// Passes: `hash-secret`'s 2 up to 4.
+#[cfg(feature = "argon2")]
+pub const TOKEN_HASH_T_COST: std::ops::RangeInclusive<u32> = 2..=4;
+/// Lanes: `hash-secret`'s 1 up to 4.
+#[cfg(feature = "argon2")]
+pub const TOKEN_HASH_P_COST: std::ops::RangeInclusive<u32> = 1..=4;
+/// Output length: `hash-secret`'s 32 bytes, exactly.
+#[cfg(feature = "argon2")]
+pub const TOKEN_HASH_OUTPUT_LEN: usize = 32;
 
 /// Parse the gateway token's measured hash (`GATEWAY_TOKEN_HASH`): an
 /// Argon2id PHC string that a token can actually verify against.
@@ -838,6 +922,18 @@ pub fn parse_gateway_token_hash(hash: &str) -> Result<argon2::PasswordHash, Toke
         return Err(TokenHashError::Incomplete);
     };
     let params = argon2::Params::try_from(&parsed).map_err(|_| TokenHashError::Unusable)?;
+    // The operational profile, checked before anything is hashed: a hash's
+    // parameters decide how much memory and time verifying it costs, so an
+    // extreme one would turn the check (and the node's boot) into an
+    // allocation of the hash's choosing.
+    let in_profile = parsed.version == Some(TOKEN_HASH_VERSION)
+        && TOKEN_HASH_M_COST.contains(&params.m_cost())
+        && TOKEN_HASH_T_COST.contains(&params.t_cost())
+        && TOKEN_HASH_P_COST.contains(&params.p_cost())
+        && params.output_len() == Some(TOKEN_HASH_OUTPUT_LEN);
+    if !in_profile {
+        return Err(TokenHashError::OutsideProfile);
+    }
     argon2::Argon2::default()
         .hash_password_customized(
             b"",
@@ -908,11 +1004,20 @@ mod tests {
             max_batched_tokens: 8192,
             max_prefill_chunk: 4096,
             draft_tokens: 2,
-            max_requests: 256,
+            max_requests: 8,
         };
         assert!(check_resources(&sizing, 65_536, 8).is_ok());
-        // 256 slots × 64 MiB = 16 GiB of request memory.
-        assert!(check_resources(&sizing, 8192, 8).is_err());
+        // Each slot can hold 32 MiB × (129 read + 42 admitted) ≈ 5.3 GiB at
+        // worst; eight of them and the headroom exceed 32 GiB.
+        assert!(check_resources(&sizing, 32_768, 8).is_err());
+        // Near the limit: eleven slots (60,192 MiB of pools, plus headroom
+        // and tables) fit 64 GiB; twelve (65,664 MiB of pools alone) do not.
+        let near = |n| Sizing {
+            max_requests: n,
+            ..sizing
+        };
+        assert!(check_resources(&near(11), 65_536, 8).is_ok());
+        assert!(check_resources(&near(12), 65_536, 8).is_err());
         assert!(
             check_resources(
                 &Sizing {
@@ -934,6 +1039,61 @@ mod tests {
             ..sizing
         };
         assert!(check_resources(&tables, 16_384, 8).is_err());
+    }
+
+    #[test]
+    fn an_artifact_ref_is_modelwraps() {
+        let root = "d".repeat(64);
+        let uuid = "3892cd2f-a06e-5aee-8276-93140b9f06ec";
+        assert!(is_artifact_ref(&format!("{root}_17419419648_{uuid}")));
+        assert!(is_artifact_ref(&format!("{root}_0_{uuid}")));
+        for bad in [
+            root.clone(),
+            format!("{root}_garbage"),
+            format!("{root}_x_{uuid}"),
+            format!("{root}__{uuid}"),
+            format!("{root}_99999999999999999999_{uuid}"),
+            format!("{root}_1_{}", uuid.to_uppercase()),
+            format!("{root}_1_{uuid}_extra"),
+            format!("{}_1_{uuid}", "D".repeat(64)),
+            format!("{root}_1_3892cd2fa06e5aee827693140b9f06ec"),
+        ] {
+            assert!(!is_artifact_ref(&bad), "{bad}");
+        }
+    }
+
+    #[cfg(feature = "argon2")]
+    #[test]
+    fn an_extreme_token_hash_is_refused_before_hashing() {
+        let good = "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$unNYT/KTNSNW0JCH9+9OQ2zBApPLxGNZiw746903Q8E";
+        assert!(parse_gateway_token_hash(good).is_ok());
+        let started = std::time::Instant::now();
+        for params in [
+            "m=4294967295,t=2,p=1",
+            "m=19456,t=4294967295,p=1",
+            "m=19456,t=2,p=255",
+            "m=8192,t=2,p=1",
+            "m=19456,t=1,p=1",
+        ] {
+            let extreme = good.replace("m=19456,t=2,p=1", params);
+            assert_eq!(
+                parse_gateway_token_hash(&extreme).unwrap_err(),
+                TokenHashError::OutsideProfile,
+                "{params}"
+            );
+        }
+        // A 16-byte output and a pre-1.3 version are outside the profile too.
+        let short = "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$aGFzaGhhc2hoYXNoaGFzaA";
+        assert_eq!(
+            parse_gateway_token_hash(short).unwrap_err(),
+            TokenHashError::OutsideProfile
+        );
+        assert_eq!(
+            parse_gateway_token_hash(&good.replace("v=19", "v=16")).unwrap_err(),
+            TokenHashError::OutsideProfile
+        );
+        // Refused without hashing: an m of 4 TiB would take far longer.
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
@@ -1055,7 +1215,10 @@ mod tests {
 
     #[test]
     fn the_weights_are_the_granted_pinned_pack() {
-        let mpk = format!("{}_17419419648_3892cd2f", "d".repeat(64));
+        let mpk = format!(
+            "{}_17419419648_3892cd2f-a06e-5aee-8276-93140b9f06ec",
+            "d".repeat(64)
+        );
         let pack = ModelPack {
             name: "weights",
             repo: Some("o/m@4444"),
@@ -1144,7 +1307,7 @@ mod tests {
     #[cfg(feature = "argon2")]
     #[test]
     fn the_token_hash_is_a_whole_argon2id_phc_string() {
-        let good = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA";
+        let good = "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$unNYT/KTNSNW0JCH9+9OQ2zBApPLxGNZiw746903Q8E";
         assert!(parse_gateway_token_hash(good).is_ok());
         assert_eq!(
             parse_gateway_token_hash("$argon2id$garbage").unwrap_err(),

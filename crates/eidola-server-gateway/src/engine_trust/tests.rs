@@ -392,7 +392,7 @@ fn the_gateway_token_is_a_secret_and_only_its_hash_is_measured() {
 
     // The node parses the whole PHC string, not just its prefix.
     let mut tree = Tree::fixture();
-    let hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA";
+    let hash = "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$unNYT/KTNSNW0JCH9+9OQ2zBApPLxGNZiw746903Q8E";
     tree.edit_config(hash, "$argon2id$garbage");
     refused(&tree, "GATEWAY_TOKEN_HASH: not a valid Argon2 hash string");
 
@@ -776,7 +776,7 @@ fn allocations_are_capped_and_fit_the_deployment() {
         ("EIDOLA_ENGINE_MAX_BATCHED_TOKENS", "\"8192\"", "\"65537\""),
         ("EIDOLA_ENGINE_MAX_PREFILL_CHUNK", "\"4096\"", "\"65537\""),
         ("EIDOLA_ENGINE_MAX_MODEL_LEN", "\"131072\"", "\"1048577\""),
-        ("EIDOLA_ENGINE_MAX_REQUESTS", "\"256\"", "\"4097\""),
+        ("EIDOLA_ENGINE_MAX_REQUESTS", "\"8\"", "\"4097\""),
         ("EIDOLA_ENGINE_DRAFT_TOKENS", "\"2\"", "\"9\""),
         ("EIDOLA_ENGINE_KV_BLOCK_SIZE", "\"16\"", "\"1025\""),
         ("EIDOLA_ENGINE_KV_BLOCKS", "\"65536\"", "\"2147483648\""),
@@ -786,10 +786,14 @@ fn allocations_are_capped_and_fit_the_deployment() {
         refused(&tree, &format!("{name} must be at most"));
     }
 
-    // Host: 4,096 admission slots hold 256 GiB of bodies and parses, more
-    // than 64 GiB.
+    // Host, near the limit: each request slot can hold about 5.3 GiB at worst
+    // (a 32 MiB body with both parses in the read pool, and its tree, prompt
+    // and tokens in the admission pool); eleven fit 64 GiB, twelve do not.
     let mut tree = Tree::fixture();
-    tree.edit_config("MAX_REQUESTS: \"256\"", "MAX_REQUESTS: \"4096\"");
+    tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"11\"");
+    tree.check().expect("eleven request slots fit 64 GiB");
+    let mut tree = Tree::fixture();
+    tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"12\"");
     refused(&tree, "more than the VM's");
     // Device: 2^30 blocks of 16 positions do not fit eight GPUs.
     let mut tree = Tree::fixture();
@@ -1059,7 +1063,7 @@ fn the_weights_dir_is_the_granted_pinned_pack() {
 
     let mut tree = Tree::fixture();
     tree.edit_config("    mpk: \"5555", "    mpk: \"zz");
-    refused(&tree, "pinned by its root hash");
+    refused(&tree, "pinned by its artifact reference");
 
     let mut tree = Tree::fixture();
     tree.edit_config(
@@ -1312,5 +1316,21 @@ fn the_config_holds_to_tinfoils_decoder_and_validator() {
         let mut tree = Tree::fixture();
         tree.edit_config(from, to);
         refused(&tree, needle);
+    }
+}
+
+/// The weights pack is pinned by a whole modelwrap artifact reference.
+#[test]
+fn the_weights_pack_is_pinned_by_a_whole_artifact_reference() {
+    let reference = "5555555555555555555555555555555555555555555555555555555555555555_17419419648_3892cd2f-a06e-5aee-8276-93140b9f06ec";
+    let root = &reference[..64];
+    for bad in [
+        root.to_string(),
+        format!("{root}_garbage"),
+        format!("{root}_x_3892cd2f-a06e-5aee-8276-93140b9f06ec"),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(reference, &bad);
+        refused(&tree, "pinned by its artifact reference");
     }
 }

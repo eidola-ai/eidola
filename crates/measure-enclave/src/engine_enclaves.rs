@@ -158,7 +158,7 @@ gpus: 8
 models:
   - name: "weights"
     repo: "example/fixture-model@4444444444444444444444444444444444444444"
-    mpk: "{root}_17419419648_3892cd2f"
+    mpk: "{root}_17419419648_3892cd2f-a06e-5aee-8276-93140b9f06ec"
     schema: 2
 shim:
   upstream-port: 8080
@@ -186,8 +186,8 @@ containers:
       - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "8192"
       - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "4096"
       - EIDOLA_ENGINE_DRAFT_TOKENS: "2"
-      - EIDOLA_ENGINE_MAX_REQUESTS: "256"
-      - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA"
+      - EIDOLA_ENGINE_MAX_REQUESTS: "8"
+      - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$unNYT/KTNSNW0JCH9+9OQ2zBApPLxGNZiw746903Q8E"
       - EIDOLA_ENGINE_PREFIX_CACHE: "true"
       - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
       - EIDOLA_ENGINE_CACHE_MAX_AGE_SECS: "7200"
