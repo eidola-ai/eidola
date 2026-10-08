@@ -31,9 +31,11 @@
 //!
 //! A request is tried on at most [`RouterConfig::request_attempts`] engines,
 //! in rank order, moving on only when the engine gave no response (no
-//! attested connection, or a connection that closed under the request), a
-//! refusal before the body is read, or "overloaded". An engine's answer, an
-//! error included, is never retried elsewhere.
+//! attested connection, or a connection that closed under the request) or
+//! refused it before admission, by the node's exact status and error type
+//! (`eidola_common::engine_protocol::refused_before_admission`: a
+//! misconfiguration, or `overloaded`). Any other answer, an error included,
+//! may come after the engine ran the request, and is returned.
 //! The response comes back in the same shapes the Tinfoil backend produces
 //! (`BackendResponse`, `BackendStreamEvent`), so billing settles it the same
 //! way: usage → charge.
@@ -60,6 +62,7 @@ use crate::engine_trust::protocol::{
 use crate::engine_trust::{self, PinnedModel};
 use crate::error::ServerError;
 use crate::types::{ChatCompletionChunk, ChatCompletionResponse, ErrorResponse};
+use eidola_common::engine_protocol::{PreAdmission, refused_before_admission};
 
 mod breaker;
 pub mod placement;
@@ -602,11 +605,15 @@ impl EngineRouter {
                 "the engine refused the request".to_string(),
             ),
         };
-        match status.as_u16() {
-            // Refused before the body was read: the gateway's token, the
-            // pinned weights, the model or the route are not what this
-            // upstream serves. Misconfigured; open it and move on.
-            401 | 404 | 412 | 428 => {
+        // Only a refusal the node makes before admitting the request, read by
+        // its exact status and error type (`refused_before_admission`, the
+        // rule the node holds itself to), may go to another engine. Any other
+        // answer, an `engine_unavailable` 503 included, may come after the
+        // engine ran the request, and is returned.
+        match refused_before_admission(status.as_u16(), &error_type) {
+            // The gateway's token, the pinned weights or the model are not
+            // what this upstream serves: misconfigured; open it and move on.
+            Some(PreAdmission::Misconfigured) => {
                 upstream.breaker().trip(Instant::now(), config);
                 warn!(
                     upstream = %upstream.base_url,
@@ -615,19 +622,14 @@ impl EngineRouter {
                 );
                 Attempt::Next
             }
-            // At capacity is load, not ill health; a stopped engine is.
-            503 => {
-                if error_type != "overloaded" {
-                    upstream.breaker().on_failure(Instant::now(), config);
-                }
-                Attempt::Next
-            }
-            s => {
-                if s >= 500 {
+            // At capacity is load, not ill health.
+            Some(PreAdmission::Overloaded) => Attempt::Next,
+            None => {
+                if status.is_server_error() {
                     upstream.breaker().on_failure(Instant::now(), config);
                 }
                 Attempt::Fail(ServerError::Backend {
-                    status: s,
+                    status: status.as_u16(),
                     error_type,
                     message,
                 })
@@ -736,17 +738,26 @@ fn error_chain(e: &reqwest::Error) -> String {
 }
 
 /// One server-sent event.
+#[derive(Debug, PartialEq, Eq)]
 struct SseEvent {
     event: Option<String>,
     data: String,
 }
 
+/// An event block the relay cannot read.
+#[derive(Debug, PartialEq, Eq)]
+struct Unreadable;
+
 /// Take the next complete event (terminated by a blank line) off `buffer`.
-fn next_event(buffer: &mut Vec<u8>) -> Option<SseEvent> {
+/// A block that is not UTF-8 is unreadable, never repaired: a lossy decode
+/// would forward altered output as if the engine had sent it.
+fn next_event(buffer: &mut Vec<u8>) -> Result<Option<SseEvent>, Unreadable> {
     loop {
-        let end = buffer.windows(2).position(|w| w == b"\n\n")?;
+        let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") else {
+            return Ok(None);
+        };
         let block: Vec<u8> = buffer.drain(..end + 2).collect();
-        let text = String::from_utf8_lossy(&block[..end]);
+        let text = std::str::from_utf8(&block[..end]).map_err(|_| Unreadable)?;
         let mut event = None;
         let mut data: Option<String> = None;
         for line in text.lines() {
@@ -764,17 +775,20 @@ fn next_event(buffer: &mut Vec<u8>) -> Option<SseEvent> {
                 }
             }
         }
-        // A block with no data (a comment, a keep-alive) is not an event.
+        // A block with no data (a comment, a keep-alive) dispatches no event,
+        // as the SSE format defines.
         if let Some(data) = data {
-            return Some(SseEvent { event, data });
+            return Ok(Some(SseEvent { event, data }));
         }
     }
 }
 
-/// Relay an engine's SSE stream as backend events. A stream that ends without
-/// `[DONE]`, or with the node's `event: error` frame, is an error (the
-/// handler then settles it as a failed stream); one that completes reports
-/// the engine's usage in `Done`.
+/// Relay an engine's SSE stream as backend events. Every way the stream can
+/// go wrong ends it with an error, counted against the upstream's health, and
+/// the handler settles it as a failed stream: the node's `event: error` frame,
+/// an end without `[DONE]`, a broken connection, a chunk that does not parse,
+/// a block that is not UTF-8, or an event type the node does not send. Nothing
+/// is skipped. A stream that completes reports the engine's usage in `Done`.
 async fn relay_stream(
     response: reqwest::Response,
     upstream: Arc<Upstream>,
@@ -805,7 +819,34 @@ async fn relay_stream(
         // One stamp per socket read, before any send can wait on the client.
         let received_at = Instant::now();
         buffer.extend_from_slice(&bytes);
-        while let Some(event) = next_event(&mut buffer) {
+        loop {
+            let event = match next_event(&mut buffer) {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(Unreadable) => {
+                    let _ = tx
+                        .send(fail(ServerError::Parse(
+                            "the engine's stream was not UTF-8".to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            match event.event.as_deref() {
+                // An ordinary data event.
+                None | Some("message") => {}
+                Some("error") => {}
+                // Nothing else is in the node's stream: an event this relay
+                // does not know ends it rather than being passed over.
+                Some(_) => {
+                    let _ = tx
+                        .send(fail(ServerError::Parse(
+                            "the engine sent an unknown stream event".to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+            }
             if event.event.as_deref() == Some("error") {
                 let (error_type, message) = match serde_json::from_str::<ErrorResponse>(&event.data)
                 {
@@ -854,10 +895,15 @@ async fn relay_stream(
                         return;
                     }
                 }
-                Err(e) => warn!(
-                    "failed to parse an engine SSE chunk: {}",
-                    crate::error::parse_error_summary(&e)
-                ),
+                // A chunk this relay cannot read ends the stream as an error:
+                // skipping it would forward truncated output, and a later
+                // `[DONE]` would bill it as complete.
+                Err(e) => {
+                    let summary = crate::error::parse_error_summary(&e);
+                    warn!("an engine SSE chunk did not parse: {summary}");
+                    let _ = tx.send(fail(ServerError::Parse(summary))).await;
+                    return;
+                }
             }
         }
     }

@@ -24,6 +24,7 @@ use crate::types::{
     Capability, Model, ModelCapabilities, ModelHosting, ModelPricing, OutputBudgetClass,
     PinnedWeightsCapability, PromptCacheCapability, ScaledPrice,
 };
+use eidola_common::engine_protocol::error_type as kind;
 
 const TOKEN: &str = "test-gateway-token-0123456789";
 
@@ -119,6 +120,13 @@ enum Mode {
     StreamError,
     /// Stream a role chunk, then end without `[DONE]`.
     StreamTruncated,
+    /// Answer `engine_unavailable` (503), as the node does when its engine
+    /// stops after the request was submitted.
+    UnavailableAfterSubmit,
+    /// Stream a chunk that does not parse among good ones, then `[DONE]`.
+    MalformedChunk,
+    /// Stream an event type the node never sends, then the rest.
+    UnknownEvent,
     /// Stream a role chunk, then wait for `release`.
     Hold,
 }
@@ -327,10 +335,13 @@ async fn chat(
     });
     let mode = *state.mode.lock().unwrap();
     match mode {
-        Mode::Overloaded => return error(StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
-        Mode::Fail500 => return error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+        Mode::Overloaded => return error(StatusCode::SERVICE_UNAVAILABLE, kind::OVERLOADED),
+        Mode::Fail500 => return error(StatusCode::INTERNAL_SERVER_ERROR, kind::INTERNAL_ERROR),
         Mode::WeightsMismatch => {
-            return error(StatusCode::PRECONDITION_FAILED, "weights_hash_mismatch");
+            return error(StatusCode::PRECONDITION_FAILED, kind::WEIGHTS_HASH_MISMATCH);
+        }
+        Mode::UnavailableAfterSubmit => {
+            return error(StatusCode::SERVICE_UNAVAILABLE, kind::ENGINE_UNAVAILABLE);
         }
         _ => {}
     }
@@ -361,6 +372,23 @@ async fn chat(
                 .to_string(),
         )],
         Mode::StreamTruncated => vec![],
+        Mode::MalformedChunk | Mode::UnknownEvent => {
+            let odd = if mode == Mode::MalformedChunk {
+                Event::default().data(r#"{"id":"chatcmpl-fake","choices":"#)
+            } else {
+                Event::default().event("progress").data("{}")
+            };
+            vec![
+                odd,
+                chunk(
+                    &state,
+                    serde_json::json!([{"index": 0, "delta": {"content": "hello"}, "finish_reason": null}]),
+                    None,
+                ),
+                chunk(&state, serde_json::json!([]), Some(usage())),
+                Event::default().data("[DONE]"),
+            ]
+        }
         _ => vec![
             chunk(
                 &state,
@@ -1128,4 +1156,145 @@ async fn placement_reads_the_schemas_table() {
         ours,
         vec![row("https://a.test", false), row("https://b.test", true)]
     );
+}
+
+/// An answer the node may give after the engine ran the request (its engine
+/// stopped: `engine_unavailable`), or any answer that is not one of the
+/// node's pre-admission refusals, is returned and never sent to another
+/// engine; it counts against the upstream's health.
+#[tokio::test]
+async fn an_answer_after_admission_is_returned_not_retried() {
+    let engines = [
+        engine(Identity::of(MODEL_A)).await,
+        engine(Identity::of(MODEL_A)).await,
+    ];
+    let refs: Vec<&Engine> = engines.iter().collect();
+    let router = router_for(&refs, models());
+    let rows: Vec<EnginePlacementRow> = engines
+        .iter()
+        .map(|e| e.row(MODEL_A, DEPLOYMENT_A))
+        .collect();
+    router.apply_placement(&rows).await;
+    router.probe_due().await;
+
+    let key = key_text(9);
+    let before = counts(&refs);
+    router
+        .send(&request(MODEL_A, Some(&key), false))
+        .await
+        .unwrap();
+    let home = served_by(&refs, &before);
+    let other = 1 - home;
+
+    engines[home].set_mode(Mode::UnavailableAfterSubmit);
+    for stream in [false, true] {
+        let before = counts(&refs);
+        let result = if stream {
+            router
+                .send_stream(&request(MODEL_A, Some(&key), true))
+                .await
+                .map(|_| ())
+        } else {
+            router
+                .send(&request(MODEL_A, Some(&key), false))
+                .await
+                .map(|_| ())
+        };
+        match result {
+            Err(ServerError::Backend {
+                status: 503,
+                error_type,
+                ..
+            }) => assert_eq!(error_type, kind::ENGINE_UNAVAILABLE),
+            other => panic!("expected the engine's 503, got ok={}", other.is_ok()),
+        }
+        assert_eq!(engines[home].chats().len(), before[home] + 1);
+        assert_eq!(
+            engines[other].chats().len(),
+            before[other],
+            "retried elsewhere"
+        );
+    }
+    assert!(
+        !upstream(&router, MODEL_A, &engines[home].base_url).routable(),
+        "two failures open it"
+    );
+}
+
+/// Anything in a stream the relay cannot read ends it with an error and
+/// counts against the upstream: a later `[DONE]` never turns skipped output
+/// into a completed, billed response.
+#[tokio::test]
+async fn an_unreadable_stream_event_ends_the_stream_as_an_error() {
+    for mode in [Mode::MalformedChunk, Mode::UnknownEvent] {
+        let a = engine(Identity::of(MODEL_A)).await;
+        let router = router_for(&[&a], models());
+        router
+            .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+            .await;
+        router.probe_due().await;
+        a.set_mode(mode);
+        for _ in 0..2 {
+            let mut rx = router
+                .send_stream(&request(MODEL_A, None, true))
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            assert!(
+                matches!(events.last(), Some(Err(ServerError::Parse(_)))),
+                "{mode:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, Ok(BackendStreamEvent::Done(..)))),
+                "{mode:?}"
+            );
+            let text: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    Ok(BackendStreamEvent::Chunk(c, _)) => {
+                        c.choices.first().and_then(|c| c.delta.content.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "", "{mode:?}: nothing after the bad event is relayed");
+        }
+        assert!(
+            !upstream(&router, MODEL_A, &a.base_url).routable(),
+            "{mode:?}: counted as failures"
+        );
+    }
+}
+
+/// The parser takes complete events only, joins multi-line data, passes over
+/// data-less blocks as the format defines, and refuses a block that is not
+/// UTF-8 rather than repairing it.
+#[test]
+fn the_stream_parser_reads_events_and_refuses_bad_bytes() {
+    let mut buffer =
+        b": keep-alive\n\nevent: error\ndata: a\ndata: b\n\ndata: [DONE]\n\ndata: par".to_vec();
+    assert_eq!(
+        next_event(&mut buffer),
+        Ok(Some(SseEvent {
+            event: Some("error".into()),
+            data: "a\nb".into()
+        }))
+    );
+    assert_eq!(
+        next_event(&mut buffer),
+        Ok(Some(SseEvent {
+            event: None,
+            data: "[DONE]".into()
+        }))
+    );
+    assert_eq!(next_event(&mut buffer), Ok(None));
+    assert_eq!(buffer, b"data: par");
+
+    let mut bad = b"data: \xff\xfe\n\n".to_vec();
+    assert_eq!(next_event(&mut bad), Err(Unreadable));
 }

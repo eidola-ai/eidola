@@ -63,19 +63,20 @@ impl ApiError {
         }
     }
 
-    /// The OpenAI `error.type`.
+    /// The OpenAI `error.type`, spelled by `eidola_common::engine_protocol::error_type`.
     pub fn error_type(&self) -> &'static str {
+        use eidola_common::engine_protocol::error_type as t;
         match self {
-            ApiError::Unauthorized => "authentication_error",
-            ApiError::WeightsHashRequired => "weights_hash_required",
-            ApiError::WeightsHashMismatch => "weights_hash_mismatch",
-            ApiError::ModelNotFound => "model_not_found",
-            ApiError::InvalidRequest(_) => "invalid_request_error",
-            ApiError::ContextLengthExceeded(_) => "context_length_exceeded",
-            ApiError::PayloadTooLarge => "request_too_large",
-            ApiError::Overloaded => "overloaded",
-            ApiError::Unavailable => "engine_unavailable",
-            ApiError::Internal(_) => "internal_error",
+            ApiError::Unauthorized => t::AUTHENTICATION_ERROR,
+            ApiError::WeightsHashRequired => t::WEIGHTS_HASH_REQUIRED,
+            ApiError::WeightsHashMismatch => t::WEIGHTS_HASH_MISMATCH,
+            ApiError::ModelNotFound => t::MODEL_NOT_FOUND,
+            ApiError::InvalidRequest(_) => t::INVALID_REQUEST,
+            ApiError::ContextLengthExceeded(_) => t::CONTEXT_LENGTH_EXCEEDED,
+            ApiError::PayloadTooLarge => t::REQUEST_TOO_LARGE,
+            ApiError::Overloaded => t::OVERLOADED,
+            ApiError::Unavailable => t::ENGINE_UNAVAILABLE,
+            ApiError::Internal(_) => t::INTERNAL_ERROR,
         }
     }
 
@@ -136,6 +137,42 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gateway sends a refused request to another node only when
+    /// `refused_before_admission` says so, so exactly the refusals raised
+    /// before anything is admitted may say so: the token and weights checks
+    /// (before the body is read), the model check (before admission), and
+    /// `Overloaded` (a read or admission slot not taken). `Unavailable` can
+    /// come after the engine ran the request, and must not.
+    #[test]
+    fn only_pre_admission_refusals_say_so() {
+        use eidola_common::engine_protocol::{PreAdmission, refused_before_admission};
+        let cases = [
+            (ApiError::Unauthorized, Some(PreAdmission::Misconfigured)),
+            (
+                ApiError::WeightsHashRequired,
+                Some(PreAdmission::Misconfigured),
+            ),
+            (
+                ApiError::WeightsHashMismatch,
+                Some(PreAdmission::Misconfigured),
+            ),
+            (ApiError::ModelNotFound, Some(PreAdmission::Misconfigured)),
+            (ApiError::Overloaded, Some(PreAdmission::Overloaded)),
+            (ApiError::Unavailable, None),
+            (ApiError::invalid("x"), None),
+            (ApiError::ContextLengthExceeded("x".into()), None),
+            (ApiError::PayloadTooLarge, None),
+            (ApiError::Internal("x"), None),
+        ];
+        for (e, expected) in cases {
+            assert_eq!(
+                refused_before_admission(e.status().as_u16(), e.error_type()),
+                expected,
+                "{e}"
+            );
+        }
+    }
 
     #[test]
     fn display_never_carries_the_response_message() {

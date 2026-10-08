@@ -177,6 +177,8 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
     check_weights_header(&state, request.headers())?;
     // Held from before the first body byte until the request is admitted or refused, so
     // the bodies and parses outside admission are bounded too.
+    // `Overloaded` only where nothing has been admitted: a gateway sends it to another
+    // node (`eidola_common::engine_protocol::refused_before_admission`).
     let reading = state.reading.try_acquire().ok_or(ApiError::Overloaded)?;
     let body = axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES)
         .await
