@@ -30,7 +30,9 @@
 //! releases the sequence before its next step.
 //!
 //! When idle the thread sleeps until a command arrives or the prefix-cache sweep is due,
-//! and sweeps, so expired KV is zeroed without waiting for traffic. An executor failure
+//! and sweeps once it is due, so expired KV is zeroed without waiting for traffic. The
+//! sweep keeps an absolute deadline, so idle-leaving commands arriving faster than the
+//! interval cannot postpone it (while busy, each engine step sweeps on its own schedule). An executor failure
 //! is fatal: every in-flight request gets an error, the health check turns unhealthy, and
 //! the thread exits (the process then exits; see `main.rs`).
 
@@ -337,18 +339,25 @@ impl<E: Executor> Worker<E> {
     }
 
     fn run(mut self) {
+        // An absolute deadline, not a fresh timeout per wait: commands that leave the
+        // engine idle (refused submissions, cancels of finished requests) can arrive
+        // faster than the interval without ever postponing the sweep.
+        let mut next_sweep = Instant::now() + self.sweep_interval;
         loop {
-            // Idle: wait for work, sweeping the prefix cache on schedule.
+            // Idle: wait for work until the sweep is due, and sweep whenever it is.
             if self.engine.unfinished() == 0 {
-                match self.inbox.recv_timeout(self.sweep_interval) {
-                    Ok(cmd) => self.handle(cmd),
-                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                        if self.engine.sweep(self.now()).is_err() {
-                            return self.fail();
-                        }
-                        self.publish();
-                        continue;
+                let now = Instant::now();
+                if now >= next_sweep {
+                    if self.engine.sweep(self.now()).is_err() {
+                        return self.fail();
                     }
+                    self.publish();
+                    next_sweep = now + self.sweep_interval;
+                    continue;
+                }
+                match self.inbox.recv_timeout(next_sweep - now) {
+                    Ok(cmd) => self.handle(cmd),
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
                     // Every handle is gone: the process is shutting down.
                     Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
                 }
