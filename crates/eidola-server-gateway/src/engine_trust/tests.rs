@@ -910,6 +910,37 @@ fn allocations_are_capped_and_fit_the_deployment() {
     );
     refused(&tree, "less than the 12228280320 bytes the KV pools need");
 
+    // The device holds the KV budget, the weights (the pack's data size,
+    // 17,419,419,648 bytes here) and the executor's reserve (16,789,798,912
+    // bytes for this sizing) within the B300's 287,428,640,768.
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "KV_DEVICE_BYTES: \"68719476736\"",
+        "KV_DEVICE_BYTES: \"253219422208\"",
+    );
+    tree.check().expect("the budget fills the device exactly");
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "KV_DEVICE_BYTES: \"68719476736\"",
+        "KV_DEVICE_BYTES: \"253219422209\"",
+    );
+    refused(&tree, "more than the NVIDIA B300 SXM6 AC's 287428640768");
+    // A Flash-sized pack leaves room for 64 GiB, and not for twice that.
+    let flash_pack = "_177700003840_";
+    let mut tree = Tree::fixture();
+    tree.edit_config("_17419419648_", flash_pack);
+    tree.check().expect("64 GiB of KV beside Flash's weights");
+    let mut tree = Tree::fixture();
+    tree.edit_config("_17419419648_", flash_pack);
+    tree.edit_config(
+        "KV_DEVICE_BYTES: \"68719476736\"",
+        "KV_DEVICE_BYTES: \"137438953472\"",
+    );
+    refused(
+        &tree,
+        "of device memory, more than the NVIDIA B300 SXM6 AC's",
+    );
+
     // The kernels ship in the image, never in an attached mount.
     let mut tree = Tree::fixture();
     tree.edit_config(

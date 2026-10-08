@@ -19,10 +19,10 @@ use std::collections::BTreeMap;
 use serde_json::Value as Json;
 
 use super::{
-    ExecutorSettings, MeasuredConfig, ModelPack, WeightsStorage, check_container_gpu_access,
-    check_env_names, check_gpu_attestation, check_kernels_dir, check_resources, check_secrets,
-    check_shim_paths, check_vm_resources, check_weights_pack, env, parse_cvm_version,
-    parse_measured,
+    ExecutorSettings, MeasuredConfig, ModelPack, WeightsStorage, artifact_data_bytes,
+    check_container_gpu_access, check_env_names, check_gpu_attestation, check_kernels_dir,
+    check_resources, check_secrets, check_shim_paths, check_vm_resources, check_weights_pack, env,
+    parse_cvm_version, parse_measured,
 };
 
 /// The image every engine deployment runs, pinned by digest.
@@ -148,10 +148,19 @@ pub fn check_deployment(
     .map_err(|e| format!("{at}: {e}"))?;
 
     // What the node allocates fits the VM and the GPUs it attaches.
+    // `check_weights_pack` held the config to one pack with a whole artifact
+    // reference, so its data size bounds the weights.
+    let weights_bytes = c
+        .packs
+        .first()
+        .and_then(|p| p.mpk.as_deref())
+        .and_then(artifact_data_bytes)
+        .ok_or_else(|| format!("{at}: the weights pack has no artifact reference"))?;
     check_resources(
         &measured.sizing,
         &measured.cache,
         &measured.executor,
+        weights_bytes,
         c.memory,
         c.gpus.unwrap_or(0),
     )

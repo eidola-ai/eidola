@@ -124,10 +124,12 @@ pub mod caps {
     /// prefix cache's unit of reuse; beyond 1,024 positions paging stops
     /// paying, and the page stride (32-bit) stays far from overflow.
     pub const KV_BLOCK_SIZE: u32 = 1024;
-    /// Device memory for the CUDA executor's KV pools: one GPU's, at most
-    /// ([`super::MAX_GPU_MEMORY_BYTES`]); the node also refuses a value not
-    /// less than its device's memory.
-    pub const KV_DEVICE_BYTES: u64 = super::MAX_GPU_MEMORY_BYTES;
+    /// Device memory for the CUDA executor's KV pools: less than the
+    /// supported GPU's memory ([`super::SUPPORTED_GPU_MEMORY_BYTES`]), as the
+    /// node itself refuses a value not less than its device's. What a pinned
+    /// deployment may give the pools, beside its weights and the executor's
+    /// own reserve, is held separately ([`super::check_resources`]).
+    pub const KV_DEVICE_BYTES: u64 = super::SUPPORTED_GPU_MEMORY_BYTES - 1;
     /// Blocks per KV group (the `cpu` executor's): the device block tables are `i32`
     /// (`kv::GroupGeometry::validate`). The device bytes they cost are held
     /// to the attached GPUs separately ([`super::check_resources`]).
@@ -171,9 +173,69 @@ pub const SLIDING_WINDOW: u64 = 128;
 /// prefix cache enabled (the node's `cuda::RETENTION_POINTS`).
 pub const RETENTION_POINTS: u64 = 3;
 
-/// Largest memory of one confidential GPU the platform offers, in bytes: the
-/// largest NVIDIA-CC part's HBM, rounded up (288 GiB).
-pub const MAX_GPU_MEMORY_BYTES: u64 = 288 << 30;
+/// The one GPU the CUDA executor runs on (`eidola-engine-cuda`: Blackwell,
+/// `sm_103a`), by the name its driver reports. A node uses one of them.
+pub const SUPPORTED_GPU: &str = "NVIDIA B300 SXM6 AC";
+
+/// The supported GPU's device memory, in bytes, as its driver reports it
+/// (`cuDeviceTotalMem`, the node's `/v1/engine/info` `device.memory_bytes`
+/// on that part): about 267.7 GiB, not the 288 GB of HBM it is sold with.
+pub const SUPPORTED_GPU_MEMORY_BYTES: u64 = 287_428_640_768;
+
+/// Device memory the CUDA executor holds whatever its sizing: the CUDA
+/// context, the loaded kernel modules, the decode graphs' captures (a few
+/// MiB a rung), and the slack of the weights' device layouts over their file
+/// bytes (each fused QKV chunk padded to whole 128-row tiles, norm and bias
+/// vectors widened to f32): 4 GiB.
+pub const DEVICE_FIXED_RESERVE_BYTES: u64 = 4 << 30;
+
+/// Device scratch per token a step may hold (`MAX_BATCHED_TOKENS`), at
+/// Flash's shapes (`eidola-engine-cuda` `model::ScratchSizes`, whose logit
+/// rows are a step's tokens): the f32 logits row (152,576 × 4 bytes), the
+/// residual stream and its projections, the quantized activations, Q, K, V
+/// and attention output, the dense FFN, and eight expert rows of 22,580
+/// bytes each, about 1.03 MB in all, rounded up to 1.25 MiB.
+pub const STEP_TOKEN_DEVICE_BYTES: u64 = 5 << 18;
+
+/// The expert scratch held whatever the step: rows of the masked layout (256
+/// experts × 128) or the contiguous layout's per-expert padding, at most
+/// 65,536 rows of at most 24 KiB.
+pub const EXPERT_FLOOR_DEVICE_BYTES: u64 = 65_536 * (24 << 10);
+
+/// Device memory per seat (`MAX_SEQS`): the sampler's f32 distribution over
+/// the vocabulary (152,576 × 4 bytes) and its row buffers, rounded up to
+/// 640 KiB.
+pub const SEAT_DEVICE_BYTES: u64 = 640 << 10;
+
+/// RoPE table bytes per position (`MAX_MODEL_LEN`): 64 f32 for each distinct
+/// θ, at most three.
+pub const ROPE_DEVICE_BYTES_PER_POSITION: u64 = 3 * 64 * 4;
+
+/// Device memory the CUDA executor takes beside its weights and KV pools,
+/// bounded from above: [`DEVICE_FIXED_RESERVE_BYTES`], plus
+/// [`STEP_TOKEN_DEVICE_BYTES`] per `MAX_BATCHED_TOKENS`,
+/// [`EXPERT_FLOOR_DEVICE_BYTES`], [`SEAT_DEVICE_BYTES`] per `MAX_SEQS`, the
+/// device block tables (`MAX_SEQS` × ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉
+/// `i32` entries per KV group, two groups) and the RoPE tables
+/// ([`ROPE_DEVICE_BYTES_PER_POSITION`] per `MAX_MODEL_LEN`). Saturates.
+pub fn cuda_device_reserve_bytes(sizing: &Sizing) -> u64 {
+    let blocks_per_seq =
+        u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size.max(1)));
+    DEVICE_FIXED_RESERVE_BYTES
+        .saturating_add(
+            u64::from(sizing.max_batched_tokens).saturating_mul(STEP_TOKEN_DEVICE_BYTES),
+        )
+        .saturating_add(EXPERT_FLOOR_DEVICE_BYTES)
+        .saturating_add(u64::from(sizing.max_seqs).saturating_mul(SEAT_DEVICE_BYTES))
+        .saturating_add(
+            u64::from(sizing.max_seqs)
+                .saturating_mul(blocks_per_seq)
+                .saturating_mul(2 * 4),
+        )
+        .saturating_add(
+            u64::from(sizing.max_model_len).saturating_mul(ROPE_DEVICE_BYTES_PER_POSITION),
+        )
+}
 
 /// Worst-case bytes of `serde_json::Value` tree per byte of JSON text, for
 /// the node's strict parse (`api::parse_request`): the densest text is the
@@ -258,14 +320,17 @@ pub fn cuda_kv_min_bytes(sizing: &Sizing, cache: &CacheConfig) -> u64 {
 /// allocates, as far as configuration alone fixes it. Host memory (`memory`,
 /// MiB) holds [`host_memory_bytes`], plus, for the `cpu` executor, its KV
 /// cache (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`KV_BYTES_PER_POSITION`]). For the
-/// `cuda` executor, which runs on one GPU, `KV_DEVICE_BYTES` holds at least
-/// [`cuda_kv_min_bytes`] and at most one GPU's [`MAX_GPU_MEMORY_BYTES`], and
-/// the VM has a GPU. The weights' own footprint is the model's and is not
-/// estimated here.
+/// `cuda` executor, which runs on one [`SUPPORTED_GPU`], the VM has a GPU,
+/// `KV_DEVICE_BYTES` holds at least [`cuda_kv_min_bytes`], and
+/// `KV_DEVICE_BYTES` + `weights_bytes` + [`cuda_device_reserve_bytes`] fit
+/// [`SUPPORTED_GPU_MEMORY_BYTES`]. `weights_bytes` bounds the weights' device
+/// footprint from above: the pack's data size ([`artifact_data_bytes`]),
+/// every file of it, whether the node loads it or not.
 pub fn check_resources(
     sizing: &Sizing,
     cache: &CacheConfig,
     executor: &ExecutorSettings,
+    weights_bytes: u64,
     memory_mib: u64,
     gpus: u64,
 ) -> Result<(), String> {
@@ -299,9 +364,15 @@ pub fn check_resources(
                 env::MAX_MODEL_LEN
             ));
         }
-        if *kv_device_bytes > MAX_GPU_MEMORY_BYTES {
+        let reserve = cuda_device_reserve_bytes(sizing);
+        let device = kv_device_bytes
+            .saturating_add(weights_bytes)
+            .saturating_add(reserve);
+        if device > SUPPORTED_GPU_MEMORY_BYTES {
             return Err(format!(
-                "{} ({kv_device_bytes}) is more than one GPU holds ({MAX_GPU_MEMORY_BYTES})",
+                "{} ({kv_device_bytes}), the weights ({weights_bytes}) and the executor's \
+                 reserve ({reserve}) need {device} bytes of device memory, more than the \
+                 {SUPPORTED_GPU}'s {SUPPORTED_GPU_MEMORY_BYTES}",
                 env::KV_DEVICE_BYTES
             ));
         }
@@ -813,22 +884,33 @@ pub fn check_kernels_dir(kernels_dir: &str) -> Result<(), String> {
 /// root hash, a decimal hash offset that fits a `u64` (`HashOffsetBytes`), and
 /// a lowercase UUID (8-4-4-4-12 hex), joined by exactly two underscores.
 pub fn is_artifact_ref(mpk: &str) -> bool {
+    artifact_data_bytes(mpk).is_some()
+}
+
+/// The data size of a modelwrap artifact reference: its `hashOffset`, where
+/// the dm-verity hash tree starts, which is the byte length of the EROFS
+/// image before it (modelwrap `SPEC.md`: "the MWP data area is exactly the
+/// bytes preceding the hash area"). The image is built uncompressed
+/// (`wrap.go` runs `mkfs.erofs` without `-z`), so every file in the pack is
+/// stored whole inside it, and this bounds the pack's file bytes from above.
+/// `None` unless `mpk` is a whole reference ([`is_artifact_ref`]).
+pub fn artifact_data_bytes(mpk: &str) -> Option<u64> {
     let hex = |s: &str, n: usize| {
         s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     };
     let parts: Vec<&str> = mpk.split('_').collect();
     let [root, offset, uuid] = parts.as_slice() else {
-        return false;
+        return None;
     };
     let uuid_ok = {
         let groups: Vec<&str> = uuid.split('-').collect();
         groups.len() == 5 && groups.iter().zip([8, 4, 4, 4, 12]).all(|(g, n)| hex(g, n))
     };
-    hex(root, 64)
+    let ok = hex(root, 64)
         && !offset.is_empty()
         && offset.bytes().all(|b| b.is_ascii_digit())
-        && offset.parse::<u64>().is_ok()
-        && uuid_ok
+        && uuid_ok;
+    offset.parse::<u64>().ok().filter(|_| ok)
 }
 
 /// A model pack as an engine config declares it.
@@ -1253,20 +1335,20 @@ mod tests {
             max_age_secs: 3600,
         };
         let kv = cuda(64 << 30);
-        assert!(check_resources(&sizing, &cache, &kv, 65_536, 8).is_ok());
+        assert!(check_resources(&sizing, &cache, &kv, FIXTURE_PACK, 65_536, 8).is_ok());
         // Each slot can hold 32 MiB × (129 read + 42 admitted) ≈ 5.3 GiB at
         // worst; eight of them and the headroom exceed 32 GiB.
-        assert!(check_resources(&sizing, &cache, &kv, 32_768, 8).is_err());
+        assert!(check_resources(&sizing, &cache, &kv, FIXTURE_PACK, 32_768, 8).is_err());
         // Near the limit: eleven slots (60,192 MiB of pools, plus headroom
         // and tables) fit 64 GiB; twelve (65,664 MiB of pools alone) do not.
         let near = |n| Sizing {
             max_requests: n,
             ..sizing
         };
-        assert!(check_resources(&near(11), &cache, &kv, 65_536, 8).is_ok());
-        assert!(check_resources(&near(12), &cache, &kv, 65_536, 8).is_err());
+        assert!(check_resources(&near(11), &cache, &kv, FIXTURE_PACK, 65_536, 8).is_ok());
+        assert!(check_resources(&near(12), &cache, &kv, FIXTURE_PACK, 65_536, 8).is_err());
         // The cuda executor needs a GPU.
-        assert!(check_resources(&sizing, &cache, &kv, 65_536, 0).is_err());
+        assert!(check_resources(&sizing, &cache, &kv, FIXTURE_PACK, 65_536, 0).is_err());
         // Block size 1 at the longest model length: 2^20 entries per slot.
         let tables = Sizing {
             kv_block_size: 1,
@@ -1274,12 +1356,12 @@ mod tests {
             max_seqs: caps::MAX_SEQS,
             ..sizing
         };
-        assert!(check_resources(&tables, &cache, &cuda(caps::KV_DEVICE_BYTES), 16_384, 8).is_err());
+        assert!(check_resources(&tables, &cache, &kv, FIXTURE_PACK, 16_384, 8).is_err());
         // The cpu executor's KV is host memory: 2^20 blocks of 16 positions
         // are 3.4 TiB.
         let cpu = |kv_blocks| ExecutorSettings::Cpu { kv_blocks };
-        assert!(check_resources(&sizing, &cache, &cpu(1024), 65_536, 0).is_ok());
-        assert!(check_resources(&sizing, &cache, &cpu(1 << 20), 65_536, 0).is_err());
+        assert!(check_resources(&sizing, &cache, &cpu(1024), FIXTURE_PACK, 65_536, 0).is_ok());
+        assert!(check_resources(&sizing, &cache, &cpu(1 << 20), FIXTURE_PACK, 65_536, 0).is_err());
     }
 
     #[test]
@@ -1305,22 +1387,82 @@ mod tests {
         // Without the cache, no retained windows: 1 + 64 × 10 + 512 = 1,153.
         assert_eq!(cuda_kv_min_bytes(&sizing, &cache(false)), 6_707_527_680);
         let min = cuda_kv_min_bytes(&sizing, &cache(true));
-        let fits = |bytes| check_resources(&sizing, &cache(true), &cuda(bytes), 65_536, 1);
+        let fits =
+            |bytes| check_resources(&sizing, &cache(true), &cuda(bytes), FIXTURE_PACK, 65_536, 1);
         assert!(fits(min).is_ok());
         assert!(fits(min - 1).is_err());
-        assert!(fits(MAX_GPU_MEMORY_BYTES).is_ok());
-        assert!(fits(MAX_GPU_MEMORY_BYTES + 1).is_err());
-        // Eight GPUs do not widen one node's device: it runs on one.
-        assert!(
-            check_resources(
-                &sizing,
-                &cache(true),
-                &cuda(MAX_GPU_MEMORY_BYTES + 1),
-                65_536,
-                8
-            )
-            .is_err()
+    }
+
+    /// The weights pack in the gateway's fixture: 17,419,419,648 bytes.
+    const FIXTURE_PACK: u64 = 17_419_419_648;
+
+    /// MiMo-V2.6-Flash's checkpoint, about 177.7 GB.
+    const FLASH_PACK: u64 = 177_700_003_840;
+
+    #[test]
+    fn the_device_holds_kv_weights_and_the_executors_reserve() {
+        let sizing = Sizing {
+            kv_block_size: 16,
+            max_model_len: 131_072,
+            max_seqs: 64,
+            max_batched_tokens: 8192,
+            max_prefill_chunk: 4096,
+            draft_tokens: 0,
+            max_requests: 8,
+        };
+        let cache = CacheConfig {
+            enabled: true,
+            idle_ttl_secs: 900,
+            max_age_secs: 3600,
+        };
+        // 4 GiB fixed; 8,192 step tokens × 1.25 MiB; the 1.5 GiB expert
+        // floor; 64 seats × 640 KiB; 64 × 8,192 table entries × 2 groups × 4
+        // bytes; 131,072 positions × 768 bytes of RoPE tables.
+        let reserve = cuda_device_reserve_bytes(&sizing);
+        assert_eq!(
+            reserve,
+            (4 << 30)
+                + 8192 * (5 << 18)
+                + 65_536 * (24 << 10)
+                + 64 * (640 << 10)
+                + 64 * 8192 * 8
+                + 131_072 * 768
         );
+        assert_eq!(reserve, 16_789_798_912);
+        let fits = |kv: u64, weights: u64, gpus: u64| {
+            check_resources(&sizing, &cache, &cuda(kv), weights, 65_536, gpus)
+        };
+        // A realistic Flash deployment: 64 GiB of KV beside the checkpoint.
+        assert!(fits(64 << 30, FLASH_PACK, 1).is_ok());
+        assert!(fits(64 << 30, FLASH_PACK, 8).is_ok());
+        // Exactly the device, and one byte past it.
+        let room = SUPPORTED_GPU_MEMORY_BYTES - FLASH_PACK - reserve;
+        assert!(fits(room, FLASH_PACK, 1).is_ok());
+        let err = fits(room + 1, FLASH_PACK, 1).unwrap_err();
+        assert!(err.contains(SUPPORTED_GPU), "{err}");
+        // A budget that fits only without the weights.
+        let without_weights = SUPPORTED_GPU_MEMORY_BYTES - reserve;
+        assert!(fits(without_weights, 0, 1).is_ok());
+        assert!(fits(without_weights, FIXTURE_PACK, 1).is_err());
+        // 288 GiB is more than the device holds, whatever else; and eight
+        // GPUs do not widen one node's device.
+        assert!(fits(288 << 30, 0, 8).is_err());
+        // The node refuses a budget not less than its device's memory; this
+        // rule refuses one less than that too, as the reserve is never zero.
+        assert!(fits(SUPPORTED_GPU_MEMORY_BYTES, 0, 8).is_err());
+        assert!(fits(SUPPORTED_GPU_MEMORY_BYTES - 1, 0, 8).is_err());
+    }
+
+    #[test]
+    fn an_artifact_ref_gives_its_data_size() {
+        let root = "d".repeat(64);
+        let uuid = "3892cd2f-a06e-5aee-8276-93140b9f06ec";
+        assert_eq!(
+            artifact_data_bytes(&format!("{root}_17419419648_{uuid}")),
+            Some(17_419_419_648)
+        );
+        assert_eq!(artifact_data_bytes(&format!("{root}_+5_{uuid}")), None);
+        assert_eq!(artifact_data_bytes(&format!("{root}_5_{uuid}x")), None);
     }
 
     #[test]
