@@ -246,11 +246,27 @@ fn seal_recorded_body(mut kept: Vec<u8>, received: usize, side: RecordedSide) ->
 /// honest about it. See [`RecordedBody::seal_request`].
 ///
 /// **The request still travels whole**; what is bounded is what is kept.
+///
+/// **One member is withheld rather than kept: `cache_key`.** The prefix-cache
+/// key is secret ([`crate::prefix_cache`]) and the Record is a surface people
+/// read, so the row says a key was sent — its value replaced by
+/// [`WITHHELD_CACHE_KEY`] — and never which. A body without one is kept
+/// exactly as before.
 pub(crate) fn recorded_request(body: &Value) -> Vec<u8> {
     let mut kept = RecordedBody::default();
-    kept.push(body.to_string().as_bytes());
+    if body.get("cache_key").is_some() {
+        let mut shown = body.clone();
+        crate::prefix_cache::scrub_body_key(&mut shown);
+        shown["cache_key"] = Value::String(WITHHELD_CACHE_KEY.to_string());
+        kept.push(shown.to_string().as_bytes());
+    } else {
+        kept.push(body.to_string().as_bytes());
+    }
     kept.seal_request()
 }
+
+/// What the Record shows in place of a request's prefix-cache key.
+pub(crate) const WITHHELD_CACHE_KEY: &str = "[withheld: prefix-cache key]";
 
 /// What the Record keeps of a blocking answer, stating both the retention cap
 /// and the read ceiling where either applied.
@@ -277,6 +293,41 @@ pub(crate) fn recorded_cut_answer(partial: &BoundedBody) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Record says a key was sent and never which; a keyless body is kept
+    /// byte for byte.
+    #[test]
+    fn a_requests_cache_key_is_withheld_from_the_record() {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+        let keyed = eidola_common::chat_completion_request_body(
+            "m",
+            &messages,
+            16,
+            &[],
+            false,
+            false,
+            Some(key),
+        );
+        let kept = String::from_utf8(recorded_request(&keyed)).unwrap();
+        assert!(!kept.contains(key), "{kept}");
+        let parsed: Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(parsed["cache_key"], WITHHELD_CACHE_KEY);
+        assert_eq!(parsed["messages"], keyed["messages"]);
+        // The caller's body still carries the key it sends.
+        assert_eq!(keyed["cache_key"], key);
+
+        let keyless = eidola_common::chat_completion_request_body(
+            "m",
+            &messages,
+            16,
+            &[],
+            false,
+            false,
+            None,
+        );
+        assert_eq!(recorded_request(&keyless), keyless.to_string().into_bytes());
+    }
 
     /// A request's note is a request's: it states the size this app built and
     /// claims nothing about sending, delivering or receiving.

@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 12;
+const LATEST_VERSION: i64 = 13;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -1328,6 +1328,123 @@ fn opt_str(v: Option<&str>) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Layer 1 — Transport: prefix-cache keys
+// ---------------------------------------------------------------------------
+
+/// Hand one request its lineage's prefix-cache key: the stored key when the
+/// rotation rule keeps it ([`crate::prefix_cache::decide`]), a freshly minted
+/// one otherwise — and stamp the use either way.
+///
+/// **A lineage is `(space_id, participant_id)`**: one participant answering in
+/// one space, on whatever branch and whether replying or regenerating. The key
+/// row carries the `model` it was minted for, so a participant whose model
+/// changes starts a new key.
+///
+/// Decided at the write, in one `BEGIN IMMEDIATE`: two turns of one lineage
+/// racing each other (a regeneration beside a reply, a driven turn beside a
+/// human's) both read the row the other wrote, so they share a key or one of
+/// them mints the lineage's next key; no interleaving leaves them holding
+/// different keys each believes current. `Ok(None)` only when a fresh key was
+/// due and the OS could not supply randomness — the request then carries no
+/// key at all. Emits nothing: no surface reads a key.
+pub(crate) async fn claim_prefix_cache_key(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    model: &str,
+    policy: &crate::prefix_cache::PromptCachePolicy,
+    now: i64,
+) -> Result<Option<crate::prefix_cache::CacheKey>, AppError> {
+    begin_write(conn).await?;
+    match claim_prefix_cache_key_body(conn, space_id, participant_id, model, policy, now).await {
+        Ok(key) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(key)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn claim_prefix_cache_key_body(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    model: &str,
+    policy: &crate::prefix_cache::PromptCachePolicy,
+    now: i64,
+) -> Result<Option<crate::prefix_cache::CacheKey>, AppError> {
+    use crate::prefix_cache::{CacheKey, Claim, StoredKeyAge, decide, mint};
+    use eidola_common::engine_protocol::CACHE_KEY_BYTES;
+    use zeroize::Zeroizing;
+
+    let lineage = (
+        Value::Text(space_id.to_string()),
+        Value::Text(participant_id.to_string()),
+    );
+    let mut rows = conn
+        .query(
+            "SELECT model, created_at, last_used_at, key_bytes FROM prefix_cache_key \
+             WHERE space_id = ?1 AND participant_id = ?2",
+            lineage.clone(),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut stored: Option<(StoredKeyAge, Zeroizing<Vec<u8>>)> = None;
+    if let Some(row) = rows.next().await.map_err(AppError::db)? {
+        let age = StoredKeyAge {
+            model: row.get::<String>(0).map_err(AppError::db)?,
+            created_at: row.get::<i64>(1).map_err(AppError::db)?,
+            last_used_at: row.get::<i64>(2).map_err(AppError::db)?,
+        };
+        let bytes = Zeroizing::new(row.get::<Vec<u8>>(3).map_err(AppError::db)?);
+        stored = Some((age, bytes));
+    }
+    drop(rows);
+
+    if let Some((age, bytes)) = &stored
+        && decide(Some(age), model, policy, now) == Claim::Reuse
+        && let Ok(bytes) = <&[u8; CACHE_KEY_BYTES]>::try_from(&bytes[..])
+    {
+        conn.execute(
+            "UPDATE prefix_cache_key SET last_used_at = ?3 \
+             WHERE space_id = ?1 AND participant_id = ?2",
+            (lineage.0, lineage.1, Value::Integer(now)),
+        )
+        .await
+        .map_err(AppError::db)?;
+        return Ok(Some(CacheKey::from_bytes(bytes)));
+    }
+
+    let Some(fresh) = mint() else {
+        return Ok(None);
+    };
+    // The parameter is a copy turso owns from here; the local one is scrubbed
+    // when `fresh` drops.
+    conn.execute(
+        "INSERT INTO prefix_cache_key \
+             (space_id, participant_id, model, key_bytes, created_at, last_used_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+         ON CONFLICT (space_id, participant_id) DO UPDATE SET \
+             model = excluded.model, key_bytes = excluded.key_bytes, \
+             created_at = excluded.created_at, last_used_at = excluded.last_used_at",
+        (
+            lineage.0,
+            lineage.1,
+            Value::Text(model.to_string()),
+            Value::Blob(fresh.to_vec()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(Some(CacheKey::from_bytes(&fresh)))
+}
+
+// ---------------------------------------------------------------------------
 // Layer 2 — Semantic: Participant operations
 // ---------------------------------------------------------------------------
 
@@ -1585,10 +1702,14 @@ pub async fn space_footprint_counts(
 /// leg. If that ever stopped being true the FK would abort this transaction
 /// and the space would be kept, which is the direction this whole feature errs
 /// in; deleting the rows to be safe would err the other way, taking a grant
-/// with a space nobody proved was empty. The inbound edges of a
-/// space-owned `participant` are `action` and `memory_block` (both checked;
-/// `space_participant` / `space_template_participant` are CHECK-pinned to
-/// globals and `space.notebook_participant_id` names only a global). FK
+/// with a space nobody proved was empty. **`prefix_cache_key` is the same
+/// case** (it names the space and a participant): only a turn writes a key
+/// row, and a turn answers a post in its space, so a space holding one is
+/// refused by the first leg; it is not deleted either. The inbound edges of a
+/// space-owned `participant` are `action`, `memory_block` (both checked) and
+/// `prefix_cache_key` (empty, as above; `space_participant` /
+/// `space_template_participant` are CHECK-pinned to globals and
+/// `space.notebook_participant_id` names only a global). FK
 /// enforcement is on for every connection, so anything this reasoning missed
 /// aborts the transaction and the space is kept — which is the direction the
 /// whole feature errs in.

@@ -3853,3 +3853,50 @@ fn a_stream_framed_with_bare_carriage_returns_is_split_into_its_events() {
         assert!(mock.refund_hits() >= 1, "the streaming hold settled");
     });
 }
+
+/// REGRESSION: **a proxied completion carries no prefix-cache key — not one of
+/// this app's, and not one its caller wrote.**
+///
+/// The proxy's turn has no lineage: no space, no participant, nothing that
+/// says two requests continue one conversation, so there is nothing for an
+/// app-minted key to be scoped to. And a downstream tool's `cache_key` is a
+/// body field outside the allowlist for the reason `traceparent` is a header
+/// outside its own: a value the caller picks and never rotates, linking every
+/// request it rides on for as long as the tool likes. So even for a model whose
+/// engine caches prefixes, the upstream sees no key either way.
+#[test]
+fn a_proxied_completion_carries_no_cache_key_even_when_its_caller_sends_one() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            declared_prompt_cache: Some(chat_harness::supported_prompt_cache()),
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+        let caller_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+        for body in [
+            format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hello"}}]}}"#),
+            format!(
+                r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hello"}}],"cache_key":"{caller_key}"}}"#
+            ),
+        ] {
+            let (status, answer) =
+                runtime.block_on(exchange(&core, &post("/v1/chat/completions", &key, &body)));
+            assert_eq!(status, 200, "{answer}");
+        }
+
+        let sent = mock.chat_bodies();
+        assert_eq!(sent.len(), 2);
+        for body in &sent {
+            assert!(body.get("cache_key").is_none(), "{body}");
+        }
+        for raw in mock.chat_raw_bodies() {
+            let text = String::from_utf8(raw).unwrap();
+            assert!(!text.contains(caller_key), "{text}");
+        }
+    });
+}

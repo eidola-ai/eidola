@@ -1377,6 +1377,24 @@ mod tests {
         assert!(serde_json::to_string(request.cache_key.as_ref().unwrap()).is_err());
     }
 
+    /// The client mints keys with the shared encoder; whatever it spells, this
+    /// decoder reads back as the bytes it encoded.
+    #[test]
+    fn the_shared_encoder_round_trips_through_the_decoder() {
+        use eidola_common::engine_protocol::{CACHE_KEY_BYTES, encode_cache_key};
+        for seed in 0u8..=255 {
+            let mut bytes = [0u8; CACHE_KEY_BYTES];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = seed
+                    .wrapping_mul(31)
+                    .wrapping_add((i as u8).wrapping_mul(97));
+            }
+            let text = String::from_utf8(encode_cache_key(&bytes).to_vec()).unwrap();
+            let key: CacheKey = serde_json::from_value(text.into()).unwrap();
+            assert_eq!(key.as_bytes(), &bytes);
+        }
+    }
+
     #[test]
     fn the_shared_body_with_a_cache_key_is_accepted() {
         let body = eidola_common::chat_completion_request_body(

@@ -917,6 +917,47 @@ CREATE INDEX idx_request_credential
     ON request (credential_nonce)
     WHERE credential_nonce IS NOT NULL;
 
+-- ============================================================
+-- Prefix-cache keys: one secret per conversation lineage.
+--
+-- A lineage is one participant answering in one space: every
+-- turn that participant takes there — on any branch, and every
+-- regeneration — reads a context that shares the space's trunk,
+-- so its requests share a prompt prefix. An Eidola-hosted
+-- engine reuses cached computation only between requests that
+-- carry the same key, so the key is what makes reuse possible
+-- and also exactly what links those requests to one another.
+--
+-- `key_bytes` is 32 bytes from the OS CSPRNG, sent as
+-- unpadded base64url (`eidola_common::engine_protocol`). It is
+-- secret: it is never logged, never shown, never recorded in a
+-- request row (the Record withholds it) and no control-protocol
+-- verb reads it. Written only by `db::claim_prefix_cache_key`,
+-- which rotates it to a fresh value when the catalog's retention
+-- says the engine can no longer hold the lineage's cache — idle
+-- past `idle_ttl_secs`, older than `max_age_secs`, a different
+-- `model`, or a clock that ran backwards — so no key outlives
+-- the cache it unlocks.
+--
+-- Both timestamps are this client's clock: `created_at` is the
+-- key's birth, `last_used_at` the most recent request it was
+-- handed to.
+--
+-- No cascade. A row exists only after a turn ran in the space,
+-- and a turn needs a post there, so a space the pristine reaper
+-- may delete never has one (see `db::discard_space_if_pristine`).
+-- ============================================================
+CREATE TABLE prefix_cache_key (
+    space_id        TEXT NOT NULL REFERENCES space(id),
+    participant_id  TEXT NOT NULL REFERENCES participant(id),
+    model           TEXT NOT NULL,
+    key_bytes       BLOB NOT NULL CHECK (length(key_bytes) = 32),
+    created_at      INTEGER NOT NULL,
+    last_used_at    INTEGER NOT NULL,
+
+    PRIMARY KEY (space_id, participant_id)
+);
+
 
 -- ############################################################
 -- #  LAYER 4 — THE LOCAL INFERENCE PROXY                     #

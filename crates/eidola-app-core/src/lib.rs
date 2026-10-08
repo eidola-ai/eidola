@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod local_models;
 pub mod memory;
 mod peer_read;
+mod prefix_cache;
 pub mod proxy;
 mod recorded;
 pub mod router;
@@ -1727,7 +1728,9 @@ pub struct RequestInfo {
 }
 
 /// The full recorded request/response pair, raw bodies included. This is
-/// the user's own traffic on their own machine — nothing is redacted.
+/// the user's own traffic on their own machine, kept as sent with one
+/// exception: a request's prefix-cache key, a secret no surface shows, is
+/// recorded as withheld (`recorded::recorded_request`).
 #[derive(Clone, Debug)]
 pub struct RequestDetail {
     pub id: String,
@@ -2174,6 +2177,12 @@ struct Inner {
     /// build contains no path that widens what counts as our own catalog.
     #[cfg(feature = "test-support")]
     trust_declared_capabilities: std::sync::atomic::AtomicBool,
+    /// Milliseconds added to the clock the prefix-cache rotation rule reads
+    /// ([`Inner::cache_clock_ms`]), so a test can stand a lineage past its idle
+    /// TTL or maximum age — or set the clock back — without waiting. Only the
+    /// rotation rule reads it; every other timestamp is untouched.
+    #[cfg(feature = "test-support")]
+    cache_clock_offset_ms: std::sync::atomic::AtomicI64,
     /// The process-lifetime exclusive advisory lock on the local database
     /// (`<data_dir>/eidola.db.lock`). Taken in [`AppCore::build`] — a second
     /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
@@ -2752,6 +2761,52 @@ impl Inner {
             return true;
         }
         !eidola.base_url_is_override && !eidola.measurements_are_override
+    }
+
+    /// The clock the prefix-cache rotation rule reads: this client's own wall
+    /// clock (plus a test's offset). See [`prefix_cache::decide`] for what a
+    /// clock that moves backwards does.
+    fn cache_clock_ms(&self) -> i64 {
+        #[cfg(feature = "test-support")]
+        {
+            now_ms().saturating_add(
+                self.cache_clock_offset_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            now_ms()
+        }
+    }
+
+    /// The prefix-cache key this request of `prep`'s turn carries, if any.
+    ///
+    /// `None` unless the catalog declared the model's prefix cache
+    /// (`TurnPrep::prompt_cache`), so every other request is untouched. Asked
+    /// **per request** rather than once per turn: a tool round can run past
+    /// the idle TTL, and each request stamps the lineage's last use as it is
+    /// built. A failure to read or write the key is not the turn's failure —
+    /// the request goes without one, which costs a cache miss and links
+    /// nothing — and the warning names neither the key nor the lineage.
+    async fn claim_cache_key(&self, prep: &TurnPrep) -> Option<prefix_cache::CacheKey> {
+        let policy = prep.prompt_cache.as_ref()?;
+        match db::claim_prefix_cache_key(
+            &prep.db_conn,
+            &prep.space_id,
+            &prep.model_participant_id,
+            &prep.model,
+            policy,
+            self.cache_clock_ms(),
+        )
+        .await
+        {
+            Ok(key) => key,
+            Err(_) => {
+                eprintln!("warning: a turn's prefix-cache key could not be claimed; sending none");
+                None
+            }
+        }
     }
 }
 
@@ -6315,6 +6370,7 @@ impl Inner {
             remote_pricing,
             external_auth,
             tool_policy,
+            prompt_cache,
         ) = match backend_kind {
             BackendKind::Local | BackendKind::LlamaCpp => {
                 // A request *is* the load trigger: an unloaded engine is
@@ -6366,6 +6422,7 @@ impl Inner {
                     None,
                     None,
                     ToolPolicy::Learned,
+                    None,
                 )
             }
             BackendKind::OpenAi => {
@@ -6390,6 +6447,7 @@ impl Inner {
                     None,
                     auth,
                     ToolPolicy::Learned,
+                    None,
                 )
             }
             BackendKind::Eidola => {
@@ -6451,6 +6509,13 @@ impl Inner {
                     Some(pricing),
                     None,
                     tool_policy,
+                    // Whether this model's engine reuses a prompt prefix, and
+                    // for how long — the only input deciding whether the turn
+                    // sends a prefix-cache key (see [`prefix_cache`]). Read
+                    // whoever's catalog this is: it shapes the request and
+                    // vouches for nothing, and the server it describes already
+                    // reads every prompt it would link.
+                    model_entry.declared_prompt_cache(),
                 )
             }
         };
@@ -7174,6 +7239,7 @@ impl Inner {
             consumer_tools,
             auto_tools,
             tool_policy,
+            prompt_cache,
             remote_pricing,
             budget,
             charge_credits,
@@ -7632,7 +7698,9 @@ impl Inner {
             self.bus.emit(Change::Space(space_for_emit.clone()));
         };
 
-        let request_body_json = prep.request_body(false);
+        let cache_key = self.claim_cache_key(prep).await;
+        let request_body_json = prep.request_body(false, cache_key.as_ref());
+        drop(cache_key);
         let request_at = now_ms();
 
         // Send the chat request. On failure, attempt refund recovery before
@@ -8352,7 +8420,9 @@ impl Inner {
         // Sending it from the client is harmless (the server ignores
         // and overrides the value), but it's also unnecessary, so we
         // keep our outgoing request minimal.
-        let request_body_json = prep.request_body(true);
+        let cache_key = self.claim_cache_key(prep).await;
+        let request_body_json = prep.request_body(true, cache_key.as_ref());
+        drop(cache_key);
         let request_at = now_ms();
 
         let mut request = prep
@@ -9920,6 +9990,17 @@ impl AppCore {
             .store(trusted, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// **Test-only seam.** Move the clock the prefix-cache rotation rule reads
+    /// by `delta_ms` (negative sets it back). Cumulative. Nothing else reads
+    /// this offset, so posts, requests and every other stamp keep real time.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_advance_cache_clock(&self, delta_ms: i64) {
+        self.inner
+            .cache_clock_offset_ms
+            .fetch_add(delta_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn build(
         config_dir: PathBuf,
         data_dir: PathBuf,
@@ -10000,6 +10081,8 @@ impl AppCore {
                 http_override,
                 #[cfg(feature = "test-support")]
                 trust_declared_capabilities: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "test-support")]
+                cache_clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
                 _db_lock: db_lock,
             }),
         })
@@ -12630,6 +12713,11 @@ struct ModelCapabilitiesInfo {
     input_modalities: Option<Vec<String>>,
     #[serde(default)]
     output_modalities: Option<Vec<String>>,
+    /// Kept raw: [`prefix_cache::PromptCachePolicy::from_catalog`] reads it,
+    /// and a leaf of a shape this build does not expect then means "no key"
+    /// rather than an unreadable catalog.
+    #[serde(default)]
+    prompt_cache: Option<serde_json::Value>,
 }
 
 /// A capability leaf. An object rather than a bare boolean so the wire can
@@ -12660,6 +12748,13 @@ impl ModelListEntry {
         }
     }
 
+    /// The engine prefix cache this row declares, if it declares a complete one.
+    fn declared_prompt_cache(&self) -> Option<prefix_cache::PromptCachePolicy> {
+        prefix_cache::PromptCachePolicy::from_catalog(
+            self.capabilities.as_ref()?.prompt_cache.as_ref(),
+        )
+    }
+
     fn declared_budget_class(&self) -> Option<OutputBudgetClass> {
         self.output_budget_class
             .as_deref()
@@ -12683,6 +12778,33 @@ impl ModelListEntry {
 /// and streaming transports differ only in how they carry the request and
 /// read the response; everything durable before and after the wire lives
 /// here.
+/// One request's body, as sent: scrubs its prefix-cache key when the request
+/// is done with it.
+///
+/// Every exit of a round reads the body (the Record keeps it), so it lives for
+/// the round; the copy of the key it holds goes when it does. The Record never
+/// keeps the key ([`recorded::recorded_request`] withholds it).
+struct WireBody(serde_json::Value);
+
+impl std::ops::Deref for WireBody {
+    type Target = serde_json::Value;
+    fn deref(&self) -> &serde_json::Value {
+        &self.0
+    }
+}
+
+impl serde::Serialize for WireBody {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl Drop for WireBody {
+    fn drop(&mut self) {
+        prefix_cache::scrub_body_key(&mut self.0);
+    }
+}
+
 struct TurnPrep {
     db_conn: turso::Connection,
     provider_id: String,
@@ -12783,6 +12905,11 @@ struct TurnPrep {
     /// `tools` field. Read by [`Inner::should_degrade_tools`]: only a policy
     /// that was never declared may be probed.
     tool_policy: ToolPolicy,
+    /// The model's engine prefix cache as the catalog declared it, or `None`
+    /// for every model without one — every non-eidola backend included. Only
+    /// a `Some` here ever puts a `cache_key` on the wire
+    /// ([`Inner::claim_cache_key`]).
+    prompt_cache: Option<prefix_cache::PromptCachePolicy>,
     /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
     /// for every non-spend backend. Kept so a later round can re-estimate.
     remote_pricing: Option<ChargePricing>,
@@ -12902,22 +13029,25 @@ impl TurnPrep {
     /// least one tool. That omission is load-bearing: a registry-less install
     /// sends exactly the bytes it sent before tool support existed, so
     /// upstream prefix caches — and every pinned-bytes test — are undisturbed.
-    fn request_body(&self, stream: bool) -> serde_json::Value {
+    ///
+    /// `cache_key` is the lineage's key for this request
+    /// ([`Inner::claim_cache_key`]); `None` — every model whose catalog row
+    /// declares no prefix cache — leaves the body exactly as it was before
+    /// keys existed.
+    fn request_body(&self, stream: bool, cache_key: Option<&prefix_cache::CacheKey>) -> WireBody {
         // The Eidola server forces `include_usage` upstream regardless
         // (accurate refunds depend on it), so the remote request stays
         // minimal — but a local llama-server only reports usage when the
         // client asks.
-        eidola_common::chat_completion_request_body(
+        WireBody(eidola_common::chat_completion_request_body(
             &self.wire_model,
             &self.messages,
             self.max_completion_tokens,
             &self.tool_schemas,
             stream,
             stream && self.spend.is_none(),
-            // No prefix-cache key yet: the turn sends none, so no engine
-            // prefix is shared beyond the request itself.
-            None,
-        )
+            cache_key.map(prefix_cache::CacheKey::as_str),
+        ))
     }
 
     /// Flush attestations captured since the last flush (a fresh handshake

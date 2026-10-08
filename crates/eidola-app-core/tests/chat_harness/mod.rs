@@ -406,6 +406,22 @@ pub const FLAT_MODEL: &str = "flat-priced";
 /// The flat price, in credits, [`FLAT_MODEL`] costs per request.
 pub const FLAT_PRICE: u64 = 7;
 
+/// The idle TTL [`supported_prompt_cache`] declares, in seconds.
+pub const CACHE_IDLE_TTL_SECS: i64 = 900;
+/// The maximum key age [`supported_prompt_cache`] declares, in seconds.
+pub const CACHE_MAX_AGE_SECS: i64 = 7200;
+
+/// The `prompt_cache` leaf an Eidola-hosted catalog row carries: its engine
+/// reuses a prompt prefix between requests sharing a `cache_key`, under the
+/// engine core's own default retention.
+pub fn supported_prompt_cache() -> serde_json::Value {
+    serde_json::json!({
+        "supported": true,
+        "idle_ttl_secs": CACHE_IDLE_TTL_SECS,
+        "max_age_secs": CACHE_MAX_AGE_SECS,
+    })
+}
+
 /// The head of `eidola_app_core::summaries::SUMMARY_SYSTEM_PROMPT`. Branch
 /// summaries share the router's *model*, so the mock tells the two chores apart
 /// by their system prompt, not by the wire model.
@@ -543,6 +559,11 @@ pub struct MockConfig {
     /// reaches this mock through a base-URL override and an override is a
     /// hint, never a declaration.
     pub declared_tool_calling: Option<bool>,
+    /// The `capabilities.prompt_cache` leaf `GET /v1/models` publishes for
+    /// [`MODEL`], verbatim. `None` — the default — publishes none, which is
+    /// every model the server sells today; [`supported_prompt_cache`] is the
+    /// leaf an Eidola-hosted row carries.
+    pub declared_prompt_cache: Option<serde_json::Value>,
     /// List [`FLAT_MODEL`], the flat-priced entry, in the catalog. Opt-in so
     /// the listings every other test pins are unchanged.
     pub list_flat_model: bool,
@@ -567,6 +588,7 @@ impl Default for MockConfig {
             catalog_omits: catalog_omissions(),
             tool_script: tool_script(),
             declared_tool_calling: None,
+            declared_prompt_cache: None,
             list_flat_model: false,
             chat_delay_ms: 0,
         }
@@ -584,6 +606,10 @@ pub struct MockServer {
     /// order — lets tests assert exactly what context the client sent
     /// upstream (e.g. regenerate's upstream-only thread).
     chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    /// The exact bytes of every `POST /v1/chat/completions` body, in arrival
+    /// order — for the assertions that are about bytes rather than JSON
+    /// values (a body that must be byte-for-byte what it was before).
+    chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     /// Whether each `POST /v1/chat/completions` carried an `Authorization`
     /// header, in arrival order — local turns must send none (no spend).
     chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
@@ -616,6 +642,21 @@ impl MockServer {
     /// The recorded chat request bodies (see `chat_bodies`).
     pub fn chat_bodies(&self) -> Vec<serde_json::Value> {
         self.chat_bodies.lock().unwrap().clone()
+    }
+    /// The recorded chat request bodies as sent (see `chat_raw_bodies`).
+    pub fn chat_raw_bodies(&self) -> Vec<Vec<u8>> {
+        self.chat_raw_bodies.lock().unwrap().clone()
+    }
+    /// The `cache_key` each chat request carried, in arrival order.
+    pub fn chat_cache_keys(&self) -> Vec<Option<String>> {
+        self.chat_bodies()
+            .iter()
+            .map(|b| {
+                b.get("cache_key")
+                    .and_then(|k| k.as_str())
+                    .map(str::to_owned)
+            })
+            .collect()
     }
     /// Per-chat-request `Authorization` presence (see `chat_auths`).
     pub fn chat_auths(&self) -> Vec<bool> {
@@ -1009,6 +1050,8 @@ pub async fn start(config: MockConfig) -> MockServer {
     let chat_hits = Arc::new(AtomicU64::new(0));
     let chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let chat_auths: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1019,6 +1062,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         let issuer = issuer.clone();
         let chat_hits = chat_hits.clone();
         let chat_bodies = chat_bodies.clone();
+        let chat_raw_bodies = chat_raw_bodies.clone();
         let chat_auths = chat_auths.clone();
         let chat_auth_values = chat_auth_values.clone();
         let refund_hits = refund_hits.clone();
@@ -1032,6 +1076,7 @@ pub async fn start(config: MockConfig) -> MockServer {
                 let config = config.clone();
                 let chat_hits = chat_hits.clone();
                 let chat_bodies = chat_bodies.clone();
+                let chat_raw_bodies = chat_raw_bodies.clone();
                 let chat_auths = chat_auths.clone();
                 let chat_auth_values = chat_auth_values.clone();
                 let refund_hits = refund_hits.clone();
@@ -1043,6 +1088,7 @@ pub async fn start(config: MockConfig) -> MockServer {
                         config,
                         chat_hits,
                         chat_bodies,
+                        chat_raw_bodies,
                         chat_auths,
                         chat_auth_values,
                         refund_hits,
@@ -1058,6 +1104,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         base_url,
         chat_hits,
         chat_bodies,
+        chat_raw_bodies,
         chat_auths,
         chat_auth_values,
         refund_hits,
@@ -1137,6 +1184,7 @@ async fn handle_conn(
     config: MockConfig,
     chat_hits: Arc<AtomicU64>,
     chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     refund_hits: Arc<AtomicU64>,
@@ -1211,6 +1259,7 @@ async fn handle_conn(
             if let Some(body) = parsed {
                 chat_bodies.lock().unwrap().push(body);
             }
+            chat_raw_bodies.lock().unwrap().push(req.body.clone());
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
             let parsed: serde_json::Value =
@@ -2673,6 +2722,12 @@ fn models_body(config: &MockConfig) -> String {
         });
         primary["max_output_tokens"] = serde_json::json!(4096u64);
         primary["output_budget_class"] = serde_json::json!("standard");
+    }
+    if let Some(leaf) = &config.declared_prompt_cache {
+        if primary.get("capabilities").is_none() {
+            primary["capabilities"] = serde_json::json!({});
+        }
+        primary["capabilities"]["prompt_cache"] = leaf.clone();
     }
     let router = serde_json::json!({
         "id": ROUTER_REMOTE_MODEL,
