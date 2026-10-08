@@ -376,7 +376,13 @@ async fn chat(
             let odd = if mode == Mode::MalformedChunk {
                 Event::default().data(r#"{"id":"chatcmpl-fake","choices":"#)
             } else {
-                Event::default().event("progress").data("{}")
+                // A well-formed chunk, so only its event type is wrong.
+                chunk(
+                    &state,
+                    serde_json::json!([{"index": 0, "delta": {"content": "x"}, "finish_reason": null}]),
+                    None,
+                )
+                .event("progress")
             };
             vec![
                 odd,
