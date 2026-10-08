@@ -2965,6 +2965,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidola-server-engine"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "axum",
+ "base64 0.23.1",
+ "eidola-engine",
+ "eidola-engine-chat",
+ "eidola-engine-cpu",
+ "eidola-engine-model",
+ "flate2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
 name = "eidola-www"
 version = "0.1.0"
 dependencies = [
