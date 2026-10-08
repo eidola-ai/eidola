@@ -173,7 +173,43 @@ fn render_values(entries: BTreeMap<String, Vec<Value>>) -> Result<String> {
         models.insert(model, Value::Array(deployments));
     }
     let file = json!({ "schema_version": SCHEMA_VERSION, "models": models });
-    Ok(serde_json::to_string_pretty(&file)? + "\n")
+    Ok(serde_json::to_string_pretty(&SortedKeys(&file))? + "\n")
+}
+
+/// Serializes a JSON value with every object's keys in sorted order.
+///
+/// `serde_json::Map` keeps insertion order when any crate in the build enables
+/// serde_json's `preserve_order` feature and sorts otherwise, so a `Value`'s
+/// own serialization depends on what else is compiled alongside this crate.
+/// The canonical file must not, so the order is fixed here.
+struct SortedKeys<'a>(&'a Value);
+
+impl serde::Serialize for SortedKeys<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut out = serializer.serialize_map(Some(keys.len()))?;
+                for key in keys {
+                    out.serialize_entry(key, &SortedKeys(&map[key]))?;
+                }
+                out.end()
+            }
+            Value::Array(items) => {
+                let mut out = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    out.serialize_element(&SortedKeys(item))?;
+                }
+                out.end()
+            }
+            other => other.serialize(serializer),
+        }
+    }
 }
 
 /// The single `eidola-server-engine` container's env, as name → value.
