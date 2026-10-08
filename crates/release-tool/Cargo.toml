@@ -17,7 +17,7 @@ base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 cryptoki = "0.12.0"
-der = { version = "0.7", features = ["alloc"] }
+der = { version = "0.8", features = ["alloc"] }
 eidola-app-core = { path = "../eidola-app-core" }
 eidola-apple = { path = "../eidola-apple" }
 eidola-attestation = { path = "../eidola-attestation" }

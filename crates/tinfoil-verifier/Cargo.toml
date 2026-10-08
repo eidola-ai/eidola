@@ -13,7 +13,7 @@ sev = { version = "8", default-features = false, features = ["snp", "crypto_noss
 
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
 x509-cert = "0.2"
-der = { version = "0.7", features = ["alloc"] }
+der = { version = "0.8", features = ["alloc"] }
 # RSA-PSS verification for AMD CRLs (the `sev` crate uses this same crate
 # internally for ARK→ASK signature verification when built with the
 # `crypto_nossl` feature; we pin it directly so we can verify CRLs the
