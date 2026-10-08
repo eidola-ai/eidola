@@ -6,17 +6,17 @@ default:
 
 # --- Development ---
 
-# Run the full server stack with the server in a container (detached).
+# Run the full dev stack with the gateway in a container (detached).
 dev:
     ./scripts/dev.sh --container
 
-# Run backing services for host-mode dev — server runs on host with cargo; writes .env.local with BIND_ADDR + STRIPE_WEBHOOK_SECRET to source.
+# Run backing services for host-mode dev — gateway runs on host with cargo; writes .env.local with BIND_ADDR + STRIPE_WEBHOOK_SECRET to source.
 services:
     ./scripts/dev.sh --host
 
 # Stop everything started by `just dev` or `just services`.
 down:
-    docker compose --profile server --profile stripe down --remove-orphans
+    docker compose --profile gateway --profile stripe down --remove-orphans
 
 # Point this machine's client (GUI + CLI) at the local dev stack
 client-local:
@@ -34,13 +34,13 @@ db-reset:
 
 # --- Build (local toolchain, fast iteration) ---
 
-# Build a system: server, cli, gui, www, or engine-server
+# Build a system: gateway, cli, gui, www, or engine-server
 build system:
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ system }}" in
-      server)
-        cargo build -p eidola-server
+      gateway)
+        cargo build -p eidola-server-gateway
         ;;
       cli)
         cargo build -p eidola-cli
@@ -63,7 +63,7 @@ build system:
         cargo build -p eidola-server-engine
         ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www, engine-server)" >&2
+        echo "error: unknown system '{{ system }}' (expected: gateway, cli, gui, www, engine-server)" >&2
         exit 1
         ;;
     esac
@@ -84,13 +84,13 @@ engine-kernels *args:
 engine:
     nix build .#llama-server -o crates/eidola-gui/build/llama-server
 
-# Build and run a system: server, cli, gui, www, or engine-server
+# Build and run a system: gateway, cli, gui, www, or engine-server
 run system *args:
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ system }}" in
-      server)
-        cargo run -p eidola-server -- {{ args }}
+      gateway)
+        cargo run -p eidola-server-gateway -- {{ args }}
         ;;
       cli)
         cargo run -p eidola-cli -- {{ args }}
@@ -144,7 +144,7 @@ run system *args:
           cargo run -p eidola-server-engine -- {{ args }}
         ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www, engine-server)" >&2
+        echo "error: unknown system '{{ system }}' (expected: gateway, cli, gui, www, engine-server)" >&2
         exit 1
         ;;
     esac
@@ -189,7 +189,7 @@ test:
 
 # Run integration tests (requires: just services && just db-reset)
 test-integration:
-    DATABASE_URL="${DATABASE_URL:-postgres://eidola@localhost/eidola}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidola-server -- --ignored
+    DATABASE_URL="${DATABASE_URL:-postgres://eidola@localhost/eidola}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidola-server-gateway -- --ignored
 
 # Run E2E webhook smoke tests (requires STRIPE_API_KEY)
 test-webhook-smoke:
@@ -199,7 +199,7 @@ test-webhook-smoke:
 
 # Regenerate OpenAPI spec
 update-openapi:
-    ./scripts/update-server-openapi.sh
+    ./scripts/update-gateway-openapi.sh
 
 # Regenerate every identity asset from the brand geometry (macOS only —
 # the .icns needs iconutil; Assets.car needs actool + ictool). See

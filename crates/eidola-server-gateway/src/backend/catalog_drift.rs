@@ -361,7 +361,7 @@ fn report(drifts: &[Drift]) -> String {
     }
     out.push_str(
         "\nEvery line is a decision, not a chore: correct the row in MODEL_CATALOG \
-         (crates/eidola-server/src/backend.rs), or record the id in \
+         (crates/eidola-server-gateway/src/backend.rs), or record the id in \
          NOT_SOLD_UPSTREAM_MODELS with the route it is served on and the reason \
          it is not sold.\n",
     );

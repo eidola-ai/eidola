@@ -10,7 +10,7 @@ This repository contains several components under different licenses. This file 
 
 | Crate | License |
 |---|---|
-| `eidola-server`, `eidola-server-engine` | [AGPL-3.0-only](LICENSES/AGPL-3.0-only.txt) |
+| `eidola-server-gateway`, `eidola-server-engine` | [AGPL-3.0-only](LICENSES/AGPL-3.0-only.txt) |
 | `eidola-engine`, `eidola-engine-model`, `eidola-engine-chat`, `eidola-engine-kernels`, `eidola-engine-cpu`, `eidola-engine-cuda` | [AGPL-3.0-only](LICENSES/AGPL-3.0-only.txt) |
 | `eidola-app-core` | [GPL-3.0-only](LICENSES/GPL-3.0-only.txt) |
 | `eidola-cli` | [GPL-3.0-only](LICENSES/GPL-3.0-only.txt) |

@@ -26,7 +26,7 @@
 //!
 //! * **Real issuance crypto.** The mock holds a freshly generated ACT issuer
 //!   `PrivateKey` and reuses the *same* `anonymous-credit-tokens` primitives
-//!   the production server (`crates/eidola-server/src/credentials.rs`) uses —
+//!   the production server (`crates/eidola-server-gateway/src/credentials.rs`) uses —
 //!   `issue` for `/v1/account/credentials`, `refund` for the inline chat refund
 //!   and `/v1/credentials/refund`. The server's issuance handler is glued to
 //!   postgres and can't be called as a library, so this reimplements only the
@@ -204,7 +204,7 @@ pub enum ChatBehavior {
     /// A **refund-bearing** non-2xx, the shape the server answers with when a
     /// streaming request fails after the nullifier is recorded but before the
     /// SSE opens — request validation, `send_stream`, a spend-proof re-encode
-    /// (`eidola-server/src/handlers.rs`: `error_response_with_refund`). The
+    /// (`eidola-server-gateway/src/handlers.rs`: `error_response_with_refund`). The
     /// credential is spent and the only copy of its refund may be in this body,
     /// because the server's own persistence of the token is best-effort.
     Non2xxWithRefund(u16),
@@ -298,7 +298,7 @@ pub enum ChatBehavior {
     /// This is the deployed shape, not an invented one. The server's request
     /// type is `deny_unknown_fields`, so an unknown member fails in the
     /// `LoggedJson` extractor, whose `Rejection` is axum's `JsonRejection`
-    /// (`crates/eidola-server/src/handlers.rs`). Axum renders `JsonDataError`
+    /// (`crates/eidola-server-gateway/src/handlers.rs`). Axum renders `JsonDataError`
     /// as `(422, String)` — **`text/plain`, not JSON** — and the handler body
     /// never runs, so no `refund` rides the response and the ACT nullifier is
     /// never recorded.

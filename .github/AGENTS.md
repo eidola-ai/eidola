@@ -56,7 +56,7 @@ The macOS signing outputs — the signed container and the detached signature ma
 
 ## Image tagging
 
-`main` (rolling, updated per promotion), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Published to `ghcr.io/<owner>/eidola-{server,cli,postgres}`. The separate `ghcr.io/<owner>/eidola-buildcache` package (tags `server`/`cli`/`postgres`, each a single mutable ref overwritten in place) holds the BuildKit layer cache — not a release artifact.
+`main` (rolling, updated per promotion), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Published to `ghcr.io/<owner>/eidola-{server-gateway,cli,postgres}` (the gateway image is built by the `server` bake target and recorded under the manifest key `eidola-server`; releases before the rename published it as `ghcr.io/<owner>/eidola-server`, which keeps those releases' images and must not be deleted). The separate `ghcr.io/<owner>/eidola-buildcache` package (tags `server`/`cli`/`postgres`, each a single mutable ref overwritten in place) holds the BuildKit layer cache — not a release artifact.
 
 ## Other workflows
 

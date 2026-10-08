@@ -20,7 +20,7 @@ SPDX-License-Identifier = "MIT OR Apache-2.0"
 # Server layer.
 [[annotations]]
 path = [
-    "crates/eidola-server/**",
+    "crates/eidola-server-gateway/**",
     "crates/eidola-server-engine/**",
     "crates/eidola-engine/**",
     "crates/eidola-engine-model/**",
