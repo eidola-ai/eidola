@@ -64,7 +64,6 @@ use base64::Engine;
 use der::{Decode, Encode, asn1::BitString};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
-use rcgen::KeyPair;
 use rsa::sha2 as rsa_sha2;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -994,11 +993,9 @@ fn build_tls_leaf(
     (Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let tls_alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-    let tls_key = KeyPair::generate_for(tls_alg)?;
-    // rcgen 0.14 only exposes the SPKI as PEM; decode it back to DER for x509-cert.
-    let tls_pub_pem = tls_key.public_key_pem();
-    let tls_spki = <SubjectPublicKeyInfoOwned as der::DecodePem>::from_pem(&tls_pub_pem)?;
+    let tls_key = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+    let tls_spki_der = p256::pkcs8::EncodePublicKey::to_public_key_der(tls_key.verifying_key())?;
+    let tls_spki = SubjectPublicKeyInfoOwned::from_der(tls_spki_der.as_bytes())?;
 
     let leaf_subject = x509_cert::name::Name::from_str("CN=tinfoil-shim-mock")?;
     let leaf_key_id = key_id_from_spki(&tls_spki);
@@ -1019,8 +1016,10 @@ fn build_tls_leaf(
         )?),
     )?;
 
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(tls_key.serialize_der())
-        .map_err(|e| format!("invalid TLS private key DER: {e}"))?;
+    let pkcs8 = p256::pkcs8::EncodePrivateKey::to_pkcs8_der(&tls_key)?;
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8.as_bytes().to_vec()),
+    );
 
     Ok((cert_der, key_der))
 }

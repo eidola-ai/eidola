@@ -23,8 +23,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
 
-# Certificate generation (TLS leaf only — mock CA chain is built manually)
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+# The TLS leaf's ephemeral ECDSA P-256 key (every certificate is built with
+# x509-cert below)
+p256 = { version = "0.13", features = ["ecdsa", "arithmetic", "pkcs8"] }
 
 # Mock SEV-SNP certificate chain (RSA-PSS SHA-384)
 rsa = { version = "0.9", features = ["pem"] }
