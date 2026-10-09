@@ -19,9 +19,14 @@
 //!
 //! Layouts:
 //!
-//! * **Contiguous** (`MGroupedContiguous`, prefill): A, SFA and D hold every
-//!   group's rows back to back, each group's run starting on a multiple of 128
-//!   rows; `grouped_layout[row]` is the row's group, or `-1` for padding rows.
+//! * **Psum** (`MGroupedContiguousWithPsumLayout`, prefill): A, SFA and D hold
+//!   every group's rows back to back in group order, group `g`'s run starting
+//!   at the previous run's end rounded up to 128 rows; `grouped_layout[g]` is
+//!   the end of group `g`'s rows (a prefix sum over the groups, 256 words).
+//!   The scheduler visits only each group's own blocks and narrows a group's
+//!   last block to its rows rounded up to 16, so the work follows the routed
+//!   rows, not M. (DeepGEMM's per-row contiguous layout runs every block of M
+//!   through the tensor cores on SM100, padding included.)
 //! * **Masked** (`MGroupedMasked`, decode): A is `[G][M][K]`, SFA `[G][K/512][M']`,
 //!   D `[G][M][N]`; `grouped_layout[g]` is the number of valid rows of group `g`.
 //!
@@ -36,15 +41,16 @@ use crate::{CudaError, Gpu, Result};
 
 /// Groups (routed experts) every instance is built for.
 pub const GROUPS: u32 = 256;
-/// The block M of the instances: contiguous-layout groups start on multiples
-/// of it.
+/// The block M of the instances: psum-layout groups start on multiples of
+/// it.
 pub const BLOCK_M: u32 = 128;
 
 /// Which grouped layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeLayout {
-    /// `m` is the total row count (a multiple of [`BLOCK_M`]).
-    Contiguous,
+    /// `m` is the row count the layout holds (a multiple of [`BLOCK_M`]):
+    /// the descriptors' bound, not the work.
+    Psum,
     /// `m` is the per-group row capacity.
     Masked,
 }
@@ -71,12 +77,8 @@ impl MoeProj {
 
     fn meta(self, layout: MoeLayout) -> &'static str {
         match (layout, self) {
-            (MoeLayout::Contiguous, MoeProj::GateUp) => {
-                "eidola_deepgemm_fp8_fp4_contiguous_gate_up_meta"
-            }
-            (MoeLayout::Contiguous, MoeProj::Down) => {
-                "eidola_deepgemm_fp8_fp4_contiguous_down_meta"
-            }
+            (MoeLayout::Psum, MoeProj::GateUp) => "eidola_deepgemm_fp8_fp4_psum_gate_up_meta",
+            (MoeLayout::Psum, MoeProj::Down) => "eidola_deepgemm_fp8_fp4_psum_down_meta",
             (MoeLayout::Masked, MoeProj::GateUp) => "eidola_deepgemm_fp8_fp4_masked_gate_up_meta",
             (MoeLayout::Masked, MoeProj::Down) => "eidola_deepgemm_fp8_fp4_masked_down_meta",
         }
@@ -88,9 +90,9 @@ impl MoeProj {
 pub struct MoeGemmArgs {
     pub layout: MoeLayout,
     pub proj: MoeProj,
-    /// Rows: total (contiguous) or per group (masked).
+    /// Rows: the layout's bound (psum) or per group (masked).
     pub m: u32,
-    /// `i32` per row (contiguous) or per group (masked).
+    /// `i32` per group: its rows' end (psum) or its row count (masked).
     pub grouped_layout: u64,
     pub a: u64,
     pub sfa: u64,
@@ -123,7 +125,7 @@ impl MoeGemmArgs {
         let m = self.m as u64;
         let g = GROUPS as u64;
         let groups_m = match self.layout {
-            MoeLayout::Contiguous => 1,
+            MoeLayout::Psum => 1,
             MoeLayout::Masked => g,
         };
         let m4 = m.div_ceil(4) * 4;
@@ -189,7 +191,7 @@ impl MoeGemmArgs {
     pub fn check(&self) -> Result<()> {
         let ok = self.m > 0
             && match self.layout {
-                MoeLayout::Contiguous => self.m.is_multiple_of(BLOCK_M),
+                MoeLayout::Psum => self.m.is_multiple_of(BLOCK_M),
                 MoeLayout::Masked => true,
             };
         if ok {
@@ -210,7 +212,7 @@ impl MoeGemm {
     pub fn from_module(module: KernelModule) -> Result<MoeGemm> {
         module.expect_image("deepgemm_fp8_fp4_grouped")?;
         let mut kernels = Vec::new();
-        for layout in [MoeLayout::Contiguous, MoeLayout::Masked] {
+        for layout in [MoeLayout::Psum, MoeLayout::Masked] {
             for proj in [MoeProj::GateUp, MoeProj::Down] {
                 let entry = module
                     .cubin()

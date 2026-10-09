@@ -567,9 +567,11 @@ impl<E: Executor> Engine<E> {
     /// drafts keeps the full width: it is off the executor's fast path whatever its width.
     ///
     /// On the CUDA executor the limit is the masked expert layout's 128 tokens: past it
-    /// the target pass takes the contiguous layout, measured at 41-44 ms a step for 64
-    /// decode rows drafting two or three tokens against 15 ms for one, so a wide step at
-    /// high concurrency produces fewer tokens per second than a narrow one.
+    /// the target pass leaves that layout. Under the per-row contiguous layout it then
+    /// took, a step of 64 decode rows drafting two or three tokens measured 41-44 ms
+    /// against 15 ms for one, so a wide step at high concurrency produced fewer tokens
+    /// per second than a narrow one; the psum layout that replaced it is to be measured
+    /// before the limit moves.
     fn narrow_drafts(&mut self, planned: &mut [Planned]) {
         let limit = self.spec.draft_step_tokens;
         let k = planned

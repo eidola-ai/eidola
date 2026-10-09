@@ -10,6 +10,7 @@ use common::{Lcg, setup};
 use eidola_engine_cuda::bf16;
 use eidola_engine_cuda::engine_ops::{
     COMBINE_WIDTH, EngineOps, ROUTER_CLUSTER, ROUTER_THREADS, ROUTER_TILED_THREADS, RouterForm,
+    expert_placement, psum_rows,
 };
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::{Gpu, ImageArch, Kernel};
@@ -22,11 +23,10 @@ const EXPERTS: usize = 256;
 const TOP_K: usize = 8;
 const INTER: usize = 2048;
 const CAP: usize = 128;
-const BLOCK_M: usize = 128;
 /// Token counts: decode rows, a masked-layout batch, the largest masked one,
-/// contiguous ones (513 leaves the tiled router a one-token last tile), and a
-/// full prefill step.
-const TOKENS: [usize; 8] = [1, 2, 7, 64, 128, 513, 2048, 8192];
+/// psum ones (the smallest, and 513 leaves the tiled router a one-token last
+/// tile), and a full prefill step.
+const TOKENS: [usize; 9] = [1, 2, 7, 64, 128, 129, 513, 2048, 8192];
 /// Both router forms, whatever the token count.
 const FORMS: [RouterForm; 2] = [RouterForm::PerToken, RouterForm::Tiled];
 
@@ -360,7 +360,7 @@ fn router_matches_model_routing() {
 }
 
 /// Distinct experts per token, skewed toward low ids so some experts take
-/// more than one 128-row block in the contiguous layout.
+/// more than one 128-row block in the psum layout.
 fn topk_ids(rng: &mut Lcg, tokens: usize) -> Vec<i32> {
     let mut ids = Vec::with_capacity(tokens * TOP_K);
     for _ in 0..tokens {
@@ -393,8 +393,7 @@ impl Layout {
                 cap: CAP,
             }
         } else {
-            let n = tokens * TOP_K;
-            let rows = (n + n.min(EXPERTS) * (BLOCK_M - 1)).div_ceil(BLOCK_M) * BLOCK_M;
+            let rows = psum_rows(tokens, TOP_K);
             Layout {
                 rows,
                 rows4: rows.div_ceil(4) * 4,
@@ -416,12 +415,38 @@ impl Layout {
     }
 }
 
-/// The executor's placement of `ids`: `row_of` per pair, read back.
+/// The executor's placement of `ids` (`row_of` per pair, read back), checked
+/// word for word against its host form along with the grouped layout.
 fn place(gpu: &Gpu, ops: &EngineOps, ids: &[i32], tokens: usize, layout: &Layout) -> Vec<i32> {
+    let (row_of, grouped) = permute(gpu, ops, ids, tokens, layout);
+    let (want_row_of, want_grouped) = expert_placement(ids, u32_of(layout.cap));
+    assert_eq!(row_of, want_row_of, "{tokens} tokens: row_of");
+    assert_eq!(grouped, want_grouped, "{tokens} tokens: grouped layout");
+    let mut seen = vec![false; layout.rows];
+    for &r in &row_of {
+        let r = usize::try_from(r).unwrap();
+        assert!(
+            r < layout.rows && !seen[r],
+            "row {r} out of range or taken twice"
+        );
+        seen[r] = true;
+    }
+    row_of
+}
+
+/// `eidola_moe_permute` over `ids`: `row_of` and the grouped layout, read
+/// back; both start as sentinels, so a word the kernel leaves reads -7.
+fn permute(
+    gpu: &Gpu,
+    ops: &EngineOps,
+    ids: &[i32],
+    tokens: usize,
+    layout: &Layout,
+) -> (Vec<i32>, Vec<i32>) {
     let s = gpu.stream();
     let dids = s.clone_htod(ids).unwrap();
-    let grouped = s.alloc_zeros::<i32>(layout.rows.max(EXPERTS)).unwrap();
-    let row_of = s.alloc_zeros::<i32>(tokens * TOP_K).unwrap();
+    let grouped = s.clone_htod(&vec![-7i32; EXPERTS]).unwrap();
+    let row_of = s.clone_htod(&vec![-7i32; ids.len()]).unwrap();
     unsafe {
         ops.moe_permute(
             gpu,
@@ -435,17 +460,62 @@ fn place(gpu: &Gpu, ops: &EngineOps, ids: &[i32], tokens: usize, layout: &Layout
         )
         .unwrap();
     }
-    let row_of = s.clone_dtoh(&row_of).unwrap();
-    let mut seen = vec![false; layout.rows];
-    for &r in &row_of {
-        let r = usize::try_from(r).unwrap();
-        assert!(
-            r < layout.rows && !seen[r],
-            "row {r} out of range or taken twice"
-        );
-        seen[r] = true;
+    (
+        s.clone_dtoh(&row_of).unwrap(),
+        s.clone_dtoh(&grouped).unwrap(),
+    )
+}
+
+/// The placement equals its host form word for word, in the masked layout
+/// (up to 128 tokens) and the psum one (every count), over spread and
+/// concentrated routing (runs of many blocks), and an id outside the experts
+/// is placed nowhere: its `row_of` word is left as it was and it counts for
+/// no expert.
+#[test]
+fn permute_matches_host_placement() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    for &arch in &su.archs {
+        let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
+        for &tokens in &TOKENS {
+            let mut rng = Lcg(0x5e7 ^ tokens as u64);
+            let spread = topk_ids(&mut rng, tokens);
+            // Every token on 8 of the first 12 experts.
+            let concentrated: Vec<i32> = (0..tokens)
+                .flat_map(|t| (0..TOP_K).map(move |j| i32::try_from((t + 3 * j) % 12).unwrap()))
+                .collect();
+            let mut stray = spread.clone();
+            for i in (0..stray.len()).step_by(37) {
+                stray[i] = if i % 2 == 0 { -1 } else { 256 };
+            }
+            let psum = Layout {
+                rows: psum_rows(tokens, TOP_K),
+                rows4: 0,
+                cap: 0,
+            };
+            let masked = Layout::for_tokens(tokens.min(CAP));
+            for (what, ids) in [
+                ("spread", &spread),
+                ("concentrated", &concentrated),
+                ("stray", &stray),
+            ] {
+                for layout in [&psum, &masked] {
+                    if layout.cap != 0 && tokens > layout.cap {
+                        continue;
+                    }
+                    let (row_of, grouped) = permute(gpu, &ops, ids, tokens, layout);
+                    let (want_row_of, want_grouped) = expert_placement(ids, u32_of(layout.cap));
+                    let want_row_of: Vec<i32> = want_row_of
+                        .iter()
+                        .map(|&r| if r < 0 { -7 } else { r })
+                        .collect();
+                    let tag = format!("{arch:?} {tokens} tokens {what} cap {}", layout.cap);
+                    assert_eq!(row_of, want_row_of, "{tag}: row_of");
+                    assert_eq!(grouped, want_grouped, "{tag}: grouped layout");
+                }
+            }
+        }
     }
-    row_of
 }
 
 const SENTINEL_BYTE: u8 = 0xa5;

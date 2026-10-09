@@ -308,8 +308,8 @@ impl CudaExecutor {
             kv_groups,
             max_draft_tokens: cfg.draft_tokens,
             // A target pass of at most this many tokens takes the masked
-            // expert layout; past it the contiguous layout costs several
-            // times as much (`AGENTS.md` → Drafting).
+            // expert layout, past it the psum one (`AGENTS.md` → Drafting:
+            // the limit stays until the psum layout's step cost is measured).
             draft_step_tokens: crate::model::MASKED_TOKENS,
             num_state_slots: cfg.num_state_slots,
             buckets: cfg.buckets.clone(),

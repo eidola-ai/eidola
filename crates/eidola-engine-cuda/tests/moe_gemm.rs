@@ -147,8 +147,19 @@ fn run(proj: MoeProj, layout: MoeLayout) {
     let (n, k) = (proj.n() as usize, proj.k() as usize);
     let g_all = GROUPS as usize;
     let mut rng = Lcg(91 + k as u64);
-    // Active groups and their row counts (one empty group in the masked case).
-    let active: Vec<(usize, usize)> = vec![(3, 130), (17, 128), (200, 5), (255, 1), (40, 0)];
+    // Active groups and their row counts, out of group order: two runs past
+    // one block, a full block, short runs whose last block the psum
+    // scheduler narrows (5 and 1 rows), an empty group, and the first and
+    // last groups.
+    let active: Vec<(usize, usize)> = vec![
+        (3, 130),
+        (17, 128),
+        (200, 5),
+        (255, 1),
+        (40, 0),
+        (0, 33),
+        (41, 250),
+    ];
     let experts: Vec<Expert> = active.iter().map(|_| expert(&mut rng, n, k)).collect();
 
     // B and SFB for all groups; only the active ones hold data.
@@ -177,25 +188,35 @@ fn run(proj: MoeProj, layout: MoeLayout) {
     // Lay A, SFA, D and the grouped layout out.
     let (m, a, sfa, layout_vec, offsets): (usize, Vec<u8>, Vec<i32>, Vec<i32>, Vec<usize>) =
         match layout {
-            MoeLayout::Contiguous => {
-                let mut offsets = Vec::new();
+            MoeLayout::Psum => {
+                // Runs in group order, each from the previous run's end
+                // rounded up to a block; the layout holds a few spare blocks
+                // past the last run, as the executor's bound does.
+                let mut order: Vec<usize> = (0..active.len()).collect();
+                order.sort_by_key(|&i| active[i].0);
+                let mut offsets = vec![0usize; active.len()];
+                let mut ends = vec![0i32; g_all];
                 let mut total = 0usize;
-                for &(_, r) in &active {
-                    offsets.push(total);
-                    total += r.div_ceil(BLOCK_M as usize) * BLOCK_M as usize;
+                let mut gi = 0usize;
+                for (g, end) in ends.iter_mut().enumerate() {
+                    while gi < order.len() && active[order[gi]].0 == g {
+                        let (_, r) = active[order[gi]];
+                        offsets[order[gi]] = total;
+                        total += r;
+                        gi += 1;
+                    }
+                    *end = i32::try_from(total).unwrap();
+                    total = total.div_ceil(BLOCK_M as usize) * BLOCK_M as usize;
                 }
-                let mut a = vec![0u8; total * k];
-                let mut scales = vec![127u8; total * k / 128];
-                let mut gl = vec![-1i32; total];
-                for (((g, r), off), (codes, sc, _)) in active.iter().zip(&offsets).zip(&rows) {
+                let m = total + 2 * BLOCK_M as usize;
+                let mut a = vec![0u8; m * k];
+                let mut scales = vec![127u8; m * k / 128];
+                for ((&(_, r), off), (codes, sc, _)) in active.iter().zip(&offsets).zip(&rows) {
                     a[off * k..(off + r) * k].copy_from_slice(codes);
                     scales[off * k / 128..(off + r) * k / 128].copy_from_slice(sc);
-                    for row in 0..*r {
-                        gl[off + row] = i32::try_from(*g).unwrap();
-                    }
                 }
-                let sfa = sfa_words(&scales, total, k);
-                (total, a, sfa, gl, offsets)
+                let sfa = sfa_words(&scales, m, k);
+                (m, a, sfa, ends, offsets)
             }
             MoeLayout::Masked => {
                 let cap = 2 * BLOCK_M as usize;
@@ -220,7 +241,7 @@ fn run(proj: MoeProj, layout: MoeLayout) {
     let dsfa = s.clone_htod(&sfa).unwrap();
     let dgl = s.clone_htod(&layout_vec).unwrap();
     let d_rows = match layout {
-        MoeLayout::Contiguous => m,
+        MoeLayout::Psum => m,
         MoeLayout::Masked => m * g_all,
     };
     for &arch in &su.archs {
@@ -253,13 +274,13 @@ fn run(proj: MoeProj, layout: MoeLayout) {
 }
 
 #[test]
-fn contiguous_gate_up() {
-    run(MoeProj::GateUp, MoeLayout::Contiguous);
+fn psum_gate_up() {
+    run(MoeProj::GateUp, MoeLayout::Psum);
 }
 
 #[test]
-fn contiguous_down() {
-    run(MoeProj::Down, MoeLayout::Contiguous);
+fn psum_down() {
+    run(MoeProj::Down, MoeLayout::Psum);
 }
 
 #[test]

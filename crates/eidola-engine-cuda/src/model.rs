@@ -188,15 +188,6 @@ fn round_up(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
 }
 
-/// Rows the contiguous expert layout can need for `tokens` tokens.
-fn contiguous_rows(tokens: usize, top_k: usize, experts: usize) -> usize {
-    let n = tokens * top_k;
-    round_up(
-        n + n.min(experts) * (BLOCK_M as usize - 1),
-        BLOCK_M as usize,
-    )
-}
-
 pub struct GpuModel {
     pub(crate) weights: ModelWeights,
     pub(crate) kernels: Kernels,
@@ -238,7 +229,6 @@ pub(crate) struct ScratchSizes {
     eact_sf: usize,
     sel: usize,
     logits: usize,
-    erows: usize,
     experts: usize,
     rows: usize,
 }
@@ -367,7 +357,6 @@ impl ScratchSizes {
             eact_sf,
             sel,
             logits,
-            erows,
             experts,
             rows,
         })
@@ -423,7 +412,6 @@ impl GpuModel {
             eact_sf,
             sel,
             logits,
-            erows,
             experts,
             rows,
         } = ScratchSizes::new(
@@ -454,7 +442,7 @@ impl GpuModel {
             topk_ids: s.alloc_zeros(topk)?,
             topk_w: s.alloc_zeros(topk)?,
             row_of: s.alloc_zeros(topk)?,
-            grouped: s.alloc_zeros(erows.max(experts))?,
+            grouped: s.alloc_zeros(experts.max(1))?,
             ea: s.alloc_zeros(eah)?,
             esf: s.alloc_zeros(esf)?,
             egu: s.alloc_zeros(egu)?,
@@ -1312,8 +1300,8 @@ unsafe fn layer(
                         MASKED_CAP32,
                     )
                 } else {
-                    let r = contiguous_rows(t, m.top_k as usize, m.experts as usize);
-                    (MoeLayout::Contiguous, r, 0)
+                    let r = crate::engine_ops::psum_rows(t, m.top_k as usize);
+                    (MoeLayout::Psum, r, 0)
                 };
                 let rows4: u32 = narrow(round_up(rows, 4), "padded expert rows")?;
                 let rows32: u32 = narrow(rows, "expert rows")?;

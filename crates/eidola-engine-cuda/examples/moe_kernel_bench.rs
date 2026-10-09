@@ -1,27 +1,34 @@
 //! Per-launch device time of the expert path's kernels (the router in both
 //! forms, gather, SwiGLU, combine) and the fused-QKV RoPE + KV write against
-//! their single-block reference forms (`engine_ops_reference.cu`), at Flash's
-//! shapes on synthetic data, per token count. No checkpoint needed.
+//! their single-block reference forms (`engine_ops_reference.cu`), and of the
+//! placement and both grouped GEMMs (no reference form; zero weights for all
+//! 256 experts), at Flash's shapes on synthetic data, per token count. No
+//! checkpoint needed.
 //!
 //! ```text
-//! moe_kernel_bench <kernels_dir> [--iters N] [--tokens 1,2,4,...]
+//! moe_kernel_bench <kernels_dir> [--iters N] [--tokens 1,2,4,...] [--layout executor|psum]
 //! ```
 //!
 //! Each measurement enqueues `--iters` launches (default 200) behind a
 //! long-running launch, so the device runs them back to back whatever the
 //! host's launch rate, and divides the time between two events around them.
 //! The expert layout is the executor's for that token count (masked up to 128
-//! tokens, contiguous above), placed from the router's own selection. The
+//! tokens, psum above), placed from the router's own selection; `--layout
+//! psum` takes the psum layout at every count, to compare it with the masked
+//! one at 128 tokens and below. The
 //! router is timed in both forms at every token count (`router/token`,
 //! `router/tiled`), with the form the executor picks marked `*`: the data
 //! `ROUTER_PER_TOKEN_MAX` is chosen from. `qkv` is a sliding layer's (two KV
 //! heads per chunk). Prints a table and one JSON line per kernel and token
-//! count (`{"kernel", "tokens", "new_us", "reference_us", "executor"}`).
+//! count (`{"kernel", "tokens", "new_us", "reference_us", "executor"}`;
+//! `reference_us` is null for a kernel without a reference form).
 
 use cudarc::driver::sys::CUevent_flags;
 use eidola_engine_cuda::bf16;
+use eidola_engine_cuda::engine_ops::psum_rows;
 use eidola_engine_cuda::engine_ops::{EngineOps, QkvArgs, RouterForm};
 use eidola_engine_cuda::launch::dptr;
+use eidola_engine_cuda::moe_gemm::{GROUPS, MoeGemm, MoeGemmArgs, MoeLayout, MoeProj};
 use eidola_engine_cuda::{Gpu, KernelDir, KernelModule};
 
 const HIDDEN: u32 = 4096;
@@ -29,7 +36,6 @@ const EXPERTS: u32 = 256;
 const TOP_K: u32 = 8;
 const INTER: u32 = 2048;
 const CAP: u32 = 128;
-const BLOCK_M: u32 = 128;
 /// Tokens of the launch that keeps the device busy while the timed launches
 /// are enqueued (the reference router at this size runs for milliseconds).
 const HEAD_START_TOKENS: u32 = 4096;
@@ -93,6 +99,11 @@ fn main() {
     };
     let rest = &a[2..];
     let iters: usize = flag(rest, "--iters").map_or(200, |x| x.parse().unwrap());
+    let psum_only = match flag(rest, "--layout").unwrap_or("executor") {
+        "executor" => false,
+        "psum" => true,
+        other => panic!("--layout takes executor or psum, not {other}"),
+    };
     let token_counts: Vec<u32> = flag(rest, "--tokens")
         .unwrap_or("1,2,4,8,16,32,64,128,513,2048")
         .split(',')
@@ -113,7 +124,21 @@ fn main() {
         .unwrap();
     let ref_combine = reference.kernel("eidola_reference_moe_combine").unwrap();
     let ref_qkv = reference.kernel("eidola_reference_qkv_rope_kv").unwrap();
+    let moe =
+        MoeGemm::from_module(KernelModule::load(&gpu, &dir, "deepgemm_fp8_fp4_grouped").unwrap())
+            .unwrap();
     let s = gpu.stream();
+    // Every expert's weights and scales (zeros: the time does not depend on
+    // the values), so a step reads what the executor's would.
+    let expert_weights = |proj: MoeProj| {
+        let (n, k, g) = (usize_of(proj.n()), usize_of(proj.k()), usize_of(GROUPS));
+        (
+            s.alloc_zeros::<u8>(g * n * k / 2).unwrap(),
+            s.alloc_zeros::<i32>(g * (k / 128) * n).unwrap(),
+        )
+    };
+    let (gate_up_w, gate_up_sf) = expert_weights(MoeProj::GateUp);
+    let (down_w, down_sf) = expert_weights(MoeProj::Down);
 
     let max_tokens = token_counts
         .iter()
@@ -165,25 +190,33 @@ fn main() {
     );
     let mut json = Vec::new();
     for &t in &token_counts {
-        let masked = t <= CAP;
+        let masked = t <= CAP && !psum_only;
+        // Whether this count's layout is the one the executor runs.
+        let layout_is_executors = !psum_only || t > CAP;
         let (rows, cap) = if masked {
             (EXPERTS * CAP, CAP)
         } else {
-            let n = t * TOP_K;
             (
-                (n + n.min(EXPERTS) * (BLOCK_M - 1)).div_ceil(BLOCK_M) * BLOCK_M,
+                u32::try_from(psum_rows(usize_of(t), usize_of(TOP_K))).unwrap(),
                 0,
             )
         };
         let rows4 = rows.div_ceil(4) * 4;
-        let mut report = |kernel: &str, executor: bool, new_us: f64, ref_us: f64| {
+        let mut report = |kernel: &str, executor: bool, new_us: f64, ref_us: Option<f64>| {
             let mark = if executor { "*" } else { " " };
-            println!(
-                "{t:>6} {kernel:>12}{mark} {new_us:>12.2} {ref_us:>14.2} {:>7.1}x",
-                ref_us / new_us
-            );
+            match ref_us {
+                Some(r) => println!(
+                    "{t:>6} {kernel:>12}{mark} {new_us:>12.2} {r:>14.2} {:>7.1}x",
+                    r / new_us
+                ),
+                None => println!(
+                    "{t:>6} {kernel:>12}{mark} {new_us:>12.2} {:>14} {:>8}",
+                    "-", "-"
+                ),
+            }
+            let ref_json = ref_us.map_or("null".to_string(), |r| format!("{r:.3}"));
             json.push(format!(
-                "{{\"kernel\":\"{kernel}\",\"tokens\":{t},\"new_us\":{new_us:.3},\"reference_us\":{ref_us:.3},\"executor\":{executor}}}"
+                "{{\"kernel\":\"{kernel}\",\"tokens\":{t},\"new_us\":{new_us:.3},\"reference_us\":{ref_json},\"executor\":{executor}}}"
             ));
         };
 
@@ -220,37 +253,35 @@ fn main() {
             "router/token",
             chosen == RouterForm::PerToken,
             per_token,
-            old,
+            Some(old),
         );
-        report("router/tiled", chosen == RouterForm::Tiled, tiled, old);
+        report(
+            "router/tiled",
+            chosen == RouterForm::Tiled,
+            tiled,
+            Some(old),
+        );
 
         // The layout from this selection.
         unsafe {
             ops.router_topk(&gpu, pid, pw, px, prw, pb, t, HIDDEN, EXPERTS, TOP_K, 1.0)
                 .unwrap();
         }
-        let grouped = s.alloc_zeros::<i32>(usize_of(rows.max(EXPERTS))).unwrap();
+        let grouped = s.alloc_zeros::<i32>(usize_of(EXPERTS)).unwrap();
         let row_of = s.alloc_zeros::<i32>(usize_of(t * TOP_K)).unwrap();
-        unsafe {
-            ops.moe_permute(
-                &gpu,
-                dptr(&grouped, s),
-                dptr(&row_of, s),
-                pid,
-                t,
-                TOP_K,
-                cap,
-                rows,
-            )
-            .unwrap();
-        }
+        let (pgrouped, prow_of) = (dptr(&grouped, s), dptr(&row_of, s));
+        let permute = time_us(&gpu, iters, &head_start, &|| unsafe {
+            ops.moe_permute(&gpu, pgrouped, prow_of, pid, t, TOP_K, cap, rows)
+                .unwrap();
+        });
+        report("permute", layout_is_executors, permute, None);
         let host_row_of = s.clone_dtoh(&row_of).unwrap();
         let mut row_src = vec![-1i32; usize_of(rows)];
         for (i, &r) in host_row_of.iter().enumerate() {
             row_src[usize::try_from(r).unwrap()] = i32::try_from(i / usize_of(TOP_K)).unwrap();
         }
         let row_src = s.clone_htod(&row_src).unwrap();
-        let (prow_of, prow_src) = (dptr(&row_of, s), dptr(&row_src, s));
+        let prow_src = dptr(&row_src, s);
 
         // Gather.
         let a = s.alloc_zeros::<u8>(usize_of(rows * HIDDEN)).unwrap();
@@ -279,7 +310,7 @@ fn main() {
             )
             .unwrap();
         });
-        report("gather", true, new, old);
+        report("gather", layout_is_executors, new, Some(old));
 
         // SwiGLU.
         let gu = s
@@ -308,7 +339,7 @@ fn main() {
             )
             .unwrap();
         });
-        report("swiglu", true, new, old);
+        report("swiglu", layout_is_executors, new, Some(old));
 
         // Combine, over the down projection's rows.
         let edown = s
@@ -334,7 +365,49 @@ fn main() {
             )
             .unwrap();
         });
-        report("combine", true, new, old);
+        report("combine", true, new, Some(old));
+
+        // The grouped GEMMs over this layout: gate/up from the gathered rows
+        // into the SwiGLU's input, down from the SwiGLU's output.
+        let (layout, m) = if masked {
+            (MoeLayout::Masked, CAP)
+        } else {
+            (MoeLayout::Psum, rows)
+        };
+        let gemm = |proj, a, sfa, b, sfb, d| {
+            let args = MoeGemmArgs {
+                layout,
+                proj,
+                m,
+                grouped_layout: pgrouped,
+                a,
+                sfa,
+                b,
+                sfb,
+                d,
+            };
+            time_us(&gpu, iters, &head_start, &|| unsafe {
+                moe.launch(&gpu, &args).unwrap();
+            })
+        };
+        let gate_up = gemm(
+            MoeProj::GateUp,
+            pa,
+            pasf,
+            dptr(&gate_up_w, s),
+            dptr(&gate_up_sf, s),
+            pgu,
+        );
+        report("gemm/gate_up", layout_is_executors, gate_up, None);
+        let down = gemm(
+            MoeProj::Down,
+            pq,
+            pqsf,
+            dptr(&down_w, s),
+            dptr(&down_sf, s),
+            pedown,
+        );
+        report("gemm/down", layout_is_executors, down, None);
 
         // Fused QKV RoPE + KV write: token i at block 1 + i / 16, slot i % 16.
         let nkv = QKV_CHUNKS * QKV_KV_HEADS;
@@ -379,7 +452,7 @@ fn main() {
         let old = time_us(&gpu, iters, &head_start, &|| unsafe {
             eidola_engine_cuda::launch!(gpu, ref_qkv, [t, 1, 1], args).unwrap();
         });
-        report("qkv", true, new, old);
+        report("qkv", true, new, Some(old));
     }
     println!();
     for line in json {
