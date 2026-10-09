@@ -149,9 +149,13 @@ fn sass_uses_the_intended_tensor_core_path() {
             assert!(mma(manifest, gemm, arch, "UTCQMMA") > 0, "{gemm} {arch}");
             assert_eq!(mma(manifest, gemm, arch, "HMMA"), 0, "{gemm} {arch}");
         }
-        let fa2 = "flashinfer_fa2_sink_paged";
-        assert!(mma(manifest, fa2, arch, "HMMA") > 0, "{arch}");
-        assert_eq!(mma(manifest, fa2, arch, "UTC"), 0, "{arch}");
+        for fa2 in [
+            "flashinfer_fa2_sink_paged",
+            "flashinfer_fa2_sink_paged_variants",
+        ] {
+            assert!(mma(manifest, fa2, arch, "HMMA") > 0, "{fa2} {arch}");
+            assert_eq!(mma(manifest, fa2, arch, "UTC"), 0, "{fa2} {arch}");
+        }
         assert!(
             mma(manifest, "cutlass_bf16_gemm", arch, "UTCHMMA") > 0,
             "{arch}"
@@ -224,6 +228,30 @@ fn entries_and_meta_records() {
     for tile in [16, 64, 128] {
         let symbol = format!("eidola_fa2_sink_paged_bf16_q{tile}");
         assert!(fa2.entry(&symbol).is_some(), "{symbol}");
+    }
+    // The bench-only shapes, named q<tile>_w<Q warps>x<KV warps>_k<MMA_KV>
+    // (the CUDA source pins each name's template arguments).
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        let variants = manifest
+            .cubin("flashinfer_fa2_sink_paged_variants", arch)
+            .expect("fa2 variants");
+        let mut symbols: Vec<&str> = variants.entries.iter().map(|e| e.symbol.as_str()).collect();
+        symbols.sort_unstable();
+        assert_eq!(
+            symbols,
+            [
+                "eidola_fa2v_anch_q128_w4x1_k4",
+                "eidola_fa2v_anch_q16_w1x1_k4",
+                "eidola_fa2v_anch_q16_w1x4_k2",
+                "eidola_fa2v_anch_q64_w4x1_k4",
+                "eidola_fa2v_anch_q64_w4x1_k8",
+                "eidola_fa2v_anch_q64_w4x4_k2",
+                "eidola_fa2v_stock_q16_w1x1_k4",
+                "eidola_fa2v_stock_q64_w4x1_k4",
+                "eidola_fa2v_stock_q64_w4x4_k2",
+            ],
+            "{arch}"
+        );
     }
     let merge = fa2
         .entry_for_meta("eidola_fa2_merge_states_bf16_d128_meta")

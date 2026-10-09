@@ -130,8 +130,12 @@
       "sha256": "8157a71f063d7857c7c1123337859f37c4de247675fc70f5f2cf0daa8a643645"
     },
     {
+      "path": "csrc/flashinfer_fa2_sink_paged_variants.cu",
+      "sha256": "90a3a6145c00cd51c61780871b9d358e1340541d16524b903f08124946054ba8"
+    },
+    {
       "path": "csrc/kernels.json",
-      "sha256": "8f94d86f6f47c1850568e6394ac9454ea4b0d3fc1281a76acc4d40f3f4418327"
+      "sha256": "a47f620b61674a6526eda38dbafb025745b16068282f4831c9ec775bfc2aed3d"
     },
     {
       "path": "csrc/rmsnorm.cu",
@@ -983,6 +987,216 @@
       }
     },
     {
+      "name": "flashinfer_fa2_sink_paged_variants",
+      "arch": "sm_100a",
+      "source": "csrc/flashinfer_fa2_sink_paged_variants.cu",
+      "profile": "flashinfer",
+      "file": "cubin/flashinfer_fa2_sink_paged_variants.sm_100a.cubin",
+      "sha256": "786676594d961e86839c5e7b753410677b3a42c99e6a7dcaabbae42800a36669",
+      "size": 601904,
+      "entries": [
+        {
+          "symbol": "eidola_fa2v_anch_q128_w4x1_k4",
+          "demangled": "eidola_fa2v_anch_q128_w4x1_k4",
+          "meta": "eidola_fa2v_anch_q128_w4x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q16_w1x1_k4",
+          "demangled": "eidola_fa2v_anch_q16_w1x1_k4",
+          "meta": "eidola_fa2v_anch_q16_w1x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q16_w1x4_k2",
+          "demangled": "eidola_fa2v_anch_q16_w1x4_k2",
+          "meta": "eidola_fa2v_anch_q16_w1x4_k2_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q64_w4x1_k4",
+          "demangled": "eidola_fa2v_anch_q64_w4x1_k4",
+          "meta": "eidola_fa2v_anch_q64_w4x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q64_w4x1_k8",
+          "demangled": "eidola_fa2v_anch_q64_w4x1_k8",
+          "meta": "eidola_fa2v_anch_q64_w4x1_k8_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q64_w4x4_k2",
+          "demangled": "eidola_fa2v_anch_q64_w4x4_k2",
+          "meta": "eidola_fa2v_anch_q64_w4x4_k2_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_stock_q16_w1x1_k4",
+          "demangled": "eidola_fa2v_stock_q16_w1x1_k4",
+          "meta": "eidola_fa2v_stock_q16_w1x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_stock_q64_w4x1_k4",
+          "demangled": "eidola_fa2v_stock_q64_w4x1_k4",
+          "meta": "eidola_fa2v_stock_q64_w4x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_stock_q64_w4x4_k2",
+          "demangled": "eidola_fa2v_stock_q64_w4x4_k2",
+          "meta": "eidola_fa2v_stock_q64_w4x4_k2_meta"
+        }
+      ],
+      "meta": [
+        "eidola_fa2v_anch_q128_w4x1_k4_meta",
+        "eidola_fa2v_anch_q16_w1x1_k4_meta",
+        "eidola_fa2v_anch_q16_w1x4_k2_meta",
+        "eidola_fa2v_anch_q64_w4x1_k4_meta",
+        "eidola_fa2v_anch_q64_w4x1_k8_meta",
+        "eidola_fa2v_anch_q64_w4x4_k2_meta",
+        "eidola_fa2v_stock_q16_w1x1_k4_meta",
+        "eidola_fa2v_stock_q64_w4x1_k4_meta",
+        "eidola_fa2v_stock_q64_w4x4_k2_meta"
+      ],
+      "mma_sass": {
+        "HMMA": 1558
+      }
+    },
+    {
+      "name": "flashinfer_fa2_sink_paged_variants",
+      "arch": "sm_100f",
+      "source": "csrc/flashinfer_fa2_sink_paged_variants.cu",
+      "profile": "flashinfer",
+      "file": "cubin/flashinfer_fa2_sink_paged_variants.sm_100f.cubin",
+      "sha256": "e94d05fd7615f3760417c9c84adf7f2b3c582daecc1bae067d678eecb06664b4",
+      "size": 601904,
+      "entries": [
+        {
+          "symbol": "eidola_fa2v_anch_q128_w4x1_k4",
+          "demangled": "eidola_fa2v_anch_q128_w4x1_k4",
+          "meta": "eidola_fa2v_anch_q128_w4x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q16_w1x1_k4",
+          "demangled": "eidola_fa2v_anch_q16_w1x1_k4",
+          "meta": "eidola_fa2v_anch_q16_w1x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q16_w1x4_k2",
+          "demangled": "eidola_fa2v_anch_q16_w1x4_k2",
+          "meta": "eidola_fa2v_anch_q16_w1x4_k2_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q64_w4x1_k4",
+          "demangled": "eidola_fa2v_anch_q64_w4x1_k4",
+          "meta": "eidola_fa2v_anch_q64_w4x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q64_w4x1_k8",
+          "demangled": "eidola_fa2v_anch_q64_w4x1_k8",
+          "meta": "eidola_fa2v_anch_q64_w4x1_k8_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q64_w4x4_k2",
+          "demangled": "eidola_fa2v_anch_q64_w4x4_k2",
+          "meta": "eidola_fa2v_anch_q64_w4x4_k2_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_stock_q16_w1x1_k4",
+          "demangled": "eidola_fa2v_stock_q16_w1x1_k4",
+          "meta": "eidola_fa2v_stock_q16_w1x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_stock_q64_w4x1_k4",
+          "demangled": "eidola_fa2v_stock_q64_w4x1_k4",
+          "meta": "eidola_fa2v_stock_q64_w4x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_stock_q64_w4x4_k2",
+          "demangled": "eidola_fa2v_stock_q64_w4x4_k2",
+          "meta": "eidola_fa2v_stock_q64_w4x4_k2_meta"
+        }
+      ],
+      "meta": [
+        "eidola_fa2v_anch_q128_w4x1_k4_meta",
+        "eidola_fa2v_anch_q16_w1x1_k4_meta",
+        "eidola_fa2v_anch_q16_w1x4_k2_meta",
+        "eidola_fa2v_anch_q64_w4x1_k4_meta",
+        "eidola_fa2v_anch_q64_w4x1_k8_meta",
+        "eidola_fa2v_anch_q64_w4x4_k2_meta",
+        "eidola_fa2v_stock_q16_w1x1_k4_meta",
+        "eidola_fa2v_stock_q64_w4x1_k4_meta",
+        "eidola_fa2v_stock_q64_w4x4_k2_meta"
+      ],
+      "mma_sass": {
+        "HMMA": 1558
+      }
+    },
+    {
+      "name": "flashinfer_fa2_sink_paged_variants",
+      "arch": "sm_103a",
+      "source": "csrc/flashinfer_fa2_sink_paged_variants.cu",
+      "profile": "flashinfer",
+      "file": "cubin/flashinfer_fa2_sink_paged_variants.sm_103a.cubin",
+      "sha256": "ad728007bb65b49004a925e39a93dea902e7646f8d46c1a536787b8be5f936eb",
+      "size": 602776,
+      "entries": [
+        {
+          "symbol": "eidola_fa2v_anch_q128_w4x1_k4",
+          "demangled": "eidola_fa2v_anch_q128_w4x1_k4",
+          "meta": "eidola_fa2v_anch_q128_w4x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q16_w1x1_k4",
+          "demangled": "eidola_fa2v_anch_q16_w1x1_k4",
+          "meta": "eidola_fa2v_anch_q16_w1x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q16_w1x4_k2",
+          "demangled": "eidola_fa2v_anch_q16_w1x4_k2",
+          "meta": "eidola_fa2v_anch_q16_w1x4_k2_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q64_w4x1_k4",
+          "demangled": "eidola_fa2v_anch_q64_w4x1_k4",
+          "meta": "eidola_fa2v_anch_q64_w4x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q64_w4x1_k8",
+          "demangled": "eidola_fa2v_anch_q64_w4x1_k8",
+          "meta": "eidola_fa2v_anch_q64_w4x1_k8_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_anch_q64_w4x4_k2",
+          "demangled": "eidola_fa2v_anch_q64_w4x4_k2",
+          "meta": "eidola_fa2v_anch_q64_w4x4_k2_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_stock_q16_w1x1_k4",
+          "demangled": "eidola_fa2v_stock_q16_w1x1_k4",
+          "meta": "eidola_fa2v_stock_q16_w1x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_stock_q64_w4x1_k4",
+          "demangled": "eidola_fa2v_stock_q64_w4x1_k4",
+          "meta": "eidola_fa2v_stock_q64_w4x1_k4_meta"
+        },
+        {
+          "symbol": "eidola_fa2v_stock_q64_w4x4_k2",
+          "demangled": "eidola_fa2v_stock_q64_w4x4_k2",
+          "meta": "eidola_fa2v_stock_q64_w4x4_k2_meta"
+        }
+      ],
+      "meta": [
+        "eidola_fa2v_anch_q128_w4x1_k4_meta",
+        "eidola_fa2v_anch_q16_w1x1_k4_meta",
+        "eidola_fa2v_anch_q16_w1x4_k2_meta",
+        "eidola_fa2v_anch_q64_w4x1_k4_meta",
+        "eidola_fa2v_anch_q64_w4x1_k8_meta",
+        "eidola_fa2v_anch_q64_w4x4_k2_meta",
+        "eidola_fa2v_stock_q16_w1x1_k4_meta",
+        "eidola_fa2v_stock_q64_w4x1_k4_meta",
+        "eidola_fa2v_stock_q64_w4x4_k2_meta"
+      ],
+      "mma_sass": {
+        "HMMA": 1558
+      }
+    },
+    {
       "name": "rmsnorm",
       "arch": "sm_100a",
       "source": "csrc/rmsnorm.cu",
@@ -1177,6 +1391,16 @@
       "file": "fatbin/flashinfer_fa2_sink_paged.fatbin",
       "sha256": "fd2bb6cdb694942a0c1e56f778e097e5edb29a65bdf540d2d211095f9d0690ba",
       "size": 492800,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "flashinfer_fa2_sink_paged_variants",
+      "file": "fatbin/flashinfer_fa2_sink_paged_variants.fatbin",
+      "sha256": "f0f685d7e4670e07565e5439187f506c1c69ed36613140eb7a7c798954c11ffd",
+      "size": 1204912,
       "archs": [
         "sm_100a",
         "sm_103a"

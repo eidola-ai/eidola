@@ -61,6 +61,11 @@
         "eidola_fa2_merge_states_bf16_d128_meta":
           "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj"
       }
+    },
+    {
+      "name": "flashinfer_fa2_sink_paged_variants",
+      "source": "flashinfer_fa2_sink_paged_variants.cu",
+      "profile": "flashinfer"
     }
   ]
 }
