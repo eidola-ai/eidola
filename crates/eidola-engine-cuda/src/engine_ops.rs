@@ -624,17 +624,17 @@ pub enum RouterForm {
 /// split form.
 ///
 /// On a B300 (`moe_kernel_bench`, MiMo-V2.6-Flash shapes, µs per layer) the
-/// one-token form costs 20.5 at 1 token, 20.9 at 8, 21.27 at 9, 21.26 at 10,
-/// 21.37 at 12 and 21.55 at 14, then 38.91 at 16, 57.3 at 32 and 93.3 at 64,
-/// growing with the token count from there: it steps up once its clusters no
-/// longer all run at once. The split form costs 25.6 at 1 token, 26.6 at 8,
-/// 27.52 at 9, 26.83 at 10, 27.54 at 12, 27.36 at 14, 27.49 at 16, 27.6 at
-/// 64, 49.7 at 256 and 825 at 8192, below the one-token form from 16 tokens
-/// on. Up to 14 tokens the one-token form saves 5–6 µs a layer, a quarter of
-/// a millisecond of a decode step over the 47 expert layers. 15 is not
-/// measured, so the bound is the largest count measured where the one-token
-/// form wins.
-pub const ROUTER_PER_TOKEN_MAX: u32 = 14;
+/// one-token form costs 20.5 at 1 token, 20.9 at 8, 21.27 at 9, 21.26 at 10
+/// and 21.37 at 12; in a second run 22.27 at 14 and 22.36 at 15, then 37.70
+/// at 16 (38.91 in the first), 57.3 at 32 and 93.3 at 64, growing with the
+/// token count from there: it steps up once its clusters no longer all run at
+/// once. The split form costs 25.6 at 1 token, 26.6 at 8, 27.52 at 9, 26.83
+/// at 10 and 27.54 at 12; 26.64 at 14 and 15 and 26.63 at 16 in the second
+/// run; 27.6 at 64, 49.7 at 256 and 825 at 8192, below the one-token form from
+/// 16 tokens on. Through 15 tokens the one-token form saves 4–6 µs a layer,
+/// about a quarter of a millisecond of a decode step over the 47 expert
+/// layers, so the bound is the last count before the step.
+pub const ROUTER_PER_TOKEN_MAX: u32 = 15;
 
 /// The form the executor routes `tokens` rows in. A function of the token
 /// count alone, so a captured decode rung, its replays and the same step run
@@ -996,11 +996,11 @@ mod tests {
     /// the form its token count picks, the same whether captured or eager.
     #[test]
     fn executor_router_picks_the_form_by_token_count() {
-        assert_eq!(ROUTER_PER_TOKEN_MAX, 14);
+        assert_eq!(ROUTER_PER_TOKEN_MAX, 15);
         for tokens in 0..=ROUTER_PER_TOKEN_MAX {
             assert_eq!(executor_router(tokens), RouterForm::PerToken, "{tokens}");
         }
-        for tokens in [15u32, 16, 64, 513, 8192, u32::MAX] {
+        for tokens in [16u32, 17, 64, 513, 8192, u32::MAX] {
             assert_eq!(executor_router(tokens), RouterForm::Split, "{tokens}");
         }
         // Decode rungs of one token per row; drafted rungs of four (width 3).

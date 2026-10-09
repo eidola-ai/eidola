@@ -24,10 +24,10 @@ const EXPERTS: usize = 256;
 const TOP_K: usize = 8;
 const INTER: usize = 2048;
 /// Token counts: decode rows, the executor's last one-token-form count and the
-/// first past it (14 and 15), decode batches (64 and 128 tokens, and 129, one
+/// first past it (15 and 16), decode batches (64 and 128 tokens, and 129, one
 /// past a block of rows), 513 (which leaves the split router a one-token last
 /// tile), and a full prefill step.
-const TOKENS: [usize; 11] = [1, 2, 7, 14, 15, 64, 128, 129, 513, 2048, 8192];
+const TOKENS: [usize; 11] = [1, 2, 7, 15, 16, 64, 128, 129, 513, 2048, 8192];
 /// Both router forms, whatever the token count.
 const FORMS: [RouterForm; 2] = [RouterForm::PerToken, RouterForm::Split];
 
