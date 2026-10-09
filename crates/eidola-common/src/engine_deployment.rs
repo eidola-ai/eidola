@@ -196,10 +196,12 @@ pub const SUPPORTED_GPU: &str = "NVIDIA B300 SXM6 AC";
 pub const SUPPORTED_GPU_MEMORY_BYTES: u64 = 287_428_640_768;
 
 /// Device memory the CUDA executor holds whatever its sizing: the CUDA
-/// context, the loaded kernel modules, the decode graphs' captures (a few
-/// MiB a rung; with drafting, a ladder for each draft width), and the slack of the weights' device layouts over their file
-/// bytes (each fused QKV chunk padded to whole 128-row tiles, norm and bias
-/// vectors widened to f32): 4 GiB.
+/// context, the loaded kernel modules, the graphs' captures (a few MiB a
+/// rung: the decode ladder and, without drafting, the mixed-step ladder of
+/// at most 32 rungs; with drafting, a decode ladder for each draft width),
+/// and the slack of the weights' device layouts over their file bytes (each
+/// fused QKV chunk padded to whole 128-row tiles, norm and bias vectors
+/// widened to f32): 4 GiB.
 pub const DEVICE_FIXED_RESERVE_BYTES: u64 = 4 << 30;
 
 /// Device scratch per token a step may hold (`MAX_BATCHED_TOKENS`), at
@@ -252,6 +254,16 @@ pub fn drafter_seat_rows(draft_tokens: u32) -> u64 {
 /// three depths) are inside [`STEP_TOKEN_DEVICE_BYTES`]'s rounding.
 pub const DRAFT_TABLE_SEAT_BYTES: u64 = 32 << 10;
 
+/// Step-table bytes an undrafted executor may hold per seat beside its
+/// global page lists, in the decode graphs' table, the mixed-step graphs'
+/// table and an eager step's work lists together: the sliding group's page
+/// lists (the window's pages and one more, at most 130 words a list at a
+/// one-position block) and the per-row logit, sample and work-list arrays
+/// (about 40 words a table), bounded by 4 KiB. The mixed table's per-token
+/// arrays (about 25 words a token, for at most 512 tokens) are inside
+/// [`STEP_TOKEN_DEVICE_BYTES`]'s rounding.
+pub const GRAPH_TABLE_SEAT_BYTES: u64 = 4 << 10;
+
 /// RoPE table bytes per position (`MAX_MODEL_LEN`): 64 f32 for each distinct
 /// θ, at most three.
 pub const ROPE_DEVICE_BYTES_PER_POSITION: u64 = 3 * 64 * 4;
@@ -263,11 +275,14 @@ pub const ROPE_DEVICE_BYTES_PER_POSITION: u64 = 3 * 64 * 4;
 /// [`SAMPLER_ROW_DEVICE_BYTES`], the device block tables (`MAX_SEQS` ×
 /// ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉ `i32` entries per KV group,
 /// [`kv_groups`]) and the RoPE tables
-/// ([`ROPE_DEVICE_BYTES_PER_POSITION`] per `MAX_MODEL_LEN`). With
-/// `DRAFT_TOKENS` `k` > 0, per `MAX_SEQS` also [`drafter_seat_rows`] rows of
-/// 16 KiB, [`DRAFT_TABLE_SEAT_BYTES`], and the global page lists of a
-/// drafted step's table twice over (a graph's and an eager step's, one
-/// `i32` per block of `MAX_MODEL_LEN`). The MTP layers' own scratch (their
+/// ([`ROPE_DEVICE_BYTES_PER_POSITION`] per `MAX_MODEL_LEN`). Without
+/// drafting, per `MAX_SEQS` also [`GRAPH_TABLE_SEAT_BYTES`] and three global
+/// page lists (the decode graphs' table, the mixed-step graphs' table and an
+/// eager step's work list, one `i32` per block of `MAX_MODEL_LEN` each).
+/// With `DRAFT_TOKENS` `k` > 0, per `MAX_SEQS` instead
+/// [`drafter_seat_rows`] rows of 16 KiB, [`DRAFT_TABLE_SEAT_BYTES`], and the
+/// global page lists of a drafted step's table twice over (a graph's and an
+/// eager step's). The MTP layers' own scratch (their
 /// copy lists, 36 bytes a token) and the drafted step's copy of the target's
 /// states (one 16 KiB row a token) are inside [`STEP_TOKEN_DEVICE_BYTES`]'s
 /// rounding, and their weights inside the pack. Saturates.
@@ -283,7 +298,7 @@ pub fn cuda_device_reserve_bytes(sizing: &Sizing) -> u64 {
         .saturating_add(if drafting {
             DRAFT_TABLE_SEAT_BYTES.saturating_add(blocks_per_seq.saturating_mul(2 * 4))
         } else {
-            0
+            GRAPH_TABLE_SEAT_BYTES.saturating_add(blocks_per_seq.saturating_mul(3 * 4))
         });
     DEVICE_FIXED_RESERVE_BYTES
         .saturating_add(
@@ -1582,20 +1597,27 @@ mod tests {
             max_age_secs: 3600,
         };
         // 4 GiB fixed; 8,192 step tokens × 1.25 MiB; the 1.5 GiB expert
-        // floor; 64 seats × one sampler row of 1.25 MiB; 64 × 8,192 table
-        // entries × 2 groups × 4 bytes; 131,072 positions × 768 bytes of RoPE
-        // tables.
+        // floor; 64 seats × (one sampler row of 1.25 MiB, 4 KiB of graph
+        // tables and three global page lists of 8,192 entries); 64 × 8,192
+        // table entries × 2 groups × 4 bytes; 131,072 positions × 768 bytes
+        // of RoPE tables.
         let reserve = cuda_device_reserve_bytes(&sizing);
         assert_eq!(
             reserve,
             (4 << 30)
                 + 8192 * (5 << 18)
                 + 65_536 * (24 << 10)
-                + 64 * (5 << 18)
+                + 64 * ((5 << 18) + (4 << 10) + 3 * 8192 * 4)
                 + 64 * 8192 * 8
                 + 131_072 * 768
         );
-        assert_eq!(reserve, 16_831_741_952);
+        assert_eq!(reserve, 16_838_295_552);
+        // The mixed-step graphs' page reservation per seat (the global
+        // group's: every block of the sequence and one more) is one of the
+        // three lists, and its sliding list fits the 4 KiB with the decode
+        // table's and an eager step's: the window's pages and one more each,
+        // at the smallest block.
+        const { assert!(3 * (128 + 2) * 4 < GRAPH_TABLE_SEAT_BYTES) };
         // A sampler row holds an f64 distribution over every id of the head.
         const { assert!(SAMPLER_ROW_DEVICE_BYTES >= 152_576 * 8) };
         // Drafting three tokens: per seat 8 sampler rows, 39 rows of 16 KiB
