@@ -2701,7 +2701,10 @@ mod tests {
         };
         assert_eq!(p.shape.page_size, 1);
         assert!(!p.shape.split);
+        let mut next = 0usize;
         for (q0, n, pages, kv_len) in pass_requests(w, p) {
+            assert_eq!(q0, next, "depth {depth}: queries in order");
+            next = q0 + n;
             let (r, first) = op_rows[q0];
             let (_, last) = op_rows[q0 + n - 1];
             assert!(op_rows[q0..q0 + n].iter().all(|&(rr, _)| rr == r));
@@ -2710,8 +2713,17 @@ mod tests {
             let window = AttentionKind::Sliding {
                 window: ctx.drafter_window,
             };
-            let lo = window.first_visible(first).max(depth + 1);
+            // The row's run in this launch starts at its first query here;
+            // its pieces share the run's anchor, each inside one KV tile.
+            let run_first = op_rows
+                .iter()
+                .find(|&&(rr, _)| rr == r)
+                .map(|&(_, x)| x)
+                .expect("the row has queries");
+            let lo = window.first_visible(run_first).max(depth + 1);
             let start = last + 1 - kv_len;
+            let tile = crate::attention::KV_TILE;
+            assert_eq!((first - start) / tile, (last - start) / tile);
             assert!(
                 start <= lo && start > depth,
                 "depth {depth} row {r}: {start}"
@@ -2728,12 +2740,14 @@ mod tests {
                 "depth {depth} row {r} queries {first}..={last}"
             );
         }
+        assert_eq!(next, op_rows.len(), "depth {depth}: every query once");
     }
 
-    /// The target's requests: sliding ones a row each, from the anchor below
-    /// the row's window; global ones the row's queries cut at multiples of
-    /// the split, each from position 0 through its last query; every query
-    /// in exactly one request, in order.
+    /// The target's requests: each row's queries cut at every KV tile of
+    /// keys (counted from its first listed page: position 0 for global
+    /// layers, the anchor below the row's window for sliding ones), each
+    /// piece listing pages from there through its last query; every query in
+    /// exactly one request, in order.
     fn check_target_pages(
         w: &World,
         plan: &[PassAt],
@@ -2743,7 +2757,7 @@ mod tests {
         g: usize,
         ctx: &PlanCtx,
     ) {
-        use crate::attention::{KV_TILE, MASKED_PAGE, SPLIT_KEYS};
+        use crate::attention::{KV_TILE, MASKED_PAGE};
         let bs = ctx.block_size;
         let attention = ctx.targets[g].attention;
         let mut next = 0usize;
@@ -2758,16 +2772,14 @@ mod tests {
                 assert_eq!(n, (last - first + 1) as usize);
                 let row = &rows[r];
                 let start = last + 1 - kv_len;
+                // A piece of the row's run inside one KV tile, cut only at
+                // KV tiles (counted from its first listed page).
+                assert_eq!((first - start) / KV_TILE, (last - start) / KV_TILE);
+                assert!(first == row.c || (first - start).is_multiple_of(KV_TILE));
+                assert!(last == row.p() + row.k || (last + 1 - start).is_multiple_of(KV_TILE));
                 if p.shape.split {
                     assert_eq!(start, 0);
-                    assert_eq!(
-                        first / SPLIT_KEYS,
-                        last / SPLIT_KEYS,
-                        "a piece in one chunk"
-                    );
-                    assert!(first == row.c || first.is_multiple_of(SPLIT_KEYS));
                 } else {
-                    assert_eq!((first, last), (row.c, row.p() + row.k));
                     let lo = attention.first_visible(row.c);
                     assert!(
                         start <= lo && lo - start < KV_TILE * bs,

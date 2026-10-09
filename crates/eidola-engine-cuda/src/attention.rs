@@ -5,14 +5,14 @@
 //!
 //! **Batch invariance.** A row's output depends only on its own query, the
 //! keys it sees and its position: never on the other rows of its step, how
-//! the step was chunked, or which query tile it landed in. Three rules make
+//! the step was chunked, or which query tile it landed in. Four rules make
 //! that hold, each enforced here or in the kernel
 //! (`eidola-engine-kernels/csrc/flashinfer_fa2_sink_paged.cu`):
 //!
 //! - **One reduction shape.** Every instance reduces a row's softmax with one
 //!   KV warp over [`KV_TILE`]-key tiles; only the query tile (16, 64 or 128
-//!   rows, chosen per step for speed) differs, and it does not change a
-//!   row's arithmetic.
+//!   rows, chosen per step for speed) differs, and within one KV tile of
+//!   query positions (below) it does not change a row's arithmetic.
 //! - **Anchored sliding tiles** ([`Reduction::Anchored`]). A sliding
 //!   request's pages start at an anchor, its layer's origin plus a multiple
 //!   of [`KV_TILE`] positions ([`Reduction::kv_start`]), and the kernel
@@ -23,10 +23,23 @@
 //!   keys are split at absolute multiples of [`SPLIT_KEYS`], each chunk its
 //!   own work item writing a partial state, and the merge kernel combines a
 //!   row's partials in chunk order. Requests are cut at multiples of
-//!   [`SPLIT_KEYS`] of their query positions ([`HostPlan::new`]), so a row at
+//!   [`SPLIT_KEYS`] of their query positions (below), so a row at
 //!   position `p` merges exactly chunks `0 ..= p / SPLIT_KEYS`, and every row
 //!   of a work item sees at least one key of its chunk. The sink is added to
 //!   chunk 0's state only, so the merge carries it into each row once.
+//!
+//! - **Query tiles inside one KV tile.** A CTA iterates over KV tiles up to
+//!   the one its query tile's *last* row reaches, so a row whose tile mates
+//!   reach further meets fully masked KV tiles past its own last one.
+//!   Masking them is not an exact no-op: FlashInfer rescales a row's state
+//!   after every KV tile by `exp2(m_prev · s − m · s)`, which the compiler
+//!   contracts into a fused multiply-add, so an unchanged maximum rescales by
+//!   `exp2` of a rounding error rather than by exactly 1. [`HostPlan::new`]
+//!   therefore cuts every request at multiples of [`KV_TILE`] of its query
+//!   positions (counted from its first listed page): every query tile then
+//!   lies inside one KV tile, and every row's last KV tile is its own.
+//!   (Fully masked KV tiles *before* a row's first visible key are exact:
+//!   its state is still empty there, and the rescale is `exp2(−∞) = 0`.)
 //!
 //! The kernel takes FlashInfer's `PagedParams` by value inside [`AttnParams`]
 //! ([`PagedParams`] is its `repr(C)` mirror, 296 bytes; [`AttnParams`] is
@@ -512,73 +525,64 @@ impl HostPlan {
             max_page,
             passes: Vec::new(),
         };
-        match reduction {
-            Reduction::Anchored { .. } => {
-                let pieces: Vec<Piece> = requests
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| Piece {
-                        q_start: r.q_start,
-                        qo_len: r.qo_len,
-                        kv_len: r.kv_len,
-                        from: i,
-                    })
-                    .collect();
-                plan.passes.push(plan.pass(requests, &pieces)?);
-            }
-            Reduction::Split => {
-                let split = SPLIT_KEYS;
-                let mut pass: Vec<Piece> = Vec::new();
-                let mut partials = 0u64;
-                for (i, r) in requests.iter().enumerate() {
-                    // The request's queries sit at positions `first ..
-                    // r.kv_len` (its pages start at position 0); cut them at
-                    // multiples of the split, then into pieces whose partial
-                    // rows fit one pass.
-                    let first = r.kv_len - r.qo_len;
-                    let mut a = first;
-                    while a < r.kv_len {
-                        let chunk_end = (a / split + 1).saturating_mul(split).min(r.kv_len);
-                        let chunks = u64::from(a / split + 1);
-                        if chunks > u64::from(partial_rows) {
-                            return Err(bad(
-                                r,
-                                &format!(
-                                    "{chunks} chunks a query, past the {partial_rows} partial rows"
-                                ),
-                            ));
-                        }
-                        let most = u64::from(partial_rows) / chunks;
-                        let mut b = a;
-                        while b < chunk_end {
-                            // Room left in this pass, in queries.
-                            let room = (u64::from(partial_rows) - partials) / chunks;
-                            if room == 0 {
-                                plan.passes.push(plan.pass(requests, &pass)?);
-                                pass.clear();
-                                partials = 0;
-                                continue;
-                            }
-                            let n = u64::from(chunk_end - b).min(room).min(most);
-                            // Every piece takes a query: the loop always ends.
-                            assert!(n > 0, "a split piece with no queries");
-                            let n32 = u32::try_from(n).expect("below a u32 span");
-                            pass.push(Piece {
-                                q_start: r.q_start + (b - first),
-                                qo_len: n32,
-                                kv_len: b + n32,
-                                from: i,
-                            });
-                            partials += n * chunks;
-                            b += n32;
-                        }
-                        a = chunk_end;
+        // Every request is cut into pieces whose queries lie within one
+        // `KV_TILE` block of keys (counted from its first listed page): a
+        // query tile then never straddles a KV-tile boundary, so no row
+        // iterates over a KV tile past its own last one (see the module
+        // docs). A split's pieces also go in passes whose partial rows fit
+        // the scratch; a cut at every 64 keys is a cut at every 1,024 too.
+        let split = reduction.is_split();
+        let mut pass: Vec<Piece> = Vec::new();
+        let mut partials = 0u64;
+        for (i, r) in requests.iter().enumerate() {
+            // The request's queries sit at key indices `first .. r.kv_len`.
+            let first = r.kv_len - r.qo_len;
+            let mut a = first;
+            while a < r.kv_len {
+                let block_end = (a / KV_TILE + 1).saturating_mul(KV_TILE).min(r.kv_len);
+                // Partial rows a query of this block writes (a split's
+                // chunks; none when anchored).
+                let chunks = if split {
+                    u64::from(a / SPLIT_KEYS + 1)
+                } else {
+                    0
+                };
+                if chunks > u64::from(partial_rows) {
+                    return Err(bad(
+                        r,
+                        &format!("{chunks} chunks a query, past the {partial_rows} partial rows"),
+                    ));
+                }
+                let mut b = a;
+                while b < block_end {
+                    // Room left in this pass, in queries.
+                    let room = (u64::from(partial_rows) - partials)
+                        .checked_div(chunks)
+                        .unwrap_or(u64::MAX);
+                    if room == 0 {
+                        plan.passes.push(plan.pass(requests, &pass)?);
+                        pass.clear();
+                        partials = 0;
+                        continue;
                     }
+                    let n = u64::from(block_end - b).min(room);
+                    // Every piece takes a query: the loop always ends.
+                    assert!(n > 0, "an attention piece with no queries");
+                    let n32 = u32::try_from(n).expect("below a u32 span");
+                    pass.push(Piece {
+                        q_start: r.q_start + (b - first),
+                        qo_len: n32,
+                        kv_len: b + n32,
+                        from: i,
+                    });
+                    partials += n * chunks;
+                    b += n32;
                 }
-                if !pass.is_empty() || plan.passes.is_empty() {
-                    plan.passes.push(plan.pass(requests, &pass)?);
-                }
+                a = block_end;
             }
+        }
+        if !pass.is_empty() || plan.passes.is_empty() {
+            plan.passes.push(plan.pass(requests, &pass)?);
         }
         Ok(plan)
     }
@@ -731,13 +735,13 @@ impl PassCaps {
         let tiles = (u64::from(queries) * u64::from(group_size)).div_ceil(u64::from(tile));
         let rows64 = u64::from(rows);
         let fit = |x: u64| u32::try_from(x).ok().filter(|&v| i32::try_from(v).is_ok());
+        // A request of `queries` queries is cut into at most this many
+        // pieces at `KV_TILE` boundaries (`HostPlan::new`).
+        let pieces = u64::from(queries.max(1) - 1).div_ceil(u64::from(KV_TILE)) + 1;
+        let requests = rows64 * pieces;
         let caps = match reduction {
             Reduction::Split => {
-                // A request of `queries` queries crosses at most
-                // `(queries - 1) / SPLIT_KEYS + 1` chunk boundaries.
-                let pieces = u64::from(queries.max(1) - 1).div_ceil(u64::from(SPLIT_KEYS)) + 1;
                 let chunks = u64::from(max_model_len.max(1)).div_ceil(u64::from(SPLIT_KEYS));
-                let requests = rows64 * pieces;
                 let work = requests * tiles * chunks;
                 let partials = rows64 * u64::from(queries) * chunks;
                 let work32 = fit(work).ok_or_else(overflow)?;
@@ -757,7 +761,7 @@ impl PassCaps {
                 }
             }
             Reduction::Anchored { .. } => {
-                let work32 = fit(rows64 * tiles).ok_or_else(overflow)?;
+                let work32 = fit(requests * tiles).ok_or_else(overflow)?;
                 PassCaps {
                     shape: PassShape {
                         tile,
@@ -765,12 +769,12 @@ impl PassCaps {
                         group_size,
                         split: false,
                         grid: work32,
-                        num_requests: rows,
+                        num_requests: fit(requests).ok_or_else(overflow)?,
                         merge_rows: 0,
                         partial_rows: 0,
                     },
                     work_items: work32,
-                    pages: fit(rows64 * u64::from(max_pages)).ok_or_else(overflow)?,
+                    pages: fit(requests * u64::from(max_pages)).ok_or_else(overflow)?,
                 }
             }
         };
@@ -1474,6 +1478,12 @@ mod tests {
                 let kv = (pages - 1) * page + u(pass.last_page_len[i]);
                 let chunks = kv.div_ceil(SPLIT_KEYS);
                 assert!(c < chunks);
+                // The piece's queries lie inside one KV tile.
+                assert_eq!(
+                    (kv - qo) / KV_TILE,
+                    (kv - 1) / KV_TILE,
+                    "a piece across a KV tile"
+                );
                 // The tile's rows (packed rows / group size).
                 let lo = t * p.tile / group;
                 let hi = ((t + 1) * p.tile).div_ceil(group).min(qo);
@@ -1547,6 +1557,169 @@ mod tests {
         }
     }
 
+    /// Anchored requests are cut at multiples of the KV tile of their query
+    /// positions counted from their first listed page (the origin's phase):
+    /// every piece inside one KV tile, every query once, in order, the
+    /// pages a prefix of the request's.
+    #[test]
+    fn anchored_requests_are_cut_at_kv_tiles() {
+        for (origin, page) in [(0u32, 16u32), (0, 1), (3, 1)] {
+            let r = Reduction::Anchored { origin };
+            for (start, qo) in [(0u32, 300u32), (5, 64), (60, 9), (887, 300), (1037, 4)] {
+                // No query below the origin (it has no KV there).
+                let start = start.max(origin);
+                let kv_start = r.kv_start((start + 1).saturating_sub(128).max(origin), page);
+                let end = start + qo;
+                let req = AttnRequest {
+                    q_start: 0,
+                    qo_len: qo,
+                    pages: (kv_start / page..end.div_ceil(page))
+                        .map(|i| i + 1)
+                        .collect(),
+                    kv_start,
+                    kv_len: end - kv_start,
+                };
+                let plan = HostPlan::new(std::slice::from_ref(&req), 8, page, r, 0).unwrap();
+                let [pass] = plan.passes.as_slice() else {
+                    panic!("one pass")
+                };
+                let mut next = 0;
+                for i in 0..pass.num_requests() {
+                    let (q0, q1) = (u(pass.q_indptr[i]), u(pass.q_indptr[i + 1]));
+                    assert_eq!(q0, next);
+                    next = q1;
+                    let pages = u(pass.indptr[i + 1] - pass.indptr[i]);
+                    let kv = (pages - 1) * page + u(pass.last_page_len[i]);
+                    // Key indices of its queries: kv - (q1 - q0) ..= kv - 1.
+                    assert_eq!((kv - (q1 - q0)) / KV_TILE, (kv - 1) / KV_TILE);
+                    assert_eq!(kv_start + kv - 1, start + q1 - 1);
+                    let first = us(pass.indptr[i]);
+                    assert_eq!(
+                        pass.indices[first..first + pages as usize]
+                            .iter()
+                            .map(|&x| u(x))
+                            .collect::<Vec<_>>(),
+                        req.pages[..pages as usize]
+                    );
+                }
+                assert_eq!(next, qo);
+                assert!(pass.merge_indptr.is_empty());
+            }
+        }
+    }
+
+    /// The kernel's anchored attention, emulated from FlashInfer's tile
+    /// arithmetic and `AnchoredSink` over every plan's work items, sees
+    /// exactly the model's window (`eidola_engine_model::attention::visible`:
+    /// the query and its `W - 1` predecessors) at every window edge,
+    /// including the positions where a window of 128 first drops key 0; no
+    /// visible key lies outside the KV tiles a work item walks or on a masked
+    /// page; and every row's last walked KV tile is its own (the invariance
+    /// rule).
+    #[test]
+    fn anchored_attention_sees_exactly_the_models_window() {
+        use eidola_engine_model::attention::visible;
+        use eidola_engine_model::config::{AttentionKind as Kind, AttentionSpec};
+        let page = 16u32;
+        for window in [1u32, 2, 63, 64, 65, 127, 128, 129] {
+            let spec = AttentionSpec {
+                kind: Kind::Sliding {
+                    window: window as usize,
+                },
+                num_q_heads: 64,
+                num_kv_heads: 8,
+                head_dim_qk: 192,
+                head_dim_v: 128,
+                rope_dim: 64,
+                rope_theta: 1e4,
+                has_sinks: true,
+                softmax_scale: 1.0,
+            };
+            let wl = window - 1;
+            for (start, qo) in [
+                (0u32, 1u32),
+                (120, 16),
+                (126, 4),
+                (127, 1),
+                (128, 1),
+                (129, 3),
+                (100, 300),
+                (1037, 4),
+                (190, 70),
+            ] {
+                let first = (start + 1).saturating_sub(window);
+                let kv_start = ANCHORED.kv_start(first, page);
+                let end = start + qo;
+                let pages: Vec<u32> = (kv_start / page..first / page)
+                    .map(|_| MASKED_PAGE)
+                    .chain((first / page..end.div_ceil(page)).map(|i| i + 1))
+                    .collect();
+                let req = AttnRequest {
+                    q_start: 0,
+                    qo_len: qo,
+                    pages,
+                    kv_start,
+                    kv_len: end - kv_start,
+                };
+                let plan = HostPlan::new(std::slice::from_ref(&req), 8, page, ANCHORED, 0).unwrap();
+                let pass = &plan.passes[0];
+                let tile = plan.tile;
+                for w in 0..pass.work_items() {
+                    let i = us(pass.request_indices[w]);
+                    let t = u(pass.qo_tile_indices[w]);
+                    let qo_len = u(pass.q_indptr[i + 1] - pass.q_indptr[i]);
+                    let n_pages = u(pass.indptr[i + 1] - pass.indptr[i]);
+                    let kv_len = (n_pages - 1) * page + u(pass.last_page_len[i]);
+                    let page_of =
+                        |k: u32| u(pass.indices[us(pass.indptr[i]) + (k / page) as usize]);
+                    // AnchoredSink: the tile's first row's first visible key,
+                    // down to a multiple of the KV tile.
+                    let q0 = t * tile / 8;
+                    let f = (kv_len + q0).saturating_sub(qo_len + wl);
+                    let kv_begin = f / KV_TILE * KV_TILE;
+                    let last_row = ((t + 1) * tile).div_ceil(8);
+                    let reach = (kv_len - qo_len + last_row)
+                        .saturating_sub(kv_begin)
+                        .min(kv_len - kv_begin);
+                    let kv_end = kv_begin + reach.div_ceil(KV_TILE) * KV_TILE;
+                    for q in q0..last_row.min(qo_len) {
+                        let q_pos = kv_start + kv_len - qo_len + q;
+                        // The row's own last KV tile is the walk's last.
+                        let own = kv_len - qo_len + q;
+                        assert_eq!(
+                            own / KV_TILE,
+                            (kv_end - 1) / KV_TILE,
+                            "W {window} q {q_pos}"
+                        );
+                        for k_pos in 0..=q_pos + 1 {
+                            let model = visible(&spec, q_pos as usize, k_pos as usize);
+                            let Some(k) = k_pos.checked_sub(kv_start) else {
+                                assert!(
+                                    !model,
+                                    "W {window} q {q_pos}: key {k_pos} before the pages"
+                                );
+                                continue;
+                            };
+                            let kernel = k >= kv_begin
+                                && k < kv_end
+                                && k < kv_len
+                                && k + qo_len <= kv_len + q
+                                && k + qo_len + wl >= kv_len + q;
+                            assert_eq!(kernel, model, "W {window} q {q_pos} key {k_pos}");
+                            if model {
+                                assert_ne!(
+                                    page_of(k),
+                                    MASKED_PAGE,
+                                    "W {window} q {q_pos} key {k_pos}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A request is cut at multiples of the split of its query positions:
     /// pieces never straddle one, and lose no query.
     #[test]
@@ -1576,11 +1749,15 @@ mod tests {
         let p = check_split(&[global(0, 300, 2100, 16)], 8, 16, 1 << 20);
         let pass = &p.passes[0];
         assert_eq!(p.tile, 128);
-        // Queries 1800..2100: 1800..2048 (248 rows, 2 chunks), 2048..2100
-        // (52 rows, 3 chunks).
-        assert_eq!(pass.q_indptr, vec![0, 248, 300]);
+        // Queries 1800..2100, cut at every 64 keys: 1800..1856 (56 rows),
+        // three blocks of 64 to 2048 (2 chunks each), 2048..2100 (52 rows, 3
+        // chunks).
+        assert_eq!(pass.q_indptr, vec![0, 56, 120, 184, 248, 300]);
         let tiles = |q: u32| (q * 8).div_ceil(128);
-        assert_eq!(pass.work_items(), (tiles(248) * 2 + tiles(52) * 3) as usize);
+        assert_eq!(
+            pass.work_items(),
+            ((tiles(56) + 3 * tiles(64)) * 2 + tiles(52) * 3) as usize
+        );
         assert_eq!(&pass.kv_tile_indices[..4], &[0, 1, 0, 1]);
         assert_eq!(&pass.qo_tile_indices[..4], &[0, 0, 1, 1]);
         assert_eq!(*pass.o_indptr.last().unwrap(), 248 * 2 + 52 * 3);

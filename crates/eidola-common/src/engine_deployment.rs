@@ -247,7 +247,7 @@ pub fn drafter_seat_rows(draft_tokens: u32) -> u64 {
 /// page lists, in a graph's table and an eager step's together: every other
 /// per-row array of a drafted step (copy lists, token ids, positions, KV
 /// targets, work lists, the drafter's one-position page lists, sampler and
-/// acceptance rows; about 1,600 words a table for three depths), bounded by
+/// acceptance rows; about 2,400 words a table for three depths), bounded by
 /// 32 KiB. An eager step's arrays per token beyond those (about 30 words for
 /// three depths) are inside [`STEP_TOKEN_DEVICE_BYTES`]'s rounding.
 pub const DRAFT_TABLE_SEAT_BYTES: u64 = 32 << 10;
@@ -276,7 +276,7 @@ pub fn split_partial_rows(sizing: &Sizing) -> u64 {
 
 /// Step-table bytes a drafting executor holds per seat for each chunk of
 /// [`SPLIT_ATTENTION_KEYS`] of `MAX_MODEL_LEN`: a row's global work items
-/// (its verify run cut in at most two pieces at a chunk boundary, each a
+/// (its verify run cut in at most two pieces at a 64-key boundary, each a
 /// work item per chunk, three words each), in a graph's table and an eager
 /// step's.
 pub const DRAFT_TABLE_SEAT_BYTES_PER_CHUNK: u64 = 2 * 2 * 3 * 4;
@@ -297,7 +297,7 @@ pub const ROPE_DEVICE_BYTES_PER_POSITION: u64 = 3 * 64 * 4;
 /// `DRAFT_TOKENS` `k` > 0, per `MAX_SEQS` also [`drafter_seat_rows`] rows of
 /// 16 KiB, [`DRAFT_TABLE_SEAT_BYTES`], the global page lists of a drafted
 /// step's table four times over (a graph's and an eager step's, each a row's
-/// pages twice when its verify run is cut at a chunk boundary, one `i32` per
+/// pages twice when its verify run is cut at a 64-key boundary, one `i32` per
 /// block of `MAX_MODEL_LEN`), and [`DRAFT_TABLE_SEAT_BYTES_PER_CHUNK`] per
 /// chunk of `MAX_MODEL_LEN`. The MTP layers' own scratch (their
 /// copy lists, 36 bytes a token) and the drafted step's copy of the target's

@@ -5,14 +5,18 @@
 //!   Flash's shapes, no checkpoint): four probe rows at positions `p ..= p +
 //!   3`, for global layers (4 KV heads, split at 1,024 keys and merged) and
 //!   sliding ones (8 KV heads, window 128, sinks, anchored), at contexts
-//!   around and past the first chunk boundary (1,000, 1,022, 1,037, 2,047,
-//!   4,101, 16,389). Each probe alone in its own launch is the baseline;
+//!   where the window first drops key 0 (126), around and past the first
+//!   chunk boundary (1,000, 1,022, 1,037), before a 64-key boundary (1,084)
+//!   and long ones (2,047, 4,101, 16,389). Each probe alone in its own launch is the baseline;
 //!   every other scenario must give its rows bit for bit:
 //!   - `+prefill`: the four as decode rows beside another sequence's
 //!     300-query chunk;
 //!   - `verify`: one request of four queries (a drafted decode row, `k = 3`);
 //!   - `chunk300` / `chunk2048`: inside a prefill chunk of 300 / 2,048
-//!     queries starting 150 / 1,000 positions before `p`;
+//!     queries starting 150 / 1,000 positions before `p` (or at 0);
+//!   - `chunk300@-13`: inside a 300-query chunk starting 13 before `p`, so
+//!     at `p` = 126 and 1,084 the probes' query tiles cross a 64-key boundary
+//!     (a row's walk must still end at its own last KV tile);
 //!   - `chunk2048/passes`: the same chunk planned with a partial-row scratch
 //!     of one row's chunks plus one, so its global work list runs in many
 //!     passes.
@@ -24,7 +28,7 @@
 //! - **The executor** (`executor_logits_are_batch_invariant`; the truncated
 //!   checkpoint, `EIDOLA_MIMO_DIR`): the logits of four positions past 1,037
 //!   and past 2,100, computed as decode steps after a prefill in chunks of
-//!   64, as one verify-shaped chunk after chunks of 300, as decode rows each
+//!   64, 63 and 65, as one verify-shaped chunk after chunks of 300, as decode rows each
 //!   beside another sequence's 300-token chunk, inside a 2,048-token chunk,
 //!   inside 300-token chunks, and after a prefix shared from another
 //!   sequence's blocks (a prefix-cache hit): the same bits in every one.
@@ -56,7 +60,10 @@ use eidola_engine_model::safetensors::WeightSet;
 const NQ: u32 = 64;
 const BS: u32 = 16;
 const PROBES: u32 = 4;
-const CONTEXTS: [u32; 6] = [1000, 1022, 1037, 2047, 4101, 16389];
+/// Probe contexts: where a window of 128 first drops key 0 (126 to 129
+/// probed), around and past the first 1,024-key chunk boundary, just before
+/// a 64-key boundary that is not a chunk boundary (1,084), and long ones.
+const CONTEXTS: [u32; 8] = [126, 1000, 1022, 1037, 1084, 2047, 4101, 16389];
 
 fn usize_of(x: u32) -> usize {
     usize::try_from(x).unwrap()
@@ -111,12 +118,16 @@ enum Budget {
 /// step row of the first probe, and its partial-row budget.
 fn scenarios(p: u32) -> Vec<(&'static str, Queries, u32, Budget)> {
     let mut beside: Queries = (0..PROBES).map(|i| (p + i, 1)).collect();
-    beside.push((p - 700, 300));
+    beside.push((p.saturating_sub(700), 300));
     let start = p.saturating_sub(1000);
+    let (s150, s13) = (p.saturating_sub(150), p.saturating_sub(13));
     vec![
         ("+prefill", beside, 0, Budget::OnePass),
         ("verify", vec![(p, PROBES)], 0, Budget::OnePass),
-        ("chunk300", vec![(p - 150, 300)], 150, Budget::OnePass),
+        ("chunk300", vec![(s150, 300)], p - s150, Budget::OnePass),
+        // Query tiles of 8 or 16 rows from p - 13 put probe rows in tiles
+        // that cross a 64-key boundary at 1,088 (p = 1,084) or 128 (p = 126).
+        ("chunk300@-13", vec![(s13, 300)], p - s13, Budget::OnePass),
         ("chunk2048", vec![(start, 2048)], p - start, Budget::OnePass),
         (
             "chunk2048/passes",
@@ -263,6 +274,12 @@ struct Pool {
 
 impl Pool {
     fn new(gpu: &Gpu, kind: Kind, positions: u32, seed: u64) -> Pool {
+        Pool::with_key(gpu, kind, positions, seed, None)
+    }
+
+    /// The pool, with position `loud` (if any) holding a key and value far
+    /// larger than any other: a row that sees it moves a long way.
+    fn with_key(gpu: &Gpu, kind: Kind, positions: u32, seed: u64, loud: Option<u32>) -> Pool {
         let pages = positions.div_ceil(BS);
         let perm = page_perm(pages, seed);
         let mut rng = Lcg(seed ^ 0xA5A5);
@@ -277,6 +294,13 @@ impl Pool {
             Some(_) => (0..NQ).map(|_| SINK_LO + 2.0 * rng.f32().abs()).collect(),
             None => vec![f32::NEG_INFINITY; usize_of(NQ)],
         };
+        let mut k_host = k_host;
+        let mut v_host = v_host;
+        if let Some(x) = loud {
+            let x = usize_of(x);
+            k_host[x * kp..(x + 1) * kp].fill(bf16::from_f32(8.0));
+            v_host[x * vp..(x + 1) * vp].fill(bf16::from_f32(50.0));
+        }
         // Physical page `perm[l]` holds logical page `l`; page 0 stays zero.
         let n = usize_of(BS);
         let mut k_dev = vec![0u16; (total + n) * kp];
@@ -522,6 +546,68 @@ fn attention_rows_are_batch_invariant() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// The window's edge is exact on the device: a row alone (and inside a
+/// chunk) gives the same bits whatever the key just outside its window
+/// holds, and moves when the key just inside it does, at rows where a
+/// window of 128 first drops key 0 and past it.
+#[test]
+fn the_window_edge_is_exact() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    let rows = budget_rows(Budget::Small);
+    let tv = s
+        .alloc_zeros::<u16>(usize_of(rows * NQ * HEAD_DIM_VO))
+        .unwrap();
+    let ts = s.alloc_zeros::<f32>(usize_of(rows * NQ)).unwrap();
+    let partials = Partials {
+        v: dptr(&tv, s),
+        s: dptr(&ts, s),
+        rows,
+        heads: NQ,
+    };
+    let kind = Kind::Sliding;
+    let w = kind.window().unwrap();
+    let positions = 1200;
+    let base = Pool::new(gpu, kind, positions, 21);
+    let mut failures = Vec::new();
+    for &arch in &su.archs {
+        let attn = Attention::from_module(su.module("flashinfer_fa2_sink_paged", arch)).unwrap();
+        for p in [127u32, 128, 129, 130, 200, 1037, 1087] {
+            // Alone, and as the 14th row of a 100-query chunk.
+            let shapes: [(&[(u32, u32)], u32); 2] =
+                [(&[(p, 1)], 0), (&[(p.saturating_sub(13), 100)], p.min(13))];
+            for (queries, first) in shapes {
+                let run = |pool: &Pool| {
+                    attend_rows(
+                        gpu,
+                        &attn,
+                        pool,
+                        &partials,
+                        queries,
+                        Budget::Small,
+                        first,
+                        1,
+                    )
+                };
+                let want = run(&base);
+                if let Some(outside) = (p + 1).checked_sub(w + 1) {
+                    let pool = Pool::with_key(gpu, kind, positions, 21, Some(outside));
+                    if run(&pool) != want {
+                        failures.push(format!("{arch:?} p={p} {queries:?}: key {outside} outside the window reached the row"));
+                    }
+                }
+                let inside = (p + 1).saturating_sub(w);
+                let pool = Pool::with_key(gpu, kind, positions, 21, Some(inside));
+                if run(&pool) == want {
+                    failures.push(format!("{arch:?} p={p} {queries:?}: key {inside} inside the window did not reach the row"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 // ---------------------------------------------------------------------------
 // The executor on the truncated checkpoint.
 
@@ -719,6 +805,26 @@ fn executor_logits_are_batch_invariant() {
             "inside a 2,048-token chunk",
             l[at..at + usize_of(PROBES) * vocab].to_vec(),
         ));
+
+        // Chunks of 63 and 65 (every chunk after the first starting off a
+        // 16- and 64-key boundary), then four decode steps (slot 6).
+        for (chunk, name) in [
+            (63u32, "decode after chunks of 63"),
+            (65, "decode after chunks of 65"),
+        ] {
+            prefill(&mut ex, 6, base(6), all(need), 0, p, chunk, false);
+            let mut out = Vec::new();
+            for i in 0..PROBES {
+                let l = step(
+                    &mut ex,
+                    &[(6, p + i, &probes[usize_of(i)..usize_of(i) + 1])],
+                    vec![],
+                    vec![],
+                );
+                out.extend(row(&l, 0));
+            }
+            runs.push((name, out));
+        }
 
         // The probes inside chunks of 300 from 0.
         let l = prefill(
