@@ -115,7 +115,7 @@
     },
     {
       "path": "csrc/engine_ops.cu",
-      "sha256": "3d41da8ecaa854b1256bcd22c8fd563c947017fe3816adade5fb09da7b28f011"
+      "sha256": "2a6045f7172674ca202aa514161312b2783dc6dfcc20de2d49708cc097e64108"
     },
     {
       "path": "csrc/engine_ops_common.cuh",
@@ -406,8 +406,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_100a.cubin",
-      "sha256": "891231a995927fcd825486d4a3f0fc15b45e952b7e3ed09e47553dc87aa8c8d4",
-      "size": 453616,
+      "sha256": "d96b2be70a05fb75d515293af49001e3bafbe241d1992e7e7630cd0454a63858",
+      "size": 461552,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -522,8 +522,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_100f.cubin",
-      "sha256": "6aeb6078a5ad22c2c85b861775e760f37394165fc0e5b1b1d2978b445b866398",
-      "size": 453616,
+      "sha256": "a8fff420218f963f1bc1ab13572b3c5adf56e9f7f79a3cfe785432c1469af965",
+      "size": 461552,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -638,8 +638,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_103a.cubin",
-      "sha256": "2766ad621b3a633158fe8ee1eca50144aa10ffb696348b81b3969ef24b217abd",
-      "size": 453616,
+      "sha256": "4d10ba9b04d6f6adaf1ee43b6acb19ba2ab8abd2f172adc9cfe59588f3d7895b",
+      "size": 461552,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -1173,8 +1173,8 @@
     {
       "name": "engine_ops",
       "file": "fatbin/engine_ops.fatbin",
-      "sha256": "aded3b7a4e8fa84c4c340479e517db2d24cc26d399b6cb54a442f898bb0ad4c3",
-      "size": 907464,
+      "sha256": "85e9c501610be6cd3f94841b01b57c6b50462b9caf36ea13af06925a4ae1879f",
+      "size": 923336,
       "archs": [
         "sm_100a",
         "sm_103a"

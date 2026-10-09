@@ -103,10 +103,31 @@ EIDOLA_KERNEL_META(eidola_add_bf16, kThreads, 1, 1, 0, 1, 1, 1, 0);
 // KV: K of token t goes to pool + kv_block[t] * block_elems + k_off +
 // kv_slot[t] * (num_kv_heads * 192), V likewise with v_off and 128.
 //
-// One thread per output element: grid (tokens, ceil(per-token elements /
-// kThreads)), where a token's elements are its chunks' Q, K and V elements in
-// the row's own order (per chunk (qh + kh) x 192 then kh x 128). Each element
-// is computed independently, with the arithmetic of the per-token form.
+// One thread per kQkvVec consecutive output elements: grid (tokens,
+// ceil(per-token elements / (kQkvVec * kThreads))), where a token's elements
+// are its chunks' Q, K and V elements in the row's own order (per chunk
+// (qh + kh) x 192 then kh x 128). Heads of 192 and 128 are whole vectors, so
+// a vector never straddles a head, and the 64 rotated dims are whole vectors:
+// a rotated vector also loads its 8 partners 32 dims away and its 8 cos/sin
+// pairs. Every load and store is 16 bytes (the host checks the alignment of
+// every base, stride and offset). Each element is computed independently,
+// with the arithmetic of the per-token form.
+constexpr uint32_t kQkvVec = 8;
+
+__device__ __forceinline__ void unpack_bf16x8(const uint4 w, float (&f)[kQkvVec]) {
+  const uint32_t words[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+  for (uint32_t e = 0; e < kQkvVec; ++e) f[e] = bf16f(static_cast<uint16_t>(words[e / 2] >> (16 * (e % 2))));
+}
+
+__device__ __forceinline__ uint4 pack_bf16x8(const float (&f)[kQkvVec]) {
+  uint32_t words[4];
+#pragma unroll
+  for (uint32_t i = 0; i < 4; ++i)
+    words[i] = static_cast<uint32_t>(f2bf16(f[2 * i])) | (static_cast<uint32_t>(f2bf16(f[2 * i + 1])) << 16);
+  return make_uint4(words[0], words[1], words[2], words[3]);
+}
+
 extern "C" __global__ void __launch_bounds__(kThreads)
     eidola_qkv_rope_kv(const __grid_constant__ EidolaQkvArgs a) {
   constexpr uint32_t D = 192, DV = 128, R = 64, H = R / 2;
@@ -114,41 +135,58 @@ extern "C" __global__ void __launch_bounds__(kThreads)
   const uint32_t per_chunk_qk = (a.q_heads_per_chunk + a.kv_heads_per_chunk) * D;
   const uint32_t per_chunk_v = a.kv_heads_per_chunk * DV;
   const uint32_t per_chunk = per_chunk_qk + per_chunk_v;
-  const uint32_t el = blockIdx.y * kThreads + threadIdx.x;
+  const uint32_t el = (blockIdx.y * kThreads + threadIdx.x) * kQkvVec;
   if (el >= a.chunks * per_chunk) return;
   const uint32_t c = el / per_chunk, within = el % per_chunk;
   const uint16_t* row = a.qkv + static_cast<size_t>(t) * a.chunk_stride * a.chunks;
   const uint32_t nq = a.q_heads_per_chunk * a.chunks, nkv = a.kv_heads_per_chunk * a.chunks;
   const size_t kv_base = static_cast<size_t>(a.kv_block[t]) * a.block_elems;
   if (within < per_chunk_qk) {
-    // Q and K: one (head, dim).
-    const float* cs = a.rope + static_cast<size_t>(a.positions[t]) * R;
-    const uint32_t head = within / D, d = within % D;
+    // Q and K: one head's dims d0 .. d0 + 8.
+    const uint32_t head = within / D, d0 = within % D;
     const uint16_t* src = row + static_cast<size_t>(c) * a.chunk_stride + head * D;
-    float v = bf16f(src[d]);
-    if (d < R) {
-      const uint32_t j = d % H;
-      const float cosv = cs[j], sinv = cs[H + j];
-      const float x1 = bf16f(src[j]), x2 = bf16f(src[j + H]);
-      // x1 * cos - x2 * sin fuses the first product onto the rounded second;
-      // x2 * cos + x1 * sin fuses the second product onto the rounded first.
-      // Both are the contractions the reference form compiles to, so every
-      // rotated element is bit-identical to it.
-      v = d < H ? __fmaf_rn(x1, cosv, -__fmul_rn(x2, sinv)) : __fmaf_rn(x1, sinv, __fmul_rn(x2, cosv));
+    float v[kQkvVec];
+    unpack_bf16x8(__ldg(reinterpret_cast<const uint4*>(src + d0)), v);
+    if (d0 < R) {
+      // The pair of dims d and d +- 32: x1 = src[j], x2 = src[j + H] with
+      // j = d % H; this vector holds x1 below H and x2 above it.
+      const uint32_t j0 = d0 % H;
+      const float* cs = a.rope + static_cast<size_t>(a.positions[t]) * R;
+      float other[kQkvVec], cosv[kQkvVec], sinv[kQkvVec];
+      unpack_bf16x8(__ldg(reinterpret_cast<const uint4*>(src + (d0 < H ? d0 + H : d0 - H))), other);
+#pragma unroll
+      for (uint32_t q4 = 0; q4 < kQkvVec / 4; ++q4) {
+        const float4 cv = __ldg(reinterpret_cast<const float4*>(cs + j0 + 4 * q4));
+        const float4 sv = __ldg(reinterpret_cast<const float4*>(cs + H + j0 + 4 * q4));
+        cosv[4 * q4] = cv.x, cosv[4 * q4 + 1] = cv.y, cosv[4 * q4 + 2] = cv.z, cosv[4 * q4 + 3] = cv.w;
+        sinv[4 * q4] = sv.x, sinv[4 * q4 + 1] = sv.y, sinv[4 * q4 + 2] = sv.z, sinv[4 * q4 + 3] = sv.w;
+      }
+#pragma unroll
+      for (uint32_t e = 0; e < kQkvVec; ++e) {
+        // x1 * cos - x2 * sin fuses the first product onto the rounded
+        // second; x2 * cos + x1 * sin fuses the second product onto the
+        // rounded first. Both are the contractions the reference form
+        // compiles to, so every rotated element is bit-identical to it.
+        const float x1 = d0 < H ? v[e] : other[e], x2 = d0 < H ? other[e] : v[e];
+        v[e] = d0 < H ? __fmaf_rn(x1, cosv[e], -__fmul_rn(x2, sinv[e]))
+                      : __fmaf_rn(x1, sinv[e], __fmul_rn(x2, cosv[e]));
+      }
     }
+    uint16_t* dst;
     if (head < a.q_heads_per_chunk) {
       const uint32_t qh = c * a.q_heads_per_chunk + head;
-      a.q_out[(static_cast<size_t>(t) * nq + qh) * D + d] = f2bf16(v);
+      dst = a.q_out + (static_cast<size_t>(t) * nq + qh) * D;
     } else {
-      uint16_t* kdst = a.pool + kv_base + a.k_off + static_cast<size_t>(a.kv_slot[t]) * nkv * D;
       const uint32_t kh = c * a.kv_heads_per_chunk + (head - a.q_heads_per_chunk);
-      kdst[kh * D + d] = f2bf16(v);
+      dst = a.pool + kv_base + a.k_off + static_cast<size_t>(a.kv_slot[t]) * nkv * D + kh * D;
     }
+    *reinterpret_cast<uint4*>(dst + d0) = pack_bf16x8(v);
   } else {
     // V: copied as is.
     uint16_t* vdst = a.pool + kv_base + a.v_off + static_cast<size_t>(a.kv_slot[t]) * nkv * DV;
     const uint32_t vi = within - per_chunk_qk;
-    vdst[c * per_chunk_v + vi] = row[static_cast<size_t>(c) * a.chunk_stride + per_chunk_qk + vi];
+    *reinterpret_cast<uint4*>(vdst + c * per_chunk_v + vi) =
+        __ldg(reinterpret_cast<const uint4*>(row + static_cast<size_t>(c) * a.chunk_stride + per_chunk_qk + vi));
   }
 }
 EIDOLA_KERNEL_META(eidola_qkv_rope_kv, kThreads, 1, 1, 0, 1, 1, 1, sizeof(EidolaQkvArgs));
@@ -186,38 +224,58 @@ EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_f32scale, 32, 1, 1, 0, 1, 1, 1, 0);
 // landed in: block x is pair i, its row row_of[i]. Rows no pair names (the
 // expert layout's padding) are not touched; the grouped GEMMs compute every
 // row independently, so what they hold reaches only padding outputs, which
-// the combine never reads. Grid (pairs, I/512), 4 warps (one per 128 group).
+// the combine never reads.
+//
+// Grid (pairs, I/1024), 4 warps: block y covers two 512-wide scale words
+// (eight 128-wide groups), each half-warp one group, each lane 8 consecutive
+// elements (16-byte gate and up loads, an 8-byte store). gu and q must be
+// 16- and 8-byte aligned (the host checks both).
+constexpr uint32_t kSwigluVec = 8;
+constexpr uint32_t kSwigluWidth = 128 * kSwigluVec;
+
+__device__ __forceinline__ float half_warp_max(float v) {
+#pragma unroll
+  for (int o = 8; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  return v;
+}
+
 extern "C" __global__ void __launch_bounds__(128)
     eidola_swiglu_quant_fp8_ue8m0(uint8_t* __restrict__ q, int32_t* __restrict__ sf,
                                   const uint16_t* __restrict__ gu,
                                   const int32_t* __restrict__ row_of, uint32_t inter,
                                   uint32_t rows4) {
-  __shared__ uint8_t exps[4];
+  __shared__ uint8_t exps[8];
   const uint32_t r = static_cast<uint32_t>(row_of[blockIdx.x]);
-  const uint32_t w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-  const uint32_t g = w * 4 + warp;
-  const uint16_t* gate = gu + static_cast<size_t>(r) * 2 * inter + g * 128;
-  const uint16_t* up = gate + inter;
-  float v[4];
+  const uint32_t gb = threadIdx.x / 16, i0 = (threadIdx.x % 16) * kSwigluVec;
+  const uint32_t g = blockIdx.y * 8 + gb;
+  const uint16_t* gate = gu + static_cast<size_t>(r) * 2 * inter + g * 128 + i0;
+  const uint4 gw = *reinterpret_cast<const uint4*>(gate);
+  const uint4 uw = *reinterpret_cast<const uint4*>(gate + inter);
+  const uint32_t gws[4] = {gw.x, gw.y, gw.z, gw.w}, uws[4] = {uw.x, uw.y, uw.z, uw.w};
+  float v[kSwigluVec];
   float amax = 0.f;
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const uint32_t i = lane + 32 * j;
-    const float x = bf16f(gate[i]);
-    v[j] = x / (1.f + expf(-x)) * bf16f(up[i]);
-    amax = fmaxf(amax, fabsf(v[j]));
+  for (uint32_t e = 0; e < kSwigluVec; ++e) {
+    const float x = bf16f(static_cast<uint16_t>(gws[e / 2] >> (16 * (e % 2))));
+    v[e] = x / (1.f + expf(-x)) * bf16f(static_cast<uint16_t>(uws[e / 2] >> (16 * (e % 2))));
+    amax = fmaxf(amax, fabsf(v[e]));
   }
-  amax = warp_max(amax);
-  const uint8_t e = ue8m0_for(amax);
-  const float inv = 1.f / ue8m0_value(e);
-  uint8_t* dst = q + static_cast<size_t>(r) * inter + g * 128;
+  amax = half_warp_max(amax);
+  const uint8_t e8 = ue8m0_for(amax);
+  const float inv = 1.f / ue8m0_value(e8);
+  uint32_t lo = 0, hi = 0;
 #pragma unroll
-  for (int j = 0; j < 4; ++j) dst[lane + 32 * j] = f2e4m3(v[j] * inv);
-  if (lane == 0) exps[warp] = e;
+  for (uint32_t e = 0; e < 4; ++e) {
+    lo |= static_cast<uint32_t>(f2e4m3(v[e] * inv)) << (8 * e);
+    hi |= static_cast<uint32_t>(f2e4m3(v[e + 4] * inv)) << (8 * e);
+  }
+  *reinterpret_cast<uint2*>(q + static_cast<size_t>(r) * inter + g * 128 + i0) = make_uint2(lo, hi);
+  if (threadIdx.x % 16 == 0) exps[gb] = e8;
   __syncthreads();
-  if (threadIdx.x == 0) {
-    const uint32_t word = exps[0] | (exps[1] << 8) | (exps[2] << 16) | (static_cast<uint32_t>(exps[3]) << 24);
-    sf[sfa_index(r, w, rows4)] = static_cast<int32_t>(word);
+  if (threadIdx.x < 2) {
+    const uint8_t* e4 = exps + 4 * threadIdx.x;
+    const uint32_t word = e4[0] | (e4[1] << 8) | (e4[2] << 16) | (static_cast<uint32_t>(e4[3]) << 24);
+    sf[sfa_index(r, blockIdx.y * 2 + threadIdx.x, rows4)] = static_cast<int32_t>(word);
   }
 }
 EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);
@@ -900,36 +958,42 @@ extern "C" __global__ void __launch_bounds__(kPermuteExperts)
 EIDOLA_KERNEL_META(eidola_moe_permute, 256, 1, 1, 0, 1, 1, 1, 0);
 
 // Gather f32 token rows into DeepGEMM's FP8 A with packed UE8M0 scales:
-// a [rows][K], sf (see sfa_index). Block x is routed pair i: token i / top_k,
-// written to row row_of[i]. Rows no pair names (the expert layout's padding)
-// are not touched; see eidola_swiglu_quant_fp8_ue8m0. Grid (pairs, K/512),
-// 4 warps.
+// a [rows][K], sf (see sfa_index). Every routed (token, slot) pair i gets
+// token i / top_k's row in row row_of[i]. Rows no pair names (the expert
+// layout's padding) are not touched; see eidola_swiglu_quant_fp8_ue8m0.
+//
+// Grid (tokens, K/512), 4 warps: block (t, w) quantizes token t's 512-wide
+// word w once (each warp one 128-wide group, each lane 4 consecutive
+// elements: a 16-byte load, a 4-byte store) and stores it into the row of
+// every one of the token's pairs. A token's pairs carry the same row, so the
+// codes and scale word are the ones a block per pair would compute. x must be
+// 16-byte aligned and a 4-byte aligned (the host checks both).
 extern "C" __global__ void __launch_bounds__(128)
     eidola_gather_quant_ue8m0(uint8_t* __restrict__ a, int32_t* __restrict__ sf,
                               const float* __restrict__ x, const int32_t* __restrict__ row_of,
                               uint32_t top_k, uint32_t k, uint32_t rows4) {
   __shared__ uint8_t exps[4];
-  const uint32_t r = static_cast<uint32_t>(row_of[blockIdx.x]), src = blockIdx.x / top_k;
-  const uint32_t w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const uint32_t t = blockIdx.x, w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const uint32_t g = w * 4 + warp;
-  float v[4];
+  const float4 x4 = *reinterpret_cast<const float4*>(x + static_cast<size_t>(t) * k + g * 128 + lane * 4);
+  const float v[4] = {x4.x, x4.y, x4.z, x4.w};
   float amax = 0.f;
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    v[j] = x[static_cast<size_t>(src) * k + g * 128 + lane + 32 * j];
-    amax = fmaxf(amax, fabsf(v[j]));
-  }
+  for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(v[j]));
   amax = warp_max(amax);
   const uint8_t e = ue8m0_for(amax);
   const float inv = 1.f / ue8m0_value(e);
-  uint8_t* dst = a + static_cast<size_t>(r) * k + g * 128;
+  uint32_t codes = 0;
 #pragma unroll
-  for (int j = 0; j < 4; ++j) dst[lane + 32 * j] = f2e4m3(v[j] * inv);
+  for (int j = 0; j < 4; ++j) codes |= static_cast<uint32_t>(f2e4m3(v[j] * inv)) << (8 * j);
   if (lane == 0) exps[warp] = e;
   __syncthreads();
-  if (threadIdx.x == 0) {
-    const uint32_t word = exps[0] | (exps[1] << 8) | (exps[2] << 16) | (static_cast<uint32_t>(exps[3]) << 24);
-    sf[sfa_index(r, w, rows4)] = static_cast<int32_t>(word);
+  const uint32_t word = exps[0] | (exps[1] << 8) | (exps[2] << 16) | (static_cast<uint32_t>(exps[3]) << 24);
+  const int32_t* rows = row_of + static_cast<size_t>(t) * top_k;
+  for (uint32_t j = 0; j < top_k; ++j) {
+    const uint32_t r = static_cast<uint32_t>(rows[j]);
+    *reinterpret_cast<uint32_t*>(a + static_cast<size_t>(r) * k + g * 128 + lane * 4) = codes;
+    if (threadIdx.x == 0) sf[sfa_index(r, w, rows4)] = static_cast<int32_t>(word);
   }
 }
 EIDOLA_KERNEL_META(eidola_gather_quant_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);

@@ -49,6 +49,26 @@ fn out_of_range_launches_are_refused() {
             "top_k"
         );
         assert!(
+            ops.swiglu_quant_ue8m0(gpu, 0, 0, 8, 0, 1, 8, 8, 2048, 8)
+                .is_err(),
+            "gate/up rows not 16-byte aligned"
+        );
+        assert!(
+            ops.swiglu_quant_ue8m0(gpu, 4, 0, 0, 0, 1, 8, 8, 2048, 8)
+                .is_err(),
+            "codes not 8-byte aligned"
+        );
+        assert!(
+            ops.gather_quant_ue8m0(gpu, 0, 0, 4, 0, 1, 8, 8, 4096, 8)
+                .is_err(),
+            "token rows not 16-byte aligned"
+        );
+        assert!(
+            ops.gather_quant_ue8m0(gpu, 2, 0, 0, 0, 1, 8, 8, 4096, 8)
+                .is_err(),
+            "codes not 4-byte aligned"
+        );
+        assert!(
             ops.router_topk(gpu, 0, 0, 0, 0, 0, 0, 1, 4096, 300, 8, 1.0)
                 .is_err(),
             "experts"
