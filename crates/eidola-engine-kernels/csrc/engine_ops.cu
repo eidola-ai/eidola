@@ -293,49 +293,36 @@ EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);
 // is NaN, in which case that expert. This is exactly what a scan in expert
 // order keeping the first strictly greater choice selects.
 //
-// The executor runs the split form, two launches with the scores between them
-// in global memory:
+// Two forms compute the same ids and weights; the executor picks one by token
+// count (engine_ops.rs, executor_router, records the measurements behind the
+// bound):
 //
-//   eidola_router_scores: kRouterScoresTile tokens x kRouterScoresExperts
-//     experts per block, no cluster, so the grid grows with both the token
-//     count and the expert count (16 blocks per 8 tokens at 256 experts). Each
-//     lane runs the chains of 4 experts x 8 tokens for its i; the rows stream
-//     through shared memory a chunk at a time, kRouterScoresStages chunks in
-//     flight. Writes every (token, expert)'s choice and score.
-//   eidola_router_select: one warp per token, reading the token's 256 choices
-//     from global memory and selecting as below.
-//
-// The two cluster forms below compute the same ids and weights in one launch
-// and are kept for the kernel bench and the tests. Both run one cluster of
-// kRouterCluster blocks over a group of tokens, block rank b scoring experts
-// 32b .. 32b + 31; rank 0 then reads every block's scores through distributed
-// shared memory and selects, one warp per token. They differ in how many
-// tokens a cluster takes:
-//
-//   eidola_router_topk: one token per cluster, 32 warps per block, one expert
-//     per warp; the token's row staged in shared memory, each lane keeping
-//     kRouterBatch weight loads in flight ahead of its multiply-adds.
-//   eidola_router_topk_tiled: kRouterTile tokens per cluster, 4 warps per
-//     block, each lane running the chains of 8 experts x kRouterTile tokens
-//     for its i, so each weight is read once per tile instead of once per
-//     token. The tile's rows and the block's weight rows stream through
-//     shared memory kRouterChunk elements of i at a time (cp.async,
-//     kRouterStages chunks in flight).
-//
-// engine_ops.rs (RouterForm) records why the executor runs the split form.
+//   eidola_router_topk: one launch, one cluster of kRouterCluster blocks per
+//     token, 32 warps per block, one expert per warp, block rank b scoring
+//     experts 32b .. 32b + 31; the token's row staged in shared memory, each
+//     lane keeping kRouterBatch weight loads in flight ahead of its
+//     multiply-adds. Rank 0 then reads every block's scores through
+//     distributed shared memory and selects with one warp. Run at a few
+//     tokens.
+//   The split form, run above that: two launches with the scores between
+//   them in global memory.
+//     eidola_router_scores: kRouterScoresTile tokens x kRouterScoresExperts
+//       experts per block, no cluster, so the grid grows with both the token
+//       count and the expert count (16 blocks per 8 tokens at 256 experts).
+//       Each lane runs the chains of 4 experts x 8 tokens for its i; the rows
+//       stream through shared memory kRouterChunk elements of i at a time,
+//       kRouterScoresStages chunks in flight (cp.async). Writes every
+//       (token, expert)'s choice and score.
+//     eidola_router_select: one warp per token, reading the token's 256
+//       choices from global memory and selecting as eidola_router_topk's
+//       rank 0 does.
 constexpr uint32_t kRouterCluster = 8;
 constexpr uint32_t kRouterWarps = 32;
 constexpr uint32_t kRouterThreads = kRouterWarps * 32;
 constexpr uint32_t kRouterMaxHidden = 4096;
 // W loads in flight per lane before their multiply-adds.
 constexpr uint32_t kRouterBatch = 32;
-
-constexpr uint32_t kRouterTile = 8;
-constexpr uint32_t kRouterTiledWarps = 4;
-constexpr uint32_t kRouterTiledThreads = kRouterTiledWarps * 32;
-constexpr uint32_t kRouterWarpExperts = kRouterWarps / kRouterTiledWarps;
 constexpr uint32_t kRouterChunk = 128;
-constexpr uint32_t kRouterStages = 3;
 
 namespace {
 
@@ -353,90 +340,6 @@ __device__ __forceinline__ bool router_before(float av, uint32_t ai, float bv, u
 
 // The score of a logit, as the one-token form computes it inline.
 __device__ __forceinline__ float router_sigmoid(float logit) { return 1.f / (1.f + expf(-logit)); }
-
-// One token's selection for the tiled form, by a whole warp of rank 0 (the
-// one-token form runs the same code inline): `choice` and `score` are this
-// block's rows of the token's 32 choices and scores, which every rank holds at
-// the same offset. Writes the token's k ids (ascending) and weights.
-__device__ __forceinline__ void router_select(const cooperative_groups::cluster_group& cluster,
-                                              float* choice, float* score, uint32_t lane,
-                                              uint32_t experts, uint32_t top_k, float scaling,
-                                              int32_t* __restrict__ ids_out,
-                                              float* __restrict__ w_out) {
-  // Lane l holds experts 32q + l for q < kRouterCluster (block q's slot l).
-  float c[kRouterCluster];
-  uint32_t valid = 0;
-#pragma unroll
-  for (uint32_t q = 0; q < kRouterCluster; ++q) {
-    c[q] = 0.f;
-    if (q * kRouterWarps + lane < experts) {
-      c[q] = cluster.map_shared_rank(choice, q)[lane];
-      valid |= 1u << q;
-    }
-  }
-  int32_t picked[8];
-  for (uint32_t j = 0; j < top_k; ++j) {
-    // The lowest untaken expert, and its choice.
-    // `valid` loses an expert's bit when it is taken.
-    uint32_t low = kNone;
-#pragma unroll
-    for (uint32_t q = 0; q < kRouterCluster; ++q)
-      if ((valid >> q & 1u) && low == kNone) low = q * kRouterWarps + lane;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) low = min(low, __shfl_xor_sync(0xffffffffu, low, o));
-    float low_c = 0.f;
-#pragma unroll
-    for (uint32_t q = 0; q < kRouterCluster; ++q)
-      if (q == low / kRouterWarps) low_c = c[q];
-    low_c = __shfl_sync(0xffffffffu, low_c, low % kRouterWarps);
-    uint32_t best = low;
-    if (!isnan(low_c)) {
-      float bv = 0.f;
-      uint32_t bi = kNone;
-#pragma unroll
-      for (uint32_t q = 0; q < kRouterCluster; ++q) {
-        const uint32_t ei = q * kRouterWarps + lane;
-        if ((valid >> q & 1u) && !isnan(c[q]) && router_before(c[q], ei, bv, bi)) {
-          bv = c[q];
-          bi = ei;
-        }
-      }
-#pragma unroll
-      for (int o = 16; o > 0; o >>= 1) {
-        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-        const uint32_t oi = __shfl_xor_sync(0xffffffffu, bi, o);
-        if (router_before(ov, oi, bv, bi)) {
-          bv = ov;
-          bi = oi;
-        }
-      }
-      best = bi;
-    }
-    picked[j] = static_cast<int32_t>(best);
-    if (lane == best % kRouterWarps) valid &= ~(1u << (best / kRouterWarps));
-  }
-  if (lane == 0) {
-    // Ascending expert order.
-    for (uint32_t a = 1; a < top_k; ++a)
-      for (uint32_t b = a; b > 0 && picked[b - 1] > picked[b]; --b) {
-        const int32_t tmp = picked[b];
-        picked[b] = picked[b - 1];
-        picked[b - 1] = tmp;
-      }
-    float sel[8];
-    for (uint32_t j = 0; j < top_k; ++j) {
-      const uint32_t p = static_cast<uint32_t>(picked[j]);
-      sel[j] = cluster.map_shared_rank(score, p / kRouterWarps)[p % kRouterWarps];
-    }
-    float sum = 0.f;
-    for (uint32_t j = 0; j < top_k; ++j) sum += sel[j];
-    const float denom = sum + 1e-20f;
-    for (uint32_t j = 0; j < top_k; ++j) {
-      ids_out[j] = picked[j];
-      w_out[j] = sel[j] / denom * scaling;
-    }
-  }
-}
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
   const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
@@ -571,101 +474,6 @@ extern "C" __global__ void __launch_bounds__(kRouterThreads)
 }
 EIDOLA_KERNEL_META(eidola_router_topk, kRouterThreads, 1, 1, 0, kRouterCluster, 1, 1, 0);
 
-// The tiled form: grid kRouterCluster * ceil(tokens / kRouterTile); x and w
-// 16-byte aligned (the host checks). Warp v of rank b owns experts
-// 32b + 8v .. 32b + 8v + 7; its lane l runs, for every token of the tile and
-// each of those experts, the chain over i = l, l + 32, ..., in ascending i
-// across the chunks.
-extern "C" __global__ void __launch_bounds__(kRouterTiledThreads)
-    eidola_router_topk_tiled(int32_t* __restrict__ topk_ids, float* __restrict__ topk_w,
-                             const float* __restrict__ x, const uint16_t* __restrict__ w,
-                             const float* __restrict__ bias, uint32_t tokens, uint32_t hidden,
-                             uint32_t experts, uint32_t top_k, float scaling) {
-  namespace cg = cooperative_groups;
-  __shared__ __align__(16) float xs_stage[kRouterStages][kRouterTile][kRouterChunk];
-  __shared__ __align__(16) uint16_t ws_stage[kRouterStages][kRouterWarps][kRouterChunk];
-  __shared__ float score[kRouterTile][kRouterWarps];
-  __shared__ float choice[kRouterTile][kRouterWarps];
-  const cg::cluster_group cluster = cg::this_cluster();
-  if (cluster.num_blocks() != kRouterCluster) __trap();
-  const uint32_t t0 = blockIdx.x / kRouterCluster * kRouterTile, rank = cluster.block_rank();
-  const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-  const uint32_t live = min(kRouterTile, tokens - t0);
-  const uint32_t e0 = rank * kRouterWarps;
-  // Chunk c of the tile's rows and the block's weight rows into stage s. Rows
-  // past the tokens or the experts are not loaded, and nothing reads them.
-  auto load = [&](uint32_t c, uint32_t s) {
-    float* xs = &xs_stage[s][0][0];
-    uint16_t* ws = &ws_stage[s][0][0];
-    const uint32_t i0 = c * kRouterChunk;
-    for (uint32_t v = threadIdx.x; v < kRouterTile * kRouterChunk / 4; v += kRouterTiledThreads) {
-      const uint32_t r = v / (kRouterChunk / 4), col = v % (kRouterChunk / 4) * 4;
-      if (r < live) cp_async16(xs + r * kRouterChunk + col, x + static_cast<size_t>(t0 + r) * hidden + i0 + col);
-    }
-    for (uint32_t v = threadIdx.x; v < kRouterWarps * kRouterChunk / 8; v += kRouterTiledThreads) {
-      const uint32_t r = v / (kRouterChunk / 8), col = v % (kRouterChunk / 8) * 8;
-      if (e0 + r < experts)
-        cp_async16(ws + r * kRouterChunk + col, w + static_cast<size_t>(e0 + r) * hidden + i0 + col);
-    }
-  };
-  float acc[kRouterTile][kRouterWarpExperts];
-#pragma unroll
-  for (uint32_t r = 0; r < kRouterTile; ++r)
-#pragma unroll
-    for (uint32_t q = 0; q < kRouterWarpExperts; ++q) acc[r][q] = 0.f;
-  const uint32_t chunks = hidden / kRouterChunk;
-#pragma unroll
-  for (uint32_t s = 0; s + 1 < kRouterStages; ++s) {
-    if (s < chunks) load(s, s);
-    cp_async_commit();
-  }
-  for (uint32_t c = 0; c < chunks; ++c) {
-    // Chunk c's group is complete (one group per chunk, committed in order),
-    // and every thread is done with chunk c - 1, whose stage is refilled next.
-    cp_async_wait<kRouterStages - 2>();
-    __syncthreads();
-    if (c + kRouterStages - 1 < chunks) load(c + kRouterStages - 1, (c + kRouterStages - 1) % kRouterStages);
-    cp_async_commit();
-    const float* xs = &xs_stage[c % kRouterStages][0][0];
-    const uint16_t* ws = &ws_stage[c % kRouterStages][warp * kRouterWarpExperts][0];
-#pragma unroll
-    for (uint32_t jj = 0; jj < kRouterChunk / 32; ++jj) {
-      const uint32_t i = lane + 32 * jj;
-      float xv[kRouterTile], wv[kRouterWarpExperts];
-#pragma unroll
-      for (uint32_t r = 0; r < kRouterTile; ++r) xv[r] = xs[r * kRouterChunk + i];
-#pragma unroll
-      for (uint32_t q = 0; q < kRouterWarpExperts; ++q) wv[q] = bf16f(ws[q * kRouterChunk + i]);
-#pragma unroll
-      for (uint32_t r = 0; r < kRouterTile; ++r)
-#pragma unroll
-        for (uint32_t q = 0; q < kRouterWarpExperts; ++q) acc[r][q] = __fmaf_rn(xv[r], wv[q], acc[r][q]);
-    }
-  }
-  // Each chain's butterfly; lane 0's sum, as the one-token form takes it.
-  // The sigmoids are spread over the lanes.
-#pragma unroll
-  for (uint32_t r = 0; r < kRouterTile; ++r)
-#pragma unroll
-    for (uint32_t q = 0; q < kRouterWarpExperts; ++q) {
-      const float logit = __shfl_sync(0xffffffffu, warp_sum(acc[r][q]), 0);
-      const uint32_t el = warp * kRouterWarpExperts + q;
-      if (lane == (r * kRouterWarpExperts + q) % 32 && e0 + el < experts) {
-        const float s = router_sigmoid(logit);
-        score[r][el] = s;
-        choice[r][el] = s + bias[e0 + el];
-      }
-    }
-  cluster.sync();
-  if (rank == 0)
-    for (uint32_t r = warp; r < live; r += kRouterTiledWarps)
-      router_select(cluster, choice[r], score[r], lane, experts, top_k, scaling,
-                    topk_ids + static_cast<size_t>(t0 + r) * top_k,
-                    topk_w + static_cast<size_t>(t0 + r) * top_k);
-  cluster.sync();
-}
-EIDOLA_KERNEL_META(eidola_router_topk_tiled, kRouterTiledThreads, 1, 1, 0, kRouterCluster, 1, 1, 0);
-
 // The split form's geometry. A block scores kRouterScoresTile tokens x
 // kRouterScoresExperts experts with 4 warps; warp v owns the block's experts
 // 4v .. 4v + 3 for every token of the tile, so each lane runs 32 chains, one
@@ -690,7 +498,7 @@ constexpr uint32_t kRouterSelectWarps = 4;
 // ceil(tokens / 8)); x and w 16-byte aligned (the host checks). Lane l of
 // warp v in block (b, y) runs, for token 8y + r and expert 16b + 4v + q, the
 // chain over i = l, l + 32, ..., in ascending i across the chunks: the same
-// chains, butterfly, lane-0 sum and sigmoid as the cluster forms.
+// chains, butterfly, lane-0 sum and sigmoid as eidola_router_topk.
 extern "C" __global__ void __launch_bounds__(kRouterScoresThreads)
     eidola_router_scores(float* __restrict__ out, const float* __restrict__ x,
                          const uint16_t* __restrict__ w, const float* __restrict__ bias,
@@ -756,7 +564,7 @@ extern "C" __global__ void __launch_bounds__(kRouterScoresThreads)
         for (uint32_t q = 0; q < kRouterScoresWarpExperts; ++q) acc[r][q] = __fmaf_rn(xv[r], wv[q], acc[r][q]);
     }
   }
-  // Each chain's butterfly; lane 0's sum, as the cluster forms take it. Chain
+  // Each chain's butterfly; lane 0's sum, as eidola_router_topk takes it. Chain
   // (r, q) goes to lane 4r + q, so every lane computes one sigmoid.
   float logit = 0.f;
 #pragma unroll
@@ -779,7 +587,7 @@ EIDOLA_KERNEL_META(eidola_router_scores, kRouterScoresThreads, 1, 1, kRouterScor
 
 // The selection of eidola_router_scores' output: one warp per token, grid
 // ceil(tokens / kRouterSelectWarps). Each round takes the untaken expert the
-// cluster forms' rank-0 warp takes (the same code over the same choices),
+// rank-0 warp of eidola_router_topk takes (the same code over the same choices),
 // the k picks are put in ascending order by a sorting network (they are
 // distinct), and the weights are the same expressions over the scores in that
 // order.

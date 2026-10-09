@@ -13,10 +13,10 @@
 //! long-running launch, so the device runs them back to back whatever the
 //! host's launch rate, and divides the time between two events around them.
 //! The expert layout is the executor's for that token count, placed from the
-//! router's own selection. The router is timed in every form at every token
-//! count (`router/token`, `router/tiled`, `router/split`, the last both of its
-//! launches), with the form the executor runs marked `*`: the data
-//! `EXECUTOR_ROUTER` is chosen from. `qkv` is a sliding layer's (two KV
+//! router's own selection. The router is timed in both forms at every token
+//! count (`router/token`, and `router/split` over both of its launches), with
+//! the form the executor runs at that count marked `*`: the data
+//! `ROUTER_PER_TOKEN_MAX` is chosen from. `qkv` is a sliding layer's (two KV
 //! heads per chunk). Prints a table and one JSON line per kernel and token
 //! count (`{"kernel", "tokens", "new_us", "reference_us", "executor"}`;
 //! `reference_us` is null for a kernel without a reference form).
@@ -25,7 +25,7 @@ use cudarc::driver::sys::CUevent_flags;
 use eidola_engine_cuda::bf16;
 use eidola_engine_cuda::engine_ops::psum_rows;
 use eidola_engine_cuda::engine_ops::{
-    EXECUTOR_ROUTER, EngineOps, QkvArgs, RouterForm, router_scores_len,
+    EngineOps, QkvArgs, RouterForm, executor_router, router_scores_len,
 };
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::moe_gemm::{GROUPS, MoeGemm, MoeGemmArgs, MoeProj};
@@ -208,7 +208,7 @@ fn main() {
             ));
         };
 
-        // Router, every form.
+        // Router, both forms.
         let router = |form: RouterForm| {
             time_us(&gpu, iters, &head_start, &|| unsafe {
                 ops.router_topk_form(
@@ -218,7 +218,6 @@ fn main() {
             })
         };
         let per_token = router(RouterForm::PerToken);
-        let tiled = router(RouterForm::Tiled);
         let split = router(RouterForm::Split);
         let old = time_us(&gpu, iters, &head_start, &|| unsafe {
             eidola_engine_cuda::launch!(
@@ -237,17 +236,11 @@ fn main() {
             )
             .unwrap();
         });
-        let chosen = EXECUTOR_ROUTER;
+        let chosen = executor_router(t);
         report(
             "router/token",
             chosen == RouterForm::PerToken,
             per_token,
-            Some(old),
-        );
-        report(
-            "router/tiled",
-            chosen == RouterForm::Tiled,
-            tiled,
             Some(old),
         );
         report(

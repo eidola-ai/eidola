@@ -5,7 +5,7 @@ mod common;
 
 use common::setup;
 use eidola_engine_cuda::attention::{Attention, AttnLayer};
-use eidola_engine_cuda::engine_ops::{EngineOps, QkvArgs};
+use eidola_engine_cuda::engine_ops::{EngineOps, QkvArgs, RouterForm};
 
 #[test]
 fn out_of_range_launches_are_refused() {
@@ -98,11 +98,23 @@ fn out_of_range_launches_are_refused() {
                 .is_err(),
             "weights unaligned"
         );
-        assert!(
-            ops.router_topk(gpu, 0, 0, 2, 0, 0, 0, 1, 4096, 256, 8, 1.0)
-                .is_err(),
-            "scores scratch unaligned"
-        );
+        // Refused before any launch whichever form the token count picks
+        // (1 token: the one-token form; 64: the split form), and in either
+        // form asked for directly.
+        for tokens in [1, 64] {
+            assert!(
+                ops.router_topk(gpu, 0, 0, 2, 0, 0, 0, tokens, 4096, 256, 8, 1.0)
+                    .is_err(),
+                "scores scratch unaligned, {tokens} tokens"
+            );
+            for form in [RouterForm::PerToken, RouterForm::Split] {
+                assert!(
+                    ops.router_topk_form(gpu, form, 0, 0, 2, 0, 0, 0, tokens, 4096, 256, 8, 1.0)
+                        .is_err(),
+                    "scores scratch unaligned, {form:?}, {tokens} tokens"
+                );
+            }
+        }
         assert!(
             ops.moe_permute(gpu, 0, 0, 0, 200, 8, 33_664).is_err(),
             "rows below the layout's bound"
