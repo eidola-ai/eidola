@@ -2990,6 +2990,7 @@ dependencies = [
  "cudarc",
  "eidola-engine",
  "eidola-engine-chat",
+ "eidola-engine-cpu",
  "eidola-engine-kernels",
  "eidola-engine-model",
  "serde_json",

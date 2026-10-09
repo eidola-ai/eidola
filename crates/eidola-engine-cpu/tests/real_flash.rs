@@ -87,6 +87,7 @@ fn truncated_flash_through_the_engine_matches_the_dense_forward() {
         // remaining 901 rows are padding.
         sampleable_vocab_size: 151_675,
         pad_batches: false,
+        draft_step_tokens: 0,
         record: true,
     };
     let mut sched_cfg = sched(true);

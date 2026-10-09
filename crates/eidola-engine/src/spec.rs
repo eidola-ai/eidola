@@ -99,6 +99,11 @@ pub struct ModelSpec {
     pub kv_groups: Vec<KvGroupSpec>,
     /// Drafted tokens per speculative step (`k`); 0 disables speculative decoding.
     pub max_draft_tokens: u32,
+    /// Query tokens up to which the executor's step runs on its fast path (0: no such
+    /// limit). The scheduler narrows a step's draft width so the step stays within it
+    /// when narrowing alone can (`engine` → draft width); a step that is past it without
+    /// drafts keeps the full width.
+    pub draft_step_tokens: u32,
     /// Per-sequence device state rows (block tables, drafter hidden states); the maximum
     /// number of concurrently running sequences.
     pub num_state_slots: u32,

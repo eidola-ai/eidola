@@ -238,6 +238,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 mtp_hidden: MtpHidden::Normed,
                 sampleable_vocab_size,
                 pad_batches: false,
+                draft_step_tokens: 0,
                 record: false,
             };
             let engine = worker::spawn(
@@ -271,6 +272,8 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 image = report.image.unwrap_or("none"),
                 global_kv_blocks = blocks.global,
                 sliding_kv_blocks = blocks.sliding,
+                drafter_kv_blocks = blocks.drafter,
+                draft_tokens = prepared.config().draft_tokens,
                 cuda_graphs = prepared.config().graphs.as_str(),
                 "loading the model onto the device"
             );

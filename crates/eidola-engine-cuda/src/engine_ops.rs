@@ -28,6 +28,34 @@ pub struct QkvArgs {
 
 const _: () = assert!(std::mem::size_of::<QkvArgs>() == 96);
 
+/// Buffers one `eidola_copy_rows` launch may name.
+pub const COPY_BUFFERS: usize = 8;
+
+/// The status bit `eidola_copy_rows` raises for an item naming a buffer or a
+/// row out of range (the item copies nothing).
+pub const STATUS_BAD_INDEX: u32 = 4;
+
+/// `EidolaCopyArgs`: one `eidola_copy_rows` launch. Buffer `b` is
+/// `buf[b]`, holding `rows[b]` rows of `width` 32-bit words (0 rows for an
+/// unused buffer); item `i` copies row `src_row[i]` of buffer `src_buf[i]`
+/// to row `dst_row[i]` of buffer `dst_buf[i]`. The four item arrays are
+/// device addresses of `items` words each.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyArgs {
+    pub buf: [u64; COPY_BUFFERS],
+    pub rows: [u64; COPY_BUFFERS],
+    pub src_buf: u64,
+    pub src_row: u64,
+    pub dst_buf: u64,
+    pub dst_row: u64,
+    pub status: u64,
+    pub width: u32,
+    pub items: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<CopyArgs>() == 176);
+
 pub struct EngineOps {
     _module: KernelModule,
     embed: Kernel,
@@ -44,6 +72,7 @@ pub struct EngineOps {
     gather_quant: Kernel,
     combine: Kernel,
     gather_bf16: Kernel,
+    copy: Kernel,
 }
 
 impl EngineOps {
@@ -59,7 +88,14 @@ impl EngineOps {
                 "eidola_qkv_rope_kv: argument struct size",
             ));
         }
+        let copy = m.kernel("eidola_copy_rows")?;
+        if copy.meta().params_bytes as usize != std::mem::size_of::<CopyArgs>() {
+            return Err(crate::CudaError::new(
+                "eidola_copy_rows: argument struct size",
+            ));
+        }
         Ok(EngineOps {
+            copy,
             embed: m.kernel("eidola_embed")?,
             rmsnorm: m.kernel("eidola_rmsnorm_f32")?,
             quant: m.kernel("eidola_quant_fp8_f32scale")?,
@@ -497,6 +533,36 @@ impl EngineOps {
         }
         unsafe { launch!(gpu, self.gather_bf16, [n, 1, 1], out, x, rows, hidden) }
     }
+
+    /// `args.items` row copies of `args.width` words ([`CopyArgs`]). The
+    /// kernel bounds every buffer and row index against `args.rows` and
+    /// raises [`STATUS_BAD_INDEX`] in `args.status` for an item out of
+    /// range; the item arrays themselves must hold `items` words each, and
+    /// no item's destination row may be another item's source or
+    /// destination.
+    pub unsafe fn copy_rows(&self, gpu: &Gpu, args: CopyArgs) -> Result<()> {
+        let grid = copy_grid(args.items, args.width)?;
+        if grid[0] == 0 {
+            return Ok(());
+        }
+        unsafe { launch!(gpu, self.copy, grid, args) }
+    }
+}
+
+/// Threads per block of `eidola_copy_rows`: one per word of a row.
+pub const COPY_THREADS: u32 = 256;
+
+/// The row copy's grid: one block row per item, and one thread per word of
+/// the row.
+pub fn copy_grid(items: u32, width: u32) -> Result<[u32; 3]> {
+    require(width > 0, "copy_rows: rows of no words")?;
+    require(
+        items <= MAX_GRID_X,
+        "copy_rows: too many items for one launch",
+    )?;
+    let blocks = width.div_ceil(COPY_THREADS);
+    require(blocks <= 65_535, "copy_rows: rows too wide for one launch")?;
+    Ok([items, blocks, 1])
 }
 
 /// The driver's grid limit in x.

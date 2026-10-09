@@ -16,7 +16,7 @@ use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
 use eidola_engine_cuda::attention::AttnRequest;
 use eidola_engine_cuda::model::ForwardInput;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, KvBlocks};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, KvBlocks, MtpHidden};
 use eidola_engine_model::safetensors::WeightSet;
 
 const KEEP: [usize; 4] = [0, 1, 2, 5];
@@ -95,6 +95,7 @@ fn seam_contract_on_the_truncated_checkpoint() {
         num_blocks: KvBlocks {
             global: 32,
             sliding: 32,
+            drafter: 0,
         },
         num_state_slots: 4,
         max_model_len: 1024,
@@ -105,6 +106,8 @@ fn seam_contract_on_the_truncated_checkpoint() {
         sampleable_vocab_size: SAMPLEABLE,
         image: None,
         graphs: CudaGraphs::Off,
+        draft_tokens: 0,
+        mtp_hidden: MtpHidden::Normed,
     };
     let mut ex = CudaExecutor::new(su.gpu, &su.dir, store, Some(&KEEP), cfg).unwrap();
     let prompt: Vec<u32> = (0..40u32).map(|i| (i * 7919 + 13) % 150_000).collect();

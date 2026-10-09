@@ -24,6 +24,8 @@ eidola-engine-model = { path = "../eidola-engine-model" }
 
 [dev-dependencies]
 eidola-engine-chat = { path = "../eidola-engine-chat" }
+# The reference executor drafted steps are compared with on the GPU.
+eidola-engine-cpu = { path = "../eidola-engine-cpu" }
 serde_json = "1"
 
 # The evaluator's scoring and comparison logic is unit-tested with the crate.

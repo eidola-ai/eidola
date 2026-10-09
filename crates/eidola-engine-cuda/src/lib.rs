@@ -14,6 +14,7 @@
 pub mod attention;
 pub mod bf16;
 pub mod device;
+pub mod draft;
 pub mod engine_ops;
 pub mod executor;
 pub mod gemm;
@@ -32,7 +33,8 @@ pub mod weights;
 use std::fmt;
 
 pub use device::{DeviceInfo, Gpu, ImageArch};
-pub use executor::{CudaExecutor, CudaExecutorConfig, DecodeStats, KvBlocks};
+pub use draft::MtpHidden;
+pub use executor::{CudaExecutor, CudaExecutorConfig, DecodeStats, DraftRecord, KvBlocks};
 pub use graph::{CudaGraphs, DecodePath};
 pub use module::{ImageSource, Kernel, KernelDir, KernelModule};
 pub use support::{Unsupported, check_device, check_supported};

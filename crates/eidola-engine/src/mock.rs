@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::executor::{Executor, ExecutorError, Maintenance, StepInput, StepOutput};
+use crate::executor::{Executor, ExecutorError, Maintenance, SeqEntry, StepInput, StepOutput};
 use crate::sampling::{self, SamplingParams, Stream, mix64};
 use crate::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK};
 
@@ -85,6 +85,7 @@ pub fn mimo_like_spec(
             ),
         ],
         max_draft_tokens: k,
+        draft_step_tokens: 0,
         num_state_slots: slots,
         buckets: vec![
             Bucket {
@@ -184,6 +185,7 @@ pub struct MockExecutor {
     zero_log: Vec<(u64, u32, u32)>,
     steps: u64,
     buckets_used: Vec<Bucket>,
+    rows_used: Vec<Vec<SeqEntry>>,
 }
 
 impl MockExecutor {
@@ -203,6 +205,7 @@ impl MockExecutor {
             zero_log: Vec::new(),
             steps: 0,
             buckets_used: Vec::new(),
+            rows_used: Vec::new(),
             spec,
             cfg,
         }
@@ -221,6 +224,11 @@ impl MockExecutor {
     /// Buckets of the executed steps, in order.
     pub fn buckets_used(&self) -> &[Bucket] {
         &self.buckets_used
+    }
+
+    /// Rows of the executed steps, in order.
+    pub fn rows_used(&self) -> &[Vec<SeqEntry>] {
+        &self.rows_used
     }
 
     /// Whether every byte of a block is zero.
@@ -373,6 +381,7 @@ impl Executor for MockExecutor {
             return Err(ExecutorError("batch exceeds its bucket".into()));
         }
         self.buckets_used.push(step.bucket);
+        self.rows_used.push(step.seqs.clone());
         let bs = self.spec.block_size as usize;
         for m in &step.maintenance {
             match *m {

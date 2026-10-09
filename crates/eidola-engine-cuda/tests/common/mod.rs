@@ -63,7 +63,11 @@ impl Lcg {
         ((self.next_u64() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
 
+    /// Uniform-ish in `0..n` (`n` at most 2^31), from the state's high bits: a
+    /// power-of-two LCG's low bits cycle with short periods (bit `i` with period
+    /// `2^(i+1)`), so `next % 4` repeats every four draws and a loop rejecting
+    /// draws can spin forever.
     pub fn below(&mut self, n: u64) -> u64 {
-        self.next_u64() % n
+        (self.next_u64() >> 33) % n
     }
 }

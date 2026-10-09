@@ -681,6 +681,7 @@ impl DecodeGraphs {
                 .collect(),
             logit_rows: at(layout.logit_rows),
             num_logit_rows: rows,
+            final_norm: false,
         };
         // SAFETY: the table holds a packed step for this layout (the
         // caller's contract): every value `pack` wrote passed the eager
@@ -790,7 +791,7 @@ impl DecodeGraphs {
     }
 }
 
-fn free_memory() -> Result<i64> {
+pub(crate) fn free_memory() -> Result<i64> {
     let (free, _) = cudarc::driver::result::mem_get_info()?;
     narrow(free, "free device memory")
 }

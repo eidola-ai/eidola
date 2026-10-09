@@ -745,3 +745,48 @@ extern "C" __global__ void __launch_bounds__(kThreads)
   for (uint32_t i = threadIdx.x; i < hidden; i += kThreads) dst[i] = f2bf16(src[i]);
 }
 EIDOLA_KERNEL_META(eidola_gather_rows_bf16, kThreads, 1, 1, 0, 1, 1, 1, 0);
+
+// Row copies between buffers (the speculative step's gathers and scatters
+// of hidden states, drafter state, boundary taps and token ids). Buffer `b`
+// holds `rows[b]` rows of `width` 32-bit words; item i copies row
+// `src_row[i]` of buffer `src_buf[i]` to row `dst_row[i]` of buffer
+// `dst_buf[i]`, word for word. Every index is bounded here: an item naming a
+// buffer past kCopyBuffers or a row past its buffer copies nothing and sets
+// kStatusBadIndex in `status`. Items must not overlap (no item's destination
+// row is another item's source or destination row): the host plans them so.
+//
+// Grid (items, ceil(width / kThreads)): one thread per word.
+namespace {
+constexpr uint32_t kCopyBuffers = 8;
+constexpr uint32_t kStatusBadIndex = 4;
+}  // namespace
+
+struct EidolaCopyArgs {
+  uint32_t* buf[kCopyBuffers];
+  uint64_t rows[kCopyBuffers];
+  const uint32_t* src_buf;
+  const uint32_t* src_row;
+  const uint32_t* dst_buf;
+  const uint32_t* dst_row;
+  uint32_t* status;
+  uint32_t width;
+  uint32_t items;
+};
+static_assert(sizeof(EidolaCopyArgs) == 176, "host mirror layout");
+
+extern "C" __global__ void __launch_bounds__(kThreads)
+    eidola_copy_rows(const __grid_constant__ EidolaCopyArgs a) {
+  const uint32_t i = blockIdx.x;
+  if (i >= a.items) return;
+  const uint32_t sb = a.src_buf[i], db = a.dst_buf[i];
+  const uint32_t sr = a.src_row[i], dr = a.dst_row[i];
+  if (sb >= kCopyBuffers || db >= kCopyBuffers || sr >= a.rows[sb] || dr >= a.rows[db]) {
+    if (blockIdx.y == 0 && threadIdx.x == 0) atomicOr(a.status, kStatusBadIndex);
+    return;
+  }
+  const uint32_t w = blockIdx.y * kThreads + threadIdx.x;
+  if (w >= a.width) return;
+  a.buf[db][static_cast<uint64_t>(dr) * a.width + w] =
+      a.buf[sb][static_cast<uint64_t>(sr) * a.width + w];
+}
+EIDOLA_KERNEL_META(eidola_copy_rows, kThreads, 1, 1, 0, 1, 1, 1, sizeof(EidolaCopyArgs));

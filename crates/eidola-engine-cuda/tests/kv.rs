@@ -7,7 +7,7 @@ mod common;
 
 use common::{Lcg, setup};
 use eidola_engine::executor::{Maintenance, TableUpdate};
-use eidola_engine_cuda::kv::{GroupGeometry, KvStore};
+use eidola_engine_cuda::kv::{GroupGeometry, KvLayout, KvStore};
 
 fn geometry() -> Vec<GroupGeometry> {
     vec![
@@ -18,6 +18,7 @@ fn geometry() -> Vec<GroupGeometry> {
             head_dim_v: 128,
             block_size: 16,
             num_blocks: 6,
+            layout: KvLayout::Blocked,
         },
         GroupGeometry {
             num_layers: 5,
@@ -26,6 +27,7 @@ fn geometry() -> Vec<GroupGeometry> {
             head_dim_v: 128,
             block_size: 16,
             num_blocks: 5,
+            layout: KvLayout::Blocked,
         },
     ]
 }

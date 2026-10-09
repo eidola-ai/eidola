@@ -66,6 +66,7 @@ fn direct_greedy(prompt: Vec<u32>, max_tokens: u32) -> (Vec<u32>, FinishReason) 
             mtp_hidden: MtpHidden::Normed,
             sampleable_vocab_size: model.tokenizer().vocab_size() as u32,
             pad_batches: false,
+            draft_step_tokens: 0,
             record: false,
         },
     );

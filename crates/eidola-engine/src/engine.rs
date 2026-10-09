@@ -17,9 +17,12 @@
 //!    admitted while a slot, budget, and KV for their first chunk are available. Admission
 //!    is strictly first-come-first-served: the first request that does not fit blocks those
 //!    behind it (no starvation of long prompts).
-//! 4. The batch is padded to the smallest captured [`Bucket`](crate::spec::Bucket) and
+//! 4. **Draft width.** When the step is past the executor's
+//!    [`ModelSpec::draft_step_tokens`] and a narrower uniform draft width brings it
+//!    within, every drafting row drafts that width (`narrow_drafts`).
+//! 5. The batch is padded to the smallest captured [`Bucket`](crate::spec::Bucket) and
 //!    executed together with all pending maintenance and table updates.
-//! 5. **Commit.** Produced tokens are appended; the sequence finishes on an EOS or stop
+//! 6. **Commit.** Produced tokens are appended; the sequence finishes on an EOS or stop
 //!    token, `max_tokens`, or the model length. KV beyond the accepted positions is rolled
 //!    back, full blocks are sealed into the prefix cache, and finished sequences are
 //!    released.
@@ -539,6 +542,7 @@ impl<E: Executor> Engine<E> {
         if planned.is_empty() && !self.kv.has_pending_maintenance() {
             return Ok(events);
         }
+        self.narrow_drafts(&mut planned);
         events.extend(self.execute_and_commit(planned, now)?);
         Ok(events)
     }
@@ -552,6 +556,48 @@ impl<E: Executor> Engine<E> {
             tokens: Vec::new(),
             finish: Some(reason),
             cached_prompt_tokens: seq.cached_prompt_tokens.unwrap_or(0),
+        }
+    }
+
+    /// Narrows the step's draft width to the widest `w < k` that keeps its query tokens
+    /// within [`ModelSpec::draft_step_tokens`], when the full width does not and some
+    /// narrower one does; the rows give back the reservations they no longer need. Every
+    /// drafting row keeps the same width (rows trimmed near the model length keep their
+    /// fewer drafts when those are fewer still). A step past the limit even without
+    /// drafts keeps the full width: it is off the executor's fast path whatever its width.
+    ///
+    /// On the CUDA executor the limit is the masked expert layout's 128 tokens: past it
+    /// the target pass takes the contiguous layout, measured at 41-44 ms a step for 64
+    /// decode rows drafting two or three tokens against 15 ms for one, so a wide step at
+    /// high concurrency produces fewer tokens per second than a narrow one.
+    fn narrow_drafts(&mut self, planned: &mut [Planned]) {
+        let limit = self.spec.draft_step_tokens;
+        let k = planned
+            .iter()
+            .map(|p| p.entry.num_drafts)
+            .max()
+            .unwrap_or(0);
+        if limit == 0 || k == 0 {
+            return;
+        }
+        let tokens = |w: u32| -> u32 {
+            planned
+                .iter()
+                .map(|p| p.entry.num_tokens + p.entry.num_drafts.min(w))
+                .sum()
+        };
+        if tokens(k) <= limit {
+            return;
+        }
+        let Some(w) = (0..k).rev().find(|&w| tokens(w) <= limit) else {
+            return;
+        };
+        for p in planned.iter_mut().filter(|p| p.entry.num_drafts > w) {
+            p.entry.num_drafts = w;
+            self.kv.shrink(
+                p.id,
+                p.entry.context_len + p.entry.num_tokens + p.entry.num_drafts,
+            );
         }
     }
 

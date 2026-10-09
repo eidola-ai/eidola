@@ -23,7 +23,7 @@ use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::secret::EngineSalt;
 use eidola_engine::spec::Bucket;
-use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, KvBlocks};
+use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, KvBlocks, MtpHidden};
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
 
@@ -137,6 +137,7 @@ impl Harness {
             num_blocks: KvBlocks {
                 global: blocks,
                 sliding: blocks,
+                drafter: 0,
             },
             num_state_slots: 8,
             max_model_len: 1024,
@@ -153,6 +154,8 @@ impl Harness {
             sampleable_vocab_size: SAMPLEABLE,
             image: None,
             graphs: graphs_from_env(),
+            draft_tokens: 0,
+            mtp_hidden: MtpHidden::Normed,
         };
         let ex = CudaExecutor::new(su.gpu, &su.dir, env.store.clone(), Some(&KEEP), cfg).unwrap();
         Some(Harness {

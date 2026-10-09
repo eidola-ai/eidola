@@ -89,6 +89,7 @@ pub fn exec_config(blocks: u32, mtp_depths: Vec<usize>) -> CpuExecutorConfig {
         mtp_hidden: MtpHidden::Normed,
         sampleable_vocab_size: VOCAB,
         pad_batches: false,
+        draft_step_tokens: 0,
         record: true,
     }
 }

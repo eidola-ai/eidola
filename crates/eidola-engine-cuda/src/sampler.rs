@@ -65,6 +65,34 @@ pub(crate) struct SampleLaunch {
 /// logits sets.
 pub const STATUS_NON_FINITE: u32 = 1;
 
+/// The status bit a token id at or past the sampleable vocabulary raises:
+/// one `eidola_sample` would have written (it writes 0 instead), or a draft
+/// `eidola_chain_accept` was given (the row ends with no tokens). Draft ids
+/// a drafter produces on the device are bounded by these two kernels, where
+/// they are made and where they are read, not on the host.
+pub const STATUS_BAD_TOKEN: u32 = 2;
+
+/// One `eidola_chain_accept` launch over device addresses (see
+/// [`Sampler::launch_accept`]).
+#[derive(Clone, Copy, Debug)]
+pub struct AcceptLaunch {
+    pub target: u64,
+    pub draft: u64,
+    pub n: u32,
+    pub rows: u64,
+    pub target_row: u64,
+    pub draft_row: u64,
+    pub draft_step: u32,
+    pub num_drafts: u64,
+    pub drafts: u64,
+    pub stride: u32,
+    pub scratch: u64,
+    pub out: u64,
+    pub counts: u64,
+    pub status: u64,
+    pub num_rows: u32,
+}
+
 /// The sampler kernels.
 pub struct Sampler {
     _module: KernelModule,
@@ -194,10 +222,12 @@ impl Sampler {
     /// and `rows[r].position` set to its first drafted position. Writes the
     /// tokens to `out[r * stride ..]` and their count to `counts[r]`.
     ///
-    /// Everything the kernel indexes by (draft counts, distribution rows,
-    /// draft token ids) is checked here, on the host, against the buffers
-    /// it will reach, and then uploaded into `inputs`: the device reads only
-    /// values that passed.
+    /// Everything the kernel indexes by (draft counts, distribution rows)
+    /// is checked here, on the host, against the buffers it will reach, and
+    /// then uploaded into `inputs`: the device reads only values that
+    /// passed. Draft ids are checked here too, and again by the kernel (the
+    /// drafted step's ids never reach the host), which raises
+    /// [`STATUS_BAD_TOKEN`] in `status` for one out of range.
     #[allow(clippy::too_many_arguments)]
     pub fn chain_accept(
         &self,
@@ -211,9 +241,13 @@ impl Sampler {
         scratch: &mut CudaSlice<f64>,
         out: &mut CudaSlice<u32>,
         counts: &mut CudaSlice<u32>,
+        status: &mut CudaSlice<u32>,
     ) -> Result<()> {
         if plan.is_empty() {
             return Ok(());
+        }
+        if status.is_empty() {
+            return Err(CudaError::new("chain_accept: no status word"));
         }
         let r = plan.len();
         let stride = inputs.stride;
@@ -233,12 +267,127 @@ impl Sampler {
         {
             return Err(CudaError::new("chain_accept: buffer too small"));
         }
-        let mut drafts = vec![0u32; r * stride as usize];
+        let AcceptPlan {
+            target_row,
+            draft_row,
+            num_drafts,
+            ids,
+        } = AcceptPlan::new(plan, n, stride, target_rows, draft_rows)?;
+        let s = gpu.stream();
+        if inputs.drafts.len() < ids.len() {
+            inputs.drafts = s.alloc_zeros(ids.len())?;
+        }
+        s.memcpy_htod(&target_row, &mut inputs.target_row.slice_mut(..r))?;
+        s.memcpy_htod(&draft_row, &mut inputs.draft_row.slice_mut(..r))?;
+        s.memcpy_htod(&num_drafts, &mut inputs.num_drafts.slice_mut(..r))?;
+        s.memcpy_htod(&ids, &mut inputs.drafts.slice_mut(..ids.len()))?;
+        // SAFETY: arguments match `eidola_chain_accept`; every index the
+        // kernel derives was bounded above, and `inputs` holds exactly the
+        // checked values (uploaded on this stream, before the launch).
+        unsafe {
+            self.launch_accept(
+                gpu,
+                AcceptLaunch {
+                    target: dptr(target, s),
+                    draft: dptr(draft, s),
+                    n,
+                    rows: dptr(rows, s),
+                    target_row: dptr(&inputs.target_row, s),
+                    draft_row: dptr(&inputs.draft_row, s),
+                    draft_step: 1,
+                    num_drafts: dptr(&inputs.num_drafts, s),
+                    drafts: dptr(&inputs.drafts, s),
+                    stride,
+                    scratch: dptr(scratch, s),
+                    out: dptr(out, s),
+                    counts: dptr(counts, s),
+                    status: dptr(status, s),
+                    num_rows: narrow(r, "acceptance rows")?,
+                },
+            )
+        }
+    }
+
+    /// The `eidola_chain_accept` launch alone, over inputs already on the
+    /// device.
+    ///
+    /// # Safety
+    ///
+    /// For each of `a.num_rows` rows `r`: `a.rows[r]` and `a.num_drafts[r] =
+    /// k` must be readable; the target rows `a.target_row[r] ..= + k` and the
+    /// draft rows `a.draft_row[r] + i * a.draft_step` (`i < k`) must lie
+    /// inside `a.target` and `a.draft` (rows of `a.n` f64), the latter also
+    /// inside `a.drafts`; `a.out` must hold `r * a.stride + k + 1` words,
+    /// `a.counts` and `a.scratch` (rows of `a.n`) `a.num_rows` rows, and
+    /// `a.status` one word. Draft ids are bounded by the kernel.
+    pub unsafe fn launch_accept(&self, gpu: &Gpu, a: AcceptLaunch) -> Result<()> {
+        if a.num_rows == 0 {
+            return Ok(());
+        }
+        if a.n == 0 || a.n > 1 << 20 {
+            return Err(CudaError::new(format!("chain_accept: vocabulary {}", a.n)));
+        }
+        // SAFETY: arguments match `eidola_chain_accept`; the caller's
+        // contract covers every address.
+        unsafe {
+            launch!(
+                gpu,
+                self.accept,
+                [a.num_rows, 1, 1],
+                a.target,
+                a.draft,
+                a.n,
+                a.rows,
+                a.target_row,
+                a.draft_row,
+                a.draft_step,
+                a.num_drafts,
+                a.drafts,
+                a.stride,
+                a.scratch,
+                a.out,
+                a.counts,
+                a.status,
+            )
+        }
+    }
+}
+
+/// A host-scheduled chain acceptance, checked and laid out as the kernel
+/// reads it: per row its target row, draft row and draft count, and the
+/// draft ids. The kernel reads draft `i` of a row at the index of its
+/// distribution (`draft_row + i`), so an id row belongs to a distribution
+/// row: a draft is the token drawn from that distribution. Rows may share
+/// distribution rows only with the same ids there; rows that name different
+/// ids for one distribution row are refused, since one of them would be
+/// accepted against the other's drafts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptPlan {
+    pub target_row: Vec<u32>,
+    pub draft_row: Vec<u32>,
+    pub num_drafts: Vec<u32>,
+    pub ids: Vec<u32>,
+}
+
+impl AcceptPlan {
+    /// Checks `plan` against distributions of `target_rows` and `draft_rows`
+    /// rows over a vocabulary of `n`, and outputs of `stride` tokens a row:
+    /// every index the kernel derives in bounds, every draft id below `n`,
+    /// and no id row given two different ids. Needs no device.
+    pub fn new(
+        plan: &[AcceptRow<'_>],
+        n: u32,
+        stride: u32,
+        target_rows: usize,
+        draft_rows: usize,
+    ) -> Result<AcceptPlan> {
+        let r = plan.len();
         let (mut target_row, mut draft_row, mut num_drafts) = (
             Vec::with_capacity(r),
             Vec::with_capacity(r),
             Vec::with_capacity(r),
         );
+        let mut id_rows = 0usize;
         for (i, row) in plan.iter().enumerate() {
             let k = row.drafts.len();
             // Up to k accepted drafts and one more token: k + 1 slots.
@@ -270,38 +419,36 @@ impl Sampler {
                     "chain_accept: row {i} drafts token {d} of {n}"
                 )));
             }
-            drafts[i * stride as usize..][..k].copy_from_slice(row.drafts);
+            if k > 0 {
+                id_rows = id_rows.max(draft_end.map_or(0, |e| e as usize));
+            }
             target_row.push(row.target_row);
             draft_row.push(row.draft_row);
             num_drafts.push(k32);
         }
-        let s = gpu.stream();
-        s.memcpy_htod(&target_row, &mut inputs.target_row.slice_mut(..r))?;
-        s.memcpy_htod(&draft_row, &mut inputs.draft_row.slice_mut(..r))?;
-        s.memcpy_htod(&num_drafts, &mut inputs.num_drafts.slice_mut(..r))?;
-        s.memcpy_htod(&drafts, &mut inputs.drafts.slice_mut(..r * stride as usize))?;
-        // SAFETY: arguments match `eidola_chain_accept`; every index the
-        // kernel derives was bounded above, and `inputs` holds exactly the
-        // checked values (uploaded on this stream, before the launch).
-        unsafe {
-            launch!(
-                gpu,
-                self.accept,
-                [narrow(r, "acceptance rows")?, 1, 1],
-                dptr(target, s),
-                dptr(draft, s),
-                n,
-                dptr(rows, s),
-                dptr(&inputs.target_row, s),
-                dptr(&inputs.draft_row, s),
-                dptr(&inputs.num_drafts, s),
-                dptr(&inputs.drafts, s),
-                stride,
-                dptr(scratch, s),
-                dptr(out, s),
-                dptr(counts, s),
-            )
+        // Draft ids sit where their distributions do: draft `i` of row `r`
+        // at id row `draft_row + i` (the kernel's `draft_step` of 1).
+        let mut ids: Vec<Option<(usize, u32)>> = vec![None; id_rows.max(1)];
+        for (i, row) in plan.iter().enumerate() {
+            for (j, &d) in row.drafts.iter().enumerate() {
+                let at = row.draft_row as usize + j;
+                match ids[at] {
+                    Some((other, e)) if e != d => {
+                        return Err(CudaError::new(format!(
+                            "chain_accept: rows {other} and {i} draft {e} and {d} from \
+                             distribution row {at}"
+                        )));
+                    }
+                    _ => ids[at] = Some((i, d)),
+                }
+            }
         }
+        Ok(AcceptPlan {
+            target_row,
+            draft_row,
+            num_drafts,
+            ids: ids.into_iter().map(|x| x.map_or(0, |(_, d)| d)).collect(),
+        })
     }
 }
 
@@ -346,5 +493,41 @@ impl AcceptInputs {
     /// Tokens per output row: the most drafts a row may have, plus one.
     pub fn stride(&self) -> u32 {
         self.stride
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(target_row: u32, draft_row: u32, drafts: &[u32]) -> AcceptRow<'_> {
+        AcceptRow {
+            target_row,
+            draft_row,
+            drafts,
+        }
+    }
+
+    /// Each row's ids land at its distribution rows; rows may share
+    /// distribution rows with the same ids, never with different ones (the
+    /// kernel reads an id at its distribution's index, so the later row's
+    /// ids would replace the earlier's).
+    #[test]
+    fn draft_ids_belong_to_their_distribution_rows() {
+        let plan = AcceptPlan::new(&[row(0, 0, &[3, 4]), row(3, 2, &[5])], 8, 3, 6, 3).unwrap();
+        assert_eq!(plan.ids, [3, 4, 5]);
+        assert_eq!(plan.draft_row, [0, 2]);
+        assert_eq!(plan.num_drafts, [2, 1]);
+        // Shared rows, same ids: one layout serves both.
+        let plan = AcceptPlan::new(&[row(0, 0, &[3, 4]), row(3, 1, &[4])], 8, 3, 6, 2).unwrap();
+        assert_eq!(plan.ids, [3, 4]);
+        // Shared rows, different ids: refused, naming both rows.
+        let e = AcceptPlan::new(&[row(0, 0, &[3, 4]), row(3, 1, &[6])], 8, 3, 6, 2).unwrap_err();
+        assert!(e.to_string().contains("rows 0 and 1"), "{e}");
+        let e = AcceptPlan::new(&[row(0, 0, &[3]), row(3, 0, &[6])], 8, 3, 6, 2).unwrap_err();
+        assert!(e.to_string().contains("distribution row 0"), "{e}");
+        // A row without drafts names no id rows, wherever its draft row.
+        let plan = AcceptPlan::new(&[row(0, u32::MAX, &[])], 8, 3, 6, 2).unwrap();
+        assert_eq!(plan.ids, [0]);
     }
 }

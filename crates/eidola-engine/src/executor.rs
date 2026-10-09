@@ -59,10 +59,12 @@
 //! and acceptance run inside the step, so a speculative decode step needs no host round
 //! trip. Steps with `num_drafts` uniform across rows and one host token per row (pure
 //! decode) are the ones expected to replay a captured graph; mixed prefill steps may
-//! run piecewise. The host gives every row either the full draft width `k` or none
-//! (none at position 0, and none for every row of a step that ran short of KV),
-//! trimming only near the model length, so non-uniform decode steps are rare and need
-//! no graph of their own. `maintenance` and `table_updates` are applied by small
+//! run piecewise. The host gives every drafting row of a step the same width: the full
+//! `k`, or the widest `w < k` that keeps the step within
+//! [`ModelSpec::draft_step_tokens`] when only narrowing does (none at position 0, and
+//! none for every row of a step that ran short of KV), trimming only near the model
+//! length, so non-uniform decode steps are rare and need no graph of their own; an
+//! executor that reports a step limit captures a graph per width it can be given. `maintenance` and `table_updates` are applied by small
 //! kernels or copies before the graph replays.
 //!
 //! # Determinism contract
@@ -80,32 +82,41 @@
 //!
 //! # Drafter rows
 //!
-//! A drafter that consumes a token together with a hidden state from the previous
-//! position must index its row by the **token it consumes**. For MTP depth `d` (level 0 is
-//! the target's hidden state, level `d + 1` is depth `d`'s output):
+//! A drafter that consumes a token together with a hidden state from an earlier position
+//! must index its row by the **token it consumes**. For MTP depth `d`, every depth
+//! conditioned on the **target's** hidden state (as the model vendor serves its MTP
+//! layers: layer `d` combines `h_x` with the token `d + 1` past `x`, never another MTP
+//! layer's output):
 //!
-//! * the row at position `s` consumes the token at `s` and level `d` at `s - 1`, uses
-//!   RoPE position `s - 1`, writes its KV at `s`, and predicts the token at `s + 1`; rows
-//!   exist for `s >= d + 1`;
+//! * the row at position `s` consumes the token at `s` and the target's hidden state at
+//!   the anchor `a = s - 1 - d`, uses RoPE position `a`, writes its KV at `s`, and
+//!   predicts the token at `s + 1`; rows exist for `s >= d + 1`;
 //! * the draft for position `p + 1 + i` (after the last host token `p`) is depth `i`'s
-//!   prediction at `p + i`; depth `i`'s speculative rows occupy `p + 1 ..= p + i`, inside
-//!   the positions the host reserved for drafts.
+//!   prediction at `p + i`, anchored at `p - 1` like every depth's; depth `i`'s
+//!   speculative rows occupy `p + 1 ..= p + i`, inside the positions the host reserved
+//!   for drafts.
+//!
+//! A depth's output feeds only its own logits and KV. Level `l` at position `x` names the
+//! target's state at `x - l` (zeros before position 0), so depth `d`'s row at `s` reads
+//! level `d` at `s - 1`.
 //!
 //! Indexing a row by the hidden state it continues from instead (`(h_p, t_{p+1})` at `p`)
 //! would make a block's last drafter row depend on the next block's first token, which
 //! the block's cache key does not cover.
 //!
 //! A sequence resuming at a block boundary `c` (prefix hit or preemption resume) needs the
-//! drafter's levels at `c - 1`, which no KV holds. The executor therefore stores a
-//! **boundary tap** in each drafter block: the levels at the block's last position. Taps
+//! drafter's levels at `c - 1` (the target's states at `c - 1 ..= c - D` for `D` depths),
+//! which no KV holds. The executor therefore stores a **boundary tap** in each drafter
+//! block: the levels at the block's last position. Taps
 //! are part of the block (a function of the tokens it covers), are zeroed and copied with
 //! it, and a fresh slot loads its drafter state from the tap of the block ending at
 //! `c - 1`; a running sequence carries it in per-slot state.
 //!
 //! A block drafter (DFlash shape) satisfies the same invariant: its per-position context
 //! KV at `s` is projected from target hidden states at `s`, which depend only on tokens
-//! `<= s`; the target taps it continues from at a resume point are stored the same way. A GPU executor that cannot make attention or GEMMs
-//! batch-invariant must document its tolerance; the CPU reference executor meets it exactly.
+//! `<= s`; the target taps it continues from at a resume point are stored the same way.
+//! A GPU executor that cannot make attention or GEMMs batch-invariant must document its
+//! tolerance; the CPU reference executor meets it exactly.
 
 use crate::sampling::SamplingParams;
 use crate::spec::{Bucket, ModelSpec};
