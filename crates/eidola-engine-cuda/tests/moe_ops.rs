@@ -1,4 +1,4 @@
-//! The expert path's router (every form), gather, SwiGLU and combine kernels
+//! The expert path's router (both forms), gather, SwiGLU and combine kernels
 //! against their single-block reference forms (`engine_ops_reference.cu`, the
 //! numerics they must keep) bit for bit, and the router against the model
 //! crate's routing, on every image this device runs, from one token to a full
@@ -10,8 +10,8 @@ use common::{Lcg, setup};
 use eidola_engine_cuda::bf16;
 use eidola_engine_cuda::engine_ops::{
     COMBINE_WIDTH, EngineOps, ROUTER_CLUSTER, ROUTER_SCORES_SMEM, ROUTER_SCORES_THREADS,
-    ROUTER_SELECT_WARPS, ROUTER_THREADS, ROUTER_TILED_THREADS, RouterForm, expert_placement,
-    psum_rows, router_scores_len,
+    ROUTER_SELECT_WARPS, ROUTER_THREADS, RouterForm, executor_router, expert_placement, psum_rows,
+    router_scores_len,
 };
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::{Gpu, ImageArch, Kernel};
@@ -23,12 +23,13 @@ const HIDDEN: usize = 4096;
 const EXPERTS: usize = 256;
 const TOP_K: usize = 8;
 const INTER: usize = 2048;
-/// Token counts: decode rows, decode batches (64 and 128 tokens, and 129, one
-/// past a block of rows), 513 (which leaves the tiled router a one-token last
+/// Token counts: decode rows, the executor's last one-token-form count and the
+/// first past it (8 and 9), decode batches (64 and 128 tokens, and 129, one
+/// past a block of rows), 513 (which leaves the split router a one-token last
 /// tile), and a full prefill step.
-const TOKENS: [usize; 9] = [1, 2, 7, 64, 128, 129, 513, 2048, 8192];
-/// Every router form, whatever the token count.
-const FORMS: [RouterForm; 3] = [RouterForm::PerToken, RouterForm::Tiled, RouterForm::Split];
+const TOKENS: [usize; 11] = [1, 2, 7, 8, 9, 64, 128, 129, 513, 2048, 8192];
+/// Both router forms, whatever the token count.
+const FORMS: [RouterForm; 2] = [RouterForm::PerToken, RouterForm::Split];
 
 fn u32_of(x: usize) -> u32 {
     u32::try_from(x).unwrap()
@@ -193,9 +194,6 @@ fn router_launch_contract() {
         let meta = *m.kernel("eidola_router_topk").unwrap().meta();
         assert_eq!(meta.block, [ROUTER_THREADS, 1, 1], "{arch:?}");
         assert_eq!(meta.cluster, [ROUTER_CLUSTER, 1, 1], "{arch:?}");
-        let meta = *m.kernel("eidola_router_topk_tiled").unwrap().meta();
-        assert_eq!(meta.block, [ROUTER_TILED_THREADS, 1, 1], "{arch:?}");
-        assert_eq!(meta.cluster, [ROUTER_CLUSTER, 1, 1], "{arch:?}");
         assert_eq!(meta.dynamic_smem_bytes, 0, "{arch:?}");
         let meta = *m.kernel("eidola_router_scores").unwrap().meta();
         assert_eq!(meta.block, [ROUTER_SCORES_THREADS, 1, 1], "{arch:?}");
@@ -217,7 +215,7 @@ fn router_launch_contract() {
 }
 
 /// Same expert ids in the same order and the same weights, bit for bit,
-/// ties included, at every token count, in every form.
+/// ties included, at every token count, in both forms.
 #[test]
 fn router_matches_reference_bit_for_bit() {
     let Some(su) = setup() else { return };
@@ -262,9 +260,63 @@ fn router_matches_reference_bit_for_bit() {
     }
 }
 
+/// The executor's router, in the form it picks for each count from 1 to 16
+/// tokens (across the bound between the one-token and the split form): the
+/// reference's ids and weights, bit for bit.
+#[test]
+fn executor_router_matches_reference_across_the_form_bound() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    let s = gpu.stream();
+    for &arch in &su.archs {
+        let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
+        let reference = Reference::load(&su, arch);
+        for tokens in 1..=16 {
+            let mut rng = Lcg(0xb0 ^ tokens as u64);
+            let case = router_case(&mut rng, tokens);
+            let form = executor_router(u32_of(tokens));
+            let (_, want) = run_router(gpu, &ops, form, &reference, &case, tokens);
+            let x = s.clone_htod(&case.x).unwrap();
+            let w = s.clone_htod(&case.w).unwrap();
+            let bias = s.clone_htod(&case.bias).unwrap();
+            let scores = s
+                .clone_htod(&vec![f32::NAN; router_scores_len(tokens, EXPERTS).unwrap()])
+                .unwrap();
+            let ids = s.alloc_zeros::<i32>(tokens * TOP_K).unwrap();
+            let wts = s.alloc_zeros::<f32>(tokens * TOP_K).unwrap();
+            unsafe {
+                ops.router_topk(
+                    gpu,
+                    dptr(&ids, s),
+                    dptr(&wts, s),
+                    dptr(&scores, s),
+                    dptr(&x, s),
+                    dptr(&w, s),
+                    dptr(&bias, s),
+                    u32_of(tokens),
+                    u32_of(HIDDEN),
+                    u32_of(EXPERTS),
+                    u32_of(TOP_K),
+                    1.0f32,
+                )
+                .unwrap();
+            }
+            let got = (
+                s.clone_dtoh(&ids).unwrap(),
+                s.clone_dtoh(&wts)
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<u32>>(),
+            );
+            assert_eq!(got, want, "{arch:?} {form:?} {tokens} tokens");
+        }
+    }
+}
+
 /// Fewer experts than the kernels' widest (a partial last expert block of
 /// the split form, and lanes holding no expert in its selection): the same
-/// ids and weights as the reference, bit for bit, in every form.
+/// ids and weights as the reference, bit for bit, in both forms.
 #[test]
 fn router_partial_experts_match_reference() {
     let Some(su) = setup() else { return };
@@ -296,7 +348,7 @@ fn router_partial_experts_match_reference() {
 }
 
 /// NaN choices select exactly as the reference's scan does: a NaN at the
-/// lowest untaken expert is taken, one elsewhere never wins. Every form, at
+/// lowest untaken expert is taken, one elsewhere never wins. Both forms, at
 /// every token count, with NaN logits too (a NaN in a token's row makes every
 /// one of its scores NaN).
 #[test]
