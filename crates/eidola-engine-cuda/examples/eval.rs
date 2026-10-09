@@ -37,8 +37,16 @@
 //! outputs to compare. `generate --draft-tokens K` drafts `K` tokens a step
 //! with the checkpoint's MTP layers (greedy speculation: the outputs are the
 //! undrafted run's but for near-ties) and prints the acceptance of each draft
-//! depth over the prompts: the share of drafted steps whose draft `i` was
-//! accepted among those whose drafts before it were.
+//! depth over the prompts, conditional: draft `d` accepted among the rows
+//! that drafted at least `d` tokens in a step and had their first `d - 1`
+//! accepted (`tests/common/draft_tally.rs`, shared with `tests/drafting.rs`).
+//! Rows are counted from what the executor was asked to draft, so a row that
+//! drafted nothing (a prefill, a step narrowed to width 0) or fewer than `d`
+//! tokens (narrowed by the serving core to stay in the masked expert layout)
+//! is outside depth `d`'s denominator, not a rejection there. A second
+//! line gives each depth's counts and the width distribution of sampled
+//! decode rows (with sampled prefill rows apart), so narrowing is visible; the
+//! first line's totals are the engine's own accepted/drafted.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -59,6 +67,10 @@ use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, KvBl
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
 use serde_json::{Value, json};
+
+#[path = "../tests/common/draft_tally.rs"]
+mod draft_tally;
+use draft_tally::Tallying;
 
 const TOP: usize = 20;
 
@@ -174,6 +186,7 @@ fn render(model: &str, tasks: &str, out: &str) {
 fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32, depths: u32) {
     let tok = MimoTokenizer::from_model_dir(Path::new(model)).unwrap();
     let (ex, _) = executor(kernels, model, 2048, 64, depths);
+    let ex = Tallying::new(ex);
     let sched = SchedulerConfig {
         max_batched_tokens: 2048,
         max_seqs: 64,
@@ -202,13 +215,13 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32, 
     let mut outputs: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut finish: HashMap<u64, String> = HashMap::new();
     let (t0, mut steps, mut produced) = (Instant::now(), 0u64, 0usize);
-    // Per decode step and request: the tokens it produced (1 + accepted drafts).
-    let mut per_step: Vec<usize> = Vec::new();
+    // Steps in which a request produced tokens, over every request.
+    let mut row_steps = 0usize;
     while eng.unfinished() > 0 {
         for e in eng.step(steps).unwrap() {
             produced += e.tokens.len();
             if !e.tokens.is_empty() {
-                per_step.push(e.tokens.len());
+                row_steps += 1;
             }
             outputs.entry(e.id).or_default().extend(&e.tokens);
             if let Some(f) = e.finish {
@@ -233,7 +246,14 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32, 
     if depths > 0 {
         let s = eng.stats();
         let rate = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
-        let depth: Vec<String> = acceptance_by_depth(&per_step, depths as usize)
+        let t = eng.executor().tally();
+        assert_eq!(
+            (t.accepted_total, t.drafted_total),
+            (s.accepted, s.drafted),
+            "the tally disagrees with the engine's own counts"
+        );
+        let depth: Vec<String> = t
+            .rates()
             .iter()
             .enumerate()
             .map(|(i, r)| format!("draft {}: {:.3}", i + 1, r))
@@ -243,29 +263,33 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32, 
             s.accepted,
             s.drafted,
             rate(s.accepted, s.drafted),
-            produced as f64 / per_step.len().max(1) as f64,
+            produced as f64 / row_steps.max(1) as f64,
             depth.join(", ")
+        );
+        let counts: Vec<String> = t
+            .accepted
+            .iter()
+            .zip(&t.reached)
+            .enumerate()
+            .map(|(i, (a, r))| format!("draft {}: {a}/{r}", i + 1))
+            .collect();
+        let widths: Vec<String> = t
+            .widths
+            .iter()
+            .enumerate()
+            .map(|(w, n)| format!("w{w} {n}"))
+            .collect();
+        eprintln!(
+            "drafting {depths} counts: {}; decode rows by width: {}; sampled prefill rows: {}",
+            counts.join(", "),
+            widths.join(", "),
+            t.prefill
         );
     }
     let out_rows: Vec<Value> = (0..rows.len() as u64)
         .map(|i| json!({"id": index[&i], "output_ids": outputs.get(&i).cloned().unwrap_or_default(), "finish": finish[&i]}))
         .collect();
     write_jsonl(out, &out_rows);
-}
-
-/// Acceptance of each draft depth from the tokens each step produced per
-/// request: draft `i` was accepted in a step that produced more than `i`
-/// tokens, among the steps whose first `i - 1` drafts were accepted (that
-/// produced at least `i`). Prefill steps count once with one token, the
-/// first, and bias nothing past depth 1's denominator by more than one step
-/// per request.
-fn acceptance_by_depth(produced: &[usize], depths: usize) -> Vec<f64> {
-    (1..=depths)
-        .map(|i| {
-            let reached = produced.iter().filter(|&&n| n >= i).count().max(1);
-            produced.iter().filter(|&&n| n > i).count() as f64 / reached as f64
-        })
-        .collect()
 }
 
 /// Log-probabilities of one logit row over its first `n` ids.
