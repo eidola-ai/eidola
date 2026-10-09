@@ -206,17 +206,29 @@ struct Pool {
     kind: Kind,
     k: CudaSlice<u16>,
     v: CudaSlice<u16>,
-    k_host: Vec<u16>,
-    v_host: Vec<u16>,
-    /// Physical page of each logical page.
-    perm: Vec<u32>,
-    sinks: Vec<f32>,
+    host: HostKv,
     sink_dev: CudaSlice<f32>,
 }
 
-impl Pool {
-    fn new(gpu: &Gpu, kind: Kind, positions: u32, seed: u64) -> Pool {
-        let s = gpu.stream();
+/// A pool's values on the host: K and V by logical position, the page
+/// shuffle, and the sink logits.
+struct HostKv {
+    kind: Kind,
+    k: Vec<u16>,
+    v: Vec<u16>,
+    /// Physical page of each logical page.
+    perm: Vec<u32>,
+    sinks: Vec<f32>,
+}
+
+/// Sink logits of the sliding layers. The learned sinks are large enough
+/// here that leaving them out moves the outputs well past the reference
+/// tolerance, so an instance that drops or doubles the sink reads `OUT`
+/// (`tests::a_missing_sink_is_out_of_tolerance`).
+const SINK_LO: f32 = 4.0;
+
+impl HostKv {
+    fn new(kind: Kind, positions: u32, seed: u64) -> HostKv {
         let pages = positions.div_ceil(BS);
         let h = kind.kv_heads();
         let mut rng = Lcg(seed);
@@ -238,6 +250,28 @@ impl Pool {
         for x in &mut v_host {
             *x = bf16::from_f32(rng.f32());
         }
+        let sinks: Vec<f32> = match kind.window() {
+            Some(_) => (0..NQ).map(|_| SINK_LO + 2.0 * rng.f32().abs()).collect(),
+            None => vec![f32::NEG_INFINITY; usize_of(NQ)],
+        };
+        HostKv {
+            kind,
+            k: k_host,
+            v: v_host,
+            perm,
+            sinks,
+        }
+    }
+}
+
+impl Pool {
+    fn new(gpu: &Gpu, kind: Kind, positions: u32, seed: u64) -> Pool {
+        let s = gpu.stream();
+        let host = HostKv::new(kind, positions, seed);
+        let h = kind.kv_heads();
+        let (k_pos, v_pos) = (usize_of(h * HEAD_DIM_QK), usize_of(h * HEAD_DIM_VO));
+        let total = usize_of(positions.div_ceil(BS) * BS);
+        let (perm, k_host, v_host) = (&host.perm, &host.k, &host.v);
         // Device layout: physical page p holds its 16 positions' K (and V).
         let mut k_dev = vec![0u16; total * k_pos];
         let mut v_dev = vec![0u16; total * v_pos];
@@ -249,19 +283,12 @@ impl Pool {
             v_dev[dst * v_pos..(dst + n) * v_pos]
                 .copy_from_slice(&v_host[src * v_pos..(src + n) * v_pos]);
         }
-        let sinks: Vec<f32> = match kind.window() {
-            Some(_) => (0..NQ).map(|_| 0.5 + rng.f32().abs()).collect(),
-            None => vec![f32::NEG_INFINITY; usize_of(NQ)],
-        };
         Pool {
             kind,
             k: s.clone_htod(&k_dev).unwrap(),
             v: s.clone_htod(&v_dev).unwrap(),
-            k_host,
-            v_host,
-            perm,
-            sink_dev: s.clone_htod(&sinks).unwrap(),
-            sinks,
+            sink_dev: s.clone_htod(&host.sinks).unwrap(),
+            host,
         }
     }
 
@@ -284,11 +311,18 @@ impl Pool {
     }
 
     fn request(&self, q_start: u32, start: u32, len: u32, anchored: bool) -> AttnRequest {
-        paged_request(self.kind, &self.perm, q_start, start, len, anchored)
+        paged_request(self.kind, &self.host.perm, q_start, start, len, anchored)
     }
 
-    /// The f32 reference output of the query at `pos` (`[64][128]`).
     fn reference(&self, pos: u32) -> Vec<f32> {
+        self.host.reference(pos, true)
+    }
+}
+
+impl HostKv {
+    /// The f32 reference output of the query at `pos` (`[64][128]`), with
+    /// or without the sliding layers' sinks.
+    fn reference(&self, pos: u32, with_sinks: bool) -> Vec<f32> {
         let h = usize_of(self.kind.kv_heads());
         let (dqk, dv) = (usize_of(HEAD_DIM_QK), usize_of(HEAD_DIM_VO));
         let spec = AttentionSpec {
@@ -304,7 +338,7 @@ impl Pool {
             head_dim_v: dv,
             rope_dim: 64,
             rope_theta: 1e4,
-            has_sinks: self.kind.window().is_some(),
+            has_sinks: with_sinks && self.kind.window().is_some(),
             softmax_scale: 1.0 / (dqk as f32).sqrt(),
         };
         let q: Vec<f32> = q_row(pos).iter().map(|&x| bf16::to_f32(x)).collect();
@@ -316,7 +350,7 @@ impl Pool {
             let k: Vec<Vec<f32>> = (lo..hi)
                 .map(|p| {
                     let o = p * h * dqk + g * dqk;
-                    self.k_host[o..o + dqk]
+                    self.k[o..o + dqk]
                         .iter()
                         .map(|&x| bf16::to_f32(x))
                         .collect()
@@ -325,10 +359,7 @@ impl Pool {
             let v: Vec<Vec<f32>> = (lo..hi)
                 .map(|p| {
                     let o = p * h * dv + g * dv;
-                    self.v_host[o..o + dv]
-                        .iter()
-                        .map(|&x| bf16::to_f32(x))
-                        .collect()
+                    self.v[o..o + dv].iter().map(|&x| bf16::to_f32(x)).collect()
                 })
                 .collect();
             let keys: Vec<&[f32]> = k.iter().map(Vec::as_slice).collect();
@@ -339,7 +370,10 @@ impl Pool {
                     &q[head * dqk..(head + 1) * dqk],
                     &keys,
                     &values,
-                    self.kind.window().map(|_| self.sinks[head]),
+                    self.kind
+                        .window()
+                        .filter(|_| with_sinks)
+                        .map(|_| self.sinks[head]),
                     &mut out[head * dv..(head + 1) * dv],
                 );
             }
@@ -1294,6 +1328,60 @@ mod tests {
             }
         }
         assert!(!control_required(Kind::Sliding, &[(5000, 2)]));
+    }
+
+    /// The matrix's reference column catches an instance that drops the
+    /// sliding layers' sink: without it the outputs leave the tolerance on
+    /// most elements.
+    #[test]
+    fn a_missing_sink_is_out_of_tolerance() {
+        let kv = HostKv::new(Kind::Sliding, 1200, 12);
+        for pos in [127, 600, 1100] {
+            let (with, without) = (kv.reference(pos, true), kv.reference(pos, false));
+            let out = with
+                .iter()
+                .zip(&without)
+                .filter(|&(&w, &g)| (g - w).abs() > 4e-3 + w.abs() / 128.0)
+                .count();
+            assert!(
+                out * 2 > with.len(),
+                "pos {pos}: {out} of {} out",
+                with.len()
+            );
+        }
+    }
+
+    /// The sink enters each row once: the variants add it in the CTA whose
+    /// work item has KV chunk 0 (`kv_tile_indices`, the split index FlashInfer
+    /// passes to the variant's `update_m_d`), never by the traversal tile an
+    /// anchored start begins at. Every query tile of every request has
+    /// exactly one chunk-0 work item, split or not, including an anchored
+    /// sliding chunk whose traversal starts tiles past the page origin.
+    #[test]
+    fn the_sink_enters_each_row_once() {
+        let perm: Vec<u32> = (0..300).collect();
+        let reqs = [
+            paged_request(Kind::Sliding, &perm, 0, 1037 - 150, 300, true),
+            paged_request(Kind::Sliding, &perm, 300, 1037, 1, true),
+        ];
+        // The chunk's later query tiles start well past its first page.
+        let first = 1037 - 150 + 300 - reqs[0].kv_len;
+        assert!(Kind::Sliding.first_visible(1037 + 149) - first >= 64);
+        for (tile, split) in [(16, 0), (64, 0), (128, 0), (16, 64), (128, 256)] {
+            let w = WorkList::new(&reqs, 8, tile, split);
+            for (i, r) in reqs.iter().enumerate() {
+                for t in 0..(r.qo_len * 8).div_ceil(tile) {
+                    let zeros = (0..w.request_indices.len())
+                        .filter(|&k| {
+                            w.request_indices[k] == i32_of(u32_of(i))
+                                && w.qo_tile_indices[k] == i32_of(t)
+                                && w.kv_tile_indices[k] == 0
+                        })
+                        .count();
+                    assert_eq!(zeros, 1, "request {i} tile {t} tile {tile} split {split}");
+                }
+            }
+        }
     }
 
     /// The executor's tile rule.

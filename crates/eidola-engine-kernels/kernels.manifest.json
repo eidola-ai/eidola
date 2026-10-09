@@ -131,7 +131,7 @@
     },
     {
       "path": "csrc/flashinfer_fa2_sink_paged_variants.cu",
-      "sha256": "90a3a6145c00cd51c61780871b9d358e1340541d16524b903f08124946054ba8"
+      "sha256": "7187e7eaa4bc60c5beb1ff5db0bdb40451d0032dd8043984c5ed29877a5dcd07"
     },
     {
       "path": "csrc/kernels.json",
@@ -992,8 +992,8 @@
       "source": "csrc/flashinfer_fa2_sink_paged_variants.cu",
       "profile": "flashinfer",
       "file": "cubin/flashinfer_fa2_sink_paged_variants.sm_100a.cubin",
-      "sha256": "786676594d961e86839c5e7b753410677b3a42c99e6a7dcaabbae42800a36669",
-      "size": 601904,
+      "sha256": "611e43d4f2d46384f554e1376d4fc2c6922db9a476ddc013acb161266083b696",
+      "size": 599136,
       "entries": [
         {
           "symbol": "eidola_fa2v_anch_q128_w4x1_k4",
@@ -1062,8 +1062,8 @@
       "source": "csrc/flashinfer_fa2_sink_paged_variants.cu",
       "profile": "flashinfer",
       "file": "cubin/flashinfer_fa2_sink_paged_variants.sm_100f.cubin",
-      "sha256": "e94d05fd7615f3760417c9c84adf7f2b3c582daecc1bae067d678eecb06664b4",
-      "size": 601904,
+      "sha256": "8c7198ede6e048c63ae141b566a87dfac96f1c1f5b5ca100cb63da18e4f30171",
+      "size": 599136,
       "entries": [
         {
           "symbol": "eidola_fa2v_anch_q128_w4x1_k4",
@@ -1132,8 +1132,8 @@
       "source": "csrc/flashinfer_fa2_sink_paged_variants.cu",
       "profile": "flashinfer",
       "file": "cubin/flashinfer_fa2_sink_paged_variants.sm_103a.cubin",
-      "sha256": "ad728007bb65b49004a925e39a93dea902e7646f8d46c1a536787b8be5f936eb",
-      "size": 602776,
+      "sha256": "081611b1ebe7b75f7487f1710b4ca400cfa2b722dc9395f41f8a175b57771432",
+      "size": 599912,
       "entries": [
         {
           "symbol": "eidola_fa2v_anch_q128_w4x1_k4",
@@ -1399,8 +1399,8 @@
     {
       "name": "flashinfer_fa2_sink_paged_variants",
       "file": "fatbin/flashinfer_fa2_sink_paged_variants.fatbin",
-      "sha256": "f0f685d7e4670e07565e5439187f506c1c69ed36613140eb7a7c798954c11ffd",
-      "size": 1204912,
+      "sha256": "6eac305772fce4418c32e12b3a993da77b039bf49db48e181121da6e07abcb71",
+      "size": 1199280,
       "archs": [
         "sm_100a",
         "sm_103a"

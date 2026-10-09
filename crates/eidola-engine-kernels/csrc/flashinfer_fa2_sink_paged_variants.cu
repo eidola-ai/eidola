@@ -70,6 +70,9 @@ struct AnchoredSink : AttentionVariantBase {
     sm_scale_log2 = params.sm_scale * math::log2e;
     window_left = true_window_left;
 #ifdef __CUDA_ARCH__
+    // Anchoring moves where a query tile's keys start, which a KV split's
+    // chunk boundaries would then no longer follow.
+    if (params.partition_kv) __trap();
     const uint32_t tile = static_cast<uint32_t>(params.qo_tile_indices[blockIdx.x]);
     const uint32_t q0 = (tile * CTA_TILE_Q) / params.group_size;
     // The first key row q0 sees, as the kernel computes its start.
@@ -95,7 +98,13 @@ struct AnchoredSink : AttentionVariantBase {
   REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
                        { return visible(qo_idx, kv_idx); })
 
-  // AttentionSink's sink and output, unchanged.
+  // AttentionSink's sink and output, unchanged. The kernel passes
+  // update_m_d its work item's KV chunk (kv_tile_indices[blockIdx.x], 0 for
+  // every work item without a split), not the tile the traversal starts at,
+  // so the sink enters each row exactly once wherever an anchored start
+  // begins. Anchored instances never run split (the constructor traps on
+  // partition_kv); split stock instances add it in chunk 0 only, and the
+  // merge carries it into the row once.
   REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, {
     float log_sink = (kv_tile_idx == 0 && qo_head_idx < params.num_qo_heads)
                          ? params.sink[qo_head_idx] * math::log2e
