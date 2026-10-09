@@ -21,6 +21,7 @@ pub mod gemm;
 pub mod graph;
 pub mod kv;
 pub mod launch;
+pub mod mixed;
 pub mod model;
 pub mod module;
 pub mod moe_gemm;

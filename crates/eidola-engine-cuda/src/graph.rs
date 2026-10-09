@@ -677,6 +677,7 @@ impl DecodeGraphs {
                     qo_tile_indices: at(r.qo_tile_indices),
                     kv_tile_indices: at(r.kv_tile_indices),
                     kv_chunk_size: at(layout.kv_chunk_size),
+                    valid: 0,
                 })
                 .collect(),
             logit_rows: at(layout.logit_rows),

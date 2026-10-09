@@ -8,9 +8,15 @@
 //!   and logits are bit-identical whether the captured graph replays, its
 //!   launches run directly, or the eager path runs; and padding writes no
 //!   block outside the pad blocks;
+//! - every rung of the mixed ladder captures, and on mixed steps (prefill
+//!   chunks and extends beside decode rows, masked and contiguous expert
+//!   layouts, sampled and unsampled rows, contexts past the sliding window)
+//!   tokens and logits are bit-identical across replay, direct and eager; a
+//!   step whose eager work list tiles below 128 runs eagerly on every path;
 //! - through the engine, a workload mixing prefill chunks and decode steps
-//!   produces the same tokens with graphs replaying as eagerly, and every
-//!   free block stays zero or queued for zeroing after every step.
+//!   produces the same tokens with graphs replaying (decode and mixed steps)
+//!   as eagerly, and every free block stays zero or queued for zeroing after
+//!   every step.
 //!
 //! Needs a GPU, `EIDOLA_ENGINE_KERNELS_DIR`, `EIDOLA_MIMO_DIR` and
 //! `EIDOLA_MIMO_GOLDEN` (as `real_flash.rs`); prints what it measured, so run
@@ -106,11 +112,17 @@ fn executor(fx: &Fixture, blocks: u32, buckets: Vec<Bucket>) -> Option<CudaExecu
     let ex = CudaExecutor::new(su.gpu, &su.dir, fx.store.clone(), layers().as_deref(), cfg)
         .expect("every rung captures");
     let graphs = ex.decode_graphs().expect("graphs on");
+    let mixed = ex.mixed_graphs().expect("graphs on");
     println!(
-        "loaded and captured in {:.1?}: rungs {:?}, capture bytes {:?}",
+        "loaded and captured in {:.1?}: rungs {:?}, capture bytes {:?}; mixed rungs {:?}, \
+         capture bytes {:?} ({} in all), table and read-back {} bytes",
         t0.elapsed(),
         graphs.ladder(),
-        graphs.capture_bytes()
+        graphs.capture_bytes(),
+        mixed.ladder(),
+        mixed.capture_bytes(),
+        mixed.capture_bytes().iter().sum::<i64>(),
+        mixed.table_bytes()
     );
     Some(ex)
 }
@@ -175,7 +187,10 @@ fn logit_bits(out: &eidola_engine::executor::StepOutput) -> Vec<Vec<u32>> {
         .as_ref()
         .unwrap()
         .iter()
-        .map(|r| r[0].iter().map(|x| x.to_bits()).collect())
+        .map(|r| {
+            r.first()
+                .map_or_else(Vec::new, |row| row.iter().map(|x| x.to_bits()).collect())
+        })
         .collect()
 }
 
@@ -278,6 +293,214 @@ fn decode_steps_replay_bit_for_bit() {
     assert_eq!((stats.replayed, stats.direct), (steps, steps));
     assert_eq!(stats.eager, eager_before + steps);
     println!("{steps} decode steps, bit-identical on every path: {stats:?}");
+
+    // Padding wrote no block the seam can name: every block no slot maps is
+    // still zero.
+    for g in 0..2 {
+        for b in 1 + SLOTS * PER_SLOT..blocks {
+            assert!(
+                ex.block_is_zero(g, b).unwrap(),
+                "group {g} block {b} written"
+            );
+        }
+    }
+}
+
+/// The mixed-step test's steps: `(slot, host tokens, samples)` per row.
+/// Multi-token rows take the golden's real ids, single-token rows the slot's
+/// last output. The first is the prefill of every slot (contexts from one
+/// token to past the sliding window); every step but the last has a row of
+/// at least nine tokens, so both groups tile at 128 and it replays.
+fn mixed_steps() -> [&'static [(u32, u32, bool)]; 9] {
+    [
+        &[
+            (0, 40, true),
+            (1, 17, true),
+            (2, 1, true),
+            (3, 130, true),
+            (4, 64, true),
+            (5, 5, true),
+            (6, 150, true),
+            (7, 2, true),
+        ],
+        // Decode rows and a 9-token extend: 16 tokens, the smallest rung.
+        &[
+            (0, 1, true),
+            (1, 1, true),
+            (2, 1, true),
+            (3, 1, true),
+            (4, 1, true),
+            (5, 1, true),
+            (6, 1, true),
+            (7, 9, true),
+        ],
+        // An extend past the window beside decode rows: 103 tokens, masked.
+        &[(1, 1, true), (3, 100, true), (6, 1, true), (0, 1, true)],
+        // One extend filling the 128 rung exactly.
+        &[(0, 128, true)],
+        // Past 128 (the contiguous layout): 155 tokens in the 160 rung.
+        &[
+            (2, 1, true),
+            (5, 150, true),
+            (7, 1, true),
+            (4, 1, true),
+            (1, 1, true),
+            (6, 1, true),
+        ],
+        // A chunk that does not sample beside decode rows.
+        &[(4, 30, false), (0, 1, true), (2, 1, true)],
+        // Two long extends and decode rows: 453 tokens in the 464 rung.
+        &[
+            (1, 200, true),
+            (3, 1, true),
+            (6, 250, true),
+            (7, 1, true),
+            (5, 1, true),
+        ],
+        // Nothing samples.
+        &[(4, 20, false)],
+        // The longest row has four tokens: the global group tiles at 64, so
+        // every path runs eagerly.
+        &[(0, 1, true), (2, 4, true), (5, 1, true)],
+    ]
+}
+
+/// The mixed-step test's host side, without a device: each step within its
+/// bucket and every slot within its blocks, no slot twice in a step, and
+/// exactly the steps meant to replay with a row of at least nine tokens
+/// (Flash's GQA groups of 16 and 8 tile at 128 from there).
+#[test]
+fn mixed_steps_fit_without_a_device() {
+    let steps = mixed_steps();
+    let mut ctx = [0u32; SLOTS as usize];
+    for (k, rows) in steps.iter().enumerate() {
+        assert!(rows.iter().map(|r| r.1).sum::<u32>() <= 512, "step {k}");
+        for (i, &(slot, n, _)) in rows.iter().enumerate() {
+            assert!(
+                rows[..i].iter().all(|r| r.0 != slot),
+                "step {k}: slot {slot} twice"
+            );
+            ctx[slot as usize] += n;
+            assert!(ctx[slot as usize] <= PER_SLOT * BS, "step {k}: slot {slot}");
+        }
+        let longest = rows.iter().map(|r| r.1).max().unwrap();
+        assert_eq!(longest >= 9, k + 1 < steps.len(), "step {k}");
+    }
+}
+
+/// Every mixed rung's capture together, at most: what
+/// `DEVICE_FIXED_RESERVE_BYTES` (`eidola_common::engine_deployment`) holds
+/// beside the context, the modules and the decode graphs.
+const MIXED_CAPTURE_BOUND: i64 = 512 << 20;
+
+#[test]
+fn mixed_steps_replay_bit_for_bit() {
+    let Some(fx) = fixture() else { return };
+    let blocks = 1 + SLOTS * PER_SLOT + 16;
+    let Some(mut ex) = executor(
+        &fx,
+        blocks,
+        vec![Bucket {
+            max_seqs: SLOTS,
+            max_tokens: 512,
+        }],
+    ) else {
+        return;
+    };
+    let mixed = ex.mixed_graphs().unwrap();
+    let want: Vec<u32> = (1..=32).map(|i| 16 * i).collect();
+    assert_eq!(mixed.ladder(), want);
+    let captured: i64 = mixed.capture_bytes().iter().sum();
+    assert!(
+        captured <= MIXED_CAPTURE_BOUND,
+        "mixed captures took {captured} bytes"
+    );
+    let per_slot = PER_SLOT * BS;
+
+    let steps = mixed_steps();
+    let mut ctx = [0u32; SLOTS as usize];
+    let mut next = [0u32; SLOTS as usize];
+    let mut text_at = 0usize;
+    for (k, rows) in steps.iter().enumerate() {
+        let (mut seqs, mut tokens) = (Vec::new(), Vec::new());
+        let mut updates = Vec::new();
+        for &(slot, n, sample) in *rows {
+            assert!(
+                ctx[slot as usize] + n <= per_slot,
+                "step {k}: slot {slot} past its blocks"
+            );
+            let start = u32::try_from(tokens.len()).unwrap();
+            if n == 1 && ctx[slot as usize] > 0 {
+                tokens.push(next[slot as usize]);
+            } else {
+                tokens.extend(fx.text(text_at, n as usize));
+                text_at += n as usize;
+            }
+            seqs.push(SeqEntry {
+                sample,
+                ..entry(slot, start, ctx[slot as usize], n)
+            });
+            if k == 0 {
+                updates.extend(map(slot));
+            }
+        }
+        let input = step_of(seqs, tokens, updates);
+        let before = ex.decode_stats();
+        let mut outs = Vec::new();
+        for path in [DecodePath::Replay, DecodePath::Direct, DecodePath::Eager] {
+            ex.set_decode_path(path);
+            outs.push((path, ex.execute(&input).unwrap()));
+        }
+        let after = ex.decode_stats();
+        let replays = k + 1 < steps.len();
+        if replays {
+            assert_eq!(
+                (
+                    after.mixed_replayed - before.mixed_replayed,
+                    after.mixed_direct - before.mixed_direct,
+                    after.eager - before.eager
+                ),
+                (1, 1, 1),
+                "step {k}: replay, direct, eager"
+            );
+        } else {
+            assert_eq!(
+                after.eager - before.eager,
+                3,
+                "step {k}: eager on every path"
+            );
+            assert_eq!(after.mixed_replayed, before.mixed_replayed);
+        }
+        let (_, replay) = &outs[0];
+        let want = logit_bits(replay);
+        for (path, out) in &outs[1..] {
+            assert_eq!(out.tokens, replay.tokens, "step {k}: {path:?} tokens");
+            assert_eq!(
+                out.num_tokens, replay.num_tokens,
+                "step {k}: {path:?} counts"
+            );
+            for (i, (got, want)) in logit_bits(out).iter().zip(&want).enumerate() {
+                assert!(
+                    got == want,
+                    "step {k}: row {i} logits differ on {path:?}, max |Δ| {}",
+                    max_diff(got, want)
+                );
+            }
+        }
+        for (i, &(slot, n, sample)) in rows.iter().enumerate() {
+            ctx[slot as usize] += n;
+            assert_eq!(replay.num_tokens[i], u32::from(sample), "step {k} row {i}");
+            if sample {
+                next[slot as usize] = replay.row(i)[0];
+                assert!(next[slot as usize] < SAMPLEABLE);
+            }
+        }
+    }
+    println!(
+        "{} mixed steps, bit-identical on every path: {:?}",
+        steps.len(),
+        ex.decode_stats()
+    );
 
     // Padding wrote no block the seam can name: every block no slot maps is
     // still zero.
@@ -407,9 +630,15 @@ fn the_engine_serves_the_same_tokens_with_graphs() {
         );
     }
     assert!(after.replayed > before.replayed, "no decode step replayed");
+    assert!(
+        after.mixed_replayed > before.mixed_replayed,
+        "no mixed step replayed"
+    );
     println!(
-        "engine workload: eager run {before:?}, replayed run {} replays, {} eager steps",
+        "engine workload: eager run {before:?}, replayed run {} decode and {} mixed replays, \
+         {} eager steps",
         after.replayed - before.replayed,
+        after.mixed_replayed - before.mixed_replayed,
         after.eager - before.eager
     );
 }

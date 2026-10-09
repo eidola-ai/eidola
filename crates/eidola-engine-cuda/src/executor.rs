@@ -16,8 +16,10 @@
 //!
 //! With [`CudaGraphs::On`], a pure-decode step (or, drafting, a uniform drafted
 //! decode step) that fits a rung of its ladder replays that rung's graph
-//! instead of launching eagerly (see [`crate::graph`] and [`crate::draft`]);
-//! every check above runs first, the same either way.
+//! instead of launching eagerly (see [`crate::graph`] and [`crate::draft`]),
+//! and without drafting so does a mixed step whose work lists tile at 128 and
+//! whose tokens fit a rung of the mixed ladder ([`crate::mixed`]); every
+//! check above runs first, the same either way.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -39,6 +41,7 @@ use crate::graph::{
 };
 use crate::kv::{GroupGeometry, KvLayout, KvStore};
 use crate::launch::dptr;
+use crate::mixed::{MixedGraphs, MixedRows, mixed_ladder, mixed_rung};
 use crate::model::{
     ForwardInput, GpuModel, InputParts, Kernels, group_geometry, group_layers, read_config,
 };
@@ -65,8 +68,8 @@ pub struct CudaExecutorConfig {
     /// Kernel image to run (the device's own when `None`; `Sm100f` runs the
     /// family image on any CC 10.x part).
     pub image: Option<ImageArch>,
-    /// Whether decode steps replay captured graphs (captured here, at
-    /// construction, one per rung of [`decode_ladder`], or of
+    /// Whether steps replay captured graphs (captured here, at construction:
+    /// one per rung of [`decode_ladder`] and of [`mixed_ladder`], or of
     /// [`crate::draft::draft_ladder`] when drafting).
     pub graphs: CudaGraphs,
     /// Draft width `k`: MTP depths drafted per decode step, depth `d` served
@@ -155,8 +158,10 @@ pub struct CudaExecutor {
     all_logits: Option<Vec<f32>>,
     /// The captured decode graphs (graphs on).
     decode: Option<DecodeGraphs>,
-    /// How a decode step that fits a rung runs. A cell so a test or a
-    /// measurement can switch it on an executor an engine owns.
+    /// The captured mixed-step graphs (graphs on, not drafting).
+    mixed: Option<MixedGraphs>,
+    /// How a step that fits a rung (decode or mixed) runs. A cell so a test
+    /// or a measurement can switch it on an executor an engine owns.
     decode_path: Cell<DecodePath>,
     stats: DecodeStats,
 }
@@ -164,12 +169,17 @@ pub struct CudaExecutor {
 /// Steps by how they ran (see [`CudaExecutor::decode_stats`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DecodeStats {
-    /// Steps launched eagerly (prefill, mixed, or any step with graphs off).
+    /// Steps launched eagerly (any step no rung holds, or any step with
+    /// graphs off).
     pub eager: u64,
     /// Decode steps run as the padded launch sequence without its graph.
     pub direct: u64,
     /// Decode steps that replayed a captured graph.
     pub replayed: u64,
+    /// Mixed steps run as the padded launch sequence without its graph.
+    pub mixed_direct: u64,
+    /// Mixed steps that replayed a captured graph.
+    pub mixed_replayed: u64,
 }
 
 impl std::fmt::Debug for CudaExecutor {
@@ -428,6 +438,7 @@ impl CudaExecutor {
             drafts: std::cell::RefCell::new(Vec::new()),
             all_logits: None,
             decode: None,
+            mixed: None,
             decode_path: Cell::new(decode_path),
             stats: DecodeStats::default(),
         };
@@ -439,6 +450,7 @@ impl CudaExecutor {
                 ex.capture_draft_graphs()?;
             } else {
                 ex.capture_decode_graphs()?;
+                ex.capture_mixed_graphs()?;
             }
         }
         Ok(ex)
@@ -467,11 +479,11 @@ impl CudaExecutor {
             .collect()
     }
 
-    /// Allocate the decode graphs' buffers and capture one graph per rung.
-    fn capture_decode_graphs(&mut self) -> Result<()> {
+    /// Every target group as the graphs see it.
+    fn graph_slots(&self) -> Result<Vec<GroupSlots>> {
         let bs = self.spec.block_size;
         let max_blocks = self.spec.max_blocks_per_seq();
-        let slots = self
+        Ok(self
             .group_sizes()?
             .into_iter()
             .zip(&self.spec.kv_groups)
@@ -482,7 +494,12 @@ impl CudaExecutor {
                 pad_block: geom.pad_block(),
                 max_pages: max_decode_pages(group.attention, bs, max_blocks),
             })
-            .collect();
+            .collect())
+    }
+
+    /// Allocate the decode graphs' buffers and capture one graph per rung.
+    fn capture_decode_graphs(&mut self) -> Result<()> {
+        let slots = self.graph_slots()?;
         let mut graphs = DecodeGraphs::new(&self.gpu, decode_ladder(&self.spec.buckets), slots)?;
         let probs = dptr(&self.probs, self.gpu.stream());
         graphs.capture(
@@ -499,14 +516,41 @@ impl CudaExecutor {
         Ok(())
     }
 
+    /// Allocate the mixed-step graphs' buffers and capture one graph per
+    /// rung of the mixed ladder.
+    fn capture_mixed_graphs(&mut self) -> Result<()> {
+        let slots = self.graph_slots()?;
+        let seats = self.spec.buckets.last().map_or(0, |b| b.max_seqs);
+        let mut graphs =
+            MixedGraphs::new(&self.gpu, mixed_ladder(&self.spec.buckets), seats, slots)?;
+        let probs = dptr(&self.probs, self.gpu.stream());
+        graphs.capture(
+            &self.gpu,
+            &mut ProgramArgs {
+                model: &mut self.model,
+                kv: &self.kv,
+                probs,
+                vocab: self.spec.vocab_size,
+                sampleable: self.spec.sampleable_vocab_size,
+            },
+        )?;
+        self.mixed = Some(graphs);
+        Ok(())
+    }
+
     /// The captured decode graphs, when graphs are on.
     pub fn decode_graphs(&self) -> Option<&DecodeGraphs> {
         self.decode.as_ref()
     }
 
-    /// How decode steps that fit a rung run from now on. With graphs off
-    /// only [`DecodePath::Eager`] is available; a step asking for another
-    /// is refused.
+    /// The captured mixed-step graphs, when graphs are on without drafting.
+    pub fn mixed_graphs(&self) -> Option<&MixedGraphs> {
+        self.mixed.as_ref()
+    }
+
+    /// How steps that fit a rung (decode or mixed) run from now on. With
+    /// graphs off only [`DecodePath::Eager`] is available; a step asking for
+    /// another is refused.
     pub fn set_decode_path(&self, path: DecodePath) {
         self.decode_path.set(path);
     }
@@ -656,6 +700,11 @@ impl CudaExecutor {
             }
         }
         let group_sizes = self.group_sizes()?;
+        let hosts = group_sizes
+            .iter()
+            .zip(&requests)
+            .map(|(&group_size, r)| HostPlan::new(r, group_size, bs))
+            .collect::<Result<Vec<HostPlan>>>()?;
         let path = self.decode_path.get();
         if path != DecodePath::Eager && !self.record_all_logits && !self.model.capture_layers {
             let decode = self
@@ -665,10 +714,26 @@ impl CudaExecutor {
             if let Some(rung) = decode_rows(step).and_then(|n| rung_for(decode.ladder(), n)) {
                 return self.decode_step(step, staged, &kv_targets, &requests, &group_sizes, rung);
             }
+            let tiles: Vec<u32> = hosts.iter().map(HostPlan::tile).collect();
+            if let Some(rung) = self
+                .mixed
+                .as_ref()
+                .and_then(|m| mixed_rung(m.ladder(), total, &tiles))
+            {
+                let shapes: Vec<PlanShape> = hosts.iter().map(HostPlan::shape).collect();
+                return self.mixed_step(
+                    step,
+                    staged,
+                    &kv_targets,
+                    &requests,
+                    &shapes,
+                    &logit_rows,
+                    rung,
+                );
+            }
         }
         let mut plans: Vec<AttnPlan> = Vec::with_capacity(groups.len());
-        for (g, &group_size) in group_sizes.iter().enumerate() {
-            let host = HostPlan::new(&requests[g], group_size, bs)?;
+        for host in hosts {
             // Fresh buffers for this step only: no executor state changes.
             plans.push(self.model.kernels.attention.upload(&self.gpu, host)?);
         }
@@ -873,6 +938,123 @@ impl CudaExecutor {
                 .stream()
                 .clone_dtoh(&self.model.logits().slice(..n * v))?;
             out.logits = Some(all.chunks(v).map(|row| vec![row.to_vec()]).collect());
+        }
+        Ok(out)
+    }
+}
+
+impl CudaExecutor {
+    /// A mixed step on mixed rung `rung`: the eager path's checks over the
+    /// real tokens, then (nothing having changed yet) the padded step table
+    /// packed; then maintenance and table updates, one upload, the graph (or
+    /// its launches directly), and one read-back. Its output is the eager
+    /// path's: one token per sampled row, logits per sampled row when asked.
+    #[allow(clippy::too_many_arguments)]
+    fn mixed_step(
+        &mut self,
+        step: &StepInput,
+        staged: crate::kv::Staged,
+        kv_targets: &[Vec<(u32, u32)>],
+        requests: &[Vec<AttnRequest>],
+        shapes: &[PlanShape],
+        logit_rows: &[u32],
+        rung: usize,
+    ) -> Result<StepOutput> {
+        self.model.check_parts(
+            &self.kv,
+            &InputParts {
+                tokens: &step.token_ids,
+                positions: &step.positions,
+                kv_targets,
+                plans: shapes,
+                logit_rows,
+            },
+        )?;
+        let mut samples = Vec::with_capacity(logit_rows.len());
+        let mut which = Vec::with_capacity(logit_rows.len());
+        for (i, e) in step.seqs.iter().enumerate() {
+            if e.sample {
+                let row = narrow(samples.len(), "sample row")?;
+                samples.push(SampleRow::new(
+                    &e.sampling,
+                    e.context_len + e.num_tokens,
+                    row,
+                ));
+                which.push(i);
+            }
+        }
+        let mixed = self.mixed.as_mut().expect("checked by the caller");
+        let packed = crate::mixed::pack(
+            mixed.layout(rung),
+            mixed.slots(),
+            &MixedRows {
+                tokens: &step.token_ids,
+                positions: &step.positions,
+                kv_targets,
+                requests,
+                logit_rows,
+                samples: &samples,
+            },
+        )?;
+
+        // 1-2. Maintenance, then table updates.
+        self.kv.commit(&self.gpu, staged)?;
+        // 3-4. The forward and sampling, over the padded step.
+        mixed.upload(&self.gpu, &packed)?;
+        let direct = self.decode_path.get() == DecodePath::Direct;
+        let probs = dptr(&self.probs, self.gpu.stream());
+        mixed.run(
+            &self.gpu,
+            rung,
+            direct,
+            &mut ProgramArgs {
+                model: &mut self.model,
+                kv: &self.kv,
+                probs,
+                vocab: self.spec.vocab_size,
+                sampleable: self.spec.sampleable_vocab_size,
+            },
+        )?;
+        if direct {
+            self.stats.mixed_direct += 1;
+        } else {
+            self.stats.mixed_replayed += 1;
+        }
+        let readback = mixed.readback(&self.gpu, rung)?;
+        let rows = mixed.layout(rung).logits as usize;
+        let (tokens, status) = split_readback(&readback, samples.len(), rows);
+        if status & STATUS_NON_FINITE != 0 {
+            return Err(CudaError::new("non-finite logits"));
+        }
+        let stride = self.spec.max_draft_tokens + 1;
+        let mut out = StepOutput {
+            tokens: vec![0; step.seqs.len() * stride as usize],
+            stride,
+            num_tokens: vec![0; step.seqs.len()],
+            logits: step.return_logits.then(Vec::new),
+        };
+        for (&i, &t) in which.iter().zip(tokens) {
+            out.tokens[i * stride as usize] = t;
+            out.num_tokens[i] = 1;
+        }
+        if let Some(rows) = out.logits.as_mut() {
+            let v = self.spec.vocab_size as usize;
+            let all = if which.is_empty() {
+                Vec::new()
+            } else {
+                self.gpu
+                    .stream()
+                    .clone_dtoh(&self.model.logits().slice(..which.len() * v))?
+            };
+            let mut j = 0;
+            for e in &step.seqs {
+                if e.sample {
+                    rows.push(vec![all[j * v..(j + 1) * v].to_vec()]);
+                    j += 1;
+                } else {
+                    rows.push(Vec::new());
+                }
+            }
         }
         Ok(out)
     }

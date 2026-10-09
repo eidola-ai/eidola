@@ -172,6 +172,13 @@ fn main() {
     for (r, bytes) in ladder.iter().zip(&capture) {
         println!("rung {r:>4}: capture took {bytes} bytes of device memory");
     }
+    if let Some(m) = ex.mixed_graphs() {
+        println!(
+            "mixed rungs {:?}: captures took {} bytes of device memory in all",
+            m.ladder(),
+            m.capture_bytes().iter().sum::<i64>()
+        );
+    }
 
     // Every slot's blocks, in every group, mapped once.
     let mut updates = Vec::new();

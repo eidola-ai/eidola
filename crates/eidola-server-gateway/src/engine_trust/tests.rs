@@ -922,18 +922,18 @@ fn allocations_are_capped_and_fit_the_deployment() {
     refused(&tree, "less than the 12228280320 bytes the KV pools need");
 
     // The device holds the KV budget, the weights (the pack's data size,
-    // 17,419,419,648 bytes here) and the executor's reserve (16,831,741,952
+    // 17,419,419,648 bytes here) and the executor's reserve (16,838,295,552
     // bytes for this sizing) within the B300's 287,428,640,768.
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"253177479168\"",
+        "KV_DEVICE_BYTES: \"253170925568\"",
     );
     tree.check().expect("the budget fills the device exactly");
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"253177479169\"",
+        "KV_DEVICE_BYTES: \"253170925569\"",
     );
     refused(&tree, "more than the NVIDIA B300 SXM6 AC's 287428640768");
     // A Flash-sized pack leaves room for 64 GiB, and not for twice that.
