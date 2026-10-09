@@ -247,10 +247,39 @@ pub fn drafter_seat_rows(draft_tokens: u32) -> u64 {
 /// page lists, in a graph's table and an eager step's together: every other
 /// per-row array of a drafted step (copy lists, token ids, positions, KV
 /// targets, work lists, the drafter's one-position page lists, sampler and
-/// acceptance rows; about 1,300 words a table for three depths), bounded by
+/// acceptance rows; about 1,600 words a table for three depths), bounded by
 /// 32 KiB. An eager step's arrays per token beyond those (about 30 words for
 /// three depths) are inside [`STEP_TOKEN_DEVICE_BYTES`]'s rounding.
 pub const DRAFT_TABLE_SEAT_BYTES: u64 = 32 << 10;
+
+/// Keys per chunk of the CUDA executor's split global attention
+/// (`eidola-engine-cuda` `attention::SPLIT_KEYS`): a global row's keys are
+/// reduced in chunks of this many positions, each a partial row, then merged.
+pub const SPLIT_ATTENTION_KEYS: u64 = 1024;
+
+/// Device bytes of one split-attention partial row at Flash's shapes: 64
+/// query heads, each a BF16 output of 128 and an f32 log-sum-exp
+/// (`eidola-engine-cuda` `attention::PARTIAL_BYTES_PER_HEAD`).
+pub const SPLIT_PARTIAL_ROW_BYTES: u64 = 64 * (128 * 2 + 4);
+
+/// Split attention's partial-row scratch (`eidola-engine-cuda`
+/// `executor::split_partial_rows`): the most tokens a captured step holds,
+/// `min(MAX_SEQS × (1 + DRAFT_TOKENS), MAX_BATCHED_TOKENS)`, times the
+/// chunks of a `MAX_MODEL_LEN` sequence. Saturates.
+pub fn split_partial_rows(sizing: &Sizing) -> u64 {
+    u64::from(sizing.max_seqs)
+        .saturating_mul(u64::from(sizing.draft_tokens) + 1)
+        .min(u64::from(sizing.max_batched_tokens))
+        .max(1)
+        .saturating_mul(u64::from(sizing.max_model_len.max(1)).div_ceil(SPLIT_ATTENTION_KEYS))
+}
+
+/// Step-table bytes a drafting executor holds per seat for each chunk of
+/// [`SPLIT_ATTENTION_KEYS`] of `MAX_MODEL_LEN`: a row's global work items
+/// (its verify run cut in at most two pieces at a chunk boundary, each a
+/// work item per chunk, three words each), in a graph's table and an eager
+/// step's.
+pub const DRAFT_TABLE_SEAT_BYTES_PER_CHUNK: u64 = 2 * 2 * 3 * 4;
 
 /// RoPE table bytes per position (`MAX_MODEL_LEN`): 64 f32 for each distinct
 /// θ, at most three.
@@ -263,11 +292,14 @@ pub const ROPE_DEVICE_BYTES_PER_POSITION: u64 = 3 * 64 * 4;
 /// [`SAMPLER_ROW_DEVICE_BYTES`], the device block tables (`MAX_SEQS` ×
 /// ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉ `i32` entries per KV group,
 /// [`kv_groups`]) and the RoPE tables
-/// ([`ROPE_DEVICE_BYTES_PER_POSITION`] per `MAX_MODEL_LEN`). With
+/// ([`ROPE_DEVICE_BYTES_PER_POSITION`] per `MAX_MODEL_LEN`), and split
+/// attention's [`split_partial_rows`] of [`SPLIT_PARTIAL_ROW_BYTES`]. With
 /// `DRAFT_TOKENS` `k` > 0, per `MAX_SEQS` also [`drafter_seat_rows`] rows of
-/// 16 KiB, [`DRAFT_TABLE_SEAT_BYTES`], and the global page lists of a
-/// drafted step's table twice over (a graph's and an eager step's, one
-/// `i32` per block of `MAX_MODEL_LEN`). The MTP layers' own scratch (their
+/// 16 KiB, [`DRAFT_TABLE_SEAT_BYTES`], the global page lists of a drafted
+/// step's table four times over (a graph's and an eager step's, each a row's
+/// pages twice when its verify run is cut at a chunk boundary, one `i32` per
+/// block of `MAX_MODEL_LEN`), and [`DRAFT_TABLE_SEAT_BYTES_PER_CHUNK`] per
+/// chunk of `MAX_MODEL_LEN`. The MTP layers' own scratch (their
 /// copy lists, 36 bytes a token) and the drafted step's copy of the target's
 /// states (one 16 KiB row a token) are inside [`STEP_TOKEN_DEVICE_BYTES`]'s
 /// rounding, and their weights inside the pack. Saturates.
@@ -281,7 +313,10 @@ pub fn cuda_device_reserve_bytes(sizing: &Sizing) -> u64 {
         .saturating_mul(SAMPLER_ROW_DEVICE_BYTES)
         .saturating_add(drafter_seat_rows(sizing.draft_tokens).saturating_mul(16 << 10))
         .saturating_add(if drafting {
-            DRAFT_TABLE_SEAT_BYTES.saturating_add(blocks_per_seq.saturating_mul(2 * 4))
+            let chunks = u64::from(sizing.max_model_len).div_ceil(SPLIT_ATTENTION_KEYS);
+            DRAFT_TABLE_SEAT_BYTES
+                .saturating_add(blocks_per_seq.saturating_mul(4 * 4))
+                .saturating_add(chunks.saturating_mul(DRAFT_TABLE_SEAT_BYTES_PER_CHUNK))
         } else {
             0
         });
@@ -296,6 +331,7 @@ pub fn cuda_device_reserve_bytes(sizing: &Sizing) -> u64 {
                 .saturating_mul(blocks_per_seq)
                 .saturating_mul(groups * 4),
         )
+        .saturating_add(split_partial_rows(sizing).saturating_mul(SPLIT_PARTIAL_ROW_BYTES))
         .saturating_add(
             u64::from(sizing.max_model_len).saturating_mul(ROPE_DEVICE_BYTES_PER_POSITION),
         )
@@ -1583,9 +1619,12 @@ mod tests {
         };
         // 4 GiB fixed; 8,192 step tokens × 1.25 MiB; the 1.5 GiB expert
         // floor; 64 seats × one sampler row of 1.25 MiB; 64 × 8,192 table
-        // entries × 2 groups × 4 bytes; 131,072 positions × 768 bytes of RoPE
-        // tables.
+        // entries × 2 groups × 4 bytes; split attention's 64 tokens × 128
+        // chunks of partial rows of 16,640 bytes; 131,072 positions × 768
+        // bytes of RoPE tables.
         let reserve = cuda_device_reserve_bytes(&sizing);
+        assert_eq!(split_partial_rows(&sizing), 64 * 128);
+        assert_eq!(SPLIT_PARTIAL_ROW_BYTES, 16_640);
         assert_eq!(
             reserve,
             (4 << 30)
@@ -1593,28 +1632,32 @@ mod tests {
                 + 65_536 * (24 << 10)
                 + 64 * (5 << 18)
                 + 64 * 8192 * 8
+                + 64 * 128 * 16_640
                 + 131_072 * 768
         );
-        assert_eq!(reserve, 16_831_741_952);
+        assert_eq!(reserve, 16_968_056_832);
         // A sampler row holds an f64 distribution over every id of the head.
         const { assert!(SAMPLER_ROW_DEVICE_BYTES >= 152_576 * 8) };
         // Drafting three tokens: per seat 8 sampler rows, 39 rows of 16 KiB
-        // (12 of drafter state, 3 + 24 level rows), 32 KiB of step tables
-        // and two global page lists of 8,192 entries; and a third group's
-        // block tables.
+        // (12 of drafter state, 3 + 24 level rows), 32 KiB of step tables,
+        // four global page lists of 8,192 entries and 48 bytes of work items
+        // per chunk; a third group's block tables; and the partial rows of
+        // 64 rows of four tokens.
         let drafting = Sizing {
             draft_tokens: 3,
             ..sizing
         };
         assert_eq!(sampler_rows(3), 8);
         assert_eq!(drafter_seat_rows(3), 39);
+        assert_eq!(split_partial_rows(&drafting), 256 * 128);
         assert_eq!(
             cuda_device_reserve_bytes(&drafting),
             (4 << 30)
                 + 8192 * (5 << 18)
                 + 65_536 * (24 << 10)
-                + 64 * (8 * (5 << 18) + 39 * (16 << 10) + (32 << 10) + 8192 * 8)
+                + 64 * (8 * (5 << 18) + 39 * (16 << 10) + (32 << 10) + 8192 * 16 + 128 * 48)
                 + 64 * 8192 * 12
+                + 256 * 128 * 16_640
                 + 131_072 * 768
         );
         for k in 1..=3 {
