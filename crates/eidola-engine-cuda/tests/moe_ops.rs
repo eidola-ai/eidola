@@ -224,9 +224,11 @@ fn router_launch_contract() {
         }
         let meta = *m.kernel("eidola_quant_fp8_f32scale").unwrap().meta();
         assert_eq!(meta.block, [QUANT_WARPS * 32, 1, 1], "{arch:?}");
-        let meta = *m.kernel("eidola_moe_permute").unwrap().meta();
-        assert_eq!(meta.block, [u32_of(EXPERTS), 1, 1], "{arch:?}");
-        assert_eq!(meta.cluster, [1, 1, 1], "{arch:?}");
+        for k in ["eidola_moe_permute", "eidola_moe_permute_count"] {
+            let meta = *m.kernel(k).unwrap().meta();
+            assert_eq!(meta.block, [u32_of(EXPERTS), 1, 1], "{k} {arch:?}");
+            assert_eq!(meta.cluster, [1, 1, 1], "{k} {arch:?}");
+        }
     }
 }
 
@@ -564,9 +566,11 @@ fn permute(
     let dids = s.clone_htod(ids).unwrap();
     let grouped = s.clone_htod(&vec![-7i32; EXPERTS]).unwrap();
     let row_of = s.clone_htod(&vec![-7i32; ids.len()]).unwrap();
-    let scratch = s.alloc_zeros::<u32>(PERMUTE_SCRATCH_WORDS).unwrap();
-    // Twice over the same scratch: the first launch must leave the grid
-    // barrier's counters as it found them.
+    // Scratch starts as garbage, and the placement runs twice over it: no
+    // word the count launch does not write may reach the placement.
+    let scratch = s
+        .clone_htod(&vec![0xdead_beef_u32; PERMUTE_SCRATCH_WORDS])
+        .unwrap();
     for _ in 0..2 {
         unsafe {
             ops.moe_permute(
@@ -582,12 +586,6 @@ fn permute(
             .unwrap();
         }
     }
-    let counters = s.clone_dtoh(&scratch).unwrap()[PERMUTE_SCRATCH_WORDS - 2..].to_vec();
-    assert_eq!(
-        counters,
-        [0, 0],
-        "{tokens} tokens: barrier counters left set"
-    );
     (
         s.clone_dtoh(&row_of).unwrap(),
         s.clone_dtoh(&grouped).unwrap(),

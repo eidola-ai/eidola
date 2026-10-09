@@ -165,8 +165,8 @@ struct Scratch {
     router_scores: CudaSlice<f32>,
     row_of: CudaSlice<i32>,
     grouped: CudaSlice<i32>,
-    /// The placement's per-block counts and grid barrier
-    /// (`engine_ops::PERMUTE_SCRATCH_WORDS`, zeroed here once).
+    /// The placement's per-block counts between its two launches
+    /// (`engine_ops::PERMUTE_SCRATCH_WORDS`).
     permute: CudaSlice<u32>,
     ea: CudaSlice<u8>,
     esf: CudaSlice<i32>,
@@ -1616,8 +1616,8 @@ mod tests {
         );
         assert_eq!(moe.router_scores, both.router_scores);
         assert_eq!(dense.router_scores, 1);
-        // The placement's scratch: a count per (expert, block) and the grid
-        // barrier's counters, only with expert layers.
+        // The placement's scratch: a count per (expert, block), only with
+        // expert layers.
         assert_eq!(moe.permute, crate::engine_ops::PERMUTE_SCRATCH_WORDS);
         assert_eq!(moe.permute, both.permute);
         assert_eq!(dense.permute, 1);

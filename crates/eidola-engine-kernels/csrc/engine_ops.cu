@@ -796,59 +796,60 @@ EIDOLA_KERNEL_META(eidola_router_select, kRouterSelectWarps * 32, 1, 1, 0, 1, 1,
 // placed nowhere (its row_of entry is left as it is); the router writes none.
 //
 // Grid B blocks of 256 threads (B = ceil(pairs / kPermuteChunk), at least
-// one and at most kPermuteMaxBlocks): block b takes the b-th of B equal contiguous runs of
-// the pairs, and its warp w the w-th eighth of that run. Each warp counts its
-// eighth into its own shared histogram (shared atomics: the counts do not
-// depend on their order), and thread e turns the histograms into each warp's
-// offset for expert e inside the block and the block's count of expert e.
-// With more than one block, every block publishes its counts to
-// scratch[e][b], waits until every block has (a grid barrier: the grid is
-// small enough to be resident at once), and thread e reads expert e's counts
-// of every block: their sum is the expert's count and the sum over the
-// blocks before b the block's first row inside the expert's run. Every block
-// then computes the same starts (an exclusive scan of the rounded runs);
-// block 0 writes the grouped layout. Each warp walks its eighth in order 32
-// pairs at a time: a pair's row is its warp's next row for its expert plus
-// the lanes before it holding the same expert. Blocks, warps and lanes are
-// in pair order, so pairs keep their order within an expert.
+// one and at most kPermuteMaxBlocks): block b takes the b-th of B equal
+// contiguous runs of the pairs, and its warp w the w-th eighth of that run.
+// Each warp counts its eighth into its own shared histogram (shared atomics:
+// the counts do not depend on their order), and thread e turns the
+// histograms into each warp's offset for expert e inside the block and the
+// block's count of expert e.
+//
+// With more than one block the placement is two launches, so no block ever
+// waits for another (nothing assumes the blocks are resident together):
+// eidola_moe_permute_count writes every block's counts to scratch[e][b],
+// then eidola_moe_permute (the same grid) recounts its own run and reads
+// expert e's counts of every block: their sum is the expert's count and the
+// sum over the blocks before b the block's first row inside the expert's
+// run. With one block, eidola_moe_permute alone runs and reads no scratch.
+// Every block computes the same starts (an exclusive scan of the rounded
+// runs); block 0 writes the grouped layout. Each warp walks its eighth in
+// order 32 pairs at a time: a pair's row is its warp's next row for its
+// expert plus the lanes before it holding the same expert. Blocks, warps and
+// lanes are in pair order, so pairs keep their order within an expert.
 //
 // scratch (16-byte aligned) holds the counts, expert-major (256 ×
-// kPermuteMaxBlocks words), then the barrier's arrival and departure
-// counters, which must be zero before the first launch; the last block to
-// leave the barrier zeroes both, so every launch leaves them as it found
-// them. One block needs no scratch (it may be null).
+// kPermuteMaxBlocks words). The count launch writes every word the
+// placement reads, so nothing carries from one step to the next.
 constexpr uint32_t kPermuteExperts = 256;
 constexpr uint32_t kPermuteWarps = kPermuteExperts / 32;
 constexpr uint32_t kPermuteChunk = 512;
 constexpr uint32_t kPermuteMaxBlocks = 128;
 
-__device__ __forceinline__ uint32_t ld_acquire_gpu(const uint32_t* p) {
-  uint32_t v;
-  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
-  return v;
-}
+// The block's run and its warp's eighth: [lo, hi) of this warp.
+struct PermuteRun {
+  uint32_t lo, hi;
+  __device__ __forceinline__ PermuteRun(uint32_t n, uint32_t blocks, uint32_t b, uint32_t warp) {
+    const uint32_t run = (n + blocks - 1) / blocks;
+    const uint32_t blo = min(b * run, n), bhi = min(blo + run, n);
+    const uint32_t seg = (bhi - blo + kPermuteWarps - 1) / kPermuteWarps;
+    lo = min(blo + warp * seg, bhi);
+    hi = min(lo + seg, bhi);
+  }
+};
 
-extern "C" __global__ void __launch_bounds__(kPermuteExperts)
-    eidola_moe_permute(int32_t* __restrict__ grouped_layout, int32_t* __restrict__ row_of,
-                       const int32_t* __restrict__ topk_ids, uint32_t* scratch,
-                       uint32_t tokens, uint32_t top_k) {
-  __shared__ uint32_t next[kPermuteWarps][kPermuteExperts];
-  __shared__ uint32_t scan[kPermuteExperts];
+// Counts the block's run into next[w][e] as each warp's offset inside the
+// block for expert e; returns the block's count of expert e (thread e).
+__device__ __forceinline__ uint32_t permute_count(uint32_t (&next)[kPermuteWarps][kPermuteExperts],
+                                                  const int32_t* __restrict__ topk_ids,
+                                                  const PermuteRun& run) {
   const uint32_t e = threadIdx.x, warp = e / 32, lane = e % 32;
-  const uint32_t n = tokens * top_k, blocks = gridDim.x, b = blockIdx.x;
-  const uint32_t run = (n + blocks - 1) / blocks;
-  const uint32_t blo = min(b * run, n), bhi = min(blo + run, n);
-  const uint32_t seg = (bhi - blo + kPermuteWarps - 1) / kPermuteWarps;
-  const uint32_t lo = min(blo + warp * seg, bhi), hi = min(lo + seg, bhi);
 #pragma unroll
   for (uint32_t w = 0; w < kPermuteWarps; ++w) next[w][e] = 0;
   __syncthreads();
-  for (uint32_t i = lo + lane; i < hi; i += 32) {
+  for (uint32_t i = run.lo + lane; i < run.hi; i += 32) {
     const uint32_t id = static_cast<uint32_t>(topk_ids[i]);
     if (id < kPermuteExperts) atomicAdd(&next[warp][id], 1u);
   }
   __syncthreads();
-  // This block's count of expert e, and each warp's offset inside it.
   uint32_t count = 0;
 #pragma unroll
   for (uint32_t w = 0; w < kPermuteWarps; ++w) {
@@ -856,26 +857,38 @@ extern "C" __global__ void __launch_bounds__(kPermuteExperts)
     next[w][e] = count;
     count += h;
   }
+  return count;
+}
+
+extern "C" __global__ void __launch_bounds__(kPermuteExperts)
+    eidola_moe_permute_count(uint32_t* __restrict__ scratch, const int32_t* __restrict__ topk_ids,
+                             uint32_t tokens, uint32_t top_k) {
+  __shared__ uint32_t next[kPermuteWarps][kPermuteExperts];
+  const PermuteRun run(tokens * top_k, gridDim.x, blockIdx.x, threadIdx.x / 32);
+  scratch[threadIdx.x * kPermuteMaxBlocks + blockIdx.x] = permute_count(next, topk_ids, run);
+}
+EIDOLA_KERNEL_META(eidola_moe_permute_count, kPermuteExperts, 1, 1, 0, 1, 1, 1, 0);
+
+extern "C" __global__ void __launch_bounds__(kPermuteExperts)
+    eidola_moe_permute(int32_t* __restrict__ grouped_layout, int32_t* __restrict__ row_of,
+                       const int32_t* __restrict__ topk_ids, const uint32_t* __restrict__ scratch,
+                       uint32_t tokens, uint32_t top_k) {
+  __shared__ uint32_t next[kPermuteWarps][kPermuteExperts];
+  __shared__ uint32_t scan[kPermuteExperts];
+  const uint32_t e = threadIdx.x, warp = e / 32, lane = e % 32;
+  const uint32_t blocks = gridDim.x, b = blockIdx.x;
+  const PermuteRun run(tokens * top_k, blocks, b, warp);
+  const uint32_t count = permute_count(next, topk_ids, run);
   // Expert e's count over every block, and the pairs of it before this block.
   uint32_t total = count, before = 0;
   if (blocks > 1) {
-    uint32_t* counters = scratch + kPermuteExperts * kPermuteMaxBlocks;
-    scratch[e * kPermuteMaxBlocks + b] = count;
-    __syncthreads();
-    if (e == 0) {
-      __threadfence();
-      atomicAdd(counters, 1u);
-      while (ld_acquire_gpu(counters) < blocks) __nanosleep(64);
-      __threadfence();
-    }
-    __syncthreads();
-    // Expert e's counts are contiguous: every 16-byte load is issued at once.
+    // Expert e's counts are contiguous, read eight 16-byte loads at a time.
     total = 0;
     const uint4* counts = reinterpret_cast<const uint4*>(scratch + e * kPermuteMaxBlocks);
-#pragma unroll
+#pragma unroll 8
     for (uint32_t c4 = 0; c4 < kPermuteMaxBlocks / 4; ++c4) {
       if (c4 * 4 < blocks) {
-        const uint4 h4 = __ldcg(counts + c4);
+        const uint4 h4 = __ldg(counts + c4);
         const uint32_t h[4] = {h4.x, h4.y, h4.z, h4.w};
 #pragma unroll
         for (uint32_t j = 0; j < 4; ++j) {
@@ -884,10 +897,6 @@ extern "C" __global__ void __launch_bounds__(kPermuteExperts)
           before += c < b ? h[j] : 0;
         }
       }
-    }
-    if (e == 0 && atomicAdd(counters + 1, 1u) == blocks - 1) {
-      atomicExch(counters, 0u);
-      atomicExch(counters + 1, 0u);
     }
   }
   // Starts: an exclusive scan of the runs.
@@ -905,9 +914,9 @@ extern "C" __global__ void __launch_bounds__(kPermuteExperts)
 #pragma unroll
   for (uint32_t w = 0; w < kPermuteWarps; ++w) next[w][e] += start + before;
   __syncthreads();
-  for (uint32_t base = lo; base < hi; base += 32) {
+  for (uint32_t base = run.lo; base < run.hi; base += 32) {
     const uint32_t i = base + lane;
-    const uint32_t id = i < hi ? static_cast<uint32_t>(topk_ids[i]) : kPermuteExperts;
+    const uint32_t id = i < run.hi ? static_cast<uint32_t>(topk_ids[i]) : kPermuteExperts;
     const bool placed = id < kPermuteExperts;
     const uint32_t same = __match_any_sync(0xffffffffu, placed ? id : kPermuteExperts);
     const uint32_t ahead = __popc(same & ((1u << lane) - 1u));

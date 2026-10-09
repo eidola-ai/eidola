@@ -69,6 +69,7 @@ pub struct EngineOps {
     router: Kernel,
     router_scores: Kernel,
     router_select: Kernel,
+    permute_count: Kernel,
     permute: Kernel,
     gather_quant: Kernel,
     combine: Kernel,
@@ -108,6 +109,7 @@ impl EngineOps {
             router: m.kernel("eidola_router_topk")?,
             router_scores: m.kernel("eidola_router_scores")?,
             router_select: m.kernel("eidola_router_select")?,
+            permute_count: m.kernel("eidola_moe_permute_count")?,
             permute: m.kernel("eidola_moe_permute")?,
             gather_quant: m.kernel("eidola_gather_quant_ue8m0")?,
             combine: m.kernel("eidola_moe_combine")?,
@@ -411,9 +413,11 @@ impl EngineOps {
     /// Expert-major placement of `tokens × top_k` routed pairs
     /// ([`expert_placement`] is its host form): `row_of` per pair, and the
     /// psum layout's grouped layout, 256 words, every run within
-    /// `rows_bound` rows. `scratch` is [`PERMUTE_SCRATCH_WORDS`] words,
-    /// zeroed once when allocated (each launch leaves its barrier's counters
-    /// zero), used by one launch at a time.
+    /// `rows_bound` rows. `scratch` is [`PERMUTE_SCRATCH_WORDS`] words: above
+    /// one block, `eidola_moe_permute_count` writes every block's counts
+    /// there and `eidola_moe_permute` (the same grid) reads them, so no
+    /// block waits for another; with one block the placement is one launch
+    /// and reads no scratch.
     pub unsafe fn moe_permute(
         &self,
         gpu: &Gpu,
@@ -426,6 +430,19 @@ impl EngineOps {
         rows_bound: u32,
     ) -> Result<()> {
         let grid = permute_grid(tokens, top_k, rows_bound, scratch)?;
+        if grid[0] > 1 {
+            unsafe {
+                launch!(
+                    gpu,
+                    self.permute_count,
+                    grid,
+                    scratch,
+                    topk_ids,
+                    tokens,
+                    top_k
+                )?;
+            }
+        }
         unsafe {
             launch!(
                 gpu,
@@ -922,13 +939,12 @@ pub fn quant_grid(rows: u32, k: u32, m_pad: u32, q: u64, x: u64) -> Result<[u32;
 /// [`PERMUTE_MAX_BLOCKS`].
 pub const PERMUTE_CHUNK: u32 = 512;
 
-/// Most blocks of `eidola_moe_permute` (`kPermuteMaxBlocks`): few enough to
-/// be resident at once, which its grid barrier needs.
+/// Most blocks of `eidola_moe_permute` (`kPermuteMaxBlocks`): the scratch
+/// holds a count per (expert, block), each expert's read in 16-byte loads.
 pub const PERMUTE_MAX_BLOCKS: u32 = 128;
 
-/// Words of `eidola_moe_permute`'s scratch: a count per (expert, block),
-/// then its grid barrier's two counters.
-pub const PERMUTE_SCRATCH_WORDS: usize = crate::support::EXPERTS * PERMUTE_MAX_BLOCKS as usize + 2;
+/// Words of `eidola_moe_permute`'s scratch: a count per (expert, block).
+pub const PERMUTE_SCRATCH_WORDS: usize = crate::support::EXPERTS * PERMUTE_MAX_BLOCKS as usize;
 
 /// The placement's grid: one block per [`PERMUTE_CHUNK`] pairs, at least
 /// one (it writes the grouped layout) and at most [`PERMUTE_MAX_BLOCKS`].
@@ -1430,7 +1446,7 @@ mod tests {
             "rows past i32"
         );
         assert!(permute_grid(u32::MAX / 8 + 1, 8, u32::MAX, scratch).is_err());
-        assert_eq!(PERMUTE_SCRATCH_WORDS, 256 * 128 + 2);
+        assert_eq!(PERMUTE_SCRATCH_WORDS, 256 * 128);
     }
 
     /// `eidola_moe_permute`'s arithmetic on the host, for `blocks` blocks:
