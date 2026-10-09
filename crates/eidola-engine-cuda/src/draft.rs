@@ -1536,6 +1536,7 @@ pub(crate) unsafe fn run(
         qo_tile_indices: word(p.arrays[5]),
         kv_tile_indices: word(p.arrays[6]),
         kv_chunk_size: word(layout.kv_chunk),
+        valid: 0,
     };
     for l in launches {
         match l {

@@ -196,8 +196,45 @@ pub struct PlanShape {
     pub max_page: Option<u32>,
 }
 
+/// The query tile FlashInfer's rule picks for `requests`: from the longest
+/// packed query run (query rows × GQA group size), 16, 64 or 128.
+pub fn tile_for(requests: &[AttnRequest], group_size: u32) -> u32 {
+    let packed = requests
+        .iter()
+        .map(|r| r.qo_len as u64 * group_size as u64)
+        .max()
+        .unwrap_or(1);
+    if packed <= 16 {
+        16
+    } else if packed <= 64 {
+        64
+    } else {
+        128
+    }
+}
+
 impl HostPlan {
+    /// The plan at the tile FlashInfer's rule picks ([`tile_for`]): what
+    /// the eager path launches.
     pub fn new(requests: &[AttnRequest], group_size: u32, page_size: u32) -> Result<HostPlan> {
+        HostPlan::with_tile(
+            requests,
+            group_size,
+            page_size,
+            tile_for(requests, group_size),
+        )
+    }
+
+    /// The plan at query tile `tile`: 16, 64 or 128, and at least the tile
+    /// [`tile_for`] picks, so every query tile holds whole packed rows of
+    /// one request. The mixed-step graphs record their launches at 128
+    /// over an all-padding step, whose own rule would pick 16.
+    pub fn with_tile(
+        requests: &[AttnRequest],
+        group_size: u32,
+        page_size: u32,
+        tile: u32,
+    ) -> Result<HostPlan> {
         let bad =
             |r: &AttnRequest, why: &str| CudaError::new(format!("attention request {r:?}: {why}"));
         let int = |x: u64| i32::try_from(x).ok();
@@ -206,18 +243,12 @@ impl HostPlan {
                 "attention plan: group size {group_size}, page size {page_size}"
             )));
         }
-        let packed = requests
-            .iter()
-            .map(|r| r.qo_len as u64 * group_size as u64)
-            .max()
-            .unwrap_or(1);
-        let tile = if packed <= 16 {
-            16
-        } else if packed <= 64 {
-            64
-        } else {
-            128
-        };
+        if ![16, 64, 128].contains(&tile) || tile < tile_for(requests, group_size) {
+            return Err(CudaError::new(format!(
+                "attention plan: tile {tile} for requests the rule tiles at {}",
+                tile_for(requests, group_size)
+            )));
+        }
         let mut p = HostPlan {
             group_size,
             page_size,
@@ -370,6 +401,7 @@ impl AttnPlan {
             qo_tile_indices: dptr(&self.qo_tile_indices, s),
             kv_tile_indices: dptr(&self.kv_tile_indices, s),
             kv_chunk_size: dptr(&self.kv_chunk_size, s),
+            valid: 0,
         }
     }
 }
@@ -379,7 +411,8 @@ impl AttnPlan {
 /// indirectly. Everything a step varies inside a fixed shape lives behind
 /// these addresses, so a launch over a view can be recorded once and
 /// replayed with new array contents. Made by [`AttnPlan::view`] (fresh
-/// buffers per step) or by the decode graphs over their step table.
+/// buffers per step) or by the decode and mixed-step graphs over their step
+/// tables.
 #[derive(Clone, Copy, Debug)]
 pub struct PlanView {
     pub(crate) tile: u32,
@@ -395,6 +428,12 @@ pub struct PlanView {
     pub(crate) qo_tile_indices: u64,
     pub(crate) kv_tile_indices: u64,
     pub(crate) kv_chunk_size: u64,
+    /// FlashInfer's `block_valid_mask`: one byte per work item, a CTA whose
+    /// byte is zero returning before it reads anything else; 0 when every
+    /// work item is real. The mixed-step graphs launch a fixed number of
+    /// work items and mark the ones a step does not use
+    /// ([`crate::mixed`]).
+    pub(crate) valid: u64,
 }
 
 /// One layer's KV and attention settings.
@@ -607,6 +646,7 @@ impl Attention {
             kv_tile_indices: plan.kv_tile_indices,
             o_indptr: plan.q_indptr,
             kv_chunk_size_ptr: plan.kv_chunk_size,
+            block_valid_mask: plan.valid,
             padded_batch_size: plan.work_items,
             partition_kv: false,
             ..PagedParams::default()
@@ -672,5 +712,29 @@ mod tests {
         );
         // A page size past i32 leaves a last page whose length cannot be held.
         refused(&[req(0, 1, 1, 1 << 31)], 16, u32::MAX);
+    }
+
+    /// A forced tile is one the kernels have, and never smaller than the
+    /// rule's; at the rule's own tile it is the plan `new` makes.
+    #[test]
+    fn a_forced_tile_is_a_kernel_tile_at_least_the_rules() {
+        let rs = [req(0, 1, 2, 17), req(1, 3, 2, 32)];
+        assert_eq!(tile_for(&rs, 16), 64);
+        assert_eq!(
+            HostPlan::with_tile(&rs, 16, 16, 64).unwrap(),
+            HostPlan::new(&rs, 16, 16).unwrap()
+        );
+        let p = HostPlan::with_tile(&rs, 16, 16, 128).unwrap();
+        assert_eq!(p.tile(), 128);
+        // One work item per request at the larger tile, the arrays otherwise
+        // the rule's.
+        assert_eq!(p.work_items(), 2);
+        assert_eq!(p.indices, HostPlan::new(&rs, 16, 16).unwrap().indices);
+        for tile in [0, 16, 32, 100, 256] {
+            assert!(HostPlan::with_tile(&rs, 16, 16, tile).is_err(), "{tile}");
+        }
+        assert_eq!(tile_for(&[], 16), 16);
+        assert_eq!(tile_for(&[req(0, 9, 1, 9)], 8), 128);
+        assert_eq!(tile_for(&[req(0, 8, 1, 9)], 8), 64);
     }
 }
